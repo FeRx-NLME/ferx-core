@@ -662,6 +662,469 @@ fn adaptive_model_refusal_texts() {
     ]);
 }
 
+/// Two states, residual error on CMT 2 only: a `Dv` reading of CMT 1 has no σ.
+const ODE_ERR_ON_CMT2: &str = "[parameters]\n  theta TVCL(4.0, 0.5, 20.0)\n  \
+    theta TVV(50.0, 5.0, 200.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.10 (sd)\n\
+    [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  \
+    ode(obs_cmt=central, states=[central, periph])\n[odes]\n  d/dt(central) = -(CL / V) * central\n  \
+    d/dt(periph) = 0\n[error_model]\n  CMT=2: DV ~ proportional(PROP)\n";
+
+/// A subject with observations and no dose: the controller is its only source of drug.
+fn dose_free(id: &str, obs_times: &[f64]) -> Subject {
+    let n = obs_times.len();
+    Subject {
+        id: id.to_string(),
+        obs_times: obs_times.to_vec(),
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        cens: vec![0; n],
+        ..Default::default()
+    }
+}
+
+/// The next `f64` above `t`: within the driver's 1e-15 dedup of `t`, but not bit-equal.
+fn next_up(t: f64) -> f64 {
+    f64::from_bits(t.to_bits() + 1)
+}
+
+/// The adaptive driver's refusals that are a function of the inputs alone, moved to the
+/// entry by #1983: their code, block and whole text, and — the reason they moved — that
+/// each is raised **before any subject is simulated**. The controller factory is called
+/// once per (subject, replicate) just before the driver runs, so a row whose factory count
+/// is not 0 reached a subject first. That is what the driver-side check did: on the
+/// base × reset row subject '1' is valid and would run, and only subject '2' is refused.
+///
+/// Each predicate is also asserted from its accepting side, in the same test, so a check
+/// stuck on "refuse" (or a gate deleted) reddens it.
+#[test]
+fn adaptive_entry_refusals_simulate_no_subject() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
+    use std::cell::Cell;
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let cmt2_err = parse_model_string(ODE_ERR_ON_CMT2).expect("parse");
+    let made = Cell::new(0usize);
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    // `simulate_adaptive`, counting controllers made; each row resets the count.
+    let mut run =
+        |name: &'static str, m: &CompiledModel, pop: &Population, o: AdaptiveSimulateOptions| {
+            made.set(0);
+            let r = simulate_adaptive(
+                m,
+                pop,
+                &m.default_params,
+                1,
+                || {
+                    made.set(made.get() + 1);
+                    |_: &ControllerCtx| vec![DoseAction::Hold]
+                },
+                &o,
+            );
+            counts.push((name, made.get()));
+            r
+        };
+    let schedule = |decision_times: Vec<f64>| AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times,
+        ..Default::default()
+    };
+    let monitored = |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions {
+        monitors,
+        ..schedule(vec![0.0])
+    };
+    let one = population_of(vec![dose_free("1", &[12.0])], &[]);
+    // Subject '1' is valid; subject '2' carries a base dose and an EVID=3 reset.
+    let mut base_reset = observed("2", &[1.0, 40.0]);
+    base_reset.reset_times = vec![30.0];
+    let two = population_of(vec![observed("1", &[1.0, 40.0]), base_reset], &[]);
+
+    // The spec path: no factory to count, so `n_sim = 0` — a refusal that still fires there
+    // cannot be the driver's, which runs only inside a replicate.
+    let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
+    let mut spec = parse_full_model(&tdm)
+        .expect("parse")
+        .adaptive_dosing
+        .expect("has [adaptive_dosing]");
+    assert!(spec.with_assay_error, "the TDM example draws an assay");
+    let mut spec_on = |cmt: usize| {
+        spec.assay_cmt = Some(cmt);
+        simulate_adaptive_from_spec(
+            &cmt2_err,
+            &one,
+            &cmt2_err.default_params,
+            0,
+            &spec,
+            &AdaptiveSimulateOptions::default(),
+        )
+    };
+    let spec_dv_cmt1 = spec_on(1);
+    let spec_dv_cmt2 = spec_on(2);
+
+    let rows = vec![
+        row(
+            "base regimen × EVID=3 under IOV",
+            run("base × reset", &iov, &two, schedule(vec![0.0, 24.0])),
+            "E_ADAPTIVE_UNSUPPORTED",
+            None,
+            "subject '2': a pre-scheduled base regimen combined with system resets (EVID=3/4) \
+             is not yet supported under time-varying covariates or inter-occasion \
+             variability; #932 supports base × reset on the constant-covariate path only \
+             (time-varying-covariate / IOV base × reset is a follow-up)",
+        ),
+        row(
+            "max_decisions",
+            run(
+                "max_decisions",
+                &ode,
+                &one,
+                AdaptiveSimulateOptions {
+                    max_decisions: 1,
+                    ..schedule(vec![0.0, 24.0])
+                },
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "decision schedule has 2 points, exceeding max_decisions = 1 (runaway guard); \
+             raise `max_decisions` in the simulate options if the schedule is intentional",
+        ),
+        row(
+            "monitor past the states",
+            run(
+                "monitor cmt 2",
+                &ode,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 2, ObserveMode::Ipred)]),
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "monitor 'A' observes compartment 2 but the model has 1 state(s)",
+        ),
+        row(
+            "monitor on compartment 0",
+            run(
+                "monitor cmt 0",
+                &ode,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 0, ObserveMode::Ipred)]),
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "monitor 'A' observes compartment 0 but the model has 1 state(s)",
+        ),
+        row(
+            "Dv monitor, no [error_model] on its compartment",
+            run(
+                "Dv cmt 1",
+                &cmt2_err,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]),
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "monitor 'A' requests DV observation on compartment 1 but no [error_model] \
+             defines residual error there",
+        ),
+        row(
+            "from_spec, assay_cmt with no [error_model]",
+            spec_dv_cmt1,
+            "E_ADAPTIVE_SPEC",
+            Some("adaptive_dosing"),
+            "simulate_adaptive_from_spec: [adaptive_dosing]: `with_assay_error = true` draws \
+             the assay from the [error_model] of assay_cmt = 1, but no [error_model] defines \
+             residual error there",
+        ),
+    ];
+
+    // The accepting side of each predicate, one input changed from a refused row.
+    let accepted = [
+        (
+            "base × reset without IOV (constant path, #932)",
+            run("ok: base × reset", &ode, &two, schedule(vec![0.0, 24.0])).err(),
+        ),
+        (
+            "two decisions under max_decisions = 2",
+            run(
+                "ok: max_decisions",
+                &ode,
+                &one,
+                AdaptiveSimulateOptions {
+                    max_decisions: 2,
+                    ..schedule(vec![0.0, 24.0])
+                },
+            )
+            .err(),
+        ),
+        (
+            "a monitor on the model's last state",
+            run(
+                "ok: monitor cmt 1",
+                &ode,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)]),
+            )
+            .err(),
+        ),
+        (
+            "a Dv monitor on the compartment with the [error_model]",
+            run(
+                "ok: Dv cmt 2",
+                &cmt2_err,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 2, ObserveMode::Dv)]),
+            )
+            .err(),
+        ),
+        (
+            "an Ipred monitor on the compartment without one",
+            run(
+                "ok: Ipred cmt 1",
+                &cmt2_err,
+                &one,
+                monitored(vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)]),
+            )
+            .err(),
+        ),
+        (
+            "from_spec, assay_cmt with an [error_model]",
+            spec_dv_cmt2.err(),
+        ),
+    ];
+    for (what, err) in &accepted {
+        assert!(err.is_none(), "{what} must run: {err:?}");
+    }
+
+    // Refused rows made no controller; accepted ones made one per subject, which is what
+    // makes the zero above a measurement rather than a constant.
+    for (name, n) in &counts {
+        let want = match *name {
+            "ok: base × reset" => 2,
+            n if n.starts_with("ok: ") => 1,
+            _ => 0,
+        };
+        assert_eq!(*n, want, "{name}: controllers made");
+    }
+    check_rows(rows);
+}
+
+/// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
+/// doses, the break timeline or the controller's own output. One row per text, through
+/// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
+/// fixture differs from a run that succeeds in the one input named in the row.
+#[test]
+fn adaptive_driver_refusals_carry_their_codes() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let lagged =
+        parse_model_string(&ODE_ADAPTIVE.replace("  V  = TVV\n", "  V  = TVV\n  LAGTIME = 2.0\n"))
+            .expect("parse");
+    let input_rate = parse_model_string(
+        &ODE_ADAPTIVE
+            .replace(
+                "  theta TVV(50.0, 5.0, 200.0)\n",
+                "  theta TVV(50.0, 5.0, 200.0)\n  theta TVKA(1.0, 0.05, 24.0)\n",
+            )
+            .replace("  V  = TVV\n", "  V  = TVV\n  KA = TVKA\n")
+            .replace(
+                "d/dt(central) = -(CL / V) * central",
+                "d/dt(central) = first_order(ka=KA) - (CL / V) * central",
+            ),
+    )
+    .expect("parse");
+    let nan_lag = parse_model_string(
+        &ODE_ADAPTIVE.replace("  V  = TVV\n", "  V  = TVV\n  LAGTIME = exp(1000.0)\n"),
+    )
+    .expect("parse");
+    let tad = parse_model_string(&ODE_ADAPTIVE.replace(
+        "d/dt(central) = -(CL / V) * central",
+        "d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)",
+    ))
+    .expect("parse");
+    let run = |m: &CompiledModel,
+               pop: &Population,
+               decision_times: Vec<f64>,
+               actions: Vec<DoseAction>| {
+        let o = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times,
+            ..Default::default()
+        };
+        simulate_adaptive(
+            m,
+            pop,
+            &m.default_params,
+            1,
+            || {
+                let a = actions.clone();
+                move |_: &ControllerCtx| a.clone()
+            },
+            &o,
+        )
+    };
+    let bolus = |amt: f64, cmt: usize| vec![DoseAction::Bolus { amt, cmt }];
+    let one = population_of(vec![dose_free("1", &[12.0])], &[]);
+    let mut ss_base = observed("1", &[6.0, 30.0]);
+    ss_base.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)];
+    let mut reset_at_1 = dose_free("1", &[2.0]);
+    reset_at_1.reset_times = vec![1.0];
+    check_rows(vec![
+        row(
+            "base SS dose under IOV",
+            run(
+                &iov,
+                &population_of(vec![ss_base], &[]),
+                vec![0.0, 24.0],
+                bolus(100.0, 1),
+            ),
+            "E_ADAPTIVE_UNSUPPORTED",
+            None,
+            "subject '1' (sim 1): ode_predictions_adaptive: a pre-scheduled base dose (index 0) \
+             combined with time-varying covariates or inter-occasion variability must be a \
+             plain fixed bolus or infusion into a plain compartment; steady-state, lagged, \
+             built-in input-rate (transit / zero-order absorption), and modeled-RATE base \
+             doses under a time-varying covariate or IOV are a #930/#931 follow-up",
+        ),
+        row(
+            "infinite base-dose lag",
+            run(
+                &nan_lag,
+                &population_of(vec![observed("1", &[12.0])], &[]),
+                vec![0.0],
+                vec![DoseAction::Hold],
+            ),
+            "E_ADAPTIVE_UNSUPPORTED",
+            None,
+            "subject '1' (sim 1): ode_predictions_adaptive: a non-finite break time \
+             (NaN/infinite dose lagtime, route lag, or infusion duration) — the subject's \
+             timeline cannot be ordered",
+        ),
+        row(
+            "IOV: decision within 1e-15 of an observation",
+            run(
+                &iov,
+                &population_of(vec![dose_free("1", &[1.0])], &[]),
+                vec![next_up(1.0)],
+                bolus(100.0, 1),
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "subject '1' (sim 1): adaptive-dosing (time-varying) event time 1.0000000000000002 \
+             lies within 1e-15 of another break time but is not bit-identical, so its \
+             per-event PK / decision lookup would be silently dropped. Align decision, \
+             observation, and EVID=2 times to identical values (integer-valued time grids are \
+             unaffected).",
+        ),
+        row(
+            "constant path: decision within 1e-15 of a reset",
+            run(
+                &ode,
+                &population_of(vec![reset_at_1], &[]),
+                vec![next_up(1.0)],
+                bolus(100.0, 1),
+            ),
+            "E_ADAPTIVE_OPTIONS",
+            None,
+            "subject '1' (sim 1): adaptive-dosing decision time 1.0000000000000002 lies within \
+             1e-15 of a system-reset or base-regimen (dose / infusion-end) break time but is \
+             not bit-identical, so its decision lookup would be silently dropped. Align \
+             decision, reset (EVID=3), and base-dose times to identical values \
+             (integer-valued time grids are unaffected).",
+        ),
+        row(
+            "controller dose past the states",
+            run(&ode, &one, vec![0.0], bolus(100.0, 2)),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0: dose into compartment 2 but the model has 1 \
+             state(s)",
+        ),
+        row(
+            "controller dose into an input-rate compartment",
+            run(&input_rate, &one, vec![0.0], bolus(100.0, 1)),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0: compartment 1 is fed by a built-in input-rate \
+             (absorption) function; controller dosing into an input-rate compartment is not \
+             supported",
+        ),
+        row(
+            "controller dose into a lagged compartment",
+            run(&lagged, &one, vec![0.0], bolus(100.0, 1)),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0: compartment 1 declares a dose lag time (2); \
+             lagged controller dosing is not supported",
+        ),
+        row(
+            "controller dose into compartment 0",
+            run(&ode, &one, vec![0.0], bolus(100.0, 0)),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0 at t=0: dose target compartment is 0, but CMT is \
+             1-based",
+        ),
+        row(
+            "controller dose with a negative amount",
+            run(&ode, &one, vec![0.0], bolus(-1.0, 1)),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0 at t=0: dose amount must be finite and \
+             non-negative; got -1",
+        ),
+        row(
+            "controller infusion with a zero rate",
+            run(
+                &ode,
+                &one,
+                vec![0.0],
+                vec![DoseAction::Infuse {
+                    amt: 100.0,
+                    cmt: 1,
+                    rate: 0.0,
+                }],
+            ),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0 at t=0: Infuse requires a positive, finite rate; \
+             got 0",
+        ),
+        row(
+            "controller Stop before another action",
+            run(
+                &ode,
+                &one,
+                vec![0.0],
+                vec![DoseAction::Stop, DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            ),
+            "E_ADAPTIVE_CONTROLLER_ACTION",
+            None,
+            "subject '1' (sim 1): decision 0 at t=0: Stop must be the final action, but 1 \
+             action(s) follow it",
+        ),
+        row(
+            "TAD read before any dose",
+            run(
+                &tad,
+                &population_of(vec![dose_free("1", &[9.0])], &[]),
+                vec![6.0, 12.0],
+                vec![DoseAction::Hold],
+            ),
+            "E_ADAPTIVE_UNSUPPORTED",
+            None,
+            "subject '1' (sim 1): ode_predictions_adaptive: the segment (9, 12] integrated to \
+             a non-finite state, and the [odes] RHS reads `TAD`, which has no referent there: \
+             no dose has been given in this run. No observation is read off that segment, but \
+             the state integrated there carries into every later read. Where the record \
+             contains a dose, the static engines anchor such a window at the first one — a \
+             dose a reactive run has not decided yet, and may never decide — so this driver \
+             refuses the window rather than read one out of the future. Give the subject a \
+             pre-scheduled base regimen, or have the controller dose at a decision at or \
+             before the subject's first record; a controller that never doses leaves a model \
+             reading `TAD` unanchored for the whole run.",
+        ),
+    ]);
+}
+
 const DEPOT_READOUT: &str = "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  \
     theta TVV(50.0, 5.0, 500.0)\n  theta TVKA(1.0, 0.01, 10.0)\n  omega ETA_CL ~ 0.09\n  \
     sigma PROP ~ 0.01 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \

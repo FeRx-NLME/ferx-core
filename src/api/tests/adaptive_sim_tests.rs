@@ -5918,6 +5918,9 @@ fn adaptive_run_with_a_diverged_state_serves_nan_and_does_not_verify() {
             && e.to_string().contains("cannot confirm it"),
         "{e}"
     );
+    // The runtime control for #1983: the driver's refusals carry a code, but a replay that
+    // disagrees with the run it checks is a runtime failure, not the caller's input — no code.
+    assert_eq!(e.code(), None, "{e}");
 }
 
 /// T6's second cell (#1539, inherited from #1570 review row 1): a pre-dose `[odes]` RHS that

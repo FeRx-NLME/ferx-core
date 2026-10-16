@@ -4358,6 +4358,68 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
     breaks.insert(pos, t);
 }
 
+/// What a refusal of the reactive adaptive driver is about (#1983). The API layer
+/// gives each kind its code (`api/entry_refusals.rs`); `src/ode` names no code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveRefusalKind {
+    /// The schedule meets the subject's own records in a way the driver cannot key
+    /// (`E_ADAPTIVE_OPTIONS`).
+    Options,
+    /// A model or base regimen the driver cannot simulate faithfully
+    /// (`E_ADAPTIVE_UNSUPPORTED`).
+    Unsupported,
+    /// A malformed or unsupported controller action (`E_ADAPTIVE_CONTROLLER_ACTION`).
+    ControllerAction,
+}
+
+/// The error of [`ode_predictions_adaptive_impl`] (#1983): a refusal of the caller's
+/// input — its model, data, schedule or controller — which carries a code at the API
+/// boundary, or a runtime / internal failure, which carries none.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AdaptiveDriverError {
+    Refusal {
+        kind: AdaptiveRefusalKind,
+        message: String,
+    },
+    Runtime(String),
+}
+
+impl AdaptiveDriverError {
+    fn refusal(kind: AdaptiveRefusalKind, message: String) -> Self {
+        AdaptiveDriverError::Refusal { kind, message }
+    }
+
+    fn options(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::Options, message)
+    }
+
+    fn unsupported(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::Unsupported, message)
+    }
+
+    fn controller_action(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::ControllerAction, message)
+    }
+
+    /// The refusal's kind, or `None` for a runtime failure.
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> Option<AdaptiveRefusalKind> {
+        match self {
+            AdaptiveDriverError::Refusal { kind, .. } => Some(*kind),
+            AdaptiveDriverError::Runtime(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AdaptiveDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdaptiveDriverError::Refusal { message, .. }
+            | AdaptiveDriverError::Runtime(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Out-of-scope-compartment guards shared by the bolus and infusion decision
 /// branches of [`ode_predictions_adaptive`]. A controller dose into compartment
 /// `cmt` (1-based) is a typed error — never a silent wrong answer — when the
@@ -4371,6 +4433,9 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
 ///    its own TAD anchor inside `integrate_segment` (whose filter is
 ///    `d.time + lag <= t_start`).
 ///
+/// Each refusal is the controller's (`AdaptiveRefusalKind::ControllerAction`): the
+/// action named a compartment this driver cannot dose.
+///
 /// On success returns the per-compartment bioavailability `F`, which both
 /// branches need (the bolus to scale its state jump, the infusion its window).
 /// Single source of truth so the two branches cannot drift the eligibility
@@ -4381,26 +4446,26 @@ fn reject_unsupported_dose_compartment(
     n_states: usize,
     pk_params_flat: &[f64],
     decision_index: usize,
-) -> Result<f64, String> {
+) -> Result<f64, AdaptiveDriverError> {
     if cmt > n_states {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: dose into compartment {cmt} but the model has \
              {n_states} state(s)"
-        ));
+        )));
     }
     if input_rate_consumes_cmt(ode, cmt) {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: compartment {cmt} is fed by a built-in input-rate \
              (absorption) function; controller dosing into an input-rate compartment is not \
              supported"
-        ));
+        )));
     }
     let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
     if lag != 0.0 {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: compartment {cmt} declares a dose lag time ({lag}); \
              lagged controller dosing is not supported"
-        ));
+        )));
     }
     Ok(ode.dose_attr_map.f_bio(cmt, pk_params_flat))
 }
@@ -4833,7 +4898,7 @@ pub(crate) fn ode_predictions_adaptive(
     // Assay-noise capability for `Dv` monitors (#391 S1.5). `None` ⇒ Ipred-only;
     // a `Dv` monitor then errors at its first decision.
     assay: Option<&AssayNoise>,
-) -> Result<AdaptiveRun, String> {
+) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let mons: Vec<AdaptiveMonitor> = monitors
         .iter()
         .map(|spec| AdaptiveMonitor {
@@ -4904,54 +4969,19 @@ pub(crate) fn ode_predictions_adaptive_impl(
     controller: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision,
     max_decisions: usize,
     assay: Option<&AssayNoise>,
-) -> Result<AdaptiveRun, String> {
+) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let n = ode.n_states;
     let tv = event_pk.is_some();
     let iov = eta_occ.is_some();
 
-    // --- Preconditions (typed errors, never silent) ----------------------
-    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
-    // supported on the constant-covariate path (the controller augments it), on the time-
-    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
-    // base dose's F resolved from its own occasion-κ / covariate snapshot just below). Since
-    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
-    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
-    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
-    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
-    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
-    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
-    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
-    //
-    // Base × reset UNDER a time-varying covariate or IOV (`tv`) stays a typed error: the
-    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
-    // composition with a base regimen across a reset is not yet oracle-verified against the
-    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
-    if !subject.doses.is_empty() && subject.has_resets() && tv {
-        return Err(
-            "ode_predictions_adaptive: a pre-scheduled base regimen combined with system \
-             resets (EVID=3/4) is not yet supported under time-varying covariates or \
-             inter-occasion variability; #932 supports base × reset on the constant-covariate \
-             path only (time-varying-covariate / IOV base × reset is a follow-up)"
-                .to_string(),
-        );
-    }
-    if decision_times.len() > max_decisions {
-        return Err(format!(
-            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
-             raise `max_decisions` in the simulate options if the schedule is intentional",
-            decision_times.len(),
-            max_decisions
-        ));
-    }
-    for am in monitors {
-        let m = am.spec;
-        if m.cmt == 0 || m.cmt > n {
-            return Err(format!(
-                "monitor '{}' observes compartment {} but the model has {} state(s)",
-                m.name, m.cmt, n
-            ));
-        }
-    }
+    // --- Preconditions -----------------------------------------------------
+    // The checks a function of the inputs alone answers — `max_decisions`, a monitor's
+    // compartment range, a `Dv` monitor's `[error_model]`, and a base regimen × EVID=3/4
+    // reset under a time-varying covariate or IOV — run at the API entry, before any
+    // subject is simulated (#1983; `api/adaptive.rs`, `run_adaptive_population`). The
+    // ones below need the resolved doses, the break timeline or the controller's output.
+    debug_assert!(decision_times.len() <= max_decisions);
+    debug_assert!(monitors.iter().all(|am| (1..=n).contains(&am.spec.cmt)));
 
     // #702: resolve any pre-scheduled base regimen to concrete rate/duration (#324) and
     // capture its per-dose lagtime / bioavailability, exactly as the static engine does.
@@ -4974,8 +5004,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // administration time) instead of the t=0 `pk_params_flat` the constant path uses. This is
     // symmetric with a controller-injected dose, whose F is fixed from the driver's per-decision
     // LOCF snapshot at injection. `compute_event_pk_params_{into,iov}` populates `event_pk.dose`
-    // parallel to the base doses; base × reset is the only base combo rejected above, and it never
-    // reaches here.
+    // parallel to the base doses; base × reset is the only base combo rejected at entry
+    // (#1983), and it never reaches here.
     //
     // Scope: only a plain FIXED bolus / real-infusion base dose into a PLAIN compartment is
     // supported here. A base dose that is steady-state, lagged, fed by a built-in input-rate
@@ -4995,13 +5025,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 || base_lagtimes[k] != 0.0
                 || input_rate_consumes_cmt(ode, dose.cmt_raw())
             {
-                return Err(format!(
+                return Err(AdaptiveDriverError::unsupported(format!(
                     "ode_predictions_adaptive: a pre-scheduled base dose (index {k}) combined with \
                      time-varying covariates or inter-occasion variability must be a plain fixed \
                      bolus or infusion into a plain compartment; steady-state, lagged, built-in \
                      input-rate (transit / zero-order absorption), and modeled-RATE base doses \
                      under a time-varying covariate or IOV are a #930/#931 follow-up"
-                ));
+                )));
             }
             base_f_bio[k] = ode.dose_attr_map.f_bio(dose.cmt_raw(), &ev.dose[k].values);
         }
@@ -5214,11 +5244,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
     if abandon_non_finite_timeline(break_times.iter().copied(), None) {
-        return Err(
+        return Err(AdaptiveDriverError::unsupported(
             "ode_predictions_adaptive: a non-finite break time (NaN/infinite dose lagtime, \
              route lag, or infusion duration) — the subject's timeline cannot be ordered"
                 .to_string(),
-        );
+        ));
     }
 
     // #700 review guard: the tolerance dedup above can merge two break times within
@@ -5239,12 +5269,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .copied()
             .find(|t| !surviving.contains(&t.to_bits()))
         {
-            return Err(format!(
+            return Err(AdaptiveDriverError::options(format!(
                 "adaptive-dosing (time-varying) event time {t} lies within 1e-15 of another \
                  break time but is not bit-identical, so its per-event PK / decision lookup \
                  would be silently dropped. Align decision, observation, and EVID=2 times to \
                  identical values (integer-valued time grids are unaffected)."
-            ));
+            )));
         }
     }
 
@@ -5263,12 +5293,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .copied()
             .find(|t| !surviving.contains(&t.to_bits()))
         {
-            return Err(format!(
+            return Err(AdaptiveDriverError::options(format!(
                 "adaptive-dosing decision time {t} lies within 1e-15 of a system-reset or \
                  base-regimen (dose / infusion-end) break time but is not bit-identical, so its \
                  decision lookup would be silently dropped. Align decision, reset (EVID=3), and \
                  base-dose times to identical values (integer-valued time grids are unaffected)."
-            ));
+            )));
         }
     }
 
@@ -5481,13 +5511,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     let value = match m.mode {
                         ObserveMode::Ipred => latent,
                         ObserveMode::Dv => {
+                            // An internal invariant, so uncoded: `run_adaptive_population`
+                            // always supplies the assay.
                             let a = assay.ok_or_else(|| {
-                                format!(
+                                AdaptiveDriverError::Runtime(format!(
                                     "decision {decision_index} at t={t_start}: monitor '{}' \
                                      requests DV (assay-noised) observation but no assay-noise \
                                      capability was supplied (Ipred-only run)",
                                     m.name
-                                )
+                                ))
                             })?;
                             // Scale-correct by construction: under `Dv` the
                             // declarative path compiles no `observe` expression, so
@@ -5498,14 +5530,17 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // always on the error model's scale (#391 S2).
                             //
                             // Edge (a): a DV monitor on a compartment with no
-                            // residual error model is a typed error, not a guessed σ.
+                            // residual error model is a typed error, not a guessed σ. The
+                            // entry points refuse it before any subject runs (#1983), with
+                            // the same predicate `resid_var` applies, so a `None` here is an
+                            // internal invariant and stays uncoded.
                             let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
-                                format!(
+                                AdaptiveDriverError::Runtime(format!(
                                     "decision {decision_index} at t={t_start}: monitor '{}' \
                                      requests DV observation on compartment {} but no [error_model] \
                                      defines residual error there",
                                     m.name, m.cmt
-                                )
+                                ))
                             })?;
                             // `has_residual_error_for_cmt` (the gate behind `resid_var`)
                             // requires `sigma` to cover the model's σ indices, so a `Some`
@@ -5564,15 +5599,17 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // (`[Stop, …]`) is rejected rather than silently truncated, so the
                 // decision log can never disagree with the ledger about what ran.
                 for (j, action) in actions.iter().enumerate() {
-                    action
-                        .validate()
-                        .map_err(|e| format!("decision {decision_index} at t={t_start}: {e}"))?;
+                    action.validate().map_err(|e| {
+                        AdaptiveDriverError::controller_action(format!(
+                            "decision {decision_index} at t={t_start}: {e}"
+                        ))
+                    })?;
                     if action.is_stop() && j + 1 < actions.len() {
-                        return Err(format!(
+                        return Err(AdaptiveDriverError::controller_action(format!(
                             "decision {decision_index} at t={t_start}: Stop must be the final \
                              action, but {} action(s) follow it",
                             actions.len() - j - 1
-                        ));
+                        )));
                     }
                 }
 
@@ -5882,7 +5919,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     t_start,
                     t_end,
                 ) {
-                    return Err(msg);
+                    return Err(AdaptiveDriverError::unsupported(msg));
                 }
             }
 
