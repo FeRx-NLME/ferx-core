@@ -973,9 +973,6 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV inner gradient");
@@ -1068,9 +1065,6 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV inner gradient");
@@ -1211,9 +1205,6 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
             &params.omega,
             omega_iov,
             &params.sigma.values,
-            n_eta,
-            n_kappa,
-            k,
             None,
         )
         .expect("analytic IOV inner gradient");
@@ -1724,9 +1715,6 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV + iiv_on_ruv inner gradient");
@@ -1843,9 +1831,6 @@ fn iov_m3_inner_grad_matches_fd() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV + M3 inner gradient");
@@ -1960,9 +1945,6 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV + M3 inner gradient (right-censored)");
@@ -2083,9 +2065,6 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
             &params.omega,
             omega_iov,
             &params.sigma.values,
-            n_eta,
-            n_kappa,
-            k,
             None,
         )
         .expect("analytic ODE IOV + M3 inner gradient");
@@ -2200,9 +2179,6 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
             &params.omega,
             omega_iov,
             &params.sigma.values,
-            n_eta,
-            n_kappa,
-            k,
             None,
         )
         .expect("analytic ODE IOV + M3 + iiv_on_ruv inner gradient");
@@ -2320,9 +2296,6 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
         &params.omega,
         omega_iov,
         &params.sigma.values,
-        n_eta,
-        n_kappa,
-        k,
         None,
     )
     .expect("analytic IOV + M3 + iiv_on_ruv inner gradient");
@@ -4457,9 +4430,6 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
             &params.omega,
             params.omega_iov.as_ref().expect("IOV model"),
             &params.sigma.values,
-            model.n_eta,
-            model.n_kappa,
-            r.kappas.len(),
             None,
         )
         .expect("the analytic IOV gradient serves a walk subject");
@@ -4552,7 +4522,6 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
         );
         let layout = NestedLayout::of(&model, subject).expect("prepared");
         let b = fx::point(&layout, 1.0);
-        let k = iov_occasion_groups(subject).len();
         let mult = model.ruv_obs_mult(subject, &params.theta);
         let g = analytic_eta_nll_gradient_iov(
             &model,
@@ -4562,9 +4531,6 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
             &params.omega,
             omega_iov,
             &params.sigma.values,
-            model.n_eta,
-            model.n_kappa,
-            k,
             mult.as_deref(),
         )
         .unwrap_or_else(|| panic!("{label}: the analytic inner gradient declined"));
@@ -4698,5 +4664,73 @@ fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
         assert!(ebe.converged && ebe.nll.is_finite(), "{label}");
         assert!(analytic >= 3, "{label}: {analytic} analytic steps");
         assert_eq!(fd, 0, "{label}: {fd} steps fell back to FD");
+    }
+}
+
+/// #2037: an EBE search builds the subject's layout a fixed number of times, not once per
+/// objective or gradient evaluation. The layout depends on the subject alone, so a
+/// rebuild per call is invisible in every number the search returns; only the count
+/// (`LAYOUT_BUILDS`: every `StackedLayout::new` and `NestedLayout::of`) can see it.
+///
+/// Measured: 2–5 builds per search (the search's own, plus the warm-start, FD-reason and
+/// variance setup around it) against 56–208 analytic gradient steps and their
+/// line-search objectives. Before #2037 every objective built two layouts and every
+/// analytic gradient three or four, so the same searches built hundreds. The bound is
+/// the measured worst plus two. The FD-inner case pins the objective's prediction path
+/// alone: its gradient is FD of that objective, and it records no route.
+#[test]
+fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::stacked_layout::LAYOUT_BUILDS;
+    const MAX_BUILDS: usize = 7;
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let one_level = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse one-level IOV");
+    // A dose without an occasion label is outside the closed-form walk's scope; labelled,
+    // the one-level search runs on the analytic gradient.
+    let mut labelled = make_iov_subject();
+    labelled.dose_occasions = vec![1];
+    // `(label, model, subject, takes the analytic gradient)`.
+    let mut cases: Vec<(&str, CompiledModel, Subject, bool)> = vec![
+        (
+            "one level, fd inner",
+            make_iov_model(),
+            make_iov_subject(),
+            false,
+        ),
+        ("one level", one_level, labelled, true),
+    ];
+    for (label, src) in [
+        ("nested algebraic", fx::algebraic()),
+        ("nested closed form", fx::closed_form()),
+        ("nested ode", fx::ode()),
+    ] {
+        let (m, pop) = fx::prepared(&src, 1);
+        cases.push((label, m, pop.subjects[0].clone(), true));
+    }
+    for (label, m, s, analytic_route) in &cases {
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        LAYOUT_BUILDS.with(|c| c.set(0));
+        let ebe = find_ebe_for_stage(m, s, &m.default_params, 200, 1e-8, None, None, 0, &stage);
+        let builds = LAYOUT_BUILDS.with(|c| c.get());
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(ebe.nll.is_finite(), "{label}");
+        if *analytic_route {
+            // The bound must be far below the work, or it could not tell the two apart.
+            assert!(
+                analytic >= 50 && fd == 0,
+                "{label}: {analytic} analytic / {fd} FD steps"
+            );
+        }
+        assert!(
+            builds <= MAX_BUILDS,
+            "{label}: {builds} layout builds in one EBE search ({analytic} analytic steps)"
+        );
     }
 }

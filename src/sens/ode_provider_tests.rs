@@ -8740,7 +8740,12 @@ fn ode_iov_subject_past_the_last_bucket_declines_to_fd() {
 
     let stacked = vec![0.01; n_stacked];
     assert!(
-        ode_iov_subject_supported(&model, &subj).is_none(),
+        ode_iov_subject_supported(
+            &model,
+            &subj,
+            &crate::stats::stacked_layout::StackedLayout::sens_of(&model, &subj).unwrap()
+        )
+        .is_none(),
         "a subject past the cap must be declined by the gate, before any dispatch"
     );
     assert!(

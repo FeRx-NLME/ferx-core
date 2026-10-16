@@ -2627,7 +2627,32 @@ pub(crate) fn iov_linearization(
     // dense across rows, exactly what FD of the continuous prediction captures
     // (the old Option-A version wrote κ_k only on occasion-k's rows).
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
-    let ipreds = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
+    // One layout and one scratch for the 2·n_b + 1 predictions below (#2037): the layout
+    // depends on the subject alone, and each prediction rewrites every scratch event.
+    // The prediction pads an unlabelled record's κ to the *model's* width, which a caller
+    // handing an `Ω_IOV` of another order (a hand-built fixture) does not share.
+    let model_width;
+    let pred_layout = if n_iov == model.n_kappa {
+        &layout
+    } else {
+        model_width =
+            crate::stats::stacked_layout::StackedLayout::new(n_eta, model.n_kappa, subject);
+        &model_width
+    };
+    let mut scratch = pk::EventPkParams::default();
+    let mut predict = |k: &[Vec<f64>]| {
+        pk::predict_iov_in(
+            model,
+            subject,
+            pred_layout,
+            theta,
+            eta_hat.as_slice(),
+            k,
+            &mut scratch,
+            None,
+        )
+    };
+    let ipreds = predict(&kappa_slices);
 
     // #1082: under nested levels `b` is the compact vector (one κ block per group of each
     // level), so a κ column perturbs one group's κ in every cell that shares it.
@@ -2646,21 +2671,9 @@ pub(crate) fn iov_linearization(
             let orig = bpert[c];
             let step = EPS * (1.0 + orig.abs());
             bpert[c] = orig + step;
-            let preds_plus = pk::predict_iov(
-                model,
-                subject,
-                theta,
-                eta_hat.as_slice(),
-                &nested.expand(&bpert),
-            );
+            let preds_plus = predict(&nested.expand(&bpert));
             bpert[c] = orig - step;
-            let preds_minus = pk::predict_iov(
-                model,
-                subject,
-                theta,
-                eta_hat.as_slice(),
-                &nested.expand(&bpert),
-            );
+            let preds_minus = predict(&nested.expand(&bpert));
             bpert[c] = orig;
             let inv_2step = 1.0 / (2.0 * step);
             for j in 0..n_obs {
@@ -2695,9 +2708,9 @@ pub(crate) fn iov_linearization(
             let orig = kpert[k][ki];
             let step = EPS * (1.0 + orig.abs());
             kpert[k][ki] = orig + step;
-            let preds_plus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            let preds_plus = predict(&kpert);
             kpert[k][ki] = orig - step;
-            let preds_minus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            let preds_minus = predict(&kpert);
             kpert[k][ki] = orig;
             let inv_2step = 1.0 / (2.0 * step);
             for j in 0..n_obs {
@@ -3424,12 +3437,47 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
 ) -> f64 {
-    // #1082: the compact layout, built once. A nested-level subject never given its cells
-    // has none, and is refused rather than scored as one-level IOV or with κ dropped.
-    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
-    if model.has_nested_levels() && nested.is_none() {
+    // #1082: a nested-level subject never given its cells has no layout, and is refused
+    // rather than scored as one-level IOV or with κ dropped.
+    let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) else {
         return 1e20;
-    }
+    };
+    individual_nll_iov_frozen_in(
+        model,
+        subject,
+        &layout,
+        theta,
+        eta,
+        kappas,
+        omega,
+        omega_iov,
+        sigma_values,
+        pk_scratch,
+        schedule,
+        frozen_var_preds,
+    )
+}
+
+/// [`individual_nll_iov_frozen`] over a caller-built `layout`
+/// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
+/// so the EBE search builds the subject's layout once rather than once per objective
+/// evaluation (#2037).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[K],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    frozen_var_preds: Option<&[f64]>,
+) -> f64 {
+    let nested = layout.nested();
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -3476,8 +3524,8 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov_with_scratch_and_schedule(
-        model, subject, theta, eta, kappas, pk_scratch, schedule,
+    let preds = pk::predict_iov_in(
+        model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
     );
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right

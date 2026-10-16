@@ -1479,6 +1479,30 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    let layout =
+        crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), model.n_kappa, subject);
+    predict_iov_in(
+        model, subject, &layout, theta, eta_bsv, kappas, scratch, schedule,
+    )
+}
+
+/// [`predict_iov_with_scratch_and_schedule`] over a caller-built `layout` — the
+/// occasion → group map, which depends on the subject alone, so a caller predicting the
+/// subject many times (an EBE search, a linearization's FD columns) builds it once
+/// (#2037). `layout` must be the subject's, for `eta_bsv.len()` between-subject effects.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[K],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+) -> Vec<f64> {
+    debug_assert_eq!(layout.n_eta(), eta_bsv.len());
+    debug_assert_eq!(layout.n_kappa(), model.n_kappa);
     let EventPkParams {
         dose: dose_params,
         obs: obs_params,
@@ -1516,8 +1540,7 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
-    let layout = crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), n_kappa, subject);
-    let combined_for = iov_occasion_eta(&layout, eta_bsv, kappas);
+    let combined_for = iov_occasion_eta(layout, eta_bsv, kappas);
 
     // Exact initial reservations preserve the convenience API's old footprint
     // for short vectors; later probes keep these capacities without allocating.

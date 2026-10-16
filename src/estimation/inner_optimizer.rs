@@ -1,6 +1,6 @@
 use crate::pk;
 use crate::stats::likelihood::{
-    individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen,
+    individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen_in,
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
@@ -289,15 +289,16 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if eff.ss_absorption_out_of_scope(subject) {
             return "steady-state dose + built-in absorption forcing";
         }
-        let layout = crate::stats::stacked_layout::StackedLayout::of(eff, subject);
+        // The walk's layout: its width is the compact axis count under nested levels. A
+        // subject `sens_of` declines is the unprepared one, already named above.
+        let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
+        else {
+            return "nested-level subject without level cells";
+        };
         if layout.n_groups() == 0 {
             return "no observation occasions";
         }
-        // The walk's width: the compact axis count under nested levels (the unprepared
-        // case returned above, so `sens_of` only falls back for a model without levels).
-        let n_axes = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
-            .map_or(layout.n_stacked(), |l| l.n_axes());
-        let m_dim = eff.n_theta + n_axes;
+        let m_dim = eff.n_theta + layout.n_axes();
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
@@ -2369,7 +2370,12 @@ fn find_ebe_iov(
     // per group of each level — and each candidate is expanded to the per-cell κ vectors
     // the prediction reads. Without nested levels the compact vector *is* the
     // per-occasion stack, and every line below reads exactly as before.
-    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    //
+    // The subject's layout is built once here and shared by every objective and gradient
+    // evaluation of the search (#2037); `None` only for a nested-level subject never given
+    // its cells, whose objective is the refusal sentinel at every point.
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject);
+    let nested = layout.as_ref().and_then(|l| l.nested());
     let n_flat = match &nested {
         Some(n) => n.n_compact(),
         None => stacked_width(n_eta, n_kappa, k_occasions),
@@ -2430,10 +2436,14 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(pi, mi)| pi - mi)
             .collect();
+        let Some(layout) = &layout else {
+            return 1e20;
+        };
         let kappas = to_kappas(p);
-        individual_nll_iov_frozen(
+        individual_nll_iov_frozen_in(
             model,
             subject,
+            layout,
             &params.theta,
             &eta_t,
             &kappas,
@@ -2502,6 +2512,12 @@ fn find_ebe_iov(
         if !analytic_iov_inner {
             return gradient_fd(&obj, p, n_flat);
         }
+        let Some(layout) = &layout else {
+            // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
+            #[cfg(test)]
+            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+            return gradient_fd(&obj, p, n_flat);
+        };
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
         // gradient is identical in psi- and η_true-space (constant `mu` shift).
@@ -2518,14 +2534,12 @@ fn find_ebe_iov(
         match analytic_eta_nll_gradient_iov_frozen(
             model,
             subject,
+            layout,
             &params.theta,
             &stacked_true,
             &params.omega,
             omega_iov,
             &params.sigma.values,
-            n_eta,
-            n_kappa,
-            k_occasions,
             mult.as_deref(),
             frozen,
         ) {
@@ -2636,22 +2650,13 @@ fn find_ebe_iov(
     let mut nm_converged = nm_converged;
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
-        && iov_prior_maha(
-            &x,
-            &mu,
-            n_eta,
-            n_kappa,
-            k_occasions,
-            nested.as_ref(),
-            params,
-        ) > runaway_limit
+        && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, nested, params) > runaway_limit
     {
         let mut seed = vec![0.0; n_flat];
         seed[..n_eta].copy_from_slice(&mu);
         // Certified on stationarity, polish held inside the runaway limit (#1527).
         let (cold, cold_ok) = cert.nelder_mead_recover(&obj, seed, &|p| {
-            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested.as_ref(), params)
-                <= runaway_limit
+            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested, params) <= runaway_limit
         });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
@@ -3854,22 +3859,18 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
     omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix,
     sigma: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: usize,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     analytic_eta_nll_gradient_iov_frozen(
         model,
         subject,
+        &layout,
         theta,
         stacked_true,
         omega_bsv,
         omega_iov,
         sigma,
-        n_eta,
-        n_kappa,
-        k_occasions,
         mult,
         None,
     )
@@ -3879,30 +3880,36 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
 /// `frozen_var_preds = Some(f₀)` (the augmented marginal's `f(η = 0, κ = 0)`) takes each
 /// row's variance at `f₀[j]` with `∂V/∂(η, κ) = 0` and no `η_ruv` column; `None` is the
 /// conditional gradient, bit-identical.
+///
+/// `layout` is the subject's
+/// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of),
+/// built once per EBE search by the caller (#2037); it carries `n_eta`, the κ width and
+/// the group count, so none of them is a parameter that could disagree with it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     stacked_true: &[f64],
     omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix,
     sigma: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: usize,
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
     // The walk reads the per-group `stacked_true` and returns the jet over the layout's
     // axes — the compact vector under nested levels (#1082 PR3), the stack itself otherwise
     // — so the gradient below is over the vector the EBE search moves.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
-    if layout.n_groups() != k_occasions || layout.n_kappa() != n_kappa {
-        return None;
-    }
+    let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
+    let sens = crate::sens::provider::subject_eta_grad_iov_in(
+        model,
+        subject,
+        layout,
+        theta,
+        stacked_true,
+    )?;
     let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),
@@ -3976,8 +3983,13 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     for (ks, base) in layout.kappa_blocks() {
         let w = ks.len();
         let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
-        let inv_l = omega_iov.inv.select_rows(&ks).select_columns(&ks);
-        let prior_kg = &inv_l * &kappa_g;
+        // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
+        // only a nested level's subset is copied out (#2037).
+        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
+            &omega_iov.inv * &kappa_g
+        } else {
+            &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
+        };
         for c in 0..w {
             grad[base + c] += prior_kg[c];
         }

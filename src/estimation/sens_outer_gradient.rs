@@ -1574,15 +1574,17 @@ pub fn subject_theta_gradient_iov(
     params: &ModelParameters,
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
-    let sens = crate::sens::provider::subject_sensitivities_iov(
+    // One layout for the walk and the assembly (#2037).
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov_in(
         model,
         subject,
+        &layout,
         &params.theta,
         stacked_eta_hat,
     )?;
     // The jet is over the layout's axes (the compact vector under nested levels, #1082
     // PR3), so the assembly runs there: `b̂` in that basis, the prior over it.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let b_hat = layout.to_axes(stacked_eta_hat)?;
     let n_stacked = layout.n_axes();
     let omega_iov = params.omega_iov.as_ref()?;
@@ -2097,14 +2099,16 @@ pub fn subject_packed_gradient_iov(
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     let params = unpack_params(x, template);
-    let sens = crate::sens::provider::subject_sensitivities_iov(
+    // One layout for the walk and the assembly (#2037).
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov_in(
         model,
         subject,
+        &layout,
         &params.theta,
         stacked_eta_hat,
     )?;
     // Over the layout's axes (the compact vector under nested levels, #1082 PR3).
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let b_hat = layout.to_axes(stacked_eta_hat)?;
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -3333,9 +3337,12 @@ pub fn subject_eta_dx_iov(
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<DVector<f64>>> {
     let params = unpack_params(x, template);
-    let sens = crate::sens::provider::subject_sensitivities_iov(
+    // One layout for the walk and the assembly (#2037).
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov_in(
         model,
         subject,
+        &layout,
         &params.theta,
         stacked_eta_hat,
     )?;
@@ -3343,7 +3350,6 @@ pub fn subject_eta_dx_iov(
     let err_keys = model.error_spec.obs_keys(subject);
     // Over the layout's axes (the compact vector under nested levels, #1082 PR3); the
     // response is `db̂/dx` in that basis.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let b_hat = layout.to_axes(stacked_eta_hat)?;
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -3504,9 +3510,12 @@ pub fn subject_packed_gradient_foce_iov(
 ) -> Option<Vec<f64>> {
     let params = unpack_params(x, template);
     let n_theta = params.theta.len();
-    let sens = crate::sens::provider::subject_sensitivities_iov(
+    // One layout for the walk and the assembly (#2037).
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov_in(
         model,
         subject,
+        &layout,
         &params.theta,
         stacked_eta_hat,
     )?;
@@ -3514,7 +3523,6 @@ pub fn subject_packed_gradient_foce_iov(
     let err_keys = model.error_spec.obs_keys(subject);
     // The Sheiner–Beal marginal over the layout's axes — the compact vector under nested
     // levels (#1082 PR3), where `b̂` and `Σ_b` are compact while the walks read per cell.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let b_hat_vec = layout.to_axes(stacked_eta_hat)?;
     let b_hat = b_hat_vec.as_slice();
     let n_eta_bsv = model.n_eta;
@@ -3525,8 +3533,13 @@ pub fn subject_packed_gradient_foce_iov(
         return None;
     }
     let zeros = vec![0.0f64; layout.n_stacked()];
-    let sens0 =
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &zeros)?;
+    let sens0 = crate::sens::provider::subject_sensitivities_iov_in(
+        model,
+        subject,
+        &layout,
+        &params.theta,
+        &zeros,
+    )?;
     if sens.obs.len() != n_obs || sens0.obs.len() != n_obs {
         return None;
     }
