@@ -1625,9 +1625,18 @@ pub(crate) fn find_ebe_cached(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    #[cfg(test)]
+    EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
     find_ebe_impl(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
     )
+}
+
+// Solves entered through `find_ebe_cached` on this thread, so a test can observe which
+// subjects an inner pass actually solved rather than which it finished (#574 review).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
@@ -4922,6 +4931,7 @@ pub fn run_inner_loop_warm(
         min_obs,
         restarts,
         InnerSolvePolicy::default(),
+        None,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -4967,6 +4977,10 @@ pub(crate) fn run_inner_loop_warm_seeded(
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
         },
+        // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
+        // Gauss–Newton and the trust region, which would carry a placeholder into a
+        // returned result or an accepted state. Those poll at their own boundaries.
+        None,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -4976,7 +4990,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
 /// before the population barrier. The FOCE outer loop uses this to score the
 /// marginal without launching another subject pass. Results retain subject order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn run_inner_loop_warm_map<T: Send>(
+pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -4987,6 +5001,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     min_obs: usize,
     restarts: usize,
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -5007,6 +5022,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         restarts,
         None,
         policy,
+        cancel,
         finish_subject,
     )
 }
@@ -5015,7 +5031,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
 /// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
 /// outer-loop evaluation. See [`find_ebe_cached`].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
+pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -5027,6 +5043,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
     restarts: usize,
     schedules: &[Option<pk::event_driven::EventSchedule>],
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -5047,12 +5064,47 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
         restarts,
         Some(schedules),
         policy,
+        cancel,
         finish_subject,
     )
 }
 
+/// What a subject skipped by a cooperative cancel reports in place of its EBE (#574).
+///
+/// `hard_reject` makes the outer EBE guard reject the trial and `nll = +inf` keeps the
+/// placeholder out of any OFV it might be summed into, so a cancelled pass can never be
+/// accepted as an improvement. The shapes match a real result (η length `n_eta`, an
+/// `n_obs × n_eta` zero H, one κ per occasion) so no consumer indexes out of bounds on the
+/// way out; `fit()` returns `Err("cancelled by user")` before any of it is reported.
+fn cancelled_ebe_placeholder(
+    model: &CompiledModel,
+    subject: &Subject,
+    init: Option<&[f64]>,
+) -> EbeResult {
+    let eta = match init {
+        Some(e) if e.len() == model.n_eta => DVector::from_column_slice(e),
+        _ => DVector::zeros(model.n_eta),
+    };
+    let n_occ = if model.n_kappa > 0 {
+        crate::stats::stacked_layout::group_count(subject)
+    } else {
+        0
+    };
+    EbeResult {
+        eta,
+        h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        terminal_hessian: None,
+        converged: false,
+        used_fallback: false,
+        grad_norm: 0.0,
+        nll: f64::INFINITY,
+        kappas: vec![DVector::zeros(model.n_kappa); n_occ],
+        hard_reject: true,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn run_inner_loop_warm_map_impl<T: Send>(
+fn run_inner_loop_warm_map_impl<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -5064,6 +5116,7 @@ fn run_inner_loop_warm_map_impl<T: Send>(
     restarts: usize,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -5080,6 +5133,17 @@ fn run_inner_loop_warm_map_impl<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
+            // Cooperative cancel, polled per subject (#574): one outer evaluation of a
+            // large ODE population is minutes of EBE solves, and the outer loops only
+            // poll between evaluations. A subject that has not started when the flag
+            // flips gets a placeholder instead of a solve, so the pass drains in the
+            // time of the solves already in flight.
+            if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+                return (
+                    cancelled_ebe_placeholder(model, subject, init),
+                    T::default(),
+                );
+            }
             // Both arms route through `find_ebe_cached` so the policy reaches the solve
             // either way; the uncached arm just builds its schedule per call.
             let local_schedule = if schedules.is_none() {

@@ -24,9 +24,9 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "src/api/adaptive.rs",
         "run_adaptive_population",
         3,
-        "one `?` on the adaptive driver (ode_predictions_adaptive_impl) carries ~20 causes: its input \
-         refusals and malformed controller actions get codes in #1983; runtime: the run itself; \
-         internal: the snapshot and frozen-replay verifiers",
+        "internal only (#1983 coded every input refusal and controller action): the driver's \
+         AdaptiveDriverError::Runtime arm (a Dv monitor with no assay or no σ, both refused before \
+         any subject runs), the snapshot verifier and the frozen-replay verifier",
     ),
     (
         "src/api/simulate.rs",

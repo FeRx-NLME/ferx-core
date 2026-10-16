@@ -412,8 +412,9 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
 Both are restricted to the plain Gaussian residual scope the expected
 information has a closed form on: no IOV, no [mixture](mixture.qmd), no M3, no
 time-to-event endpoint, no `block_sigma` residual correlation, no
-`[covariate_nn]` θ, no residual magnitude, no FREM. A model outside it keeps the
-historical solver and says so by name in the fit's warnings.
+`[covariate_nn]` θ, no residual magnitude. FREM is in scope since #1421, which
+fixed the σ score of its covariate pseudo-observations. A model outside it keeps
+the historical solver and says so by name in the fit's warnings.
 
 #### Measured
 
@@ -553,25 +554,34 @@ M-step solver repaired:
   weights the early, still-crawling iterates most (`TH_WT` 0.637 with the
   average, 0.961 without).
 
-The FREM drift itself is real and is **not** fixed: undamped, that reprex
-settles near `TVFRD1` 0.18 from either start on the default schedule, keeps
-drifting on a 3× longer one (0.03), and 200 MH steps per iteration do not
-change it — so it is not plain E-step under-mixing. The importance-sampled
-objective cannot rank the two points on a 12-eta model (ESS/K = 0.001), but the
-FOCEI objective can: the drifted fit is 47 units worse than the held one
-(7492.7 against 7445.3), so on this model the hold is the better answer.
+#### Why the default is keyed to `iiv_on_ruv`
 
-The drift is the **`iiv_on_ruv` coupling**, not FREM and not the no-ETA
-channel as such: the same model with its `iiv_on_ruv` line and `ETA_RUV`
-omega removed lands undamped at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 —
-on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342
-/ 2.228 / 147.5. Under `iiv_on_ruv` the E-step is modified (`η_RUV` is
-re-centred into σ every iteration) and σ shares the numerical M-step with the
-no-ETA thetas; that is where the pathology lives, and it needs its own fix
-(#1421). So
-**the default is keyed to that shape**: a model with `iiv_on_ruv` keeps the
-0.03 cap, every other model runs undamped, and a value you set wins either
-way. `FIX` is the honest spelling of the same hold when the value is known.
+The FREM drift itself is real and is **not** fixed: undamped, that reprex
+settles near `TVFRD1` 0.15–0.18 from either start on the default schedule,
+keeps drifting on a 3× longer one (0.03), and 200 MH steps per iteration do
+not change it — so it is not plain E-step under-mixing. The importance-sampled
+objective ranks the drifted point worse, by 7–11 units — see [what #1421
+measured](#saem-1421-measured) below, which also shows that the FOCEI
+objective first used for this ranking is not a reliable one on an
+`iiv_on_ruv` model.
+
+It needs **both `iiv_on_ruv` and FREM**. The same model with its `iiv_on_ruv`
+line and `ETA_RUV` omega removed lands undamped at `TVFRD1` 0.414, `TVMAT`
+2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03
+cap leaves it at 0.342 / 2.228 / 147.5. With `iiv_on_ruv` but without the FREM
+covariate rows, every SAEM variant lands somewhere the objective cannot tell
+from the optimum. So **the default is keyed to `iiv_on_ruv`**: such a model
+keeps the 0.03 cap, every other model runs undamped, and a value you set wins
+either way. It is keyed to `iiv_on_ruv` alone, not to `iiv_on_ruv` *with*
+FREM, because that one non-FREM measurement cannot tell the cap from the
+undamped update: `TVFRD1` is barely identified there, so it shows the cap is
+harmless on that data, not that undamped is safe on a non-FREM `iiv_on_ruv`
+model whose no-ETA thetas are identified. If yours is such a model, set
+`mstep_damping = 1.0` and compare the two fits by importance sampling (see
+[below](#saem-1421-measured)). `FIX` is the honest spelling of the same hold
+when the value is known.
+
+#### Which fits it damps
 
 The option only acts on the channel it is about: a fit is damped when NLopt is
 left estimating a theta that is **not mu-referenced**, which is exactly the
@@ -594,6 +604,67 @@ draw, and the NONMEM-anchored mixture seed sweep was calibrated on the partial
 step that configuration returns — a converged per-class solve moves `TVCL2`
 from the NONMEM MLE 2.84 to 3.23. An exact M-step on a hard class draw is a
 different estimator, so that channel changes only with its own anchor.
+
+#### What #1421 measured {#saem-1421-measured}
+
+On the #1011 reprex (`n_exploration = 1000`, `n_convergence = 1000`,
+`n_mh_steps = 50`, seed 12345), ranked by the importance-sampled −2 log L at
+K = 20000 with the covariate etas Rao-Blackwellised (`frem_rao_blackwell`, the
+default), evaluated at each point with `imp_eval_only`:
+
+| point | `TVFRD1` | IS −2 log L |
+|---|---:|---:|
+| IMPMAP | 0.318 | 6857.1 ± 1.8 |
+| SAEM, `mstep_solver = score_sa`, undamped | 0.147 | 6864.4 ± 1.4 |
+| the same, 3× schedule (3000 + 2000) | 0.063 | 6868.2 ± 1.6 |
+| IMPMAP with only `TVFRD1` moved to 0.15 | 0.150 | 6867.3 ± 1.6 |
+
+At K = 5000 the undamped `bobyqa` point (0.149) scores 6866.7 ± 1.9 against
+IMPMAP's 6856.0 ± 2.6; the order does not change with K. So on the FREM model
+the drift moves away from the marginal optimum, and keeps moving on a longer
+schedule. Every mechanism #1421 suggested was tested and **ruled out**, each by
+one run that changes it alone:
+
+* **η_RUV re-centring (#904)** — disabled, undamped still lands at 0.183.
+* **Ω feedback** — the 11-eta FREM block held `FIX` at IMPMAP's Ω, undamped
+  `bobyqa` still lands at 0.148 (0.149 with Ω free); `score_sa` at 0.230.
+* **σ** — it reaches IMPMAP's 0.18 by iteration 5 and stays there.
+* **The single-draw Jensen bias** — `score_sa`, which has no Jensen term, drifts
+  too (the table above).
+* **Declaration order** — `ETA_RUV` declared after the FREM block: 0.080.
+
+The same data without the FREM covariate rows (the PK block of 3 plus
+`ETA_RUV`, same schedule) shows no defect to fix: `bobyqa` undamped 0.242,
+`score_sa` 0.401, the 0.03 hold 0.359, and from a 0.2 start 0.229 (hold) and
+0.247 (`score_sa`) all score between −2276.8 and −2272.0 (MC SE 1.0–2.5) —
+`TVFRD1` is barely identified there, and no SAEM variant is distinguishable from
+another. What remains of #1421 is therefore the interaction of FREM's
+covariate rows with `iiv_on_ruv`, and the hold stays the default for it.
+
+#### The FOCEI objective cannot rank `iiv_on_ruv` fits
+
+#1415 ranked the reprex's drifted and held points by the FOCEI objective at
+each (47 units apart). That objective is not reliable at `ω_RUV ≈ 0.3`. On a
+covariate-conditional twin of the reprex — the FREM block replaced by the
+regression of the PK etas on the covariates implied by IMPMAP's Ω, so the
+covariates enter as fixed effects and IS needs no Rao-Blackwellisation — the
+FOCEI objective sits ~440 units from the IS −2 log L at every point, and it
+carries a slope in `TVFRD1` that the marginal likelihood does not. Moving
+`TVFRD1` alone at the IMPMAP point:
+
+| `TVFRD1` | FOCEI objective | IS −2 log L (K = 20000) |
+|---:|---:|---:|
+| 0.18 | −1950.7 | −2394.6 ± 1.4 |
+| 0.28 | −1961.4 | −2396.8 ± 1.2 |
+| 0.35 | −1965.9 | −2394.1 ± 1.2 |
+
+FOCEI prefers the larger value by 15 units; IS is flat to within its noise. At
+the fitted points the two disagree on the *sign*: FOCEI puts the `score_sa` fit
+(0.184) 13.5 units behind IMPMAP's (0.279), IS puts it 3.2 ± 2.4 ahead. The
+same holds for a FOCEI *fit*: on the no-FREM model above it estimates
+`TVFRD1` 0.413 but `ω_RUV` 0.058 against SAEM's 0.28, and scores 124–129 units
+worse than every SAEM point on the IS −2 log L (−2148.2 ± 0.2). Rank `iiv_on_ruv` fits by IS, as the
+next section recommends for SAEM in general.
 
 ### Comparing a SAEM fit to FOCEI: read the importance-sampled objective
 
