@@ -314,6 +314,23 @@ impl EngineError {
         }
     }
 
+    /// An error with no diagnostic: [`code`](Self::code) is `None`.
+    ///
+    /// Right only for a failure `ferx check` has no code for: a runtime, IO or
+    /// internal failure, or a refusal no code exists for yet. A refusal some
+    /// helper already codes goes through that helper's [`Diagnostic`] instead.
+    /// There is deliberately no `From<String>` (#1775): a `?` on a `String`
+    /// helper would otherwise drop a code silently. Every call site is listed in
+    /// `UNCODED_SITES` (the test module below) with its reason.
+    pub(crate) fn uncoded(message: impl Into<String>) -> Self {
+        EngineError {
+            diagnostic: None,
+            message: message.into(),
+            context: None,
+            suggestion_in_display: false,
+        }
+    }
+
     /// This error, attributed to the entry point `context` (e.g. `"run_sir"`).
     pub(crate) fn in_context(mut self, context: impl Into<String>) -> Self {
         self.context = Some(context.into());
@@ -372,25 +389,6 @@ impl std::fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<String> for EngineError {
-    fn from(message: String) -> Self {
-        EngineError {
-            diagnostic: None,
-            message,
-            context: None,
-            suggestion_in_display: false,
-        }
-    }
-}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<&str> for EngineError {
-    fn from(message: &str) -> Self {
-        message.to_string().into()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -455,7 +453,7 @@ mod tests {
         assert_eq!(err.context(), None);
         assert_eq!(err.to_string(), "second is the error");
 
-        let plain = EngineError::from("no diagnostic here".to_string());
+        let plain = EngineError::uncoded("no diagnostic here");
         assert!(plain.diagnostic().is_none());
         assert_eq!(plain.code(), None);
         assert_eq!(plain.to_string(), "no diagnostic here");
@@ -506,3 +504,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "diagnostics_uncoded_sites.rs"]
+mod uncoded_sites;

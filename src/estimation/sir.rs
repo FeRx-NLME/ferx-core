@@ -7,6 +7,7 @@
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
 
+use crate::diagnostics::EngineError;
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
@@ -916,7 +917,8 @@ pub(crate) fn run_sir_core_coded(
             ofv_hat,
             options,
         )
-    })?
+    })
+    .map_err(EngineError::uncoded)?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -963,19 +965,17 @@ fn run_sir_in_box(
     // mismatch is a caller error, refused here rather than panicking in `mixture_ofv`.
     match (model.mixture.is_some(), params.mixture.is_some()) {
         (true, false) => {
-            return Err(
+            return Err(EngineError::uncoded(
                 "run_sir_core: the model declares [mixture] but the parameters carry \
                  no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
-                 fitted_params_from_result or pass the fit's own parameters."
-                    .to_string()
-                    .into(),
-            )
+                 fitted_params_from_result or pass the fit's own parameters.",
+            ))
         }
         (false, true) => {
-            return Err("run_sir_core: the parameters carry per-class Ω/Σ \
-                 (ModelParameters::mixture) but the model declares no [mixture]."
-                .to_string()
-                .into())
+            return Err(EngineError::uncoded(
+                "run_sir_core: the parameters carry per-class Ω/Σ \
+                 (ModelParameters::mixture) but the model declares no [mixture].",
+            ))
         }
         _ => {}
     }
@@ -1056,7 +1056,8 @@ fn run_sir_in_box(
     // likelihood and can be resampled. The proposal lives on the draw scale
     // `y`; the samples are stored, bounds-checked and scored on the packed
     // scale `x`, and the weights carry `|dx/dy|` so the target is unchanged.
-    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)?;
+    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)
+        .map_err(EngineError::uncoded)?;
     let draw_bounds = bounds_to_draw_scale(&bounds, &logit_coords);
     let log_jac_hat = log_abs_jacobian(&x_hat, &logit_coords);
 
@@ -1095,7 +1096,8 @@ fn run_sir_in_box(
         })
         .collect();
     let sd_caps = proposal_sd_caps(&y_hat, &draw_bounds, &free_idx, options.sir_df);
-    let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names)?;
+    let conditioned =
+        condition_free_proposal(&sub_cov, &sd_caps, &free_names).map_err(EngineError::uncoded)?;
     if options.verbose {
         for w in conditioned.warnings() {
             eprintln!("  SIR: {w}");
@@ -1239,7 +1241,11 @@ fn run_sir_in_box(
         .fold(f64::NEG_INFINITY, f64::max);
 
     if max_log_w == f64::NEG_INFINITY {
-        return Err(all_invalid_weights_message(&outcomes, &coord_names, &conditioned).into());
+        return Err(EngineError::uncoded(all_invalid_weights_message(
+            &outcomes,
+            &coord_names,
+            &conditioned,
+        )));
     }
 
     let weights: Vec<f64> = log_weights
@@ -1307,7 +1313,7 @@ fn run_sir_in_box(
 
     // Step 3: Resample with replacement proportional to weights
     let weighted_dist = WeightedIndex::new(&weights)
-        .map_err(|e| format!("Failed to build weighted sampler: {}", e))?;
+        .map_err(|e| EngineError::uncoded(format!("Failed to build weighted sampler: {}", e)))?;
     let resampled_indices: Vec<usize> = (0..n_resamples)
         .map(|_| weighted_dist.sample(&mut rng))
         .collect();

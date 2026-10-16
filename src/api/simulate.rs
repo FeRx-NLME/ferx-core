@@ -794,12 +794,11 @@ pub fn simulate_with_options_diag(
         .enumerate()
         .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
     {
-        return Err(format!(
+        return Err(EngineError::uncoded(format!(
             "propensity-score matching: the posthoc eta for subject '{}' is \
              non-finite (its EBE did not converge); cannot match",
             population.subjects[i].id
-        )
-        .into());
+        )));
     }
 
     let omega_inv = &params.omega.inv;
@@ -1463,7 +1462,8 @@ pub fn simulate_with_uncertainty_diag(
         opts.n_uncertainty_draws,
         opts.method,
         &mut rng,
-    )?;
+    )
+    .map_err(EngineError::uncoded)?;
 
     // Final size is deterministic, so we can size the buffer once and avoid
     // repeated reallocations for large simulations.

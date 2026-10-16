@@ -654,7 +654,9 @@ where
                 opts.max_decisions,
                 Some(&assay),
             )
-            .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
+            .map_err(|e| {
+                EngineError::uncoded(format!("subject '{}' (sim {sim}): {e}", subject.id))
+            })?;
 
             if opts.verify {
                 // #748: the frozen-replay verifier below reuses the *same* precomputed
@@ -678,10 +680,10 @@ where
                     event_pk,
                 )
                 .map_err(|e| {
-                    format!(
+                    EngineError::uncoded(format!(
                         "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
-                    )
+                    ))
                 })?;
 
                 crate::ode::verify_adaptive_frozen_replay(
@@ -697,10 +699,10 @@ where
                     &run,
                 )
                 .map_err(|e| {
-                    format!(
+                    EngineError::uncoded(format!(
                         "frozen-schedule replay verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
-                    )
+                    ))
                 })?;
             }
 
