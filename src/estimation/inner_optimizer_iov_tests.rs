@@ -4453,3 +4453,32 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
          (max |g| {gmax:e})"
     );
 }
+
+/// #1082 PR2: a model with nested levels names them as its finite-difference reason, ahead
+/// of any per-subject cause; the same model with one level does not.
+#[test]
+fn a_nested_model_names_its_levels_as_the_fd_reason() {
+    let src = "[parameters]\n  theta T(1.0)\n  omega E ~ 0.1\n  level A by STUDY in ID\n  \
+               level B by ARM in A\n  kappa KA ~ 0.2 at A\n  kappa KB ~ 0.3 at B\n  \
+               sigma S ~ 0.1\n[individual_parameters]\n  P = T * exp(E + KA + KB)\n\
+               [structural_model]\n  y = P\n[error_model]\n  DV ~ additive(S)\n";
+    let nested = crate::parser::model_parser::parse_model_string(src).unwrap();
+    let one = crate::parser::model_parser::parse_model_string(
+        &src.replace("  level B by ARM in A\n", "")
+            .replace("at B", "at A"),
+    )
+    .unwrap();
+    let subject = Subject {
+        obs_times: vec![1.0],
+        observations: vec![1.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        occasions: vec![1],
+        ..Default::default()
+    };
+    assert_eq!(
+        iov_fd_reason(&nested, &subject),
+        "nested variability levels"
+    );
+    assert_ne!(iov_fd_reason(&one, &subject), "nested variability levels");
+}

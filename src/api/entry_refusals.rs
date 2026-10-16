@@ -42,6 +42,21 @@ pub(crate) fn observe_covariate_missing(message: impl Into<String>) -> EngineErr
     )
 }
 
+/// `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: a model with nested levels (more than one
+/// `level`, #1082) reached a `simulate*` or adaptive entry point, which draw one κ per
+/// occasion and have no per-level draw yet.
+pub(crate) fn nested_level_simulate_unsupported() -> EngineError {
+    coded(
+        "E_NESTED_LEVEL_SIMULATE_UNSUPPORTED",
+        Some("parameters"),
+        "simulation does not yet support nested levels (more than one `level`): it draws \
+         one kappa per occasion, and a kappa at an outer level must be drawn once per group \
+         and shared by the groups inside it. Fit the model; simulate from it in a later \
+         release."
+            .to_string(),
+    )
+}
+
 /// `E_CTMM_UNSUPPORTED`: a `[markov_model]` endpoint reached `predict*` / `simulate*`,
 /// which have no state-occupancy path yet (#759, #820).
 #[cfg(feature = "markov")]

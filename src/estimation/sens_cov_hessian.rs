@@ -445,6 +445,10 @@ pub(crate) fn covariance_sensitivities(
     theta: &[f64],
     b: &[f64],
 ) -> Option<SubjectSens> {
+    // Nested levels (#1082): the covariance step finite-differences the objective.
+    if model.has_nested_levels() {
+        return None;
+    }
     if model.n_kappa > 0 {
         crate::sens::provider::subject_sensitivities_cov_iov(model, subject, theta, b)
     } else {
@@ -468,6 +472,10 @@ fn iov_stack(
     params: &ModelParameters,
     b: &[f64],
 ) -> Option<Option<IovStack>> {
+    // Nested levels (#1082): the stacked prior below is the one-level one; decline.
+    if model.has_nested_levels() {
+        return None;
+    }
     if model.n_kappa == 0 {
         if params.omega_iov.is_some() {
             return None;
