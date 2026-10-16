@@ -10,8 +10,11 @@
 //! profile). The canonical nonlinear Emax showcase lives in
 //! `examples/emax_pkpd.ferx`.
 
-use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
-use ferx_core::types::{DoseEvent, ErrorSpec, Population, SigmaType};
+use ferx_core::parser::model_parser::{
+    parse_full_model_file, parse_model_file, parse_model_string,
+};
+use ferx_core::sens::provider::analytic_outer_gradient_available;
+use ferx_core::types::{DoseEvent, ErrorSpec, GradientMethod, Population, SigmaType};
 use ferx_core::{fit, predict, EstimationMethod, FitOptions};
 use std::path::Path;
 
@@ -220,4 +223,25 @@ fn emax_example_parses_to_per_cmt_error_spec() {
         }
         other => panic!("expected PerCmt error spec, got {other:?}"),
     }
+}
+
+/// #1625: the Emax showcase must stay on the analytic route. It once forced
+/// `gradient = fd` with a stale "required" note; FD made `optimizer = auto`
+/// resolve to BOBYQA, which stopped 3–11 OFV short in the PD parameters. Both
+/// halves are pinned: the file must not opt out, and the per-CMT Form C readout
+/// must actually be in analytic scope (so dropping the line is not a no-op).
+#[test]
+fn emax_example_takes_the_analytic_gradient_route() {
+    let parsed = parse_full_model_file(Path::new("examples/emax_pkpd.ferx"))
+        .expect("emax_pkpd example must parse");
+    assert_ne!(
+        parsed.fit_options.gradient_method,
+        GradientMethod::Fd,
+        "examples/emax_pkpd.ferx forces gradient = fd; its readouts are analytic (#1625)"
+    );
+    assert_ne!(parsed.model.gradient_method, GradientMethod::Fd);
+    assert!(
+        analytic_outer_gradient_available(&parsed.model),
+        "the per-CMT Form C readout fell out of analytic outer scope"
+    );
 }

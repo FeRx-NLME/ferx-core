@@ -8,9 +8,10 @@
 # endpoints contribute to one joint FOCEI likelihood — the gold-standard
 # alternative to the sequential (PK-then-PD) workaround.
 #
-# Per-CMT error models are ODE-only (the residual dispatch lives in the
-# FD-differenced likelihood path). `gradient = fd` is required here because
-# the PD readout uses a Form C `y[CMT=N] = <expr>` readout.
+# Both per-CMT readouts are differentiated analytically (#439), so the
+# default `gradient = auto` route serves this model. Forcing `gradient = fd`
+# makes `optimizer = auto` fall back to BOBYQA, which stops short in the PD
+# parameters (#1625).
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)
@@ -58,4 +59,3 @@
   method     = focei
   maxiter    = 500
   covariance = true
-  gradient   = fd                         # required: per-CMT / Form C readout
