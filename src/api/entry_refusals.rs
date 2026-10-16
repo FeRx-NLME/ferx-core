@@ -100,7 +100,9 @@ pub(crate) fn propensity_input(message: impl Into<String>) -> EngineError {
 /// `E_ADAPTIVE_UNSUPPORTED`: a model the adaptive-dosing driver cannot simulate
 /// faithfully — no `[odes]` block, an SDE, a covariate-selected `[error_model]`, a
 /// residual `correlation` line — or an `auc_target` on a subject whose exposure metric
-/// it cannot integrate exactly. `block` is the block at fault, when one is.
+/// it cannot integrate exactly. Once the driver runs (#1983): a base regimen it cannot
+/// replay under a time-varying covariate or IOV, a non-finite break time, or a dose
+/// clock the RHS reads before any dose. `block` is the block at fault, when one is.
 pub(crate) fn adaptive_unsupported(block: Option<&str>, message: impl Into<String>) -> EngineError {
     EngineError::from_diagnostic(adaptive_unsupported_diag(block, message))
 }
@@ -114,14 +116,44 @@ pub(crate) fn adaptive_unsupported_diag(
 }
 
 /// `E_ADAPTIVE_OPTIONS`: `AdaptiveSimulateOptions` that give no usable schedule — an
-/// empty or not finite and strictly increasing `decision_times` — or that set
-/// `decision_times` / `monitors` where the `[adaptive_dosing]` spec already owns them.
+/// empty or not finite and strictly increasing `decision_times`, more decisions than
+/// `max_decisions`, or one the driver cannot key against a subject's own break times
+/// (#1983) — monitors it cannot read, or that set `decision_times` / `monitors` where
+/// the `[adaptive_dosing]` spec already owns them.
 pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
     coded("E_ADAPTIVE_OPTIONS", None, message.into())
 }
 
+/// `E_ADAPTIVE_CONTROLLER_ACTION`: a controller returned an action the driver refuses —
+/// a dose with a non-finite or negative amount, a rate that is not positive and finite,
+/// compartment 0 or one past the model's states, a compartment fed by an input-rate
+/// function or carrying a lag, or a `Stop` with actions after it (#1983). The
+/// controller is the caller's code, so this is an input refusal, although it depends on
+/// the simulated state and `ferx check` cannot see it. `simulate_adaptive` only: on
+/// `simulate_adaptive_from_spec` the controller is compiled from the spec's `route`, so
+/// the same refusal is [`adaptive_spec`].
+pub(crate) fn adaptive_controller_action(message: impl Into<String>) -> EngineError {
+    coded("E_ADAPTIVE_CONTROLLER_ACTION", None, message.into())
+}
+
+/// A refusal of the reactive driver (`ode_predictions_adaptive_impl`) as the code its
+/// kind names (#1983). Its runtime failures carry no code and do not come here.
+pub(crate) fn adaptive_driver_refusal(
+    kind: crate::ode::AdaptiveRefusalKind,
+    message: String,
+) -> EngineError {
+    use crate::ode::AdaptiveRefusalKind as K;
+    match kind {
+        K::Options => adaptive_options(message),
+        K::Unsupported => adaptive_unsupported(None, message),
+        K::ControllerAction => adaptive_controller_action(message),
+    }
+}
+
 /// `E_ADAPTIVE_SPEC`: an `[adaptive_dosing]` spec that does not compile against the
-/// model — an invariant the block parser checks, an `assay_cmt` out of range, or an
+/// model — an invariant the block parser checks, an `assay_cmt` out of range or with no
+/// `[error_model]` to draw its assay from (#1983), a `route` compartment out of range or
+/// fed by an input-rate function, a `route` dose the driver refuses (#1983), or an
 /// `observe` expression that does not compile.
 pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
     diag("E_ADAPTIVE_SPEC", Some("adaptive_dosing"), message.into())

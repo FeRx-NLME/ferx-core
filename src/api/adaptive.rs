@@ -337,7 +337,86 @@ where
         // `auc_target_attainment` is left unreported.
         None,
         opts,
+        AdaptiveEntry::Programmatic,
     )
+}
+
+/// The entry point a run came through. Each words and codes the refusals of its own
+/// inputs: `opts` and the caller's controller on [`simulate_adaptive`], the
+/// `[adaptive_dosing]` spec — which the controller is compiled from — on
+/// [`simulate_adaptive_from_spec`] (#1983).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptiveEntry {
+    Programmatic,
+    /// `route_cmt` is the compartment the spec's `route` doses into.
+    Spec {
+        route_cmt: usize,
+    },
+}
+
+impl AdaptiveEntry {
+    /// A `Dv` monitor on a compartment no `[error_model]` covers: an option on one entry,
+    /// `assay_cmt` on the other.
+    fn dv_without_error_model(self, m: &crate::sim::adaptive::MonitorSpec) -> EngineError {
+        match self {
+            AdaptiveEntry::Programmatic => super::entry_refusals::adaptive_options(format!(
+                "monitor '{}' requests DV observation on compartment {} but no [error_model] \
+                 defines residual error there",
+                m.name, m.cmt
+            )),
+            // Under `with_assay_error` the one monitor reads `assay_cmt`.
+            AdaptiveEntry::Spec { .. } => spec_refusal(format!(
+                "[adaptive_dosing]: `with_assay_error = true` draws the assay from the \
+                 [error_model] of assay_cmt = {}, but no [error_model] defines residual error \
+                 there",
+                m.cmt
+            )),
+        }
+    }
+
+    /// A refusal of the reactive driver, as its kind's code — except a refused action on
+    /// the spec path, where the controller is compiled from the spec's `route`, so the
+    /// input at fault is the spec (`E_ADAPTIVE_SPEC`), not a caller's controller.
+    fn driver_refusal(self, kind: crate::ode::AdaptiveRefusalKind, message: String) -> EngineError {
+        match (self, kind) {
+            (AdaptiveEntry::Spec { .. }, crate::ode::AdaptiveRefusalKind::ControllerAction) => {
+                spec_refusal(message)
+            }
+            _ => super::entry_refusals::adaptive_driver_refusal(kind, message),
+        }
+    }
+
+    /// The spec's `route` compartment, refused before any subject runs where the model
+    /// alone decides it (#1983 review, finding 1): out of range, or fed by a built-in
+    /// input-rate function — the driver's own checks on a controller's dose. A dose lag on
+    /// it depends on the drawn parameters, so the driver keeps that one, coded by
+    /// [`driver_refusal`](Self::driver_refusal) as the spec's too. `None` off the spec path.
+    fn route_refusal(self, ode: &crate::ode::OdeSpec) -> Option<EngineError> {
+        let AdaptiveEntry::Spec { route_cmt } = self else {
+            return None;
+        };
+        if route_cmt == 0 || route_cmt > ode.n_states {
+            return Some(spec_refusal(format!(
+                "[adaptive_dosing]: route cmt = {route_cmt} is out of range (model has {} \
+                 compartment(s))",
+                ode.n_states
+            )));
+        }
+        if crate::ode::input_rate_consumes_cmt(ode, route_cmt) {
+            return Some(spec_refusal(format!(
+                "[adaptive_dosing]: route cmt = {route_cmt} is fed by a built-in input-rate \
+                 (absorption) function; the controller cannot dose into an input-rate \
+                 compartment"
+            )));
+        }
+        None
+    }
+}
+
+/// `E_ADAPTIVE_SPEC` (block `adaptive_dosing`) in `simulate_adaptive_from_spec`'s context.
+fn spec_refusal(message: String) -> EngineError {
+    EngineError::from_diagnostic(super::entry_refusals::adaptive_spec(message))
+        .in_context("simulate_adaptive_from_spec")
 }
 
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
@@ -368,6 +447,7 @@ fn run_adaptive_population<F, C>(
     target_window: Option<(f64, f64)>,
     auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
+    entry: AdaptiveEntry,
 ) -> Result<AdaptiveSimulationResult, EngineError>
 where
     F: Fn() -> C,
@@ -489,6 +569,75 @@ where
              other outputs remain per-event / per-occasion / reset aware), or track \
              #700/#701/#716 for a per-event, reset-node-aware AUC.",
         ));
+    }
+
+    // The driver's refusals that are a function of the inputs alone (#1983): checked here,
+    // before any subject is simulated, rather than on the first subject the driver reaches.
+    // Within one subject, in the order the driver checked them; but base × reset now runs
+    // over every subject before `max_decisions` and the monitor checks, so on an input with
+    // two of these faults the one reported first can differ from the driver's.
+    //
+    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
+    // supported on the constant-covariate path (the controller augments it), on the time-
+    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
+    // base dose's F resolved from its own occasion-κ / covariate snapshot in the driver). Since
+    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
+    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
+    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
+    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
+    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
+    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
+    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
+    //
+    // Base × reset UNDER a time-varying covariate or IOV stays a typed error: the
+    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
+    // composition with a base regimen across a reset is not yet oracle-verified against the
+    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
+    // "Time-varying or IOV" is the driver's `tv` — `event_pk` is `Some` — decided by the
+    // same two predicates the loop below uses to build `event_pk`.
+    for subject in &population.subjects {
+        let tv = model.n_kappa > 0 || crate::pk::subject_needs_per_event_pk(model, subject);
+        if !subject.doses.is_empty() && subject.has_resets() && tv {
+            return Err(super::entry_refusals::adaptive_unsupported(
+                None,
+                format!(
+                    "subject '{}': a pre-scheduled base regimen combined with system resets \
+                     (EVID=3/4) is not yet supported under time-varying covariates or \
+                     inter-occasion variability; #932 supports base × reset on the \
+                     constant-covariate path only (time-varying-covariate / IOV base × reset is \
+                     a follow-up)",
+                    subject.id
+                ),
+            ));
+        }
+    }
+    if decision_times.len() > opts.max_decisions {
+        return Err(super::entry_refusals::adaptive_options(format!(
+            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
+             raise `max_decisions` in the simulate options if the schedule is intentional",
+            decision_times.len(),
+            opts.max_decisions
+        )));
+    }
+    for am in monitors {
+        let m = am.spec;
+        if m.cmt == 0 || m.cmt > ode.n_states {
+            return Err(super::entry_refusals::adaptive_options(format!(
+                "monitor '{}' observes compartment {} but the model has {} state(s)",
+                m.name, m.cmt, ode.n_states
+            )));
+        }
+        // S1.5 edge (a): a `Dv` monitor reads σ off the `[error_model]` of its compartment;
+        // with none there it is a typed error, never a guessed σ. The predicate is the one
+        // `assay_resid_var` applies when the driver draws the assay.
+        if m.mode == crate::sim::adaptive::ObserveMode::Dv
+            && !model.has_residual_error_for_cmt(m.cmt, &params.sigma.values)
+        {
+            return Err(entry.dv_without_error_model(m));
+        }
+    }
+    if let Some(e) = entry.route_refusal(ode) {
+        return Err(e);
     }
 
     // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
@@ -642,6 +791,7 @@ where
 
             // A fresh controller per (subject, replicate) — see the factory note.
             let mut controller = make_controller();
+            // A refusal carries the code of its kind; a runtime failure carries none (#1983).
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive_impl(
                 ode,
                 &pk.values,
@@ -657,7 +807,15 @@ where
                 opts.max_decisions,
                 Some(&assay),
             )
-            .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
+            .map_err(|e| match e {
+                crate::ode::AdaptiveDriverError::Refusal { kind, message } => entry.driver_refusal(
+                    kind,
+                    format!("subject '{}' (sim {sim}): {message}", subject.id),
+                ),
+                crate::ode::AdaptiveDriverError::Runtime(message) => {
+                    EngineError::from(format!("subject '{}' (sim {sim}): {message}", subject.id))
+                }
+            })?;
 
             if opts.verify {
                 // #748: the frozen-replay verifier below reuses the *same* precomputed
@@ -681,10 +839,10 @@ where
                     event_pk,
                 )
                 .map_err(|e| {
-                    format!(
+                    EngineError::from(format!(
                         "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
-                    )
+                    ))
                 })?;
 
                 crate::ode::verify_adaptive_frozen_replay(
@@ -700,10 +858,10 @@ where
                     &run,
                 )
                 .map_err(|e| {
-                    format!(
+                    EngineError::from(format!(
                         "frozen-schedule replay verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
-                    )
+                    ))
                 })?;
             }
 
@@ -1301,5 +1459,11 @@ pub fn simulate_adaptive_from_spec(
         // metrics-only); `Some` here is what turns on the signal-AUC pass.
         spec.auc_target,
         opts,
+        AdaptiveEntry::Spec {
+            route_cmt: match spec.route {
+                crate::sim::adaptive::AdaptiveRoute::Bolus { cmt }
+                | crate::sim::adaptive::AdaptiveRoute::Infuse { cmt, .. } => cmt,
+            },
+        },
     )
 }
