@@ -21,6 +21,7 @@ use std::ops::Range;
 
 use nalgebra::DMatrix;
 
+use crate::stats::nested_levels::NestedLayout;
 use crate::types::{CompiledModel, Subject};
 
 /// The stacked-vector index of κ block `g`'s first entry. The one place the offset is
@@ -84,6 +85,9 @@ pub(crate) struct StackedLayout {
     /// `(occasion label, observation indices)` per group, in stacked order.
     groups: Vec<(u32, Vec<usize>)>,
     occ_to_group: HashMap<u32, usize>,
+    /// The derivative axes of a model with nested levels (#1082 PR3), set only by
+    /// [`Self::sens_of`]. See the *axes* methods below.
+    nested: Option<NestedLayout>,
 }
 
 impl StackedLayout {
@@ -96,12 +100,108 @@ impl StackedLayout {
             n_kappa,
             groups,
             occ_to_group,
+            nested: None,
         }
     }
 
     /// The layout of `subject` under `model`'s `n_eta` / `n_kappa`.
     pub(crate) fn of(model: &CompiledModel, subject: &Subject) -> Self {
         Self::new(model.n_eta, model.n_kappa, subject)
+    }
+
+    /// The layout the sensitivity walks and their assemblies differentiate over (#1082
+    /// PR3): [`Self::of`], plus — for a model with nested levels — the compact axes.
+    ///
+    /// Under nested levels the groups are the level **cells** (`assign_level_cells`), and
+    /// the stacked vector `[η, κ_cell0, κ_cell1, …]` is an expansion of the compact
+    /// `[η, level blocks…]` the subject is integrated over: two arms of one study read the
+    /// same study κ. The values a walk reads stay per cell — every reader of the stacked
+    /// vector is unchanged — but each κ is **seeded on its compact axis**
+    /// ([`Self::kappa_axis`]), so the shared study κ's two cells land on one axis and the
+    /// jet is `∂f/∂(compact)` directly. Without nested levels the axes are the stacked
+    /// indices, and every method below is the one-level formula.
+    ///
+    /// `None` for a nested model whose subject was never given its cells
+    /// ([`crate::stats::nested_levels::unprepared`]): its axes are unknown, and laying the
+    /// jet out per cell would integrate κ per cell — a one-level model in disguise.
+    pub(crate) fn sens_of(model: &CompiledModel, subject: &Subject) -> Option<Self> {
+        let mut layout = Self::of(model, subject);
+        if model.has_nested_levels() {
+            layout.nested = Some(NestedLayout::of(model, subject)?);
+        }
+        Some(layout)
+    }
+
+    /// Number of derivative axes: the compact width under nested levels, else
+    /// [`Self::n_stacked`].
+    pub(crate) fn n_axes(&self) -> usize {
+        match &self.nested {
+            Some(n) => n.n_compact(),
+            None => self.n_stacked(),
+        }
+    }
+
+    /// The axis group `g`'s κ `k` is seeded on: its compact index under nested levels,
+    /// else `kappa_offset(g) + k`.
+    #[inline]
+    pub(crate) fn kappa_axis(&self, g: usize, k: usize) -> usize {
+        match &self.nested {
+            Some(n) => n.compact_index(g, k),
+            None => self.kappa_offset(g) + k,
+        }
+    }
+
+    /// The stacked vector `stacked` (per group) in the axis basis: compacted under nested
+    /// levels, a copy otherwise. `None` when `stacked` is not this subject's width.
+    pub(crate) fn to_axes(&self, stacked: &[f64]) -> Option<Vec<f64>> {
+        if stacked.len() != self.n_stacked() {
+            return None;
+        }
+        match &self.nested {
+            Some(n) => {
+                let cells: Vec<&[f64]> = (0..self.n_groups())
+                    .map(|g| self.kappa(stacked, g))
+                    .collect();
+                n.compact(&stacked[..self.n_eta], &cells)
+            }
+            None => Some(stacked.to_vec()),
+        }
+    }
+
+    /// `a ⊕ (κ blocks of b)` over the axes: [`block_diag_stack`] without nested levels,
+    /// the compact `a ⊕_L (I_{G_L} ⊗ b_L)` with them. Serves the prior covariance
+    /// (`Ω`, `Ω_iov`), its Cholesky factor and its precision, which share the structure
+    /// (no `block_kappa` spans two levels, so each is block-diagonal by level).
+    pub(crate) fn axes_block_diag(&self, a: &DMatrix<f64>, b: &DMatrix<f64>) -> DMatrix<f64> {
+        match &self.nested {
+            Some(n) => n.prior(a, b),
+            None => block_diag_stack(a, b, self.n_groups()),
+        }
+    }
+
+    /// Every axis pair `(row, col)` at which `Ω_iov[(i, j)]` appears in the axes prior,
+    /// in group order: once per group, or — under nested levels — once per group of the
+    /// level both κs live at, and nowhere when they live at two levels (a structural
+    /// zero). The Ω_iov gradient is the sum of the prior gradient over these pairs.
+    pub(crate) fn iov_entry_axes(&self, i: usize, j: usize) -> Vec<(usize, usize)> {
+        match &self.nested {
+            Some(n) => n.iov_entry_axes(i, j),
+            None => (0..self.n_groups())
+                .map(|g| (self.kappa_offset(g) + i, self.kappa_offset(g) + j))
+                .collect(),
+        }
+    }
+
+    /// The κ blocks of the axes, as `(model κ indices, first axis)`: each block is
+    /// contiguous and carries those κs in order. One per group without nested levels;
+    /// one per group of each level with them.
+    pub(crate) fn kappa_blocks(&self) -> Vec<(Vec<usize>, usize)> {
+        match &self.nested {
+            Some(n) => n.kappa_blocks(),
+            None => (0..self.n_groups())
+                .map(|g| ((0..self.n_kappa).collect(), self.kappa_offset(g)))
+                .collect(),
+        }
     }
 
     /// Width of one κ block.

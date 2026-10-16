@@ -23,14 +23,17 @@
 //!
 //! ## Measured (macOS arm64)
 //!
-//! | quantity | worst \|ferx − NONMEM\| | bound |
-//! |---|---|---|
-//! | OFV | 9.869e-8 | `1e-6` (10× above) |
-//! | η̂ (sponsor), κ̂ (study, arm), 108 values | 8.479e-6 | `2e-5` (2.4× above) |
+//! | quantity | worst \|ferx − NONMEM\|, analytic (PR3) | FD route (PR2) | bound |
+//! |---|---|---|---|
+//! | OFV | 1.121e-7 | 9.869e-8 | `1e-6` (8.9× above) |
+//! | η̂ (sponsor), κ̂ (study, arm), 108 values | 8.821e-6 | 8.479e-6 | `2e-5` (2.3× above) |
 //!
-//! The engine under test is the FD route: a nested model reports finite-difference
-//! inner and outer gradients (asserted below), so the EBE search and the κ columns of
-//! the FOCEI `H` are central differences of the per-cell prediction.
+//! The engine under test is the analytic route (#1082 PR3): the compartment-free walk
+//! seeds each κ on its compact axis, so the EBE search runs on the analytic inner gradient
+//! and the outer gradient is analytic too (both asserted below, with no FD-fallback
+//! warning). The κ columns of the FOCEI `H` stay central differences of the per-cell
+//! prediction, as under one level. PR2's FD route scored the same point within the same
+//! bounds, which is the comparison the second column records.
 
 use ferx_core::api::read_population_for;
 use ferx_core::build_info::GradientMethodKind;
@@ -40,12 +43,13 @@ use std::path::Path;
 
 /// NONMEM 7.6.0 `OBJ` at the evaluated point (`results/nested_levels_3_eval.ext`, `-1000000000`).
 const NM_OFV: f64 = 107.04357106164440;
-/// Worst realised |ΔOFV| 9.869e-8 (macOS arm64); `1e-6` is 10× above it. A one-level
-/// misreading of the data (κ_study drawn per arm) moves the OFV by whole units.
+/// Worst realised |ΔOFV| 1.121e-7 on the analytic route (macOS arm64; 9.869e-8 on PR2's
+/// FD route); `1e-6` is 8.9× above it. A one-level misreading of the data (κ_study drawn
+/// per arm) moves the OFV by whole units.
 const OFV_TOL: f64 = 1e-6;
 /// Worst realised |Δ| over every η̂ and κ̂ against `.phi`'s six-significant-figure
-/// print: 8.479e-6 (macOS arm64), of which up to 5e-6 is the print's own rounding on
-/// values up to 3.2; `2e-5` is 2.4× above it.
+/// print: 8.821e-6 on the analytic route (macOS arm64; 8.479e-6 on FD), of which up to
+/// 5e-6 is the print's own rounding on values up to 3.2; `2e-5` is 2.3× above it.
 const EBE_TOL: f64 = 2e-5;
 
 const MODEL: &str = include_str!("../nonmem_anchor/nested_levels_3.ferx");
@@ -166,15 +170,21 @@ fn nested_levels_match_nonmem_exact3_at_its_optimum() {
     assert_eq!(compared, 12 * 9);
     eprintln!("worst |Δ EBE| {worst:.3e}");
 
-    // The route: every gradient of a nested model is finite-differenced until the
-    // analytic walks learn the compact layout.
+    // The route (#1082 PR3): the compartment-free walk serves the nested model on both
+    // loops, so the EBEs above were found on the analytic inner gradient, and no subject
+    // fell back to finite differences.
     assert_eq!(
         r.gradient_method_inner,
-        GradientMethodKind::FiniteDifferences.as_str()
+        GradientMethodKind::Analytic.as_str()
     );
-    assert_ne!(
+    assert_eq!(
         r.gradient_method_outer,
         GradientMethodKind::Analytic.as_str()
+    );
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("finite-difference")),
+        "{:?}",
+        r.warnings
     );
 }
 

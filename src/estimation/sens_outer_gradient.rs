@@ -35,13 +35,12 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::estimation::parameterization::{
-    block_chol_full, chol_pack, lower_tri_entries, packed_fixed_mask, rho_chain, rho_packed_start,
-    theta_packs_log, unpack_params,
+    chol_pack, lower_tri_entries, packed_fixed_mask, rho_chain, rho_packed_start, theta_packs_log,
+    unpack_params,
 };
 use crate::sens::provider::{subject_sensitivities, ObsSens, SubjectSens};
 use crate::stats::residual_error::{residual_rd, residual_rd2};
 use crate::stats::special::m3_censored_outer;
-use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::types::{CompiledModel, ModelParameters, Population, ResidualCorrelation, Subject};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -1581,17 +1580,13 @@ pub fn subject_theta_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k_groups = crate::stats::stacked_layout::group_count(subject);
-    let n_stacked = stacked_width(model.n_eta, model.n_kappa, k_groups);
-    if stacked_eta_hat.len() != n_stacked {
-        return None;
-    }
+    // The jet is over the layout's axes (the compact vector under nested levels, #1082
+    // PR3), so the assembly runs there: `b̂` in that basis, the prior over it.
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let b_hat = layout.to_axes(stacked_eta_hat)?;
+    let n_stacked = layout.n_axes();
     let omega_iov = params.omega_iov.as_ref()?;
-    let block = crate::stats::likelihood::build_block_diag_omega(
-        &params.omega.matrix,
-        &omega_iov.matrix,
-        k_groups,
-    );
+    let block = layout.axes_block_diag(&params.omega.matrix, &omega_iov.matrix);
     let omega_inv = block.cholesky()?.inverse();
     let prep = prepare_stacked(
         model,
@@ -1600,7 +1595,7 @@ pub fn subject_theta_gradient_iov(
         &sens,
         n_stacked,
         omega_inv,
-        stacked_eta_hat,
+        &b_hat,
         // IIV on residual error (#474) for IOV: the residual-eta `c̃` column rides the
         // stacked `[η_bsv, κ]` assembly (η_ruv ∈ the BSV block, so `rr < n_eta_bsv` is a
         // valid stacked index; the residual-eta loops already span all stacked axes incl.
@@ -2108,19 +2103,14 @@ pub fn subject_packed_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k = crate::stats::stacked_layout::group_count(subject);
+    // Over the layout's axes (the compact vector under nested levels, #1082 PR3).
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let b_hat = layout.to_axes(stacked_eta_hat)?;
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_stacked = stacked_width(n_eta_bsv, n_iov, k);
-    if stacked_eta_hat.len() != n_stacked {
-        return None;
-    }
+    let n_stacked = layout.n_axes();
     let omega_iov = params.omega_iov.as_ref()?;
-    let block = crate::stats::likelihood::build_block_diag_omega(
-        &params.omega.matrix,
-        &omega_iov.matrix,
-        k,
-    );
+    let block = layout.axes_block_diag(&params.omega.matrix, &omega_iov.matrix);
     let omega_inv = block.cholesky()?.inverse();
     let prep = prepare_stacked(
         model,
@@ -2129,7 +2119,7 @@ pub fn subject_packed_gradient_iov(
         &sens,
         n_stacked,
         omega_inv,
-        stacked_eta_hat,
+        &b_hat,
         // IIV on residual error (#4b): thread the residual-eta index so the production
         // packed gradient applies the `exp(2·η_ruv)` scaling and the `η_ruv` `c̃` column
         // over the stacked layout. `None` for non-`iiv_on_ruv` IOV models. (Was `None` —
@@ -2149,15 +2139,17 @@ pub fn subject_packed_gradient_iov(
     }
 
     // Ω blocks from the natural symmetric gradient over the stacked Σ_b.
-    let m_mat = natural_omega_grad_matrix(&prep, stacked_eta_hat);
+    let m_mat = natural_omega_grad_matrix(&prep, &b_hat);
     let m_bsv = m_mat.view((0, 0), (n_eta_bsv, n_eta_bsv)).into_owned();
     let bsv_packed = chol_pack(&m_bsv, &params.omega.chol, params.omega.diagonal);
-    // Sum the K diagonal IOV sub-blocks (shared κ-variance / SAME).
-    let mut m_iov = DMatrix::<f64>::zeros(n_iov, n_iov);
-    for kk in 0..k {
-        let off = kappa_offset(n_eta_bsv, n_iov, kk);
-        m_iov += m_mat.view((off, off), (n_iov, n_iov));
-    }
+    // Sum the IOV sub-blocks (shared κ-variance / SAME): every axis pair at which each
+    // `Ω_iov` entry sits in Σ_b — one per occasion group, or per group of its level.
+    let m_iov = DMatrix::<f64>::from_fn(n_iov, n_iov, |i, j| {
+        layout
+            .iov_entry_axes(i, j)
+            .into_iter()
+            .fold(0.0, |acc, (r, c)| acc + m_mat[(r, c)])
+    });
     let iov_packed = chol_pack(&m_iov, &omega_iov.chol, omega_iov.diagonal);
 
     // σ (log-σ chain).
@@ -3258,7 +3250,7 @@ fn frozen_eta_dx_assemble_iov(
     l_full: &DMatrix<f64>,
     b_hat: &[f64],
     x_len: usize,
-    k_occ: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<Vec<DVector<f64>>> {
     let n_st = b_hat.len();
     let n_theta = params.theta.len();
@@ -3294,11 +3286,8 @@ fn frozen_eta_dx_assemble_iov(
     let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut r = DVector::zeros(n_st);
-        for kk in 0..k_occ {
-            r += m_l_response(
-                kappa_offset(n_eta_bsv, n_iov, kk) + i,
-                kappa_offset(n_eta_bsv, n_iov, kk) + j,
-            );
+        for (row, col) in layout.iov_entry_axes(i, j) {
+            r += m_l_response(row, col);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         out[iov_start + e] = r * chain;
@@ -3352,19 +3341,15 @@ pub fn subject_eta_dx_iov(
     )?;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let k = crate::stats::stacked_layout::group_count(subject);
+    // Over the layout's axes (the compact vector under nested levels, #1082 PR3); the
+    // response is `db̂/dx` in that basis.
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let b_hat = layout.to_axes(stacked_eta_hat)?;
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_st = stacked_width(n_eta_bsv, n_iov, k);
-    if stacked_eta_hat.len() != n_st {
-        return None;
-    }
+    let n_st = layout.n_axes();
     let omega_iov = params.omega_iov.as_ref()?;
-    let block = crate::stats::likelihood::build_block_diag_omega(
-        &params.omega.matrix,
-        &omega_iov.matrix,
-        k,
-    );
+    let block = layout.axes_block_diag(&params.omega.matrix, &omega_iov.matrix);
     let omega_inv = block.cholesky()?.inverse();
     let prep = prepare_stacked(
         model,
@@ -3373,7 +3358,7 @@ pub fn subject_eta_dx_iov(
         &sens,
         n_st,
         omega_inv,
-        stacked_eta_hat,
+        &b_hat,
         // Thread the residual-eta index for `iiv_on_ruv` IOV models (#4b). Defensive:
         // the only consumer (`subject_packed_gradient_foce_iov`) is unreachable when
         // `interaction` is set, and `iiv_on_ruv` requires FOCEI — but keep it correct.
@@ -3406,10 +3391,10 @@ pub fn subject_eta_dx_iov(
     }
 
     // Ω coords (per Cholesky entry of Σ_b, pre-chain response).
-    let z = &prep.omega_inv * DVector::from_column_slice(stacked_eta_hat);
+    let z = &prep.omega_inv * DVector::from_column_slice(&b_hat);
     let l_bsv = &params.omega.chol;
     let l_iov = &omega_iov.chol;
-    let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
+    let l_full = layout.axes_block_diag(l_bsv, l_iov);
     let m_l_response = |row: usize, col: usize| -> DVector<f64> {
         let v = l_full.column(col).into_owned();
         let vz = v.dot(&z);
@@ -3429,11 +3414,8 @@ pub fn subject_eta_dx_iov(
     let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut resp = DVector::zeros(n_st);
-        for kk in 0..k {
-            resp += m_l_response(
-                kappa_offset(n_eta_bsv, n_iov, kk) + i,
-                kappa_offset(n_eta_bsv, n_iov, kk) + j,
-            );
+        for (row, col) in layout.iov_entry_axes(i, j) {
+            resp += m_l_response(row, col);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         out[iov_start + e] = resp * chain;
@@ -3530,18 +3512,19 @@ pub fn subject_packed_gradient_foce_iov(
     )?;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let k = crate::stats::stacked_layout::group_count(subject);
+    // The Sheiner–Beal marginal over the layout's axes — the compact vector under nested
+    // levels (#1082 PR3), where `b̂` and `Σ_b` are compact while the walks read per cell.
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let b_hat_vec = layout.to_axes(stacked_eta_hat)?;
+    let b_hat = b_hat_vec.as_slice();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
-    let n_st = stacked_width(n_eta_bsv, n_iov, k);
-    if stacked_eta_hat.len() != n_st {
-        return None;
-    }
+    let n_st = layout.n_axes();
     let n_obs = subject.observations.len();
     if n_obs == 0 {
         return None;
     }
-    let zeros = vec![0.0f64; n_st];
+    let zeros = vec![0.0f64; layout.n_stacked()];
     let sens0 =
         crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &zeros)?;
     if sens.obs.len() != n_obs || sens0.obs.len() != n_obs {
@@ -3549,11 +3532,7 @@ pub fn subject_packed_gradient_foce_iov(
     }
     let sigma = &params.sigma.values;
     let omega_iov = params.omega_iov.as_ref()?;
-    let omega_full = crate::stats::likelihood::build_block_diag_omega(
-        &params.omega.matrix,
-        &omega_iov.matrix,
-        k,
-    );
+    let omega_full = layout.axes_block_diag(&params.omega.matrix, &omega_iov.matrix);
 
     // M3 BLOQ: the censored rows leave the augmented Sheiner–Beal marginal (R̃ and the
     // quadratic form are built over the quantified rows only) and re-enter as the marginal
@@ -3614,7 +3593,7 @@ pub fn subject_packed_gradient_foce_iov(
         let mut jeta = 0.0;
         for kk in 0..n_st {
             jmat[(i, kk)] = obs.df_deta[kk];
-            jeta += obs.df_deta[kk] * stacked_eta_hat[kk];
+            jeta += obs.df_deta[kk] * b_hat[kk];
         }
         rho[i] = subject.observations[j] - (obs.f - jeta);
         let r = rows.r[j];
@@ -3647,7 +3626,7 @@ pub fn subject_packed_gradient_foce_iov(
         &sens0,
         sigma,
         &omega_full,
-        stacked_eta_hat,
+        b_hat,
         n_st,
         n_theta,
         m3,
@@ -3665,7 +3644,7 @@ pub fn subject_packed_gradient_foce_iov(
             for l in 0..n_st {
                 let bjl = obs.d2f_deta_dtheta[l * n_theta + m];
                 em[(i, l)] = bjl;
-                bjeta += bjl * stacked_eta_hat[l];
+                bjeta += bjl * b_hat[l];
             }
             qm[i] = -obs.df_dtheta[m] + bjeta;
             // ∂R⁰ᵢ/∂θₘ = d⁰ᵢ·∂f0ᵢ/∂θₘ + the magnitude's direct-θ term (#576/#486).
@@ -3689,7 +3668,7 @@ pub fn subject_packed_gradient_foce_iov(
     // `entry_grad` reads (#646).
     let l_bsv = &params.omega.chol;
     let l_iov = &omega_iov.chol;
-    let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
+    let l_full = layout.axes_block_diag(l_bsv, l_iov);
     let jl = &jmat * &l_full;
     let cjl = cg.prep_jl(&l_full); // (Jⱼ L_full) per censored row, once
     let entry_grad = |row: usize, col: usize| -> f64 {
@@ -3723,9 +3702,7 @@ pub fn subject_packed_gradient_foce_iov(
     let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut raw = 0.0;
-        for kk in 0..k {
-            let row = kappa_offset(n_eta_bsv, n_iov, kk) + i;
-            let col = kappa_offset(n_eta_bsv, n_iov, kk) + j;
+        for (row, col) in layout.iov_entry_axes(i, j) {
             raw += entry_grad(row, col) + cg.omega_entry(row, col, &cjl);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
@@ -3744,7 +3721,7 @@ pub fn subject_packed_gradient_foce_iov(
             let mut s = 0.0;
             for l in 0..n_st {
                 let a_kl = obs.d2f_deta2[kk * n_st + l];
-                s += a_kl * stacked_eta_hat[l];
+                s += a_kl * b_hat[l];
                 dk[(i, l)] = a_kl;
             }
             pk[i] = s;
@@ -3761,24 +3738,16 @@ pub fn subject_packed_gradient_foce_iov(
     // conditional response, bit-identical (the two objectives coincide there).
     let eta_dx = if model.error_spec.has_f_dependent_variance() {
         let omega_inv = omega_full.clone().cholesky()?.inverse();
-        let resp = frozen_eta_response(
-            subject,
-            m3,
-            &sens,
-            &sens0,
-            &rows,
-            &omega_inv,
-            stacked_eta_hat,
-        )?;
+        let resp = frozen_eta_response(subject, m3, &sens, &sens0, &rows, &omega_inv, b_hat)?;
         frozen_eta_dx_assemble_iov(
             &resp,
             &params,
             template,
             &omega_inv,
             &l_full,
-            stacked_eta_hat,
+            b_hat,
             x.len(),
-            k,
+            &layout,
         )?
     } else {
         subject_eta_dx_iov(model, subject, template, x, stacked_eta_hat)?

@@ -417,7 +417,7 @@ A level is not identified when every parent has at most one group of it **and** 
 
 Nested levels (more than one `level`) are estimated with `method = foce` or `focei` at `n_agq = 1`. In this release:
 
-- **Gradients are finite differences.** The fit reports `gradient_method_inner` as `finite differences`, `optimizer = auto` takes its derivative-free choice for the outer loop, and the covariance step finite-differences the objective. The analytic sensitivities follow in a later release.
+- **Gradients are analytic.** The inner and outer gradients come from the same exact sensitivity walks as one-level IOV (compartment-free, closed-form and `[odes]` models), so the fit reports `gradient_method_inner` and `gradient_method_outer` as `analytic (Dual2)` and `optimizer = auto` takes its gradient-based choice. Each kappa's derivative lands on its own group's random effect: an arm's records move the arm kappa of that arm and the study kappa of its study, which every arm of the study shares. Two cases stay on finite differences and say so: a closed-form transit or inverse-Gaussian absorption model (`pk one_cpt_transit`, …), whose IOV subjects run on an ODE twin (`gradient_method_inner` reports `finite differences`, with the reason `nested variability levels on a closed-form transit/IG model`), and the covariance step, which finite-differences the objective.
 - **Other estimators are refused** with `E_NESTED_LEVEL_METHOD_UNSUPPORTED`: SAEM, IMP, IMPMAP, Bayes, VI, Laplace and FOCEI quadrature, GN, a `[mixture]` and FREM. Each is enabled later with its own anchor. A single level is not affected.
 - **Simulation is refused** with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`, on `simulate()` and the adaptive-dosing entry points: the simulator draws one kappa per occasion, and a kappa at an outer level must be drawn once per group.
 - **A residual `correlation … by` line** is refused with `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED`.
@@ -430,8 +430,8 @@ NONMEM's exact spelling of nested levels is the IOV idiom: re-base `ID` at the c
 
 | | NONMEM 7.6.0 | ferx |
 |---|---|---|
-| OFV | 107.04357106 | 107.04357096 |
-| worst \|Δ\| over the 108 compared η̂ and κ̂ (84 distinct: each study κ̂ is read by both of its arms) | | 8.5e-6 |
+| OFV | 107.04357106 | 107.04357095 |
+| worst \|Δ\| over the 108 compared η̂ and κ̂ (84 distinct: each study κ̂ is read by both of its arms) | | 8.8e-6 |
 
 NONMEM's `$LEVEL` is a different object and is not an oracle for this: its help describes its FOCE as a linearized approximation at the super-ID level. On the same data it recovers γ² = 0.88 against a truth of 4 (the IOV-idiom coding recovers 3.76), and its covariance step aborts.
 

@@ -7533,3 +7533,172 @@ fn latch_veto_is_wired_into_the_objective() {
         result.ofv
     );
 }
+
+/// One nested fixture's analytic packed gradient (FOCEI when `interaction`, else FOCE) at
+/// its EBE, with the per-cell stacked EBE it was taken at and the stage it used.
+fn nested_packed_gradient(
+    model: &CompiledModel,
+    s: &Subject,
+    interaction: bool,
+    inner_tol: f64,
+) -> (Vec<f64>, Vec<f64>, FitOptions) {
+    use crate::estimation::inner_optimizer::find_ebe_for_stage;
+    use crate::estimation::parameterization::{pack_with_bounds, unpack_params, PackedStart};
+    let p = &model.default_params;
+    let PackedStart { packed: x, .. } = pack_with_bounds(p);
+    let stage = FitOptions {
+        method: if interaction {
+            EstimationMethod::FoceI
+        } else {
+            EstimationMethod::Foce
+        },
+        interaction,
+        inner_tol,
+        inner_maxiter: 2000,
+        ..FitOptions::default()
+    };
+    let at = unpack_params(&x, p);
+    let ebe = find_ebe_for_stage(model, s, &at, 2000, inner_tol, None, None, 0, &stage);
+    let mut stacked = ebe.eta.as_slice().to_vec();
+    for k in &ebe.kappas {
+        stacked.extend_from_slice(k.as_slice());
+    }
+    let g = if interaction {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
+            model, s, p, &x, &stacked,
+        )
+    } else {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
+            model, s, p, &x, &stacked,
+        )
+    }
+    .expect("the analytic packed gradient declined");
+    assert!(g.iter().all(|v| v.is_finite()));
+    (g, stacked, stage)
+}
+
+/// The packed block `[θ, Ω, σ, Ω_IOV]` coordinate `i` lies in, for failure messages.
+fn nested_packed_block(p: &ModelParameters, i: usize) -> &'static str {
+    let n_theta = p.theta.len();
+    let n_omega =
+        crate::estimation::parameterization::omega_packed_len(p.omega.dim(), p.omega.diagonal);
+    let ends = [
+        n_theta,
+        n_theta + n_omega,
+        n_theta + n_omega + p.sigma.values.len(),
+    ];
+    ["θ", "Ω", "σ", "Ω_IOV"][ends.iter().take_while(|&&e| i >= e).count()]
+}
+
+/// #1082 PR3: the analytic FOCEI and FOCE packed gradients of a nested-level subject —
+/// the walks' compact jets assembled over the compact prior, with each `Ω_IOV` entry
+/// summed over the groups of its own level — against the per-subject reconverged-FD
+/// gradient, which re-solves the EBE and differences the objective `pop_nll` sums. That
+/// oracle shares no assembly with the analytic path, so a per-cell prior, a study κ summed
+/// once per arm, or a lost off-diagonal of the study block reddens it.
+///
+/// Measured (macOS arm64), worst `|a − fd| / (1 + |fd|)`: algebraic FOCEI 2.9e-6, closed
+/// form FOCEI 2.5e-6 / FOCE 1.8e-6. The bound `2e-5` is 7× above the worst. The ODE
+/// fixture is the closed-form model written as `[odes]`; its reconverged-FD stencil is
+/// ODE-noise-limited (7.8e-4 on `Ω`, measured) and slow, so the ODE assembly is checked
+/// against the closed-form one instead — a computation outside both engines' FD — where
+/// they agree to 1.7e-9 (bound `1e-6`).
+#[test]
+fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::stats::nested_levels::test_helpers as fx;
+    // The oracle re-solves the EBE at every stencil point, so its error is the EBE
+    // tolerance over the step: at the default `inner_tol` it measured itself (worst 4.5e-4,
+    // on θ and σ as much as on Ω_IOV). Tighter is not free: past the tolerance BFGS can
+    // certify from a cold start, every re-solve falls back to Nelder–Mead (2–4 s each).
+    // These are the tightest that never did on this fixture (measured per stencil point).
+    const CF_TOL: f64 = 1e-8;
+    const ALG_TOL: f64 = 1e-7;
+    let (cf_model, cf_pop) = fx::prepared(&fx::closed_form(), 1);
+    let (ode_model, ode_pop) = fx::prepared(&fx::ode(), 1);
+    let (alg_model, alg_pop) = fx::prepared(&fx::algebraic(), 1);
+    for m in [&cf_model, &ode_model, &alg_model] {
+        assert!(
+            crate::sens::provider::iov_sens_supported(m)
+                && crate::sens::provider::analytic_outer_gradient_available(m),
+            "the outer gradient must be analytic"
+        );
+    }
+    assert!(ode_model.ode_spec.is_some() && cf_model.ode_spec.is_none());
+    // The algebraic model has additive error, where the FOCE and FOCEI objectives coincide
+    // (their analytic gradients agree to every printed digit), so it runs once.
+    for (label, model, s, interaction, tol) in [
+        ("algebraic", &alg_model, &alg_pop.subjects[0], true, ALG_TOL),
+        ("closed form", &cf_model, &cf_pop.subjects[0], true, CF_TOL),
+        ("closed form", &cf_model, &cf_pop.subjects[0], false, CF_TOL),
+    ] {
+        let stage_label = if interaction { "FOCEI" } else { "FOCE" };
+        {
+            let p = &model.default_params;
+            let PackedStart {
+                packed: x, bounds, ..
+            } = pack_with_bounds(p);
+            let (analytic, stacked, stage) = nested_packed_gradient(model, s, interaction, tol);
+            // A cold start (prior mode) at every stencil point: warm-started at the EBE,
+            // BFGS cannot certify `inner_tol` from a point already there and every re-solve
+            // falls back to Nelder–Mead (2.5 s each, measured), to the same mode.
+            let warm = DVector::zeros(stacked.len());
+            let fd = subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, &stage);
+            assert_eq!(analytic.len(), fd.len());
+            let mut worst = 0.0_f64;
+            for (i, (a, f)) in analytic.iter().zip(&fd).enumerate() {
+                assert!(f.is_finite(), "{label} {stage_label} x{i}");
+                let e = (a - f).abs() / (1.0 + f.abs());
+                worst = worst.max(e);
+                assert!(
+                    e < 2e-5,
+                    "{label} {stage_label}: packed x{i} ({}) analytic {a} vs reconverged FD {f}",
+                    nested_packed_block(p, i)
+                );
+            }
+            // Every free Ω_IOV coordinate must be live, or the per-level sum is untested —
+            // the study block's off-diagonal included. The cross-level entries are
+            // structural zeros (no κ pair spans two levels): exactly zero on both sides.
+            let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+            let mut free = 0;
+            for i in (0..fd.len()).filter(|&i| nested_packed_block(p, i) == "Ω_IOV") {
+                if structural[i] {
+                    assert_eq!((analytic[i], fd[i]), (0.0, 0.0), "{label} x{i}");
+                } else {
+                    free += 1;
+                    assert!(
+                        fd[i].abs() > 1e-3,
+                        "{label} {stage_label}: x{i} is not live"
+                    );
+                }
+            }
+            assert_eq!(
+                free, 4,
+                "{label}: the study pair's three entries and the arm variance"
+            );
+            eprintln!(
+                "MEASURE nested {label} {stage_label} packed gradient: worst rel {worst:.3e}"
+            );
+        }
+    }
+    for interaction in [true, false] {
+        let stage_label = if interaction { "FOCEI" } else { "FOCE" };
+        let (cf, _, _) =
+            nested_packed_gradient(&cf_model, &cf_pop.subjects[0], interaction, CF_TOL);
+        let (ode, _, _) =
+            nested_packed_gradient(&ode_model, &ode_pop.subjects[0], interaction, CF_TOL);
+        let mut worst = 0.0_f64;
+        for (i, (o, c)) in ode.iter().zip(&cf).enumerate() {
+            let e = (o - c).abs() / (1.0 + c.abs());
+            worst = worst.max(e);
+            assert!(
+                e < 1e-6,
+                "ode vs closed form {stage_label}: packed x{i} ({}) {o} vs {c}",
+                nested_packed_block(&cf_model.default_params, i)
+            );
+        }
+        eprintln!(
+            "MEASURE nested ode vs closed form {stage_label} packed gradient: worst rel {worst:.3e}"
+        );
+    }
+}
