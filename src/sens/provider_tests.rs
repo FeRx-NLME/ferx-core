@@ -14356,6 +14356,53 @@ fn iov_gate_needs_one_theta_column_beside_the_eta_kappa_block() {
     }
 }
 
+/// A program with no θ columns is one empty chunk, dispatched on `n_eff` alone: it fits the
+/// table up to `n_eff = 24` — one past the θ-seeded limit above — and is refused at 25 by the
+/// dispatch itself rather than by the `chunk_len == 0` arm. Below the cap its η block is the
+/// θ-seeded builder's bit for bit, since forward-mode axes never interact.
+#[test]
+fn iov_combined_derivs_without_theta_dispatch_on_the_eta_kappa_block() {
+    let theta = [0.2, 10.0, 1.5];
+    for (n_extra, fits) in [(19usize, true), (20, true), (21, false)] {
+        let model = parse_model_string(&warfarin_iov_extra_etas(n_extra)).expect("parse");
+        let n_eff = model.n_eta + model.n_kappa;
+        assert_eq!(
+            n_eff <= MAX_TVCOV_AXES,
+            fits,
+            "the trio must straddle the table"
+        );
+        let stacked: Vec<f64> = (0..n_eff).map(|i| 0.01 * (i as f64 + 1.0).sin()).collect();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let n_rows = prog.pk_slots_ref().len();
+        let cov = HashMap::new();
+        let free = iov_combined_derivs_dyn(prog, 0, n_eff, n_rows, &cov, &theta, &stacked);
+        assert_eq!(free.is_some(), fits, "n_eff = {n_eff}: θ-free dispatch");
+        let Some(free) = free else { continue };
+        assert!(
+            free.deta.iter().flatten().all(|x| x.is_finite())
+                && free.deta.iter().flatten().any(|x| *x != 0.0),
+            "n_eff = {n_eff}: the η block must be live and finite"
+        );
+        if n_eff < MAX_TVCOV_AXES {
+            let seeded =
+                iov_combined_derivs_dyn(prog, model.n_theta, n_eff, n_rows, &cov, &theta, &stacked)
+                    .expect("θ-seeded builder below the cap");
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for i in 0..n_rows {
+                assert_eq!(
+                    bits(&free.deta[i]),
+                    bits(&seeded.deta[i]),
+                    "n_eff = {n_eff}, row {i}: deta"
+                );
+            }
+        }
+    }
+}
+
 /// Gate ⇒ route, swept over the program width (`n_pad` 0..=27, i.e. 7..=34 axes, across
 /// the 24/25 boundary) and the stacked width (`K` = 1, 2, 4 occasions): whenever
 /// `iov_analytical_supported` admits the model, both the outer walk and the inner η route
