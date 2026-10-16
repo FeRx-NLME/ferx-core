@@ -129,7 +129,9 @@ pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
 /// compartment 0 or one past the model's states, a compartment fed by an input-rate
 /// function or carrying a lag, or a `Stop` with actions after it (#1983). The
 /// controller is the caller's code, so this is an input refusal, although it depends on
-/// the simulated state and `ferx check` cannot see it.
+/// the simulated state and `ferx check` cannot see it. `simulate_adaptive` only: on
+/// `simulate_adaptive_from_spec` the controller is compiled from the spec's `route`, so
+/// the same refusal is [`adaptive_spec`].
 pub(crate) fn adaptive_controller_action(message: impl Into<String>) -> EngineError {
     coded("E_ADAPTIVE_CONTROLLER_ACTION", None, message.into())
 }
@@ -150,8 +152,9 @@ pub(crate) fn adaptive_driver_refusal(
 
 /// `E_ADAPTIVE_SPEC`: an `[adaptive_dosing]` spec that does not compile against the
 /// model — an invariant the block parser checks, an `assay_cmt` out of range or with no
-/// `[error_model]` to draw its assay from (#1983), or an `observe` expression that does
-/// not compile.
+/// `[error_model]` to draw its assay from (#1983), a `route` compartment out of range or
+/// fed by an input-rate function, a `route` dose the driver refuses (#1983), or an
+/// `observe` expression that does not compile.
 pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
     diag("E_ADAPTIVE_SPEC", Some("adaptive_dosing"), message.into())
 }
