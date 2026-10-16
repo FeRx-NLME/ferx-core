@@ -1869,10 +1869,12 @@ pub(crate) fn iov_sens_eta_supported(model: &CompiledModel) -> bool {
 /// program's θ axes to seed `∂p/∂θ`) or the η-only one (`false`); every other clause applies
 /// to both.
 fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
-    // #1082 PR2: a model with nested levels integrates a compact vector no sensitivity
-    // walk lays out yet, so every gradient that reads one is finite-differenced. PR3 lifts
-    // this with a `Dual2`-vs-FD parity test per walk.
-    if model.has_nested_levels() {
+    // Nested levels (#1082 PR3): every walk below seeds κ on the compact axes
+    // (`StackedLayout::kappa_axis`), so they serve a nested model as they serve one level —
+    // except through the ODE twin of a closed-form transit/IG model, which is re-parsed
+    // from emitted source and so is not known to carry the levels. Such a model stays on
+    // finite differences, named by `nested_levels_outside_analytic_scope`.
+    if nested_levels_outside_analytic_scope(model) {
         return false;
     }
     // A closed-form transit/IG IOV model has two routes per subject (#1560): the absorption
@@ -1895,6 +1897,16 @@ fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> b
         || crate::sens::algebraic::supported_iov(model)
 }
 
+/// Whether a model with nested levels (#1082) lies outside the analytic IOV walks: one
+/// whose IOV subjects may be served by a closed-form transit/IG model's ODE twin
+/// (`absorption_ode_equivalent`). The twin is a separate `CompiledModel` parsed from
+/// emitted source; a walk run on it lays κ out by *its* levels, so a twin without them
+/// would seed per cell — one κ per arm where the model draws one per study. `false` for
+/// every model without nested levels.
+pub(crate) fn nested_levels_outside_analytic_scope(model: &CompiledModel) -> bool {
+    model.has_nested_levels() && model.absorption_ode_equivalent.is_some()
+}
+
 /// Light **inner** η-gradient (`∂f/∂(stacked-η)` per observation) for an IOV subject
 /// over the stacked vector `[η_bsv, κ₁..κ_K]`, or `None` when no analytic inner serves
 /// the model (caller falls back to the FD inner). Dispatches to the ODE IOV provider
@@ -1906,6 +1918,9 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    if nested_levels_outside_analytic_scope(model) {
+        return None;
+    }
     // Closed-form transit/IG IOV → the absorption walk or its ODE twin (#1560, #719); a
     // no-op otherwise. See `subject_sensitivities_iov`.
     let model = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
@@ -1951,6 +1966,11 @@ pub fn subject_sensitivities_iov(
     // here (they carry `obs_records`, so the analytic-IOV gates already decline them);
     // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
     if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return None;
+    }
+    // A nested-level model whose subjects may run on a closed-form transit/IG model's ODE
+    // twin (#1082 PR3): the twin's layout is not known to carry the levels.
+    if nested_levels_outside_analytic_scope(model) {
         return None;
     }
     // Compartment-free (#811): no walk to gate, no dose to route, no `pk_model` to
@@ -2065,7 +2085,7 @@ pub fn subject_sensitivities_iov(
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
             |M| run_obs_iov::<M>(
                 model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-                &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
+                &s.pkonly_src, &s.slot_row, s.n_eta, &s.layout, s.n_eff, s.n_stacked,
                 s.n_theta, cols, &eff_doses, &schedule, s.scale_groups.as_deref(),
                 s.bsv_amount.as_ref(), readout, into,
             )
@@ -2097,8 +2117,12 @@ struct IovSources {
     pkonly_src: Vec<usize>,
     slot_row: [Option<usize>; N_PK],
     n_eta: usize,
-    n_kappa: usize,
+    /// The subject's layout. The walks seed each κ on `layout.kappa_axis(g, k)` — the
+    /// compact axis under nested levels (#1082 PR3).
+    layout: crate::stats::stacked_layout::StackedLayout,
     n_eff: usize,
+    /// The jet's η-block width, `layout.n_axes()`; the stacked *value* vector the walk
+    /// reads is `layout.n_stacked()` wide.
     n_stacked: usize,
     n_theta: usize,
     /// For an `ExpressionScale` `obs_scale` divisor: one `(pk, combined-derivs)` per
@@ -2159,15 +2183,15 @@ fn build_iov_sources(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
 
-    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_kappa, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let k_groups = layout.n_groups();
     if k_groups == 0 {
         return None;
     }
-    let n_stacked = layout.n_stacked();
-    if stacked_eta.len() != n_stacked {
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
+    let n_stacked = layout.n_axes();
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
     let combined_for = |k: usize| layout.combined_effect(stacked_eta, k);
     // A pk-only row runs under its own occasion's group (`crate::pk::pk_only_row_occasion`,
@@ -2369,7 +2393,7 @@ fn build_iov_sources(
         pkonly_src,
         slot_row,
         n_eta,
-        n_kappa,
+        layout,
         n_eff,
         n_stacked,
         n_theta,
@@ -2428,7 +2452,7 @@ fn subject_eta_grad_iov_analytical(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
         |N| run_obs_iov_eta::<N>(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-            &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+            &s.pkonly_src, &s.slot_row, s.n_eta, &s.layout, s.n_stacked,
             s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
             readout,
         )
@@ -2479,7 +2503,7 @@ fn run_obs_iov<const M: usize>(
     pkonly_src: &[usize],
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
@@ -2502,17 +2526,16 @@ fn run_obs_iov<const M: usize>(
     // Build the `Dual2<M>` for a differentiated PK row `i` of source `cd`/`group`,
     // carrying `val` and `∂/∂(θ_chunk, stacked-η)`. The combined column `c` maps to a
     // stacked axis: η_bsv (`c < n_eta`) → shared `nc + c`; κ (`c ≥ n_eta`) →
-    // group g's block `nc + n_eta + g·n_kappa + (c−n_eta)`, or is dropped when
-    // `group` is `None` (an ungrouped pk-only event, κ fixed at 0). The θ-θ Hessian block is
-    // unused downstream (left zero).
+    // `nc + layout.kappa_axis(g, c − n_eta)` — group g's block `n_eta + g·n_kappa + …`,
+    // or under nested levels the compact axis its cell shares with the rest of its group
+    // (#1082) — or is dropped when `group` is `None` (an ungrouped pk-only event, κ fixed
+    // at 0). The θ-θ Hessian block is unused downstream (left zero).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual2<M> {
-        let kappa_base =
-            group.map(|g| nc + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
         let stacked_axis = |c: usize| -> Option<usize> {
             if c < n_eta {
                 Some(nc + c)
             } else {
-                kappa_base.map(|kb| kb + (c - n_eta))
+                group.map(|g| nc + layout.kappa_axis(g, c - n_eta))
             }
         };
         let mut grad = [0.0; M];
@@ -2880,7 +2903,7 @@ fn run_obs_iov_eta<const N: usize>(
     pkonly_src: &[usize],
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     n_stacked: usize,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
@@ -2890,16 +2913,15 @@ fn run_obs_iov_eta<const N: usize>(
     use crate::sens::propagate::PkDual;
 
     // First-order stacked-η seed (no θ axes): η_bsv column `c` → axis `c`; κ column
-    // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
-    // (an ungrouped pk-only event, κ fixed at 0).
+    // `c` (group g) → `layout.kappa_axis(g, c − n_eta)` (the compact axis under nested
+    // levels, #1082), dropped when `group` is `None` (an ungrouped pk-only event, κ fixed
+    // at 0).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual1<N> {
-        let kappa_base =
-            group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
         let stacked_axis = |c: usize| -> Option<usize> {
             if c < n_eta {
                 Some(c)
             } else {
-                kappa_base.map(|kb| kb + (c - n_eta))
+                group.map(|g| layout.kappa_axis(g, c - n_eta))
             }
         };
         let mut grad = [0.0; N];

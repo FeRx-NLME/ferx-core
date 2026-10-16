@@ -4454,20 +4454,32 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     );
 }
 
-/// #1082 PR2: a model with nested levels names them as its finite-difference reason, ahead
-/// of any per-subject cause; the same model with one level does not.
+/// #1082 PR3: the one nested model the analytic walks decline — a closed-form transit
+/// one, whose IOV subjects run on an ODE twin — names its levels as the finite-difference
+/// reason, ahead of any per-subject cause. The same model with one level, and a nested
+/// model without a twin, do not: PR2 named the levels for every nested model.
 #[test]
-fn a_nested_model_names_its_levels_as_the_fd_reason() {
-    let src = "[parameters]\n  theta T(1.0)\n  omega E ~ 0.1\n  level A by STUDY in ID\n  \
-               level B by ARM in A\n  kappa KA ~ 0.2 at A\n  kappa KB ~ 0.3 at B\n  \
-               sigma S ~ 0.1\n[individual_parameters]\n  P = T * exp(E + KA + KB)\n\
-               [structural_model]\n  y = P\n[error_model]\n  DV ~ additive(S)\n";
-    let nested = crate::parser::model_parser::parse_model_string(src).unwrap();
-    let one = crate::parser::model_parser::parse_model_string(
-        &src.replace("  level B by ARM in A\n", "")
-            .replace("at B", "at A"),
-    )
-    .unwrap();
+fn a_nested_transit_model_names_its_levels_as_the_fd_reason() {
+    const REASON: &str = "nested variability levels on a closed-form transit/IG model";
+    let parse = crate::parser::model_parser::parse_model_string;
+    let one_level = |src: &str| {
+        parse(
+            &src.replace("  level B by ARM in A\n", "")
+                .replace("at B", "at A"),
+        )
+    };
+    let algebraic = "[parameters]\n  theta T(1.0)\n  omega E ~ 0.1\n  level A by STUDY in ID\n  \
+                     level B by ARM in A\n  kappa KA ~ 0.2 at A\n  kappa KB ~ 0.3 at B\n  \
+                     sigma S ~ 0.1\n[individual_parameters]\n  P = T * exp(E + KA + KB)\n\
+                     [structural_model]\n  y = P\n[error_model]\n  DV ~ additive(S)\n";
+    let transit = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+                   theta TVMTT(3.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  \
+                   omega ETA_V ~ 0.09\n  level A by STUDY in ID\n  level B by ARM in A\n  \
+                   kappa KA ~ 0.04 at A\n  kappa KB ~ 0.09 at B\n  sigma PROP ~ 0.15 (sd)\n\
+                   [individual_parameters]\n  CL = TVCL * exp(KA)\n  V = TVV * exp(ETA_V)\n  \
+                   MTT = TVMTT * exp(KB)\n  NTR = TVN\n[structural_model]\n  \
+                   pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n[error_model]\n  \
+                   DV ~ proportional(PROP)\n";
     let subject = Subject {
         obs_times: vec![1.0],
         observations: vec![1.0],
@@ -4476,9 +4488,188 @@ fn a_nested_model_names_its_levels_as_the_fd_reason() {
         occasions: vec![1],
         ..Default::default()
     };
+    let nested_transit = parse(transit).unwrap();
+    assert!(nested_transit.has_nested_levels());
+    assert_eq!(iov_fd_reason(&nested_transit, &subject), REASON);
+    for (label, m) in [
+        ("transit, one level", one_level(transit).unwrap()),
+        ("algebraic, nested", parse(algebraic).unwrap()),
+        ("algebraic, one level", one_level(algebraic).unwrap()),
+    ] {
+        assert_ne!(iov_fd_reason(&m, &subject), REASON, "{label}");
+    }
+}
+
+/// #1082 PR3: the analytic IOV inner gradient of a nested-level model is over the compact
+/// vector the EBE search moves — data term from the walk's compact jet, prior one block per
+/// group of each level — and matches central FD of the inner objective over that vector,
+/// on each walk. A prior laid out per cell (`κ_cellᵀΩ⁻¹κ_cell` for every arm, counting a
+/// study κ once per arm) or a study block read without its off-diagonal fails here, named
+/// by axis.
+#[test]
+fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vector() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::nested_levels::NestedLayout;
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (model, pop) = fx::prepared(&src, 1);
+        let subject = &pop.subjects[0];
+        let params = model.default_params.clone();
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov");
+        assert!(
+            crate::sens::provider::iov_sens_eta_supported(&model),
+            "{label}: the inner gradient must be analytic"
+        );
+        let layout = NestedLayout::of(&model, subject).expect("prepared");
+        let b = fx::point(&layout, 1.0);
+        let k = iov_occasion_groups(subject).len();
+        let mult = model.ruv_obs_mult(subject, &params.theta);
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            subject,
+            &params.theta,
+            &fx::stacked(&layout, &b),
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            model.n_eta,
+            model.n_kappa,
+            k,
+            mult.as_deref(),
+        )
+        .unwrap_or_else(|| panic!("{label}: the analytic inner gradient declined"));
+        assert_eq!(g.len(), layout.n_compact(), "{label}");
+        let nll = |bb: &[f64]| -> f64 {
+            individual_nll_iov(
+                &model,
+                subject,
+                &params.theta,
+                &bb[..model.n_eta],
+                &layout.expand(bb),
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        let mut worst = 0.0_f64;
+        for p in 0..b.len() {
+            let h = 1e-6 * (1.0 + b[p].abs());
+            let mut bp = b.clone();
+            bp[p] += h;
+            let mut bm = b.clone();
+            bm[p] -= h;
+            let fd = (nll(&bp) - nll(&bm)) / (2.0 * h);
+            assert!(g[p].is_finite() && fd.is_finite(), "{label}");
+            let e = (g[p] - fd).abs() / (1e-6 + 1e-4 * fd.abs());
+            worst = worst.max(e);
+            assert!(
+                e < 1.0,
+                "{label}: ∂NLL/∂[{}] analytic {} vs FD {fd}",
+                fx::axis_label(&model, &layout, p),
+                g[p]
+            );
+        }
+        eprintln!("MEASURE nested inner NLL gradient {label}: worst margin {worst:.3e}");
+    }
+}
+
+/// #1082 PR3: the two nested cases the analytic walks decline do so at the walks' own
+/// entry, not only in the model-level predicates — so a caller that skips the predicate
+/// still gets `None` (→ FD) rather than a jet laid out per cell — and the FD-fallback
+/// reason names each: a closed-form transit model (its subjects run on an ODE twin) and a
+/// subject never given its level cells (its compact axes are unknown). The prepared
+/// closed-form / ODE twins of each fixture are served, so the declines are the cases' own.
+#[test]
+fn the_nested_walks_decline_a_transit_twin_and_an_unprepared_subject() {
+    use crate::sens::provider::{subject_eta_grad_iov, subject_sensitivities_iov};
+    use crate::stats::nested_levels::test_helpers as fx;
+    let walks = |m: &CompiledModel, s: &Subject| {
+        let k = iov_occasion_groups(s).len();
+        let stacked = vec![0.01; m.n_eta + k * m.n_kappa];
+        let th = &m.default_params.theta;
+        (
+            subject_sensitivities_iov(m, s, th, &stacked).is_some(),
+            subject_eta_grad_iov(m, s, th, &stacked).is_some(),
+        )
+    };
+    let (transit, pop) = fx::prepared(&fx::transit(), 1);
+    assert!(transit.absorption_ode_equivalent.is_some() && transit.has_nested_levels());
     assert_eq!(
-        iov_fd_reason(&nested, &subject),
-        "nested variability levels"
+        walks(&transit, &pop.subjects[0]),
+        (false, false),
+        "transit twin"
     );
-    assert_ne!(iov_fd_reason(&one, &subject), "nested variability levels");
+    assert_eq!(
+        iov_fd_reason(&transit, &pop.subjects[0]),
+        "nested variability levels on a closed-form transit/IG model"
+    );
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (m, pop) = fx::prepared(&src, 1);
+        let prepared = &pop.subjects[0];
+        assert_eq!(
+            walks(&m, prepared),
+            (true, true),
+            "{label}: the prepared twin is served"
+        );
+        // Unprepared: occasion labels no longer parallel to the records.
+        let mut bare = prepared.clone();
+        bare.occasions.pop();
+        assert!(crate::stats::stacked_layout::StackedLayout::sens_of(&m, &bare).is_none());
+        assert_eq!(
+            walks(&m, &bare),
+            (false, false),
+            "{label}: unprepared subject"
+        );
+        assert_eq!(
+            iov_fd_reason(&m, &bare),
+            "nested-level subject without level cells",
+            "{label}"
+        );
+    }
+}
+
+/// #1082 PR3, review 1 finding 1: the nested EBE search really runs on the analytic
+/// gradient. `find_ebe_iov` searches the compact vector, and `agrad` must hand the walk
+/// the per-cell stack; handed the compact one, the analytic gradient declines and every
+/// step silently falls back to FD while the fit still reports the analytic route. So the
+/// route is read off `agrad` itself (`IOV_AGRAD_ROUTE`): analytic steps taken, FD none —
+/// on each walk, and on a solve long enough to take several steps.
+#[test]
+fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (m, pop) = fx::prepared(&src, 1);
+        let stage = FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(
+            &m,
+            &pop.subjects[0],
+            &m.default_params,
+            200,
+            1e-8,
+            None,
+            None,
+            0,
+            &stage,
+        );
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(ebe.converged && ebe.nll.is_finite(), "{label}");
+        assert!(analytic >= 3, "{label}: {analytic} analytic steps");
+        assert_eq!(fd, 0, "{label}: {fd} steps fell back to FD");
+    }
 }

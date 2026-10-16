@@ -32,3 +32,7 @@ pub mod three_cpt_explicit;
 pub mod two_cpt;
 pub mod two_cpt_explicit;
 pub(crate) mod widths;
+
+#[cfg(test)]
+#[path = "nested_levels_tests.rs"]
+mod nested_levels_tests;

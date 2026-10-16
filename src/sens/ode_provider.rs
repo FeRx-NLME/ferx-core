@@ -2826,15 +2826,15 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     if layout.n_groups() == 0 {
         return None;
     }
-    let n_stacked = layout.n_stacked();
-    // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
-    // since `K` is per subject) so an extremely many-occasion subject routes to FD rather
-    // than a silent `_ => None` downgrade.
-    let m_dim = model.n_theta + n_stacked;
+    // Stacked dual width `M = n_theta + n_eta + K·n_kappa` — or, under nested levels
+    // (#1082), `n_theta` plus the compact axis count. Bounded here (per subject, since `K`
+    // is per subject) so an extremely many-occasion subject routes to FD rather than a
+    // silent `_ => None` downgrade.
+    let m_dim = model.n_theta + layout.n_axes();
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
@@ -2885,12 +2885,11 @@ pub fn ode_subject_eta_grad_iov(
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
-    let n_stacked = layout.n_stacked();
-    if stacked_eta.len() != n_stacked {
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     dispatch_ode_iov_axes!(
-        n_stacked,
+        layout.n_axes(),
         run_subject_iov_eta,
         model,
         subject,
@@ -2914,18 +2913,16 @@ fn seed_pk_dual2_iov<const M: usize>(
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
     group: Option<usize>,
-    n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     n_theta: usize,
 ) -> Vec<Dual2<M>> {
-    let n_eff = n_eta + n_kappa;
-    let kappa_base =
-        group.map(|g| n_theta + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
+    let n_eta = model.n_eta;
+    let n_eff = n_eta + model.n_kappa;
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(n_theta + c)
         } else {
-            kappa_base.map(|base| base + (c - n_eta))
+            group.map(|g| n_theta + layout.kappa_axis(g, c - n_eta))
         }
     };
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
@@ -3030,7 +3027,8 @@ fn run_subject_iov<const M: usize>(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
     let k_groups = layout.n_groups();
-    let n_stacked = layout.n_stacked();
+    // The jet's η-block width: the compact axis count under nested levels (#1082).
+    let n_stacked = layout.n_axes();
     let cov = &subject.covariates;
 
     let occ_to_k = layout.occ_to_group();
@@ -3061,8 +3059,7 @@ fn run_subject_iov<const M: usize>(
             &pk,
             &cd,
             Some(g),
-            n_eta,
-            n_kappa,
+            layout,
             n_theta,
         ))
     };
@@ -3087,7 +3084,7 @@ fn run_subject_iov<const M: usize>(
             &combined_pk_only,
         )?;
         Some(seed_pk_dual2_iov::<M>(
-            model, &pk, &cd, None, n_eta, n_kappa, n_theta,
+            model, &pk, &cd, None, layout, n_theta,
         ))
     };
 
@@ -3351,16 +3348,15 @@ fn seed_pk_dual1_iov<const N: usize>(
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
     group: Option<usize>,
-    n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Vec<Dual1<N>> {
-    let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
+    let n_eta = model.n_eta;
+    let n_eff = n_eta + model.n_kappa;
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(c)
         } else {
-            kappa_base.map(|base| base + (c - n_eta))
+            group.map(|g| layout.kappa_axis(g, c - n_eta))
         }
     };
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
@@ -3397,7 +3393,8 @@ fn run_subject_iov_eta<const N: usize>(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
     let k_groups = layout.n_groups();
-    let n_stacked = layout.n_stacked();
+    // The jet's η-block width: the compact axis count under nested levels (#1082).
+    let n_stacked = layout.n_axes();
     let cov = &subject.covariates;
 
     let occ_to_k = layout.occ_to_group();
@@ -3417,14 +3414,7 @@ fn run_subject_iov_eta<const N: usize>(
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog, n_theta, n_eff, n_rows, cov, theta, &combined,
         )?;
-        Some(seed_pk_dual1_iov::<N>(
-            model,
-            &pk,
-            &cd,
-            Some(g),
-            n_eta,
-            n_kappa,
-        ))
+        Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, Some(g), layout))
     };
     // The inner κ = 0 seed, for the same rows as the outer one above (#1876). Built lazily
     // inside the closure so the common IOV subject pays no allocation.
@@ -3443,9 +3433,7 @@ fn run_subject_iov_eta<const N: usize>(
             theta,
             &combined_pk_only,
         )?;
-        Some(seed_pk_dual1_iov::<N>(
-            model, &pk, &cd, None, n_eta, n_kappa,
-        ))
+        Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, None, layout))
     };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate

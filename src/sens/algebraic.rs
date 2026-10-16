@@ -309,7 +309,8 @@ const _: () = assert!(
 //
 // The axis layout is the stacked one every IOV provider uses: θ on `0..n_theta`,
 // η_bsv on `n_theta..n_theta+n_eta`, and occasion group `g`'s κ block at
-// `n_theta + n_eta + g·n_kappa` (`StackedLayout::kappa_offset`, shifted by `n_theta`). Widths are bucketed (`ODE_IOV_WIDTH_BUCKETS`)
+// `n_theta + n_eta + g·n_kappa` (`StackedLayout::kappa_axis`, shifted by `n_theta`; under
+// nested levels the compact axis the group's cell shares, #1082). Widths are bucketed (`ODE_IOV_WIDTH_BUCKETS`)
 // because the stacked count grows with the number of occasions — an MBMA study
 // with many treatment arms is exactly that case — and monomorphising every width
 // to 96 is the compile-cost trap #971 measured.
@@ -325,7 +326,7 @@ fn iov_layout(
     subject: &Subject,
     stacked_eta: &[f64],
 ) -> Option<(ObsGroups, StackedLayout)> {
-    let layout = StackedLayout::of(model, subject);
+    let layout = StackedLayout::sens_of(model, subject)?;
     if layout.n_groups() == 0 || stacked_eta.len() != layout.n_stacked() {
         return None;
     }
@@ -409,7 +410,9 @@ fn run_obs_iov<const M: usize>(
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
     let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
-    let n_stacked = layout.n_stacked();
+    // The jet's width is the layout's axis count: the compact one under nested levels
+    // (#1082), where cells sharing a group share its κ axis.
+    let n_stacked = layout.n_axes();
     let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
     let n_rows = prog_indiv.pk_slots_ref().len();
     let uses_time = compiled_model_uses_time_builtin(model);
@@ -437,14 +440,13 @@ fn run_obs_iov<const M: usize>(
         };
 
         // Combined column `c` → stacked axis. η_bsv is shared across occasions;
-        // κ lands in this group's block, or is dropped when the row carries no
-        // occasion (its κ is held at 0, so it has no derivative).
-        let kappa_base = group.map(|g| n_theta + layout.kappa_offset(g));
+        // κ lands on this group's axis (`kappa_axis`), or is dropped when the row
+        // carries no occasion (its κ is held at 0, so it has no derivative).
         let axis = |c: usize| -> Option<usize> {
             let ax = if c < n_eta {
                 n_theta + c
             } else {
-                kappa_base? + (c - n_eta)
+                n_theta + layout.kappa_axis(group?, c - n_eta)
             };
             (ax < M).then_some(ax)
         };
@@ -507,7 +509,9 @@ fn run_obs_grad_iov<const N: usize>(
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
     let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
-    let n_stacked = layout.n_stacked();
+    // The jet's width is the layout's axis count: the compact one under nested levels
+    // (#1082), where cells sharing a group share its κ axis.
+    let n_stacked = layout.n_axes();
     let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
     let n_rows = prog_indiv.pk_slots_ref().len();
     let uses_time = compiled_model_uses_time_builtin(model);
@@ -532,12 +536,11 @@ fn run_obs_grad_iov<const N: usize>(
             )?
         };
         // Inner axes are the stacked η alone — no θ block, no Hessian.
-        let kappa_base = group.map(|g| layout.kappa_offset(g));
         let axis = |c: usize| -> Option<usize> {
             let ax = if c < n_eta {
                 c
             } else {
-                kappa_base? + (c - n_eta)
+                layout.kappa_axis(group?, c - n_eta)
             };
             (ax < N).then_some(ax)
         };
@@ -583,7 +586,7 @@ pub(crate) fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let dim = model.n_theta + stacked_eta.len();
+    let dim = model.n_theta + StackedLayout::sens_of(model, subject)?.n_axes();
     macro_rules! arms {
         ($($m:literal),+ $(,)?) => {
             match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
@@ -605,7 +608,7 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let dim = stacked_eta.len();
+    let dim = StackedLayout::sens_of(model, subject)?.n_axes();
     macro_rules! arms {
         ($($n:literal),+ $(,)?) => {
             match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
