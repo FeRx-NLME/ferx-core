@@ -156,6 +156,27 @@ $$
 
 **Damped σ step.** The residual σ that rides the numerical M-step gets its own capped step, $\gamma_k^\sigma = \min(\gamma_k,\,0.2,\,\gamma_k^\theta)$, applied to $\sigma^2$ rather than to $\log\sigma$ (issue #1445). Until then it was the one SAEM statistic with no stochastic approximation at all — assigned outright in both phases — so the reported σ was a single draw of the M-step maximiser rather than its average. The cap is on in **both** phases, which is what distinguishes it from the Ω step: Ω accepts the $\gamma=1$ assignment at the first convergence iteration because $(1/N)\sum_i \eta_i\eta_i^T$ over $N$ subjects is a well-determined statistic, while the σ maximiser of a *minority* variance component is not. The additive half of a `combined(PROP, ADD)` model on sparse data is exactly that: its single-draw conditional maximiser is boundary-heavy, so an assigned σ reports whichever value the last iteration happened to draw. Beyond $k-K_1 = 5$ the cap no longer binds and the full decaying $\gamma_k = 1/(k-K_1)$ takes over, which is what lets the SA estimate settle. Averaging on the variance scale is deliberate — it is the scale the [scalar residual sufficient statistic](#scalar-residual-error-update) already averages on, and a geometric mean of a sequence with mass near zero collapses where the arithmetic mean of $\sigma^2$ does not (measured: $\log\sigma$ averaging leaves the #1445 fixture's $\sigma_{\text{add}}$ at 0.47 against a truth of 1.8, where the $\sigma^2$ average reaches 1.4). The third term is one-sided: σ never steps *faster* than θ, but the two are not always equal. They are equal during **exploration** whenever `mstep_damping` is at or below 0.2 (the `iiv_on_ruv` default of 0.03 is), and from the fifth convergence iteration on, where $1/(k-K_1) \le 0.2$. They differ over the four hand-off iterations $k-K_1 \in \{1,2,3,4\}$ — θ takes 1, ½, ⅓, ¼ while σ takes 0.2 — and during exploration for any `mstep_damping` above 0.2, where σ is the slower of the two. So no configuration, `iiv_on_ruv` included, is bit-identical to before; what is preserved is that σ is never given a larger step than the θ it shares a maximiser with.
 
+#### Which σ components the exploration cap applies to {#saem-sigma-cap-release}
+
+Since issue #1464 the exploration half of that cap is **per component**. The cap protects a variance component that the data identify only weakly. For one the data pin down, it only slows σ's exploration trajectory. That trajectory reaches every θ without an ETA through the same frozen-η objective the numerical M-step maximises. At each exploration M-step ferx computes the standard error of $\log\sigma_k$ under that objective, from the inverse of the σ–σ block of its expected information at the current draw:
+
+$$
+I_{ab} = \tfrac12 \sum_j \frac{\partial V_j/\partial\log\sigma_a \;\, \partial V_j/\partial\log\sigma_b}{V_j^2}.
+$$
+
+The block is inverted rather than read off its diagonal, so two components the data cannot tell apart both read as weak. A component with $\mathrm{SE}(\log\sigma_k) \le 0.10$ takes θ's step, $\min(\gamma_k, \gamma_k^\theta)$, and keeps the guarantee that σ never steps faster than θ. Every other component keeps the 0.2 cap. The convergence hand-off is unchanged for every component.
+
+That standard error is how far one draw's maximiser of the component can wander, in log units. Measured along 6-seed fits, cefepime's additive term reads 0.15–0.24 throughout exploration. Busulfan's additive term starts at 0.64 from its 1.0 initial estimate (a minority at that point, so it is correctly held) and falls to 0.06 once it has grown to its converged ~28. Every proportional term reads 0.01–0.03. On importance-sampled −2 log L over the same 6 seeds, against the cap on every component:
+
+| | cefepime (run64) | busulfan, 600 subjects | busulfan, `TVQ` FIX |
+|---|---|---|---|
+| release at SE ≤ 0.10 (shipped) | −0.2 | **−15.6** | −5.9 |
+| release every component | +1.0 | −14.3 | −4.7 |
+
+The table hides the readout that fails. Releasing every component puts cefepime's `ADD_ERR` at 0.051 and 0.104 on two seeds in six, which is #1445 again. The shipped gate keeps all six at 1.22–1.41, up from 1.10–1.25 with the cap everywhere and closer to NONMEM FOCEI's 1.550 on the same data. On busulfan the no-ETA `TVQ` moves from 11.7–15.3 to 8.8–11.5; the `TVQ`-FIX control sits at 8.44.
+
+The release applies only in the plain Gaussian scope of [`mstep_solver = score_sa`](#saem-mstep-jensen), and not to `iiv_on_ruv` models. An `iiv_on_ruv` σ shares a ridge with ω_RUV, and the conditional standard error misreads that ridge. Outside that scope the schedule is the #1445 one unchanged.
+
 ### 3. M-Step for Omega (Closed Form)
 
 $$
@@ -221,9 +242,17 @@ $$
 
 with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. The new estimate is blended with the same SA step $\gamma_k$ as the single-anchor shift, and each η is re-centred by the change in its own mu so $\phi_i$ is unchanged. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
 
+##### Typical values that share a theta
+
 Covariate mu-references that **share an estimated theta** are one group ([#1620](https://github.com/FeRx-NLME/ferx-core/issues/1620)). In `examples/two_cpt_oral_cov.ferx`, `CL` and `V1` both read `THETA_WT`. Stepping them one at a time cannot work: a step over CL's thetas alone holds $\eta_{V1}$ as drawn — the η-frozen coordinates #619 removed for a single typical value — so $\phi_{V1}$ absorbs V1's half of every move of `THETA_WT`, and the exponent drifts to its bound (SAEM put it at 0.0101 against NONMEM's 0.662). The joint step fits the union of the thetas to every member's $\phi_i$ under the full $\Omega^{-1}$ form and re-centres every member's eta. A theta read only by the members is not "read elsewhere", so such a group still takes the exact engine; one also read outside every group, or by a mu-reference that was itself declined, keeps the data term. A fit warning names the etas and the shared theta. A shared `FIX`ed theta links nothing.
 
-A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which then stay on the numerical M-step as before — when one of its thetas is also another eta's single anchor, when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
+##### A theta that anchors another eta
+
+A covariate mu-reference can also read the theta that **anchors another eta** on its own ([#1630](https://github.com/FeRx-NLME/ferx-core/issues/1630)) — `V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` next to `V2 = TVV2 * exp(ETA_V2)`. Two channels moving `TVV2` in one iteration would have no joint optimum, and declining the group (as ferx did before #1630) left its covariate exponent on the η-frozen numerical M-step, where it wandered (`THETA_WT_V1` 0.68 / 1.07 / 0.63 over three seeds against FOCEI's 0.577). Instead the anchor joins the group as a one-theta member: its closed-form shift is dropped, and the joint step fits `TVV2` to both etas' $\phi_i$ and re-centres both. When nothing else reads `TVV2`, the exact engine still runs. If that other eta has a covariate mu-reference of its own, its anchor never runs, so there is nothing to collide with: the two groups simply share the theta and merge as above. A group is still declined when the anchor's eta has an IIV below `1e-3`, or when the anchor's typical value is not on a log or logit scale (`TVV2 + ETA_V2`), and the warning says which.
+
+##### Scope, and when a group is declined
+
+A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
 
 #### Scalar residual-error update
 
@@ -961,6 +990,32 @@ shared ([#1629](https://github.com/FeRx-NLME/ferx-core/issues/1629)), so the tab
 compares the joint group's own coordinates. `tests/saem_covariate_mu_ref.rs`
 (slow-gated) pins the table's two "after" columns and the `score_sa` and 300/700
 runs against NONMEM; seeds 2 and 3 are reported here, not tested.
+
+### Validation of a group reading another eta's anchor (#1630)
+
+Two exact reparameterisations of `examples/two_cpt_oral_cov.ferx` on its bundled data,
+each against NONMEM 7.6.0 `METHOD=SAEM` on the same model
+(`nonmem_anchor/covmuref_anchor_{a,b}_saem.ctl`) and against ferx on the control that
+writes `V1 = TVV1 * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` directly:
+
+- **A**: `V1 = TVCL * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` reads `TVCL`, whose eta
+  has its own covariate mu-reference;
+- **B**: `V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` reads `TVV2`, the plain
+  anchor of `V2 = TVV2 * exp(ETA_V2)`.
+
+| Quantity | A before | A after | NONMEM A | B before | B after | NONMEM B |
+|---|---:|---:|---:|---:|---:|---:|
+| OFV (ferx, seed 1, 150/250) | **−1184.06** | −1199.28 | −1199.33 (IMP) | −1197.70 | −1199.28 | −1199.34 (IMP) |
+| `THETA_CRCL` | **0.2137** | 0.5566 | 0.5564 | 0.5568 | 0.5566 | 0.5563 |
+| typical V1 | **41.1** | 48.24 | 48.14 | 45.1 | 48.24 | 48.22 |
+| `THETA_WT_V1`, 300/700 | 0.338 | 0.597 | 0.586 | **0.402** | 0.597 | 0.591 |
+
+The control gives the same "after" numbers to every printed digit, on seeds 1, 2 and 3
+and at 300/700. That is expected: with the fix, each fixture's M-step is the control's
+written in other coordinates. Before the fix, A's OFV was −1184.06 / −1171.40 / −1189.06
+over seeds 1/2/3, and B's `THETA_WT_V1` at 150/250 was 0.68 / 1.07 / 0.63 against
+FOCEI's 0.577. `tests/saem_covariate_mu_ref.rs` (slow-gated) pins A at 150/250 and B at
+300/700 against NONMEM.
 
 ## Inter-Occasion Variability (IOV)
 

@@ -1218,6 +1218,11 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
 /// uppercased identifier set of every block *other* than `[parameters]` and
 /// `[individual_parameters]`, which is how a theta reaching the likelihood
 /// through `[odes]` or `[derived]` is seen from here.
+///
+/// The same walk notes every one-theta typical value of the same shapes
+/// ([`classify_single_anchor`]), and each group carries the ones on its own
+/// thetas as [`CovariateMuRef::colliding_anchors`] (#1630), so SAEM / IMP can
+/// take such an anchor into the group's joint M-step instead of declining it.
 fn detect_covariate_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
@@ -1227,6 +1232,11 @@ fn detect_covariate_mu_refs(
 ) -> Vec<CovariateMuRef> {
     let mut scope = InlineScope::new(stmts);
     let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
+    // One-theta typical values, kept apart from `found` (#1630): eta, owner,
+    // and the one theta. Only the ones a group collides with are materialised,
+    // after the walk — building every anchor's inlined typical value would
+    // undo the lazy inlining (#1684) on every plain mu-reference.
+    let mut anchors: Vec<(usize, String, usize)> = Vec::new();
     // The top-level statement that recorded each owner's surviving group. An
     // owner is retired on any later assignment to its name, so the latest
     // recording is the one `found` keeps.
@@ -1241,10 +1251,17 @@ fn detect_covariate_mu_refs(
                 let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
                 // Retire before recording, and retire whether or not this line is
                 // itself a group: an assignment that no longer classifies still
-                // supersedes the one it overwrites.
+                // supersedes the one it overwrites. Single anchors are retired
+                // by the same rule, for the same reason.
                 retire_superseded_group(&mut found, name, expr);
+                retire_superseded_group(&mut anchors, name, expr);
                 if let Some((eta_idx, entry)) = classified {
                     found.push((eta_idx, name.clone(), entry));
+                    recorded_at.insert(name.clone(), si);
+                } else if let Some((eta_idx, theta_idx)) =
+                    single_anchor_of(expr, theta_names.len(), n_bsv_eta.min(eta_names.len()))
+                {
+                    anchors.push((eta_idx, name.clone(), theta_idx));
                     recorded_at.insert(name.clone(), si);
                 }
                 scope.record(si, name, raw_expr);
@@ -1258,9 +1275,11 @@ fn detect_covariate_mu_refs(
             } => {
                 for (_, body) in branches {
                     retire_superseded_groups_in(&mut found, body);
+                    retire_superseded_groups_in(&mut anchors, body);
                 }
                 if let Some(eb) = else_body {
                     retire_superseded_groups_in(&mut found, eb);
+                    retire_superseded_groups_in(&mut anchors, eb);
                 }
             }
             _ => {}
@@ -1272,24 +1291,80 @@ fn detect_covariate_mu_refs(
     // earlier assignment to the same name is an ordinary reader.
     let recording = |owner: &str| -> &Statement { &stmts[recorded_at[owner]] };
     let all_owners: Vec<&Statement> = found.iter().map(|(_, owner, _)| recording(owner)).collect();
+    // The single anchors whose theta some group reads, materialised from their
+    // own statement (a definition is assigned once, so the view is the one the
+    // walk saw).
+    let group_thetas: Vec<&str> = found
+        .iter()
+        .flat_map(|(_, _, g)| g.theta_names.iter().map(String::as_str))
+        .collect();
+    let anchors: Vec<(usize, String, CovariateMuRef)> = anchors
+        .into_iter()
+        .filter(|&(_, _, t)| group_thetas.contains(&theta_names[t].as_str()))
+        .filter_map(|(eta_idx, owner, _)| {
+            let Statement::Assign(_, raw) = recording(&owner) else {
+                return None;
+            };
+            let (_, entry) = classify_single_anchor(
+                scope.view(recorded_at[&owner], raw),
+                theta_names,
+                eta_names,
+                n_bsv_eta,
+            )?;
+            Some((eta_idx, owner, entry))
+        })
+        .collect();
+    // The same walk stopped at those anchors too, for a joint M-step that also
+    // takes them in (#1630). An anchor reads its one theta and nothing that
+    // carries another's taint (a second theta would have made it a group, an
+    // unresolved name rejects it), so stopping only at the colliding ones is
+    // the same as stopping at all of them. The anchors get every reachability
+    // field a group gets: once absorbed they are members like any other.
+    let owners_and_anchors: Vec<&Statement> = all_owners
+        .iter()
+        .copied()
+        .chain(anchors.iter().map(|(_, owner, _)| recording(owner)))
+        .collect();
+    let fill = |owner: &str, eta_idx: usize, entry: &mut CovariateMuRef| {
+        entry.shared_thetas = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &[recording(owner)],
+            &entry.theta_names,
+        );
+        entry.read_outside_groups = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &all_owners,
+            &entry.theta_names,
+        );
+        entry.read_outside_groups_and_anchors = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &owners_and_anchors,
+            &entry.theta_names,
+        );
+        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+    };
+    let anchors: Vec<CovariateMuRef> = anchors
+        .into_iter()
+        .map(|(eta_idx, owner, mut entry)| {
+            fill(&owner, eta_idx, &mut entry);
+            entry
+        })
+        .collect();
     found
         .into_iter()
         .map(|(eta_idx, owner, mut entry)| {
-            entry.shared_thetas = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &[recording(&owner)],
-                &entry.theta_names,
-            );
-            entry.read_outside_groups = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &all_owners,
-                &entry.theta_names,
-            );
-            entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
+            fill(&owner, eta_idx, &mut entry);
+            entry.colliding_anchors = anchors
+                .iter()
+                .filter(|a| entry.theta_names.contains(&a.theta_names[0]))
+                .cloned()
+                .collect();
             entry
         })
         .collect()
@@ -1307,8 +1382,8 @@ fn detect_covariate_mu_refs(
 /// unconditional and keyed two ways: on the eta the new right-hand side carries
 /// (the same key recording uses) and on the assigned parameter name, which is
 /// the only handle left when the new line carries no eta at all (`CL = TVCL`).
-fn retire_superseded_group<'a, V: RhsView<'a>>(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
+fn retire_superseded_group<'a, V: RhsView<'a>, T>(
+    found: &mut Vec<(usize, String, T)>,
     name: &str,
     expr: V,
 ) {
@@ -1318,10 +1393,7 @@ fn retire_superseded_group<'a, V: RhsView<'a>>(
 
 /// [`retire_superseded_group`] over a conditional body, recursively. Retires
 /// only — see the `Statement::If` arm of [`detect_covariate_mu_refs`].
-fn retire_superseded_groups_in(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
-    stmts: &[Statement],
-) {
+fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts: &[Statement]) {
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => retire_superseded_group(found, name, expr),
@@ -1527,6 +1599,47 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     eta_names: &[String],
     n_bsv_eta: usize,
 ) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n >= 2)
+}
+
+/// `(eta_idx, theta_idx)` when [`classify_single_anchor`] would accept the
+/// right-hand side, without building its typical value — the per-statement
+/// test of [`detect_covariate_mu_refs`], which materialises only the anchors a
+/// group collides with.
+fn single_anchor_of<'a, V: RhsView<'a>>(
+    expr: V,
+    n_thetas: usize,
+    n_bsv_eta: usize,
+) -> Option<(usize, usize)> {
+    let (typical, eta_idx, _) = split_typical_and_eta(expr)?;
+    let read = typical.summary();
+    (eta_idx < n_bsv_eta && !read.other && read.thetas.len() == 1 && read.thetas[0] < n_thetas)
+        .then(|| (eta_idx, read.thetas[0]))
+}
+
+/// The one-theta twin of [`classify_covariate_mu_ref`]: a typical value of
+/// the same shapes and the same admissible reads, with exactly **one** theta —
+/// `V2 = TVV2 * exp(ETA_V2)`, `V = TVV * WT/70 * exp(ETA_V)`. Recorded only so
+/// that a group reading that theta can take the anchor into its joint M-step
+/// (#1630, [`CovariateMuRef::colliding_anchors`]).
+fn classify_single_anchor<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n == 1)
+}
+
+/// [`classify_covariate_mu_ref`] and [`classify_single_anchor`], told apart by
+/// how many thetas the typical value may read.
+fn classify_typical_value<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    theta_count_ok: impl Fn(usize) -> bool,
+) -> Option<(usize, CovariateMuRef)> {
     let (typical, eta_idx, transform) = split_typical_and_eta(expr)?;
     if eta_idx >= n_bsv_eta || eta_idx >= eta_names.len() {
         return None;
@@ -1535,7 +1648,10 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     // rejected line never needs.
     let read = typical.summary();
     let mut theta_idx = read.thetas;
-    if read.other || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
+    if read.other
+        || !theta_count_ok(theta_idx.len())
+        || theta_idx.iter().any(|&i| i >= theta_names.len())
+    {
         return None;
     }
     theta_idx.sort_unstable();
@@ -1546,12 +1662,14 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names: read.covariates,
-            // All three filled by `detect_covariate_mu_refs` once the whole block
+            // All filled by `detect_covariate_mu_refs` once the whole block
             // (and the other blocks' identifiers) are in view; a single
             // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
             read_outside_groups: Vec::new(),
             eta_shared: false,
+            read_outside_groups_and_anchors: Vec::new(),
+            colliding_anchors: Vec::new(),
             typical: typical.build(),
         },
     ))
@@ -14256,6 +14374,16 @@ fn build_ode_spec(
         .collect();
     let rhs_hoist = build_rhs_hoist(&stmts_owned, n_vars_total, &rhs_invariant_slots);
     let rhs_hoist_f64 = rhs_hoist.clone();
+    let binding = RhsBindingPlan::for_program(
+        &stmts_owned,
+        n_vars_total,
+        state_count,
+        indiv_count,
+        time_slot,
+        tafd_slot,
+        tad_slot,
+        macheps_slot,
+    );
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -14274,6 +14402,7 @@ fn build_ode_spec(
         has_chz: !chz_state_slots.is_empty(),
         init_indiv_reads,
         hoist: rhs_hoist,
+        binding,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -14311,59 +14440,77 @@ fn build_ode_spec(
                 // to the struct; field reborrows are disjoint.
                 let scratch = &mut *s;
                 let warm = match &rhs_hoist_f64 {
-                    Some(h) => h.reset(&mut scratch.rhs_vars, n_vars_total),
+                    Some(h) => h.reset(&mut scratch.rhs_vars, n_vars_total, binding.zero),
                     None => {
-                        scratch.rhs_vars.clear();
-                        scratch.rhs_vars.resize(n_vars_total, 0.0);
+                        // The scratch is shared by every ODE model on the thread,
+                        // so a lean binding still resizes a buffer of the wrong
+                        // shape; what it skips is the fill of a right-shaped one.
+                        if binding.zero || scratch.rhs_vars.len() != n_vars_total {
+                            scratch.rhs_vars.clear();
+                            scratch.rhs_vars.resize(n_vars_total, 0.0);
+                        }
                         false
                     }
                 };
 
-                // State values from u[].
+                // State values from u[]. A short `u` (a broken contract, see the
+                // debug_assert above) leaves the remaining states at 0.0 whether
+                // or not the buffer was re-zeroed.
                 scratch.rhs_vars[..copy_n].copy_from_slice(&u[..copy_n]);
+                scratch.rhs_vars[copy_n..state_count].fill(0.0);
 
                 // Individual parameters from params[] via the pre-computed
-                // slot plan. `usize::MAX` slots (impossible under the
-                // assert_eq above) leave the var at 0.0.
+                // slot plan. A slot `params` does not cover (impossible under
+                // the assert_eq above) reads 0.0 — written, not left to the
+                // re-zero, so the lean binding cannot see a stale value.
                 for (i, &slot) in indiv_to_params_slot.iter().enumerate() {
-                    if let (Some(dst), Some(&val)) =
-                        (scratch.rhs_vars.get_mut(state_count + i), params.get(slot))
-                    {
-                        *dst = val;
+                    if let Some(dst) = scratch.rhs_vars.get_mut(state_count + i) {
+                        *dst = params.get(slot).copied().unwrap_or(0.0);
                     }
                 }
 
                 // TIME / T — solver time axis (same as dataset TIME column).
-                if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
-                    *dst = t;
+                if binding.seed_time {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
+                        *dst = t;
+                    }
                 }
                 // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
-                if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
-                    *dst = params
-                        .get(crate::types::MAX_PK_PARAMS)
-                        .copied()
-                        .filter(|v| v.is_finite())
-                        .map_or(f64::NAN, |first| t - first);
+                if binding.seed_tafd {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                        *dst = params
+                            .get(crate::types::MAX_PK_PARAMS)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .map_or(f64::NAN, |first| t - first);
+                    }
                 }
                 // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
-                if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
-                    *dst = params
-                        .get(crate::types::MAX_PK_PARAMS + 1)
-                        .copied()
-                        .filter(|v| v.is_finite())
-                        .map_or(f64::NAN, |last| t - last);
+                if binding.seed_tad {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                        *dst = params
+                            .get(crate::types::MAX_PK_PARAMS + 1)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .map_or(f64::NAN, |last| t - last);
+                    }
                 }
                 // MACHEPS — machine epsilon constant, available in every ODE
                 // expression (parallels its `[derived]`/`init` availability).
-                if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
-                    *dst = f64::EPSILON;
+                if binding.seed_macheps {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
+                        *dst = f64::EPSILON;
+                    }
                 }
 
                 // Reset du so a state without a firing d/dt this iteration
                 // (e.g. inside an untaken if-branch) gets 0.0 rather than
-                // stale memory.
-                for slot in du.iter_mut() {
-                    *slot = 0.0;
+                // stale memory. The lean binding proved every path writes all
+                // `state_count` of them; a `du` of another length keeps the reset.
+                if binding.zero || du.len() != state_count {
+                    for slot in du.iter_mut() {
+                        *slot = 0.0;
+                    }
                 }
 
                 let empty_theta: [f64; 0] = [];
@@ -24853,6 +25000,35 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, an ODE RHS built on this thread keeps the full
+    /// per-call binding — re-zero `vars`/`du`, seed every time/anchor slot — so a
+    /// test can build the same model both ways and require bit-for-bit agreement
+    /// (#1523). Read at parse time on the parsing thread, like
+    /// [`IP_HOIST_DISABLED`].
+    pub(crate) static RHS_LEAN_BINDING_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`RHS_LEAN_BINDING_DISABLED`].
+#[cfg(test)]
+pub(crate) struct RhsLeanBindingOff(bool);
+
+#[cfg(test)]
+impl RhsLeanBindingOff {
+    pub(crate) fn enter() -> Self {
+        Self(RHS_LEAN_BINDING_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RhsLeanBindingOff {
+    fn drop(&mut self) {
+        RHS_LEAN_BINDING_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
 /// Test-only scope guard for [`IP_HOIST_DISABLED`]. Restores the previous value
 /// on drop, including on an assertion unwind.
 #[cfg(test)]
@@ -26308,9 +26484,16 @@ impl RhsHoist {
     /// Ready `vars` for one RHS call before its states, parameters and time are
     /// written: zero the program's own slots exactly as a fresh
     /// `clear(); resize(n, 0)` would, and keep the tail if it holds this program's
-    /// cache. Returns whether it does.
+    /// cache. Returns whether it does. `zero_own = false` keeps the program's own
+    /// slots as the last call left them — sound only under
+    /// [`rhs_defines_before_reads`].
     #[inline]
-    fn reset<T: crate::sens::num::vm::VmNum>(&self, vars: &mut Vec<T>, n_vars: usize) -> bool {
+    fn reset<T: crate::sens::num::vm::VmNum>(
+        &self,
+        vars: &mut Vec<T>,
+        n_vars: usize,
+        zero_own: bool,
+    ) -> bool {
         let zero = T::from_f64(0.0);
         // The id lives in the slot's value; its jet (zero) carries nothing, and
         // lifting `self.id` to a full dual just to compare it would cost a jet-sized
@@ -26318,7 +26501,9 @@ impl RhsHoist {
         let warm =
             vars.len() == self.n_ext && vars[self.id_slot].val().to_bits() == self.id.to_bits();
         if warm {
-            vars[..n_vars].fill(zero);
+            if zero_own {
+                vars[..n_vars].fill(zero);
+            }
         } else {
             vars.clear();
             vars.resize(self.n_ext, zero);
@@ -26583,6 +26768,214 @@ fn build_rhs_hoist(
     })
 }
 
+/// Which per-call binding work an ODE RHS actually needs (#1523). Decided once per
+/// program at build time; every `false` field is work whose result no statement
+/// can observe.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RhsBindingPlan {
+    /// Re-zero `vars[..n_vars]` and `du` before binding (P1c). `false` only under
+    /// [`rhs_defines_before_reads`].
+    zero: bool,
+    /// Seed the `T`/`TIME`, `TAFD`, `TAD` and `MACHEPS` slots (B3). Each is a
+    /// dedicated slot, so leaving one unwritten is observable only through a read
+    /// of it, which [`stmts_read_slots`] rules out. The lifted code of an
+    /// [`RhsHoist`] is cut from the same statements, so it is covered too.
+    seed_time: bool,
+    seed_tafd: bool,
+    seed_tad: bool,
+    seed_macheps: bool,
+}
+
+impl RhsBindingPlan {
+    /// The binding as it was before #1523: everything, every call.
+    #[cfg(test)]
+    const FULL: Self = Self {
+        zero: true,
+        seed_time: true,
+        seed_tafd: true,
+        seed_tad: true,
+        seed_macheps: true,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_program(
+        stmts: &[Statement],
+        n_vars: usize,
+        state_count: usize,
+        indiv_count: usize,
+        time_slot: usize,
+        tafd_slot: usize,
+        tad_slot: usize,
+        macheps_slot: usize,
+    ) -> Self {
+        #[cfg(test)]
+        if RHS_LEAN_BINDING_DISABLED.with(|c| c.get()) {
+            return Self::FULL;
+        }
+        let reads = |slot: usize| stmts_read_slots(stmts, &[slot]);
+        let plan = Self {
+            zero: true,
+            seed_time: reads(time_slot),
+            seed_tafd: reads(tafd_slot),
+            seed_tad: reads(tad_slot),
+            seed_macheps: reads(macheps_slot),
+        };
+        // An unseeded time slot is never read, so it may count as defined: the
+        // walk only has to establish that every *read* sees this call's value.
+        let zero = !rhs_defines_before_reads(
+            stmts,
+            n_vars,
+            state_count,
+            (0..state_count + indiv_count).chain([time_slot, tafd_slot, tad_slot, macheps_slot]),
+        );
+        Self { zero, ..plan }
+    }
+}
+
+/// Can the RHS binding skip re-zeroing `vars[..n_vars]` and `du` on every call
+/// (#1523, P1c)?
+///
+/// The re-zero exists so a read of a slot nothing wrote *this call* — an
+/// intermediate assigned only inside an untaken `if` arm, a `d/dt` that fires only
+/// in one branch — sees `0.0` rather than whatever the previous call left there.
+/// Skipping it is unobservable exactly when no such read exists. So this is a
+/// def-before-use walk in evaluation order: `defined` starts as the slots the
+/// binding writes unconditionally (`initially_defined`), every read must hit a
+/// defined slot, an assignment defines its target, and after an `if` only what
+/// *every* arm defines stays defined — an `if` with no `else` keeps only what was
+/// defined before it. `du` must be fully written on every path.
+///
+/// Conservative by construction: any shape it does not model (an unresolved
+/// `Assign`/`DiffEq`, an out-of-range slot, an unresolved `Variable`) answers
+/// `false`, which keeps the re-zero.
+fn rhs_defines_before_reads(
+    stmts: &[Statement],
+    n_vars: usize,
+    state_count: usize,
+    initially_defined: impl IntoIterator<Item = usize>,
+) -> bool {
+    let mut defined = vec![false; n_vars];
+    for s in initially_defined {
+        match defined.get_mut(s) {
+            Some(d) => *d = true,
+            None => return false,
+        }
+    }
+    let mut du = vec![false; state_count];
+    rhs_dbu_walk(stmts, &mut defined, &mut du) && du.iter().all(|&w| w)
+}
+
+fn rhs_dbu_walk(stmts: &[Statement], defined: &mut [bool], du: &mut [bool]) -> bool {
+    fn set(v: &mut [bool], i: usize) -> bool {
+        match v.get_mut(i) {
+            Some(d) => {
+                *d = true;
+                true
+            }
+            None => false,
+        }
+    }
+    for s in stmts {
+        let ok = match s {
+            Statement::AssignBc(i, bc) => bc_reads_defined(bc, defined) && set(defined, *i),
+            Statement::AssignIdx(i, e) => expr_reads_defined(e, defined) && set(defined, *i),
+            Statement::DiffEqBc(k, bc) => bc_reads_defined(bc, defined) && set(du, *k),
+            Statement::DiffEqIdx(k, e) => expr_reads_defined(e, defined) && set(du, *k),
+            // The evaluators skip an unresolved statement outright; nothing models it here.
+            Statement::Assign(..) | Statement::DiffEq(..) => false,
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Each condition runs only after the earlier ones failed, so no
+                // earlier arm's body has executed: all see the pre-`if` state.
+                let (d0, u0) = (defined.to_vec(), du.to_vec());
+                let mut acc: Option<(Vec<bool>, Vec<bool>)> = None;
+                let mut arm = |body: Option<&[Statement]>| -> bool {
+                    let (mut d, mut u) = (d0.clone(), u0.clone());
+                    if let Some(b) = body {
+                        if !rhs_dbu_walk(b, &mut d, &mut u) {
+                            return false;
+                        }
+                    }
+                    acc = Some(match acc.take() {
+                        None => (d, u),
+                        Some((ad, au)) => (
+                            ad.iter().zip(&d).map(|(a, b)| *a && *b).collect(),
+                            au.iter().zip(&u).map(|(a, b)| *a && *b).collect(),
+                        ),
+                    });
+                    true
+                };
+                let mut ok = true;
+                for (c, body) in branches {
+                    ok = ok && cond_reads_defined(c, &d0) && arm(Some(body));
+                }
+                // No `else`: the fall-through path defines nothing new.
+                ok = ok && arm(else_body.as_deref());
+                if ok {
+                    let (ad, au) = acc.expect("the else / fall-through arm always runs");
+                    defined.copy_from_slice(&ad);
+                    du.copy_from_slice(&au);
+                }
+                ok
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn bc_reads_defined(bc: &Bytecode, defined: &[bool]) -> bool {
+    bc.ops.iter().all(|op| match *op {
+        Op::PushVar(i) => defined.get(i as usize).copied().unwrap_or(false),
+        _ => true,
+    })
+}
+
+fn expr_reads_defined(e: &Expression, defined: &[bool]) -> bool {
+    match e {
+        Expression::VariableIdx(i) => defined.get(*i).copied().unwrap_or(false),
+        // Unresolved: what it reads is not known here.
+        Expression::Variable(_) => false,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_reads_defined(a, defined) && expr_reads_defined(b, defined)
+        }
+        Expression::UnaryFn(_, a) => expr_reads_defined(a, defined),
+        Expression::ThetaGather { idx, .. } => expr_reads_defined(idx, defined),
+        Expression::Conditional(c, t, f) => {
+            cond_reads_defined(c, defined)
+                && expr_reads_defined(t, defined)
+                && expr_reads_defined(f, defined)
+        }
+        // No `vars` read. Listed rather than wildcarded so a new variant has to
+        // be classified here before it compiles.
+        Expression::Literal(_)
+        | Expression::Theta(_)
+        | Expression::Eta(_)
+        | Expression::Time
+        | Expression::MixNum
+        | Expression::Covariate(_)
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => true,
+    }
+}
+
+fn cond_reads_defined(c: &Condition, defined: &[bool]) -> bool {
+    match c {
+        Condition::Compare(a, _, b) => {
+            expr_reads_defined(a, defined) && expr_reads_defined(b, defined)
+        }
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_reads_defined(a, defined) && cond_reads_defined(b, defined)
+        }
+        Condition::Not(a) => cond_reads_defined(a, defined),
+        Condition::Present(e) => expr_reads_defined(e, defined),
+    }
+}
+
 /// `eval_bytecode` (the scalar VM the f64 RHS closure uses) in the shape
 /// [`RhsHoist::refresh`] takes.
 fn rhs_lift_eval_f64(bc: &Bytecode, vars: &[f64], stack: &mut Vec<f64>) -> f64 {
@@ -26668,6 +27061,8 @@ pub struct OdeRhsProgram {
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
     init_indiv_reads: Vec<(usize, Vec<usize>)>,
+    /// Which per-call binding work this program needs (#1523).
+    binding: RhsBindingPlan,
 }
 
 impl OdeRhsProgram {
@@ -27042,36 +27437,52 @@ impl OdeRhsProgram {
         // busulfan: the `DualMixed` RHS gained ~5% self time with the lift on). For
         // `f64` and `Dual1` the key is a handful of words and the lift pays.
         let hoist = self.hoist.as_ref().filter(|_| !T::SECOND_ORDER);
+        let b = self.binding;
+        let zero = T::from_f64(0.0);
         let warm = match hoist {
-            Some(h) => h.reset(vars, self.n_vars_total),
+            Some(h) => h.reset(vars, self.n_vars_total, b.zero),
             None => {
-                vars.clear();
-                vars.resize(self.n_vars_total, T::from_f64(0.0));
+                // Same shape rule as the f64 closure: a lean binding skips only
+                // the fill of an already right-shaped buffer.
+                if b.zero || vars.len() != self.n_vars_total {
+                    vars.clear();
+                    vars.resize(self.n_vars_total, zero);
+                }
                 false
             }
         };
         let copy_n = self.state_count.min(u.len());
         vars[..copy_n].copy_from_slice(&u[..copy_n]);
+        vars[copy_n..self.state_count].fill(zero);
         for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
-            if let (Some(dst), Some(&val)) = (vars.get_mut(self.state_count + i), params.get(slot))
-            {
-                *dst = val;
+            if let Some(dst) = vars.get_mut(self.state_count + i) {
+                *dst = params.get(slot).copied().unwrap_or(zero);
             }
         }
-        if let Some(d) = vars.get_mut(self.time_slot) {
-            *d = T::from_f64(t);
+        if b.seed_time {
+            if let Some(d) = vars.get_mut(self.time_slot) {
+                *d = T::from_f64(t);
+            }
         }
-        if let Some(d) = vars.get_mut(self.tafd_slot) {
-            *d = T::from_f64(tafd);
+        if b.seed_tafd {
+            if let Some(d) = vars.get_mut(self.tafd_slot) {
+                *d = T::from_f64(tafd);
+            }
         }
-        if let Some(d) = vars.get_mut(self.tad_slot) {
-            *d = tad;
+        if b.seed_tad {
+            if let Some(d) = vars.get_mut(self.tad_slot) {
+                *d = tad;
+            }
         }
-        if let Some(d) = vars.get_mut(self.macheps_slot) {
-            *d = T::from_f64(f64::EPSILON);
+        if b.seed_macheps {
+            if let Some(d) = vars.get_mut(self.macheps_slot) {
+                *d = T::from_f64(f64::EPSILON);
+            }
         }
-        for d in du.iter_mut() {
-            *d = T::from_f64(0.0);
+        if b.zero || du.len() != self.state_count {
+            for d in du.iter_mut() {
+                *d = zero;
+            }
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.

@@ -19,9 +19,19 @@
 //! from these starts stops with rounding errors at 814.84. The control streams are in
 //! `tests/nonmem/mm_basin_shift_*.ctl`.
 //!
-//! The two Tier-2 tests use a 10-subject subset (subjects 1–5 plus the five the issue
-//! names as trapped) on which the same trap reproduces in about a second. Every number
-//! below was measured on Linux x86_64, identically at 1, 2, 4 and 16 threads.
+//! The two Tier-2 tests use a 10-subject subset on which the same trap reproduces in a
+//! few seconds. Every number below was measured on Linux x86_64.
+//!
+//! **The subset changed with #1527.** The original one — subjects 1–5 plus the five the
+//! issue names as trapped — trapped only because the inner loop's Nelder–Mead fallback
+//! certified two of its EBEs as converged at gradient norms of 57.8 and 19.0 early in the
+//! fit, and the warm start carried them. With that fallback certified on stationarity the
+//! same fit goes straight to its optimum (−148.6795) and never traps, so it can no longer
+//! exercise the restart. Subjects 5, 20, 40, 74, 83, 106, 159, 167, 175 and 199 (one of
+//! 3 traps in 60 random 10-subject draws from `mm_n200.csv`) trap on a genuine secondary
+//! mode instead. The trapped leg and both tests' warnings are identical before and after
+//! #1527 to every digit quoted below; the restarted leg ends at −79.1679 with #1527 and at
+//! −79.1691 without it.
 //!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
@@ -66,11 +76,11 @@ fn quoted_pair(message: &str) -> (f64, f64) {
     (cold, best)
 }
 
-/// The restart path. Before #1565 this fit reported OFV −143.4726 with `converged =
-/// true`: best-seen −141.7318, cold re-solve at the same θ 1.74 *lower*, one subject in
-/// a lower cold mode. Now the run is restarted from that point — its first inner solve
-/// is cold — and reaches −148.6799, 5.2 below what was reported. A refit from those
-/// estimates reproduces −148.6804, so this is the optimum and not another trap.
+/// The restart path. The trapped leg ends after 44 evaluations at a point whose cold
+/// re-solve scores −74.973431, below what the optimizer saw there; the run is restarted
+/// from it — its first inner solve is cold — and reaches −79.1679, 4.2 below the trapped
+/// leg. A refit started from those estimates reproduces −79.168, so this is the optimum
+/// and not another trap.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
     let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", None);
@@ -90,15 +100,15 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
     assert!(
-        notice.message.contains("cold OFV = -143.472619"),
+        notice.message.contains("cold OFV = -74.973431"),
         "the notice names the trapped leg's cold objective: {}",
         notice.message
     );
 
     assert!(
-        result.ofv < -148.6,
-        "expected the restart to reach the optimum (−148.6799); pre-#1565 reported \
-         −143.4726. Got {}",
+        result.ofv < -79.1,
+        "expected the restart to reach the optimum (−79.1679); the trapped leg's cold \
+         objective is −74.9734. Got {}",
         result.ofv
     );
     assert!(
@@ -116,14 +126,14 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
     );
 }
 
-/// The no-restart path. At `maxiter = 5` (a 45-evaluation budget) the first leg ends
-/// with NLopt `Success` after 46 evaluations — L-BFGS checks `maxeval` only between line
-/// searches — at the same trapped point as above, so there is no budget left to restart
-/// on. Before #1565 this fit reported `converged = true`; the gap must now surface as a
-/// warning and a non-converged fit.
+/// The no-restart path. At `maxiter = 4` (a 36-evaluation budget) the first leg spends
+/// its budget at a trapped point — one subject in the higher mode — so there is no budget
+/// left to restart on. Before #1565 such a fit reported `converged = true`; the gap must
+/// surface as a warning and a non-converged fit. (`maxiter = 5` no longer reaches this
+/// arm on this subset: its first leg stops after 44 of 45 evaluations and restarts.)
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(5));
+    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(4));
 
     let warning = result
         .warnings_structured
@@ -153,8 +163,8 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        (best - cold - 1.7408).abs() < 1e-3,
-        "measured gap 1.7408 (best-seen −141.7318, cold −143.4726): got {best} vs {cold}"
+        (best - cold - 7.9121).abs() < 1e-3,
+        "measured gap 7.9121 (best-seen −67.0614, cold −74.9734): got {best} vs {cold}"
     );
     assert!(
         !result.converged,

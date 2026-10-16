@@ -2413,6 +2413,8 @@ fn tv_cov_population() -> crate::types::Population {
             dose_covariates: Vec::new(),
             obs_covariates: vec![std::collections::HashMap::from([("WT".to_string(), 80.0)])],
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -6497,6 +6499,76 @@ fn covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name() {
         "(c) {:?}",
         g[0].read_outside_groups
     );
+}
+
+/// A group records the single anchors whose theta it reads (#1630), with the
+/// anchor-stopped reachability walk alongside the group-stopped one. Cells:
+///
+/// - (a) `V2 = TVV2*exp(ETA_V2)` next to a `V1` group reading `TVV2`: the
+///   anchor is recorded, `TVV2` is outside the group (through `V2`) but not
+///   outside groups *and* anchors; an anchor on a theta the group does not read
+///   (`KA`) is not listed;
+/// - (b) a third reader of `TVV2` (`Q`) is outside both walks;
+/// - (c) a later assignment that is no longer an anchor (`V2 = TVV2 + ETA_V2`)
+///   retires it, as it retires a group — a stale anchor would be absorbed and
+///   stepped from an expression the model no longer evaluates;
+/// - (d) an anchor whose eta a second right-hand side reads says so.
+#[test]
+fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
+    let tn = ["TVV2", "TH_R", "TH_WT", "TVKA"];
+    let en = ["ETA_V1", "ETA_V2", "ETA_KA"];
+    let group = "V1 = TVV2 * TH_R * (WT / 70.0)^TH_WT * exp(ETA_V1)";
+    let base = format!("V2 = TVV2 * exp(ETA_V2)\nKA = TVKA * exp(ETA_KA)\n{group}");
+
+    let g = detect_groups_outside(&base, &tn, &en, &["V1", "V2", "KA"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].read_outside_groups, vec!["TVV2"], "(a)");
+    assert!(
+        g[0].read_outside_groups_and_anchors.is_empty(),
+        "(a) {:?}",
+        g[0].read_outside_groups_and_anchors
+    );
+    assert_eq!(g[0].colliding_anchors.len(), 1, "(a)");
+    let a = &g[0].colliding_anchors[0];
+    assert_eq!(a.eta_name, "ETA_V2");
+    assert_eq!(a.theta_names, vec!["TVV2"]);
+    assert_eq!(a.transform, MuTransform::Log);
+    assert!(a.read_outside_groups_and_anchors.is_empty(), "(a)");
+    assert!(!a.eta_shared, "(a)");
+
+    // (a') A second group that reads `TVKA` but not `TVV2`: each group lists
+    // the anchors on *its* thetas only.
+    let tn2 = ["TVV2", "TH_R", "TH_WT", "TVKA", "TH_KA"];
+    let two = format!("{base}\nKA = TVKA * (WT / 70.0)^TH_KA * exp(ETA_KA)");
+    let g = detect_groups_outside(&two, &tn2, &en, &["V1", "V2", "KA"]);
+    assert_eq!(g.len(), 2, "(a')");
+    assert_eq!(g[0].eta_name, "ETA_V1");
+    let etas = |g: &CovariateMuRef| -> Vec<String> {
+        g.colliding_anchors
+            .iter()
+            .map(|a| a.eta_name.clone())
+            .collect()
+    };
+    assert_eq!(etas(&g[0]), vec!["ETA_V2"], "(a')");
+    // `ETA_KA`'s plain line is overwritten by its group, so it is no anchor.
+    assert!(etas(&g[1]).is_empty(), "(a') {:?}", etas(&g[1]));
+
+    let third = format!("{base}\nQ = TVV2 * 0.1");
+    let g = detect_groups_outside(&third, &tn, &en, &["V1", "V2", "KA", "Q"]);
+    assert_eq!(g[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
+    assert_eq!(
+        g[0].colliding_anchors[0].read_outside_groups_and_anchors,
+        vec!["TVV2"],
+        "(b)"
+    );
+
+    let retired = format!("{base}\nV2 = TVV2 + ETA_V2");
+    let g = detect_groups_outside(&retired, &tn, &en, &["V1", "V2", "KA"]);
+    assert!(g[0].colliding_anchors.is_empty(), "(c)");
+
+    let shared_eta = format!("{base}\nQ = 3.0 * exp(0.5 * ETA_V2)");
+    let g = detect_groups_outside(&shared_eta, &tn, &en, &["V1", "V2", "KA", "Q"]);
+    assert!(g[0].colliding_anchors[0].eta_shared, "(d)");
 }
 
 #[test]
@@ -11881,6 +11953,8 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -11954,6 +12028,8 @@ fn test_selected_error_obs_keys_dispatch() {
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -22397,6 +22473,8 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             dose_covariates: vec![HashMap::from([("ZCOV".to_string(), zcov[0])])],
             obs_covariates: per_obs,
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -22518,6 +22596,8 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -24963,6 +25043,8 @@ fn subject_time_after_dose_is_the_data_tad() {
         id: "4".into(),
         doses: vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)],
         pk_only_times: vec![-3.0],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         obs_times: vec![-2.0, 0.0, 10.0, 12.0],
         ..Default::default()
     };
@@ -32260,5 +32342,878 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
                 );
             }
         }
+    }
+}
+
+// ─── #1523: lean RHS binding (P1c skip re-zero, B3 skip unread seeds) ───────
+
+/// Two states `a`, `b`; individual parameters `CL`, `V`, `Q` at PK slots 0, 1, 2.
+fn lean_spec(lines: &[&str]) -> crate::ode::OdeSpec {
+    let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    build_ode_spec(
+        &lines,
+        &["a".to_string(), "b".to_string()],
+        Some("a"),
+        &["CL".to_string(), "V".to_string(), "Q".to_string()],
+        &[0, 1, 2],
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("lean fixture {lines:?} parses: {e}"))
+}
+
+fn lean_plan(lines: &[&str]) -> RhsBindingPlan {
+    lean_spec(lines)
+        .rhs_program
+        .as_ref()
+        .expect("ODE spec carries its RHS program")
+        .binding
+}
+
+/// Each fixture with the plan it must get. `zero = false` only where every read
+/// provably sees this call's value; each `seed_*` only where that slot is read.
+/// The rows pair up so each field is shown flipping on a one-line change.
+const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
+    // (name, odes, [zero, time, tafd, tad, macheps])
+    (
+        "flat with an intermediate",
+        &[
+            "K = CL / V",
+            "d/dt(a) = -K * a + Q * b",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "nothing to lift",
+        &["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"],
+        [false, false, false, false, false],
+    ),
+    (
+        "if/else both define K",
+        &[
+            "if (a > 50.0) { K = CL / V } else { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "if without else defines K",
+        &[
+            "K = CL / V",
+            "if (a > 50.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    (
+        "K defined only inside an if without else",
+        &[
+            "if (a > 50.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "d/dt(b) only inside an if without else",
+        &[
+            "d/dt(a) = -CL / V * a",
+            "if (a > 50.0) { d/dt(b) = CL / V * a - Q * b }",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "intermediate read before its first write",
+        &[
+            "K = CL / V",
+            "if (a > 50.0) { R = 2.0 } else { R = K * R }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "reads T",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * T",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, true, false, false, false],
+    ),
+    (
+        "reads TAFD",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * TAFD",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, true, false, false],
+    ),
+    (
+        "reads TAD",
+        &[
+            "d/dt(a) = -CL / V * a + 0.001 * TAD",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, false, true, false],
+    ),
+    (
+        "reads MACHEPS",
+        &[
+            "d/dt(a) = -CL / V * a + MACHEPS",
+            "d/dt(b) = CL / V * a - Q * b",
+        ],
+        [false, false, false, false, true],
+    ),
+    (
+        "reads TAD in a condition only",
+        &[
+            "K = CL / V",
+            "if (TAD > 1.0) { K = 2.0 * CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, true, false],
+    ),
+    // Nothing to lift (`R = CL` is a bare slot copy), so this re-zero is the
+    // no-hoist reset of both binding sites, not `RhsHoist::reset`.
+    (
+        "no hoist, R defined only inside an if without else",
+        &[
+            "if (a > 50.0) { R = CL }",
+            "d/dt(a) = -R * a",
+            "d/dt(b) = R * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "no hoist, R defined on both arms",
+        &[
+            "if (a > 50.0) { R = CL } else { R = Q }",
+            "d/dt(a) = -R * a",
+            "d/dt(b) = R * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // A condition reading an intermediate that only an earlier optional arm
+    // defined, with every body otherwise clean: only the condition check sees it.
+    (
+        "condition reads an intermediate defined only inside an if",
+        &[
+            "if (a > 50.0) { R = 2.0 }",
+            "if (R > 1.0) { K = 2.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "condition reads an intermediate defined before the if",
+        &[
+            "R = a / 25.0",
+            "if (R > 2.0) { K = 2.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // `else if`: the middle arm alone omits K, so every arm has to be walked.
+    (
+        "else-if arm that omits K",
+        &[
+            "if (a > 90.0) { K = 2.0 * CL / V } else if (a > 50.0) { R = 1.0 } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "else-if, every arm defines K",
+        &[
+            "if (a > 90.0) { K = 2.0 * CL / V } else if (a > 50.0) { K = 3.0 * CL / V } else { K = CL / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // An intermediate defined only by an earlier optional arm, read in exactly
+    // one sub-shape of a condition each — the right of `&&` / `||`, under `!`,
+    // in `present()`, in an inline `if`'s condition and in its else value — so
+    // each recursion arm of the walk is the only thing that can see it.
+    (
+        "optional R read on the right of &&",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (a > 0.0 && R > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read on the right of ||",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (a > 1000.0 || R > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read under !",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (!(R > 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by present()",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (present(R)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    // An inline `if` in an assignment compiles to bytecode (the `PushVar` check);
+    // inside an `if` condition it stays an expression tree, the walk's other path.
+    (
+        "optional R read on the right of a comparison",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.0 < R) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the condition of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (R > 0.0) 1.0 else 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read on the left of &&",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (R > 0.0 && a > 0.0) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the then value of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (a < 50.0) R else 0.0)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read under arithmetic inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < exp(2.0 * R) ^ 0.5) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by the else value of an inline if inside a condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "if (0.5 < (if (a > 50.0) 1.0 else R)) { K = CL / V } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by an inline if's condition",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "K = (if (R > 0.0) CL / V else Q / V)",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "optional R read by an inline if's else value",
+        &[
+            "if (a > 50.0) { R = 1.0 }",
+            "K = (if (a > 50.0) CL / V else R)",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [true, false, false, false, false],
+    ),
+    (
+        "compound conditions on defined values only",
+        &[
+            "R = a / 25.0",
+            "if (!(a > 1000.0) && (R > 2.0 || present(R))) { K = (if (R > 3.0) 2.0 * CL / V else CL / V) } else { K = Q / V }",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, false],
+    ),
+    // MACHEPS read only from a parameter-only expression, so on the hoisted
+    // paths it is read by the lifted code alone.
+    (
+        "MACHEPS read only by lifted code",
+        &[
+            "K = CL / V + MACHEPS",
+            "d/dt(a) = -K * a",
+            "d/dt(b) = K * a - Q * b",
+        ],
+        [false, false, false, false, true],
+    ),
+];
+
+/// The lean `Dual2` RHS against central finite differences of the lean f64
+/// closure — the production value path — on every fixture. Axes: `CL`, `Q`, and a
+/// dose lag that moves `TAD` (seeded as `TAD = t − last − lag`), so a binding
+/// that wrote the `TAD` slot's value but dropped its jet shows up on the fixtures
+/// that read `TAD`, and the asserted non-zero `∂/∂lag` keeps that axis live.
+#[test]
+fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
+    type D2 = crate::sens::dual2::Dual2<3>;
+    let (first, last) = (0.25, 0.4);
+    let points: [([f64; 2], f64); 4] = [
+        ([100.0, 3.0], 0.5),
+        ([80.0, 9.0], 1.25),
+        ([40.0, 9.0], 1.75),
+        ([30.0, 12.0], 2.5),
+    ];
+    // x = [CL, Q, lag]; V fixed.
+    let x0 = [4.0, 0.7, 0.0];
+    let v = 40.0;
+    let ext = |x: &[f64; 3]| -> Vec<f64> {
+        let mut p = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        p[0] = x[0];
+        p[1] = v;
+        p[2] = x[1];
+        p[crate::types::MAX_PK_PARAMS] = first;
+        p[crate::types::MAX_PK_PARAMS + 1] = last + x[2];
+        p
+    };
+    let (mut worst_g, mut worst_h) = (0.0f64, 0.0f64);
+    for (name, lines, _) in LEAN_FIXTURES {
+        let spec = lean_spec(lines);
+        let prog = spec.rhs_program.as_ref().unwrap();
+        let mut lag_live = false;
+        for (u, t) in &points {
+            let f = |x: &[f64; 3]| -> [f64; 2] {
+                let mut du = [0.0; 2];
+                (spec.rhs)(u, &ext(x), *t, &mut du);
+                du
+            };
+            let mut params: Vec<D2> = ext(&x0).iter().map(|&p| D2::constant(p)).collect();
+            params[0] = D2::var(x0[0], 0);
+            params[2] = D2::var(x0[1], 1);
+            let tad = D2::constant(t - last) - D2::var(x0[2], 2);
+            let ud: Vec<D2> = u.iter().map(|&s| D2::constant(s)).collect();
+            let mut du = vec![D2::constant(0.0); 2];
+            let (mut vars, mut stack) = (Vec::new(), Vec::new());
+            prog.eval_rhs_g::<D2>(
+                &ud,
+                &params,
+                *t,
+                t - first,
+                tad,
+                &mut du,
+                &mut vars,
+                &mut stack,
+            );
+
+            let f0 = f(&x0);
+            let shift = |i: usize, hi: f64, j: usize, hj: f64| {
+                let mut x = x0;
+                x[i] += hi;
+                x[j] += hj;
+                f(&x)
+            };
+            for k in 0..2 {
+                assert!(du[k].value.is_finite(), "{name}: du[{k}] not finite");
+                // Not bitwise: `Dual2` divides as `× recip`, the f64 VM divides.
+                assert!(
+                    (du[k].value - f0[k]).abs() <= 1e-14 * (1.0 + f0[k].abs()),
+                    "{name}: value du[{k}] dual {} vs f64 {}",
+                    du[k].value,
+                    f0[k]
+                );
+                let scale = |g: f64| 1.0 + g.abs();
+                for i in 0..3 {
+                    let h = 1e-6;
+                    let fd = (shift(i, h, i, 0.0)[k] - shift(i, -h, i, 0.0)[k]) / (2.0 * h);
+                    let g = du[k].grad[i];
+                    assert!(g.is_finite(), "{name}: grad[{k}][{i}] not finite");
+                    worst_g = worst_g.max((g - fd).abs() / scale(fd));
+                    assert!(
+                        // Measured worst 5.2e-9 relative; 19x headroom.
+                        (g - fd).abs() <= 1e-7 * scale(fd),
+                        "{name} t={t}: ∂du[{k}]/∂x{i} dual {g} vs fd {fd}"
+                    );
+                    if i == 2 && g != 0.0 {
+                        lag_live = true;
+                    }
+                    for j in 0..3 {
+                        let h = 1e-4;
+                        let fd2 =
+                            (shift(i, h, j, h)[k] - shift(i, h, j, -h)[k] - shift(i, -h, j, h)[k]
+                                + shift(i, -h, j, -h)[k])
+                                / (4.0 * h * h);
+                        let hh = du[k].hess[i][j];
+                        assert!(hh.is_finite(), "{name}: hess[{k}][{i}][{j}] not finite");
+                        worst_h = worst_h.max((hh - fd2).abs() / scale(fd2));
+                        assert!(
+                            // Measured worst 1.4e-6 relative (FD noise at h = 1e-4); 14x headroom.
+                            (hh - fd2).abs() <= 2e-5 * scale(fd2),
+                            "{name} t={t}: ∂²du[{k}]/∂x{i}∂x{j} dual {hh} vs fd {fd2}"
+                        );
+                    }
+                }
+            }
+        }
+        // A TAD read only by a condition has no derivative; an arithmetic one must.
+        let want_live = lines
+            .iter()
+            .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
+        assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
+    }
+    eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
+}
+
+/// A lean binding skips the fill of a right-shaped buffer, never the resize of a
+/// wrong-shaped one: the f64 scratch is one thread-local shared by every ODE model
+/// on the thread, and a `vars` buffer handed to `eval_rhs_g` may have last held
+/// another model. Two lean, no-hoist, `zero = false` models run smaller then
+/// larger on the same buffer, with no same-shaped call in between; the larger
+/// one's intermediates sit past the smaller buffer's end, so a skipped resize
+/// drops their writes and reads them as 0.
+#[test]
+fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
+    let small_lines = ["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"];
+    let large_lines = [
+        "R1 = CL",
+        "R2 = R1",
+        "R3 = R2",
+        "R4 = R3",
+        "R5 = Q",
+        "d/dt(a) = -R4 * a",
+        "d/dt(b) = R4 * a - R5 * b",
+    ];
+    let small = lean_spec(&small_lines);
+    let large = lean_spec(&large_lines);
+    let full_large = {
+        let _off = RhsLeanBindingOff::enter();
+        lean_spec(&large_lines)
+    };
+    let (sp, lp) = (
+        small.rhs_program.as_ref().unwrap(),
+        large.rhs_program.as_ref().unwrap(),
+    );
+    for (name, p) in [("small", sp), ("large", lp)] {
+        assert!(p.hoist.is_none(), "{name}: must take the no-hoist reset");
+        assert!(
+            !p.binding.zero,
+            "{name}: must be a lean (no re-zero) binding"
+        );
+    }
+    // The straddle: an intermediate the large model writes lies past the end of
+    // the small model's buffer.
+    assert!(
+        lp.n_vars_total > sp.n_vars_total + 1,
+        "large {} vs small {}",
+        lp.n_vars_total,
+        sp.n_vars_total
+    );
+
+    let mut params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+    params[..3].copy_from_slice(&[4.0, 40.0, 0.7]);
+    let u = [100.0, 3.0];
+
+    // f64 closure, shared thread-local. Oracle first, then small, then large.
+    let mut want = [0.0; 2];
+    (full_large.rhs)(&u, &params, 0.5, &mut want);
+    assert!(want.iter().all(|w| w.is_finite() && *w != 0.0));
+    let mut sink = [0.0; 2];
+    (small.rhs)(&u, &params, 0.5, &mut sink);
+    FERX_SCRATCH.with(|c| assert_eq!(c.borrow().rhs_vars.len(), sp.n_vars_total));
+    let mut got = [0.0; 2];
+    (large.rhs)(&u, &params, 0.5, &mut got);
+    for j in 0..2 {
+        assert!(
+            hoist_bits_eq(got[j], want[j]),
+            "f64 closure du[{j}]: lean {} vs full {}",
+            got[j],
+            want[j]
+        );
+    }
+
+    // Generic VM, one `vars` buffer handed to both programs in turn.
+    let (mut vars, mut stack) = (Vec::new(), Vec::new());
+    let mut sink = vec![0.0; 2];
+    sp.eval_rhs_g::<f64>(
+        &u, &params, 0.5, 0.25, 0.1, &mut sink, &mut vars, &mut stack,
+    );
+    assert_eq!(vars.len(), sp.n_vars_total);
+    let mut got = vec![0.0; 2];
+    lp.eval_rhs_g::<f64>(&u, &params, 0.5, 0.25, 0.1, &mut got, &mut vars, &mut stack);
+    for j in 0..2 {
+        assert!(
+            hoist_bits_eq(got[j], want[j]),
+            "generic du[{j}]: lean {} vs full {}",
+            got[j],
+            want[j]
+        );
+    }
+}
+
+/// Every operand position of the def-before-use walk's expression and condition
+/// recursion, one at a time: an undefined slot there must fail the check, and the
+/// same shape with every slot defined must pass. Complements the end-to-end
+/// `LEAN_FIXTURES` rows, which can only reach the shapes the DSL keeps as trees
+/// (an assignment's right-hand side compiles to bytecode).
+#[test]
+fn lean_rhs_walk_checks_every_operand_position() {
+    let defined = [true, false];
+    let d = || Expression::VariableIdx(0);
+    let u = || Expression::VariableIdx(1);
+    // Each builder takes the expression to place in its one varying position.
+    type Ex = fn(Expression) -> Expression;
+    let exprs: &[(&str, Ex)] = &[
+        ("bare read", |x| x),
+        ("BinOp left", |x| {
+            binop(BinOp::Add, x, Expression::VariableIdx(0))
+        }),
+        ("BinOp right", |x| {
+            binop(BinOp::Mul, Expression::VariableIdx(0), x)
+        }),
+        ("Power base", |x| {
+            Expression::Power(Box::new(x), Box::new(lit(2.0)))
+        }),
+        ("Power exponent", |x| {
+            Expression::Power(Box::new(lit(2.0)), Box::new(x))
+        }),
+        ("UnaryFn", |x| unary("exp", x)),
+        ("Conditional condition", |x| {
+            cond(cmp(x, CmpOp::Gt, lit(0.0)), lit(1.0), lit(2.0))
+        }),
+        ("Conditional then", |x| {
+            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), x, lit(2.0))
+        }),
+        ("Conditional else", |x| {
+            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), lit(1.0), x)
+        }),
+    ];
+    for (name, f) in exprs {
+        assert!(
+            expr_reads_defined(&f(d()), &defined),
+            "{name}: defined read must pass"
+        );
+        assert!(
+            !expr_reads_defined(&f(u()), &defined),
+            "{name}: undefined read must fail"
+        );
+    }
+    type Cx = fn(Expression) -> Condition;
+    let conds: &[(&str, Cx)] = &[
+        ("Compare left", |x| cmp(x, CmpOp::Lt, lit(0.0))),
+        ("Compare right", |x| cmp(lit(0.0), CmpOp::Lt, x)),
+        ("And left", |x| {
+            Condition::And(
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("And right", |x| {
+            Condition::And(
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Or left", |x| {
+            Condition::Or(
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Or right", |x| {
+            Condition::Or(
+                Box::new(cmp(lit(1.0), CmpOp::Gt, lit(0.0))),
+                Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
+            )
+        }),
+        ("Not", |x| {
+            Condition::Not(Box::new(cmp(x, CmpOp::Gt, lit(0.0))))
+        }),
+        ("Present", Condition::Present),
+    ];
+    for (name, f) in conds {
+        assert!(
+            cond_reads_defined(&f(d()), &defined),
+            "{name}: defined read must pass"
+        );
+        assert!(
+            !cond_reads_defined(&f(u()), &defined),
+            "{name}: undefined read must fail"
+        );
+    }
+    // Bytecode: any PushVar of an undefined slot fails, wherever it sits.
+    let bc = |e: Expression| compile_bytecode(&e);
+    assert!(bc_reads_defined(&bc(binop(BinOp::Add, d(), d())), &defined));
+    assert!(!bc_reads_defined(
+        &bc(binop(BinOp::Add, d(), u())),
+        &defined
+    ));
+    assert!(!bc_reads_defined(
+        &bc(binop(BinOp::Add, u(), d())),
+        &defined
+    ));
+    // Out of range is undefined, never a panic.
+    assert!(!expr_reads_defined(&Expression::VariableIdx(7), &defined));
+}
+
+/// Which fixtures reach which reset. The no-hoist rows exist to drive the
+/// `hoist = None` arm of both binding sites, and the MACHEPS row to put its only
+/// read inside the lifted code — a fixture whose path silently changed would
+/// leave that branch untested while the plan assertions stayed green.
+#[test]
+fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
+    let has_hoist = |name: &str| {
+        let (_, lines, _) = LEAN_FIXTURES
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .unwrap_or_else(|| panic!("no fixture {name}"));
+        let spec = lean_spec(lines);
+        spec.rhs_program.as_ref().unwrap().hoist.is_some()
+    };
+    for name in [
+        "no hoist, R defined only inside an if without else",
+        "no hoist, R defined on both arms",
+    ] {
+        assert!(!has_hoist(name), "{name}: must take the no-hoist reset");
+    }
+    let spec = lean_spec(&[
+        "K = CL / V + MACHEPS",
+        "d/dt(a) = -K * a",
+        "d/dt(b) = K * a - Q * b",
+    ]);
+    let p = spec.rhs_program.as_ref().unwrap();
+    let h = p.hoist.as_ref().expect("MACHEPS fixture is hoisted");
+    let slot = [p.macheps_slot];
+    assert!(
+        !stmts_read_slots(&h.stmts, &slot)
+            && h.lifted.iter().any(|(_, bc)| bc
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::PushVar(i) if *i as usize == p.macheps_slot))),
+        "MACHEPS must be read only by the lifted code, not the residual statements"
+    );
+    assert!(has_hoist("K defined only inside an if without else"));
+}
+
+#[test]
+fn lean_rhs_binding_plan_matches_each_fixture() {
+    for (name, lines, want) in LEAN_FIXTURES {
+        let p = lean_plan(lines);
+        let got = [p.zero, p.seed_time, p.seed_tafd, p.seed_tad, p.seed_macheps];
+        assert_eq!(&got, want, "{name}: [zero, time, tafd, tad, macheps]");
+    }
+    // The kill switch restores the full binding on every fixture.
+    let _off = RhsLeanBindingOff::enter();
+    for (name, lines, _) in LEAN_FIXTURES {
+        let p = lean_plan(lines);
+        assert!(
+            p.zero && p.seed_time && p.seed_tafd && p.seed_tad && p.seed_macheps,
+            "{name}: RhsLeanBindingOff must give the full binding"
+        );
+    }
+}
+
+/// Garbage a stale slot could hold. Finite and far from anything the fixtures
+/// compute, so a read of it shows up in every output bit.
+const LEAN_GARBAGE: f64 = 3.0e250;
+
+/// The same call sequence through the lean and the full binding, on scratch that
+/// persists across calls the way an integrator's does — and with the lean side's
+/// program slots and `du` overwritten with garbage before every call, the worst a
+/// previous call (or another model sharing the f64 thread-local) could leave.
+/// The full binding re-zeroes, so it is the oracle. States cross the `a > 50`
+/// branch and parameters move, so both arms of each `if` run and the hoist cache
+/// both hits and misses.
+#[test]
+fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
+    type D1 = crate::sens::dual1::Dual1<3>;
+    type D2 = crate::sens::dual2::Dual2<2>;
+
+    let p1 = [4.0, 40.0, 0.7];
+    let p2 = [4.0, 40.0, 1.3];
+    let p3 = [6.5, 33.0, 0.7];
+    let calls: [(&[f64; 3], [f64; 2], f64); 6] = [
+        (&p1, [100.0, 3.0], 0.5),
+        (&p1, [80.0, 9.0], 1.25),
+        (&p2, [40.0, 9.0], 1.75), // branch flips
+        (&p2, [30.0, 12.0], 2.0),
+        (&p3, [60.0, 12.0], 2.5), // branch flips back
+        (&p1, [100.0, 3.0], 0.5),
+    ];
+    // First dose at 0.25 and last at 0.4: TAFD and TAD are live and distinct.
+    let (first, last) = (0.25, 0.4);
+    let ext = |p: &[f64; 3]| -> Vec<f64> {
+        let mut v = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        v[..3].copy_from_slice(p);
+        v[crate::types::MAX_PK_PARAMS] = first;
+        v[crate::types::MAX_PK_PARAMS + 1] = last;
+        v
+    };
+
+    fn pollute<T: crate::sens::num::vm::VmNum>(vars: &mut [T], n: usize, du: &mut [T]) {
+        let n = n.min(vars.len());
+        vars[..n].fill(T::from_f64(LEAN_GARBAGE));
+        du.fill(T::from_f64(-LEAN_GARBAGE));
+    }
+
+    fn run_g<T: crate::sens::num::vm::VmNum>(
+        name: &str,
+        lean: &OdeRhsProgram,
+        full: &OdeRhsProgram,
+        seq: &[(Vec<T>, [f64; 2], f64)],
+        tafd_of: impl Fn(f64) -> f64,
+        tad_of: impl Fn(f64) -> T,
+    ) {
+        let (mut vl, mut sl, mut vf, mut sf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (k, (params, u, t)) in seq.iter().enumerate() {
+            let u: Vec<T> = u.iter().map(|&x| T::from_f64(x)).collect();
+            let mut want = vec![T::from_f64(0.0); 2];
+            full.eval_rhs_g::<T>(
+                &u,
+                params,
+                *t,
+                tafd_of(*t),
+                tad_of(*t),
+                &mut want,
+                &mut vf,
+                &mut sf,
+            );
+            let mut got = vec![T::from_f64(0.0); 2];
+            pollute(&mut vl, lean.n_vars_total, &mut got);
+            lean.eval_rhs_g::<T>(
+                &u,
+                params,
+                *t,
+                tafd_of(*t),
+                tad_of(*t),
+                &mut got,
+                &mut vl,
+                &mut sl,
+            );
+            for j in 0..2 {
+                assert!(
+                    want[j].val().is_finite(),
+                    "{name} call {k}: oracle du[{j}] not finite"
+                );
+                assert!(
+                    got[j].same_bits(&want[j]),
+                    "{name} call {k} du[{j}]: lean {} vs full {}",
+                    got[j].val(),
+                    want[j].val()
+                );
+            }
+        }
+    }
+
+    for (name, lines, _) in LEAN_FIXTURES {
+        let lean_s = lean_spec(lines);
+        let full_s = {
+            let _off = RhsLeanBindingOff::enter();
+            lean_spec(lines)
+        };
+        let lean = lean_s.rhs_program.as_ref().unwrap();
+        let full = full_s.rhs_program.as_ref().unwrap();
+        assert!(full.binding.zero, "{name}: oracle must be the full binding");
+
+        // The f64 closure, on the shared thread-local scratch. All oracle calls
+        // first: interleaving them would hand the lean program a buffer stamped
+        // with the other program's hoist id on every call, so it would never run
+        // warm and the pollution below would test nothing.
+        let wants: Vec<[f64; 2]> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut want = [0.0; 2];
+                (full_s.rhs)(u, &ext(p), *t, &mut want);
+                want
+            })
+            .collect();
+        for (k, ((p, u, t), want)) in calls.iter().zip(&wants).enumerate() {
+            let params = ext(p);
+            let mut got = [-LEAN_GARBAGE; 2];
+            FERX_SCRATCH.with(|c| {
+                let mut s = c.borrow_mut();
+                let n = lean.n_vars_total.min(s.rhs_vars.len());
+                s.rhs_vars[..n].fill(LEAN_GARBAGE);
+            });
+            (lean_s.rhs)(u, &params, *t, &mut got);
+            for j in 0..2 {
+                assert!(
+                    want[j].is_finite(),
+                    "{name} call {k}: oracle du[{j}] not finite"
+                );
+                assert!(
+                    hoist_bits_eq(got[j], want[j]),
+                    "{name} call {k} du[{j}] f64 closure: lean {} vs full {}",
+                    got[j],
+                    want[j]
+                );
+            }
+        }
+
+        let tafd_of = |t: f64| t - first;
+        // f64 through the generic VM.
+        let seq: Vec<(Vec<f64>, [f64; 2], f64)> =
+            calls.iter().map(|(p, u, t)| (ext(p), *u, *t)).collect();
+        run_g::<f64>(name, lean, full, &seq, tafd_of, |t| t - last);
+        // Dual1: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
+        let seq: Vec<(Vec<D1>, [f64; 2], f64)> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut v: Vec<D1> = ext(p).iter().map(|&x| D1::constant(x)).collect();
+                for i in 0..3 {
+                    v[i] = D1::var(p[i], i);
+                }
+                (v, *u, *t)
+            })
+            .collect();
+        run_g::<D1>(name, lean, full, &seq, tafd_of, |t| {
+            D1::constant(t - last) - D1::var(0.0, 0)
+        });
+        // Dual2: second order takes the un-hoisted arm of `eval_rhs_g`.
+        let seq: Vec<(Vec<D2>, [f64; 2], f64)> = calls
+            .iter()
+            .map(|(p, u, t)| {
+                let mut v: Vec<D2> = ext(p).iter().map(|&x| D2::constant(x)).collect();
+                v[0] = D2::var(p[0], 0);
+                v[2] = D2::var(p[2], 1);
+                (v, *u, *t)
+            })
+            .collect();
+        run_g::<D2>(name, lean, full, &seq, tafd_of, |t| D2::constant(t - last));
     }
 }

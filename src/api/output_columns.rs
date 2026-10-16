@@ -187,12 +187,13 @@ pub(crate) fn compute_extra_output_columns(
                     let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
                     let eta_d = combined_for(occ);
                     // Evaluate at this dose's time so a `TIME`-dependent lag (or
-                    // any TIME-built-in parameter) is honoured per dose (#610).
+                    // any TIME-built-in parameter) is honoured per dose (#610), the
+                    // TIME as written, as the prediction reads it (#1969).
                     let pk_d = (model.pk_param_fn)(
                         theta,
                         &eta_d,
                         subject.dose_cov(d),
-                        subject.doses[d].time,
+                        subject.param_time_at(subject.doses[d].time),
                     );
                     // On ODE models the lag is keyed by dose compartment (`ALAGn`;
                     // issue #369), so resolve through `dose_attr_map` — the same
@@ -221,7 +222,8 @@ pub(crate) fn compute_extra_output_columns(
         for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
             // Evaluate at this observation's time so the sdtab individual-parameter
-            // columns honour the `TIME` built-in per row, matching IPRED (#610).
+            // columns honour the `TIME` built-in per row, matching IPRED (#610): the
+            // TIME as written, the clock the prediction's parameters read (#1969).
             // The subject's own mixture class is passed explicitly rather than left to
             // the ambient guard above: `MIXNUM` defaults to class 1, so a lookup that
             // relies on the guard is one refactor away from reporting class-1 typical
@@ -230,7 +232,7 @@ pub(crate) fn compute_extra_output_columns(
                 theta,
                 eta_full,
                 cov_j,
-                subject.obs_times[j],
+                subject.param_time_obs(j),
                 mix_class,
             );
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);

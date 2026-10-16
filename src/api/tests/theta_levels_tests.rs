@@ -86,6 +86,8 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 dose_covariates: Vec::new(),
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
                 reset_covariates: Vec::new(),
@@ -797,6 +799,8 @@ mod theta_gather_index_check {
                 .map(|&i| HashMap::from([("PLA_IDX".to_string(), i)]))
                 .collect(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -4216,6 +4220,19 @@ mod absorption {
         Ok((parsed.bindings.levels["PLACEBO"].contrast, free))
     }
 
+    /// The contrast `text` binds level block `name` to on `pop`, or `None` when
+    /// the bind is refused.
+    pub(super) fn bound_contrast(
+        text: &str,
+        pop: &Population,
+        name: &str,
+    ) -> Option<LevelContrast> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text).ok()?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p).ok()?;
+        Some(parsed.bindings.levels[name].contrast)
+    }
+
     /// The Jacobian pieces at the initial θ and η = κ = 0 ([`jacobian_at`] for
     /// another point), by central FD of the f64 predictor: the block's
     /// per-level columns (bound under `none`), the other θ columns, the
@@ -4234,6 +4251,41 @@ mod absorption {
         res: Vec<(String, bool, DMatrix<f64>)>,
         labels: Vec<String>,
         one_column: bool,
+        /// Every other level block (#1963): its name, its level labels, and
+        /// the `xo` columns that are its raw per-level θ, in level order.
+        others: Vec<(String, Vec<String>, Vec<usize>)>,
+    }
+
+    impl Jac {
+        /// This Jacobian with each other level block named in `contrasts` coded
+        /// by its contrast (#1963): its raw per-level columns in `xo` replaced by
+        /// `X_other · C`, by the chain rule `∂y/∂β = ∂y/∂θ_level · C`. A block
+        /// not named stays raw, as under `none`.
+        pub(super) fn coded(&self, contrasts: &[(&str, LevelContrast)]) -> Jac {
+            let mut keep: Vec<usize> = (0..self.xo.ncols()).collect();
+            let mut parts: Vec<DMatrix<f64>> = Vec::new();
+            for (name, labels, cols) in &self.others {
+                let Some(&(_, c)) = contrasts.iter().find(|(n, _)| n == name) else {
+                    continue;
+                };
+                keep.retain(|k| !cols.contains(k));
+                let raw =
+                    DMatrix::from_fn(self.xo.nrows(), cols.len(), |r, k| self.xo[(r, cols[k])]);
+                parts.push(raw * coding_of(labels, c));
+            }
+            let kept = DMatrix::from_fn(self.xo.nrows(), keep.len(), |r, k| self.xo[(r, keep[k])]);
+            let mut all: Vec<&DMatrix<f64>> = vec![&kept];
+            all.extend(parts.iter());
+            Jac {
+                xb: self.xb.clone(),
+                xo: hcat(&all),
+                z: self.z.clone(),
+                res: self.res.clone(),
+                labels: self.labels.clone(),
+                one_column: self.one_column,
+                others: Vec::new(),
+            }
+        }
     }
 
     /// Every block of `text` under `contrast = none`, on the levels `pop` shows.
@@ -4282,6 +4334,14 @@ mod absorption {
     pub(super) fn jacobian_at(text: &str, pop0: &Population, at: Point) -> Jac {
         const EV: [f64; 6] = [0.4, -0.3, 0.7, -0.6, 0.2, 0.5];
         const CV: [f64; 5] = [0.6, -0.9, 0.3, 1.0, -0.4];
+        // Every block measured under `none`, a second one declared with its
+        // own contrast too (#1963): `Jac::coded` applies that contrast.
+        // Any spelling of the key: a fixture written `contrast=ref` must not stay
+        // coded here and be coded a second time by `Jac::coded` (#1985 review, F8).
+        let text = &regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
+            .unwrap()
+            .replace_all(text, ", contrast = none]")
+            .into_owned();
         let fitted = none_layout(text, pop0);
         let mut pop = pop0.clone();
         let mut parsed = parse_full_model(text).unwrap();
@@ -4412,6 +4472,26 @@ mod absorption {
             res.push((m.kappa_names[q].clone(), true, mat(&cols)));
         }
         let labels = fitted["PLACEBO"].labels.clone();
+        // Each other block's raw level θ, by position in `other`: the θ named
+        // `NAME[label]` for each of its labels, in level order.
+        let others = fitted
+            .iter()
+            .filter(|(name, _)| name.as_str() != "PLACEBO")
+            .map(|(name, b)| {
+                let cols: Vec<usize> = b
+                    .labels
+                    .iter()
+                    .map(|l| {
+                        let want = format!("{name}[{l}]");
+                        other
+                            .iter()
+                            .position(|&k| m.theta_names[k] == want)
+                            .unwrap_or_else(|| panic!("no θ {want}"))
+                    })
+                    .collect();
+                (name.clone(), b.labels.clone(), cols)
+            })
+            .collect();
         Jac {
             xb: mat(&block.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
             xo: mat(&other.iter().map(|&k| theta_col(k)).collect::<Vec<_>>()),
@@ -4419,18 +4499,25 @@ mod absorption {
             res,
             one_column: !labels[0].contains(','),
             labels,
+            others,
         }
     }
 
     /// The coding matrix of `contrast` over the per-level columns.
     fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
-        let l = j.labels.len();
+        coding_of(&j.labels, contrast)
+    }
+
+    /// [`coding`] for a block whose levels are `labels`; a block is one-column
+    /// when its labels hold no `,`.
+    fn coding_of(labels: &[String], contrast: LevelContrast) -> DMatrix<f64> {
+        let l = labels.len();
+        let one_column = !labels.first().is_some_and(|s| s.contains(','));
         // A one-column block is a single group (`assign_groups`).
-        let grp: Vec<&str> = j
-            .labels
+        let grp: Vec<&str> = labels
             .iter()
             .map(|s| {
-                if j.one_column {
+                if one_column {
                     ""
                 } else {
                     s.split(',').next().unwrap()
@@ -4472,13 +4559,21 @@ mod absorption {
         let r = if x.ncols() == 0 {
             z.clone()
         } else {
-            let svd = x.clone().svd(true, false);
-            let u = svd.u.unwrap();
-            let s = &svd.singular_values;
-            assert!(s.iter().all(|v| v.is_finite()), "non-finite θ sensitivity");
-            let mx = s.iter().copied().fold(0.0, f64::max);
-            let keep: Vec<usize> = (0..s.len()).filter(|&i| s[i] > 1e-10 * mx).collect();
-            let q = DMatrix::from_fn(x.nrows(), keep.len(), |r, c| u[(r, keep[c])]);
+            // A basis of `col(x)` by column-pivoted Householder QR, its rank
+            // read off `R`'s diagonal. Not the SVD's `U`: on an `x` of exact
+            // rank deficiency (a second block's raw levels next to the
+            // intercept they sum to, #1963) nalgebra 0.35's SVD can return a
+            // `U` that misses a direction of `col(x)`, depending on the column
+            // order — a residual of 2e-2 where the reordered `x` gives 5e-16.
+            assert!(x.iter().all(|v| v.is_finite()), "non-finite θ sensitivity");
+            let qr = x.clone().col_piv_qr();
+            let rr = qr.r();
+            let d: Vec<f64> = (0..rr.nrows().min(rr.ncols()))
+                .map(|i| rr[(i, i)].abs())
+                .collect();
+            let mx = d.iter().copied().fold(0.0, f64::max);
+            let keep = d.iter().take_while(|v| **v > 1e-10 * mx).count();
+            let q = qr.q().columns(0, keep).into_owned();
             z - &q * (q.transpose() * z)
         };
         r.svd(false, false)
@@ -4544,6 +4639,15 @@ mod absorption {
     pub(super) fn block_loses_rank(j: &Jac, contrast: LevelContrast) -> bool {
         let xb = &j.xb * coding(j, contrast);
         rank(&residual_sv(&xb, &DMatrix::zeros(xb.nrows(), 0))) < xb.ncols()
+    }
+
+    /// Whether the block coded by `contrast` loses rank against the other θ
+    /// (#1977): `[X_o | X_B·C]` is not of full column rank beyond `X_o`'s own,
+    /// so some coded direction is a combination of the other θ. Implies
+    /// [`block_loses_rank`].
+    pub(super) fn block_aliased(j: &Jac, contrast: LevelContrast) -> bool {
+        let xb = &j.xb * coding(j, contrast);
+        rank(&residual_sv(&xb, &j.xo)) < xb.ncols()
     }
 
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
@@ -5294,7 +5398,10 @@ mod absorption {
 
     /// Whether the binder agrees with [`joint_oracle`] on `text(contrast)` over
     /// `pop`, by T1's rule: an explicit contrast leaving a free θ is refused
-    /// exactly when the oracle absorbs something under it, and `auto` resolves
+    /// exactly when the oracle absorbs something under it, the coded block
+    /// loses rank on its own, or — where the contrast must rescue an absorbed
+    /// random effect — the coded block loses rank against the other θ
+    /// ([`block_aliased`], #1977); and `auto` resolves
     /// to a contrast that absorbs nothing — global whenever global absorbs
     /// nothing — and is refused only when every contrast absorbs. Disagreements
     /// are pushed onto `wrong`.
@@ -5317,20 +5424,58 @@ mod absorption {
         at: Point,
         wrong: &mut Vec<String>,
     ) {
-        let jac = jacobian_at(&text("none"), pop, at);
+        agrees_with_joint_oracle_coded(tag, text, pop, at, &[], wrong)
+    }
+
+    /// [`agrees_with_joint_oracle_at`] with each other level block named in
+    /// `others` coded by the contrast given there (#1963) — the one the binder
+    /// resolves it to, which the caller states — and every other one raw.
+    pub(super) fn agrees_with_joint_oracle_coded(
+        tag: &str,
+        text: &dyn Fn(&str) -> String,
+        pop: &Population,
+        at: Point,
+        others: &[(&str, LevelContrast)],
+        wrong: &mut Vec<String>,
+    ) {
+        let jac = jacobian_at(&text("none"), pop, at).coded(others);
+        // The cells a contrast must rescue: the block absorbs a random effect
+        // under `none`, and the contrast is not the nested block's within-group
+        // one, which removes each unit's mean outright. There a coded block
+        // that is a combination of the other θ rescues nothing (#1977). A block
+        // that needs no rescue is not judged on its aliasing.
+        let needs_rescue = !joint_oracle(&jac, LevelContrast::Unconstrained)
+            .0
+            .is_empty();
         let mut absorbs = HashMap::new();
         for (c, token) in EXPLICIT {
             let (absorbed, free) = joint_oracle(&jac, c);
             if free == 0 {
                 continue;
             }
-            let refuse = !absorbed.is_empty() || block_loses_rank(&jac, c);
+            let rescued = needs_rescue && (jac.one_column || c != LevelContrast::SumToZeroWithin);
+            let refuse = !absorbed.is_empty()
+                || block_loses_rank(&jac, c)
+                || (rescued && block_aliased(&jac, c));
             absorbs.insert(token, refuse);
             let got = try_bind(&text(token), pop);
             if got.is_err() != refuse {
                 wrong.push(format!(
                     "{tag} {token}: oracle absorbs {absorbed:?}, binder {got:?}"
                 ));
+            }
+            // The oracle coded each other block by the contrast the caller
+            // stated; where the binder binds, it must be the one it chose, or
+            // the two judge different models (#1985 review, F4).
+            if got.is_ok() {
+                for (name, stated) in others {
+                    let chosen = bound_contrast(&text(token), pop, name);
+                    if chosen != Some(*stated) {
+                        wrong.push(format!(
+                            "{tag} {token}: oracle coded {name} {stated:?}, binder chose {chosen:?}"
+                        ));
+                    }
+                }
             }
         }
         let all_absorb = absorbs.values().all(|a| *a);
@@ -7612,82 +7757,232 @@ mod absorption {
         assert!(wrong.is_empty(), "no intercept:\n{}", wrong.join("\n"));
     }
 
-    /// T2 (#1840). Sum-to-zero and `ref` take different directions away, and
-    /// the model can carry one and not the other. `TVB * D2`, a θ on study 2's
-    /// records alone, carries the levels' sum (its level coefficients sum to 1)
-    /// but not study 1's reference level: `sum_to_zero` is refused and names
-    /// `ref`, `ref` binds, and auto takes `ref`. `TVB * (D1 - D2)` is the
-    /// mirror: it carries the reference and not the sum. On the nested block
-    /// the same split happens without a contrived θ: `TVEMAX`'s column
-    /// `TIME / (TIME + ET50)` carries the sum of the `[STUDY, TIME]` levels but
-    /// is 0 at the reference level `TIME = 0`, so global sum-to-zero is
-    /// refused and `ref` binds; auto keeps `sum_to_zero_within`. Each row's
-    /// straddle — the oracle absorbing under one of the two contrasts and not
-    /// the other — is asserted, and every row agrees with the joint oracle.
+    /// The rows of T2 (#1840, #1977) and T5's M3/M4: the absorbed `ETA_E0`
+    /// next to `ETA_B * (1 + TIME)`, a coarser random effect, and a θ that
+    /// shares a direction with it. `TVC * TIME * D2`, with `ETA_B`'s column on
+    /// study 2, carries study 2's level: that lies in the levels' sum but not
+    /// in study 1's reference level. The mirror `TVC * TIME * (D1 - D2)` carries
+    /// `D1 - D2`, which reaches the reference and not the sum. Neither θ is a
+    /// combination of the levels, so the coded block keeps its rank.
+    fn split_text(extra: &'static str) -> impl Fn(&str) -> String {
+        move |c: &str| {
+            let r = row_1836(
+                "split",
+                format!("  E0 = {NO_INTERCEPT} + {extra} + ETA_B * (1 + TIME)"),
+                false,
+            );
+            let t = with_thetas(row_text(&r)(c), &[("TVC", 0.5)]);
+            t.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                "  omega ETA_E0 ~ 0.1\n  omega ETA_B ~ 0.1\n",
+            )
+        }
+    }
+
+    /// T2 (#1840, rewritten by #1977). Sum-to-zero and `ref` take different
+    /// directions away, and the model can carry one and not the other. A θ that
+    /// carries the direction through a coarser random effect leaves the other
+    /// contrast a rescue: `TVC * TIME * D2` ([`split_text`]) carries the levels'
+    /// sum and not the reference, so `sum_to_zero` is refused and names `ref`,
+    /// `ref` binds, and auto takes `ref`; its mirror carries the reference and
+    /// not the sum. A θ that carries the direction by being a combination of
+    /// the levels rescues nothing (#1977): `TVB * D2` is one of the `ref`-coded
+    /// columns' sums, `TVB * (D1 - D2)` one of the sum-to-zero-coded ones', and
+    /// on the nested block `TVEMAX`'s column `TIME / (TIME + ET50)`, zero at
+    /// the reference level `TIME = 0`, is one of the `ref`-coded columns' too.
+    /// Under the contrast #1840 bound them with, the oracle absorbs nothing and
+    /// the coded block is aliased: each is refused under both global contrasts,
+    /// the one-column rows with "under any contrast" and auto refused; the
+    /// nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
+    /// the split rows' oracle absorbs under one contrast and not the other, with
+    /// the block of full rank; the aliased rows' oracle absorbs under one and
+    /// finds the block aliased under the other — and every row agrees with the
+    /// joint oracle.
     ///
     /// Mutations — the certificate codes every contrast as sum-to-zero (the
-    /// `ref` rows refuse, the mirror's `ref` binds); auto never takes `ref`
-    /// (`TVB * D2`'s auto is refused).
+    /// `ref` split row refuses, the mirror's `ref` binds); auto never takes
+    /// `ref` (`TVC * TIME * D2`'s auto is refused); the #1977 guard deleted
+    /// (each aliased row binds under the contrast #1840 named).
     #[test]
     fn the_contrast_decides_which_direction_is_carried() {
         let pop = arms_pop_d();
-        let one = |tag: &'static str, extra: &str| {
-            row_1836(tag, format!("  E0 = {NO_INTERCEPT} + {extra}"), false)
+        let one = |extra: &str| {
+            let r = row_1836("aliased", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            move |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)])
         };
-        let cases: Vec<(Row, LevelContrast, LevelContrast, LevelContrast)> = vec![
-            // (row, refused, bound, auto)
+        let nested = |c: &str| {
+            row_text(&(
+                "nested",
+                "STUDY, TIME",
+                format!("  E0 = {NO_INTERCEPT}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            ))(c)
+        };
+        type Text = Box<dyn Fn(&str) -> String>;
+        // (tag, text, absorbed under, the other contrast, auto: `None` refused)
+        let split: Vec<(
+            &str,
+            Text,
+            LevelContrast,
+            LevelContrast,
+            Option<LevelContrast>,
+        )> = vec![
             (
-                one("TVB*D2", "TVB * D2"),
+                "TVC*TIME*D2",
+                Box::new(split_text("TVC * TIME * D2")),
                 LevelContrast::SumToZero,
                 LevelContrast::Ref,
-                LevelContrast::Ref,
+                Some(LevelContrast::Ref),
             ),
             (
-                one("TVB*(D1-D2)", "TVB * (D1 - D2)"),
+                "TVC*TIME*(D1-D2)",
+                Box::new(split_text("TVC * TIME * (D1 - D2)")),
                 LevelContrast::Ref,
                 LevelContrast::SumToZero,
+                Some(LevelContrast::SumToZero),
+            ),
+        ];
+        let aliased: Vec<(
+            &str,
+            Text,
+            LevelContrast,
+            LevelContrast,
+            Option<LevelContrast>,
+        )> = vec![
+            (
+                "TVB*D2",
+                Box::new(one("TVB * D2")),
                 LevelContrast::SumToZero,
+                LevelContrast::Ref,
+                None,
             ),
             (
-                (
-                    "nested",
-                    "STUDY, TIME",
-                    format!("  E0 = {NO_INTERCEPT}"),
-                    format!("E0 + {EMAXY}"),
-                    false,
-                ),
+                "TVB*(D1-D2)",
+                Box::new(one("TVB * (D1 - D2)")),
+                LevelContrast::Ref,
+                LevelContrast::SumToZero,
+                None,
+            ),
+            (
+                "nested",
+                Box::new(nested),
                 LevelContrast::SumToZero,
                 LevelContrast::Ref,
-                LevelContrast::SumToZeroWithin,
+                Some(LevelContrast::SumToZeroWithin),
             ),
         ];
         let token = |c: LevelContrast| EXPLICIT.iter().find(|(k, _)| *k == c).unwrap().1;
         let mut wrong = Vec::new();
-        for (r, refused, bound, auto) in &cases {
-            let text = |c: &str| with_thetas(row_text(r)(c), &[("TVB", 0.5)]);
-            let j = jacobian(&text("none"), &pop);
-            let (a_refused, _) = joint_oracle(&j, *refused);
-            let (a_bound, _) = joint_oracle(&j, *bound);
-            assert!(
-                a_refused == ["ETA_E0"] && a_bound.is_empty(),
-                "{}: the straddle — oracle absorbs {a_refused:?} under {refused:?}, \
-                 {a_bound:?} under {bound:?}",
-                r.0
-            );
-            if try_bind(&text(token(*refused)), &pop).is_ok() {
-                wrong.push(format!("{} {refused:?}: bound", r.0));
+        for (is_aliased, cases) in [(false, &split), (true, &aliased)] {
+            for (tag, text, absorbing, other, auto) in cases {
+                let j = jacobian(&text("none"), &pop);
+                let (a_absorbing, _) = joint_oracle(&j, *absorbing);
+                let (a_other, _) = joint_oracle(&j, *other);
+                assert!(
+                    a_absorbing == ["ETA_E0"]
+                        && a_other.is_empty()
+                        && (is_aliased || !block_aliased(&j, *absorbing))
+                        && block_aliased(&j, *other) == is_aliased,
+                    "{tag}: the straddle — oracle absorbs {a_absorbing:?} under {absorbing:?}, \
+                     {a_other:?} under {other:?}; aliased under {other:?}: {}",
+                    block_aliased(&j, *other)
+                );
+                if try_bind(&text(token(*absorbing)), &pop).is_ok() {
+                    wrong.push(format!("{tag} {absorbing:?}: bound"));
+                }
+                match (try_bind(&text(token(*other)), &pop), is_aliased) {
+                    (Ok((c, _)), false) if c == *other => {}
+                    (Err(e), true) if j.one_column && e.contains(ANY_CONTRAST) => {}
+                    (Err(_), true) if !j.one_column => {}
+                    (got, _) => wrong.push(format!("{tag} {other:?}: {got:?}")),
+                }
+                match (try_bind(&text(""), &pop), auto) {
+                    (Ok((c, _)), Some(want)) if c == *want => {}
+                    (Err(e), None) if e.contains(ANY_CONTRAST) => {}
+                    (got, _) => wrong.push(format!("{tag} auto: {got:?}, want {auto:?}")),
+                }
+                agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
             }
-            match try_bind(&text(token(*bound)), &pop) {
-                Ok((c, _)) if c == *bound => {}
-                got => wrong.push(format!("{} {bound:?}: {got:?}", r.0)),
-            }
-            match try_bind(&text(""), &pop) {
-                Ok((c, _)) if c == *auto => {}
-                got => wrong.push(format!("{} auto: {got:?}, want {auto:?}", r.0)),
-            }
-            agrees_with_joint_oracle(r.0, &text, &pop, &mut wrong);
         }
         assert!(wrong.is_empty(), "contrast split:\n{}", wrong.join("\n"));
+    }
+
+    /// [`arms_pop_d`] with `R1` and `R2`, the 0/1 indicators of two equal-size
+    /// regions of studies (1, 2 and 3, 4), on every record.
+    fn arms_pop_r() -> Population {
+        let mut p = arms_pop_d();
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("R1".to_string(), f64::from(u8::from(study <= 2.0)));
+                m.insert("R2".to_string(), f64::from(u8::from(study > 2.0)));
+            }
+        }
+        p
+    }
+
+    /// #1977. A hand-coded second "block" whose θ are combinations of the
+    /// levels rescues nothing. `TVB1 * (R1 - R2)`, a region effect coded
+    /// sum-to-zero over two equal-size regions, has level coefficients summing
+    /// to 0, so it lies in the span of the sum-to-zero-coded block; `TVB2 * R2`
+    /// puts no weight on study 1, so it lies in the span of the `ref`-coded one.
+    /// Before #1977 each bound under that contrast — and auto too, for the
+    /// `ref` row — as aliased models. Each is refused under every contrast
+    /// with "under any contrast". The straddle: under the contrast that bound,
+    /// the oracle absorbs nothing, and only the coded block's rank against the
+    /// other θ refuses it.
+    ///
+    /// Mutation — the #1977 guard in `carried` deleted: the sum-to-zero row
+    /// binds under `sum_to_zero` and auto, the `ref` row under `ref` and auto.
+    #[test]
+    fn an_aliased_rescue_is_refused() {
+        let pop = arms_pop_r();
+        let rows = [
+            ("TVB1*(R1-R2)", "TVB1 * (R1 - R2)", LevelContrast::SumToZero),
+            ("TVB2*R2", "TVB2 * R2", LevelContrast::Ref),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, extra, aliased_under) in rows {
+            let r = row_1836("region", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB1", 0.5), ("TVB2", 0.5)]);
+            let j = jacobian(&text("none"), &pop);
+            let (absorbed, _) = joint_oracle(&j, aliased_under);
+            assert!(
+                absorbed.is_empty() && block_aliased(&j, aliased_under),
+                "{tag}: the straddle — under {aliased_under:?} the oracle absorbs {absorbed:?}, \
+                 aliased {}",
+                block_aliased(&j, aliased_under)
+            );
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}")),
+                }
+            }
+            agrees_with_joint_oracle(tag, &text, &pop, &mut wrong);
+        }
+        // The control: two other θ aliased with each other, `TVB * TIME` and
+        // `TVC * TIME`, and with nothing of the block. That deficiency is the
+        // other θ's, not the coded block's, and the block still binds as R8s.
+        let r = row_1836(
+            "pair",
+            format!("  E0 = {NO_INTERCEPT} + TVB * TIME + TVC * TIME"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        for (c, want) in [
+            ("", LevelContrast::SumToZero),
+            ("sum_to_zero", LevelContrast::SumToZero),
+            ("ref", LevelContrast::Ref),
+        ] {
+            let got = try_bind(&text(c), &pop);
+            if got != Ok((want, 3)) {
+                wrong.push(format!("pair {c:?}: {got:?}"));
+            }
+        }
+        agrees_with_joint_oracle("pair", &text, &pop, &mut wrong);
+        assert!(wrong.is_empty(), "aliased rescue:\n{}", wrong.join("\n"));
     }
 
     /// T3 (#1840). An inconclusive point keeps the refusal. The intercept is
@@ -7829,8 +8124,8 @@ mod absorption {
     /// carries the levels' mean and reference level alike (an intercept), so
     /// the refusal holds under every contrast and says so. M2: `none` on R8s,
     /// where sum-to-zero binds. M3/M4: the contrast that loses, and the one
-    /// that binds, for `TVB * D2` (sum-to-zero refused, `ref` named) and its
-    /// mirror. M5: the kappa's `occasion` wording. M6: a contrast the
+    /// that binds, for T2's `TVC * TIME * D2` (sum-to-zero refused, `ref`
+    /// named) and its mirror. M5: the kappa's `occasion` wording. M6: a contrast the
     /// certificate identifies but that leaves no free θ is not named. "under any contrast" is
     /// asserted present in M1 and absent from M2 in one test, so either branch
     /// forced reddens it.
@@ -7871,12 +8166,10 @@ mod absorption {
         );
         lacks(&m2, &["Remove the block"]);
 
-        let m3 = refusal(
-            &format!("{NO_INTERCEPT} + TVB * D2"),
-            false,
-            "sum_to_zero",
-            &pop,
-        );
+        // M3/M4 on T2's split rows (#1977): `TVB * D2` and its mirror are
+        // aliased under the contrast this message would name.
+        let m3 = try_bind(&split_text("TVC * TIME * D2")("sum_to_zero"), &pop)
+            .expect_err("M3 sum_to_zero");
         has(
             &m3,
             &[
@@ -7889,12 +8182,7 @@ mod absorption {
                  effect keeps that direction.",
             ],
         );
-        let m4 = refusal(
-            &format!("{NO_INTERCEPT} + TVB * (D1 - D2)"),
-            false,
-            "ref",
-            &pop,
-        );
+        let m4 = try_bind(&split_text("TVC * TIME * (D1 - D2)")("ref"), &pop).expect_err("M4 ref");
         has(
             &m4,
             &[
@@ -7937,6 +8225,375 @@ mod absorption {
             stz.as_ref().is_err_and(|e| e.contains("a single level")),
             "M6 sum_to_zero: {stz:?}"
         );
+    }
+
+    // ── #1963: a second level block counts as it is coded ───────────────────
+    //
+    // The certificate measures the other θ; another level block's θ are among
+    // them, and they count as that block will be coded — the directions its
+    // contrast leaves, not every level. A hand-coded θ of that coding is the
+    // same model and gets the same verdict. Binder-only fixtures on the
+    // compartment-free predictor: no fit, no FD or dual engine.
+
+    /// The funnel of #1963 with no intercept: `TVE0` read through a factor of
+    /// `TIME`, so nothing carries the levels' mean.
+    const P_BASE: &str = "TVE0 * (1 + 0.01 * TIME * TIME)";
+
+    /// `B2[OCC]` hand-coded sum-to-zero over the Lagrange indicators of
+    /// `OCC` ∈ {1, 2, 3}: `I1 = (OCC-2)(OCC-3)/2`, `I2 = (OCC-1)(3-OCC)`,
+    /// `I3 = (OCC-1)(OCC-2)/2`; the last level is minus the others' sum.
+    const B2_STZ: &str = "(TVB1 * (OCC - 2) * (OCC - 3) / 2 + TVB2 * (OCC - 1) * (3 - OCC) \
+                          - (TVB1 + TVB2) * (OCC - 1) * (OCC - 2) / 2)";
+    /// `B2[OCC]` hand-coded `ref`: the first level held at 0.
+    const B2_REF: &str = "(TVB2 * (OCC - 1) * (3 - OCC) + TVB3 * (OCC - 1) * (OCC - 2) / 2)";
+    /// `B2[OCC]` hand-coded `none`: a θ per level, which sum to a constant.
+    const B2_NONE: &str = "(TVB1 * (OCC - 2) * (OCC - 3) / 2 + TVB2 * (OCC - 1) * (3 - OCC) \
+                           + TVB3 * (OCC - 1) * (OCC - 2) / 2)";
+
+    /// [`arms_pop_r`] with `REGION`, the two equal-size regions as a column
+    /// (studies 1, 2 and 3, 4), and `REGIONU`, two unequal ones (study 1, and
+    /// studies 2–4), on every record.
+    fn two_pop() -> Population {
+        let mut p = arms_pop_r();
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("REGION".to_string(), if study <= 2.0 { 1.0 } else { 2.0 });
+                m.insert("REGIONU".to_string(), if study <= 1.0 { 1.0 } else { 2.0 });
+            }
+        }
+        p
+    }
+
+    /// `decl` (`B2[OCC]`, …) under `contrast` (`""` = auto).
+    fn level_decl(decl: &str, contrast: &str) -> String {
+        match contrast {
+            "" => decl.to_string(),
+            c => decl.replacen(']', &format!(", contrast = {c}]"), 1),
+        }
+    }
+
+    /// `E0 = {funnel}{second} + PLACEBO + ETA_E0`, `PLACEBO` under `c`, the
+    /// hand-coding θ declared where read, and `decl` declared as a level block
+    /// after `PLACEBO` — before it when `first`.
+    fn two_block(funnel: &str, second: &str, decl: Option<&str>, first: bool, c: &str) -> String {
+        let r = row_1836(
+            "two",
+            format!("  E0 = {funnel}{second} + PLACEBO + ETA_E0"),
+            false,
+        );
+        let text = with_thetas(
+            row_text(&r)(c),
+            &[("TVB1", 0.5), ("TVB2", 0.5), ("TVB3", 0.5)],
+        );
+        let Some(decl) = decl else { return text };
+        let line = format!("  theta {decl}(0.0, -10.0, 10.0)\n");
+        match first {
+            true => text.replacen("  theta PLACEBO", &format!("{line}  theta PLACEBO"), 1),
+            false => text.replacen("  theta TVEMAX", &format!("{line}  theta TVEMAX"), 1),
+        }
+    }
+
+    /// The verdict T1 asserts on the arms model: `sum_to_zero`, within and `ref`
+    /// bind with 3 free θ, auto takes sum-to-zero, and `none` is refused naming
+    /// `sum_to_zero` — not "under any contrast" (#1840's M2).
+    fn arms_verdict(c: &str, got: &Result<(LevelContrast, usize), String>) -> bool {
+        let want = match c {
+            "" | "sum_to_zero" => LevelContrast::SumToZero,
+            "sum_to_zero_within" => LevelContrast::SumToZeroWithin,
+            "ref" => LevelContrast::Ref,
+            _ => {
+                return got.as_ref().is_err_and(|e| {
+                    !e.contains(ANY_CONTRAST) && e.contains("Use `contrast = sum_to_zero`")
+                })
+            }
+        };
+        *got == Ok((want, 3))
+    }
+
+    /// T1 (#1963). The issue's model: `E0 = P_BASE + B2 + PLACEBO + ETA_E0`,
+    /// `B2[OCC]` a level block of three arm levels that absorbs nothing, and
+    /// `PLACEBO[STUDY]` one level per subject. Coded sum-to-zero or `ref`, B2
+    /// carries none of the levels' mean, so for B2 ∈ {auto, `sum_to_zero`,
+    /// `ref`} the block binds as R8s does ([`arms_verdict`]), and the
+    /// hand-coded B2 of the same coding gives the same verdict in all 15
+    /// cells. Both spellings agree with the joint oracle, the level spelling's
+    /// B2 coded by the contrast it resolves to (auto → sum-to-zero).
+    ///
+    /// Mutations — other blocks under `none` in `carried` (the pre-#1963 code:
+    /// 12 cells flip to "under any contrast"); B2 coded by its declared rather
+    /// than its resolved contrast (the B2-auto row flips).
+    #[test]
+    fn a_second_block_counts_as_it_is_coded() {
+        let pop = two_pop();
+        let mut wrong = Vec::new();
+        for (b2, hand, resolved) in [
+            ("", B2_STZ, LevelContrast::SumToZero),
+            ("sum_to_zero", B2_STZ, LevelContrast::SumToZero),
+            ("ref", B2_REF, LevelContrast::Ref),
+        ] {
+            let decl = level_decl("B2[OCC]", b2);
+            let level = |c: &str| two_block(P_BASE, " + B2", Some(&decl), false, c);
+            let coded = |c: &str| two_block(P_BASE, &format!(" + {hand}"), None, false, c);
+            for c in ALL {
+                let (l, h) = (try_bind(&level(c), &pop), try_bind(&coded(c), &pop));
+                if !arms_verdict(c, &l) || l != h {
+                    wrong.push(format!("B2 {b2:?} × {c:?}: level {l:?}\n  hand {h:?}"));
+                }
+            }
+            let tag = format!("B2 {b2:?}");
+            agrees_with_joint_oracle_coded(
+                &tag,
+                &level,
+                &pop,
+                Point::ZERO,
+                &[("B2", resolved)],
+                &mut wrong,
+            );
+            agrees_with_joint_oracle(&format!("{tag} hand"), &coded, &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "second block:\n{}", wrong.join("\n"));
+    }
+
+    /// T2 (#1963). A second block coded **with** its levels' mean still
+    /// carries it: B2 under `contrast = none` has three raw levels that sum to
+    /// a constant, so `PLACEBO` is refused under every contrast with "under any
+    /// contrast", and so is the hand-coded `none` spelling, in agreement with
+    /// the joint oracle. Asserted next to T1's `none` cell, which says the
+    /// opposite, so either branch of the message forced reddens one of the two.
+    ///
+    /// Mutation — phase-1 blocks coded as sum-to-zero whatever they resolved
+    /// to (B2 `none` binds).
+    #[test]
+    fn a_second_block_with_its_mean_still_carries_it() {
+        let pop = two_pop();
+        let decl = level_decl("B2[OCC]", "none");
+        let level = |c: &str| two_block(P_BASE, " + B2", Some(&decl), false, c);
+        let coded = |c: &str| two_block(P_BASE, &format!(" + {B2_NONE}"), None, false, c);
+        let mut wrong = Vec::new();
+        for (tag, text) in [
+            ("level", &level as &dyn Fn(&str) -> String),
+            ("hand", &coded),
+        ] {
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    got => wrong.push(format!("B2 none {tag} {c:?}: {got:?}")),
+                }
+            }
+        }
+        agrees_with_joint_oracle_coded(
+            "B2 none",
+            &level,
+            &pop,
+            Point::ZERO,
+            &[("B2", LevelContrast::Unconstrained)],
+            &mut wrong,
+        );
+        agrees_with_joint_oracle("B2 none hand", &coded, &pop, &mut wrong);
+        // T1's `none` cell, in the same test: B2 sum-to-zero does not carry it.
+        let stz = level_decl("B2[OCC]", "sum_to_zero");
+        let t1 = try_bind(&two_block(P_BASE, " + B2", Some(&stz), false, "none"), &pop);
+        if !arms_verdict("none", &t1) {
+            wrong.push(format!("B2 stz none: {t1:?}"));
+        }
+        assert!(wrong.is_empty(), "mean carried:\n{}", wrong.join("\n"));
+    }
+
+    /// T3 (#1963). Declaration order does not decide: T1's and T2's level
+    /// rows with B2 declared before `PLACEBO` give, cell by cell, the verdict
+    /// they give with B2 after it.
+    ///
+    /// Mutation — resolving in declaration order and coding only the blocks
+    /// already resolved (B2-first rows bind; `PLACEBO`-first rows see B2 raw
+    /// and refuse).
+    #[test]
+    fn declaration_order_does_not_decide() {
+        let pop = two_pop();
+        let mut wrong = Vec::new();
+        for b2 in ["", "sum_to_zero", "ref", "none"] {
+            let decl = level_decl("B2[OCC]", b2);
+            for c in ALL {
+                let after = try_bind(&two_block(P_BASE, " + B2", Some(&decl), false, c), &pop);
+                let before = try_bind(&two_block(P_BASE, " + B2", Some(&decl), true, c), &pop);
+                if after != before {
+                    wrong.push(format!(
+                        "B2 {b2:?} × {c:?}: after {after:?}\n  before {before:?}"
+                    ));
+                }
+            }
+        }
+        // The order is really swapped.
+        let decl = level_decl("B2[OCC]", "");
+        let t = two_block(P_BASE, " + B2", Some(&decl), true, "");
+        assert!(t.find("theta B2[").unwrap() < t.find("theta PLACEBO[").unwrap());
+        assert!(wrong.is_empty(), "order:\n{}", wrong.join("\n"));
+    }
+
+    /// T4 (#1963, #1977). A second block whose coding aliases `PLACEBO`'s stays
+    /// refused. `B[REGION]` over two equal-size regions: coded sum-to-zero it
+    /// is `R1 − R2`, whose level coefficients sum to 0, so it lies in the span
+    /// of the sum-to-zero-coded `PLACEBO`; coded `ref` it is `R2`, in the span
+    /// of the `ref`-coded one; raw it sums to a constant. Refused under every
+    /// B contrast × every `PLACEBO` contrast with "under any contrast", and
+    /// the hand spellings with it. `B` absorbs nothing — it binds under `none`
+    /// next to `ETA_E0` — so it resolves first, coded, and only the #1977
+    /// guard refuses it. The straddle: under sum-to-zero for both, the oracle
+    /// finds `PLACEBO` aliased on equal regions and not on unequal ones
+    /// (`REGIONU`, study 1 against studies 2–4), which are refused anyway, the
+    /// region effect carrying the levels' mean. `A[STUDY]` in `E0` too (M8)
+    /// absorbs `ETA_E0` itself: both blocks are refused.
+    ///
+    /// Mutation — the #1977 guard deleted: the equal-region level spelling
+    /// binds under `PLACEBO` sum-to-zero and auto (and the hand spelling, as
+    /// in `an_aliased_rescue_is_refused`). The A row is held by two gates
+    /// (the guard, and other absorbing blocks staying raw), so deleting one
+    /// leaves it green; the REGION row is the one that dies.
+    #[test]
+    fn an_aliased_second_block_stays_refused() {
+        let pop = two_pop();
+        let mut wrong = Vec::new();
+        let refused = |tag: &str, text: &dyn Fn(&str) -> String, wrong: &mut Vec<String>| {
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}")),
+                }
+            }
+        };
+        for (region, column) in [("equal", "REGION"), ("unequal", "REGIONU")] {
+            for b in ["", "sum_to_zero", "ref", "none"] {
+                let decl = level_decl(&format!("B[{column}]"), b);
+                let text = |c: &str| two_block(P_BASE, " + B", Some(&decl), false, c);
+                refused(&format!("{region} B {b:?}"), &text, &mut wrong);
+                let resolved = match b {
+                    "ref" => LevelContrast::Ref,
+                    "none" => LevelContrast::Unconstrained,
+                    _ => LevelContrast::SumToZero,
+                };
+                agrees_with_joint_oracle_coded(
+                    &format!("{region} B {b:?}"),
+                    &text,
+                    &pop,
+                    Point::ZERO,
+                    &[("B", resolved)],
+                    &mut wrong,
+                );
+            }
+            // The straddle on the rank clause.
+            let decl = level_decl(&format!("B[{column}]"), "sum_to_zero");
+            let j = jacobian(&two_block(P_BASE, " + B", Some(&decl), false, "none"), &pop)
+                .coded(&[("B", LevelContrast::SumToZero)]);
+            assert_eq!(
+                block_aliased(&j, LevelContrast::SumToZero),
+                region == "equal",
+                "{region}: PLACEBO aliased under sum-to-zero"
+            );
+            // `B` absorbs nothing: raw, next to `ETA_E0`, it binds.
+            let alone = two_block(
+                P_BASE,
+                " + B",
+                Some(&level_decl(&format!("B[{column}]"), "none")),
+                false,
+                "",
+            )
+            .replace("  E0 = ", "  EMAX = TVEMAX + PLACEBO\n  E0 = ")
+            .replace(" + PLACEBO + ETA_E0", " + ETA_E0")
+            .replacen("  EMAX = TVEMAX\n", "", 1);
+            let mut p = pop.clone();
+            let mut parsed = parse_full_model(&alone).unwrap();
+            let bound = crate::api::bind_theta_levels(&mut parsed, &alone, &mut p);
+            assert!(
+                bound.is_ok()
+                    && parsed.bindings.levels["B"].contrast == LevelContrast::Unconstrained,
+                "{region}: B alone {bound:?}\n{alone}"
+            );
+        }
+        for (tag, hand) in [
+            ("hand TVB1*(R1-R2)", "TVB1 * (R1 - R2)"),
+            ("hand TVB2*R2", "TVB2 * R2"),
+        ] {
+            let text = |c: &str| two_block(P_BASE, &format!(" + {hand}"), None, false, c);
+            refused(tag, &text, &mut wrong);
+        }
+        for a in ["", "sum_to_zero", "ref", "none"] {
+            let decl = level_decl("A[STUDY]", a);
+            let text = |c: &str| two_block(P_BASE, " + A", Some(&decl), false, c);
+            for c in ALL {
+                if let Ok(b) = try_bind(&text(c), &pop) {
+                    wrong.push(format!("A {a:?} × {c:?}: bound {b:?}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "aliased second block:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// T5 (#1963). Over second block × its contrast × funnel, the binder agrees
+    /// with the joint oracle on every `PLACEBO` contrast and auto, the second
+    /// block coded by the contrast it resolves to. Second blocks: `B2[OCC]`
+    /// (arms), `B[REGION]` (equal regions), `B[REGIONU]` (unequal), `A[STUDY]`
+    /// on `EMAX` only, and none; contrasts auto, `sum_to_zero`, `ref`, `none`;
+    /// funnels `P_BASE` (no intercept) and `S` (an intercept, `TVE0`). One row
+    /// puts B2 inside `exp(…)`, where coding the block from the `none` model's
+    /// Jacobian is an approximation. The disagreement count is printed and
+    /// must be 0.
+    ///
+    /// Mutations — each of T1–T4's, re-run here, gives a nonzero count
+    /// (recorded in the PR).
+    #[test]
+    fn two_block_grid_agrees_with_the_joint_oracle() {
+        let pop = two_pop();
+        let mut wrong = Vec::new();
+        let mut cells = 0usize;
+        // (tag, block, how E0 reads it, `EMAX` reads it instead)
+        let seconds: [(&str, &str, &str, bool); 5] = [
+            ("B2 arms", "B2[OCC]", " + B2", false),
+            ("B2 exp", "B2[OCC]", " + exp(B2)", false),
+            ("REGION", "B[REGION]", " + B", false),
+            ("REGIONU", "B[REGIONU]", " + B", false),
+            ("A on EMAX", "A[STUDY]", "", true),
+        ];
+        for funnel in [P_BASE, "TVE0"] {
+            for (tag, block, read, on_emax) in seconds {
+                let name = &block[..block.find('[').unwrap()];
+                for b in ["", "sum_to_zero", "ref", "none"] {
+                    let decl = level_decl(block, b);
+                    let text = |c: &str| {
+                        let t = two_block(funnel, read, Some(&decl), false, c);
+                        match on_emax {
+                            true => t.replacen("  EMAX = TVEMAX\n", "  EMAX = TVEMAX + A\n", 1),
+                            false => t,
+                        }
+                    };
+                    let resolved = match b {
+                        "ref" => LevelContrast::Ref,
+                        "none" => LevelContrast::Unconstrained,
+                        _ => LevelContrast::SumToZero,
+                    };
+                    cells += 1;
+                    agrees_with_joint_oracle_coded(
+                        &format!("{funnel} {tag} {b:?}"),
+                        &text,
+                        &pop,
+                        Point::ZERO,
+                        &[(name, resolved)],
+                        &mut wrong,
+                    );
+                }
+            }
+            cells += 1;
+            let text = |c: &str| two_block(funnel, "", None, false, c);
+            agrees_with_joint_oracle(&format!("{funnel} single"), &text, &pop, &mut wrong);
+        }
+        eprintln!(
+            "two-block grid: {cells} rows, {} disagreements",
+            wrong.len()
+        );
+        assert!(wrong.is_empty(), "two-block grid:\n{}", wrong.join("\n"));
     }
 
     // ── #1834: an absorption the walk cannot name, measured ─────────────────

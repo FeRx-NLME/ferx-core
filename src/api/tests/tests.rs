@@ -186,6 +186,9 @@ fn adaptive_rejects_selected_error_model() {
     let model = parse_model_string(ode_selected).expect("ODE+Selected model parses");
     let err = reject_selected_error_for_adaptive(&model)
         .expect_err("Selected error model must be rejected for adaptive dosing");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
+    assert_eq!(err.block(), Some("error_model"), "{err}");
+    let err = err.to_string();
     assert!(
         err.to_lowercase().contains("adaptive") && err.contains("error_model"),
         "error should cite the adaptive/error_model restriction: {err}"
@@ -242,6 +245,8 @@ fn adaptive_base_subject() -> crate::types::Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -331,6 +336,9 @@ fn adaptive_rejects_sde_model() {
     assert!(model.is_sde(), "test model must be an SDE model");
     let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
         .expect_err("SDE model must be rejected for adaptive dosing");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
+    assert_eq!(err.block(), Some("diffusion"), "{err}");
+    let err = err.to_string();
     assert!(
         err.to_lowercase().contains("diffusion")
             || err.to_lowercase().contains("sde")
@@ -357,8 +365,10 @@ fn adaptive_rejects_a_residual_correlation_line() {
     assert!(model.residual_serial.is_some());
     let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
         .expect_err("a correlation line is refused");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
+    assert_eq!(err.block(), Some("error_model"), "{err}");
     assert_eq!(
-        err,
+        err.to_string(),
         "adaptive-dosing simulation does not support `correlation ar1(RHO) by ARM`: the \
          controller draws its assay noise one reading at a time, so readings in one block \
          would be independent. Drop the line for the adaptive simulation."
@@ -927,6 +937,8 @@ fn test_kappa_shrinkages_reads_informed_rule_from_population() {
             observations: vec![1.0, 1.0],
             occasions: vec![1, 2],
             pk_only_times: pk_only_at.into_iter().collect(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_occasions: pk_only_at.map(|_| 3).into_iter().collect(),
             ..Subject::default()
         };

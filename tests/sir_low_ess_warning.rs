@@ -111,14 +111,16 @@ fn rerun(f: &FitResult, opts: &FitOptions, prep: &PreparedRun, scale: SirScale) 
 
 /// S3 + the natural half on the same fit.
 ///
-/// Packed (the default): exactly one low-ESS warning, ESS 3.5482998071095064.
+/// Packed (the default): exactly one low-ESS warning, ESS 3.548442767315493 (3.5482998071095064
+/// before #1527, whose stationarity-certified fallback EBEs move this fit by ~4e-5 relative).
 /// It names the heaviest draw's move (ETA_CL, −6.36 sd) and flags **only**
 /// ETA_KA (ΔOFV 1.56): ETA_CL 9.31, ETA_V 18.09 and KAPPA_CL 76.78 are above
 /// χ²₁(0.95) and must not be named in the shelf sentence. Mutations: drop the
 /// warning push → `expect` dies; flag by the heaviest draw's coordinate instead
 /// of the floor ΔOFV → "ETA_CL (ΔOFV" appears.
 ///
-/// Natural, through `run_sir` on the fitted result: ESS 139.78474460042662 and
+/// Natural, through `run_sir` on the fitted result: ESS 139.78747287250602 (139.78474460042662
+/// before #1527) and
 /// no low-ESS warning — the packed run's is replaced, not kept beside it. Dropping the re-centre
 /// reads 57.3 (#1723 amendment A0), so the ESS assertion is the re-centre's
 /// run-level kill.
@@ -137,7 +139,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     // than keeping it beside the new ESS.
     let nat = rerun(&f, &opts, &prep, SirScale::Natural);
     report(&[("FOCEI packed", f.sir_ess), ("FOCEI natural", nat.sir_ess)]);
-    assert_ess(f.sir_ess, 3.548_299_807_109_506_4, "FOCEI packed");
+    assert_ess(f.sir_ess, 3.548_442_767_315_493, "FOCEI packed");
     let w = low_ess(&f).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", f.warnings));
     assert_eq!(
         f.warnings
@@ -167,7 +169,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
 
     assert_structured_sir(&f);
 
-    assert_ess(nat.sir_ess, 139.784_744_600_426_62, "FOCEI natural");
+    assert_ess(nat.sir_ess, 139.787_472_872_506_02, "FOCEI natural");
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
