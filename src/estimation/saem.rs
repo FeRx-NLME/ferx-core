@@ -449,6 +449,13 @@ const MSTEP_SA_MAX_STEP: f64 = 1.0;
 /// (`score_sa` drifts too), each by a run changing it alone. The cause is
 /// still open (#1421). Until it is found this cap holds those thetas near their
 /// start, which on that reprex is the better answer.
+///
+/// The default stays keyed on `iiv_on_ruv` alone, not on `iiv_on_ruv` with FREM,
+/// because the one non-FREM `iiv_on_ruv` measurement does not support lifting it:
+/// `TVFRD1` is barely identified on that data, so the cap and the undamped update
+/// score the same, which shows neither is harmful *there* — not that undamped is
+/// safe on a non-FREM `iiv_on_ruv` model whose no-ETA thetas are identified.
+/// Narrowing the default needs such a model, ranked by importance sampling.
 const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
 
 /// Default `mstep_damping` for a fit that did not set one (#1415).

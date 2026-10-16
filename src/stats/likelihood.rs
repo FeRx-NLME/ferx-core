@@ -1700,6 +1700,12 @@ pub fn apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[Option<f64>]) {
     }
 }
 
+/// The floor on a FREM covariate row's variance `σ_cov²` in
+/// [`build_frem_r_override`]. Below it the objective does not depend on the
+/// covariate σ, so a score of that σ must be zero there too
+/// (`fixed_eta_gradient::obs_dvar_dlogsigma`, #1421).
+pub(crate) const FREM_VARIANCE_FLOOR: f64 = 1e-12;
+
 pub fn build_frem_r_override(
     frem_config: Option<&FremConfig>,
     fremtype: &[u16],
@@ -1715,7 +1721,11 @@ pub fn build_frem_r_override(
             .map(|&ft| {
                 if ft > 0 && fc.fremtype_to_indices.contains_key(&ft) {
                     let s = sigma_values[fc.covariate_sigma_index];
-                    Some(if s * s > 1e-12 { s * s } else { 1e-12 })
+                    Some(if s * s > FREM_VARIANCE_FLOOR {
+                        s * s
+                    } else {
+                        FREM_VARIANCE_FLOOR
+                    })
                 } else {
                     None
                 }

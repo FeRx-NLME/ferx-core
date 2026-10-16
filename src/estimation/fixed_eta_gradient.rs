@@ -32,15 +32,16 @@ mod tests;
 /// `∂V_j/∂(log σ_k)` for one observation of the fixed-η M-step objective, before
 /// the caller's per-observation `ruv_scale` (which is `1.0` on a FREM row).
 ///
-/// A FREM covariate pseudo-observation (`frem_vj = Some(_)`) does not score
-/// against the PK residual error at all: its variance is the covariate σ squared,
-/// floored at `1e-12` ([`crate::stats::likelihood::build_frem_r_override`]), so it
-/// depends on that one σ and on nothing else. Asking the error model instead —
-/// which knows nothing about FREMTYPE — returned the PK σ's `2σ²` loading for
-/// those rows, and against a variance of `σ_cov² = 1e-6` that is a term of order
-/// `1e6·σ²` per covariate row in a score whose objective does not contain it
-/// (#1421).
-#[allow(clippy::too_many_arguments)]
+/// A FREM covariate pseudo-observation (`frem_vj = Some(v)`, `v` its variance
+/// from [`crate::stats::likelihood::build_frem_r_override`]) does not score
+/// against the PK residual error at all: `v` is the covariate σ squared, floored
+/// at `FREM_VARIANCE_FLOOR`, so it depends on that one σ and on nothing else.
+/// Reading the floor off `v` itself, rather than re-deriving it from σ, keeps the
+/// override the one owner of what this is the derivative of. Asking the error
+/// model instead — which knows nothing about FREMTYPE — returned the PK σ's
+/// `2σ²` loading for those rows, and against a variance of `σ_cov² = 1e-6` that
+/// is a term of order `1e6·σ²` per covariate row in a score whose objective does
+/// not contain it (#1421).
 fn obs_dvar_dlogsigma(
     model: &CompiledModel,
     err_key: usize,
@@ -50,15 +51,14 @@ fn obs_dvar_dlogsigma(
     mult_j: Option<&[f64]>,
     frem_vj: Option<f64>,
 ) -> f64 {
-    if frem_vj.is_some() {
+    if let Some(v) = frem_vj {
         let cov_k = model
             .frem_config
             .as_ref()
             .map(|fc| fc.covariate_sigma_index);
-        let s = sigma_values.get(k).copied().unwrap_or(0.0);
-        // `d(s²)/d(log s) = 2s²`, and zero on the floor, which does not move.
-        return if Some(k) == cov_k && s * s > 1e-12 {
-            2.0 * s * s
+        // `d(σ²)/d(log σ) = 2σ²`, and zero on the floor, which does not move.
+        return if Some(k) == cov_k && v > crate::stats::likelihood::FREM_VARIANCE_FLOOR {
+            2.0 * v
         } else {
             0.0
         };

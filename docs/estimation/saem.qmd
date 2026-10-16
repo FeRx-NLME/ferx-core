@@ -525,6 +525,8 @@ M-step solver repaired:
   weights the early, still-crawling iterates most (`TH_WT` 0.637 with the
   average, 0.961 without).
 
+#### Why the default is keyed to `iiv_on_ruv`
+
 The FREM drift itself is real and is **not** fixed: undamped, that reprex
 settles near `TVFRD1` 0.15–0.18 from either start on the default schedule,
 keeps drifting on a 3× longer one (0.03), and 200 MH steps per iteration do
@@ -541,8 +543,16 @@ cap leaves it at 0.342 / 2.228 / 147.5. With `iiv_on_ruv` but without the FREM
 covariate rows, every SAEM variant lands somewhere the objective cannot tell
 from the optimum. So **the default is keyed to `iiv_on_ruv`**: such a model
 keeps the 0.03 cap, every other model runs undamped, and a value you set wins
-either way. `FIX` is the honest spelling of the same hold when the value is
-known.
+either way. It is keyed to `iiv_on_ruv` alone, not to `iiv_on_ruv` *with*
+FREM, because that one non-FREM measurement cannot tell the cap from the
+undamped update: `TVFRD1` is barely identified there, so it shows the cap is
+harmless on that data, not that undamped is safe on a non-FREM `iiv_on_ruv`
+model whose no-ETA thetas are identified. If yours is such a model, set
+`mstep_damping = 1.0` and compare the two fits by importance sampling (see
+[below](#saem-1421-measured)). `FIX` is the honest spelling of the same hold
+when the value is known.
+
+#### Which fits it damps
 
 The option only acts on the channel it is about: a fit is damped when NLopt is
 left estimating a theta that is **not mu-referenced**, which is exactly the
