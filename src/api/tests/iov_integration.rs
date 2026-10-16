@@ -695,7 +695,10 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
 
     // `iov_column = OCC` set, no rule: refused, and the key is not asked for.
     let a = warfarin_iov_sim_model(|s| s.to_string());
-    let msg = simulate(&a).expect_err("no occasion rule on --simulate must be refused");
+    let err = simulate(&a).expect_err("no occasion rule on --simulate must be refused");
+    // #1772: the entry point carries the refusal's code, no longer just its text.
+    assert_eq!(err.code(), Some("E_IOV_MISSING_OCC"), "{err}");
+    let msg = err.to_string();
     assert!(
         msg.contains("has no dataset to read occasion labels from, so every record is unlabelled"),
         "names why: {msg}"
@@ -736,7 +739,9 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
 
     // Neither key: the same refusal, without the clause about `iov_column`.
     let b = warfarin_iov_sim_model(no_column);
-    let msg = simulate(&b).expect_err("no occasion rule on --simulate must be refused");
+    let err = simulate(&b).expect_err("no occasion rule on --simulate must be refused");
+    assert_eq!(err.code(), Some("E_IOV_MISSING_OCC"), "{err}");
+    let msg = err.to_string();
     assert!(msg.contains("has no dataset to read occasion labels from"));
     assert!(msg.contains("Set `iov_occasion = time(...)` in [fit_options], with a breakpoint"));
     assert!(msg.contains("`iov_occasion = dose` cannot label it"));
@@ -758,7 +763,9 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     let d = warfarin_iov_sim_model(|s| {
         no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = dose\n")
     });
-    let msg = simulate(&d).expect_err("the dose rule cannot label a [simulation] population");
+    let msg = simulate(&d)
+        .expect_err("the dose rule cannot label a [simulation] population")
+        .to_string();
     assert!(msg.contains("produced only a single occasion"), "{msg}");
 
     // The data path keeps the dataset advice, both remedies included.
@@ -766,7 +773,8 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
         b.path().to_str().unwrap(),
         Some(concat!(env!("CARGO_MANIFEST_DIR"), "/data/warfarin.csv")),
     )
-    .expect_err("an IOV model on a dataset without OCC must be refused");
+    .expect_err("an IOV model on a dataset without OCC must be refused")
+    .to_string();
     assert!(msg.contains(dataset_advice), "{msg}");
     assert!(msg.contains("`iov_occasion = dose`"), "{msg}");
     assert!(!msg.contains("[simulation]"), "{msg}");

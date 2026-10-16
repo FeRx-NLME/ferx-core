@@ -739,7 +739,7 @@ pub fn run_model_simulate_with_overrides(
         &parsed.fit_options.iov_occasion,
         parsed.fit_options.iov_column.as_deref(),
     ) {
-        return Err(crate::diagnostics::EngineError::from_diagnostic(d).to_string());
+        return Err(EngineError::from_diagnostic(d));
     }
 
     // Simulate
