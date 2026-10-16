@@ -300,6 +300,31 @@ fn the_occasion_column_check_does_not_fire_on_a_nested_model() {
     assert!(code_in(&diags, "E_IOV_MISSING_OCC").is_none());
 }
 
+/// The `--simulate` twin of the check above (#2005), through the gate the two share. Both
+/// sides on one unlabelled population: a nested model passes, while a one-level model,
+/// whose κ is an ordinary IOV κ read from `iov_column`, is refused. Without the nested
+/// gate `--simulate` would refuse a nested model and advise `iov_occasion = time(...)`.
+#[test]
+fn the_simulate_occasion_check_does_not_fire_on_a_nested_model() {
+    use crate::api::validation::check_simulation_iov_occasions;
+    let pop = full_design();
+    let col = &IovOccasionRule::Column;
+    assert!(check_simulation_iov_occasions(&model(), &pop, col, None).is_none());
+    let one = parse_full_model(
+        "[parameters]\n  theta TVCL(0.2)\n  omega ETA_CL ~ 0.09\n  level OCC by OCC in ID\n  \
+         kappa K ~ 0.01 at OCC\n  sigma P ~ 0.04\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + K)\n  V = 10\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(P)\n",
+    )
+    .expect("parse")
+    .model;
+    assert!(!one.has_nested_levels() && one.n_kappa == 1);
+    assert!(
+        check_simulation_iov_occasions(&one, &pop, col, Some("OCC")).is_some(),
+        "the same unlabelled population is refused for a model that is not nested"
+    );
+}
+
 /// Both sides of the single-member gate, in one test: one arm in every study is refused
 /// while κ_ARM and κ_ST read the same parameters, and accepted once either half of the
 /// condition is false.
