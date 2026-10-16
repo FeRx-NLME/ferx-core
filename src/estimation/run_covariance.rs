@@ -140,7 +140,8 @@ pub fn run_covariance(
     // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
     crate::api::with_fit_scope(options, || {
         run_covariance_scoped(fit, model, population, options)
-    })?
+    })
+    .map_err(crate::diagnostics::EngineError::uncoded)?
 }
 
 fn run_covariance_scoped(
@@ -180,6 +181,9 @@ fn run_covariance_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_covariance"))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a

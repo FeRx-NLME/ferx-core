@@ -482,6 +482,8 @@ struct TrustRegionWithStop {
     ever_progressed: bool,
     /// Verbose diagnostics for the iteration trace.
     verbose: bool,
+    /// Cooperative cancel (#574): polled at every iteration boundary.
+    cancel: Option<crate::cancel::CancelFlag>,
 }
 
 impl TrustRegionWithStop {
@@ -507,6 +509,7 @@ impl TrustRegionWithStop {
             stalled_iters: 0,
             ever_progressed: false,
             verbose: options.verbose,
+            cancel: options.cancel.clone(),
         }
     }
 
@@ -568,6 +571,11 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
     }
 
     fn terminate(&mut self, state: &TrState) -> TerminationStatus {
+        if crate::cancel::is_cancelled(&self.cancel) {
+            return TerminationStatus::Terminated(TerminationReason::SolverExit(
+                TRUST_REGION_CANCELLED.to_string(),
+            ));
+        }
         let x = match state.get_param() {
             Some(p) => p.clone(),
             None => return TerminationStatus::NotTerminated,
@@ -583,6 +591,9 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
         TerminationStatus::NotTerminated
     }
 }
+
+/// `SolverExit` reason for a run stopped by a cooperative cancel (#574).
+const TRUST_REGION_CANCELLED: &str = "cancelled by user";
 
 /// `SolverExit` reason for a run that rejected every step from iteration 0.
 /// Matched by [`classify_termination`] so the warning names the starting values
@@ -768,7 +779,12 @@ pub fn optimize_trust_region(
             let OptimizationResult {
                 problem: mut prob, ..
             } = res;
-            let grad = prob.gradient(&vec).ok();
+            // A cancelled run is discarded by `fit()`; skip the extra gradient pass.
+            let grad = if crate::cancel::is_cancelled(&options.cancel) {
+                None
+            } else {
+                prob.gradient(&vec).ok()
+            };
             if let Some(mut w) = warning {
                 if let Some(g) = grad.as_deref() {
                     // Under covariate-NN regularization this gradient is of the
@@ -1593,6 +1609,64 @@ mod tests {
             res.n_iterations, 2,
             "the reported iteration count must be the budget it exhausted"
         );
+    }
+
+    /// #574: the trust region polls the cancel flag at every iteration boundary and
+    /// skips the post-run gradient pass. Without the `terminate` check a pre-cancelled
+    /// run walks on (every trial scored 1e20) until the no-initial-progress stop, whose
+    /// warning names the starting values instead of the cancel.
+    #[test]
+    fn a_cancelled_trust_region_stops_at_the_next_iteration() {
+        use crate::io::datareader::read_nonmem_csv;
+        use std::path::Path;
+
+        let model = warfarin_model();
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let opts = FitOptions {
+            outer_maxiter: 50,
+            run_covariance_step: false,
+            verbose: false,
+            cancel: Some(flag),
+            ..FitOptions::default()
+        };
+        let res = optimize_trust_region(&model, &population, &model.default_params, &opts);
+        assert!(!res.converged);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("cancelled by user")),
+            "the stop must name the cancel: {:?}",
+            res.warnings
+        );
+        assert!(res.n_iterations <= 1, "ran {} iterations", res.n_iterations);
+        assert!(
+            res.final_gradient.is_none(),
+            "a cancelled run paid a gradient pass"
+        );
+    }
+
+    /// #574 review r2: the cancel check runs at every iteration boundary, not only before
+    /// the first. A tracker whose flag trips after a non-cancelled boundary must stop at the
+    /// next one, with the run already past iteration 0.
+    #[test]
+    fn a_cancel_after_the_first_iteration_stops_the_trust_region() {
+        let mut tracker = stall_tracker();
+        tracker.cancel = Some(crate::cancel::CancelFlag::trip_after(1));
+        let mut state = TrState::new().param(vec![0.0, 1.0]).cost(1.0);
+        state.increment_iter();
+        assert!(state.get_iter() > 0, "fixture: past iteration 0");
+        assert!(matches!(
+            tracker.terminate(&state),
+            TerminationStatus::NotTerminated
+        ));
+        state.increment_iter();
+        match tracker.terminate(&state) {
+            TerminationStatus::Terminated(TerminationReason::SolverExit(reason)) => {
+                assert_eq!(reason, TRUST_REGION_CANCELLED)
+            }
+            other => panic!("expected the cancel stop, got {other:?}"),
+        }
     }
 
     fn warfarin_model() -> crate::types::CompiledModel {

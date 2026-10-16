@@ -1236,7 +1236,7 @@ mod fitted_population_1783 {
     ///
     /// #1774: every refused cell is `E_FIT_INPUT_MISSING`, no block, the entry point
     /// as context (`refused`). Mutation — `unrecorded_rule_refusal` back on
-    /// `EngineError::from`: each cell's code is `None`.
+    /// `EngineError::uncoded`: each cell's code is `None`.
     #[test]
     fn unrecorded_rule_without_labels_is_refused() {
         // The text, after asserting the code a missing record carries.
@@ -1777,7 +1777,7 @@ impl Entry {
 ///
 /// Every fixture refuses before any inner solve, so no FD or dual engine is reached.
 ///
-/// Mutations — the builder back to an uncoded `EngineError::from`: every cell;
+/// Mutations — the builder back to an `EngineError::uncoded`: every cell;
 /// `check_subjects` with its old text: missing / extra / swapped on the `run_*`
 /// columns; `verify` without its subject check: missing and extra pass (`Ok`), and
 /// swapped reports records; the subject prefix dropped from

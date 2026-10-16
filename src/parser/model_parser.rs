@@ -5490,6 +5490,17 @@ pub fn parse_full_model_with(
     // for the fields the caller actually moved. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
 
+    // `ode_method = linear` is an assertion, not a preference (#852): a user who names it is
+    // asking for the exact path, so a model that cannot take it is an error here rather than a
+    // silent fall back to integration (which is what `auto` does, by design).
+    if fit_options.ode_method == crate::ode::OdeMethod::Linear {
+        if let Some(refusal) =
+            crate::ode::predictions::ode_method_linear_refusal(model.ode_spec.as_ref())
+        {
+            return Err(refusal);
+        }
+    }
+
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
     // estimator/gradient context) is available. (`gradient = ad` is retired and rejected
@@ -10169,7 +10180,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
                     "fit option `ode_method`: unknown value `{value}` — expected one of \
-                     auto, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
+                     auto, linear, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
                      verner7, ros23, ode23s, rodas5)"
                 )
             })?;
@@ -14253,6 +14264,9 @@ fn build_ode_spec(
         ));
     }
 
+    // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
+    let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
     // covariate reference would have been rejected above).
@@ -14451,6 +14465,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        affine_in_states,
         init_indiv_reads,
         hoist: rhs_hoist,
         binding,
@@ -27216,6 +27231,10 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition —
+    /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
+    /// `ode_linearity::stmts_affine_in_states`.
+    affine_in_states: bool,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -27515,6 +27534,20 @@ impl OdeRhsProgram {
     /// not a default.
     pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
+    }
+
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition — the
+    /// structural half of the linear fast path's eligibility (#852). The other half is
+    /// [`Self::reads_any_model_time`]; `OdeSpec::linear_ineligibility` asks both.
+    pub(crate) fn is_affine_in_states(&self) -> bool {
+        self.affine_in_states
+    }
+
+    /// Any equation reads `TIME`/`T`/`TAFD`/`TAD` — the injected hazard lines included,
+    /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
+    /// the augmented system and a time-dependent hazard line is part of it.
+    pub(crate) fn reads_any_model_time(&self) -> bool {
+        self.uses_time_vars || self.reads_time_builtin
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -28325,36 +28358,72 @@ impl IndivParamProgram {
     /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
     /// individual parameter (declaration order), whose `grad`/`hess` are the exact
     /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
+    ///
+    /// The absolute-axis layout of [`eval_param_duals_cols`](Self::eval_param_duals_cols)
+    /// (`theta_cols = None`).
     pub(crate) fn eval_param_duals<const M: usize>(
         &self,
         theta: &[f64],
         eta: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> Vec<crate::sens::dual2::Dual2<M>> {
+        self.eval_param_duals_cols::<M>(theta, eta, covariates, None, self.n_theta)
+    }
+
+    /// Column-chunked twin of [`eval_param_duals`](Self::eval_param_duals): seed the
+    /// program's θ on a **θ-column chunk's** axes rather than on absolute ones, so a
+    /// program wider than the dual dispatch can be evaluated one chunk at a time (#1907).
+    ///
+    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the chunk
+    /// does not carry enters as a **constant**. That is exact per chunk: forward-mode axes
+    /// never interact, so the chunk that owns a column supplies its derivative, and the
+    /// η block every chunk carries comes out entry for entry the same. `eta_axis_base` is
+    /// the dual axis of `eta[0]` (`cols.len()` for a chunked caller, `n_theta` for an
+    /// absolute one). `theta_cols = None` is the absolute layout `θ_m → m` — the
+    /// pre-chunking behaviour, seed for seed — the same contract as
+    /// `ScaleDerivProgram::eval_scale_dual_cols`.
+    pub(crate) fn eval_param_duals_cols<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        theta_cols: Option<&[usize]>,
+        eta_axis_base: usize,
+    ) -> Vec<crate::sens::dual2::Dual2<M>> {
         use crate::sens::dual2::Dual2;
-        // Only the program's own θ axes (`0..n_theta`, the user-declared thetas) are
-        // seeded. A `theta` slice longer than that carries generated `[covariate_nn]`
-        // weights, which reach the program through `Op::PushNnOutput` and never through
-        // `PushTheta`; seeding them here would put them on the axes `η` and the NN-output
-        // block occupy (`n_theta + k`, see `ModelNnAxisGuard`). For a program whose θ
-        // axis count equals the model's — every non-NN caller — this is the former
-        // `m < M` bound exactly.
+        // θ index → dual axis. Only the program's own θ axes (`0..n_theta`, the
+        // user-declared thetas) are seeded, under either layout. A `theta` slice longer
+        // than that carries generated `[covariate_nn]` weights, which reach the program
+        // through `Op::PushNnOutput` and never through `PushTheta`; seeding them here would
+        // put them on the axes `η` and the NN-output block occupy (`n_theta + k`, see
+        // `ModelNnAxisGuard`). For a program whose θ axis count equals the model's — every
+        // non-NN caller — the absolute layout is the former `m < M` bound exactly.
+        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
+            None => (0..theta.len())
+                .map(|m| (m < self.n_theta).then_some(m))
+                .collect(),
+            Some(_) => vec![None; theta.len()],
+        };
+        if let Some(cols) = theta_cols {
+            for (c, &m) in cols.iter().enumerate() {
+                if m < self.n_theta && m < theta_axis.len() {
+                    theta_axis[m] = Some(c);
+                }
+            }
+        }
         let theta_d: Vec<Dual2<M>> = theta
             .iter()
             .enumerate()
-            .map(|(m, &v)| {
-                if m < self.n_theta && m < M {
-                    Dual2::var(v, m)
-                } else {
-                    Dual2::constant(v)
-                }
+            .map(|(m, &v)| match theta_axis[m] {
+                Some(ax) if ax < M => Dual2::var(v, ax),
+                _ => Dual2::constant(v),
             })
             .collect();
         let eta_d: Vec<Dual2<M>> = eta
             .iter()
             .enumerate()
             .map(|(k, &v)| {
-                let dim = self.n_theta + k;
+                let dim = eta_axis_base + k;
                 if dim < M {
                     Dual2::var(v, dim)
                 } else {
@@ -28788,30 +28857,48 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). For any in-scope
-        // `ExpressionScale` model the provider gate caps `n_theta + n_eta` at
-        // `MAX_SCALE_AXES`, so both `theta` and `eta` fit a stack buffer — build them
-        // there instead of per-call heap `Vec`s (#534 review #4). (`cov_vec` /
-        // bytecode `stack` lengths are not axis-bounded, so they stay on the heap.)
+        // η_k seeds axis k directly (no `n_theta` offset). The non-IOV gate caps
+        // `n_theta + n_eta` at `MAX_SCALE_AXES`, so θ and η fit a stack buffer there —
+        // built on the stack instead of per-call heap `Vec`s (#534 review #4). The IOV
+        // gate carries no such cap: its outer evaluates the scale in θ-column chunks, so
+        // a model past it reaches this inner call with more θ than the buffer holds
+        // (#1907). Those take a heap `Vec` (the fixed-size buffer alone would panic on
+        // the `[..len]` slice). (`cov_vec` / bytecode `stack` lengths are not
+        // axis-bounded, so they stay on the heap.)
         const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
-        debug_assert!(
-            theta.len() <= CAP && eta.len() <= CAP,
-            "scale eval θ/η exceed MAX_SCALE_AXES; caller must be gate-checked"
-        );
-        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
-        for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
-            *d = Dual1::constant(v);
-        }
-        let theta_d = &theta_buf[..theta.len()];
-        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
-        for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
-            *d = if k < N {
+        let seed_eta = |k: usize, v: f64| {
+            if k < N {
                 Dual1::var(v, k)
             } else {
                 Dual1::constant(v)
-            };
-        }
-        let eta_d = &eta_buf[..eta.len()];
+            }
+        };
+        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
+        let theta_heap: Vec<Dual1<N>>;
+        let theta_d: &[Dual1<N>] = if theta.len() <= CAP {
+            for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
+                *d = Dual1::constant(v);
+            }
+            &theta_buf[..theta.len()]
+        } else {
+            theta_heap = theta.iter().map(|&v| Dual1::constant(v)).collect();
+            &theta_heap
+        };
+        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
+        let eta_heap: Vec<Dual1<N>>;
+        let eta_d: &[Dual1<N>] = if eta.len() <= CAP {
+            for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
+                *d = seed_eta(k, v);
+            }
+            &eta_buf[..eta.len()]
+        } else {
+            eta_heap = eta
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| seed_eta(k, v))
+                .collect();
+            &eta_heap
+        };
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
@@ -30944,6 +31031,9 @@ fn parse_if_statement(
         p,
     ))
 }
+
+#[path = "ode_linearity.rs"]
+mod ode_linearity;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

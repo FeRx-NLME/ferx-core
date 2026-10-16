@@ -6,7 +6,7 @@
 //! `N` individual parameters: the compiled RHS program
 //! ([`OdeRhsProgram`](crate::parser::model_parser::OdeRhsProgram)) is evaluated
 //! over the dual numbers by the generic bytecode VM, and the generic RK45
-//! ([`solve_ode_g`]) propagates `∂u/∂p` and
+//! ([`solve_ode_g`](crate::ode::solver::solve_ode_g)) propagates `∂u/∂p` and
 //! `∂²u/∂p²` through the integration with **value-based step control**. The
 //! readout then yields `∂f/∂p, ∂²f/∂p²` per observation, which feed the η/θ chain
 //! via the **general** individual-parameter derivatives `∂p/∂η, ∂p/∂θ` (FD of
@@ -51,7 +51,7 @@ use super::dual2::Dual2;
 use super::dual_mixed::DualMixed;
 use super::provider::{ObsGrad, ObsSens, SubjectSens};
 use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec, PreparedForcings};
-use crate::ode::solver::{solve_ode_g, solve_ode_g_with_auto_state, OdeAutoSwitchState};
+use crate::ode::solver::{solve_ode_g_certified, solve_ode_g_with_auto_state, OdeAutoSwitchState};
 use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
@@ -2826,15 +2826,15 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     if layout.n_groups() == 0 {
         return None;
     }
-    let n_stacked = layout.n_stacked();
-    // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
-    // since `K` is per subject) so an extremely many-occasion subject routes to FD rather
-    // than a silent `_ => None` downgrade.
-    let m_dim = model.n_theta + n_stacked;
+    // Stacked dual width `M = n_theta + n_eta + K·n_kappa` — or, under nested levels
+    // (#1082), `n_theta` plus the compact axis count. Bounded here (per subject, since `K`
+    // is per subject) so an extremely many-occasion subject routes to FD rather than a
+    // silent `_ => None` downgrade.
+    let m_dim = model.n_theta + layout.n_axes();
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
@@ -2885,12 +2885,11 @@ pub fn ode_subject_eta_grad_iov(
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
-    let n_stacked = layout.n_stacked();
-    if stacked_eta.len() != n_stacked {
+    if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     dispatch_ode_iov_axes!(
-        n_stacked,
+        layout.n_axes(),
         run_subject_iov_eta,
         model,
         subject,
@@ -2914,18 +2913,16 @@ fn seed_pk_dual2_iov<const M: usize>(
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
     group: Option<usize>,
-    n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     n_theta: usize,
 ) -> Vec<Dual2<M>> {
-    let n_eff = n_eta + n_kappa;
-    let kappa_base =
-        group.map(|g| n_theta + crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
+    let n_eta = model.n_eta;
+    let n_eff = n_eta + model.n_kappa;
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(n_theta + c)
         } else {
-            kappa_base.map(|base| base + (c - n_eta))
+            group.map(|g| n_theta + layout.kappa_axis(g, c - n_eta))
         }
     };
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
@@ -3030,7 +3027,8 @@ fn run_subject_iov<const M: usize>(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
     let k_groups = layout.n_groups();
-    let n_stacked = layout.n_stacked();
+    // The jet's η-block width: the compact axis count under nested levels (#1082).
+    let n_stacked = layout.n_axes();
     let cov = &subject.covariates;
 
     let occ_to_k = layout.occ_to_group();
@@ -3061,8 +3059,7 @@ fn run_subject_iov<const M: usize>(
             &pk,
             &cd,
             Some(g),
-            n_eta,
-            n_kappa,
+            layout,
             n_theta,
         ))
     };
@@ -3087,7 +3084,7 @@ fn run_subject_iov<const M: usize>(
             &combined_pk_only,
         )?;
         Some(seed_pk_dual2_iov::<M>(
-            model, &pk, &cd, None, n_eta, n_kappa, n_theta,
+            model, &pk, &cd, None, layout, n_theta,
         ))
     };
 
@@ -3351,16 +3348,15 @@ fn seed_pk_dual1_iov<const N: usize>(
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
     group: Option<usize>,
-    n_eta: usize,
-    n_kappa: usize,
+    layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Vec<Dual1<N>> {
-    let n_eff = n_eta + n_kappa;
-    let kappa_base = group.map(|g| crate::stats::stacked_layout::kappa_offset(n_eta, n_kappa, g));
+    let n_eta = model.n_eta;
+    let n_eff = n_eta + model.n_kappa;
     let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
             Some(c)
         } else {
-            kappa_base.map(|base| base + (c - n_eta))
+            group.map(|g| layout.kappa_axis(g, c - n_eta))
         }
     };
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
@@ -3397,7 +3393,8 @@ fn run_subject_iov_eta<const N: usize>(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
     let k_groups = layout.n_groups();
-    let n_stacked = layout.n_stacked();
+    // The jet's η-block width: the compact axis count under nested levels (#1082).
+    let n_stacked = layout.n_axes();
     let cov = &subject.covariates;
 
     let occ_to_k = layout.occ_to_group();
@@ -3417,14 +3414,7 @@ fn run_subject_iov_eta<const N: usize>(
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog, n_theta, n_eff, n_rows, cov, theta, &combined,
         )?;
-        Some(seed_pk_dual1_iov::<N>(
-            model,
-            &pk,
-            &cd,
-            Some(g),
-            n_eta,
-            n_kappa,
-        ))
+        Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, Some(g), layout))
     };
     // The inner κ = 0 seed, for the same rows as the outer one above (#1876). Built lazily
     // inside the closure so the common IOV subject pays no allocation.
@@ -3443,9 +3433,7 @@ fn run_subject_iov_eta<const N: usize>(
             theta,
             &combined_pk_only,
         )?;
-        Some(seed_pk_dual1_iov::<N>(
-            model, &pk, &cd, None, n_eta, n_kappa,
-        ))
+        Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, None, layout))
     };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate
@@ -4091,7 +4079,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     let d1v: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
     let d1s: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
     let advance_unforced = |u0: &[T]| -> Option<Vec<T>> {
-        solve_ode_g(&bare_rhs, u0, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+        solve_ode_g_certified(&bare_rhs, u0, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
@@ -4109,7 +4097,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                         du[cmt_idx] = du[cmt_idx] + rate_forcing;
                     }
                 };
-                let mut y = solve_ode_g(
+                let mut y = solve_ode_g_certified(
                     &rhs_active,
                     u0,
                     (0.0, t_inf_val),
@@ -4139,7 +4127,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 );
                 let quiet_val = dose.ii - t_inf_val;
                 if quiet_val > 0.0 {
-                    y = solve_ode_g(
+                    y = solve_ode_g_certified(
                         &bare_rhs,
                         &y,
                         (0.0, quiet_val),
@@ -4155,7 +4143,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
             None => {
                 let mut y = u0.to_vec();
                 y[cmt_idx] = y[cmt_idx] + f_bio * T::from_f64(dose.amt);
-                solve_ode_g(&bare_rhs, &y, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+                solve_ode_g_certified(&bare_rhs, &y, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
                     .last()
                     .map(|p| p.u.clone())
             }
@@ -4204,7 +4192,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                     du[cmt_idx] = du[cmt_idx] + rate_forcing;
                 }
             };
-            let sol = solve_ode_g(&rhs_active, &u, (0.0, t_inf_val), params, &saveat_inf, opts);
+            let sol =
+                solve_ode_g_certified(&rhs_active, &u, (0.0, t_inf_val), params, &saveat_inf, opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -4232,7 +4221,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 d1_stack,
             );
             if quiet_val > 0.0 {
-                let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet_val), params, &saveat_q, opts);
+                let sol =
+                    solve_ode_g_certified(&bare_rhs, &u, (0.0, quiet_val), params, &saveat_q, opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -4253,7 +4243,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     let mut cycles_run = 0usize;
     for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
-        let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
+        let sol = solve_ode_g_certified(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -4364,7 +4354,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     // f64 path because both floor the same way.
     let eq_opts = crate::ode::predictions::ss_equilibration_opts(opts);
     let advance = |rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T]| -> Option<Vec<T>> {
-        solve_ode_g(rhs, u0, (0.0, ii), params, &[ii], &eq_opts)
+        solve_ode_g_certified(rhs, u0, (0.0, ii), params, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
@@ -4420,7 +4410,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     for m in 0..n_pulses {
         let seg_start = m as f64 * ii;
         let seg_end = seg_start + ii;
-        let sol = solve_ode_g(&train, &u, (seg_start, seg_end), params, &[seg_end], opts);
+        let sol = solve_ode_g_certified(&train, &u, (seg_start, seg_end), params, &[seg_end], opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -4560,7 +4550,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
                 du[cmt_idx] = du[cmt_idx] + inf_rate;
             }
         };
-        let sol = solve_ode_g(
+        let sol = solve_ode_g_certified(
             &rhs_active,
             &u,
             (0.0, active_val),
@@ -4600,7 +4590,8 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
                 d1_stack,
             );
             let quiet_val = phase_val - t_inf_val;
-            let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet_val), params, &[quiet_val], opts);
+            let sol =
+                solve_ode_g_certified(&bare_rhs, &u, (0.0, quiet_val), params, &[quiet_val], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -4613,7 +4604,8 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
         }
     } else {
         u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
-        let sol = solve_ode_g(&bare_rhs, &u, (0.0, phase_val), params, &[phase_val], opts);
+        let sol =
+            solve_ode_g_certified(&bare_rhs, &u, (0.0, phase_val), params, &[phase_val], opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }

@@ -411,8 +411,42 @@ impl NestedLayout {
     pub(crate) fn kappas_at(&self, l: usize) -> Vec<usize> {
         self.level_kappas(l)
     }
+
+    /// Every compact pair `(row, col)` at which `Ω_IOV[(i, j)]` appears in [`Self::prior`]:
+    /// once per group of the level κ `i` and κ `j` both live at, in group order; none when
+    /// they live at two levels (a structural zero of `Ω_IOV`).
+    pub(crate) fn iov_entry_axes(&self, i: usize, j: usize) -> Vec<(usize, usize)> {
+        let ((li, pi), (lj, pj)) = (self.kappa_slot[i], self.kappa_slot[j]);
+        if li != lj {
+            return Vec::new();
+        }
+        let w = self.level_width[li];
+        (0..self.level_count[li])
+            .map(|g| {
+                let off = self.level_offset[li] + g * w;
+                (off + pi, off + pj)
+            })
+            .collect()
+    }
+
+    /// The κ blocks of the compact vector, as `(model κ indices, first compact index)`:
+    /// one per group of each level, its κs in in-level order.
+    pub(crate) fn kappa_blocks(&self) -> Vec<(Vec<usize>, usize)> {
+        let mut out = Vec::new();
+        for l in 0..self.level_width.len() {
+            let ks = self.level_kappas(l);
+            for g in 0..self.level_count[l] {
+                out.push((ks.clone(), self.level_offset[l] + g * self.level_width[l]));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 #[path = "nested_levels_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "nested_levels_test_helpers.rs"]
+pub(crate) mod test_helpers;

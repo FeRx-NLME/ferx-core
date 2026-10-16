@@ -156,7 +156,8 @@ pub fn run_sir(
     // `ode_method` would be ignored and the sampled OFVs would come from a different
     // integration accuracy than the fit being refined. The scope also puts the sample
     // fan-out on a pool whose workers carry the same settings.
-    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
+    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))
+        .map_err(crate::diagnostics::EngineError::uncoded)?
 }
 
 /// `options` with every SIR setting the caller left at its default taken from
@@ -228,6 +229,9 @@ fn run_sir_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_sir"))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a

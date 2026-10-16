@@ -2861,6 +2861,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         0,
         &schedules,
         InnerSolvePolicy::default(),
+        None,
         |_, _| (),
     );
 

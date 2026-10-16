@@ -4590,6 +4590,28 @@ pub(crate) fn all_uncertainty_draws_skipped_diags(
     )]
 }
 
+/// `E_ODE_METHOD_LINEAR`: a caller's `FitOptions { ode_method: Linear }` on a model that
+/// cannot take the exact linear path (#852).
+///
+/// `ode_method = linear` is an assertion. From the model file the parser refuses it; a
+/// caller's `FitOptions` never passes the parser, and without this the fit-scoped override
+/// would quietly integrate an ineligible model (`effective_solver_opts` demotes it to `auto`)
+/// or ignore the option on an analytical one. Every entry point that arms `FitOptions`' ODE
+/// settings calls it: `fit()` (through [`check_model_options`]), `run_covariance` and
+/// `run_sir`.
+pub(crate) fn check_ode_method_linear(
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if options.ode_method != crate::ode::OdeMethod::Linear {
+        return Vec::new();
+    }
+    crate::ode::predictions::ode_method_linear_refusal(model.ode_spec.as_ref())
+        .map(|refusal| Diagnostic::error("E_ODE_METHOD_LINEAR", refusal).with_block("fit_options"))
+        .into_iter()
+        .collect()
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
@@ -4605,6 +4627,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let _bloq = crate::types::arm_bloq_override(options.bloq_method);
     let chain = options.method_chain();
     let mut diags = Vec::new();
+
+    diags.extend(check_ode_method_linear(model, options));
 
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
     // variable to integrate over, so every estimator whose objective *is* an

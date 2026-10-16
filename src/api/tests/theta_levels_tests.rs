@@ -208,7 +208,7 @@ fn predict_reports_an_unbound_level_block_and_names_predicts_binder() {
         .err()
         .expect("an unbound model must not predict");
     // #1746 (review r1 #2): the folded text still carries the diagnostic. Mutation:
-    // build it with `EngineError::from(text)` → the `code()` assert dies.
+    // build it with `EngineError::uncoded(text)` → the `code()` assert dies.
     assert_eq!(err.code(), Some("E_THETA_LEVELS_UNBOUND"), "{err}");
     // (review r1 #6) …and the advice is in `to_string()` once (asserted below) and in
     // `suggestion()`, never also in `message()`, so a renderer of `message()` +

@@ -28,6 +28,7 @@
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |
 //! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data; on block `covariates`, the strict reader found a declared covariate column missing, whether `ferx check --data` read the file or `run_sir` / `run_covariance` re-read `fit.data_path` (#1774) |
 //! | `E_COVARIATE_NOT_NUMERIC` | the strict reader found a declared covariate column holding a value that is not a number. Block `covariates`. Raised by `ferx check --data` and by the `run_sir` / `run_covariance` re-read of `fit.data_path` (#1774), through one classifier |
+//! | `E_ODE_METHOD_LINEAR`     | `ode_method = linear` on a model that cannot take the exact linear path |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
 //! | `W_PER_CMT_UNMATCHED`     | the other direction of the two above: a **declared** per-CMT entry — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, or a `y[CMT=N]` readout on either engine — that no observation is recorded on, so the entry is inert. A warning rather than an error because nothing goes `NaN`, and one code for all three channels, with the channel named in the message. Names `[data_selection]` as a candidate cause only for the dead compartments a clause actually emptied. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead (#1405) |
@@ -102,9 +103,10 @@
 //! | `E_TTE_NOT_SIMULATABLE`   | a TTE endpoint the event-time simulator cannot draw for this population: two repeated-event streams on a subject, a repeated-event cause beside a single-event one, a reset under a repeated-event or ODE-accumulated hazard, left truncation under an ODE-accumulated hazard; or a repeated-event or ODE-accumulated TTE endpoint on `simulate_with_uncertainty`, which needs a horizon and takes none. Block `event_model`. Raised by the `simulate*` entry points (#1774) |
 //! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check still returns a `String` (#1772) |
 //! | `E_PROPENSITY_INPUT`      | propensity-score matching was requested on a population it cannot compute posthoc etas from: empty, a subject with no observations, a non-finite `DV`. Raised by `simulate_with_options*` (#1774) |
-//! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), or an `auc_target` on a time-varying-covariate, IOV or reset subject. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
-//! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite or not strictly increasing), or `decision_times` / `monitors` set beside a spec that owns them. Raised by the adaptive entry points (#1774) |
-//! | `E_ADAPTIVE_SPEC`         | an `[adaptive_dosing]` spec that does not compile against the model: a parser invariant (on a spec built in code), `assay_cmt` out of range, an `observe` that does not compile. Block `adaptive_dosing`. Raised by `simulate_adaptive_from_spec`, whose context it carries (#1774). An `observe` covariate absent from the data is `E_MISSING_COVARIATE` there, block `adaptive_dosing` |
+//! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), an `auc_target` on a time-varying-covariate, IOV or reset subject, or a base regimen × EVID=3/4 reset under a time-varying covariate or IOV (before any subject runs). Once the driver runs (#1983): a base dose under a time-varying covariate or IOV that is not a plain bolus / infusion, a non-finite break time, a `TAD` / `TAFD` read before any dose. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
+//! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite, not strictly increasing, or past `max_decisions`), a monitor compartment out of range, a `Dv` monitor on a compartment no `[error_model]` covers, or `decision_times` / `monitors` set beside a spec that owns them — all before any subject runs. Once the driver runs (#1983): two of a subject's times within 1e-15 of each other but not equal. Raised by the adaptive entry points (#1774) |
+//! | `E_ADAPTIVE_CONTROLLER_ACTION` | a controller action the driver refuses: a dose into compartment 0 or past the states, a negative or non-finite amount, a rate that is not positive and finite, a compartment fed by an input-rate function or carrying a lag, a `Stop` with actions after it. The controller is the caller's code, so an input refusal; only a simulation reaches it. Raised by `simulate_adaptive` (#1983); on `simulate_adaptive_from_spec`, whose controller is the spec's `route`, the same refusal is `E_ADAPTIVE_SPEC` |
+//! | `E_ADAPTIVE_SPEC`         | an `[adaptive_dosing]` spec that does not compile against the model: a parser invariant (on a spec built in code), `assay_cmt` out of range or with no `[error_model]` (#1983), a `route` compartment out of range or fed by an input-rate function, or — once the driver runs — a `route` dose it refuses (a lagged compartment) (#1983), an `observe` that does not compile. Block `adaptive_dosing`. Raised by `simulate_adaptive_from_spec`, whose context it carries (#1774). An `observe` covariate absent from the data is `E_MISSING_COVARIATE` there, block `adaptive_dosing` |
 //! | `E_LEVEL_MIXED_WITH_IOV_COLUMN` | a `level` declaration beside `iov_column` / `iov_occasion`, or a `kappa` with no `at LEVEL` once levels are declared (#1082). Block `parameters`; raised at parse time, so a parse error's message carries the code |
 //! | `E_LEVEL_MISSING_LABEL`   | a record with no value in a level column of a nested model (#1082). Block `parameters`. Raised by `fit()` and `ferx check --data` |
 //! | `E_LEVEL_SINGLE_MEMBER`   | a level with at most one group in every parent group whose kappa reads the same parameters as a random effect of the parent level (#1082). Block `parameters` |
@@ -277,7 +279,8 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
 /// `E_SIR_OPTIONS` / `E_SIR_NOTHING_TO_SAMPLE`, and the
 /// predict / simulate / adaptive codes of #1774 (`E_CTMM_UNSUPPORTED`,
 /// `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON`, `E_PROPENSITY_INPUT`,
-/// `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`).
+/// `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`,
+/// `E_ADAPTIVE_CONTROLLER_ACTION`).
 /// A failure with no code carries none ([`diagnostic`](Self::diagnostic) is `None`).
 ///
 /// `Display` is the historical `String` error byte for byte: the message, preceded
@@ -318,6 +321,23 @@ impl EngineError {
         EngineError {
             suggestion_in_display: true,
             ..EngineError::from_diagnostic(d)
+        }
+    }
+
+    /// An error with no diagnostic: [`code`](Self::code) is `None`.
+    ///
+    /// Right only for a failure `ferx check` has no code for: a runtime, IO or
+    /// internal failure, or a refusal no code exists for yet. A refusal some
+    /// helper already codes goes through that helper's [`Diagnostic`] instead.
+    /// There is deliberately no `From<String>` (#1775): a `?` on a `String`
+    /// helper would otherwise drop a code silently. Every call site is listed in
+    /// `UNCODED_SITES` (the test module below) with its reason.
+    pub(crate) fn uncoded(message: impl Into<String>) -> Self {
+        EngineError {
+            diagnostic: None,
+            message: message.into(),
+            context: None,
+            suggestion_in_display: false,
         }
     }
 
@@ -379,25 +399,6 @@ impl std::fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<String> for EngineError {
-    fn from(message: String) -> Self {
-        EngineError {
-            diagnostic: None,
-            message,
-            context: None,
-            suggestion_in_display: false,
-        }
-    }
-}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<&str> for EngineError {
-    fn from(message: &str) -> Self {
-        message.to_string().into()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -462,7 +463,7 @@ mod tests {
         assert_eq!(err.context(), None);
         assert_eq!(err.to_string(), "second is the error");
 
-        let plain = EngineError::from("no diagnostic here".to_string());
+        let plain = EngineError::uncoded("no diagnostic here");
         assert!(plain.diagnostic().is_none());
         assert_eq!(plain.code(), None);
         assert_eq!(plain.to_string(), "no diagnostic here");
@@ -513,3 +514,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "diagnostics_uncoded_sites.rs"]
+mod uncoded_sites;

@@ -583,29 +583,106 @@ fn fit_refuses_a_nested_model_under_saem_with_its_code() {
 
 // ── route ────────────────────────────────────────────────────────────────────────
 
-/// A nested model reports finite differences on every gradient, while the same model
-/// with one level reports the analytic walks — so the report follows the nesting, not
-/// the model class.
+/// #1082 PR3: each parity fixture (`stats::nested_levels::test_helpers` — one per analytic
+/// walk) fitted end to end reports the analytic route on both loops and no FD-fallback
+/// warning: the engine a fixture runs on is read off the fit, not assumed from the model
+/// class. A subject that dropped to FD would name itself in `iov_fd_fallback_warning`.
 #[test]
-fn a_nested_model_reports_finite_differences_and_its_one_level_twin_does_not() {
+fn every_nested_parity_fixture_fits_on_the_analytic_walks() {
+    use crate::build_info::GradientMethodKind;
+    use crate::stats::nested_levels::test_helpers as fx;
+    let analytic = GradientMethodKind::Analytic.as_str();
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (m, pop) = fx::prepared(&src, 2);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            iov_occasion: IovOccasionRule::Column,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let r = crate::api::fit(&m, &pop, &m.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(r.ofv.is_finite(), "{label}");
+        assert_eq!(r.gradient_method_inner, analytic, "{label}");
+        assert_eq!(r.gradient_method_outer, analytic, "{label}");
+        let fd: Vec<&String> = r
+            .warnings
+            .iter()
+            .filter(|w| w.contains("finite-difference"))
+            .collect();
+        assert!(fd.is_empty(), "{label}: {fd:?}");
+    }
+}
+
+/// The closed-form transit model with a κ on each of two levels. Its IOV subjects run on
+/// the ODE twin, which is re-parsed from emitted source.
+const TRANSIT_NESTED: &str = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  \
+    theta TVV(50.0, 5.0, 500.0)\n  theta TVMTT(3.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  \
+    omega ETA_V ~ 0.09\n  level STUDY by STUDY in ID\n  level ARM by ARM in STUDY\n  \
+    kappa K_ST ~ 0.04 at STUDY\n  kappa K_ARM ~ 0.09 at ARM\n  sigma PROP ~ 0.15 (sd)\n\
+    [individual_parameters]\n  CL = TVCL * exp(K_ST)\n  V = TVV * exp(ETA_V)\n  \
+    MTT = TVMTT * exp(K_ARM)\n  NTR = TVN\n[structural_model]\n  \
+    pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n[error_model]\n  \
+    DV ~ proportional(PROP)\n";
+
+/// #1082 PR3: a nested model reports the analytic walks on every gradient, as its
+/// one-level twin does — the walks seed κ on the compact axes. The one nested model left
+/// on finite differences is a closed-form transit/IG one, whose IOV subjects run on an ODE
+/// twin not known to carry the levels; its one-level twin stays analytic, so the decline
+/// follows the nesting and not the model class.
+#[test]
+fn a_nested_model_reports_the_analytic_walks_unless_it_runs_on_a_transit_twin() {
+    let one_level = |src: &str, inner: &str, outer: &str| {
+        parse_model_string(
+            &src.replace(&format!("  level {inner} by {inner} in {outer}\n"), "")
+                .replace(&format!("at {inner}"), &format!("at {outer}")),
+        )
+        .unwrap()
+    };
     let nested = model();
-    let one = parse_model_string(&src().replace("  level ARM by ARM in STUDY\n", "").replace(
-        "kappa K_ARM ~ 4.0 at ARM weight = NARM",
-        "kappa K_ARM ~ 4.0 at STUDY weight = NARM",
-    ))
-    .unwrap();
-    for (m, nested_levels) in [(&nested, true), (&one, false)] {
-        assert_eq!(m.has_nested_levels(), nested_levels);
-        let analytic = !nested_levels;
-        assert_eq!(crate::sens::provider::iov_sens_supported(m), analytic);
-        assert_eq!(crate::sens::provider::iov_sens_eta_supported(m), analytic);
+    let one = one_level(&src(), "ARM", "STUDY");
+    let transit = parse_model_string(TRANSIT_NESTED).unwrap();
+    let transit_one = one_level(TRANSIT_NESTED, "ARM", "STUDY");
+    assert!(
+        transit.absorption_ode_equivalent.is_some(),
+        "the transit fixture must carry an ODE twin, or it cannot see the decline"
+    );
+    for (label, m, nested_levels, analytic) in [
+        ("algebraic, nested", &nested, true, true),
+        ("algebraic, one level", &one, false, true),
+        ("transit, nested", &transit, true, false),
+        ("transit, one level", &transit_one, false, true),
+    ] {
+        assert_eq!(m.has_nested_levels(), nested_levels, "{label}");
+        assert_eq!(
+            crate::sens::provider::nested_levels_outside_analytic_scope(m),
+            !analytic,
+            "{label}"
+        );
+        assert_eq!(
+            crate::sens::provider::iov_sens_supported(m),
+            analytic,
+            "{label}"
+        );
+        assert_eq!(
+            crate::sens::provider::iov_sens_eta_supported(m),
+            analytic,
+            "{label}"
+        );
         assert_eq!(
             crate::estimation::inner_optimizer::inner_reports_analytic_model(m),
-            analytic
+            analytic,
+            "{label}"
         );
         assert_eq!(
             crate::sens::provider::analytic_outer_gradient_in_scope(m),
-            analytic
+            analytic,
+            "{label}"
         );
     }
 }
