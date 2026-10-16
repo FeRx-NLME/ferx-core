@@ -14323,6 +14323,28 @@ fn iov_gate_needs_one_theta_column_beside_the_eta_kappa_block() {
             fits,
             "n_eff = {n_eff}: the outer walk must agree with its gate"
         );
+        // The builder's own refusal, reached directly: the walk above returns before it
+        // when the gate declines, so it alone would leave the `chunk_len == 0` arm unrun.
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let n_rows = prog.pk_slots_ref().len();
+        assert_eq!(
+            iov_combined_derivs_dyn(
+                prog,
+                model.n_theta,
+                n_eff,
+                n_rows,
+                &HashMap::new(),
+                &theta,
+                &stacked[..n_eff],
+            )
+            .is_some(),
+            fits,
+            "n_eff = {n_eff}: the program builder needs one θ column beside [η, κ]"
+        );
         assert!(
             iov_analytical_eta_supported(&model),
             "n_eff = {n_eff}: inner gate"
