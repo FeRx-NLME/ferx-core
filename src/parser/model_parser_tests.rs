@@ -6232,11 +6232,301 @@ fn covariate_mu_ref_rejects_what_it_cannot_evaluate_per_subject() {
         ),
         (
             "if (SEX == 1) { TV = TVCL } else { TV = TH_X }\nCL = TV * exp(ETA_CL)",
-            "a conditionally assigned local cannot be inlined",
+            "a local an if assigns from a theta is not inlined (#1422)",
         ),
     ] {
         assert!(detect_groups(src, &tn, &en).is_empty(), "{why}: {src}");
     }
+}
+
+// ── #1422: a local assigned in every arm of an `if`, and `min`/`max` of a local ──
+
+/// [`detect_groups`], parsed the way a real `[individual_parameters]` block is:
+/// every assigned name in `defined_vars`, so a local reads as `Variable`, not
+/// as a data covariate of the same name.
+fn detect_groups_with_locals(
+    src: &str,
+    theta_names: &[&str],
+    eta_names: &[&str],
+) -> (Vec<CovariateMuRef>, Vec<Statement>) {
+    let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
+    let probe = parse_block_statements(src, ParseCtx::new(&tn, &en, &[]), StatementMode::Plain)
+        .expect("parses");
+    let locals = assigned_vars_in_order(&probe);
+    let ctx = ParseCtx::new(&tn, &en, &locals);
+    let stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    let groups = detect_covariate_mu_refs(&stmts, &tn, &en, en.len(), &HashSet::new());
+    (groups, stmts)
+}
+
+/// `name` after evaluating the whole block at `eta = 0` — the model's own
+/// reading, which a group's typical value must reproduce.
+fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &str) -> f64 {
+    let covariates: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let mut vars: HashMap<String, f64> = HashMap::new();
+    eval_statements(
+        stmts,
+        theta,
+        &[0.0],
+        &covariates,
+        &mut vars,
+        None,
+        None,
+        &[],
+    );
+    vars[name]
+}
+
+/// A group's typical value at `covs`.
+fn group_typical(g: &CovariateMuRef, theta: &[f64], covs: &[(&str, f64)]) -> f64 {
+    let map: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    eval_typical_value(&g.typical, theta, &map)
+}
+
+/// The issue's melphalan model: `CRCLR` is assigned in both arms of an
+/// `if`/`else`, and `CRCLM = min(CRCLR, 120)` caps it. NONMEM puts
+/// `THETA(7)*LOG(CRCLM/100)` inside `MU_1`; ferx left `CL_CRCL` on the
+/// eta-frozen numerical M-step. Each of the two gaps alone rejects the group
+/// (`covariate_mu_ref_sees_through_a_min_or_max_of_a_local` isolates the
+/// second).
+#[test]
+fn covariate_mu_ref_sees_through_an_if_assigned_local_and_a_min() {
+    let src = "\
+if (AGE >= 17) {
+  CRCLR = (((140 - AGE) * WT) / (72 * SCR)) * 0.85 ^ (1 - SEX)
+} else {
+  CRCLR = 0.413 * HT / SCR
+}
+CRCLM = min(CRCLR, 120)
+CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "CL_CRCL"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0].eta_name, "ETA_CL");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "CL_CRCL"]);
+    assert_eq!(g[0].transform, MuTransform::Log);
+    for c in ["FFM", "AGE", "WT", "SCR", "SEX", "HT"] {
+        assert!(
+            g[0].covariate_names.iter().any(|n| n == c),
+            "{c} in {:?}",
+            g[0].covariate_names
+        );
+    }
+    // The stored typical value is the model's CL at eta = 0 in every cell of
+    // (adult / paediatric arm) × (under / over the 120 cap). A typical value
+    // still reading `CRCLR` would evaluate the local as 0.
+    let theta = [6.0, 0.4];
+    let cells: [(&[(&str, f64)], bool); 4] = [
+        (
+            &[
+                ("AGE", 40.0),
+                ("WT", 70.0),
+                ("SCR", 1.0),
+                ("SEX", 0.0),
+                ("HT", 170.0),
+                ("FFM", 50.0),
+            ],
+            false,
+        ),
+        (
+            &[
+                ("AGE", 30.0),
+                ("WT", 100.0),
+                ("SCR", 0.6),
+                ("SEX", 1.0),
+                ("HT", 180.0),
+                ("FFM", 70.0),
+            ],
+            true,
+        ),
+        (
+            &[
+                ("AGE", 10.0),
+                ("WT", 30.0),
+                ("SCR", 0.5),
+                ("SEX", 1.0),
+                ("HT", 140.0),
+                ("FFM", 25.0),
+            ],
+            false,
+        ),
+        (
+            &[
+                ("AGE", 10.0),
+                ("WT", 30.0),
+                ("SCR", 0.3),
+                ("SEX", 0.0),
+                ("HT", 140.0),
+                ("FFM", 25.0),
+            ],
+            true,
+        ),
+    ];
+    for (covs, capped) in cells {
+        let crclm = block_value(&stmts, &theta, covs, "CRCLM");
+        assert_eq!(
+            crclm == 120.0,
+            capped,
+            "fixture cell {covs:?}: CRCLM = {crclm}"
+        );
+        let want = block_value(&stmts, &theta, covs, "CL");
+        assert!(want.is_finite() && want > 0.0, "{covs:?}: {want}");
+        assert_eq!(group_typical(&g[0], &theta, covs), want, "{covs:?}");
+    }
+}
+
+/// The `WTN` shape of `covmuref_power_numeric_saem_fit.ferx` before #1422 —
+/// the `if` form of `covmuref_power_saem_fit.ferx`'s `(WT/70)^TH_WT`.
+#[test]
+fn covariate_mu_ref_sees_through_the_if_assigned_weight_ratio() {
+    let src = "\
+if (WT > 0) {
+  WTN = WT / 70.0
+} else {
+  WTN = 1.0
+}
+CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)";
+    let (g, _) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_WT"]);
+    assert_eq!(g[0].covariate_names, vec!["WT"]);
+}
+
+/// An `else if` chain folds condition for condition, first true arm winning.
+/// One subject per arm: a fold that paired an arm with the wrong condition
+/// returns another arm's value for at least one of them.
+#[test]
+fn covariate_mu_ref_folds_an_else_if_chain_in_order() {
+    let src = "\
+if (AGE < 2) {
+  MAT = 0.5
+} else if (AGE < 12) {
+  MAT = 0.8
+} else {
+  MAT = 1.0
+}
+CL = TVCL * MAT * (WT / 70) ^ TH_WT * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    let theta = [5.0, 0.75];
+    for age in [1.0, 5.0, 30.0] {
+        let covs = [("AGE", age), ("WT", 35.0)];
+        let want = block_value(&stmts, &theta, &covs, "CL");
+        assert_eq!(group_typical(&g[0], &theta, &covs), want, "AGE = {age}");
+    }
+}
+
+/// The second gap on its own: a two-argument `min`/`max` is the conditional
+/// `if (a <= b) a else b`, and before #1422 substitution stopped at it, so a
+/// cap on a *local* left the local unresolved in both the condition and the arm.
+#[test]
+fn covariate_mu_ref_sees_through_a_min_or_max_of_a_local() {
+    for f in ["min", "max"] {
+        let src = format!(
+            "CRCL2 = CRCL * 1.2\nCRCLM = {f}(CRCL2, 120)\n\
+             CL = TVCL * (CRCLM / 100) ^ TH_CRCL * exp(ETA_CL)"
+        );
+        let (g, stmts) = detect_groups_with_locals(&src, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+        assert_eq!(g.len(), 1, "{f}: {g:?}");
+        assert_eq!(g[0].covariate_names, vec!["CRCL"], "{f}");
+        let theta = [5.0, 0.6];
+        // 1.2 × CRCL straddles the 120 cap: both arms of the conditional.
+        for crcl in [60.0, 150.0] {
+            let covs = [("CRCL", crcl)];
+            let want = block_value(&stmts, &theta, &covs, "CL");
+            assert_eq!(
+                group_typical(&g[0], &theta, &covs),
+                want,
+                "{f}, CRCL = {crcl}"
+            );
+        }
+    }
+}
+
+/// Every definition in an [`InlineScope`] is eta-free — `rhs_contains_eta`
+/// skips one without reading it — and a folded `if` local keeps that: one
+/// whose arm or condition reads an eta is not recorded. Asserted on the scope
+/// itself, since a typical value reading such a local is rejected downstream
+/// anyway (its summary notes the eta) and would hide the breach. The
+/// eta-free control is recorded, so the test is not satisfied by a scope that
+/// records nothing.
+#[test]
+fn a_folded_if_local_is_recorded_only_when_eta_free() {
+    let tn: Vec<String> = vec!["TVCL".into()];
+    let en: Vec<String> = vec!["ETA_CL".into()];
+    for (src, want) in [
+        ("if (WT > 0) { X = WT / 70 } else { X = 1 }", true),
+        (
+            "if (WT > 0) { X = WT / 70 * exp(ETA_CL) } else { X = 1 }",
+            false,
+        ),
+        ("if (ETA_CL > 0) { X = WT / 70 } else { X = 1 }", false),
+    ] {
+        let locals = vec!["X".to_string()];
+        let stmts =
+            parse_block_statements(src, ParseCtx::new(&tn, &en, &locals), StatementMode::Plain)
+                .expect("parses");
+        let folded = fold_branch_definitions(&stmts);
+        assert_eq!(folded.len(), 1, "{src}: folded {folded:?}");
+        let mut scope = InlineScope::new(&stmts);
+        scope.record_branch_definition(0, &folded[0].1, &folded[0].2);
+        assert_eq!(scope.defs.contains_key("X"), want, "{src}");
+    }
+}
+
+/// What the #1422 folding still rejects. Each line would be a group if the
+/// local were folded, so each guards one condition of the fold. Every row is
+/// checked before failing, so a mutation names all the rows it leaks.
+#[test]
+fn covariate_mu_ref_rejects_an_if_local_it_cannot_fold() {
+    let tail = "CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)";
+    let tn = ["TVCL", "TH_WT", "TH_F", "TH_BP"];
+    let mut leaked = Vec::new();
+    for (head, why) in [
+        (
+            "if (WT > 0) { WTN = WT / 70.0 * TH_F } else { WTN = 1.0 }",
+            "an arm reads a theta",
+        ),
+        (
+            "if (WT > TH_BP) { WTN = WT / 70.0 } else { WTN = 1.0 }",
+            "the condition reads a theta",
+        ),
+        (
+            "WTN = 1.0\nif (WT > 0) { WTN = WT / 70.0 }",
+            "no else: assigned before the if and in one arm",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { X = 1.0 }",
+            "an arm does not assign it",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { WTN = 1.0 }\nWTN = WT / 50.0",
+            "reassigned after the if: the folded value is stale below",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { if (AGE > 1) { WTN = 1.0 } else { WTN = 0.9 } }",
+            "assigned in a nested if",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 * TIME } else { WTN = 1.0 }",
+            "TIME varies within a subject",
+        ),
+        (
+            "if (WT > 0) {\n R = WT / 70.0\n WTN = R\n} else {\n R = 1.0\n WTN = R\n}",
+            "an arm reads a local assigned earlier in the same arm",
+        ),
+    ] {
+        let src = format!("{head}\n{tail}");
+        let (g, _) = detect_groups_with_locals(&src, &tn, &["ETA_CL"]);
+        if !g.is_empty() {
+            leaked.push(format!("{why}: {src}\n  → {:?}", g[0].theta_names));
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "recorded a group for:\n{}",
+        leaked.join("\n")
+    );
 }
 
 #[test]
@@ -29755,7 +30045,8 @@ fn reaching_definitions_per_shape() {
     );
 }
 
-/// The pre-#1684 inliner, kept as the oracle for [`InlineScope`]: each
+/// The pre-#1684 inliner, kept as the oracle for [`InlineScope`] (and taught
+/// #1422's substitution into a conditional, condition included): each
 /// definition is resolved where it is written and stored as a full tree, and
 /// a use substitutes a copy (exponential on a diamond, which is why it is
 /// test-only now). One entry per statement: the inlined right-hand side of
@@ -29776,6 +30067,12 @@ fn eager_inlined(stmts: &[Statement]) -> Vec<Option<Expression>> {
             Expression::UnaryFn(name, a) => {
                 Expression::UnaryFn(name.clone(), Box::new(inline(a, defs)))
             }
+            // Condition and arms alike since #1422.
+            Expression::Conditional(c, t, e) => Expression::Conditional(
+                Box::new(map_condition_operands(c, &mut |x| inline(x, defs))),
+                Box::new(inline(t, defs)),
+                Box::new(inline(e, defs)),
+            ),
             _ => expr.clone(),
         }
     }
@@ -29848,13 +30145,13 @@ fn assert_inliner_matches_eager(
 /// #1684 equivalence: on every example model's `[individual_parameters]`, as
 /// the full parse hands them to the scans, the lazy inliner reads the same
 /// tree as the eager one and classifies it the same way. Plus statement-level
-/// shapes the examples lack: a definition inside a conditional (substitution
-/// stops there), a forward reference (it resolves against the definition's
+/// shapes the examples lack: a definition read inside a conditional's arm and
+/// its condition (substituted in both since #1422), a forward reference (it resolves against the definition's
 /// own scope), the written-out logit forms, a chain through a pure alias, and
 /// a product with the definition in the middle (the built typical value
 /// re-associates through it).
-/// Dies under: substitution into a conditional (`frozen` ignored in
-/// `Inlined::resolve`); use-site resolution (`limit` not narrowed to the
+/// Dies under: no substitution into a conditional (`Conditional` dropped
+/// from `Inlined::rewrites_children`); use-site resolution (`limit` not narrowed to the
 /// definition's index); `flatten_chain` not flattening through definitions in
 /// `TypicalParts::build`.
 #[test]
@@ -29890,6 +30187,7 @@ fn the_inliner_matches_the_eager_one() {
     let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
     let shapes = [
         "A = TVV\nB = if (WT > 70) A else TVCL\nCL = B * exp(ETA_CL)",
+        "A = WT / 70\nB = if (A > 1) A else 1\nCL = TVCL * B ^ TH_WT * exp(ETA_CL)",
         "A = FOO\nFOO = TVCL\nCL = A * exp(ETA_CL)",
         "L = TVCL + TH_WT * WT\nCL = 1 / (1 + exp(-(L + ETA_CL)))\nV = 1 / (1 + exp(-L - ETA_V))",
         "L = TVCL\nM = L\nCL = inv_logit(logit(M) + ETA_CL)\nV = exp(log(M * WT) + ETA_V)",
