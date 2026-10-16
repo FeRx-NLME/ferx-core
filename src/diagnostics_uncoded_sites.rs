@@ -24,9 +24,9 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "src/api/adaptive.rs",
         "run_adaptive_population",
         3,
-        "the adaptive run's own refusals (decision schedule over max_decisions, a monitor on a missing \
-         compartment, a base regimen with system resets / IOV) have codes nearby but no Diagnostic yet, #2044; \
-         runtime: the run itself; internal: the snapshot and frozen-replay verifiers",
+        "one `?` on the adaptive driver (ode_predictions_adaptive_impl) carries ~20 causes: its input \
+         refusals and malformed controller actions get codes in #1983; runtime: the run itself; \
+         internal: the snapshot and frozen-replay verifiers",
     ),
     (
         "src/api/simulate.rs",
