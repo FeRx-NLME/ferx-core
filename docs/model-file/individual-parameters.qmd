@@ -562,7 +562,10 @@ values form **one** group: SAEM and IMP/IMPMAP re-fit all of their thetas in a s
 M-step and re-centre both etas, and the fit says so in a warning naming the etas and
 the shared theta. Here `THETA_WT` is read by nothing but the two typical values, so the
 group still takes the fast exact M-step. Two typical values that share only a `FIX`ed
-theta stay separate. See the SAEM page for the
+theta stay separate. A covariate mu-reference that reads another eta's single-theta
+anchor (`V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` next to
+`V2 = TVV2 * exp(ETA_V2)`) takes that anchor into its group in the same way
+([#1630](https://github.com/FeRx-NLME/ferx-core/issues/1630)). See the SAEM page for the
 [M-step](../estimation/saem.qmd#saem-mstep-covariate-mu-ref) and its validation
 against NONMEM.
 

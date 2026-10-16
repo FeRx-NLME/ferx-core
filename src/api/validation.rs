@@ -402,18 +402,54 @@ pub(crate) fn check_level_index_columns(
 /// Map an error string from [`read_population_for`] onto a `ferx check`
 /// diagnostic, so the covariate-validation failures the strict reader raises at
 /// fit time surface with the same code/block in `ferx check` (rather than as a
-/// generic `E_DATA`). Classification keys off the reader's stable message
-/// prefixes ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]).
+/// generic `E_DATA`). The classification is [`data_read_diagnostic`]'s; `ferx
+/// check` only words an `E_DATA` read failure with the path it read.
 fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
+    let mut d = data_read_diagnostic(err);
+    if d.code == "E_DATA" {
+        d.message = format!("Failed to read data file '{}': {}", path, err);
+    }
+    d
+}
+
+/// The one classifier of a data-file read failure (#1774): `ferx check`'s read of
+/// the data and `run_sir` / `run_covariance`'s re-read of `fit.data_path` both code
+/// through it. A covariate the strict reader finds missing is
+/// `E_MISSING_COVARIATE`, one it finds non-numeric `E_COVARIATE_NOT_NUMERIC`, both
+/// on block `covariates`; any other failure (the file cannot be opened or parsed)
+/// is `E_DATA`. Keys off the reader's stable message prefixes
+/// ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]). The message is `err`
+/// as given.
+pub(crate) fn data_read_diagnostic(err: &str) -> Diagnostic {
     if err.starts_with(ERR_COV_MISSING_COLUMNS) {
         Diagnostic::error("E_MISSING_COVARIATE", err.to_string()).with_block("covariates")
     } else if err.starts_with(ERR_COV_NON_NUMERIC) {
         Diagnostic::error("E_COVARIATE_NOT_NUMERIC", err.to_string()).with_block("covariates")
     } else {
-        Diagnostic::error(
-            "E_DATA",
-            format!("Failed to read data file '{}': {}", path, err),
-        )
+        Diagnostic::error("E_DATA", err.to_string())
+    }
+}
+
+/// The one classifier of a `[data_selection]` clause that does not compile into a
+/// row filter: `E_PARSE` on block `data_selection`, message as given. `ferx check`
+/// reaches it from a hand-built [`FitOptions`]; `run_sir` / `run_covariance` from
+/// recorded reader settings whose clauses were edited after the fit (#1774).
+pub(crate) fn selection_filter_diagnostic(err: String) -> Diagnostic {
+    Diagnostic::error("E_PARSE", err).with_block("data_selection")
+}
+
+/// The one classifier of a failed model-file read (#1752, #1774): `ferx check` and
+/// `run_sir` / `run_covariance`'s re-read of `fit.model_path` both code through it.
+/// A file that cannot be read or is not UTF-8 is `E_MODEL_READ` with no block; one
+/// that does not parse gets the parse's own code ([`parse_error_to_diagnostic`]);
+/// one whose SHA-256 is not the fit's recorded one is `E_FIT_INPUT_CHANGED`, which
+/// `ferx check` never reaches, since it compares no hash. The message is the read's.
+pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceError) -> Diagnostic {
+    use crate::io::model_source::ModelSourceError;
+    match e {
+        ModelSourceError::Read(m) => Diagnostic::error("E_MODEL_READ", m),
+        ModelSourceError::Hash(m) => crate::api::entry_refusals::fit_input_changed_diag(m),
+        ModelSourceError::Parse(m) => parse_error_to_diagnostic(&m),
     }
 }
 
@@ -434,8 +470,7 @@ fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
 fn check_selection_filter(
     opts: &FitOptions,
 ) -> Result<Option<crate::io::datareader::SelectionFilter>, Diagnostic> {
-    crate::api::run::build_selection_filter(opts)
-        .map_err(|e| Diagnostic::error("E_PARSE", e).with_block("data_selection"))
+    crate::api::run::build_selection_filter(opts).map_err(selection_filter_diagnostic)
 }
 
 /// The code a reader warning already carries, for the `ferx check` diagnostic that
@@ -1192,7 +1227,26 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
         // One variation warning per kappa — the condition is a property of the
         // dataset's shape, so repeating it per subject-occasion is noise.
         'kappa: for subj in &population.subjects {
-            for (occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
+            // Under nested levels (#1082) κ is drawn once per group of its own level, so
+            // the weight must be constant there; otherwise once per occasion.
+            let groups: Vec<(String, Vec<usize>)> = match model.nested_levels() {
+                Some(levels) => {
+                    crate::stats::nested_levels::obs_groups_at(levels, subj, levels.kappa_level[k])
+                        .into_iter()
+                        .map(|(label, idx)| (format!("group `{label}`"), idx))
+                        .collect()
+                }
+                None => crate::stats::likelihood::iov_occasion_groups(subj)
+                    .into_iter()
+                    .map(|(occ, idx)| (format!("occasion {occ}"), idx))
+                    .collect(),
+            };
+            let drawn_per = if model.has_nested_levels() {
+                "group of its level"
+            } else {
+                "occasion"
+            };
+            for (occ, obs_idx) in groups {
                 let mut seen: Option<f64> = None;
                 for &j in &obs_idx {
                     let w = (weight.eval)(theta, subj.obs_cov(j), subj.param_time_obs(j));
@@ -1204,11 +1258,17 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
                                     "W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION",
                                     format!(
                                         "[parameters] kappa `{name}` weight `{}` is not constant \
-                                         within occasion {occ} of subject `{}` ({prev} then {w}). \
-                                         κ is drawn once per occasion, so the occasion's \
+                                         within {occ} of subject `{}` ({prev} then {w}). \
+                                         κ is drawn once per {drawn_per}, so the {} \
                                          effective variance Ω_IOV/W is ambiguous; the records are \
                                          each scaled by their own weight.",
-                                        weight.expr, subj.id
+                                        weight.expr,
+                                        subj.id,
+                                        if model.has_nested_levels() {
+                                            "group's"
+                                        } else {
+                                            "occasion's"
+                                        }
                                     ),
                                 )
                                 .with_block("parameters"),
@@ -1711,6 +1771,7 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_kappa_weights(model, population));
     diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
+    diags.extend(check_nested_levels(model, population));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(check_dose_compartments(model, population));
@@ -1836,6 +1897,12 @@ fn check_iov_occasions(
     if model.n_kappa == 0 {
         return Vec::new();
     }
+    // Nested levels (#1082) name their groups from the level columns when the population
+    // is prepared, so the dataset carries no occasion labels; `check_nested_levels` checks
+    // the columns instead.
+    if model.has_nested_levels() {
+        return Vec::new();
+    }
     // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
     // occasion labels at fit time from each subject's timeline, so the dataset need
     // not carry them — the empty-occasions check does not apply.
@@ -1857,6 +1924,192 @@ fn check_iov_occasions(
          both in [fit_options] — so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// The data checks of a model with nested levels (#1082), in this order:
+///
+/// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
+///   column. Every record needs its full label path, since its group at each level is
+///   identified by that path.
+/// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
+///   its parent, with a κ that has the same readers as a random effect of the parent
+///   level. That κ is then the parent's random effect by another name, and the two
+///   variances cannot be told apart. A level where some parents have several members
+///   is identified and is not refused.
+/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
+///   levels each lie within one group of a level that carries a κ (the innermost such
+///   level is named). The block could then absorb that κ, and the level-block binder
+///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
+///   block whose levels cross those groups cannot absorb the κ and binds as before.
+fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::{label_path, record_paths, RecordKind};
+    let Some(levels) = model.nested_levels() else {
+        return Vec::new();
+    };
+    for subj in &population.subjects {
+        for (kind, i, path) in record_paths(levels, subj) {
+            if path.is_some() {
+                continue;
+            }
+            let (what, cov, time) = match kind {
+                RecordKind::Observation => ("observation", subj.obs_cov(i), subj.param_time_obs(i)),
+                RecordKind::Dose => (
+                    "dose",
+                    subj.dose_cov(i),
+                    subj.param_time_at(subj.doses[i].time),
+                ),
+                RecordKind::PkOnly => (
+                    "non-observation (EVID=2 or MDV=1)",
+                    subj.pk_only_cov(i),
+                    subj.param_time_pk_only(i),
+                ),
+                RecordKind::Reset => (
+                    "reset (EVID=3/4)",
+                    subj.reset_cov(i),
+                    subj.param_time_at(subj.reset_times[i]),
+                ),
+            };
+            let level = levels
+                .levels
+                .iter()
+                .find(|l| cov.get(&l.column).is_none_or(|v| v.is_nan()))
+                .expect("a missing path has a missing column");
+            return vec![Diagnostic::error(
+                "E_LEVEL_MISSING_LABEL",
+                format!(
+                    "level `{}` reads column `{}`, which has no numeric value on the {what} \
+                     record of subject `{}` at TIME {time}. Every record needs a label at every \
+                     level, since its group is identified by its labels from the outermost \
+                     level down, and a label is a numeric code: write a text id such as `NCT01` \
+                     as a number.",
+                    level.name, level.column, subj.id
+                ),
+            )
+            .with_block("parameters")];
+        }
+    }
+
+    // Per level, whether every parent group holds at most one of its groups, on the
+    // observation rows. A group's key is its label path, so the parent's key is the
+    // path one level shorter (the subject itself at level 0).
+    let n_eta = model.n_eta;
+    for (l, level) in levels.levels.iter().enumerate() {
+        let mut child_of: std::collections::HashMap<(usize, Vec<u64>), Vec<u64>> =
+            std::collections::HashMap::new();
+        let mut single = true;
+        'subjects: for (s, subj) in population.subjects.iter().enumerate() {
+            for j in 0..subj.obs_times.len() {
+                let Some(path) = label_path(levels, subj.obs_cov(j)) else {
+                    continue;
+                };
+                let parent = (s, path[..l].to_vec());
+                let me = path[..=l].to_vec();
+                if *child_of.entry(parent).or_insert_with(|| me.clone()) != me {
+                    single = false;
+                    break 'subjects;
+                }
+            }
+        }
+        if !single {
+            continue;
+        }
+        let parent_res: Vec<usize> = if l == 0 {
+            (0..n_eta).collect()
+        } else {
+            (0..model.n_kappa)
+                .filter(|&k| levels.kappa_level[k] == l - 1)
+                .map(|k| n_eta + k)
+                .collect()
+        };
+        for k in (0..model.n_kappa).filter(|&k| levels.kappa_level[k] == l) {
+            let readers = &levels.readers[n_eta + k];
+            if readers.is_empty() {
+                continue;
+            }
+            let Some(&twin) = parent_res.iter().find(|&&r| levels.readers[r] == *readers) else {
+                continue;
+            };
+            let twin_name = if twin < n_eta {
+                model.eta_names[twin].clone()
+            } else {
+                model.kappa_names[twin - n_eta].clone()
+            };
+            let parent = if l == 0 {
+                "subject".to_string()
+            } else {
+                format!("`{}` group", levels.levels[l - 1].name)
+            };
+            return vec![Diagnostic::error(
+                "E_LEVEL_SINGLE_MEMBER",
+                format!(
+                    "level `{}` has a single group inside every {parent}, so kappa `{}` moves \
+                     the same records as `{twin_name}` does, through the same parameters ({}): \
+                     the two variances cannot be told apart. Drop one of the two random \
+                     effects, or drop the level.",
+                    level.name,
+                    model.kappa_names[k],
+                    readers.join(", ")
+                ),
+            )
+            .with_block("parameters")];
+        }
+    }
+
+    // A level block that nests in the groups of a level carrying a κ. The innermost such
+    // level is named: a block nested in an arm is nested in its study too.
+    for decl in model.theta_blocks().level_blocks() {
+        for (l, level) in levels.levels.iter().enumerate().rev() {
+            if !levels.kappa_level.contains(&l) {
+                continue;
+            }
+            let mut owner: std::collections::HashMap<Vec<u64>, (usize, Vec<u64>)> =
+                std::collections::HashMap::new();
+            let mut nests = true;
+            'nest: for (s, subj) in population.subjects.iter().enumerate() {
+                for j in 0..subj.obs_times.len() {
+                    let cov = subj.obs_cov(j);
+                    let key: Option<Vec<u64>> = decl
+                        .columns()
+                        .iter()
+                        .map(|c| {
+                            cov.get(c)
+                                .copied()
+                                .filter(|v| !v.is_nan())
+                                .map(f64::to_bits)
+                        })
+                        .collect();
+                    let (Some(key), Some(path)) = (key, label_path(levels, cov)) else {
+                        nests = false;
+                        break 'nest;
+                    };
+                    let unit = (s, path[..=l].to_vec());
+                    if *owner.entry(key).or_insert_with(|| unit.clone()) != unit {
+                        nests = false;
+                        break 'nest;
+                    }
+                }
+            }
+            if nests {
+                return vec![Diagnostic::error(
+                    "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
+                    format!(
+                        "theta {}[{}]: each of its levels lies within one `{}` group, so it \
+                         could absorb a kappa at `{}`. Under nested levels the check that \
+                         decides whether it does is not available yet, so the model is \
+                         refused rather than fitted unchecked. Key the block on columns whose \
+                         levels cross the `{}` groups, or fit it without nested levels.",
+                        decl.name(),
+                        decl.columns().join(", "),
+                        level.name,
+                        level.name,
+                        level.name
+                    ),
+                )
+                .with_block("parameters")];
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Derive each subject's IOV occasion labels from a model-side rule
@@ -4687,6 +4940,71 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    // Nested levels (#1082) are integrated by the FOCE / FOCEI marginal alone for now;
+    // every other estimator (and FOCEI's quadrature refinement) is enabled later, each
+    // with its own anchor. A residual `correlation` line is composed with them in a
+    // later step too.
+    if model.has_nested_levels() {
+        let refused = chain
+            .iter()
+            .find(|&&m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+            .map(|m| format!("method = {}", m.label().to_lowercase()))
+            .or_else(|| {
+                (options.n_agq > 1 && chain.contains(&EstimationMethod::FoceI))
+                    .then(|| format!("method = focei with n_agq = {}", options.n_agq))
+            })
+            .or_else(|| {
+                model
+                    .mixture
+                    .is_some()
+                    .then(|| "a [mixture] block".to_string())
+            })
+            .or_else(|| model.frem_config.is_some().then(|| "FREM".to_string()));
+        if let Some(what) = refused {
+            diags.push(
+                Diagnostic::error(
+                    "E_NESTED_LEVEL_METHOD_UNSUPPORTED",
+                    format!(
+                        "{what} is not yet supported on a model with nested levels (more than \
+                         one `level`). Fit it with method = focei (or foce) at n_agq = 1."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // A fit-time occasion rule (review r1 #1): `[fit_options]` is refused at parse
+        // time, but `FitOptions::iov_occasion` reaches `fit()` without the file, and a
+        // derived rule would overwrite the level cells.
+        if options.iov_occasion != IovOccasionRule::Column {
+            let first = model
+                .nested_levels()
+                .map(|l| l.levels[0].name.clone())
+                .unwrap_or_default();
+            diags.push(
+                Diagnostic::error(
+                    "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+                    format!(
+                        "the fit options set `iov_occasion` on a model that declares `level \
+                         {first}`. The levels already define the groups; leave `iov_occasion` \
+                         at its default (`column`)."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.residual_serial.is_some() {
+            diags.push(
+                Diagnostic::error(
+                    "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED",
+                    "a residual `correlation … by` line is not yet supported on a model with \
+                     nested levels (more than one `level`). Fit the levels without it, or the \
+                     correlation with a single level.",
+                )
+                .with_block("error_model"),
+            );
+        }
     }
 
     // Rust callers bypass the parser's lower bound. Zero must not disable FOCEI
@@ -7871,6 +8189,17 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// pinned to by a test, so a reworded message cannot silently fall through to the
 /// catch-all.
 fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
+    // #1082: a `level` declaration beside `iov_column` / `iov_occasion`, or a kappa with
+    // no `at` once levels are declared. The parser writes the code as the message's
+    // prefix; the diagnostic carries it as its code and keeps the rest as the message.
+    const MIXED: &str = "E_LEVEL_MIXED_WITH_IOV_COLUMN: ";
+    if let Some(at) = err.find(MIXED) {
+        return Diagnostic::error(
+            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+            err[at + MIXED.len()..].to_string(),
+        )
+        .with_block("parameters");
+    }
     if let Some(rest) = err.strip_prefix("Missing [") {
         if let Some(end) = rest.find(']') {
             let block = &rest[..end];
@@ -8088,7 +8417,7 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 /// `data_path` overrides the model's `[data]` block, with a warning
 /// diagnostic when the two differ (see [`resolve_data_path`]).
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
-    use crate::io::model_source::{ModelSource, ModelSourceError};
+    use crate::io::model_source::ModelSource;
 
     // 1. Read and parse, once (#1752): the binding step below takes its text from
     //    this read, so nothing reads the file a second time. A failure is terminal —
@@ -8105,13 +8434,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 .unwrap_or("model")
                 .to_string();
             let data = data_path.map(|s| s.to_string());
-            let diag = match e {
-                ModelSourceError::Read(m) | ModelSourceError::Hash(m) => {
-                    Diagnostic::error("E_MODEL_READ", m)
-                }
-                ModelSourceError::Parse(m) => parse_error_to_diagnostic(&m),
-            };
-            return CheckReport::new(stem, data, vec![diag]);
+            return CheckReport::new(stem, data, vec![model_source_diagnostic(e)]);
         }
     };
     // The report's `model` is the name the fit will carry — the declared

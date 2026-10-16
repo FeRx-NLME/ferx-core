@@ -122,7 +122,7 @@ pub fn fitted_params_from_result(
             tmpl,
             &omega,
             &sigma,
-            fitted_mixture_overrides(fit_result, template, tmpl).map_err(EngineError::from)?,
+            fitted_mixture_overrides(fit_result, template, tmpl)?,
         )),
     };
     Ok(ModelParameters {
@@ -245,27 +245,26 @@ fn fitted_mixture_overrides<'a>(
     fit_result: &'a FitResult,
     template: &ModelParameters,
     tmpl: &crate::types::MixtureParams,
-) -> Result<&'a [f64], String> {
+) -> Result<&'a [f64], EngineError> {
     if tmpl.omega_override_addr.is_empty() && tmpl.sigma_override_addr.is_empty() {
         return Ok(&[]);
     }
     let segs = packed_segments(template);
     match fit_packed_estimate(fit_result, template) {
         PackedEstimate::Usable(v) => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
-        PackedEstimate::WrongLength(n) => Err(format!(
+        PackedEstimate::WrongLength(n) => Err(crate::api::fit_input_model(format!(
             "the fit's packed estimate has {} coordinates but this model's parameter layout \
              has {}, so the [mixture] override values cannot be read from it. Supply the \
              model the fit was estimated with.",
             n,
             segs.total()
-        )),
-        PackedEstimate::Stale => Err(
+        ))),
+        PackedEstimate::Stale => Err(crate::api::fit_input_model(
             "the fit's packed estimate does not reproduce its reported estimates (theta / \
              Omega / Sigma / Omega_IOV / residual correlations), so the [mixture] override \
              values it carries cannot be trusted: the estimates or the packed estimate were \
-             changed after the fit, or this is not the model the fit was estimated with."
-                .to_string(),
-        ),
+             changed after the fit, or this is not the model the fit was estimated with.",
+        )),
         PackedEstimate::Absent => {
             let names: Vec<String> = tmpl
                 .omega_override_addr
@@ -277,7 +276,7 @@ fn fitted_mixture_overrides<'a>(
                         .map(|&(c, si)| format!("sigma({}) {}", c + 1, template.sigma.names[si])),
                 )
                 .collect();
-            Err(format!(
+            Err(crate::api::fit_input_missing(format!(
                 "this [mixture] fit estimates the per-class override(s) {}, and a FitResult \
                  does not store their fitted values. They are carried by the result of a \
                  FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a .fitrx bundle save_fit \
@@ -285,7 +284,7 @@ fn fitted_mixture_overrides<'a>(
                  written by ferx-r, or a fit estimated by SAEM, IMP or Bayes lacks them \
                  (#1765).",
                 names.join(", ")
-            ))
+            )))
         }
     }
 }

@@ -342,6 +342,9 @@ pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
 ) -> Result<(), EngineError> {
+    if model.has_nested_levels() {
+        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+    }
     if model.n_kappa > 0 && params.omega_iov.is_none() {
         // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
         // message stays #1019's, which names the remedy a rebuilt parameter set needs.
@@ -399,7 +402,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
                 .join(", ")
         ));
     }
-    first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
+    Err(super::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for

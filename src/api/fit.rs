@@ -557,9 +557,15 @@ pub(crate) fn fitted_population<'a>(
                 .to_string(),
         );
     }
-    let derive_occ = iov_rule_set && model.n_kappa > 0;
+    // A nested model's groups are its level cells (#1082), which a derived rule would
+    // overwrite. `fit()` refuses such a rule up front; the post-hoc steps that prepare
+    // with the fit's recorded rule must not regroup either, so the cells win here.
+    let derive_occ = iov_rule_set && model.n_kappa > 0 && !model.has_nested_levels();
     // A `correlation … by COL` line reads its blocks off the `by` columns (#1081).
     let needs_rgroup = model.residual_serial.is_some();
+    // Nested levels (#1082): each record's level labels name its cell, written into the
+    // occasion labels the prediction reads.
+    let needs_cells = model.has_nested_levels();
     let needs_prune = population.subjects.iter().any(|s| {
         !s.dose_covariates.is_empty()
             || !s.obs_covariates.is_empty()
@@ -569,11 +575,14 @@ pub(crate) fn fitted_population<'a>(
             // `reset_covariates` must reach it rather than being gated out here.
             || !s.reset_covariates.is_empty()
     });
-    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup) {
+    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup || needs_cells) {
         return population;
     }
     let mut population = population;
     let p = population.to_mut();
+    if needs_cells {
+        crate::stats::nested_levels::assign_level_cells(model, p);
+    }
     if needs_prune {
         p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
     }

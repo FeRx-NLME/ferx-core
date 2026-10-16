@@ -207,6 +207,9 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
+    if model.has_nested_levels() {
+        return "nested variability levels";
+    }
     if analytic_inner_common_bail(model) {
         return "model-level analytic inner fallback";
     }
@@ -1664,6 +1667,23 @@ fn find_ebe_impl(
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // A nested-level subject that was never given its cells (#1082): refused, never
+    // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
+    // from averaging the placeholder into an objective.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1e20,
+            kappas: Vec::new(),
+            hard_reject: true,
+        };
+    }
+
     // ── IOV branch ─────────────────────────────────────────────────────────
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
@@ -2315,12 +2335,44 @@ fn find_ebe_iov(
 
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
-    let n_flat = stacked_width(n_eta, n_kappa, k_occasions);
+    // #1082: under nested levels the search runs over the compact vector — one κ block
+    // per group of each level — and each candidate is expanded to the per-cell κ vectors
+    // the prediction reads. Without nested levels the compact vector *is* the
+    // per-occasion stack, and every line below reads exactly as before.
+    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    let n_flat = match &nested {
+        Some(n) => n.n_compact(),
+        None => stacked_width(n_eta, n_kappa, k_occasions),
+    };
+    let to_kappas = |p: &[f64]| -> Vec<Vec<f64>> {
+        match &nested {
+            Some(n) => n.expand(p),
+            None => (0..k_occasions)
+                .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
+                .collect(),
+        }
+    };
 
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
-    let mut x = iov_initial_vector(n_eta, n_flat, &mu, eta_init);
+    // A joint warm start arrives in the per-occasion layout (`η̂` then each cell's κ̂,
+    // as `EbeResult` reports them); under nested levels it is compacted first.
+    let nested_warm: Option<Vec<f64>> = match (&nested, eta_init) {
+        (Some(n), Some(w)) if w.len() == stacked_width(n_eta, n_kappa, k_occasions) => {
+            let cells: Vec<&[f64]> = (0..k_occasions)
+                .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
+                .collect();
+            n.compact(&w[..n_eta], &cells)
+        }
+        (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
+        _ => None,
+    };
+    let warm = match &nested {
+        Some(_) => nested_warm.as_deref(),
+        None => eta_init,
+    };
+    let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -2348,9 +2400,7 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(pi, mi)| pi - mi)
             .collect();
-        let kappas: Vec<Vec<f64>> = (0..k_occasions)
-            .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
-            .collect();
+        let kappas = to_kappas(p);
         individual_nll_iov_frozen(
             model,
             subject,
@@ -2405,6 +2455,11 @@ fn find_ebe_iov(
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
         }
+        if nested.is_some() {
+            // The predicate reads the per-occasion stack the prediction sees.
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
         inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
     };
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
@@ -2455,8 +2510,9 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(p, m)| p - m)
             .collect();
-        let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-            .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+        let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
             .collect();
         // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
         // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
@@ -2536,13 +2592,22 @@ fn find_ebe_iov(
     let mut nm_converged = nm_converged;
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
-        && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, params) > runaway_limit
+        && iov_prior_maha(
+            &x,
+            &mu,
+            n_eta,
+            n_kappa,
+            k_occasions,
+            nested.as_ref(),
+            params,
+        ) > runaway_limit
     {
         let mut seed = vec![0.0; n_flat];
         seed[..n_eta].copy_from_slice(&mu);
         // Certified on stationarity, polish held inside the runaway limit (#1527).
         let (cold, cold_ok) = cert.nelder_mead_recover(&obj, seed, &|p| {
-            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, params) <= runaway_limit
+            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested.as_ref(), params)
+                <= runaway_limit
         });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
@@ -2559,8 +2624,9 @@ fn find_ebe_iov(
         .zip(mu.iter())
         .map(|(p, m)| p - m)
         .collect();
-    let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+    let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+        .iter()
+        .map(|k| DVector::from_column_slice(k))
         .collect();
 
     // H-matrix: BSV columns only (∂f/∂η_bsv with κ fixed at the EBE). The BSV block of
@@ -4617,6 +4683,7 @@ fn iov_prior_maha(
     n_eta: usize,
     n_kappa: usize,
     k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>,
     params: &ModelParameters,
 ) -> f64 {
     let bsv: Vec<f64> = x[..n_eta]
@@ -4626,8 +4693,27 @@ fn iov_prior_maha(
         .collect();
     let mut q = ebe_prior_maha(&bsv, &params.omega);
     if let Some(oi) = params.omega_iov.as_ref() {
-        for k in 0..k_occasions {
-            q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+        match nested {
+            // #1082: one block per group of each level, against that level's Ω_L⁻¹ — the
+            // compact prior's own quadratic form.
+            Some(n) => {
+                for (l, block) in n.blocks(x) {
+                    if !block.iter().all(|v| v.is_finite()) {
+                        return f64::INFINITY;
+                    }
+                    let ks = n.kappas_at(l);
+                    for (a, &ka) in ks.iter().enumerate() {
+                        for (c, &kc) in ks.iter().enumerate() {
+                            q += block[a] * oi.inv[(ka, kc)] * block[c];
+                        }
+                    }
+                }
+            }
+            None => {
+                for k in 0..k_occasions {
+                    q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+                }
+            }
         }
     }
     q

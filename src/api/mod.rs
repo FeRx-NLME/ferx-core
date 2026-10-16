@@ -39,6 +39,7 @@ pub use validation::{
 pub(crate) use validation::{
     check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
+pub(crate) use validation::{data_read_diagnostic, model_source_diagnostic};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use validation::check_survival_time_dependent_pk;
@@ -62,7 +63,10 @@ pub use adaptive::{
 };
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
-pub(crate) use entry_refusals::{adaptive_spec, adaptive_unsupported_diag};
+pub(crate) use entry_refusals::{
+    adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
+    fit_input_model, sir_nothing_to_sample, sir_options, theta_length,
+};
 pub use fit::{fit, fit_from_files};
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
@@ -103,6 +107,7 @@ pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
+    read_population_with_diag,
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
@@ -205,6 +210,10 @@ const OUTPUT_MANDATORY: &[&str] = &[
 #[cfg(test)]
 #[path = "tests/multistart_prefers_tests.rs"]
 mod multistart_prefers_tests;
+
+#[cfg(test)]
+#[path = "tests/nested_levels_tests.rs"]
+mod nested_levels_tests;
 
 #[cfg(test)]
 #[path = "tests/written_time_message_tests.rs"]
