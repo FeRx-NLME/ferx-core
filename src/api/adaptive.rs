@@ -337,14 +337,86 @@ where
         // `auc_target_attainment` is left unreported.
         None,
         opts,
-        &|m| {
-            super::entry_refusals::adaptive_options(format!(
+        AdaptiveEntry::Programmatic,
+    )
+}
+
+/// The entry point a run came through. Each words and codes the refusals of its own
+/// inputs: `opts` and the caller's controller on [`simulate_adaptive`], the
+/// `[adaptive_dosing]` spec — which the controller is compiled from — on
+/// [`simulate_adaptive_from_spec`] (#1983).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptiveEntry {
+    Programmatic,
+    /// `route_cmt` is the compartment the spec's `route` doses into.
+    Spec {
+        route_cmt: usize,
+    },
+}
+
+impl AdaptiveEntry {
+    /// A `Dv` monitor on a compartment no `[error_model]` covers: an option on one entry,
+    /// `assay_cmt` on the other.
+    fn dv_without_error_model(self, m: &crate::sim::adaptive::MonitorSpec) -> EngineError {
+        match self {
+            AdaptiveEntry::Programmatic => super::entry_refusals::adaptive_options(format!(
                 "monitor '{}' requests DV observation on compartment {} but no [error_model] \
                  defines residual error there",
                 m.name, m.cmt
-            ))
-        },
-    )
+            )),
+            // Under `with_assay_error` the one monitor reads `assay_cmt`.
+            AdaptiveEntry::Spec { .. } => spec_refusal(format!(
+                "[adaptive_dosing]: `with_assay_error = true` draws the assay from the \
+                 [error_model] of assay_cmt = {}, but no [error_model] defines residual error \
+                 there",
+                m.cmt
+            )),
+        }
+    }
+
+    /// A refusal of the reactive driver, as its kind's code — except a refused action on
+    /// the spec path, where the controller is compiled from the spec's `route`, so the
+    /// input at fault is the spec (`E_ADAPTIVE_SPEC`), not a caller's controller.
+    fn driver_refusal(self, kind: crate::ode::AdaptiveRefusalKind, message: String) -> EngineError {
+        match (self, kind) {
+            (AdaptiveEntry::Spec { .. }, crate::ode::AdaptiveRefusalKind::ControllerAction) => {
+                spec_refusal(message)
+            }
+            _ => super::entry_refusals::adaptive_driver_refusal(kind, message),
+        }
+    }
+
+    /// The spec's `route` compartment, refused before any subject runs where the model
+    /// alone decides it (#1983 review, finding 1): out of range, or fed by a built-in
+    /// input-rate function — the driver's own checks on a controller's dose. A dose lag on
+    /// it depends on the drawn parameters, so the driver keeps that one, coded by
+    /// [`driver_refusal`](Self::driver_refusal) as the spec's too. `None` off the spec path.
+    fn route_refusal(self, ode: &crate::ode::OdeSpec) -> Option<EngineError> {
+        let AdaptiveEntry::Spec { route_cmt } = self else {
+            return None;
+        };
+        if route_cmt == 0 || route_cmt > ode.n_states {
+            return Some(spec_refusal(format!(
+                "[adaptive_dosing]: route cmt = {route_cmt} is out of range (model has {} \
+                 compartment(s))",
+                ode.n_states
+            )));
+        }
+        if crate::ode::input_rate_consumes_cmt(ode, route_cmt) {
+            return Some(spec_refusal(format!(
+                "[adaptive_dosing]: route cmt = {route_cmt} is fed by a built-in input-rate \
+                 (absorption) function; the controller cannot dose into an input-rate \
+                 compartment"
+            )));
+        }
+        None
+    }
+}
+
+/// `E_ADAPTIVE_SPEC` (block `adaptive_dosing`) in `simulate_adaptive_from_spec`'s context.
+fn spec_refusal(message: String) -> EngineError {
+    EngineError::from_diagnostic(super::entry_refusals::adaptive_spec(message))
+        .in_context("simulate_adaptive_from_spec")
 }
 
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
@@ -375,9 +447,7 @@ fn run_adaptive_population<F, C>(
     target_window: Option<(f64, f64)>,
     auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
-    // The refusal of a `Dv` monitor with no `[error_model]` on its compartment, which each
-    // entry words and codes as its own input (an option on one, the spec on the other).
-    dv_without_error_model: &dyn Fn(&crate::sim::adaptive::MonitorSpec) -> EngineError,
+    entry: AdaptiveEntry,
 ) -> Result<AdaptiveSimulationResult, EngineError>
 where
     F: Fn() -> C,
@@ -563,8 +633,11 @@ where
         if m.mode == crate::sim::adaptive::ObserveMode::Dv
             && !model.has_residual_error_for_cmt(m.cmt, &params.sigma.values)
         {
-            return Err(dv_without_error_model(m));
+            return Err(entry.dv_without_error_model(m));
         }
+    }
+    if let Some(e) = entry.route_refusal(ode) {
+        return Err(e);
     }
 
     // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
@@ -735,12 +808,10 @@ where
                 Some(&assay),
             )
             .map_err(|e| match e {
-                crate::ode::AdaptiveDriverError::Refusal { kind, message } => {
-                    super::entry_refusals::adaptive_driver_refusal(
-                        kind,
-                        format!("subject '{}' (sim {sim}): {message}", subject.id),
-                    )
-                }
+                crate::ode::AdaptiveDriverError::Refusal { kind, message } => entry.driver_refusal(
+                    kind,
+                    format!("subject '{}' (sim {sim}): {message}", subject.id),
+                ),
                 crate::ode::AdaptiveDriverError::Runtime(message) => {
                     EngineError::from(format!("subject '{}' (sim {sim}): {message}", subject.id))
                 }
@@ -1388,15 +1459,11 @@ pub fn simulate_adaptive_from_spec(
         // metrics-only); `Some` here is what turns on the signal-AUC pass.
         spec.auc_target,
         opts,
-        // Under `with_assay_error` the one monitor reads `assay_cmt`.
-        &|m| {
-            EngineError::from_diagnostic(super::entry_refusals::adaptive_spec(format!(
-                "[adaptive_dosing]: `with_assay_error = true` draws the assay from the \
-                 [error_model] of assay_cmt = {}, but no [error_model] defines residual error \
-                 there",
-                m.cmt
-            )))
-            .in_context("simulate_adaptive_from_spec")
+        AdaptiveEntry::Spec {
+            route_cmt: match spec.route {
+                crate::sim::adaptive::AdaptiveRoute::Bolus { cmt }
+                | crate::sim::adaptive::AdaptiveRoute::Infuse { cmt, .. } => cmt,
+            },
         },
     )
 }

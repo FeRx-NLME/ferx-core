@@ -906,19 +906,15 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     check_rows(rows);
 }
 
-/// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
-/// doses, the break timeline or the controller's own output. One row per text, through
-/// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
-/// fixture differs from a run that succeeds in the one input named in the row.
-#[test]
-fn adaptive_driver_refusals_carry_their_codes() {
-    use crate::sim::adaptive::{ControllerCtx, DoseAction};
-    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
-    let iov = parse_model_string(ODE_IOV).expect("parse");
-    let lagged =
-        parse_model_string(&ODE_ADAPTIVE.replace("  V  = TVV\n", "  V  = TVV\n  LAGTIME = 2.0\n"))
-            .expect("parse");
-    let input_rate = parse_model_string(
+/// [`ODE_ADAPTIVE`] with a dose lag of 2 on `central`.
+fn lagged_model() -> CompiledModel {
+    parse_model_string(&ODE_ADAPTIVE.replace("  V  = TVV\n", "  V  = TVV\n  LAGTIME = 2.0\n"))
+        .expect("parse")
+}
+
+/// [`ODE_ADAPTIVE`] with a built-in first-order input rate feeding `central`.
+fn input_rate_model() -> CompiledModel {
+    parse_model_string(
         &ODE_ADAPTIVE
             .replace(
                 "  theta TVV(50.0, 5.0, 200.0)\n",
@@ -930,7 +926,101 @@ fn adaptive_driver_refusals_carry_their_codes() {
                 "d/dt(central) = first_order(ka=KA) - (CL / V) * central",
             ),
     )
-    .expect("parse");
+    .expect("parse")
+}
+
+/// An `[adaptive_dosing]` spec's `route` compartment is the spec's input, like `assay_cmt`
+/// (#1983 review, finding 1). Out of range or fed by an input-rate function, it is a function
+/// of the model alone and refused before any subject runs: those rows run at `n_sim = 0`,
+/// where the driver cannot run at all. A dose lag on it depends on the drawn parameters, so
+/// the driver refuses it — and on the spec path that refusal is the spec's code too, not
+/// `E_ADAPTIVE_CONTROLLER_ACTION`, which names a caller's controller. Each refused route is
+/// beside its accepting side: the same spec with `cmt = 1` on a model with neither.
+#[test]
+fn adaptive_spec_route_refusals_carry_the_spec_code() {
+    use crate::sim::adaptive::AdaptiveRoute;
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let lagged = lagged_model();
+    let input_rate = input_rate_model();
+    let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
+    let spec = parse_full_model(&tdm)
+        .expect("parse")
+        .adaptive_dosing
+        .expect("has [adaptive_dosing]");
+    let pop = population_of(vec![dose_free("1", &[12.0])], &[]);
+    let run = |m: &CompiledModel, route: AdaptiveRoute, n_sim: usize| {
+        let mut s = spec.clone();
+        s.route = route;
+        s.assay_cmt = Some(1);
+        simulate_adaptive_from_spec(
+            m,
+            &pop,
+            &m.default_params,
+            n_sim,
+            &s,
+            &AdaptiveSimulateOptions {
+                seed: Some(1),
+                ..Default::default()
+            },
+        )
+    };
+    let bolus = |cmt: usize| AdaptiveRoute::Bolus { cmt };
+    let infuse = |cmt: usize| AdaptiveRoute::Infuse { cmt, over: 2.0 };
+
+    for (what, ok) in [
+        ("bolus cmt 1", run(&ode, bolus(1), 1).err()),
+        ("infuse cmt 1", run(&ode, infuse(1), 1).err()),
+    ] {
+        assert!(ok.is_none(), "{what} must run: {ok:?}");
+    }
+    check_rows(vec![
+        row(
+            "route cmt past the states",
+            run(&ode, bolus(2), 0),
+            "E_ADAPTIVE_SPEC",
+            Some("adaptive_dosing"),
+            "simulate_adaptive_from_spec: [adaptive_dosing]: route cmt = 2 is out of range \
+             (model has 1 compartment(s))",
+        ),
+        row(
+            "route cmt 0 (infuse)",
+            run(&ode, infuse(0), 0),
+            "E_ADAPTIVE_SPEC",
+            Some("adaptive_dosing"),
+            "simulate_adaptive_from_spec: [adaptive_dosing]: route cmt = 0 is out of range \
+             (model has 1 compartment(s))",
+        ),
+        row(
+            "route into an input-rate compartment",
+            run(&input_rate, bolus(1), 0),
+            "E_ADAPTIVE_SPEC",
+            Some("adaptive_dosing"),
+            "simulate_adaptive_from_spec: [adaptive_dosing]: route cmt = 1 is fed by a \
+             built-in input-rate (absorption) function; the controller cannot dose into an \
+             input-rate compartment",
+        ),
+        row(
+            "route into a lagged compartment (refused by the driver)",
+            run(&lagged, bolus(1), 1),
+            "E_ADAPTIVE_SPEC",
+            Some("adaptive_dosing"),
+            "simulate_adaptive_from_spec: subject '1' (sim 1): decision 0: compartment 1 \
+             declares a dose lag time (2); lagged controller dosing is not supported",
+        ),
+    ]);
+}
+
+/// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
+/// doses, the break timeline or the controller's own output. One row per text, through
+/// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
+/// fixture differs from a run that succeeds in the one input named in the row.
+#[test]
+fn adaptive_driver_refusals_carry_their_codes() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let lagged = lagged_model();
+    let input_rate = input_rate_model();
     let nan_lag = parse_model_string(
         &ODE_ADAPTIVE.replace("  V  = TVV\n", "  V  = TVV\n  LAGTIME = exp(1000.0)\n"),
     )
