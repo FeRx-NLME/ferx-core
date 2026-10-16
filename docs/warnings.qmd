@@ -218,10 +218,12 @@ Of the input refusals, these carry a code:
   data-derived bindings, or with covariate statistics the population does not
   reproduce, or one whose η count is not the width of the fit's η̂; its θ count
   is `E_THETA_LENGTH` and its Ω, σ and Ω~IOV~ shape `E_PARAM_SHAPE`;
-- a re-read of the fit's model or data file that fails: the code, block and
-  message `ferx check` gives the same file (an `E_DATA` message without its
-  `Failed to read data file` lead), so a re-read with a covariate column missing
-  is `E_MISSING_COVARIATE` on `covariates`.
+- a re-read of the fit's model or data file that fails: the code and block
+  `ferx check` gives the same file, so a re-read with a covariate column missing
+  is `E_MISSING_COVARIATE` on `covariates`. The message is the read's own: an
+  `E_DATA` refusal has no `Failed to read data file` lead (and one from the hash
+  step names the file it could not open), and a model file read only for its
+  reader settings adds why it was read and how not to need it.
 
 Still `None`: a `[mixture]` fit whose per-class override values the fit does not
 carry or no longer reproduces, and the SIR run's own checks of its settings

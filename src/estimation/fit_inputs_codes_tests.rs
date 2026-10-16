@@ -169,6 +169,35 @@ fn assert_check_agrees(what: &str, model: &Path, data: Option<&Path>, e: &Engine
     assert_eq!(d.message, e.message(), "{what}: message");
 }
 
+/// The reader's own refusal for `path` under `settings`: `read_population_for`, the
+/// call beneath `read_population_with`, which no classifier touches. An expected text
+/// taken from `read_population_with` would pass through `data_read_diagnostic`, the
+/// code under test, so a classifier that rewrote the message would agree with itself
+/// (review r1 #1).
+fn raw_read(model: &CompiledModel, settings: &crate::api::ReaderSettings, path: &Path) -> String {
+    assert!(
+        settings.ignore_exprs.is_empty()
+            && settings.accept_exprs.is_empty()
+            && settings.ignore_subjects.is_empty(),
+        "the fixture's recorded settings carry no row filter"
+    );
+    let fallback: Option<Vec<&str>> = settings
+        .fallback_columns
+        .as_ref()
+        .map(|cols| cols.iter().map(String::as_str).collect());
+    crate::api::read_population_for(
+        model,
+        &settings.covariate_decls,
+        path.to_str().unwrap(),
+        fallback.as_deref(),
+        settings.iov_column.as_deref(),
+        None,
+        &settings.column_map,
+    )
+    .map(|_| ())
+    .unwrap_err()
+}
+
 const BECAUSE: &str = " The population is re-read with this file's `[data]` renames and \
                        `[data_selection]`, which decide the rows the fit saw. Pass \
                        `population = Some(&pop)` as well, and the model file is not read.";
@@ -422,9 +451,7 @@ fn the_re_reads_carry_ferx_checks_codes() {
         let mut f = fs.fit.clone();
         f.data_hash = None;
         let settings = f.reader_settings.clone().unwrap();
-        let read = crate::api::read_population_with(model, &settings, fs.data.to_str().unwrap())
-            .map(|_| ())
-            .unwrap_err();
+        let read = raw_read(model, &settings, &fs.data);
         let r = run(entry, &c, &f, None, None);
         assert_eq!(
             r.as_ref().unwrap_err().code(),
@@ -489,13 +516,7 @@ fn the_re_reads_carry_ferx_checks_codes() {
             );
             let mut f = fs.fit.clone();
             f.data_hash = None;
-            let read = crate::api::read_population_with(
-                model,
-                f.reader_settings.as_ref().unwrap(),
-                fs.data.to_str().unwrap(),
-            )
-            .map(|_| ())
-            .unwrap_err();
+            let read = raw_read(model, f.reader_settings.as_ref().unwrap(), &fs.data);
             let r = run(entry, &c, &f, None, None);
             assert_check_agrees(what, &fs.model, Some(&fs.data), r.as_ref().unwrap_err());
             rows.push(row(
@@ -522,8 +543,9 @@ fn the_re_reads_carry_ferx_checks_codes() {
         let mut f = c.fit.clone();
         let mut settings = f.reader_settings.clone().unwrap();
         settings.ignore_exprs = vec!["TIME >".to_string()];
+        // The filter's own refusal, not `read_population_with`'s (which classifies it).
         let read =
-            crate::api::read_population_with(model, &settings, f.data_path.as_ref().unwrap())
+            crate::io::datareader::SelectionFilter::from_opts(&settings.ignore_exprs, &[], &[])
                 .map(|_| ())
                 .unwrap_err();
         f.reader_settings = Some(settings);
