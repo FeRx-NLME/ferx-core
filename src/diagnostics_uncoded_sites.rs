@@ -7,12 +7,14 @@ use super::EngineError;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Every site in `src/` (outside test code) that turns a failure into an error with no
-/// code: `(file, enclosing fn, number of sites in it, why it has no code)`.
+/// Every `EngineError` built without a code in `src/` (outside test code), plus every
+/// `Diagnostic` dropped to its text as `.map_err(|d| d.message)`:
+/// `(file, enclosing fn, number of sites in it, why it has no code)`.
 ///
-/// Two literal spellings are counted, so the scan has no false positives:
-/// `EngineError::uncoded` and `.map_err(|d| d.message)` (a `Diagnostic` dropped to its
-/// text). A new site fails `every_uncoded_site_is_listed` until it is listed here; a
+/// Those two literal spellings are what is counted, so the scan has no false positives.
+/// It does not see a coded `EngineError` dropped to `String` (`.map_err(|e|
+/// e.to_string())` on the `String` entry points, which #1772 retires), the same drop
+/// under another binding name, or N calls of a helper that wraps `uncoded` once. A new site fails `every_uncoded_site_is_listed` until it is listed here; a
 /// listed site that is gone fails it too, so the list cannot go stale.
 ///
 /// Before adding a row, check `ferx check`'s codes: a refusal some helper already codes
@@ -22,7 +24,9 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "src/api/adaptive.rs",
         "run_adaptive_population",
         3,
-        "runtime: a subject's adaptive run, or its snapshot / frozen-replay verification, failed",
+        "the adaptive run's own refusals (decision schedule over max_decisions, a monitor on a missing \
+         compartment, a base regimen with system resets / IOV) have codes nearby but no Diagnostic yet, #2044; \
+         runtime: the run itself; internal: the snapshot and frozen-replay verifiers",
     ),
     (
         "src/api/simulate.rs",
@@ -34,7 +38,9 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "src/api/simulate.rs",
         "simulate_with_uncertainty_diag",
         1,
-        "draw_parameter_samples: sampler failure or covariance shape; its logit-θ bound refusal has no code yet, #2044",
+        "draw_parameter_samples: a missing covariance matrix / SIR pool (E_FIT_INPUT_MISSING's refusal), a \
+         covariance or SIR pool that does not match the template (E_FIT_INPUT_MODEL's family) and the logit-θ \
+         bound all lack a Diagnostic here, #2044; runtime: the sampler finds no valid draw",
     ),
     (
         "src/estimation/run_covariance.rs",
@@ -103,6 +109,39 @@ fn enclosing_fn(lines: &[&str], i: usize) -> String {
     String::from("<top level>")
 }
 
+/// The lines of `text` with every inline test module blanked: a column-0
+/// `#[cfg(test)]` / `#[cfg(all(test, …))]` (plus any further attributes) on a
+/// `mod NAME {`, through its closing `}` in column 0. Blanked, not removed, so line
+/// numbers keep their meaning. A test module may sit mid-file (`dosing.rs`,
+/// `stats/residual_error.rs`), so the scan carries on after it.
+fn production_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test") {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].starts_with("#[") {
+                j += 1;
+            }
+            if j < lines.len() && lines[j].starts_with("mod ") && lines[j].ends_with('{') {
+                let mut k = j + 1;
+                while k < lines.len() && lines[k] != "}" {
+                    k += 1;
+                }
+                let end = k.min(lines.len() - 1);
+                for line in &mut lines[i..=end] {
+                    *line = "";
+                }
+                i = k + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    lines
+}
+
 /// `(file, fn) → count` of the uncoded sites in the non-test code under `root/src`.
 fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
     let mut found = BTreeMap::new();
@@ -125,9 +164,7 @@ fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read a source file");
-            // An inline test module sits at the end of its file.
-            let body = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
-            let lines: Vec<&str> = body.lines().collect();
+            let lines = production_lines(&text);
             let rel = path
                 .strip_prefix(root)
                 .unwrap()
@@ -179,7 +216,8 @@ fn every_uncoded_site_is_listed() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// The scan sees a planted site and skips test code, so a green
+/// The scan sees a planted site, including one after a mid-file test module, and
+/// skips test code, so a green
 /// `every_uncoded_site_is_listed` is not a scan that sees nothing.
 #[test]
 fn the_scan_sees_a_planted_site_and_skips_test_code() {
@@ -193,7 +231,10 @@ fn the_scan_sees_a_planted_site_and_skips_test_code() {
         format!(
             "pub fn leaks() -> R {{\n    Err({site}\"x\"))\n}}\n\
              pub(crate) fn drops() -> R {{\n    f(){drop}?;\n    g(){drop}\n}}\n\
-             \n#[cfg(test)]\nmod tests {{\n    fn t() {{ {site}\"y\"); }}\n}}\n"
+             \n#[cfg(test)]\nmod tests {{\n    fn t() {{ {site}\"y\"); }}\n}}\n\
+             \n#[cfg(all(test, feature = \"x\"))]\n#[allow(dead_code)]\nmod more {{\n    fn u() {{ {site}\"y\"); }}\n}}\n\
+             \n#[cfg(test)]\n#[path = \"a_tests.rs\"]\nmod sibling;\n\
+             \npub(crate) fn after_the_test_module() {{\n    let _ = {site}\"w\");\n}}\n"
         ),
     )
     .unwrap();
@@ -212,6 +253,11 @@ fn the_scan_sees_a_planted_site_and_skips_test_code() {
     let want: BTreeMap<(String, String), usize> = [
         (("src/a.rs".to_string(), "leaks".to_string()), 1),
         (("src/a.rs".to_string(), "drops".to_string()), 2),
+        // Production code after a mid-file test module is still scanned.
+        (
+            ("src/a.rs".to_string(), "after_the_test_module".to_string()),
+            1,
+        ),
     ]
     .into();
     assert_eq!(found, want);
