@@ -227,7 +227,9 @@ Of the input refusals, these carry a code:
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
   above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
   prior. `fit()` with `sir = true` reports the same text as a warning;
-- a fit whose θ, Ω and σ are all FIX, so SIR has nothing to sample
+- a fit in which every estimated parameter is FIX (θ, Ω and σ, and Ω_IOV,
+  `block_sigma` correlations and `[mixture]` overrides where the model has
+  them), so SIR has nothing to sample
   (`E_SIR_NOTHING_TO_SAMPLE`, on `[parameters]`). `fit()` with `sir = true`
   reports the same text as a warning;
 - a re-read of the fit's model or data file that fails: the code and block
