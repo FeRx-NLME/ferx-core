@@ -1667,6 +1667,23 @@ fn find_ebe_impl(
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // A nested-level subject that was never given its cells (#1082): refused, never
+    // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
+    // from averaging the placeholder into an objective.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1e20,
+            kappas: Vec::new(),
+            hard_reject: true,
+        };
+    }
+
     // ── IOV branch ─────────────────────────────────────────────────────────
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].

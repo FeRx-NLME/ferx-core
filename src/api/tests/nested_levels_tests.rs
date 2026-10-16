@@ -835,3 +835,98 @@ fn at_names_a_level_ignoring_case_like_the_other_level_rules() {
     .expect("`at STUDY` names `level Study`");
     assert_eq!(m.nested_levels().unwrap().kappa_level, vec![0, 1]);
 }
+
+/// Review r1 #6: a nested model handed a population that never went through
+/// `fitted_population` (the lower-level entries `optimize_population` / `run_inner_loop`,
+/// or an in-memory population) has no cells. Each estimator site refuses such a subject
+/// with its sentinel instead of falling back to one-level IOV or dropping κ — and the
+/// same subject, once prepared, is estimated (the straddle, per site).
+#[test]
+fn an_unprepared_nested_subject_is_refused_by_every_estimator_site() {
+    use crate::estimation::inner_optimizer::find_ebe;
+    use crate::stats::likelihood::{foce_subject_nll_iov, individual_nll_iov};
+    let m = model();
+    let raw = full_design();
+    let mut prepared = raw.clone();
+    crate::stats::nested_levels::assign_level_cells(&m, &mut prepared);
+    let p = &m.default_params;
+    let iov = p.omega_iov.as_ref().unwrap();
+    let eta = nalgebra::DVector::zeros(m.n_eta);
+    let h = |s: &Subject| nalgebra::DMatrix::zeros(s.obs_times.len(), m.n_eta);
+    let cells =
+        |s: &Subject| vec![vec![0.0; m.n_kappa]; crate::stats::stacked_layout::group_count(s)];
+    let dcells = |s: &Subject| {
+        cells(s)
+            .into_iter()
+            .map(nalgebra::DVector::from_vec)
+            .collect::<Vec<_>>()
+    };
+    for (s_raw, s_ok) in raw.subjects.iter().zip(&prepared.subjects) {
+        assert!(crate::stats::nested_levels::unprepared(&m, s_raw));
+        assert!(!crate::stats::nested_levels::unprepared(&m, s_ok));
+
+        let r = find_ebe(&m, s_raw, p, 50, 1e-6, None, None, 0);
+        assert!(
+            r.hard_reject && r.nll >= 1e20,
+            "find_ebe took the subject: {}",
+            r.nll
+        );
+        let r = find_ebe(&m, s_ok, p, 50, 1e-6, None, None, 0);
+        assert!(
+            !r.hard_reject && r.nll.is_finite() && r.nll < 1e10,
+            "{}",
+            r.nll
+        );
+        assert_eq!(r.kappas.len(), 4, "one κ̂ vector per cell");
+
+        let f = |s: &Subject| {
+            foce_subject_nll_iov(
+                &m,
+                s,
+                &p.theta,
+                &eta,
+                &h(s),
+                &p.omega,
+                &p.sigma.values,
+                true,
+                &dcells(s),
+                iov,
+            )
+        };
+        assert_eq!(f(s_raw), 1e20);
+        assert!(f(s_ok) < 1e10);
+
+        let lin = |s: &Subject| {
+            crate::stats::likelihood::iov_linearization(
+                &m,
+                s,
+                &p.theta,
+                &eta,
+                &h(s),
+                &p.omega,
+                &dcells(s),
+                iov,
+            )
+        };
+        assert!(
+            lin(s_raw).is_none(),
+            "the linearization refuses the unprepared subject"
+        );
+        assert!(lin(s_ok).is_some());
+
+        let i = |s: &Subject| {
+            individual_nll_iov(
+                &m,
+                s,
+                &p.theta,
+                eta.as_slice(),
+                &cells(s),
+                &p.omega,
+                Some(iov),
+                &p.sigma.values,
+            )
+        };
+        assert_eq!(i(s_raw), 1e20);
+        assert!(i(s_ok) < 1e10);
+    }
+}

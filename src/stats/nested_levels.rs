@@ -179,6 +179,25 @@ fn level_groups(levels: &NestedLevels, cell_paths: &[Vec<u64>]) -> (Vec<Vec<usiz
     (cell_groups, counts)
 }
 
+/// Whether every record of `subject` carries an occasion label — what
+/// [`assign_level_cells`] writes, for every record kind.
+fn cells_assigned(subject: &Subject) -> bool {
+    subject.occasions.len() == subject.obs_times.len()
+        && subject.dose_occasions.len() == subject.doses.len()
+        && subject.pk_only_occasions.len() == subject.pk_only_times.len()
+        && subject.reset_occasions.len() == subject.reset_times.len()
+}
+
+/// A nested-level model with a subject that has no [`NestedLayout`]: the population was
+/// not prepared for the fit (`fitted_population` never ran, as on the lower-level entry
+/// points `optimize_population` / `run_inner_loop` handed a population as read), or a
+/// record kept a missing label. The estimator must not fall back to one-level IOV for it,
+/// which would integrate κ per record kind as read, or drop κ altogether; each site
+/// refuses the subject with its own sentinel instead (review r1 #6 on #2028).
+pub(crate) fn unprepared(model: &CompiledModel, subject: &Subject) -> bool {
+    model.has_nested_levels() && NestedLayout::of(model, subject).is_none()
+}
+
 /// One subject's compact random-effect layout under nested levels. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct NestedLayout {
@@ -197,10 +216,15 @@ pub(crate) struct NestedLayout {
 
 impl NestedLayout {
     /// The layout of `subject` under `model`, or `None` for a model without nested
-    /// levels (whose compact vector *is* the per-occasion stack) or a subject whose
-    /// occasion labels were never given cells (a cell with no labelled record).
+    /// levels (whose compact vector *is* the per-occasion stack) or for a subject that was
+    /// never given its cells: occasion labels not parallel to its records (a population
+    /// that skipped `fitted_population`), or a cell with no labelled record.
+    /// [`unprepared`] tells the second case apart from the first.
     pub(crate) fn of(model: &CompiledModel, subject: &Subject) -> Option<Self> {
         let levels = model.nested_levels()?;
+        if !cells_assigned(subject) {
+            return None;
+        }
         let mut path_of: HashMap<u32, Vec<u64>> = HashMap::new();
         for (kind, i, path) in record_paths(levels, subject) {
             let occ = match kind {
