@@ -673,8 +673,9 @@ fn warfarin_iov_sim_model(edit: impl Fn(&str) -> String) -> tempfile::NamedTempF
 }
 
 // #2005, the four cells of the issue's table that reach `E_IOV_MISSING_OCC` or its
-// remedy, in one test so a gate stuck on either branch fails it. Each assertion on a
-// refusal names one sentence of the message; deleting any sentence fails one.
+// remedy, plus the dose rule the message rules out, in one test so a gate stuck on
+// either branch fails it. Each assertion on a refusal names one sentence of the
+// message; deleting any sentence fails one.
 #[test]
 fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     let simulate = |f: &tempfile::NamedTempFile| {
@@ -698,8 +699,24 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
         "names why: {msg}"
     );
     assert!(
-        msg.contains("`iov_occasion = dose` or `iov_occasion = time(...)`"),
+        msg.contains("Set `iov_occasion = time(...)` in [fit_options], with a breakpoint"),
         "names the remedy: {msg}"
+    );
+    assert!(
+        msg.contains("between the first and last of the [simulation] `times`"),
+        "says where the breakpoint goes: {msg}"
+    );
+    assert!(
+        msg.contains("`iov_occasion = dose` cannot label it"),
+        "rules out the dose rule: {msg}"
+    );
+    assert!(
+        msg.contains("each simulated subject receives a single dose"),
+        "says why the dose rule cannot: {msg}"
+    );
+    assert!(
+        !msg.contains("Set `iov_occasion = dose`"),
+        "advises the dose rule: {msg}"
     );
     assert!(
         msg.contains("`iov_column = OCC` names a dataset column, so it has no effect"),
@@ -711,7 +728,8 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     let b = warfarin_iov_sim_model(no_column);
     let msg = simulate(&b).expect_err("no occasion rule on --simulate must be refused");
     assert!(msg.contains("has no dataset to read occasion labels from"));
-    assert!(msg.contains("`iov_occasion = dose` or `iov_occasion = time(...)`"));
+    assert!(msg.contains("Set `iov_occasion = time(...)` in [fit_options], with a breakpoint"));
+    assert!(msg.contains("`iov_occasion = dose` cannot label it"));
     assert!(!msg.contains("iov_column"), "{msg}");
 
     // A derived rule: simulates and fits.
@@ -722,6 +740,16 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
         )
     });
     simulate(&c).expect("a derived occasion rule labels the simulated population");
+
+    // The dose rule, which the message rules out: every `[simulation]` subject gets
+    // one dose, so the rule derives one occasion and `fit()` refuses it. If
+    // `[simulation]` ever grows a multiple-dose design this cell fails, and the
+    // message's sentence about the dose rule has to change with it.
+    let d = warfarin_iov_sim_model(|s| {
+        no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = dose\n")
+    });
+    let msg = simulate(&d).expect_err("the dose rule cannot label a [simulation] population");
+    assert!(msg.contains("produced only a single occasion"), "{msg}");
 
     // The data path keeps the dataset advice, both remedies included.
     let msg = crate::api::run_model_with_data(

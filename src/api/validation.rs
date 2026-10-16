@@ -1864,9 +1864,12 @@ fn check_iov_occasions(
 ///
 /// The gate is the dataset check's, but the advice cannot be: `[simulation]` has no
 /// dataset and no occasion field, so every template subject is unlabelled and no
-/// `iov_column` can change that. Only a model-side `iov_occasion` rule labels a
-/// simulated population, so it is the one remedy named, and an `iov_column` the
-/// model already sets is called out as having no effect rather than asked for.
+/// `iov_column` can change that. Nor can `iov_occasion = dose`: every template
+/// subject gets the block's one dose, so it derives a single occasion, which `fit()`
+/// then refuses as unidentifiable. Only `iov_occasion = time(...)` with a breakpoint
+/// inside the `times` grid labels a simulated population, so it is the one remedy
+/// named. An `iov_column` the model already sets is called out as having no effect
+/// rather than asked for.
 pub(crate) fn check_simulation_iov_occasions(
     model: &CompiledModel,
     template: &Population,
@@ -1879,9 +1882,11 @@ pub(crate) fn check_simulation_iov_occasions(
     let mut message = String::from(
         "Model declares kappa (IOV) parameters, but a population simulated from the \
          [simulation] block has no dataset to read occasion labels from, so every record \
-         is unlabelled. Set `iov_occasion = dose` or `iov_occasion = time(...)` in \
-         [fit_options] to derive the occasions in the model, so that per-occasion kappas \
-         can be estimated.",
+         is unlabelled. Set `iov_occasion = time(...)` in [fit_options], with a breakpoint \
+         between the first and last of the [simulation] `times`, to derive the occasions in \
+         the model, so that per-occasion kappas can be estimated. `iov_occasion = dose` \
+         cannot label it: each simulated subject receives a single dose, so that rule \
+         derives one occasion.",
     );
     if let Some(col) = iov_column {
         message.push_str(&format!(

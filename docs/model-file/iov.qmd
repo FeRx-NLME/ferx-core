@@ -371,7 +371,7 @@ This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `
 
 **Precedence.** If both `iov_occasion` (set to `dose`/`time(...)`) and `iov_column` are given, the model-side rule **wins** and a warning notes that the column was ignored.
 
-**`--simulate`.** A population simulated from the `[simulation]` block has no dataset, so `iov_column` cannot label it: a model with `kappa` run with `--simulate` needs `iov_occasion = dose` or `time(...)`. Without one the run is refused with `E_IOV_MISSING_OCC` before anything is simulated, and a model that sets `iov_column` is told that the key has no effect there.
+**`--simulate`.** A population simulated from the `[simulation]` block has no dataset, so `iov_column` cannot label it. `iov_occasion = dose` cannot either: every simulated subject receives the block's single dose, so the rule derives one occasion and the fit refuses it (see *Identifiability* below). A model with `kappa` run with `--simulate` therefore needs `iov_occasion = time(...)` with a breakpoint between the first and last of the `[simulation]` `times`. Without a rule the run is refused with `E_IOV_MISSING_OCC` before anything is simulated, and a model that sets `iov_column` is told that the key has no effect there.
 
 **Clock.** Both rules bucket observations, doses *and* `EVID=3/4` reset rows on ferx's internal event clock — the same monotonic timeline the solver integrates on. For reset-stacked subjects (`EVID=3/4`, where the data-file `TIME` restarts each period) that clock keeps advancing across the reset, so `time(...)` breakpoints separate the periods correctly and each dose stays in the same occasion as its co-timed observations.
 
