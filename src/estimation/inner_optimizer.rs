@@ -2216,36 +2216,63 @@ fn find_ebe_solve(
     // The optimiser variable already is eta_true (mean-zero, NONMEM-compatible).
     let eta_true: Vec<f64> = eta;
 
-    // Compute Jacobian at eta_true — match the gradient path so the H matrix
-    // is consistent with the gradient that drove convergence. Reuses the
-    // same per-subject helpers built once at the top of find_ebe; previously
-    // these were rebuilt here, doubling the per-subject helper cost.
-    // Inner half of the gradient-path policy ("gradient-based optimizers use
-    // sensitivities, FD fallback"): an exact analytic ∂f/∂η Jacobian when the
-    // model is in the supported analytical PK scope (1-/2-/3-cpt), else `None`
-    // and we keep the AD/FD Jacobian below. Perf follow-up: skip building the FD Jacobian
-    // when the analytic one is available — for this first landing it is computed
-    // and then overridden, which keeps the diff minimal and trivially
-    // revertible while the values come from the exact sensitivities.
-    let t_jac = std::time::Instant::now();
     let terminal_work = (policy.capture_terminal_hessian && terminal_hessian_reuse_enabled())
         .then(|| analytic_terminal_work(model, subject, params, &eta_true))
         .flatten();
     let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
-    // The captured pass already carries `∂f/∂η`; take it as the Jacobian under exactly the
-    // conditions the dedicated light call below would run (same scope predicate, same
-    // finiteness filter), so capturing a Hessian never widens which subjects get an
-    // analytic Jacobian.
+    let h_matrix = ebe_h_matrix(
+        model,
+        subject,
+        params,
+        &eta_true,
+        terminal_work.map(|(jac, _)| jac),
+        &mut pk_scratch_cell.borrow_mut(),
+        schedule,
+    );
+
+    Some(EbeResult {
+        eta: DVector::from_column_slice(&eta_true),
+        h_matrix,
+        terminal_hessian,
+        converged: ebe_converged,
+        used_fallback,
+        grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
+        nll,
+        kappas: Vec::new(),
+        hard_reject: false,
+    })
+}
+
+/// The `H` matrix (`∂f/∂η`, `n_obs × n_eta`) a non-IOV EBE solve reports at `eta`.
+///
+/// Match the gradient path, so the H matrix is consistent with the gradient that drove
+/// convergence. Inner half of the gradient-path policy ("gradient-based optimizers use
+/// sensitivities, FD fallback"): the exact analytic `∂f/∂η` Jacobian when the model is in
+/// the supported analytical scope, else the FD Jacobian. `captured_jac` is the Jacobian an
+/// `analytic_terminal_work` pass already produced; it is taken under exactly the
+/// conditions the dedicated light call would run (same scope predicate, same finiteness
+/// filter), so capturing a Hessian never widens which subjects get an analytic Jacobian.
+///
+/// A function of `(model, subject, θ, η)` alone — `pk_scratch` and `schedule` are reused
+/// buffers — which is what lets [`ebe_h_matrices_at`] rebuild the H of EBEs a fit
+/// reported (#2026). A `captured_jac` is the same `∂f/∂η` out of the full sensitivity
+/// pass rather than the light one, equal to it to about one ULP, not bit for bit.
+fn ebe_h_matrix(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+    captured_jac: Option<DMatrix<f64>>,
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> DMatrix<f64> {
+    let n_eta = model.n_eta;
+    let t_jac = std::time::Instant::now();
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
-        match terminal_work {
-            Some((jac, _)) => Some(jac),
-            None => crate::sens::provider::subject_eta_jacobian(
-                model,
-                subject,
-                &params.theta,
-                &eta_true,
-            )
-            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j)),
+        match captured_jac {
+            Some(jac) => Some(jac),
+            None => crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, eta)
+                .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j)),
         }
         .filter(|j| j.iter().all(|v| v.is_finite()))
     } else {
@@ -2259,36 +2286,58 @@ fn find_ebe_solve(
     // entirely — previously it was always computed and then discarded by an
     // `unwrap_or`, a full O(n_eta) sweep per subject per outer iteration that
     // directly undercut the speed premise (PR #381 review finding #10).
-    let h_matrix = match analytic_jac {
+    match analytic_jac {
         Some(j) => j,
         None => {
             // FD Jacobian fallback for models the analytic provider doesn't cover.
-            let mut scratch = pk_scratch_cell.borrow_mut();
             let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(
-                model,
-                subject,
-                &params.theta,
-                &eta_true,
-                &mut scratch,
-                schedule,
-            );
+            let j = compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
             GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
             j
         }
-    };
+    }
+}
 
-    Some(EbeResult {
-        eta: DVector::from_column_slice(&eta_true),
-        h_matrix,
-        terminal_hessian,
-        converged: ebe_converged,
-        used_fallback,
-        grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
-        nll,
-        kappas: Vec::new(),
-        hard_reject: false,
-    })
+/// The `H` matrices the inner loop reports alongside `etas` and `kappas` — one per subject,
+/// built at those EBEs by the same per-subject rule the solve finishes with
+/// ([`ebe_h_matrix`], or [`iov_ebe_h_matrix`] under IOV), without solving anything.
+///
+/// For a caller holding EBEs whose curvature was not kept: `run_covariance` on a fit that
+/// reported a non-cold EBE candidate (#2026), where the score cross-product reads `H`.
+/// Bit for bit the `H` of any solve that captured no terminal Hessian; to about one ULP
+/// that of a Laplace/AGQ objective-only evaluation that did.
+/// `kappas` is indexed like the inner loop's own (an empty slot for a subject with no
+/// occasions). A `[mixture]` fit's MIXEST H comes from its class solves, not from here.
+pub(crate) fn ebe_h_matrices_at(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DMatrix<f64>> {
+    use rayon::prelude::*;
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            // The same branch `find_ebe_impl` takes.
+            if model.n_kappa > 0 && !subject.occasions.is_empty() {
+                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
+            } else {
+                let schedule = cacheable_schedule(model, subject);
+                ebe_h_matrix(
+                    model,
+                    subject,
+                    params,
+                    etas[i].as_slice(),
+                    None,
+                    &mut pk::EventPkParams::default(),
+                    schedule.as_ref(),
+                )
+            }
+        })
+        .collect()
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
@@ -2391,10 +2440,7 @@ fn find_ebe_iov(
     // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
     // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
     // converge EBEs against an incomplete gradient.
-    let analytic_iov_inner = crate::sens::provider::iov_sens_eta_supported(model)
-        && omega_iov_ref.is_some()
-        && !analytic_inner_common_bail(model)
-        && !subject_has_survival_records(subject);
+    let analytic_iov_inner = analytic_iov_inner_supported(model, subject, params);
     // ODE objectives carry the adaptive-solver gradient-noise floor; enable the objective-stall
     // stop only for them — including a closed-form transit/IG + IOV subject the absorption walk
     // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
@@ -2563,46 +2609,7 @@ fn find_ebe_iov(
         .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
         .collect();
 
-    // H-matrix: BSV columns only (∂f/∂η_bsv with κ fixed at the EBE). The BSV block of
-    // the analytic stacked-η Jacobian is exactly this, so reuse the provider when it
-    // serves this subject; else the FD Jacobian.
-    let h_matrix = {
-        let analytic = if analytic_iov_inner {
-            let mut stacked_hat = bsv_eta.clone();
-            for k in &kappas_vec {
-                stacked_hat.extend(k.iter().copied());
-            }
-            crate::sens::provider::subject_eta_grad_iov(model, subject, &params.theta, &stacked_hat)
-        } else {
-            None
-        };
-        match analytic {
-            // Require one sensitivity row per observation — the indexed writes below would
-            // otherwise panic and abort the fit. The provider's scope gates hold this
-            // invariant today; guard it so a future mismatch degrades to FD instead of
-            // crashing, mirroring the outer `subject_packed_gradient_foce_iov` check (#466
-            // review round 4 #7).
-            Some(sens) if sens.len() == subject.obs_times.len() => {
-                let n_obs = subject.obs_times.len();
-                let mut h = DMatrix::zeros(n_obs, n_eta);
-                for (j, obs) in sens.iter().enumerate() {
-                    for k in 0..n_eta {
-                        h[(j, k)] = obs.df_deta[k];
-                    }
-                }
-                // Match the FD path: FREM covariate pseudo-obs rows carry the exact {0,1}
-                // Jacobian, which the provider's PK-prediction sensitivity does not emit
-                // (#466 review #9).
-                overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
-                h
-            }
-            _ => {
-                let kappas_slices: Vec<Vec<f64>> =
-                    kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-                compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices)
-            }
-        }
-    };
+    let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -2614,6 +2621,68 @@ fn find_ebe_iov(
         nll,
         kappas: kappas_vec,
         hard_reject: false,
+    }
+}
+
+/// Is the IOV solve's η-gradient (and its H) analytic for this subject? The guards are
+/// explained where `find_ebe_iov` reads this.
+fn analytic_iov_inner_supported(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+) -> bool {
+    crate::sens::provider::iov_sens_eta_supported(model)
+        && params.omega_iov.is_some()
+        && !analytic_inner_common_bail(model)
+        && !subject_has_survival_records(subject)
+}
+
+/// The `H` matrix an IOV EBE solve reports at `(bsv_eta, kappas)`: BSV columns only
+/// (`∂f/∂η_bsv` with κ fixed at the EBE). The BSV block of the analytic stacked-η Jacobian
+/// is exactly this, so reuse the provider when it serves this subject; else the FD
+/// Jacobian. Like [`ebe_h_matrix`], a function of the EBE alone (#2026).
+fn iov_ebe_h_matrix(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    bsv_eta: &[f64],
+    kappas: &[DVector<f64>],
+) -> DMatrix<f64> {
+    let n_eta = model.n_eta;
+    let analytic = if analytic_iov_inner_supported(model, subject, params) {
+        let mut stacked_hat = bsv_eta.to_vec();
+        for k in kappas {
+            stacked_hat.extend(k.iter().copied());
+        }
+        crate::sens::provider::subject_eta_grad_iov(model, subject, &params.theta, &stacked_hat)
+    } else {
+        None
+    };
+    match analytic {
+        // Require one sensitivity row per observation — the indexed writes below would
+        // otherwise panic and abort the fit. The provider's scope gates hold this
+        // invariant today; guard it so a future mismatch degrades to FD instead of
+        // crashing, mirroring the outer `subject_packed_gradient_foce_iov` check (#466
+        // review round 4 #7).
+        Some(sens) if sens.len() == subject.obs_times.len() => {
+            let n_obs = subject.obs_times.len();
+            let mut h = DMatrix::zeros(n_obs, n_eta);
+            for (j, obs) in sens.iter().enumerate() {
+                for k in 0..n_eta {
+                    h[(j, k)] = obs.df_deta[k];
+                }
+            }
+            // Match the FD path: FREM covariate pseudo-obs rows carry the exact {0,1}
+            // Jacobian, which the provider's PK-prediction sensitivity does not emit
+            // (#466 review #9).
+            overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
+            h
+        }
+        _ => {
+            let kappas_slices: Vec<Vec<f64>> =
+                kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+            compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
+        }
     }
 }
 

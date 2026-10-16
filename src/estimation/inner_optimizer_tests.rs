@@ -4383,3 +4383,136 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
         "a TTE record on a drug-driven hazard has no analytic η-channel"
     );
 }
+
+/// #2026: `ebe_h_matrices_at` rebuilds the `H` the inner loop reports from the EBEs alone,
+/// bit for bit, on every route `H` takes — the closed-form and ODE analytic Jacobians, the
+/// FD fallback, and the IOV solve's BSV block (analytic and FD) — and to one ULP the
+/// Jacobian an `analytic_terminal_work` capture supplies instead. `run_covariance` hands it to the score cross-product for a
+/// fit whose reported EBEs are not a cold solve, so any drift from the solve's own `H` is a
+/// wrong `s` / `rsr` covariance. The init parameters put every fixture's EBEs off zero
+/// (asserted), and a second call at moved EBEs must change `H`, so a rebuild that ignored
+/// its `etas` (or `kappas`) could not pass.
+#[test]
+fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
+    let cases = [
+        (
+            "warfarin closed form",
+            "examples/warfarin.ferx",
+            "data/warfarin.csv",
+            false,
+            false,
+        ),
+        (
+            "warfarin captured",
+            "examples/warfarin.ferx",
+            "data/warfarin.csv",
+            false,
+            true,
+        ),
+        (
+            "warfarin fd",
+            "examples/warfarin.ferx",
+            "data/warfarin.csv",
+            true,
+            false,
+        ),
+        (
+            "warfarin_ode",
+            "examples/warfarin_ode.ferx",
+            "data/warfarin.csv",
+            false,
+            false,
+        ),
+        (
+            "warfarin_iov",
+            "examples/warfarin_iov.ferx",
+            "data/warfarin_iov.csv",
+            false,
+            false,
+        ),
+        (
+            "warfarin_iov fd",
+            "examples/warfarin_iov.ferx",
+            "data/warfarin_iov.csv",
+            true,
+            false,
+        ),
+    ];
+    for (what, model_path, data, fd, capture) in cases {
+        let prep = crate::prepare_run(model_path, Some(data)).expect("prepare");
+        let (mut model, population, params) =
+            (prep.parsed.model, prep.population, prep.init_params);
+        if fd {
+            model.gradient_method = crate::types::GradientMethod::Fd;
+        }
+        let policy = InnerSolvePolicy {
+            capture_terminal_hessian: capture,
+            ..InnerSolvePolicy::default()
+        };
+        let (etas, hs, _, kappas, captured) = run_inner_loop_warm_map(
+            &model,
+            &population,
+            &params,
+            200,
+            1e-8,
+            None,
+            None,
+            0,
+            0,
+            policy,
+            |_, r| r.terminal_hessian.is_some(),
+        );
+        assert!(
+            etas.iter().any(|e| e.iter().any(|v| *v != 0.0)),
+            "{what}: premise — the EBEs must be off zero"
+        );
+        assert_eq!(
+            captured.iter().all(|c| *c),
+            capture,
+            "{what}: premise — the terminal capture (and its Jacobian) ran exactly when asked"
+        );
+        let is_iov = model.n_kappa > 0;
+        assert_eq!(
+            is_iov,
+            kappas.iter().any(|k| !k.is_empty()),
+            "{what}: premise — κ̂ present exactly on the IOV fixtures"
+        );
+        let rebuilt = ebe_h_matrices_at(&model, &population, &params, &etas, &kappas);
+        if capture {
+            // The captured Jacobian comes out of the full `subject_sensitivities` pass, the
+            // rebuild out of the light `subject_eta_jacobian` one: the same `∂f/∂η`, not the
+            // same rounding. Measured on macOS arm64: 4.8e-16 relative (5.3e-15 absolute),
+            // one ULP; the bound leaves 20× headroom.
+            let mut worst = 0.0f64;
+            for (a, b) in rebuilt.iter().zip(&hs) {
+                assert!(
+                    a.iter().chain(b.iter()).all(|v| v.is_finite()),
+                    "{what}: non-finite H"
+                );
+                worst = worst.max((a - b).abs().max() / b.abs().max());
+            }
+            assert!(
+                worst <= 1e-14,
+                "{what}: rebuilt H off by {worst:e} relative"
+            );
+        } else {
+            assert!(rebuilt == hs, "{what}: rebuilt H differs from the solve's");
+        }
+
+        let moved: Vec<DVector<f64>> = etas.iter().map(|e| e.add_scalar(0.1)).collect();
+        assert!(
+            ebe_h_matrices_at(&model, &population, &params, &moved, &kappas) != hs,
+            "{what}: H must depend on the EBEs it is rebuilt at"
+        );
+        if is_iov {
+            let moved_k: Vec<Vec<DVector<f64>>> = kappas
+                .iter()
+                .map(|ks| ks.iter().map(|k| k.add_scalar(0.1)).collect())
+                .collect();
+            assert!(
+                ebe_h_matrices_at(&model, &population, &params, &etas, &moved_k) != hs,
+                "{what}: the IOV H must depend on the κ̂ it is rebuilt at"
+            );
+        }
+    }
+}
