@@ -227,19 +227,21 @@ fn emax_example_parses_to_per_cmt_error_spec() {
 
 /// #1625: the Emax showcase must stay on the analytic route. It once forced
 /// `gradient = fd` with a stale "required" note; FD made `optimizer = auto`
-/// resolve to BOBYQA, which stopped 3–11 OFV short in the PD parameters. Both
-/// halves are pinned: the file must not opt out, and the per-CMT Form C readout
-/// must actually be in analytic scope (so dropping the line is not a no-op).
+/// resolve to BOBYQA, which stopped short in the PD parameters. Both halves are
+/// pinned: the file must request the default `auto` route (not `fd`, and not the
+/// retired `ad`, which `fit()` refuses), and the per-CMT Form C readout must
+/// actually be in analytic scope (so `auto` really resolves to analytic).
 #[test]
 fn emax_example_takes_the_analytic_gradient_route() {
     let parsed = parse_full_model_file(Path::new("examples/emax_pkpd.ferx"))
         .expect("emax_pkpd example must parse");
-    assert_ne!(
+    // `parse_full_model_file` leaves `model.gradient_method` at its default — the
+    // `[fit_options]` value lives only on `fit_options` — so that is the field to read.
+    assert_eq!(
         parsed.fit_options.gradient_method,
-        GradientMethod::Fd,
-        "examples/emax_pkpd.ferx forces gradient = fd; its readouts are analytic (#1625)"
+        GradientMethod::Auto,
+        "examples/emax_pkpd.ferx must use the default gradient = auto; its readouts are analytic (#1625)"
     );
-    assert_ne!(parsed.model.gradient_method, GradientMethod::Fd);
     assert!(
         analytic_outer_gradient_available(&parsed.model),
         "the per-CMT Form C readout fell out of analytic outer scope"
