@@ -125,6 +125,28 @@ fn row(field: &str, fixture: Fixture, with: FitOptions, base: FitOptions) {
         f.cov(&f.unrecorded(), &base, field) != inline,
         "{field}: premise — this field at its default must move the covariance on this fixture"
     );
+    {
+        let got = f.cov(&f.fit, &defaults(), field);
+        let (mut worst, mut n_diff) = (0.0f64, 0usize);
+        for (a, b) in got.iter().zip(inline.iter()) {
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            if a.to_bits() != b.to_bits() {
+                n_diff += 1;
+                let r = ((a - b) / b.abs().max(1e-300)).abs();
+                assert!(r.is_finite(), "{field}: non-finite diff");
+                worst = worst.max(r);
+            }
+        }
+        eprintln!(
+            "DIAG {field}: {n_diff} of {} entries differ, worst rel {worst:.3e}; ofv {:.12} gradient_inner {}",
+            got.len(),
+            f.fit.ofv,
+            f.fit.gradient_method_inner
+        );
+        for (k, w) in f.fit.warnings.iter().enumerate() {
+            eprintln!("DIAG {field}: warning {k}: {w}");
+        }
+    }
     assert!(
         f.cov(&f.fit, &defaults(), field) == inline,
         "{field}: run_covariance with default options must take the recorded {field}"
