@@ -270,37 +270,80 @@ fn segment_reads_a_column_the_forcing_dwarfs() {
 }
 
 #[test]
-fn segment_reads_a_jet_the_forcing_sensitivity_dwarfs() {
-    // `du/dt = C·p − (1 + p)·u` at p = 0, u0 = C: the value of `b` is 0, but its derivative
-    // is C, so a unit probe's `(C − 1) − C` rounds ∂A/∂p from −1 to 0 while every value
-    // check passes. Exact: u = C·e^{−t}, ∂u/∂p = C·(1 − e^{−t}) − C·t·e^{−t}.
-    let c = 1e20;
-    let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
-        let one = Dual2::<1>::from_f64(1.0);
-        du[0] = Dual2::<1>::from_f64(c) * p[0] - (one + p[0]) * u[0];
-    };
+fn segment_reads_jets_the_forcing_sensitivity_dwarfs() {
+    // `du/dt = C·p^k − (1 + p)·u` at p = 0, u0 = U: the value of `b` is 0, but its first
+    // (k = 1) or second (k = 2) derivative is of order C, so a probe below that magnitude
+    // rounds ∂A/∂p from −1 to 0 while every value check passes. Exact, with E = e^{−t}:
+    //   u = U·E;  k = 1: ∂u/∂p = C·(1 − E) − U·t·E,
+    //                    ∂²u/∂p² = −2C·(1 − E) + 2C·t·E + U·t²·E;
+    //             k = 2: ∂u/∂p = −U·t·E,  ∂²u/∂p² = 2C·(1 − E) + U·t²·E.
+    // C spans 1e20 to 1e170 (a fixed probe of 2^500 ≈ 3e150 loses the last). U = 1 leaves
+    // the jets of `b` as the only large magnitude in the model, so a probe sized from values
+    // alone is too small there.
     let t = 1.0;
-    let (hard, _) = linear_segment_g(
+    let e = (-t).exp();
+    for c in [1e20, 1e170] {
+        for u0 in [c, 1.0] {
+            for k in [1, 2] {
+                let rhs = move |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+                    let one = Dual2::<1>::from_f64(1.0);
+                    let forcing = if k == 1 { p[0] } else { p[0] * p[0] };
+                    du[0] = Dual2::<1>::from_f64(c) * forcing - (one + p[0]) * u[0];
+                };
+                let label = format!("C = {c:e}, u0 = {u0:e}, k = {k}");
+                let (hard, _) = linear_segment_g(
+                    &rhs,
+                    &[Dual2::<1>::from_f64(u0)],
+                    (0.0, t),
+                    &[Dual2::<1>::var(0.0, 0)],
+                    &[t],
+                    &[],
+                )
+                .unwrap_or_else(|| panic!("{label}: affine, autonomous"));
+                let got = hard[0].u[0];
+                let (grad, hess) = if k == 1 {
+                    (
+                        c * (1.0 - e) - u0 * t * e,
+                        -2.0 * c * (1.0 - e) + 2.0 * c * t * e + u0 * t * t * e,
+                    )
+                } else {
+                    (-u0 * t * e, 2.0 * c * (1.0 - e) + u0 * t * t * e)
+                };
+                let rel_v = (got.val() - u0 * e).abs() / (u0 * e);
+                let rel_g = (got.grad[0] - grad).abs() / grad.abs();
+                let rel_h = (got.hess[0][0] - hess).abs() / hess.abs();
+                assert!(
+                    got.jets_finite() && got.val().is_finite(),
+                    "{label}: {got:?}"
+                );
+                // Measured ≤ 1.3e-15 over all eight (value, ∂/∂p and ∂²/∂p²).
+                assert!(
+                    rel_v < 1e-14 && rel_g < 1e-14 && rel_h < 1e-14,
+                    "{label}: value rel {rel_v:e}, ∂/∂p rel {rel_g:e}, ∂²/∂p² rel {rel_h:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn segment_declines_an_rhs_whose_jets_are_not_affine() {
+    // `du/dt = −u + p·u²` at p = 0: the value is `−u`, affine at every state, so every value
+    // check passes — but ∂f/∂p = u² is not, and the column read for it (≈ s) disagrees with
+    // the RHS's own derivative at `u0`. Only the derivative half of the self-check can see it;
+    // accepting the segment returns a gradient that is off by the probe scale.
+    let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+        du[0] = p[0] * u[0] * u[0] - u[0];
+    };
+    assert!(linear_segment_g(
         &rhs,
-        &[Dual2::<1>::from_f64(c)],
-        (0.0, t),
+        &[Dual2::<1>::from_f64(1.0)],
+        (0.0, 1.0),
         &[Dual2::<1>::var(0.0, 0)],
-        &[t],
+        &[1.0],
         &[],
     )
-    .expect("affine, autonomous");
-    let got = hard[0].u[0];
-    let e = (-t).exp();
-    let (value, grad) = (c * e, c * (1.0 - e) - c * t * e);
-    let rel_v = (got.val() - value).abs() / value;
-    let rel_g = (got.grad[0] - grad).abs() / grad.abs();
-    assert!(got.val().is_finite() && got.grad[0].is_finite(), "{got:?}");
-    // Measured 1.1e-16 (value) and 7.8e-16 (∂/∂p). A unit probe gives ∂/∂p 139% off, a
-    // probe of 1e12 gives 5.7e-9: the derivative needs the probe above the *jet* of b.
-    assert!(
-        rel_v < 1e-14 && rel_g < 1e-14,
-        "value rel {rel_v:e}, ∂/∂p rel {rel_g:e}"
-    );
+    .is_none());
 }
 
 /// Two compartments, depot absorption, constant infusion into central — the shape the
@@ -354,15 +397,16 @@ fn segment_declines_a_nonlinear_rhs() {
         du[0] = -p[0] * u[0] / (p[1] + u[0]);
     };
     assert!(linear_segment_g::<f64>(&mm, &[50.0], (0.0, 4.0), &[10.0, 5.0], &[4.0], &[]).is_none());
-    // The probe sits at 2^500, so a saturable term is read at its plateau: even with Km far
-    // above every state the trajectory reaches, the column (≈ −Vmax/2^500) disagrees with the
-    // RHS at `u0` and the segment is declined.
+    // The probe sits 2^20 above the model's magnitudes, so even with Km far above every state
+    // the trajectory reaches, the column is read where saturation is ~1e-6 relative — far
+    // outside the self-check's 1e-9 — and the segment is declined.
     assert!(linear_segment_g::<f64>(&mm, &[0.5], (0.0, 4.0), &[10.0, 1e12], &[4.0], &[]).is_none());
-    // A nonlinear RHS built to agree with its probe secant at `u0 = 1` *and* at the probe:
+    // A nonlinear RHS built to agree with its probe secant at `u0 = 1` *and* at the probe
+    // (2^20 here: b = 0 and u0 = 1 put the model's magnitude at 1):
     // `u·(1 + (u − 1)·(s − u)/s)` is `u` at both, so A = 1, b = 0 and the entry checks pass.
     // Only the states the propagation reaches (`u ≈ e^0.5`, where the RHS is ~1.65× A·u)
     // expose it.
-    let s = 2f64.powi(500);
+    let s = 2f64.powi(20);
     let secant_twin = move |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
         du[0] = u[0] * (1.0 + (u[0] - 1.0) * ((s - u[0]) / s))
     };
@@ -543,5 +587,24 @@ fn ctmm_occupancy_ignores_the_pk_models_exact_route() {
         "P[0,0] = {} vs {truth} (frozen generator: {})",
         p[(0, 0)],
         (-1.0_f64).exp()
+    );
+}
+
+#[test]
+fn segment_probe_stays_near_the_models_own_magnitudes() {
+    // `((u / 1e-20) · 1e150 / 1e150) · 1e-20` is `u`, finite at every state this model
+    // reaches, but overflows at a state near 2^500: a probe that large declined this
+    // certified-linear model and integrated it. Sized from the model's magnitudes (here 1,
+    // so 2^20) the intermediate peaks near 1e176 and the exact path runs.
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+        du[0] = -((((u[0] / 1e-20) * 1e150) / 1e150) * 1e-20);
+    };
+    let (hard, _) = linear_segment_g::<f64>(&rhs, &[1.0], (0.0, 2.0), &[], &[2.0], &[])
+        .expect("certified-linear: must not be declined for an overflowing probe");
+    let exact = (-2.0_f64).exp();
+    assert!(
+        (hard[0].u[0] - exact).abs() / exact < 1e-14,
+        "{} vs {exact}",
+        hard[0].u[0]
     );
 }

@@ -26,9 +26,10 @@ pub(crate) use validation::{
     check_absorption_flip_flop_no_twin, check_absorption_flip_flop_no_twin_diags,
     check_analytic_readout_support, check_covariate_levels, check_covariate_model_bound,
     check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_level_index_columns, check_modeled_dose_rates, check_packed_start_in_box,
-    check_residual_magnitude, check_simulation_data, check_unbound_theta_levels,
-    check_variance_init_rails, unbound_level_refusal, LevelDataEntry, UnboundLevelsEntry,
+    check_level_index_columns, check_modeled_dose_rates, check_ode_method_linear,
+    check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
+    check_unbound_theta_levels, check_variance_init_rails, unbound_level_refusal, LevelDataEntry,
+    UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,

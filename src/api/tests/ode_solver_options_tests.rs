@@ -376,3 +376,40 @@ fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
         .expect("a certified model accepts ode_method = Linear");
     assert!(fitted.ode_linear_exact);
 }
+
+/// The same assertion on the two post-fit entry points that arm a caller's ODE settings.
+/// Each is asked twice on one fit — with `Linear`, which must be refused with the shared
+/// message, and with the default, which must get past the gate — so a gate that fires for
+/// every caller cannot pass either.
+#[test]
+fn run_covariance_and_run_sir_refuse_ode_method_linear_on_an_ineligible_model() {
+    let model = ode_model("");
+    let pop = population();
+    let fitted = fit(&model, &pop, &model.default_params, &eval_opts()).expect("the fit runs");
+    let linear = FitOptions {
+        ode_method: crate::ode::OdeMethod::Linear,
+        ..eval_opts()
+    };
+    let lead = "fit option `ode_method = linear`: this [odes] model cannot be propagated exactly";
+    let refused = |label: &str, r: Result<FitResult, crate::diagnostics::EngineError>| {
+        let e = match r {
+            Ok(_) => panic!("{label}: `ode_method = Linear` must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains(lead), "{label}: {e}");
+        assert!(e.contains("not linear in the states"), "{label}: {e}");
+    };
+    let not_refused = |label: &str, r: Result<FitResult, crate::diagnostics::EngineError>| {
+        if let Err(e) = r {
+            assert!(!e.to_string().contains("ode_method"), "{label}: {e}");
+        }
+    };
+    let cov = |o: &FitOptions| {
+        crate::estimation::run_covariance::run_covariance(&fitted, Some(&model), Some(&pop), o)
+    };
+    let sir = |o: &FitOptions| crate::run_sir(&fitted, Some(&model), Some(&pop), o);
+    refused("run_covariance", cov(&linear));
+    not_refused("run_covariance", cov(&eval_opts()));
+    refused("run_sir", sir(&linear));
+    not_refused("run_sir", sir(&eval_opts()));
+}

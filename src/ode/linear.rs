@@ -191,7 +191,8 @@ const SELF_CHECK_RTOL: f64 = 1e-9;
 /// `(hard, soft)` contract as the stepping drivers, so a caller cannot tell which produced it.
 ///
 /// `A` and `b` are read off the RHS itself at the segment midpoint: `b = f(0)` and column `j`
-/// of `A` is `(f(s·e_j) − b)/s`, with `s = 2^500` so the probe dominates any forcing. That keeps the dynamics in one place — the parser-built RHS, with
+/// of `A` is `(f(s·e_j) − b)/s`, with `s` a power of two 2^20 above the forcing and the entry
+/// state (values and derivative components). That keeps the dynamics in one place — the parser-built RHS, with
 /// its infusion and zero-order wrapping — instead of a second symbolic copy of the model that
 /// could drift from it.
 ///
@@ -227,24 +228,38 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     // entry. A unit probe loses every digit wherever the forcing dwarfs the coefficient: an
     // infusion of 1e9 into k = 1e-3 reads A to ~1e-7, `du/dt = 1e20 − u` reads A = 0, and a
     // forcing whose *sensitivity* is large (`C·p` with C = 1e20) zeroes ∂A/∂p while the value
-    // is fine — so no scale chosen from values alone is safe. A probe far above any forcing
-    // makes `s·A_ij` dominate `b_i` in every component instead, leaving ~ε relative on each:
-    // `fl(s·A + b) − b` is `s·A·(1 + δ)`. A power of two keeps the multiply and the divide
-    // exact. The RHS is certified affine, so the size of the probe is otherwise immaterial;
-    // the bound is overflow, which needs `|A|` near 1e158 and is caught below as non-finite.
-    const PROBE: f64 = 3.273_390_607_896_142e150; // 2^500, exactly
+    // is fine. So the probe is set from the model's own magnitudes — the forcing, the entry
+    // state, and the derivative components of both — times 2^20, rounded up to a power of
+    // two so the multiply and divide are exact: `s·A_ij` then dominates `b_i` in every
+    // component wherever `|A_ij|` is not itself tiny, and `fl(s·A + b) − b` is `s·A·(1 + δ)`.
+    // Tying it to those magnitudes, rather than to one huge constant, keeps the RHS evaluated
+    // within 2^20 of values it already produces, so a benign intermediate cannot overflow.
+    // Whatever cancellation remains is not trusted: the self-check below compares the
+    // derivative components too, and a column read wrongly in any of them declines the
+    // segment rather than returning a wrong gradient.
     let mut probe = vec![zero; n];
     let mut b = vec![zero; n];
     rhs(&probe, params, t_mid, &mut b);
+    let magnitude = b
+        .iter()
+        .chain(u0)
+        .fold(1.0_f64, |m, x| m.max(x.val().abs()).max(x.jet_max_abs()));
+    if !magnitude.is_finite() {
+        return None;
+    }
+    let scale = 2f64.powi(magnitude.log2().ceil() as i32 + 20);
+    if !scale.is_finite() {
+        return None;
+    }
     let mut a = vec![zero; n * n];
     let mut col = vec![zero; n];
-    let inv_probe = T::from_f64(1.0 / PROBE);
+    let inv_scale = T::from_f64(1.0 / scale);
     for j in 0..n {
-        probe[j] = T::from_f64(PROBE);
+        probe[j] = T::from_f64(scale);
         rhs(&probe, params, t_mid, &mut col);
         probe[j] = zero;
         for i in 0..n {
-            a[i * n + j] = (col[i] - b[i]) * inv_probe;
+            a[i * n + j] = (col[i] - b[i]) * inv_scale;
         }
     }
     if a.iter().chain(&b).any(|x| !x.val().is_finite()) {
@@ -252,18 +267,26 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     }
 
     // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
+    // In the value and in the derivative components alike: a column whose jets were lost to
+    // cancellation reproduces the RHS's value exactly and its gradient not at all.
     let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
         rhs(x, params, t, direct);
         (0..n).all(|i| {
-            let mut assembled = b[i].val();
+            let mut assembled = b[i];
             let mut scale = b[i].val().abs();
+            let mut jet_scale = b[i].jet_max_abs();
             for j in 0..n {
-                let term = a[i * n + j].val() * x[j].val();
-                assembled += term;
-                scale += term.abs();
+                let (aij, xj) = (a[i * n + j], x[j]);
+                assembled = assembled + aij * xj;
+                scale += (aij.val() * xj.val()).abs();
+                jet_scale += aij.jet_max_abs() * xj.val().abs()
+                    + aij.val().abs() * xj.jet_max_abs()
+                    + aij.jet_max_abs() * xj.jet_max_abs();
             }
-            let got = direct[i].val();
-            got.is_finite() && (got - assembled).abs() <= SELF_CHECK_RTOL * scale + 1e-300
+            let diff = direct[i] - assembled;
+            direct[i].val().is_finite()
+                && diff.val().abs() <= SELF_CHECK_RTOL * scale + 1e-300
+                && diff.jet_max_abs() <= SELF_CHECK_RTOL * jet_scale + 1e-300
         })
     };
 
