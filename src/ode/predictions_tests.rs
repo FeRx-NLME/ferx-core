@@ -7016,7 +7016,9 @@ fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: u
     let mut u = vec![0.0; ode.n_states];
     for _ in 0..max_cycles {
         u[cmt] += dose.amt;
-        if let Some(last) = solve_ode(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last() {
+        if let Some(last) =
+            solve_ode_certified(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last()
+        {
             u.copy_from_slice(&last.u);
         }
     }
@@ -8145,7 +8147,7 @@ fn explicit_ss_run_in(
     for m in 0..max_cycles {
         let prev = u.clone();
         let seg = (m as f64 * dose.ii, (m + 1) as f64 * dose.ii);
-        let sol = solve_ode(&train, &u, seg, pk, &[seg.1], &eq_opts);
+        let sol = solve_ode_certified(&train, &u, seg, pk, &[seg.1], &eq_opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }

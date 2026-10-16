@@ -73,6 +73,23 @@ pub trait PkNum:
     /// therefore inert on the prediction path and only ever fires on a dual instantiation
     /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
     fn jets_finite(self) -> bool;
+
+    /// The largest absolute **derivative** component — gradient, and the Hessian block when
+    /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
+    /// ignores [`val`](Self::val).
+    ///
+    /// For a check that has to hold in every component, not just the value: the exact linear
+    /// propagator (#852) reads `A` off differences of the RHS, and a cancellation can wipe a
+    /// derivative component while the value survives intact, so its self-check compares the
+    /// jets of `f(x)` and `A·x + b` too, against a scale built from these magnitudes.
+    ///
+    /// Provided, returning `0.0`, so adding it did not break an implementor outside this
+    /// crate. That default is only correct for a jet-free type; every dual in this crate
+    /// overrides it. An external type cannot reach the exact propagator (only a parser-certified
+    /// spec does, and that runs on this crate's types), so the default cannot weaken its check.
+    fn jet_max_abs(self) -> f64 {
+        0.0
+    }
 }
 
 impl PkNum for f64 {
@@ -220,6 +237,10 @@ macro_rules! impl_pknum_delegate {
             #[inline]
             fn jets_finite(self) -> bool {
                 $ty::jets_finite(self)
+            }
+            #[inline]
+            fn jet_max_abs(self) -> f64 {
+                $ty::jet_max_abs(self)
             }
         }
     };

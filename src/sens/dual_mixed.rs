@@ -481,6 +481,22 @@ impl<const NA: usize, const N: usize> DualMixed<NA, N> {
     pub fn jets_finite(self) -> bool {
         self.grad.iter().all(|g| g.is_finite()) && self.hess.iter().flatten().all(|h| h.is_finite())
     }
+
+    /// The largest absolute gradient **or** Hessian component — see
+    /// [`crate::sens::num::PkNum::jet_max_abs`]. A `NaN` component yields `NaN`, so a
+    /// comparison against it fails rather than passing.
+    pub fn jet_max_abs(self) -> f64 {
+        self.grad
+            .iter()
+            .chain(self.hess.iter().flatten())
+            .fold(0.0_f64, |m, g| {
+                if g.is_nan() || m.is_nan() {
+                    f64::NAN
+                } else {
+                    m.max(g.abs())
+                }
+            })
+    }
 }
 
 impl<const NA: usize, const N: usize> Add for DualMixed<NA, N> {

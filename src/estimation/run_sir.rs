@@ -228,6 +228,9 @@ fn run_sir_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_sir"))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a

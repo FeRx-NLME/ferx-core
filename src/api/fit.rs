@@ -3126,6 +3126,15 @@ fn fit_inner(
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),
+        // Read while this fit's ODE override is still armed, so a caller's
+        // `FitOptions::ode_method = rk45` on a linear model reports `false` (#852). Routed is
+        // not enough: a segment the propagator declined at the final estimates was integrated,
+        // so the predictions are not all exact and the flag must say so.
+        ode_linear_exact: model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|o| o.effective_solver_opts().method == crate::ode::OdeMethod::Linear)
+            && ode_solver_stats.linear_declined_segments == 0,
         uses_sde: model.is_sde(),
         n_threads_used,
         nlopt_missing_algorithms: nlopt_missing,
