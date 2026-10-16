@@ -695,7 +695,7 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     let a = warfarin_iov_sim_model(|s| s.to_string());
     let msg = simulate(&a).expect_err("no occasion rule on --simulate must be refused");
     assert!(
-        msg.contains("has no dataset to read occasion labels from"),
+        msg.contains("has no dataset to read occasion labels from, so every record is unlabelled"),
         "names why: {msg}"
     );
     assert!(
@@ -707,11 +707,19 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
         "says where the breakpoint goes: {msg}"
     );
     assert!(
+        msg.contains(
+            "to derive the occasions in the model, so that per-occasion kappas can be estimated"
+        ),
+        "says what the rule buys: {msg}"
+    );
+    assert!(
         msg.contains("`iov_occasion = dose` cannot label it"),
         "rules out the dose rule: {msg}"
     );
     assert!(
-        msg.contains("each simulated subject receives a single dose"),
+        msg.contains(
+            "each simulated subject receives a single dose, so that rule derives one occasion"
+        ),
         "says why the dose rule cannot: {msg}"
     );
     assert!(
