@@ -996,15 +996,6 @@ pub fn run_model_simulate_with_overrides(
     Ok((result, population))
 }
 
-/// Legacy alias of [`run_model_simulate`], keeping only the [`FitResult`]. Despite
-/// its name it simulates from the model's `[simulation]` block; it reads no data file.
-#[deprecated(
-    note = "use `run_model_simulate` (simulate, then fit) or `fit_from_files` (fit a data file)"
-)]
-pub fn run_from_file(path: &str) -> Result<FitResult, EngineError> {
-    run_model_simulate(path).map(|(r, _)| r)
-}
-
 /// Read and parse a model file once (#1752), coded by `ferx check`'s model-read
 /// classifier (#1772): a file that cannot be read is `E_MODEL_READ`, one that does
 /// not parse the parse's code. The message is `ModelSource::read`'s, byte for byte.

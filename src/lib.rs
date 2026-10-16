@@ -31,9 +31,6 @@ pub mod types;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use api::bind_theta_levels_from_fit;
-// Deprecated: a legacy alias of `run_model_simulate` (#1772).
-#[allow(deprecated)]
-pub use api::run_from_file;
 pub use api::{
     bind_from_fit, bind_theta_levels, check_model_data, check_model_data_warnings,
     check_model_options, configure_global_thread_pool, fit, fit_from_files, install_on_engine_pool,
