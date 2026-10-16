@@ -951,6 +951,7 @@ fn run_inner_loop_and_nll(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
+    cancel: Option<&crate::cancel::CancelFlag>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -959,7 +960,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, mu_k, None, schedules,
+        model, population, params, options, prev_etas, mu_k, None, schedules, cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1005,6 +1006,10 @@ fn run_inner_loop_and_nll_prepared(
     mu_k: Option<&[f64]>,
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
+    // Polled per subject (#574). Only a caller whose guard keeps a hard-rejected pass
+    // out of every accepted state passes `Some`: the NLopt objective and the global
+    // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
+    cancel: Option<&crate::cancel::CancelFlag>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -1038,6 +1043,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_restarts,
                 cache,
                 policy,
+                cancel,
                 take_terminal_work,
             ),
             None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
@@ -1051,9 +1057,23 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 policy,
+                cancel,
                 take_terminal_work,
             ),
         };
+        // A cancel observed during the pass left placeholders, not modes: do not run
+        // the quadrature on them (#574).
+        if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+            return (
+                etas,
+                h_matrices,
+                stats,
+                kappas,
+                f64::INFINITY,
+                None,
+                Vec::new(),
+            );
+        }
         let n_nodes = options.agq_nodes().expect("AGQ branch");
         let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
             Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
@@ -1132,6 +1152,7 @@ fn run_inner_loop_and_nll_prepared(
             options.inner_restarts,
             cache,
             policy,
+            cancel,
             finish_subject,
         )
     } else {
@@ -1146,10 +1167,16 @@ fn run_inner_loop_and_nll_prepared(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             policy,
+            cancel,
             finish_subject,
         )
     };
-    let nll = contributions.iter().sum();
+    // A cancelled pass sums placeholder contributions (#574); never report it as an OFV.
+    let nll = if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+        f64::INFINITY
+    } else {
+        contributions.iter().sum()
+    };
     (etas, h_matrices, stats, kappas, nll, None, contributions)
 }
 
@@ -1177,6 +1204,12 @@ struct NloptState {
     /// gradient so SLSQP/L-BFGS xtol/ftol fires in microseconds instead
     /// of grinding through `maxeval` at full inner-loop cost.
     stagnation_stopped: bool,
+    /// `best_ofv` when the #1934 decrement last vetoed a latch. A window that expires
+    /// with the incumbent still at that objective latches without asking again: the
+    /// same point gives the same decrement, so re-asking would re-arm forever.
+    vetoed_at_best_ofv: Option<f64>,
+    /// The latch overrode a decrement that still predicted a gain (the case above).
+    latch_overrode_veto: bool,
     /// The #1520 salvage guard's bookkeeping: which point a trial is measured against is
     /// decided per optimizer by [`SalvageGuardPolicy`], and the state remembers the
     /// candidates (best evaluation, last gradient point, previous `xs`).
@@ -1258,7 +1291,13 @@ fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     BASE + 50.0 * pen
 }
 
-fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool, short_window: bool) -> bool {
+fn detect_stagnation(
+    state: &mut NloptState,
+    n: usize,
+    enabled: bool,
+    short_window: bool,
+    still_descending: impl FnOnce() -> bool,
+) -> bool {
     if !enabled {
         return false;
     }
@@ -1279,6 +1318,20 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool, short_wind
     } else if state.n_evals.saturating_sub(state.last_improvement_eval)
         >= stagnation_window(n, short_window)
     {
+        // #1934: a window without a 1e-3 improvement is also what a slow creep down a
+        // long valley looks like. Ask the incumbent before latching; if a Newton step
+        // from it is still predicted to buy something, re-arm the window instead. The
+        // baseline `best_at_last_improvement` is kept, so the creep's accumulated
+        // progress still counts toward the next significant improvement. If the
+        // incumbent has not moved since the last veto, its prediction was not realised
+        // and asking again at the same point cannot change the answer: latch.
+        if state.vetoed_at_best_ofv == Some(state.best_ofv) {
+            state.latch_overrode_veto = true;
+        } else if still_descending() {
+            state.last_improvement_eval = state.n_evals;
+            state.vetoed_at_best_ofv = Some(state.best_ofv);
+            return false;
+        }
         state.stagnation_stopped = true;
         true
     } else {
@@ -1381,6 +1434,12 @@ fn step_is_expanding(steps: &std::collections::VecDeque<f64>) -> bool {
 /// the short one), then [`detect_stagnation`]. The objective closure calls this once per
 /// non-latched eval, after `best_ofv` and the plateau tracker are updated; the
 /// trace-replay tests call it too, so they exercise this code rather than a copy.
+///
+/// `still_descending` is asked only when a window has elapsed, and a `true` re-arms the
+/// window instead of latching (#1934): the objective closure answers it with
+/// [`predicted_remaining_gain`] at the incumbent, so a slow creep that the OFV-only
+/// window cannot tell from a plateau keeps running. The step-expansion veto above picks
+/// the window's *length*; this one decides whether its expiry is a stop.
 fn stagnation_after_eval(
     state: &mut NloptState,
     n: usize,
@@ -1389,6 +1448,7 @@ fn stagnation_after_eval(
     reachable_stops: bool,
     last_sig_feasible_eval: usize,
     step: f64,
+    still_descending: impl FnOnce() -> bool,
 ) -> bool {
     if state.recent_steps.len() == EXPANSION_HISTORY {
         state.recent_steps.pop_front();
@@ -1396,7 +1456,7 @@ fn stagnation_after_eval(
     state.recent_steps.push_back(step);
     let short_window = use_short_stagnation_window(algo, reachable_stops, last_sig_feasible_eval)
         && !step_is_expanding(&state.recent_steps);
-    detect_stagnation(state, n, enabled, short_window)
+    detect_stagnation(state, n, enabled, short_window, still_descending)
 }
 
 /// Does a run the stagnation guard stopped need the plateau verdict a bare
@@ -1465,6 +1525,8 @@ fn new_nlopt_state(
         best_at_last_improvement: f64::INFINITY,
         recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
+        vetoed_at_best_ofv: None,
+        latch_overrode_veto: false,
     }
 }
 
@@ -1553,6 +1615,7 @@ fn run_global_presearch(
             Some(&cached_zero),
             Some(&mu_k),
             Some(&schedule_cache),
+            options.cancel.as_ref(),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1592,6 +1655,7 @@ fn run_global_presearch(
             Some(&state.cached_etas),
             Some(&mu_k),
             Some(&schedule_cache),
+            options.cancel.as_ref(),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -2432,6 +2496,211 @@ fn failure_is_converged_plateau(
     made_progress && plateaued && consistent && left_init
 }
 
+/// Per-subject outer gradients `∂nllᵢ/∂x` (packed space) at `x`, from the same analytic
+/// entry points the optimizer's gradient is assembled from, for [`bhhh_newton_decrement`]
+/// (#1934). `None` whenever any subject has no analytic gradient — an AGQ or mixture
+/// objective, a model outside the analytic outer scope, or one subject the provider
+/// declines — so the decrement is never formed from a mix of exact and salvaged rows.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_outer_gradients(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Option<Vec<Vec<f64>>> {
+    if options.agq_nodes().is_some()
+        || model.mixture.is_some()
+        || !crate::sens::provider::analytic_outer_gradient_available(model)
+    {
+        return None;
+    }
+    let iov = crate::sens::provider::iov_sens_supported(model);
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            if iov {
+                let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
+                for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                    stacked.extend(kap.iter().copied());
+                }
+                subject_analytic_outer_gradient_iov(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    &stacked,
+                    options.interaction,
+                )
+            } else {
+                subject_analytic_outer_gradient(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    ehs[i].as_slice(),
+                    options.interaction,
+                )
+            }
+        })
+        .collect()
+}
+
+/// The BHHH Newton decrement at a point (#1934, #1564 A3/B3): the OFV a Newton step would
+/// still gain there, predicted from the per-subject gradients alone.
+///
+/// With `gᵢ = ∂nllᵢ/∂x`, `s = Σᵢ gᵢ` and `S = Σᵢ gᵢgᵢᵀ`, the information identity gives
+/// `∇²OFV ≈ 2S` and `∇OFV = 2s`, so the quadratic model's decrease `½∇ᵀ(∇²)⁻¹∇` is
+/// `sᵀS⁻¹s` — in OFV units and invariant to any linear rescaling of `x`, which a raw
+/// gradient norm is not. That is the point: a flat optimum whose gradient norm does not
+/// vanish (#1530) and a slow creep down a long valley (#1934) can carry the same `‖g‖`,
+/// and only the curvature the norm is measured against tells them apart.
+///
+/// `penalty_grad` / `penalty_hess` are the gradient and Hessian, in OFV units and packed
+/// space, of whatever the optimizer adds to the −2LL (parameter priors, the covariate-NN
+/// regularizer; zeros when neither is on). They enter on the same `nll` scale as `s` and
+/// `S`, halved, so the decrement is that of the objective the optimizer minimised.
+///
+/// Only the coordinates the optimizer can still move are kept: `fixed` ones go, and so
+/// does one sitting on a bound with the gradient pushing it through (the descent
+/// direction `−s` is infeasible there — #1564 B3's `pk1_sparse`, TVCL pinned at its lower
+/// bound, read 0.30 otherwise). The curvature is inverted on its eigenvalues above
+/// `1e-10·λ_max`, so a direction no subject's gradient spans contributes nothing rather
+/// than dividing by a rounding error. `None` when nothing is free or a component is not
+/// finite.
+fn bhhh_newton_decrement(
+    per_subject: &[Vec<f64>],
+    penalty_grad: &[f64],
+    penalty_hess: &DMatrix<f64>,
+    x: &[f64],
+    bounds: &PackedBounds,
+    fixed: &[bool],
+) -> Option<f64> {
+    let n = x.len();
+    let s_full: Vec<f64> = (0..n)
+        .map(|k| per_subject.iter().map(|g| g[k]).sum::<f64>() + 0.5 * penalty_grad[k])
+        .collect();
+    // An infinite bound (an unbounded θ, packed as ±∞ — also `ln(∞)` under log packing)
+    // binds nothing: without the `is_finite` the test reads `∞ <= ∞` and drops the
+    // coordinate whenever its gradient points toward that side.
+    let at = |b: f64, xk: f64| b.is_finite() && (xk - b).abs() <= 1e-8 * (1.0 + b.abs());
+    let free: Vec<usize> = (0..n)
+        .filter(|&k| {
+            !fixed[k]
+                && !(at(bounds.lower[k], x[k]) && s_full[k] > 0.0)
+                && !(at(bounds.upper[k], x[k]) && s_full[k] < 0.0)
+        })
+        .collect();
+    if free.is_empty() {
+        return None;
+    }
+    let m = free.len();
+    let s = DVector::from_iterator(m, free.iter().map(|&k| s_full[k]));
+    let mut curvature = DMatrix::from_fn(m, m, |a, b| 0.5 * penalty_hess[(free[a], free[b])]);
+    for g in per_subject {
+        let gf = DVector::from_iterator(m, free.iter().map(|&k| g[k]));
+        curvature.ger(1.0, &gf, &gf, 1.0);
+    }
+    if s.iter().chain(curvature.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let eig = nalgebra::SymmetricEigen::new(curvature);
+    let lambda_max = eig.eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    if lambda_max <= 0.0 {
+        return None;
+    }
+    let decrement: f64 = eig
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .filter(|&(_, &lambda)| lambda > 1e-10 * lambda_max)
+        .map(|(j, &lambda)| eig.eigenvectors.column(j).dot(&s).powi(2) / lambda)
+        .sum();
+    decrement.is_finite().then_some(decrement)
+}
+
+/// Largest [`bhhh_newton_decrement`] at which the stagnation guard may still latch
+/// (#1934). Above it, a window without a 1e-3 improvement is read as a slow creep, not a
+/// plateau, and the window is re-armed instead.
+///
+/// Measured at the would-be latch of every bundled closed-form example whose default fit
+/// latches (33 of them, Linux x86_64 at `c25832ca`): the largest is 2.6e-4
+/// (`warfarin_logit_f`), and all but three read below 1e-6. The #1934 creep reads 14.8
+/// at its eval-60 latch, and its optimum 1.8e-9. `0.1` sits ~400× above the first and
+/// ~150× below the second, and a fit predicted to gain less than a tenth of an OFV unit
+/// has nothing left in it a user could act on.
+const LATCH_MAX_PREDICTED_GAIN: f64 = 0.1;
+
+/// The warning for a stagnation latch that overrode the #1934 veto: a Newton step from
+/// the best point still predicted `gain`, but a full re-armed window did not realise any
+/// of it.
+fn veto_override_warning(gain: Option<f64>) -> String {
+    format!(
+        "Stagnation guard stopped the outer optimizer although a Newton step from the best \
+         point was still predicted to lower the objective by {:.4} (BHHH Newton decrement, \
+         max {LATCH_MAX_PREDICTED_GAIN}); a full further window did not realise it. The \
+         estimates may not be at a minimum — check the final gradient.",
+        gain.unwrap_or(f64::NAN)
+    )
+}
+
+/// Is a predicted remaining gain small enough for the guard to latch? `None` — no
+/// decrement could be formed (see [`predicted_remaining_gain`]) — latches as before #1934.
+fn gain_is_negligible(predicted_gain: Option<f64>) -> bool {
+    predicted_gain.is_none_or(|gain| gain <= LATCH_MAX_PREDICTED_GAIN)
+}
+
+/// [`bhhh_newton_decrement`] of the objective the optimizer minimises (−2LL plus any prior
+/// or covariate-NN penalty) at packed `x` with EBEs `ehs` / `kappas`, or `None` where it is
+/// not trusted to separate a creep from an optimum.
+///
+/// It is formed only on an **exact** objective: an ODE model, or a closed-form one whose
+/// absorption twin integrates some subjects ([`CompiledModel::honors_ode_solver_opts`]),
+/// is skipped. Its analytic gradient is that of the integrated objective at the solver's
+/// tolerance, and the two disagree by enough to swamp the signal: `two_cpt_iv_ode` at the
+/// default `ode_reltol` reads 2.0–2.5 at its optimum (L-BFGS and BOBYQA), against 2e-9 at
+/// `ode_reltol = 1e-9`. Its own latch at the default tolerance is 4.1 OFV short of that
+/// optimum and reads 7.8, so no single threshold separates the two there.
+#[allow(clippy::too_many_arguments)]
+fn predicted_remaining_gain(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<f64> {
+    if model.honors_ode_solver_opts() {
+        return None;
+    }
+    let per_subject =
+        per_subject_outer_gradients(model, population, init_params, x, ehs, kappas, options)?;
+    let n = x.len();
+    let theta = unpack_params(x, init_params).theta;
+    let mut penalty_grad = vec![0.0; n];
+    let mut penalty_hess = DMatrix::zeros(n, n);
+    nn_reg.add_packed_gradient(&theta, &mut penalty_grad);
+    nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
+    priors.add_gradient(x, &mut penalty_grad);
+    priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
+    bhhh_newton_decrement(
+        &per_subject,
+        &penalty_grad,
+        &penalty_hess,
+        x,
+        bounds,
+        &packed_fixed_mask(init_params),
+    )
+}
+
 /// The best point an optimizer has seen so far — a run's single source of truth
 /// for "where the fit actually is".
 ///
@@ -3107,6 +3376,12 @@ fn optimize_nlopt_once(
     // guard-forced `Success` from one NLopt reached on its own (#1530).
     let stagnation_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stagnation_latched_cl = Arc::clone(&stagnation_latched);
+    // #1934: the decrement of the last veto, and whether the latch overrode it, so a
+    // guard stop against a still-predicted gain is reported rather than silent.
+    let last_veto_gain: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let last_veto_gain_cl = Arc::clone(&last_veto_gain);
+    let latch_overrode_veto = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let latch_overrode_veto_cl = Arc::clone(&latch_overrode_veto);
 
     // Best-seen accumulator (issue #59). NLopt returns the last evaluated
     // point, not the best one — when the stagnation guard short-circuits
@@ -3302,10 +3577,21 @@ fn optimize_nlopt_once(
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
                     Some(&schedule_cache),
+                    options.cancel.as_ref(),
                 );
             contribs = nll_i.iter().map(|v| 2.0 * v).collect();
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
+        // The pass above polls the flag per subject (#574), so a cancel that lands inside
+        // it comes back here as placeholders. Leave the way the entry check does, before
+        // the guard accounting, the state caches, the trace and any gradient pass see the
+        // evaluation.
+        if crate::cancel::is_cancelled(&options.cancel) {
+            if let Some(g) = grad {
+                g.fill(0.0);
+            }
+            return 1e20;
+        }
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         // When a gradient is wanted the penalty gradient comes out of the same
         // pass (one network evaluation per curvature node) and is spliced into
@@ -3585,6 +3871,43 @@ fn optimize_nlopt_once(
             .sum::<f64>()
             .sqrt();
         let last_sig_feasible_eval = plateau_tracker_cl.lock().unwrap().1;
+        // #1934: consulted only when a window has elapsed, so the per-subject gradient
+        // pass it costs is paid once per would-be latch, not per evaluation. Measured at
+        // the incumbent with the incumbent's own EBEs — the point a latch would report.
+        let eval_no = state.n_evals;
+        let still_descending = || {
+            let incumbent = best_solve_cl.lock().unwrap();
+            let Some(inc) = incumbent.as_ref() else {
+                return false;
+            };
+            let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
+            let gain = predicted_remaining_gain(
+                model,
+                population,
+                init_params,
+                &x_inc,
+                &inc.etas,
+                &inc.kappas,
+                &bounds,
+                options,
+                &nn_reg,
+                &priors,
+            );
+            let descending = !gain_is_negligible(gain);
+            if descending {
+                *last_veto_gain_cl.lock().unwrap() = gain;
+            }
+            if verbose && descending {
+                eprintln!(
+                    "Eval {:>4}: no OFV improvement above 1e-3 in the last window, but a \
+                     Newton step from the best point is predicted to gain {:.4} more \
+                     (BHHH Newton decrement, max {LATCH_MAX_PREDICTED_GAIN}) — not stopping.",
+                    eval_no,
+                    gain.unwrap_or(f64::NAN),
+                );
+            }
+            descending
+        };
         if stagnation_after_eval(
             state,
             n,
@@ -3593,8 +3916,10 @@ fn optimize_nlopt_once(
             gradient_run_has_reachable_stops(options),
             last_sig_feasible_eval,
             step,
+            still_descending,
         ) {
             stagnation_latched_cl.store(true, Ordering::Relaxed);
+            latch_overrode_veto_cl.store(state.latch_overrode_veto, Ordering::Relaxed);
         }
         if state.stagnation_stopped && verbose {
             eprintln!(
@@ -4208,6 +4533,9 @@ fn optimize_nlopt_once(
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
     }
+    if latch_overrode_veto.load(Ordering::Relaxed) {
+        warnings.push(veto_override_warning(*last_veto_gain.lock().unwrap()));
+    }
 
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
@@ -4518,6 +4846,7 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             None,
+            None, // the built-in BFGS loop polls between iterations (#574)
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(x);
@@ -4553,6 +4882,7 @@ fn optimize_bfgs(
             Some(&mu_k),
             None,
             None,
+            None, // the built-in BFGS loop polls between iterations (#574)
         );
         let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
         let ofv = 2.0 * nll;

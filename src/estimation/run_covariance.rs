@@ -180,6 +180,9 @@ fn run_covariance_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_covariance"))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -190,7 +193,7 @@ fn run_covariance_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(crate::diagnostics::EngineError::from(format!(
+        return Err(crate::api::fit_input_model(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
@@ -1626,11 +1629,10 @@ mod from_fit_bindings {
                 .starts_with("run_covariance: model hash mismatch for "),
             "{err}"
         );
-        // #1746: an input `ferx check` has no code for carries none — "refused, no
-        // code" stays distinct from a coded precondition — and is still attributed
-        // to the entry point. Mutation: give non-diagnostic errors a generic code →
-        // the `None` assert dies.
-        assert_eq!(err.code(), None, "{err}");
+        // #1774: a file changed since the fit carries `E_FIT_INPUT_CHANGED` (it had no
+        // code under #1746), and is still attributed to the entry point. Mutation:
+        // code the hash failure as the read failure's `E_MODEL_READ` → this dies.
+        assert_eq!(err.code(), Some("E_FIT_INPUT_CHANGED"), "{err}");
         assert_eq!(err.context(), Some("run_covariance"), "{err}");
         assert!(
             err.message().starts_with("model hash mismatch for "),

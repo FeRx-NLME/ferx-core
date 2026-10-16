@@ -47,6 +47,8 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1713,7 +1715,7 @@ fn adaptive_tv_break_collision_within_tolerance_is_rejected() {
     )
     .expect_err("a sub-tolerance decision/obs collision must be rejected");
     assert!(
-        err.contains("bit-identical"),
+        err.to_string().contains("bit-identical"),
         "error should cite the collision: {err}"
     );
 }
@@ -2578,9 +2580,11 @@ fn adaptive_dv_without_assay_capability_errors() {
     )
     .unwrap_err();
     assert!(
-        err.contains("DV") && err.contains("capability"),
+        err.to_string().contains("DV") && err.to_string().contains("capability"),
         "got: {err}"
     );
+    // An internal invariant (production always supplies the assay), so no code (#1983).
+    assert_eq!(err.kind(), None, "got: {err:?}");
 }
 
 #[test]
@@ -2609,7 +2613,10 @@ fn adaptive_dv_no_error_model_errors() {
         Some(&assay),
     )
     .unwrap_err();
-    assert!(err.contains("error_model"), "got: {err}");
+    assert!(err.to_string().contains("error_model"), "got: {err}");
+    // The entry points refuse this before any subject runs (#1983), so in the driver it is
+    // an internal invariant and carries no code.
+    assert_eq!(err.kind(), None, "got: {err:?}");
 }
 
 #[test]
@@ -3154,27 +3161,8 @@ fn adaptive_base_regimen_with_reset_matches_static_ode_driver() {
     }
 }
 
-#[test]
-fn adaptive_max_decisions_runaway_guard() {
-    let ode = one_cpt_ode_spec();
-    let pk = pk_one(1.0, 10.0);
-    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(vec![], vec![1.0]);
-    let err = ode_predictions_adaptive(
-        &ode,
-        &pk.values,
-        &[],
-        &[],
-        &base,
-        &[0.0, 24.0, 48.0],
-        &[],
-        &mut controller,
-        2,
-        None,
-    )
-    .unwrap_err();
-    assert!(err.contains("max_decisions"), "got: {err}");
-}
+// The `max_decisions` runaway guard is refused at the API entry since #1983, before any
+// subject runs: `entry_refusal_codes_tests::adaptive_entry_refusals_simulate_no_subject`.
 
 #[test]
 fn adaptive_rejects_zero_compartment_via_validate() {
@@ -3195,7 +3183,7 @@ fn adaptive_rejects_zero_compartment_via_validate() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("compartment"), "got: {err}");
+    assert!(err.to_string().contains("compartment"), "got: {err}");
 }
 
 #[test]
@@ -3318,32 +3306,11 @@ fn adaptive_rejects_out_of_range_bolus_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
+    assert!(err.to_string().contains("state"), "got: {err}");
 }
 
-#[test]
-fn adaptive_rejects_out_of_range_monitor_compartment() {
-    // A monitor on a compartment beyond the model is a precondition error.
-    let ode = one_cpt_ode_spec();
-    let pk = pk_one(1.0, 10.0);
-    let monitors = [MonitorSpec::new("A", 2, ObserveMode::Ipred)]; // n_states = 1
-    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(vec![], vec![1.0]);
-    let err = ode_predictions_adaptive(
-        &ode,
-        &pk.values,
-        &[],
-        &[],
-        &base,
-        &[0.0],
-        &monitors,
-        &mut controller,
-        100,
-        None,
-    )
-    .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
-}
+// A monitor on a compartment beyond the model is refused at the API entry since #1983,
+// before any subject runs: `entry_refusal_codes_tests::adaptive_entry_refusals_simulate_no_subject`.
 
 #[test]
 fn adaptive_rejects_dosing_into_input_rate_compartment() {
@@ -3374,7 +3341,7 @@ fn adaptive_rejects_dosing_into_input_rate_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("input-rate"), "got: {err}");
+    assert!(err.to_string().contains("input-rate"), "got: {err}");
 }
 
 #[test]
@@ -3399,7 +3366,7 @@ fn adaptive_rejects_lagged_dose_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("lag time"), "got: {err}");
+    assert!(err.to_string().contains("lag time"), "got: {err}");
 }
 
 // ----- S1.3b reactive infusions (#391) ------------------------------
@@ -3818,7 +3785,7 @@ fn adaptive_rejects_nonpositive_infusion_rate() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("rate"), "got: {err}");
+    assert!(err.to_string().contains("rate"), "got: {err}");
 }
 
 #[test]
@@ -3846,7 +3813,7 @@ fn adaptive_rejects_out_of_range_infusion_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
+    assert!(err.to_string().contains("state"), "got: {err}");
 }
 
 #[test]
@@ -3881,7 +3848,7 @@ fn adaptive_rejects_infusion_into_input_rate_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("input-rate"), "got: {err}");
+    assert!(err.to_string().contains("input-rate"), "got: {err}");
 }
 
 #[test]
@@ -3910,7 +3877,7 @@ fn adaptive_rejects_lagged_infusion_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("lag time"), "got: {err}");
+    assert!(err.to_string().contains("lag time"), "got: {err}");
 }
 
 // ----- S1.4a decision log (#391) ------------------------------------
@@ -4202,7 +4169,10 @@ fn adaptive_driver_rejects_malformed_or_post_stop_actions() {
             None,
         )
         .expect_err("malformed / post-stop action list is rejected");
-        assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        assert!(
+            err.to_string().contains(needle),
+            "expected {needle:?}, got: {err}"
+        );
     }
 }
 
@@ -7014,7 +6984,9 @@ fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: u
     let mut u = vec![0.0; ode.n_states];
     for _ in 0..max_cycles {
         u[cmt] += dose.amt;
-        if let Some(last) = solve_ode(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last() {
+        if let Some(last) =
+            solve_ode_certified(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last()
+        {
             u.copy_from_slice(&last.u);
         }
     }
@@ -8143,7 +8115,7 @@ fn explicit_ss_run_in(
     for m in 0..max_cycles {
         let prev = u.clone();
         let seg = (m as f64 * dose.ii, (m + 1) as f64 * dose.ii);
-        let sol = solve_ode(&train, &u, seg, pk, &[seg.1], &eq_opts);
+        let sol = solve_ode_certified(&train, &u, seg, pk, &[seg.1], &eq_opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -12676,7 +12648,7 @@ fn the_adaptive_driver_records_an_abandoned_walk() {
     let (stats, out) = run_at(f64::NAN, &mut decide);
     let err = out.expect_err("a NaN dose time must be the driver's typed error");
     assert!(
-        err.contains("cannot be ordered"),
+        err.to_string().contains("cannot be ordered"),
         "the driver must reject it for the timeline, not for something else: {err}"
     );
     assert_eq!(

@@ -18,6 +18,7 @@
 //! Wired to the public file-driven entry point [`crate::simulate_adaptive_from_spec`]
 //! in S2.3 (#391).
 
+use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
@@ -319,14 +320,18 @@ pub(crate) struct CompiledAdaptive {
 pub(crate) fn compile_adaptive(
     model: &CompiledModel,
     spec: &AdaptiveDosingSpec,
-) -> Result<CompiledAdaptive, String> {
+) -> Result<CompiledAdaptive, Diagnostic> {
     // Re-check the spec's cross-field invariants here too: the struct is `pub`
     // with `pub` fields, so a programmatically-built spec may not have passed
     // through the block parser (which validates on its way out).
-    spec.validate()?;
-    // The reactive engine is ODE-only; reject an analytical model on both paths.
+    spec.validate().map_err(crate::api::adaptive_spec)?;
+    // The reactive engine is ODE-only; reject an analytical model on both paths. A model
+    // the driver cannot run, not a malformed spec, so `E_ADAPTIVE_UNSUPPORTED` (#1774).
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
-        "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)".to_string()
+        crate::api::adaptive_unsupported_diag(
+            None,
+            "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)",
+        )
     })?;
     let (mode, observe, observe_covariates, cmt) = if spec.with_assay_error {
         // Dv: the signal is the *noised measurement* of the model output named by
@@ -338,10 +343,10 @@ pub(crate) fn compile_adaptive(
             .assay_cmt
             .expect("validate() requires assay_cmt under with_assay_error");
         if cmt == 0 || cmt > ode.n_states {
-            return Err(format!(
+            return Err(crate::api::adaptive_spec(format!(
                 "[adaptive_dosing]: assay_cmt = {cmt} is out of range (model has {} compartment(s))",
                 ode.n_states
-            ));
+            )));
         }
         (ObserveMode::Dv, None, Vec::new(), cmt)
     } else {
@@ -351,7 +356,8 @@ pub(crate) fn compile_adaptive(
             .observe
             .as_deref()
             .expect("validate() requires observe without with_assay_error");
-        let (out_fn, cov) = compile_observe(model, observe_src, &spec.observe_declared_covariates)?;
+        let (out_fn, cov) = compile_observe(model, observe_src, &spec.observe_declared_covariates)
+            .map_err(crate::api::adaptive_spec)?;
         (ObserveMode::Ipred, Some(out_fn), cov, 1)
     };
     let monitors = vec![MonitorSpec::new(ADAPTIVE_SIGNAL, cmt, mode)];
@@ -805,13 +811,18 @@ mod tests {
             .err()
             .expect("with_assay_error needs assay_cmt");
         assert!(
-            err.contains("requires `assay_cmt"),
-            "needs assay_cmt: {err}"
+            err.message.contains("requires `assay_cmt"),
+            "needs assay_cmt: {err:?}"
         );
+        assert_eq!(err.code, "E_ADAPTIVE_SPEC", "{err:?}");
         // a measured output beyond the model's compartments
         let err = compile_adaptive(&model, &mk_spec("", true, Some(3)))
             .err()
             .expect("out-of-range assay_cmt must error");
-        assert!(err.contains("out of range"), "out of range: {err}");
+        assert!(
+            err.message.contains("out of range"),
+            "out of range: {err:?}"
+        );
+        assert_eq!(err.code, "E_ADAPTIVE_SPEC", "{err:?}");
     }
 }

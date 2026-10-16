@@ -33,6 +33,8 @@ fn subject() -> Subject {
         covariates: cov(70.),
         cens: vec![0; 4],
         pk_only_times: vec![10.],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![cov(95.)],
         reset_times: vec![23.],
         reset_covariates: vec![cov(120.)],

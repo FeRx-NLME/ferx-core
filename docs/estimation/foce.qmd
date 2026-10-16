@@ -34,6 +34,18 @@ $$
 
 The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
+#### When an inner solve counts as converged {#inner-loop-convergence}
+
+A subject's EBE is reported converged only when it is **stationary**: that flag is what `n_ebe_unconverged`, the [`max_unconverged_frac`](../model-file/fit-options.qmd) trial guard and AGQ's per-subject acceptance read. BFGS certifies its own result on the gradient norm, $\lVert\nabla_\eta\rVert < \texttt{inner\_tol}$, or — on an objective with a solver noise floor (an ODE, or a transit/IG subject rerouted to its ODE twin) — on the objective-stall stop.
+
+A Nelder-Mead result is certified by the same question, never by Nelder-Mead's own stopping rule. The simplex stops once its objective values agree within `inner_tol`; on a bowl of curvature $c$ that leaves $\lVert\nabla\rVert \approx 2\sqrt{c\cdot\texttt{inner\_tol}}$, about $10^{-2}$ at the default, so it is a stopping rule and not evidence of a mode. Until #1527 it was used as one: across the bundled examples, 4,088 of 4,109 Nelder-Mead-recovered EBEs were reported converged while **none** met the gradient test, at gradient norms up to $2.4 \times 10^{7}$. The fallback now accepts its point by the first of:
+
+1. $\lVert\nabla\rVert < \texttt{inner\_tol}$, with the gradient and metric BFGS used;
+2. on an exact objective, a positive-definite Hessian (central differences of that gradient) and either a **Newton step** $\lVert H^{-1}\nabla\rVert < \texttt{inner\_tol}$ — the EBE lies within `inner_tol` of its mode, the gradient test in $\eta$ units — or a remaining Newton decrease $\tfrac12\nabla^\top H^{-1}\nabla$ no larger than the $10^{-11}(1+|f|)$ the objective-stall stop already treats as flat, so nothing left to gain is resolvable in the objective at all. These are the points BFGS could not finish *because* the objective cannot resolve the last decrease (measured at $10^{-22}$–$10^{-10}$ on most fallback points), which is why they reached the fallback; the second arm is what keeps a tight `inner_tol` (Schnider's anchor runs at $10^{-8}$) from reporting converged subjects unconverged;
+3. a gradient polish from the point with the inner BFGS itself, objective-stall stop included, whose exit is the certificate; the polished point (never worse, since every step it takes decreases the objective) is returned only if it is certified.
+
+A point that passes none — a saddle, a non-convex region, a point far from any mode — is reported **unconverged**. One consequence: a fit whose start values give subjects EBE objectives no solver can certify now has its start guard-rejected instead of scored. `examples/ss_oral_q24.ferx` was such a case under non-interaction FOCE (a population-prediction variance of $\sim 3 \times 10^{-21}$ at its last sample); NONMEM `METHOD=1` terminates at iteration 0 from the same start, and the example now uses FOCEI, which both programs fit to the truth.
+
 #### Where the residual variance is taken {#inner-loop-residual-variance}
 
 Under **FOCEI** (and Laplace/AGQ) $V_{ij} = V(f_{ij}(\eta_i))$, the variance at the

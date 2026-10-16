@@ -27,6 +27,8 @@ fn subject() -> Subject {
         dose_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 71.0)])],
         obs_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 72.0)])],
         pk_only_times: vec![5.0],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![cov(&[("WT", 73.0)])],
         reset_times: vec![30.0],
         reset_covariates: vec![cov(&[("WT", 74.0)])],
