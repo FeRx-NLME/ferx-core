@@ -4,7 +4,8 @@
 # deliberately PERTURBED: from them a few subjects' warm-started EBEs enter a
 # high-VMAX / low-V / low-KA mode and stay there for the whole trajectory, which
 # is the trap the fix exists for. `mm_n200.csv` is the kit's `sim_mm(200, 31)`;
-# `mm_basin10.csv` is its subjects 1-5, 30, 54, 98, 154 and 165.
+# `mm_basin10.csv` is its subjects 5, 20, 40, 74, 83, 106, 159, 167, 175 and 199
+# (#1527 — see `tests/ebe_basin_shift.rs` for why the subset changed).
 [parameters]
   theta TVVMAX(0.8, 0.1, 50.0)
   theta TVKM(8.0, 0.1, 100.0)

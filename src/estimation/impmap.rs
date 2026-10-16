@@ -898,6 +898,11 @@ fn run_mcem(
     // A θ anchoring two ETAs has no single closed-form shift (see
     // `classify_mu_ref_pairs`); both its pairs are dropped, so it is estimated by
     // the weighted M-step alone.
+    // A covariate group that took both pairs in moves the θ instead (#1630).
+    let shared_theta: Vec<usize> = shared_theta
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
     if !shared_theta.is_empty() {
         warnings.push(format!(
             "{label}: typical value(s) {} are the mu-reference anchor of more than one ETA, so \
@@ -3066,6 +3071,34 @@ mod tests {
         s
     }
 
+    /// `TVP` anchors `ETA_CL` and `ETA_V` both — no single closed-form shift — and
+    /// `{q}` decides whether a covariate group on `ETA_Q` also reads it.
+    fn shared_anchor_model_1630(q: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVP(5.0, 0.01, 100.0)
+  theta TH_Q(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_Q ~ 0.09
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVP * exp(ETA_CL)
+  V  = TVP * 10.0 * exp(ETA_V)
+  Q  = {q}
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=50.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("parses")
+    }
+
     fn mix996_pop(n_per: usize) -> Population {
         use std::io::Write;
         let csv = mix996_csv(n_per);
@@ -3215,6 +3248,38 @@ mod tests {
         assert!(
             !hit.contains("TVV"),
             "TVV is log-packed and must not be listed: {hit}"
+        );
+    }
+
+    /// The IMP twin of SAEM's `saem_shared_anchor_warning_drops_a_theta_a_group_took_in`:
+    /// a theta a covariate group took both pairs of in (#1630) is moved by the
+    /// group, so the shared-anchor warning must not name it. The control side
+    /// is `imp_single_population_shared_anchor_routes_to_weighted_mstep` below.
+    #[test]
+    fn imp_shared_anchor_warning_drops_a_theta_a_group_took_in() {
+        let model = shared_anchor_model_1630("TVP * TH_Q * exp(ETA_Q)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Imp;
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_seed = Some(1630);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w
+                    .contains("ETA_CL (anchored on TVP) and ETA_V (anchored on TVP) share TVP")),
+            "premise: the group took both pairs in, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("mu-reference anchor of more than one ETA")),
+            "{:?}",
+            res.warnings
         );
     }
 

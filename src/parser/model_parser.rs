@@ -1218,6 +1218,11 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
 /// uppercased identifier set of every block *other* than `[parameters]` and
 /// `[individual_parameters]`, which is how a theta reaching the likelihood
 /// through `[odes]` or `[derived]` is seen from here.
+///
+/// The same walk notes every one-theta typical value of the same shapes
+/// ([`classify_single_anchor`]), and each group carries the ones on its own
+/// thetas as [`CovariateMuRef::colliding_anchors`] (#1630), so SAEM / IMP can
+/// take such an anchor into the group's joint M-step instead of declining it.
 fn detect_covariate_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
@@ -1227,6 +1232,11 @@ fn detect_covariate_mu_refs(
 ) -> Vec<CovariateMuRef> {
     let mut scope = InlineScope::new(stmts);
     let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
+    // One-theta typical values, kept apart from `found` (#1630): eta, owner,
+    // and the one theta. Only the ones a group collides with are materialised,
+    // after the walk — building every anchor's inlined typical value would
+    // undo the lazy inlining (#1684) on every plain mu-reference.
+    let mut anchors: Vec<(usize, String, usize)> = Vec::new();
     // The top-level statement that recorded each owner's surviving group. An
     // owner is retired on any later assignment to its name, so the latest
     // recording is the one `found` keeps.
@@ -1241,10 +1251,17 @@ fn detect_covariate_mu_refs(
                 let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
                 // Retire before recording, and retire whether or not this line is
                 // itself a group: an assignment that no longer classifies still
-                // supersedes the one it overwrites.
+                // supersedes the one it overwrites. Single anchors are retired
+                // by the same rule, for the same reason.
                 retire_superseded_group(&mut found, name, expr);
+                retire_superseded_group(&mut anchors, name, expr);
                 if let Some((eta_idx, entry)) = classified {
                     found.push((eta_idx, name.clone(), entry));
+                    recorded_at.insert(name.clone(), si);
+                } else if let Some((eta_idx, theta_idx)) =
+                    single_anchor_of(expr, theta_names.len(), n_bsv_eta.min(eta_names.len()))
+                {
+                    anchors.push((eta_idx, name.clone(), theta_idx));
                     recorded_at.insert(name.clone(), si);
                 }
                 scope.record(si, name, raw_expr);
@@ -1258,9 +1275,11 @@ fn detect_covariate_mu_refs(
             } => {
                 for (_, body) in branches {
                     retire_superseded_groups_in(&mut found, body);
+                    retire_superseded_groups_in(&mut anchors, body);
                 }
                 if let Some(eb) = else_body {
                     retire_superseded_groups_in(&mut found, eb);
+                    retire_superseded_groups_in(&mut anchors, eb);
                 }
             }
             _ => {}
@@ -1272,24 +1291,80 @@ fn detect_covariate_mu_refs(
     // earlier assignment to the same name is an ordinary reader.
     let recording = |owner: &str| -> &Statement { &stmts[recorded_at[owner]] };
     let all_owners: Vec<&Statement> = found.iter().map(|(_, owner, _)| recording(owner)).collect();
+    // The single anchors whose theta some group reads, materialised from their
+    // own statement (a definition is assigned once, so the view is the one the
+    // walk saw).
+    let group_thetas: Vec<&str> = found
+        .iter()
+        .flat_map(|(_, _, g)| g.theta_names.iter().map(String::as_str))
+        .collect();
+    let anchors: Vec<(usize, String, CovariateMuRef)> = anchors
+        .into_iter()
+        .filter(|&(_, _, t)| group_thetas.contains(&theta_names[t].as_str()))
+        .filter_map(|(eta_idx, owner, _)| {
+            let Statement::Assign(_, raw) = recording(&owner) else {
+                return None;
+            };
+            let (_, entry) = classify_single_anchor(
+                scope.view(recorded_at[&owner], raw),
+                theta_names,
+                eta_names,
+                n_bsv_eta,
+            )?;
+            Some((eta_idx, owner, entry))
+        })
+        .collect();
+    // The same walk stopped at those anchors too, for a joint M-step that also
+    // takes them in (#1630). An anchor reads its one theta and nothing that
+    // carries another's taint (a second theta would have made it a group, an
+    // unresolved name rejects it), so stopping only at the colliding ones is
+    // the same as stopping at all of them. The anchors get every reachability
+    // field a group gets: once absorbed they are members like any other.
+    let owners_and_anchors: Vec<&Statement> = all_owners
+        .iter()
+        .copied()
+        .chain(anchors.iter().map(|(_, owner, _)| recording(owner)))
+        .collect();
+    let fill = |owner: &str, eta_idx: usize, entry: &mut CovariateMuRef| {
+        entry.shared_thetas = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &[recording(owner)],
+            &entry.theta_names,
+        );
+        entry.read_outside_groups = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &all_owners,
+            &entry.theta_names,
+        );
+        entry.read_outside_groups_and_anchors = thetas_read_outside_the_group(
+            stmts,
+            theta_names,
+            outside_idents,
+            &owners_and_anchors,
+            &entry.theta_names,
+        );
+        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+    };
+    let anchors: Vec<CovariateMuRef> = anchors
+        .into_iter()
+        .map(|(eta_idx, owner, mut entry)| {
+            fill(&owner, eta_idx, &mut entry);
+            entry
+        })
+        .collect();
     found
         .into_iter()
         .map(|(eta_idx, owner, mut entry)| {
-            entry.shared_thetas = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &[recording(&owner)],
-                &entry.theta_names,
-            );
-            entry.read_outside_groups = thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &all_owners,
-                &entry.theta_names,
-            );
-            entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
+            fill(&owner, eta_idx, &mut entry);
+            entry.colliding_anchors = anchors
+                .iter()
+                .filter(|a| entry.theta_names.contains(&a.theta_names[0]))
+                .cloned()
+                .collect();
             entry
         })
         .collect()
@@ -1307,8 +1382,8 @@ fn detect_covariate_mu_refs(
 /// unconditional and keyed two ways: on the eta the new right-hand side carries
 /// (the same key recording uses) and on the assigned parameter name, which is
 /// the only handle left when the new line carries no eta at all (`CL = TVCL`).
-fn retire_superseded_group<'a, V: RhsView<'a>>(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
+fn retire_superseded_group<'a, V: RhsView<'a>, T>(
+    found: &mut Vec<(usize, String, T)>,
     name: &str,
     expr: V,
 ) {
@@ -1318,10 +1393,7 @@ fn retire_superseded_group<'a, V: RhsView<'a>>(
 
 /// [`retire_superseded_group`] over a conditional body, recursively. Retires
 /// only — see the `Statement::If` arm of [`detect_covariate_mu_refs`].
-fn retire_superseded_groups_in(
-    found: &mut Vec<(usize, String, CovariateMuRef)>,
-    stmts: &[Statement],
-) {
+fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts: &[Statement]) {
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => retire_superseded_group(found, name, expr),
@@ -1527,6 +1599,47 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     eta_names: &[String],
     n_bsv_eta: usize,
 ) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n >= 2)
+}
+
+/// `(eta_idx, theta_idx)` when [`classify_single_anchor`] would accept the
+/// right-hand side, without building its typical value — the per-statement
+/// test of [`detect_covariate_mu_refs`], which materialises only the anchors a
+/// group collides with.
+fn single_anchor_of<'a, V: RhsView<'a>>(
+    expr: V,
+    n_thetas: usize,
+    n_bsv_eta: usize,
+) -> Option<(usize, usize)> {
+    let (typical, eta_idx, _) = split_typical_and_eta(expr)?;
+    let read = typical.summary();
+    (eta_idx < n_bsv_eta && !read.other && read.thetas.len() == 1 && read.thetas[0] < n_thetas)
+        .then(|| (eta_idx, read.thetas[0]))
+}
+
+/// The one-theta twin of [`classify_covariate_mu_ref`]: a typical value of
+/// the same shapes and the same admissible reads, with exactly **one** theta —
+/// `V2 = TVV2 * exp(ETA_V2)`, `V = TVV * WT/70 * exp(ETA_V)`. Recorded only so
+/// that a group reading that theta can take the anchor into its joint M-step
+/// (#1630, [`CovariateMuRef::colliding_anchors`]).
+fn classify_single_anchor<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+) -> Option<(usize, CovariateMuRef)> {
+    classify_typical_value(expr, theta_names, eta_names, n_bsv_eta, |n| n == 1)
+}
+
+/// [`classify_covariate_mu_ref`] and [`classify_single_anchor`], told apart by
+/// how many thetas the typical value may read.
+fn classify_typical_value<'a, V: RhsView<'a>>(
+    expr: V,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    theta_count_ok: impl Fn(usize) -> bool,
+) -> Option<(usize, CovariateMuRef)> {
     let (typical, eta_idx, transform) = split_typical_and_eta(expr)?;
     if eta_idx >= n_bsv_eta || eta_idx >= eta_names.len() {
         return None;
@@ -1535,7 +1648,10 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     // rejected line never needs.
     let read = typical.summary();
     let mut theta_idx = read.thetas;
-    if read.other || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
+    if read.other
+        || !theta_count_ok(theta_idx.len())
+        || theta_idx.iter().any(|&i| i >= theta_names.len())
+    {
         return None;
     }
     theta_idx.sort_unstable();
@@ -1546,12 +1662,14 @@ fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names: read.covariates,
-            // All three filled by `detect_covariate_mu_refs` once the whole block
+            // All filled by `detect_covariate_mu_refs` once the whole block
             // (and the other blocks' identifiers) are in view; a single
             // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
             read_outside_groups: Vec::new(),
             eta_shared: false,
+            read_outside_groups_and_anchors: Vec::new(),
+            colliding_anchors: Vec::new(),
             typical: typical.build(),
         },
     ))
@@ -4870,6 +4988,30 @@ pub fn parse_full_model_with(
         })
         .collect();
 
+    // #1082: the declared levels. One level is today's IOV and is desugared onto
+    // `iov_column` once `[fit_options]` is read below; more than one is a nested model.
+    let declared_levels = kappa_info.levels.clone();
+    let nested_levels = (declared_levels.len() > 1).then(|| crate::types::NestedLevels {
+        levels: declared_levels.clone(),
+        kappa_level: kappa_info
+            .at
+            .iter()
+            .map(|at| {
+                at.as_ref()
+                    .and_then(|a| {
+                        declared_levels
+                            .iter()
+                            .position(|l| l.name.eq_ignore_ascii_case(a))
+                    })
+                    .expect("check_level_declarations: every kappa names a declared level")
+            })
+            .collect(),
+        readers: (0..n_eta + n_kappa)
+            .map(|k| direct_eta_readers(&indiv_stmts, k))
+            .collect(),
+    });
+    indiv_param_partials.nested_levels = nested_levels;
+
     let model = CompiledModel {
         residual_serial: residual_serial.clone(),
         priors: declared_priors,
@@ -5017,6 +5159,33 @@ pub fn parse_full_model_with(
     let mut model = model;
     if let Some(bloq) = fit_options.bloq_method {
         model.bloq_method = bloq;
+    }
+    // #1082: explicit `level` declarations. They replace `iov_column` / `iov_occasion`
+    // rather than combine with them, so a model states its occasion grouping once.
+    if !declared_levels.is_empty() {
+        if fit_options.iov_column.is_some() || fit_options.iov_occasion != IovOccasionRule::Column {
+            return Err(format!(
+                "E_LEVEL_MIXED_WITH_IOV_COLUMN: [parameters] declares `level {}` and \
+                 [fit_options] also sets {}. A `level` declaration replaces the occasion \
+                 option; remove it from [fit_options].",
+                declared_levels[0].name,
+                if fit_options.iov_column.is_some() {
+                    "`iov_column`"
+                } else {
+                    "`iov_occasion`"
+                }
+            ));
+        }
+        if declared_levels.len() == 1 {
+            // One level in `ID` is today's IOV spelled out: the same occasion column,
+            // read the same way, so the model fits bit-identically to `iov_column`.
+            fit_options.iov_column = Some(declared_levels[0].column.clone());
+        } else {
+            // The level labels are read like covariates and turned into groups when
+            // the population is prepared for the fit.
+            let columns: Vec<String> = declared_levels.iter().map(|l| l.column.clone()).collect();
+            register_referenced_covariates(&mut model.referenced_covariates, columns);
+        }
     }
     // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
     // `[data] path` above, only the raw value is read here;
@@ -5320,6 +5489,17 @@ pub fn parse_full_model_with(
     // arms a fit-scoped override instead (#1212), which merges over whatever is baked here
     // for the fields the caller actually moved. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
+
+    // `ode_method = linear` is an assertion, not a preference (#852): a user who names it is
+    // asking for the exact path, so a model that cannot take it is an error here rather than a
+    // silent fall back to integration (which is what `auto` does, by design).
+    if fit_options.ode_method == crate::ode::OdeMethod::Linear {
+        if let Some(refusal) =
+            crate::ode::predictions::ode_method_linear_refusal(model.ode_spec.as_ref())
+        {
+            return Err(refusal);
+        }
+    }
 
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
@@ -10000,7 +10180,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
                     "fit option `ode_method`: unknown value `{value}` — expected one of \
-                     auto, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
+                     auto, linear, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
                      verner7, ros23, ode23s, rodas5)"
                 )
             })?;
@@ -14084,6 +14264,9 @@ fn build_ode_spec(
         ));
     }
 
+    // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
+    let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
     // covariate reference would have been rejected above).
@@ -14256,6 +14439,16 @@ fn build_ode_spec(
         .collect();
     let rhs_hoist = build_rhs_hoist(&stmts_owned, n_vars_total, &rhs_invariant_slots);
     let rhs_hoist_f64 = rhs_hoist.clone();
+    let binding = RhsBindingPlan::for_program(
+        &stmts_owned,
+        n_vars_total,
+        state_count,
+        indiv_count,
+        time_slot,
+        tafd_slot,
+        tad_slot,
+        macheps_slot,
+    );
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -14272,8 +14465,10 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        affine_in_states,
         init_indiv_reads,
         hoist: rhs_hoist,
+        binding,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -14311,59 +14506,77 @@ fn build_ode_spec(
                 // to the struct; field reborrows are disjoint.
                 let scratch = &mut *s;
                 let warm = match &rhs_hoist_f64 {
-                    Some(h) => h.reset(&mut scratch.rhs_vars, n_vars_total),
+                    Some(h) => h.reset(&mut scratch.rhs_vars, n_vars_total, binding.zero),
                     None => {
-                        scratch.rhs_vars.clear();
-                        scratch.rhs_vars.resize(n_vars_total, 0.0);
+                        // The scratch is shared by every ODE model on the thread,
+                        // so a lean binding still resizes a buffer of the wrong
+                        // shape; what it skips is the fill of a right-shaped one.
+                        if binding.zero || scratch.rhs_vars.len() != n_vars_total {
+                            scratch.rhs_vars.clear();
+                            scratch.rhs_vars.resize(n_vars_total, 0.0);
+                        }
                         false
                     }
                 };
 
-                // State values from u[].
+                // State values from u[]. A short `u` (a broken contract, see the
+                // debug_assert above) leaves the remaining states at 0.0 whether
+                // or not the buffer was re-zeroed.
                 scratch.rhs_vars[..copy_n].copy_from_slice(&u[..copy_n]);
+                scratch.rhs_vars[copy_n..state_count].fill(0.0);
 
                 // Individual parameters from params[] via the pre-computed
-                // slot plan. `usize::MAX` slots (impossible under the
-                // assert_eq above) leave the var at 0.0.
+                // slot plan. A slot `params` does not cover (impossible under
+                // the assert_eq above) reads 0.0 — written, not left to the
+                // re-zero, so the lean binding cannot see a stale value.
                 for (i, &slot) in indiv_to_params_slot.iter().enumerate() {
-                    if let (Some(dst), Some(&val)) =
-                        (scratch.rhs_vars.get_mut(state_count + i), params.get(slot))
-                    {
-                        *dst = val;
+                    if let Some(dst) = scratch.rhs_vars.get_mut(state_count + i) {
+                        *dst = params.get(slot).copied().unwrap_or(0.0);
                     }
                 }
 
                 // TIME / T — solver time axis (same as dataset TIME column).
-                if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
-                    *dst = t;
+                if binding.seed_time {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
+                        *dst = t;
+                    }
                 }
                 // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
-                if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
-                    *dst = params
-                        .get(crate::types::MAX_PK_PARAMS)
-                        .copied()
-                        .filter(|v| v.is_finite())
-                        .map_or(f64::NAN, |first| t - first);
+                if binding.seed_tafd {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                        *dst = params
+                            .get(crate::types::MAX_PK_PARAMS)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .map_or(f64::NAN, |first| t - first);
+                    }
                 }
                 // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
-                if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
-                    *dst = params
-                        .get(crate::types::MAX_PK_PARAMS + 1)
-                        .copied()
-                        .filter(|v| v.is_finite())
-                        .map_or(f64::NAN, |last| t - last);
+                if binding.seed_tad {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                        *dst = params
+                            .get(crate::types::MAX_PK_PARAMS + 1)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .map_or(f64::NAN, |last| t - last);
+                    }
                 }
                 // MACHEPS — machine epsilon constant, available in every ODE
                 // expression (parallels its `[derived]`/`init` availability).
-                if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
-                    *dst = f64::EPSILON;
+                if binding.seed_macheps {
+                    if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
+                        *dst = f64::EPSILON;
+                    }
                 }
 
                 // Reset du so a state without a firing d/dt this iteration
                 // (e.g. inside an untaken if-branch) gets 0.0 rather than
-                // stale memory.
-                for slot in du.iter_mut() {
-                    *slot = 0.0;
+                // stale memory. The lean binding proved every path writes all
+                // `state_count` of them; a `du` of another length keeps the reset.
+                if binding.zero || du.len() != state_count {
+                    for slot in du.iter_mut() {
+                        *slot = 0.0;
+                    }
                 }
 
                 let empty_theta: [f64; 0] = [];
@@ -14620,6 +14833,107 @@ struct ParsedKappas {
     /// or `None` for an unweighted kappa. Always `None` for a `block_kappa`
     /// member, which the parser rejects a weight on.
     weights: Vec<Option<String>>,
+    /// Parallel to `names_ordered`: the level an `at LEVEL` tail attaches the kappa
+    /// to (#1082), or `None` for a kappa with no tail.
+    at: Vec<Option<String>>,
+    /// The `level NAME by COLUMN in PARENT` declarations (#1082), in order.
+    levels: Vec<crate::types::LevelSpec>,
+}
+
+/// Peel a trailing `at LEVEL` off a `kappa` / `block_kappa` declaration (#1082),
+/// returning the declaration without it and the level name. Only those two forms take
+/// the tail; any other line is returned unchanged.
+///
+/// `weight = <expr>` is peeled first and takes everything to its right, so a tail
+/// written after the weight (`… weight = NARM at ARM`) is found at the end of the
+/// weight expression instead, and peeled from there.
+fn split_level_attachment(
+    line: &str,
+    weight_expr: Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    let lower = line.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("kappa ") || lower.starts_with("block_kappa")) {
+        return (line.to_string(), weight_expr, None);
+    }
+    let re = Regex::new(r"(?i)^(.*\S)\s+at\s+(\w+)\s*$").unwrap();
+    if let Some(w) = &weight_expr {
+        if let Some(c) = re.captures(w) {
+            return (
+                line.to_string(),
+                Some(c[1].trim().to_string()),
+                Some(c[2].to_string()),
+            );
+        }
+    }
+    match re.captures(line) {
+        Some(c) => (c[1].to_string(), weight_expr, Some(c[2].to_string())),
+        None => (line.to_string(), weight_expr, None),
+    }
+}
+
+/// The structural rules of the `level` declarations and the `at` tails (#1082): the
+/// levels form one chain below `ID`, every `at` names a declared level, and once any
+/// level is declared every kappa carries one.
+fn check_level_declarations(kappas: &ParsedKappas) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, l) in kappas.levels.iter().enumerate() {
+        if l.name.eq_ignore_ascii_case("ID") || seen.iter().any(|s| s.eq_ignore_ascii_case(&l.name))
+        {
+            return Err(format!(
+                "[parameters] level {}: the name is already taken (by `ID` or an earlier \
+                 level); give each level its own name",
+                l.name
+            ));
+        }
+        let expected = if i == 0 { "ID" } else { seen[i - 1] };
+        if !l.parent.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "[parameters] level {} by {} in {}: a level nests in `ID` or in the level \
+                 declared just before it, so this one must be `in {expected}`. Levels form \
+                 one chain from the outermost down; two levels inside the same parent \
+                 would be crossed, which is not supported.",
+                l.name, l.column, l.parent
+            ));
+        }
+        seen.push(&l.name);
+    }
+    for (name, at) in kappas.names_ordered.iter().zip(&kappas.at) {
+        match at {
+            Some(level)
+                if !kappas
+                    .levels
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(level)) =>
+            {
+                return Err(if kappas.levels.is_empty() {
+                    format!(
+                        "[parameters] kappa {name} at {level}: no level is declared. Declare \
+                         it first with `level {level} by COLUMN in ID`."
+                    )
+                } else {
+                    format!(
+                        "[parameters] kappa {name} at {level}: `{level}` is not a declared \
+                         level (declared: {}).",
+                        kappas
+                            .levels
+                            .iter()
+                            .map(|l| l.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            }
+            None if !kappas.levels.is_empty() => {
+                return Err(format!(
+                    "E_LEVEL_MIXED_WITH_IOV_COLUMN: [parameters] kappa {name} has no `at LEVEL`, \
+                     but the model declares levels. Once a `level` is declared, every kappa \
+                     says which level it lives at."
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // --- Block extraction ---
@@ -15935,6 +16249,10 @@ fn parse_parameters(
     let mut block_kappas: Vec<BlockKappaSpec> = Vec::new();
     let mut kappa_names_ordered: Vec<String> = Vec::new();
     let mut kappa_weights_ordered: Vec<Option<String>> = Vec::new();
+    // #1082: the `at LEVEL` of each kappa (parallel to `kappa_names_ordered`) and the
+    // `level` declarations themselves.
+    let mut kappa_at_ordered: Vec<Option<String>> = Vec::new();
+    let mut level_decls: Vec<crate::types::LevelSpec> = Vec::new();
     // Per-parameter priors declared with an inline `prior(...)` tail (#254), in
     // declaration order.
     let mut priors: Vec<crate::types::ParameterPrior> = Vec::new();
@@ -16077,6 +16395,9 @@ fn parse_parameters(
     )
     .unwrap();
 
+    // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
+    let level_re = Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap();
+
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
     for source_line in &lines {
@@ -16098,8 +16419,26 @@ fn parse_parameters(
         let (line, prior_decl) = split_prior_modifier(source_line, "parameters")?;
         let (line, weight_expr) =
             split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
+        // #1082: `kappa NAME ~ VALUE at LEVEL` — peeled after the weight, which takes
+        // everything to its right.
+        let (line, weight_expr, at_level) = split_level_attachment(&line, weight_expr);
         let line = &line;
         let mut weight_consumed = false;
+        if let Some(caps) = level_re.captures(line) {
+            if prior_decl.is_some() || weight_expr.is_some() {
+                return Err(format!(
+                    "[parameters] level {}: a level takes no `prior(...)` or `weight =`; a \
+                     weight belongs on each kappa at the level",
+                    &caps[1]
+                ));
+            }
+            level_decls.push(crate::types::LevelSpec {
+                name: caps[1].to_string(),
+                column: caps[2].to_string(),
+                parent: caps[3].to_string(),
+            });
+            continue;
+        }
         // Name the prior attaches to, filled in by whichever declaration arm
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
@@ -16340,6 +16679,7 @@ fn parse_parameters(
             for name in &names {
                 kappa_names_ordered.push(name.clone());
                 kappa_weights_ordered.push(None);
+                kappa_at_ordered.push(at_level.clone());
             }
             let fixed = caps.get(3).is_some();
             // Last, not first: the code promises its repair is sufficient, so it
@@ -16435,6 +16775,7 @@ fn parse_parameters(
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             kappa_names_ordered.push(name.clone());
             kappa_weights_ordered.push(weight_expr.clone());
+            kappa_at_ordered.push(at_level.clone());
             weight_consumed = true;
             prior_target = Some((name.clone(), crate::types::ParameterKind::Kappa));
             kappas.push(KappaSpec {
@@ -16591,6 +16932,16 @@ fn parse_parameters(
         }
     }
 
+    let parsed_kappas = ParsedKappas {
+        diagonal: kappas,
+        block: block_kappas,
+        names_ordered: kappa_names_ordered,
+        weights: kappa_weights_ordered,
+        at: kappa_at_ordered,
+        levels: level_decls,
+    };
+    check_level_declarations(&parsed_kappas)?;
+
     Ok((
         thetas,
         omegas,
@@ -16598,12 +16949,7 @@ fn parse_parameters(
         sigmas,
         block_sigmas,
         eta_names_ordered,
-        ParsedKappas {
-            diagonal: kappas,
-            block: block_kappas,
-            names_ordered: kappa_names_ordered,
-            weights: kappa_weights_ordered,
-        },
+        parsed_kappas,
         vector_thetas,
         level_block_decls,
         unbound_level_blocks,
@@ -24853,6 +25199,35 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, an ODE RHS built on this thread keeps the full
+    /// per-call binding — re-zero `vars`/`du`, seed every time/anchor slot — so a
+    /// test can build the same model both ways and require bit-for-bit agreement
+    /// (#1523). Read at parse time on the parsing thread, like
+    /// [`IP_HOIST_DISABLED`].
+    pub(crate) static RHS_LEAN_BINDING_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`RHS_LEAN_BINDING_DISABLED`].
+#[cfg(test)]
+pub(crate) struct RhsLeanBindingOff(bool);
+
+#[cfg(test)]
+impl RhsLeanBindingOff {
+    pub(crate) fn enter() -> Self {
+        Self(RHS_LEAN_BINDING_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RhsLeanBindingOff {
+    fn drop(&mut self) {
+        RHS_LEAN_BINDING_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
 /// Test-only scope guard for [`IP_HOIST_DISABLED`]. Restores the previous value
 /// on drop, including on an assertion unwind.
 #[cfg(test)]
@@ -26308,9 +26683,16 @@ impl RhsHoist {
     /// Ready `vars` for one RHS call before its states, parameters and time are
     /// written: zero the program's own slots exactly as a fresh
     /// `clear(); resize(n, 0)` would, and keep the tail if it holds this program's
-    /// cache. Returns whether it does.
+    /// cache. Returns whether it does. `zero_own = false` keeps the program's own
+    /// slots as the last call left them — sound only under
+    /// [`rhs_defines_before_reads`].
     #[inline]
-    fn reset<T: crate::sens::num::vm::VmNum>(&self, vars: &mut Vec<T>, n_vars: usize) -> bool {
+    fn reset<T: crate::sens::num::vm::VmNum>(
+        &self,
+        vars: &mut Vec<T>,
+        n_vars: usize,
+        zero_own: bool,
+    ) -> bool {
         let zero = T::from_f64(0.0);
         // The id lives in the slot's value; its jet (zero) carries nothing, and
         // lifting `self.id` to a full dual just to compare it would cost a jet-sized
@@ -26318,7 +26700,9 @@ impl RhsHoist {
         let warm =
             vars.len() == self.n_ext && vars[self.id_slot].val().to_bits() == self.id.to_bits();
         if warm {
-            vars[..n_vars].fill(zero);
+            if zero_own {
+                vars[..n_vars].fill(zero);
+            }
         } else {
             vars.clear();
             vars.resize(self.n_ext, zero);
@@ -26583,6 +26967,214 @@ fn build_rhs_hoist(
     })
 }
 
+/// Which per-call binding work an ODE RHS actually needs (#1523). Decided once per
+/// program at build time; every `false` field is work whose result no statement
+/// can observe.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RhsBindingPlan {
+    /// Re-zero `vars[..n_vars]` and `du` before binding (P1c). `false` only under
+    /// [`rhs_defines_before_reads`].
+    zero: bool,
+    /// Seed the `T`/`TIME`, `TAFD`, `TAD` and `MACHEPS` slots (B3). Each is a
+    /// dedicated slot, so leaving one unwritten is observable only through a read
+    /// of it, which [`stmts_read_slots`] rules out. The lifted code of an
+    /// [`RhsHoist`] is cut from the same statements, so it is covered too.
+    seed_time: bool,
+    seed_tafd: bool,
+    seed_tad: bool,
+    seed_macheps: bool,
+}
+
+impl RhsBindingPlan {
+    /// The binding as it was before #1523: everything, every call.
+    #[cfg(test)]
+    const FULL: Self = Self {
+        zero: true,
+        seed_time: true,
+        seed_tafd: true,
+        seed_tad: true,
+        seed_macheps: true,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_program(
+        stmts: &[Statement],
+        n_vars: usize,
+        state_count: usize,
+        indiv_count: usize,
+        time_slot: usize,
+        tafd_slot: usize,
+        tad_slot: usize,
+        macheps_slot: usize,
+    ) -> Self {
+        #[cfg(test)]
+        if RHS_LEAN_BINDING_DISABLED.with(|c| c.get()) {
+            return Self::FULL;
+        }
+        let reads = |slot: usize| stmts_read_slots(stmts, &[slot]);
+        let plan = Self {
+            zero: true,
+            seed_time: reads(time_slot),
+            seed_tafd: reads(tafd_slot),
+            seed_tad: reads(tad_slot),
+            seed_macheps: reads(macheps_slot),
+        };
+        // An unseeded time slot is never read, so it may count as defined: the
+        // walk only has to establish that every *read* sees this call's value.
+        let zero = !rhs_defines_before_reads(
+            stmts,
+            n_vars,
+            state_count,
+            (0..state_count + indiv_count).chain([time_slot, tafd_slot, tad_slot, macheps_slot]),
+        );
+        Self { zero, ..plan }
+    }
+}
+
+/// Can the RHS binding skip re-zeroing `vars[..n_vars]` and `du` on every call
+/// (#1523, P1c)?
+///
+/// The re-zero exists so a read of a slot nothing wrote *this call* — an
+/// intermediate assigned only inside an untaken `if` arm, a `d/dt` that fires only
+/// in one branch — sees `0.0` rather than whatever the previous call left there.
+/// Skipping it is unobservable exactly when no such read exists. So this is a
+/// def-before-use walk in evaluation order: `defined` starts as the slots the
+/// binding writes unconditionally (`initially_defined`), every read must hit a
+/// defined slot, an assignment defines its target, and after an `if` only what
+/// *every* arm defines stays defined — an `if` with no `else` keeps only what was
+/// defined before it. `du` must be fully written on every path.
+///
+/// Conservative by construction: any shape it does not model (an unresolved
+/// `Assign`/`DiffEq`, an out-of-range slot, an unresolved `Variable`) answers
+/// `false`, which keeps the re-zero.
+fn rhs_defines_before_reads(
+    stmts: &[Statement],
+    n_vars: usize,
+    state_count: usize,
+    initially_defined: impl IntoIterator<Item = usize>,
+) -> bool {
+    let mut defined = vec![false; n_vars];
+    for s in initially_defined {
+        match defined.get_mut(s) {
+            Some(d) => *d = true,
+            None => return false,
+        }
+    }
+    let mut du = vec![false; state_count];
+    rhs_dbu_walk(stmts, &mut defined, &mut du) && du.iter().all(|&w| w)
+}
+
+fn rhs_dbu_walk(stmts: &[Statement], defined: &mut [bool], du: &mut [bool]) -> bool {
+    fn set(v: &mut [bool], i: usize) -> bool {
+        match v.get_mut(i) {
+            Some(d) => {
+                *d = true;
+                true
+            }
+            None => false,
+        }
+    }
+    for s in stmts {
+        let ok = match s {
+            Statement::AssignBc(i, bc) => bc_reads_defined(bc, defined) && set(defined, *i),
+            Statement::AssignIdx(i, e) => expr_reads_defined(e, defined) && set(defined, *i),
+            Statement::DiffEqBc(k, bc) => bc_reads_defined(bc, defined) && set(du, *k),
+            Statement::DiffEqIdx(k, e) => expr_reads_defined(e, defined) && set(du, *k),
+            // The evaluators skip an unresolved statement outright; nothing models it here.
+            Statement::Assign(..) | Statement::DiffEq(..) => false,
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Each condition runs only after the earlier ones failed, so no
+                // earlier arm's body has executed: all see the pre-`if` state.
+                let (d0, u0) = (defined.to_vec(), du.to_vec());
+                let mut acc: Option<(Vec<bool>, Vec<bool>)> = None;
+                let mut arm = |body: Option<&[Statement]>| -> bool {
+                    let (mut d, mut u) = (d0.clone(), u0.clone());
+                    if let Some(b) = body {
+                        if !rhs_dbu_walk(b, &mut d, &mut u) {
+                            return false;
+                        }
+                    }
+                    acc = Some(match acc.take() {
+                        None => (d, u),
+                        Some((ad, au)) => (
+                            ad.iter().zip(&d).map(|(a, b)| *a && *b).collect(),
+                            au.iter().zip(&u).map(|(a, b)| *a && *b).collect(),
+                        ),
+                    });
+                    true
+                };
+                let mut ok = true;
+                for (c, body) in branches {
+                    ok = ok && cond_reads_defined(c, &d0) && arm(Some(body));
+                }
+                // No `else`: the fall-through path defines nothing new.
+                ok = ok && arm(else_body.as_deref());
+                if ok {
+                    let (ad, au) = acc.expect("the else / fall-through arm always runs");
+                    defined.copy_from_slice(&ad);
+                    du.copy_from_slice(&au);
+                }
+                ok
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn bc_reads_defined(bc: &Bytecode, defined: &[bool]) -> bool {
+    bc.ops.iter().all(|op| match *op {
+        Op::PushVar(i) => defined.get(i as usize).copied().unwrap_or(false),
+        _ => true,
+    })
+}
+
+fn expr_reads_defined(e: &Expression, defined: &[bool]) -> bool {
+    match e {
+        Expression::VariableIdx(i) => defined.get(*i).copied().unwrap_or(false),
+        // Unresolved: what it reads is not known here.
+        Expression::Variable(_) => false,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_reads_defined(a, defined) && expr_reads_defined(b, defined)
+        }
+        Expression::UnaryFn(_, a) => expr_reads_defined(a, defined),
+        Expression::ThetaGather { idx, .. } => expr_reads_defined(idx, defined),
+        Expression::Conditional(c, t, f) => {
+            cond_reads_defined(c, defined)
+                && expr_reads_defined(t, defined)
+                && expr_reads_defined(f, defined)
+        }
+        // No `vars` read. Listed rather than wildcarded so a new variant has to
+        // be classified here before it compiles.
+        Expression::Literal(_)
+        | Expression::Theta(_)
+        | Expression::Eta(_)
+        | Expression::Time
+        | Expression::MixNum
+        | Expression::Covariate(_)
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => true,
+    }
+}
+
+fn cond_reads_defined(c: &Condition, defined: &[bool]) -> bool {
+    match c {
+        Condition::Compare(a, _, b) => {
+            expr_reads_defined(a, defined) && expr_reads_defined(b, defined)
+        }
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_reads_defined(a, defined) && cond_reads_defined(b, defined)
+        }
+        Condition::Not(a) => cond_reads_defined(a, defined),
+        Condition::Present(e) => expr_reads_defined(e, defined),
+    }
+}
+
 /// `eval_bytecode` (the scalar VM the f64 RHS closure uses) in the shape
 /// [`RhsHoist::refresh`] takes.
 fn rhs_lift_eval_f64(bc: &Bytecode, vars: &[f64], stack: &mut Vec<f64>) -> f64 {
@@ -26639,6 +27231,10 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition —
+    /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
+    /// `ode_linearity::stmts_affine_in_states`.
+    affine_in_states: bool,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -26668,6 +27264,8 @@ pub struct OdeRhsProgram {
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
     init_indiv_reads: Vec<(usize, Vec<usize>)>,
+    /// Which per-call binding work this program needs (#1523).
+    binding: RhsBindingPlan,
 }
 
 impl OdeRhsProgram {
@@ -26938,6 +27536,20 @@ impl OdeRhsProgram {
         i < self.indiv_to_params_slot.len()
     }
 
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition — the
+    /// structural half of the linear fast path's eligibility (#852). The other half is
+    /// [`Self::reads_any_model_time`]; `OdeSpec::linear_ineligibility` asks both.
+    pub(crate) fn is_affine_in_states(&self) -> bool {
+        self.affine_in_states
+    }
+
+    /// Any equation reads `TIME`/`T`/`TAFD`/`TAD` — the injected hazard lines included,
+    /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
+    /// the augmented system and a time-dependent hazard line is part of it.
+    pub(crate) fn reads_any_model_time(&self) -> bool {
+        self.uses_time_vars || self.reads_time_builtin
+    }
+
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
     /// of the user's `[odes]` equations only, with the injected joint-PK-TTE
     /// hazard lines excluded (#1166).
@@ -27042,36 +27654,52 @@ impl OdeRhsProgram {
         // busulfan: the `DualMixed` RHS gained ~5% self time with the lift on). For
         // `f64` and `Dual1` the key is a handful of words and the lift pays.
         let hoist = self.hoist.as_ref().filter(|_| !T::SECOND_ORDER);
+        let b = self.binding;
+        let zero = T::from_f64(0.0);
         let warm = match hoist {
-            Some(h) => h.reset(vars, self.n_vars_total),
+            Some(h) => h.reset(vars, self.n_vars_total, b.zero),
             None => {
-                vars.clear();
-                vars.resize(self.n_vars_total, T::from_f64(0.0));
+                // Same shape rule as the f64 closure: a lean binding skips only
+                // the fill of an already right-shaped buffer.
+                if b.zero || vars.len() != self.n_vars_total {
+                    vars.clear();
+                    vars.resize(self.n_vars_total, zero);
+                }
                 false
             }
         };
         let copy_n = self.state_count.min(u.len());
         vars[..copy_n].copy_from_slice(&u[..copy_n]);
+        vars[copy_n..self.state_count].fill(zero);
         for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
-            if let (Some(dst), Some(&val)) = (vars.get_mut(self.state_count + i), params.get(slot))
-            {
-                *dst = val;
+            if let Some(dst) = vars.get_mut(self.state_count + i) {
+                *dst = params.get(slot).copied().unwrap_or(zero);
             }
         }
-        if let Some(d) = vars.get_mut(self.time_slot) {
-            *d = T::from_f64(t);
+        if b.seed_time {
+            if let Some(d) = vars.get_mut(self.time_slot) {
+                *d = T::from_f64(t);
+            }
         }
-        if let Some(d) = vars.get_mut(self.tafd_slot) {
-            *d = T::from_f64(tafd);
+        if b.seed_tafd {
+            if let Some(d) = vars.get_mut(self.tafd_slot) {
+                *d = T::from_f64(tafd);
+            }
         }
-        if let Some(d) = vars.get_mut(self.tad_slot) {
-            *d = tad;
+        if b.seed_tad {
+            if let Some(d) = vars.get_mut(self.tad_slot) {
+                *d = tad;
+            }
         }
-        if let Some(d) = vars.get_mut(self.macheps_slot) {
-            *d = T::from_f64(f64::EPSILON);
+        if b.seed_macheps {
+            if let Some(d) = vars.get_mut(self.macheps_slot) {
+                *d = T::from_f64(f64::EPSILON);
+            }
         }
-        for d in du.iter_mut() {
-            *d = T::from_f64(0.0);
+        if b.zero || du.len() != self.state_count {
+            for d in du.iter_mut() {
+                *d = zero;
+            }
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
@@ -29033,6 +29661,10 @@ pub struct IndivParamPartials {
     /// hand-built fixtures, which have no statements to measure: the providers
     /// then keep the older rule, "every `eta_param_info` entry is `LogNormal`".
     pub(crate) lognormal_eta_chain: Option<bool>,
+    /// The nested variability levels (#1082), read through
+    /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
+    /// one level, and for hand-built fixtures.
+    pub(crate) nested_levels: Option<crate::types::NestedLevels>,
 }
 
 impl IndivParamPartials {
@@ -29051,6 +29683,7 @@ impl IndivParamPartials {
             data_bindings: DataBindings::default(),
             bound_from_fit: false,
             lognormal_eta_chain: None,
+            nested_levels: None,
         }
     }
 
@@ -29159,6 +29792,7 @@ fn build_indiv_param_partials(
         data_bindings: DataBindings::default(),
         bound_from_fit: false,
         lognormal_eta_chain: None,
+        nested_levels: None,
     }
 }
 
@@ -30397,6 +31031,9 @@ fn parse_if_statement(
         p,
     ))
 }
+
+#[path = "ode_linearity.rs"]
+mod ode_linearity;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

@@ -3675,7 +3675,8 @@ pub struct CovariateMuRef {
     /// The BSV eta this typical value carries.
     pub eta_name: String,
     /// Every theta the typical value reads, in declaration order. At least two —
-    /// a single-theta typical value is a plain [`MuRef`].
+    /// a single-theta typical value is a plain [`MuRef`] (the crate-internal
+    /// `colliding_anchors` entries are the one exception).
     pub theta_names: Vec<String>,
     /// Which link relates the typical value to the individual parameter:
     /// [`MuTransform::Log`] for `A * exp(η)` / `exp(log(A) + η)`,
@@ -3719,6 +3720,22 @@ pub struct CovariateMuRef {
     /// the group — it forces the prior-plus-data engine, which evaluates the
     /// observation term with the shift applied.
     pub(crate) eta_shared: bool,
+    /// [`Self::read_outside_groups`] with the taint also stopped at every
+    /// recorded **single-anchor** statement (`V2 = TVV2 * exp(ETA_V2)`, see
+    /// [`Self::colliding_anchors`]).
+    ///
+    /// That anchor's `φ_i` is frozen only when the estimator takes it into the
+    /// group (#1630); when it does not, the anchor's theta is live in the data
+    /// after all, and the estimator adds it back. So this field is exact only
+    /// together with that add-back, which is why `read_outside_groups` stays.
+    pub(crate) read_outside_groups_and_anchors: Vec<String>,
+    /// The single-anchor mu-references whose one theta this typical value also
+    /// reads — `V2 = TVV2 * exp(ETA_V2)` next to a group on `V1 = TVV2 * TH_R *
+    /// (WT/70)^TH_WT * exp(ETA_V1)` (#1630). Each is a one-theta entry of this
+    /// same type, its reachability fields filled the same way, so SAEM and
+    /// IMP/IMPMAP can take it into the group's joint M-step as a member instead
+    /// of declining the group. Empty on the entries themselves.
+    pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced already inlined.
     pub(crate) typical: crate::parser::model_parser::Expression,
@@ -4133,6 +4150,41 @@ pub struct EndpointPredictionResult {
     /// re-joining against the input population.
     pub observed: Option<f64>,
     pub prediction: Prediction,
+}
+
+/// One `level NAME by COLUMN in PARENT` declaration in `[parameters]` (#1082): the
+/// records of a subject that share a `COLUMN` value inside one group of `PARENT` (`ID`,
+/// or the level declared just before it) form one group of this level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LevelSpec {
+    /// The level's name, which `kappa … at NAME` refers to.
+    pub(crate) name: String,
+    /// The data column whose value labels a record's group.
+    pub(crate) column: String,
+    /// `ID`, or the name of the level this one nests in.
+    pub(crate) parent: String,
+}
+
+/// The variability levels below `ID` of a model that declares more than one (#1082).
+///
+/// The levels form one chain, `levels[0]` in `ID` and each later level in the one before
+/// it, and a group is identified by its key path: `ARM = 1` in study 1 and `ARM = 1` in
+/// study 2 are different groups. Each κ lives at exactly one level and is drawn once per
+/// group of it, and all levels of a subject are integrated jointly in that subject's
+/// marginal.
+///
+/// A model with one level — `iov_column` / `iov_occasion`, or a single `level` line,
+/// which is its explicit spelling — has `None` here and is today's inter-occasion
+/// variability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedLevels {
+    /// The levels, outermost first.
+    pub(crate) levels: Vec<LevelSpec>,
+    /// The level index of each κ, parallel to `CompiledModel::kappa_names`.
+    pub(crate) kappa_level: Vec<usize>,
+    /// Per random effect in `[η…, κ…]` order, the individual parameters whose own
+    /// expression reads it — the `readers` the single-member check compares.
+    pub(crate) readers: Vec<Vec<String>>,
 }
 
 /// A compiled model ready for estimation
@@ -5756,6 +5808,19 @@ impl CompiledModel {
     #[inline]
     pub fn has_weighted_kappa(&self) -> bool {
         self.kappa_weights.iter().any(|w| w.is_some())
+    }
+
+    /// Whether the model declares more than one variability level below `ID` (#1082).
+    #[inline]
+    pub(crate) fn has_nested_levels(&self) -> bool {
+        self.indiv_param_partials.nested_levels.is_some()
+    }
+
+    /// The nested variability levels of a model that declares more than one `level`
+    /// (#1082); `None` for every other model, including one with a single level.
+    #[inline]
+    pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
+        self.indiv_param_partials.nested_levels.as_ref()
     }
 
     /// Whether an *active* custom residual magnitude depends on `θ`
@@ -7398,6 +7463,18 @@ pub struct FitResult {
     pub gradient_method_outer: String,
     /// True when the model uses ODE integration; false for analytical PK.
     pub uses_ode_solver: bool,
+    /// True when the `[odes]` system was certified linear and propagated exactly by the matrix
+    /// exponential instead of integrated (#852) — `ode_method = auto` on a qualifying model,
+    /// or `ode_method = linear`. False for an analytical model, a nonlinear system, or a
+    /// linear one whose `ode_method` names an integrator. Also false when the propagator
+    /// declined any segment of the prediction pass at the final estimates
+    /// ([`OdeSolverStats::linear_declined_segments`](crate::ode::OdeSolverStats)), since those
+    /// segments were integrated.
+    ///
+    /// `#[serde(default)]`: a fit JSON written before #852 has no such key, and reads back as
+    /// `false` — the route those fits did run on.
+    #[serde(default)]
+    pub ode_linear_exact: bool,
     /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
     pub uses_sde: bool,
     /// Number of Rayon worker threads used during this fit.
@@ -9335,8 +9412,9 @@ pub enum SaemMstepSolver {
     /// Opt-in, and **restricted to the plain Gaussian residual scope** the
     /// expected information has a closed form on: no IOV, no mixture, no M3, no
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
-    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
     ///
     /// It was a **candidate default** in #1449 and did not become one: it is
     /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all

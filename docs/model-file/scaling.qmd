@@ -298,7 +298,10 @@ expose:
   amount, i.e. `central = concentration × V`, so `y = central / V` recovers the
   concentration and any additive term layers on top.
 - `depot` — the oral **depot** amount, for first-order oral models
-  (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`).
+  (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`). It is reconstructed by
+  dose superposition, so a subject with an EVID=3/4 reset or a dose into a
+  non-default compartment is refused — by `fit()`, `predict()` and, since
+  #1488, every `simulate*` entry point. Use an ODE model there.
 - **Peripheral** compartments are *not* available (the closed forms don't
   expose a cross-compartment amount) — referencing `periph`/`peripheral…` is a
   parse error pointing you to an ODE model, mirroring `[initial_conditions]`.

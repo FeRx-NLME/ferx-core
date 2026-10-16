@@ -1905,6 +1905,12 @@ pub(crate) fn iov_sens_eta_supported(model: &CompiledModel) -> bool {
 /// program's θ axes to seed `∂p/∂θ`) or the η-only one (`false`); every other clause applies
 /// to both.
 fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
+    // #1082 PR2: a model with nested levels integrates a compact vector no sensitivity
+    // walk lays out yet, so every gradient that reads one is finite-differenced. PR3 lifts
+    // this with a `Dual2`-vs-FD parity test per walk.
+    if model.has_nested_levels() {
+        return false;
+    }
     // A closed-form transit/IG IOV model has two routes per subject (#1560): the absorption
     // walk, and its ODE twin (`crate::pk::effective_model_for_eval_iov`). The walk takes a
     // subject only when its gradient is analytic (`absorption_walk_sens_in_scope` is part of
@@ -5757,7 +5763,15 @@ fn walk_covariance_scope(
     iov: bool,
     sink: &mut DeclineSink,
 ) {
-    let model_supported = if model.ode_spec.is_some() && iov {
+    // Nested levels (#1082): the covariance jets and the stacked prior are laid out per
+    // occasion, not over the compact per-level vector, so the covariance step
+    // finite-differences the objective. This is the analytic covariance path's gate:
+    // `analytic_cov_assembly` is reached on `FitOptions::analytic_cov_hessian` and this
+    // scope walk, which reads the closed-form `iov_analytical_supported` rather than
+    // `iov_sens_supported`.
+    let model_supported = if model.has_nested_levels() {
+        false
+    } else if model.ode_spec.is_some() && iov {
         crate::sens::ode_provider::ode_iov_supported(model)
     } else if model.ode_spec.is_some() {
         crate::sens::ode_provider::ode_analytical_supported(model)

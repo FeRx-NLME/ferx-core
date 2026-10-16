@@ -8,7 +8,7 @@
 //! derivative for the duration of the infusion via an RHS wrapper.
 
 use crate::ode::solver::{
-    solve_ode, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
+    solve_ode_certified, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
     OdeSolverStats,
 };
 use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
@@ -774,7 +774,7 @@ fn equilibrate_ss_input_rate(
     // The cycle's pulse sits at local `0`, so `TAD = t` across the whole window (#1139).
     let ext = ss_run_in_params(pk_params_flat, 0.0);
     let advance = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
+        solve_ode_certified(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
@@ -1316,7 +1316,8 @@ fn equilibrate_ss_pk_state(
                 pk_params_flat,
                 tad_anchor_for(&local_doses, &no_lag, seg_start),
             );
-            let sol = solve_ode(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
+            let sol =
+                solve_ode_certified(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1367,7 +1368,7 @@ fn equilibrate_ss_pk_state(
     // used costs one 1 KB stack array per infusion cycle — against that cycle's ODE solve —
     // and removes the invariant rather than documenting it.
     let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(
+        solve_ode_certified(
             &base_rhs,
             u0,
             (0.0, dose.ii),
@@ -1389,7 +1390,7 @@ fn equilibrate_ss_pk_state(
                     dy[cmt_idx] += rate;
                 }
             };
-            let mut y = solve_ode(
+            let mut y = solve_ode_certified(
                 &wrapped_rhs,
                 u0,
                 (0.0, t_inf),
@@ -1404,15 +1405,22 @@ fn equilibrate_ss_pk_state(
                 // Pulse at local `−T_inf`: this window re-opens its clock at `0` but sits
                 // `T_inf` after the cycle's pulse. See `ss_run_in_params`.
                 let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
-                y = solve_ode(&base_rhs, &y, (0.0, quiet), &ext_quiet, &[quiet], &eq_opts)
-                    .last()
-                    .map(|p| p.u.clone())?;
+                y = solve_ode_certified(
+                    &base_rhs,
+                    &y,
+                    (0.0, quiet),
+                    &ext_quiet,
+                    &[quiet],
+                    &eq_opts,
+                )
+                .last()
+                .map(|p| p.u.clone())?;
             }
             Some(y)
         } else {
             let mut y = u0.to_vec();
             y[cmt_idx] += f_bio * dose.amt;
-            solve_ode(
+            solve_ode_certified(
                 &base_rhs,
                 &y,
                 (0.0, dose.ii),
@@ -1457,7 +1465,8 @@ fn equilibrate_ss_pk_state(
                     dy[cmt_idx] += rate;
                 }
             };
-            let sol = solve_ode(&wrapped_rhs, &u, (0.0, t_inf), &ext_cycle, &[t_inf], opts);
+            let sol =
+                solve_ode_certified(&wrapped_rhs, &u, (0.0, t_inf), &ext_cycle, &[t_inf], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1466,7 +1475,8 @@ fn equilibrate_ss_pk_state(
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
                 let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
-                let sol = solve_ode(&base_rhs, &u, (0.0, quiet), &ext_quiet, &[quiet], opts);
+                let sol =
+                    solve_ode_certified(&base_rhs, &u, (0.0, quiet), &ext_quiet, &[quiet], opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -1483,7 +1493,8 @@ fn equilibrate_ss_pk_state(
             // suppressed for an input-rate compartment and `R_in` integrated over
             // the cycle instead.
             u[cmt_idx] += f_bio * dose.amt;
-            let sol = solve_ode(&base_rhs, &u, (0.0, dose.ii), &ext_cycle, &[dose.ii], opts);
+            let sol =
+                solve_ode_certified(&base_rhs, &u, (0.0, dose.ii), &ext_cycle, &[dose.ii], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1614,7 +1625,7 @@ fn ss_state_at_phase_pk(
                 dy[cmt_idx] += rate;
             }
         };
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (0.0, active),
@@ -1627,7 +1638,7 @@ fn ss_state_at_phase_pk(
         }
         if phase > t_inf {
             let quiet = phase - t_inf;
-            let sol = solve_ode(
+            let sol = solve_ode_certified(
                 &base_rhs,
                 &u,
                 (0.0, quiet),
@@ -1644,7 +1655,7 @@ fn ss_state_at_phase_pk(
         // an input-rate compartment is rejected upstream by `E_ABSORPTION_SS`;
         // see the matching note in `equilibrate_ss_state`.
         u[cmt_idx] += f_bio * dose.amt;
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &base_rhs,
             &u,
             (0.0, phase),
@@ -3379,8 +3390,69 @@ impl OdeSpec {
     /// `ode_method` / … has no other way to reach the integrator; a site that reads the field
     /// directly silently runs at the parse-time value instead. Outside a fit (`predict`, a
     /// hand-built spec) nothing is armed and this returns the field unchanged.
+    ///
+    /// This is also where the linear fast path is chosen (#852), because it is the one place
+    /// every integration reads: `auto` on a [`linear_eligible`](Self::linear_eligible) spec
+    /// becomes [`OdeMethod::Linear`](crate::ode::OdeMethod::Linear), and `linear` on a spec
+    /// that is not becomes `auto` — so no path can reach the exact propagator with an equation
+    /// the parser did not prove valid for it, whether the request came from the model file or
+    /// a fit-scoped override. A named integrator is left alone, which is how a user opts out.
     pub(crate) fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
-        crate::ode::solver::effective_solver_options(self.solver_opts)
+        use crate::ode::OdeMethod;
+        let mut opts = crate::ode::solver::effective_solver_options(self.solver_opts);
+        match opts.method {
+            OdeMethod::Auto if self.linear_eligible() => opts.method = OdeMethod::Linear,
+            OdeMethod::Linear if !self.linear_eligible() => opts.method = OdeMethod::Auto,
+            _ => {}
+        }
+        opts
+    }
+
+    /// Whether this system can be propagated exactly by the matrix exponential (#852): the
+    /// `[odes]` program is structurally affine in the states and reads no model time, it has
+    /// no absorption forcing, and it is not an SDE. The conditions and their wording live in
+    /// [`linear_ineligibility`](Self::linear_ineligibility).
+    ///
+    /// The forcings (`first_order(...)`, `transit(...)`, `igd(...)`, `weibull(...)`,
+    /// `zero_order(...)`) are lifted out of the equations at parse time and re-added by
+    /// `wrap_rhs_with_forcings` as functions of time since the dose — an input that is not
+    /// constant over a segment, so not `b`. Written as a depot state instead
+    /// (`d/dt(depot) = -KA*depot`), first-order absorption is linear and qualifies.
+    ///
+    /// The SDE exclusion is scope, not correctness: the EKF propagates a covariance alongside
+    /// the mean, and v1 of the exact path has no anchor for that pairing.
+    ///
+    /// A hand-built spec without an `rhs_program` is never eligible.
+    pub(crate) fn linear_eligible(&self) -> bool {
+        self.linear_ineligibility().is_none()
+    }
+
+    /// Why [`linear_eligible`](Self::linear_eligible) is false, phrased for the
+    /// `ode_method = linear` parse error; `None` when the spec is eligible.
+    pub(crate) fn linear_ineligibility(&self) -> Option<&'static str> {
+        let Some(program) = self.rhs_program.as_ref() else {
+            return Some("its right-hand side was not built from an [odes] block");
+        };
+        if !program.is_affine_in_states() {
+            return Some(
+                "an equation is not linear in the states (a state is multiplied by another \
+                 state, divided by, raised to a power other than 1, passed to a function, or \
+                 tested in an `if` condition)",
+            );
+        }
+        if program.reads_any_model_time() {
+            return Some("an equation reads model time (TIME, T, TAFD or TAD)");
+        }
+        if !self.input_rate.is_empty() {
+            return Some(
+                "it uses an absorption input function (first_order, transit, igd, weibull or \
+                 zero_order); write first-order absorption as a depot state instead",
+            );
+        }
+        if !self.diffusion_var.is_empty() {
+            return Some("it is a stochastic ([diffusion]) model");
+        }
+        None
     }
 
     /// Initial compartment-amount vector for a subject, given the flat
@@ -4358,6 +4430,68 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
     breaks.insert(pos, t);
 }
 
+/// What a refusal of the reactive adaptive driver is about (#1983). The API layer
+/// gives each kind its code (`api/entry_refusals.rs`); `src/ode` names no code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveRefusalKind {
+    /// The schedule meets the subject's own records in a way the driver cannot key
+    /// (`E_ADAPTIVE_OPTIONS`).
+    Options,
+    /// A model or base regimen the driver cannot simulate faithfully
+    /// (`E_ADAPTIVE_UNSUPPORTED`).
+    Unsupported,
+    /// A malformed or unsupported controller action (`E_ADAPTIVE_CONTROLLER_ACTION`).
+    ControllerAction,
+}
+
+/// The error of [`ode_predictions_adaptive_impl`] (#1983): a refusal of the caller's
+/// input — its model, data, schedule or controller — which carries a code at the API
+/// boundary, or a runtime / internal failure, which carries none.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AdaptiveDriverError {
+    Refusal {
+        kind: AdaptiveRefusalKind,
+        message: String,
+    },
+    Runtime(String),
+}
+
+impl AdaptiveDriverError {
+    fn refusal(kind: AdaptiveRefusalKind, message: String) -> Self {
+        AdaptiveDriverError::Refusal { kind, message }
+    }
+
+    fn options(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::Options, message)
+    }
+
+    fn unsupported(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::Unsupported, message)
+    }
+
+    fn controller_action(message: String) -> Self {
+        Self::refusal(AdaptiveRefusalKind::ControllerAction, message)
+    }
+
+    /// The refusal's kind, or `None` for a runtime failure.
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> Option<AdaptiveRefusalKind> {
+        match self {
+            AdaptiveDriverError::Refusal { kind, .. } => Some(*kind),
+            AdaptiveDriverError::Runtime(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AdaptiveDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdaptiveDriverError::Refusal { message, .. }
+            | AdaptiveDriverError::Runtime(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Out-of-scope-compartment guards shared by the bolus and infusion decision
 /// branches of [`ode_predictions_adaptive`]. A controller dose into compartment
 /// `cmt` (1-based) is a typed error — never a silent wrong answer — when the
@@ -4371,6 +4505,9 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
 ///    its own TAD anchor inside `integrate_segment` (whose filter is
 ///    `d.time + lag <= t_start`).
 ///
+/// Each refusal is the controller's (`AdaptiveRefusalKind::ControllerAction`): the
+/// action named a compartment this driver cannot dose.
+///
 /// On success returns the per-compartment bioavailability `F`, which both
 /// branches need (the bolus to scale its state jump, the infusion its window).
 /// Single source of truth so the two branches cannot drift the eligibility
@@ -4381,26 +4518,26 @@ fn reject_unsupported_dose_compartment(
     n_states: usize,
     pk_params_flat: &[f64],
     decision_index: usize,
-) -> Result<f64, String> {
+) -> Result<f64, AdaptiveDriverError> {
     if cmt > n_states {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: dose into compartment {cmt} but the model has \
              {n_states} state(s)"
-        ));
+        )));
     }
     if input_rate_consumes_cmt(ode, cmt) {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: compartment {cmt} is fed by a built-in input-rate \
              (absorption) function; controller dosing into an input-rate compartment is not \
              supported"
-        ));
+        )));
     }
     let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
     if lag != 0.0 {
-        return Err(format!(
+        return Err(AdaptiveDriverError::controller_action(format!(
             "decision {decision_index}: compartment {cmt} declares a dose lag time ({lag}); \
              lagged controller dosing is not supported"
-        ));
+        )));
     }
     Ok(ode.dose_attr_map.f_bio(cmt, pk_params_flat))
 }
@@ -4833,7 +4970,7 @@ pub(crate) fn ode_predictions_adaptive(
     // Assay-noise capability for `Dv` monitors (#391 S1.5). `None` ⇒ Ipred-only;
     // a `Dv` monitor then errors at its first decision.
     assay: Option<&AssayNoise>,
-) -> Result<AdaptiveRun, String> {
+) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let mons: Vec<AdaptiveMonitor> = monitors
         .iter()
         .map(|spec| AdaptiveMonitor {
@@ -4904,54 +5041,19 @@ pub(crate) fn ode_predictions_adaptive_impl(
     controller: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision,
     max_decisions: usize,
     assay: Option<&AssayNoise>,
-) -> Result<AdaptiveRun, String> {
+) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let n = ode.n_states;
     let tv = event_pk.is_some();
     let iov = eta_occ.is_some();
 
-    // --- Preconditions (typed errors, never silent) ----------------------
-    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
-    // supported on the constant-covariate path (the controller augments it), on the time-
-    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
-    // base dose's F resolved from its own occasion-κ / covariate snapshot just below). Since
-    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
-    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
-    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
-    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
-    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
-    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
-    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
-    //
-    // Base × reset UNDER a time-varying covariate or IOV (`tv`) stays a typed error: the
-    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
-    // composition with a base regimen across a reset is not yet oracle-verified against the
-    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
-    if !subject.doses.is_empty() && subject.has_resets() && tv {
-        return Err(
-            "ode_predictions_adaptive: a pre-scheduled base regimen combined with system \
-             resets (EVID=3/4) is not yet supported under time-varying covariates or \
-             inter-occasion variability; #932 supports base × reset on the constant-covariate \
-             path only (time-varying-covariate / IOV base × reset is a follow-up)"
-                .to_string(),
-        );
-    }
-    if decision_times.len() > max_decisions {
-        return Err(format!(
-            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
-             raise `max_decisions` in the simulate options if the schedule is intentional",
-            decision_times.len(),
-            max_decisions
-        ));
-    }
-    for am in monitors {
-        let m = am.spec;
-        if m.cmt == 0 || m.cmt > n {
-            return Err(format!(
-                "monitor '{}' observes compartment {} but the model has {} state(s)",
-                m.name, m.cmt, n
-            ));
-        }
-    }
+    // --- Preconditions -----------------------------------------------------
+    // The checks a function of the inputs alone answers — `max_decisions`, a monitor's
+    // compartment range, a `Dv` monitor's `[error_model]`, and a base regimen × EVID=3/4
+    // reset under a time-varying covariate or IOV — run at the API entry, before any
+    // subject is simulated (#1983; `api/adaptive.rs`, `run_adaptive_population`). The
+    // ones below need the resolved doses, the break timeline or the controller's output.
+    debug_assert!(decision_times.len() <= max_decisions);
+    debug_assert!(monitors.iter().all(|am| (1..=n).contains(&am.spec.cmt)));
 
     // #702: resolve any pre-scheduled base regimen to concrete rate/duration (#324) and
     // capture its per-dose lagtime / bioavailability, exactly as the static engine does.
@@ -4974,8 +5076,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // administration time) instead of the t=0 `pk_params_flat` the constant path uses. This is
     // symmetric with a controller-injected dose, whose F is fixed from the driver's per-decision
     // LOCF snapshot at injection. `compute_event_pk_params_{into,iov}` populates `event_pk.dose`
-    // parallel to the base doses; base × reset is the only base combo rejected above, and it never
-    // reaches here.
+    // parallel to the base doses; base × reset is the only base combo rejected at entry
+    // (#1983), and it never reaches here.
     //
     // Scope: only a plain FIXED bolus / real-infusion base dose into a PLAIN compartment is
     // supported here. A base dose that is steady-state, lagged, fed by a built-in input-rate
@@ -4995,13 +5097,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 || base_lagtimes[k] != 0.0
                 || input_rate_consumes_cmt(ode, dose.cmt_raw())
             {
-                return Err(format!(
+                return Err(AdaptiveDriverError::unsupported(format!(
                     "ode_predictions_adaptive: a pre-scheduled base dose (index {k}) combined with \
                      time-varying covariates or inter-occasion variability must be a plain fixed \
                      bolus or infusion into a plain compartment; steady-state, lagged, built-in \
                      input-rate (transit / zero-order absorption), and modeled-RATE base doses \
                      under a time-varying covariate or IOV are a #930/#931 follow-up"
-                ));
+                )));
             }
             base_f_bio[k] = ode.dose_attr_map.f_bio(dose.cmt_raw(), &ev.dose[k].values);
         }
@@ -5214,11 +5316,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
     if abandon_non_finite_timeline(break_times.iter().copied(), None) {
-        return Err(
+        return Err(AdaptiveDriverError::unsupported(
             "ode_predictions_adaptive: a non-finite break time (NaN/infinite dose lagtime, \
              route lag, or infusion duration) — the subject's timeline cannot be ordered"
                 .to_string(),
-        );
+        ));
     }
 
     // #700 review guard: the tolerance dedup above can merge two break times within
@@ -5239,12 +5341,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .copied()
             .find(|t| !surviving.contains(&t.to_bits()))
         {
-            return Err(format!(
+            return Err(AdaptiveDriverError::options(format!(
                 "adaptive-dosing (time-varying) event time {t} lies within 1e-15 of another \
                  break time but is not bit-identical, so its per-event PK / decision lookup \
                  would be silently dropped. Align decision, observation, and EVID=2 times to \
                  identical values (integer-valued time grids are unaffected)."
-            ));
+            )));
         }
     }
 
@@ -5263,12 +5365,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .copied()
             .find(|t| !surviving.contains(&t.to_bits()))
         {
-            return Err(format!(
+            return Err(AdaptiveDriverError::options(format!(
                 "adaptive-dosing decision time {t} lies within 1e-15 of a system-reset or \
                  base-regimen (dose / infusion-end) break time but is not bit-identical, so its \
                  decision lookup would be silently dropped. Align decision, reset (EVID=3), and \
                  base-dose times to identical values (integer-valued time grids are unaffected)."
-            ));
+            )));
         }
     }
 
@@ -5481,13 +5583,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     let value = match m.mode {
                         ObserveMode::Ipred => latent,
                         ObserveMode::Dv => {
+                            // An internal invariant, so uncoded: `run_adaptive_population`
+                            // always supplies the assay.
                             let a = assay.ok_or_else(|| {
-                                format!(
+                                AdaptiveDriverError::Runtime(format!(
                                     "decision {decision_index} at t={t_start}: monitor '{}' \
                                      requests DV (assay-noised) observation but no assay-noise \
                                      capability was supplied (Ipred-only run)",
                                     m.name
-                                )
+                                ))
                             })?;
                             // Scale-correct by construction: under `Dv` the
                             // declarative path compiles no `observe` expression, so
@@ -5498,14 +5602,17 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // always on the error model's scale (#391 S2).
                             //
                             // Edge (a): a DV monitor on a compartment with no
-                            // residual error model is a typed error, not a guessed σ.
+                            // residual error model is a typed error, not a guessed σ. The
+                            // entry points refuse it before any subject runs (#1983), with
+                            // the same predicate `resid_var` applies, so a `None` here is an
+                            // internal invariant and stays uncoded.
                             let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
-                                format!(
+                                AdaptiveDriverError::Runtime(format!(
                                     "decision {decision_index} at t={t_start}: monitor '{}' \
                                      requests DV observation on compartment {} but no [error_model] \
                                      defines residual error there",
                                     m.name, m.cmt
-                                )
+                                ))
                             })?;
                             // `has_residual_error_for_cmt` (the gate behind `resid_var`)
                             // requires `sigma` to cover the model's σ indices, so a `Some`
@@ -5564,15 +5671,17 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // (`[Stop, …]`) is rejected rather than silently truncated, so the
                 // decision log can never disagree with the ledger about what ran.
                 for (j, action) in actions.iter().enumerate() {
-                    action
-                        .validate()
-                        .map_err(|e| format!("decision {decision_index} at t={t_start}: {e}"))?;
+                    action.validate().map_err(|e| {
+                        AdaptiveDriverError::controller_action(format!(
+                            "decision {decision_index} at t={t_start}: {e}"
+                        ))
+                    })?;
                     if action.is_stop() && j + 1 < actions.len() {
-                        return Err(format!(
+                        return Err(AdaptiveDriverError::controller_action(format!(
                             "decision {decision_index} at t={t_start}: Stop must be the final \
                              action, but {} action(s) follow it",
                             actions.len() - j - 1
-                        ));
+                        )));
                     }
                 }
 
@@ -5882,7 +5991,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     t_start,
                     t_end,
                 ) {
-                    return Err(msg);
+                    return Err(AdaptiveDriverError::unsupported(msg));
                 }
             }
 
@@ -7589,7 +7698,7 @@ pub fn ode_predictions_with_states(
             &zero_order,
         );
 
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
@@ -8210,7 +8319,7 @@ pub(crate) fn ode_dense_solve_states_reading(
             &forcings.zero_order,
         );
 
-        let sol = solve_ode(
+        let sol = solve_ode_certified(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
@@ -8410,3 +8519,27 @@ pub(crate) fn ode_solve_until_chz_threshold(
 #[cfg(test)]
 #[path = "predictions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "predictions_linear_route.rs"]
+mod linear_route;
+
+/// The refusal for `ode_method = linear` (#852) on `ode`, or `None` when the model can take
+/// the exact path. One message for both places the option can arrive: the model file's
+/// `[fit_options]` (a parse error) and a caller's `FitOptions` (`E_ODE_METHOD_LINEAR` from
+/// `check_model_options`), so the two cannot word the same refusal differently.
+pub(crate) fn ode_method_linear_refusal(ode: Option<&OdeSpec>) -> Option<String> {
+    match ode {
+        None => Some(
+            "fit option `ode_method = linear` applies to an [odes] model, and this model has \
+             none, so there is nothing for the option to act on; remove it."
+                .to_string(),
+        ),
+        Some(ode) => ode.linear_ineligibility().map(|reason| {
+            format!(
+                "fit option `ode_method = linear`: this [odes] model cannot be propagated \
+                 exactly — {reason}. Use `ode_method = auto` (the default) to integrate it."
+            )
+        }),
+    }
+}

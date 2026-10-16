@@ -13337,3 +13337,84 @@ fn ode_provider_static_evid2_first_record_matches_production_and_closed_form() {
         check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
     }
 }
+
+// ── #852: the exact linear path under the analytic sensitivity provider ─────────────────
+
+/// Two compartments with depot absorption written as a state, lag on an IIV-bearing
+/// parameter: linear and autonomous, so `ode_method = auto` resolves to the exact
+/// matrix-exponential path and the provider's `Dual1`/`Dual2` solves run through `expm_g`.
+const TWOCPT_DEPOT_LINEAR_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  theta TVKA(1.3,  0.01, 50.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_KA ~ 0.10
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central, peripheral])
+[odes]
+  d/dt(depot)      = -KA * depot
+  d/dt(central)    =  KA * depot - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #852: value, `∂f/∂η`, `∂f/∂θ`, both Hessian blocks and inner/outer parity on the exact
+/// linear path, across the dosing shapes whose derivatives it has to carry — later doses on
+/// residual drug with a lag on IIV, a steady-state train, and a central infusion. The route is
+/// asserted first: if eligibility ever regresses this fixture silently integrates and the
+/// checks below would be testing the stepper instead.
+#[test]
+fn ode_provider_on_the_exact_linear_path_matches_fd() {
+    let model = parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).expect("parse");
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    let theta = vec![4.0, 12.0, 2.0, 25.0, 1.3, 0.4];
+    let eta = vec![0.1, -0.05, 0.08];
+
+    let mut multidose = bolus_subject(&[0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0]);
+    multidose.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    multidose.obs_cmts = vec![2; 7];
+
+    let mut steady = ss_absorption_subject(&[0.6, 2.0, 6.0, 11.5], 12.0);
+    steady.obs_cmts = vec![2; 4];
+
+    let mut infusion = bolus_subject(&[1.0, 3.0, 5.0, 9.0, 16.0]);
+    infusion.doses = vec![
+        DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 2, 25.0, false, 0.0),
+    ];
+    infusion.obs_cmts = vec![2; 5];
+
+    for subject in [&multidose, &steady, &infusion] {
+        check_vs_production(&model, subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, subject, &theta, &eta);
+    }
+}

@@ -2861,6 +2861,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         0,
         &schedules,
         InnerSolvePolicy::default(),
+        None,
         |_, _| (),
     );
 
@@ -4134,7 +4135,7 @@ mod frozen_ebe_variance {
                 ..Default::default()
             };
             let (_, ehs, _, _) = crate::estimation::covariance::reconverge_population(
-                &x, &model, &pop, &p, &warm, &stage, 1e-8,
+                &x, &model, &pop, &p, &warm, &stage, 1e-8, false,
             );
             let want = if interaction {
                 EbeVariance::Conditional

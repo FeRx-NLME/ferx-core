@@ -1191,9 +1191,16 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     #[cfg(not(feature = "markov"))]
     let design_states: HashMap<usize, usize> = HashMap::new();
 
+    // Nested levels (#1082): a blank level cell is missing, not the previous record's label.
+    let no_carry_forward: std::collections::HashSet<String> = model
+        .nested_levels()
+        .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
+        .unwrap_or_default();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
+        .with_no_carry_forward(no_carry_forward)
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
@@ -1235,11 +1242,14 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
 /// (#1622), so the re-read cannot drop a clause the fit applied: before it, the
 /// re-read took no selection filter and a fit with `ignore_subjects` came back
 /// with the ignored subjects in it.
+///
+/// A failure is the [`Diagnostic`](crate::Diagnostic) `ferx check` gives it
+/// ([`read_population_with_diag`]).
 pub(crate) fn read_population_as_fitted(
     parsed: &ParsedModel,
     data_path: &str,
-) -> Result<(Population, Option<CovariateTable>), String> {
-    read_population_with(
+) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
+    read_population_with_diag(
         &parsed.model,
         &ReaderSettings::from_parsed(parsed),
         data_path,
@@ -1346,7 +1356,21 @@ pub fn read_population_with(
     settings: &ReaderSettings,
     data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    let filter = settings.selection_filter()?;
+    read_population_with_diag(model, settings, data_path).map_err(|d| d.message)
+}
+
+/// [`read_population_with`], refusing with the [`Diagnostic`](crate::Diagnostic)
+/// `ferx check` gives the same failure (#1774): a selection clause that does not
+/// compile through `selection_filter_diagnostic`, a read failure through
+/// `data_read_diagnostic`. The message is [`read_population_with`]'s, byte for byte.
+pub(crate) fn read_population_with_diag(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    data_path: &str,
+) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
+    let filter = settings
+        .selection_filter()
+        .map_err(super::validation::selection_filter_diagnostic)?;
     let fallback: Option<Vec<&str>> = settings
         .fallback_columns
         .as_ref()
@@ -1360,6 +1384,7 @@ pub fn read_population_with(
         filter.as_ref(),
         &settings.column_map,
     )
+    .map_err(|e| super::validation::data_read_diagnostic(&e))
 }
 
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
