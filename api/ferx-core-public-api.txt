@@ -202,10 +202,6 @@ pub fn ferx_core::diagnostics::EngineError::context(&self) -> core::option::Opti
 pub fn ferx_core::diagnostics::EngineError::diagnostic(&self) -> core::option::Option<&ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::diagnostics::EngineError::message(&self) -> &str
 pub fn ferx_core::diagnostics::EngineError::suggestion(&self) -> core::option::Option<&str>
-impl core::convert::From<&str> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: &str) -> Self
-impl core::convert::From<alloc::string::String> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: alloc::string::String) -> Self
 impl core::error::Error for ferx_core::diagnostics::EngineError
 impl core::fmt::Display for ferx_core::diagnostics::EngineError
 pub fn ferx_core::diagnostics::EngineError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -1212,6 +1208,7 @@ pub type ferx_core::ode::predictions::OdeOutputFn = alloc::boxed::Box<(dyn core:
 pub mod ferx_core::ode::solver
 pub enum ferx_core::ode::solver::OdeMethod
 pub ferx_core::ode::solver::OdeMethod::Auto
+pub ferx_core::ode::solver::OdeMethod::Linear
 pub ferx_core::ode::solver::OdeMethod::Rk45
 pub ferx_core::ode::solver::OdeMethod::Rodas4
 pub ferx_core::ode::solver::OdeMethod::Rodas5P
@@ -1248,6 +1245,7 @@ pub ferx_core::ode::solver::OdeSolverStats::auto_switched_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::discarded_clamped_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::discarded_unfinished_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::diverged_segments: usize
+pub ferx_core::ode::solver::OdeSolverStats::linear_declined_segments: usize
 pub ferx_core::ode::solver::OdeSolverStats::min_step_clamped_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::rejected_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::stiff_aborted_segments: usize
@@ -1271,6 +1269,7 @@ pub const ferx_core::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD: f64
 pub const ferx_core::ode::stiffness::STIFF_TAU_FAST: f64
 pub enum ferx_core::ode::OdeMethod
 pub ferx_core::ode::OdeMethod::Auto
+pub ferx_core::ode::OdeMethod::Linear
 pub ferx_core::ode::OdeMethod::Rk45
 pub ferx_core::ode::OdeMethod::Rodas4
 pub ferx_core::ode::OdeMethod::Rodas5P
@@ -1318,6 +1317,7 @@ pub ferx_core::ode::OdeSolverStats::auto_switched_segments: usize
 pub ferx_core::ode::OdeSolverStats::discarded_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::discarded_unfinished_segments: usize
 pub ferx_core::ode::OdeSolverStats::diverged_segments: usize
+pub ferx_core::ode::OdeSolverStats::linear_declined_segments: usize
 pub ferx_core::ode::OdeSolverStats::min_step_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::rejected_steps: usize
 pub ferx_core::ode::OdeSolverStats::stiff_aborted_segments: usize
@@ -1663,6 +1663,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::constant(value: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
@@ -1695,6 +1696,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
@@ -1718,6 +1720,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::constant(value: f64) -> Se
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
@@ -1756,6 +1759,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
@@ -1776,6 +1780,7 @@ pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::inv_logit(self) -> Self
+pub fn ferx_core::sens::num::PkNum::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::num::PkNum::jets_finite(self) -> bool
 pub fn ferx_core::sens::num::PkNum::ln(self) -> Self
 pub fn ferx_core::sens::num::PkNum::ln_gamma(self) -> Self
@@ -1793,6 +1798,7 @@ pub fn f64::exp(self) -> Self
 pub fn f64::from_f64(x: f64) -> Self
 pub fn f64::guard_floor(self, lo: f64) -> Self
 pub fn f64::inv_logit(self) -> Self
+pub fn f64::jet_max_abs(self) -> f64
 pub fn f64::jets_finite(self) -> bool
 pub fn f64::ln(self) -> Self
 pub fn f64::ln_gamma(self) -> Self
@@ -1810,6 +1816,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
@@ -1827,6 +1834,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
@@ -3152,6 +3160,7 @@ pub ferx_core::types::FitResult::neural_networks: alloc::vec::Vec<ferx_core::Neu
 pub ferx_core::types::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)>
+pub ferx_core::types::FitResult::ode_linear_exact: bool
 pub ferx_core::types::FitResult::ofv: f64
 pub ferx_core::types::FitResult::ofv_data: f64
 pub ferx_core::types::FitResult::ofv_prior: f64
@@ -3442,9 +3451,11 @@ pub ferx_core::types::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::pk_only_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::pk_only_occasions: alloc::vec::Vec<u32>
+pub ferx_core::types::Subject::pk_only_raw_times: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::pk_only_times: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::reset_occasions: alloc::vec::Vec<u32>
+pub ferx_core::types::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::types::Subject::reset_times: alloc::vec::Vec<f64>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
@@ -4406,10 +4417,6 @@ pub fn ferx_core::diagnostics::EngineError::context(&self) -> core::option::Opti
 pub fn ferx_core::diagnostics::EngineError::diagnostic(&self) -> core::option::Option<&ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::diagnostics::EngineError::message(&self) -> &str
 pub fn ferx_core::diagnostics::EngineError::suggestion(&self) -> core::option::Option<&str>
-impl core::convert::From<&str> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: &str) -> Self
-impl core::convert::From<alloc::string::String> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: alloc::string::String) -> Self
 impl core::error::Error for ferx_core::diagnostics::EngineError
 impl core::fmt::Display for ferx_core::diagnostics::EngineError
 pub fn ferx_core::diagnostics::EngineError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -4655,6 +4662,7 @@ pub ferx_core::FitResult::neural_networks: alloc::vec::Vec<ferx_core::NeuralNetw
 pub ferx_core::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
+pub ferx_core::FitResult::ode_linear_exact: bool
 pub ferx_core::FitResult::ofv: f64
 pub ferx_core::FitResult::ofv_data: f64
 pub ferx_core::FitResult::ofv_prior: f64
@@ -5077,9 +5085,11 @@ pub ferx_core::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::Subject::occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::pk_only_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::pk_only_occasions: alloc::vec::Vec<u32>
+pub ferx_core::Subject::pk_only_raw_times: alloc::vec::Vec<f64>
 pub ferx_core::Subject::pk_only_times: alloc::vec::Vec<f64>
 pub ferx_core::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::reset_occasions: alloc::vec::Vec<u32>
+pub ferx_core::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::Subject::reset_times: alloc::vec::Vec<f64>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool

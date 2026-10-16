@@ -25,6 +25,12 @@ use std::collections::HashMap;
 
 /// A hand-written ODE 1-cpt IV model, so the objective goes through the integrator rather than
 /// a closed form. `tail` carries any `[fit_options]` the case needs baked onto the spec.
+///
+/// The elimination is saturable with a `Km` (1e6) four orders above any amount in the data, so
+/// the objective is the linear model's to well under a tolerance step — but the system is
+/// *structurally* nonlinear, so it is integrated. A linear RHS would be propagated exactly by
+/// the matrix exponential (#852), where `ode_reltol` has nothing to act on and every OFV
+/// comparison below would be a tautology.
 fn ode_model(tail: &str) -> CompiledModel {
     parse_model_string(&format!(
         r#"
@@ -39,7 +45,7 @@ fn ode_model(tail: &str) -> CompiledModel {
 [structural_model]
   ode(states=[central])
 [odes]
-  d/dt(central) = -(CL / V) * central
+  d/dt(central) = -(CL / V) * central / (1 + central / 1e6)
 [scaling]
   y = central / V
 [error_model]
@@ -67,6 +73,8 @@ fn subject(id: &str, scale: f64) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -246,4 +254,162 @@ fn a_fits_ode_options_do_not_outlive_it() {
         .effective_solver_opts();
     assert_eq!(after.reltol, baked.reltol);
     assert_eq!(after.abstol, baked.abstol);
+}
+
+/// #852: `FitResult::ode_linear_exact` reports the path the fit actually ran, including when
+/// a caller's `FitOptions::ode_method` moves a linear model off it — the one way the parse-time
+/// verdict and the fit can disagree, and the reason the flag is read inside the armed fit.
+#[test]
+fn the_fit_reports_whether_the_exact_linear_path_ran() {
+    let linear = parse_model_string(LINEAR_SOURCE).expect("linear model parses");
+    let pop = population();
+    let ran_exact = |model: &CompiledModel, opts: &FitOptions| {
+        fit(model, &pop, &model.default_params, opts)
+            .expect("the evaluation must succeed")
+            .ode_linear_exact
+    };
+    assert!(ran_exact(&linear, &eval_opts()), "auto on a linear model");
+    let integrated = FitOptions {
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..eval_opts()
+    };
+    assert!(
+        !ran_exact(&linear, &integrated),
+        "a caller's ode_method = rk45 must take the linear model off the exact path"
+    );
+    assert!(
+        !ran_exact(&ode_model(""), &eval_opts()),
+        "the saturable fixture is integrated"
+    );
+    // Routed to the exact path, but every segment declined: the inert `sink` rate puts
+    // ‖A·dt‖ past the exponential's squaring budget, so each segment is integrated instead.
+    // Routing alone would report `true`; the flag must report what ran.
+    let declined = parse_model_string(
+        &LINEAR_SOURCE
+            .replace("ode(states=[central])", "ode(states=[central, sink])")
+            .replace(
+                "d/dt(central) = -(CL / V) * central",
+                "d/dt(central) = -(CL / V) * central\n  d/dt(sink) = -1e25 * sink",
+            ),
+    )
+    .expect("declined model parses");
+    assert_eq!(
+        declined
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must be routed to the exact path, or it tests nothing"
+    );
+    assert!(
+        !ran_exact(&declined, &eval_opts()),
+        "segments the propagator declined were integrated"
+    );
+}
+
+/// The same 1-cpt model as [`ode_model`] with plain first-order elimination — linear.
+const LINEAR_SOURCE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `ode_method = Linear` handed to `fit()` in a caller's `FitOptions` asserts the exact path
+/// exactly as it does from the model file (where the parser refuses it). Without the
+/// `check_model_options` gate the override is demoted to `auto` on an ineligible model and
+/// ignored on an analytical one, and both fits succeed.
+#[test]
+fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
+    let pop = population();
+    let linear_opts = FitOptions {
+        ode_method: crate::ode::OdeMethod::Linear,
+        ..eval_opts()
+    };
+    let refusal =
+        |model: &CompiledModel| match fit(model, &pop, &model.default_params, &linear_opts) {
+            Ok(_) => panic!("`ode_method = Linear` from FitOptions must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+    let e = refusal(&ode_model(""));
+    assert!(
+        e.contains("this [odes] model cannot be propagated exactly — an equation is not linear in the states"),
+        "{e}"
+    );
+    assert!(
+        e.contains("Use `ode_method = auto` (the default) to integrate it."),
+        "{e}"
+    );
+
+    let analytical = parse_model_string(
+        &LINEAR_SOURCE
+            .replace("ode(states=[central])", "pk one_cpt_iv(cl=CL, v=V)")
+            .replace("[odes]\n  d/dt(central) = -(CL / V) * central\n", "")
+            .replace("[scaling]\n  y = central / V\n", ""),
+    )
+    .expect("analytical twin parses");
+    assert!(analytical.ode_spec.is_none(), "fixture must be analytical");
+    let e = refusal(&analytical);
+    assert!(
+        e.contains("applies to an [odes] model, and this model has none,"),
+        "{e}"
+    );
+
+    // The straddle: the same option on a certified model fits, on the exact path.
+    let linear = parse_model_string(LINEAR_SOURCE).expect("linear model parses");
+    let fitted = fit(&linear, &pop, &linear.default_params, &linear_opts)
+        .expect("a certified model accepts ode_method = Linear");
+    assert!(fitted.ode_linear_exact);
+}
+
+/// The same assertion on the two post-fit entry points that arm a caller's ODE settings.
+/// Each is asked twice on one fit — with `Linear`, which must be refused with the shared
+/// message, and with the default, which must get past the gate — so a gate that fires for
+/// every caller cannot pass either.
+#[test]
+fn run_covariance_and_run_sir_refuse_ode_method_linear_on_an_ineligible_model() {
+    let model = ode_model("");
+    let pop = population();
+    let fitted = fit(&model, &pop, &model.default_params, &eval_opts()).expect("the fit runs");
+    let linear = FitOptions {
+        ode_method: crate::ode::OdeMethod::Linear,
+        ..eval_opts()
+    };
+    let lead = "fit option `ode_method = linear`: this [odes] model cannot be propagated exactly";
+    let refused = |label: &str, r: Result<FitResult, crate::diagnostics::EngineError>| {
+        let e = match r {
+            Ok(_) => panic!("{label}: `ode_method = Linear` must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains(lead), "{label}: {e}");
+        assert!(e.contains("not linear in the states"), "{label}: {e}");
+    };
+    let not_refused = |label: &str, r: Result<FitResult, crate::diagnostics::EngineError>| {
+        if let Err(e) = r {
+            assert!(!e.to_string().contains("ode_method"), "{label}: {e}");
+        }
+    };
+    let cov = |o: &FitOptions| {
+        crate::estimation::run_covariance::run_covariance(&fitted, Some(&model), Some(&pop), o)
+    };
+    let sir = |o: &FitOptions| crate::run_sir(&fitted, Some(&model), Some(&pop), o);
+    refused("run_covariance", cov(&linear));
+    not_refused("run_covariance", cov(&eval_opts()));
+    refused("run_sir", sir(&linear));
+    not_refused("run_sir", sir(&eval_opts()));
 }

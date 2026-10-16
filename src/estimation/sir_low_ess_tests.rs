@@ -381,7 +381,7 @@ fn floor_probe_point_puts_a_block_variance_at_its_floor() {
 fn run_probe_fixture(
     scale: SirScale,
     adjust_box: impl FnOnce(&mut PackedBounds),
-) -> Result<SirResult, String> {
+) -> Result<SirResult, crate::EngineError> {
     run_probe_fixture_with(scale, 0.0, PROBE_MODEL, adjust_box)
 }
 
@@ -392,7 +392,7 @@ fn run_probe_fixture_with(
     ofv_offset: f64,
     model_src: &str,
     adjust_box: impl FnOnce(&mut PackedBounds),
-) -> Result<SirResult, String> {
+) -> Result<SirResult, crate::EngineError> {
     let (_, pop) = probe_fixture();
     let model = crate::parser::model_parser::parse_model_string(model_src).expect("parse");
     let params = model.default_params.clone();
@@ -469,6 +469,9 @@ fn floor_probe_baseline_ignores_the_callers_ofv_hat() {
 /// #1749 r1 #4: a declared prior is a density on the packed scale, so
 /// `sir_scale = natural` is refused for a priored model — and only then: the
 /// same model under `packed`, and the unpriored model under `natural`, run.
+///
+/// #1774: the refusal is `E_SIR_OPTIONS`, no block, and its text is unchanged.
+/// Mutation — the site back on a bare `String`: the code assertion dies.
 #[test]
 fn natural_scale_is_refused_with_a_prior_only() {
     let priored = PROBE_MODEL.replace(
@@ -477,10 +480,16 @@ fn natural_scale_is_refused_with_a_prior_only() {
     );
     assert_ne!(priored, PROBE_MODEL);
     let err = run_probe_fixture_with(SirScale::Natural, 0.0, &priored, |_| {}).unwrap_err();
-    assert!(
-        err.contains("sir_scale = natural is not defined for a model with prior(...)")
-            && err.contains("Use sir_scale = packed"),
+    assert_eq!(
+        (err.code(), err.block(), err.context()),
+        (Some("E_SIR_OPTIONS"), None, None),
         "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "sir_scale = natural is not defined for a model with prior(...): the SIR target is \
+         already the likelihood times the declared prior on the packed scale, so there is no \
+         flat prior to move to the reported scale. Use sir_scale = packed."
     );
     assert!(run_probe_fixture_with(SirScale::Packed, 0.0, &priored, |_| {}).is_ok());
     assert!(run_probe_fixture_with(SirScale::Natural, 0.0, PROBE_MODEL, |_| {}).is_ok());

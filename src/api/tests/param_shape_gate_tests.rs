@@ -241,8 +241,9 @@ fn fit_of(params: &ModelParameters) -> FitResult {
 /// panic; read the fit's blocks in `fitted_params_from_result` by `nrows()` and the
 /// `simulate_with_uncertainty` arm does.
 ///
-/// On `simulate*` an absent Ω_IOV keeps #1019's message: `validate_iov_simulatable` runs
-/// first, and the arm asserts so — move the shape check above it and that arm reddens. On
+/// On `simulate*` an absent Ω_IOV keeps #1019's message, under the shape's code (#1774):
+/// `validate_iov_simulatable` runs first, and the arm asserts so — move the shape check
+/// above it and that arm reddens on the message, drop its code and it reddens on the code. On
 /// `compute_npde_npd` it is the documented κ = 0 fallback and stays `Ok`.
 #[test]
 fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
@@ -284,7 +285,8 @@ fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
             for (entry, e) in sims {
                 let e = e.unwrap_or_else(|| panic!("{entry} accepted {}", cell.label));
                 if cell.label == "Ω_IOV absent" {
-                    assert_eq!(e.code(), None, "{entry}: #1019's refusal, not the shape's");
+                    // The shape's code (#1774: the same cause), #1019's message.
+                    assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "{entry}: {e}");
                     assert!(e
                         .to_string()
                         .contains("carry no omega_iov; simulation draws"));

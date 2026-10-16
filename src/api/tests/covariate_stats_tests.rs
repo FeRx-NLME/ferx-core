@@ -1344,7 +1344,7 @@ fn check_stats_on_re_summarises_the_population() {
     }
     pop.covariate_names.push("AGE".to_string());
     let bound = bind(&text, &pop).expect("binds");
-    assert_eq!(super::check_stats_on(&bound, &pop), Ok(None));
+    assert_eq!(super::check_stats_on(&bound, &pop).unwrap(), None);
 
     let mut other = pop.clone();
     for s in &mut other.subjects {
@@ -1374,8 +1374,14 @@ fn check_stats_on_re_summarises_the_population() {
     for s in &mut absent.subjects {
         s.covariates.remove("AGE");
     }
+    // #1774: the binder's own refusal, with its code.
     let err = super::check_stats_on(&bound, &absent).unwrap_err();
-    assert!(err.contains("covariate `AGE`"), "{err}");
+    assert_eq!(
+        (err.code.as_str(), err.block.as_deref()),
+        ("E_COVARIATE_STATS_BINDING", Some("covariate_model")),
+        "{err:?}"
+    );
+    assert!(err.message.contains("covariate `AGE`"), "{err:?}");
 }
 
 /// #1773. A fit's statistics that pass validation but that the re-parse refuses —

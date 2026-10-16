@@ -44,7 +44,11 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   `occasions_derived` `reset_occasions` is left out like the other three label
 ///   vectors. Otherwise `run_covariance` / `run_sir` refused the population
 ///   `run_model_with_data` returned, whose reset labels it had rewritten.
-pub(crate) const SCHEME: u32 = 3;
+/// - `4`: #1969. The reader keeps each pk-only row's written `TIME`
+///   (`pk_only_raw_times`) and the written `TIME` of each dose and reset row of a
+///   reset period that restarts `TIME` (`reset_period_times`), the `TIME`
+///   `[individual_parameters]` now reads there.
+pub(crate) const SCHEME: u32 = 4;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
@@ -376,6 +380,8 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         dose_covariates,
         obs_covariates,
         pk_only_times,
+        pk_only_raw_times,
+        reset_period_times,
         pk_only_covariates,
         reset_times,
         reset_covariates,
@@ -415,7 +421,12 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     r.len(obs_records.len());
     obs_records.iter().for_each(|o| obs_record(&mut r, o));
     r.f64s(pk_only_times);
+    r.f64s(pk_only_raw_times);
     r.f64s(reset_times);
+    r.len(reset_period_times.len());
+    reset_period_times
+        .iter()
+        .for_each(|&(e, w)| r.f64s(&[e, w]));
     // A derived rule overwrites these too (`apply_iov_occasion_rule`: pk-only rows
     // since #1876, reset rows since #1944).
     r.u32s(if occasions_derived {

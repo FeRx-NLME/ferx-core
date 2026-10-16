@@ -73,6 +73,8 @@ fn bolus_subject(times: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -4575,6 +4577,104 @@ const ONECPT_ODE_TVCOV: &str = r#"
   ode_reltol = 1e-9
   ode_abstol = 1e-11
 "#;
+
+/// #1969: a `TIME >= 24` step on CL, on the dose's `F1` and on an `init(central)` seed, on a
+/// non-IOV ODE model, at records whose written and
+/// engine times straddle 24 (a moved trough, a moved `EVID=2` row, a reset period that
+/// restarts `TIME`). The per-event seeds (`seed_tvcov_snapshots`) must read the written time,
+/// as the value path does: the dual value tracks the value prediction, which the engine clock
+/// would move by more than 1e-3, and the outer and inner η/θ gradients match central FD.
+#[test]
+fn param_time_written_ode_provider_matches_value_and_fd() {
+    use crate::types::test_helpers::{
+        assert_param_time_straddle_is_live, on_engine_clock, param_time_straddle_subject,
+        ParamTimeStraddle,
+    };
+    const STEP_AT_24_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(4.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME >= 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+  F1 = if (TIME >= 24.0) 0.5 else 1.0
+  BASE = if (TIME >= 24.0) 300.0 else 100.0
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(STEP_AT_24_ODE).expect("parse");
+    let theta = vec![10.0, 4.0, 50.0];
+    let eta = vec![0.15, -0.10];
+    let he = 1e-6;
+    for kind in [
+        ParamTimeStraddle::Obs,
+        ParamTimeStraddle::PkOnly,
+        ParamTimeStraddle::Reset,
+    ] {
+        let subject = param_time_straddle_subject(kind);
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "{kind:?}: the event-driven walk serves it"
+        );
+        let pred =
+            |s: &Subject, e: &[f64], th: &[f64]| compute_predictions_with_tv(&model, s, th, e);
+        let value = pred(&subject, &eta, &theta);
+        assert_param_time_straddle_is_live(
+            &value,
+            &pred(&on_engine_clock(&subject), &eta, &theta),
+            &format!("{kind:?}"),
+        );
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner");
+        for (j, obs) in sens.obs.iter().enumerate() {
+            approx::assert_relative_eq!(obs.f, value[j], max_relative = 1e-8, epsilon = 1e-10);
+            approx::assert_relative_eq!(light[j].f, value[j], max_relative = 1e-8, epsilon = 1e-10);
+            for k in 0..model.n_eta {
+                let (mut ep, mut em) = (eta.clone(), eta.clone());
+                ep[k] += he;
+                em[k] -= he;
+                let g =
+                    (pred(&subject, &ep, &theta)[j] - pred(&subject, &em, &theta)[j]) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 1e-4, epsilon = 1e-7);
+                approx::assert_relative_eq!(
+                    light[j].df_deta[k],
+                    g,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+            for m in 0..model.n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let (mut tp, mut tm) = (theta.clone(), theta.clone());
+                tp[m] += s;
+                tm[m] -= s;
+                let g = (pred(&subject, &eta, &tp)[j] - pred(&subject, &eta, &tm)[j]) / (2.0 * s);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+}
 
 /// #486: a `TIME`-switched CL on a **non-IOV ODE** model. With no TV covariates
 /// the subject routes to the event-driven TV walk purely by `uses_time_builtin`
@@ -13235,5 +13335,86 @@ fn ode_provider_static_evid2_first_record_matches_production_and_closed_form() {
         check_vs_production(&model, &subject, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
         check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    }
+}
+
+// ── #852: the exact linear path under the analytic sensitivity provider ─────────────────
+
+/// Two compartments with depot absorption written as a state, lag on an IIV-bearing
+/// parameter: linear and autonomous, so `ode_method = auto` resolves to the exact
+/// matrix-exponential path and the provider's `Dual1`/`Dual2` solves run through `expm_g`.
+const TWOCPT_DEPOT_LINEAR_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  theta TVKA(1.3,  0.01, 50.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_KA ~ 0.10
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central, peripheral])
+[odes]
+  d/dt(depot)      = -KA * depot
+  d/dt(central)    =  KA * depot - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #852: value, `∂f/∂η`, `∂f/∂θ`, both Hessian blocks and inner/outer parity on the exact
+/// linear path, across the dosing shapes whose derivatives it has to carry — later doses on
+/// residual drug with a lag on IIV, a steady-state train, and a central infusion. The route is
+/// asserted first: if eligibility ever regresses this fixture silently integrates and the
+/// checks below would be testing the stepper instead.
+#[test]
+fn ode_provider_on_the_exact_linear_path_matches_fd() {
+    let model = parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).expect("parse");
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    let theta = vec![4.0, 12.0, 2.0, 25.0, 1.3, 0.4];
+    let eta = vec![0.1, -0.05, 0.08];
+
+    let mut multidose = bolus_subject(&[0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0]);
+    multidose.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    multidose.obs_cmts = vec![2; 7];
+
+    let mut steady = ss_absorption_subject(&[0.6, 2.0, 6.0, 11.5], 12.0);
+    steady.obs_cmts = vec![2; 4];
+
+    let mut infusion = bolus_subject(&[1.0, 3.0, 5.0, 9.0, 16.0]);
+    infusion.doses = vec![
+        DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 2, 25.0, false, 0.0),
+    ];
+    infusion.obs_cmts = vec![2; 5];
+
+    for subject in [&multidose, &steady, &infusion] {
+        check_vs_production(&model, subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, subject, &theta, &eta);
     }
 }

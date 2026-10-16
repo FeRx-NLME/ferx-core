@@ -65,6 +65,16 @@
 //! folds them into the target (`φ_i + Σ_{l≠k} (W_kl / W_kk) η_il`), the numerical
 //! one evaluates the full form.
 //!
+//! **A single anchor on a group's theta joins the group** (#1630). With
+//! `V2 = TVV2*exp(ETA_V2)` next to `V1 = TVV2*TH_R*(WT/70)^TH_WT*exp(ETA_V1)`,
+//! `ETA_V2`'s closed-form shift and `V1`'s group would both move `TVV2` in one
+//! iteration. Declining the group (as before #1630) left `TH_WT` on the
+//! η-frozen numerical M-step, the trap above. Instead `V2`'s typical value
+//! becomes a one-theta member, recorded by the parser with the same
+//! reachability fields as a group, so the joint step takes the exact engine
+//! when nothing else reads `TVV2`. The resolver decides which anchors join
+//! (`resolve_covariate_mu_groups`).
+//!
 //! What this is **not**: a change to `mu_refs`. An eta whose typical value also
 //! matches a single-anchor pattern (the power form) keeps that `MuRef` for the
 //! inner-loop centring, `suggest_start` and reporting; only the SAEM / IMP
@@ -189,19 +199,37 @@ struct Admitted<'m> {
     eta_idx: usize,
     theta_idx: Vec<usize>,
     spec: &'m CovariateMuRef,
+    /// A single-anchor mu-reference taken into the group it collides with
+    /// (#1630) — one of a member's [`CovariateMuRef::colliding_anchors`] — not
+    /// a covariate mu-reference of its own.
+    absorbed_anchor: bool,
 }
 
 /// Resolve `model.covariate_mu_refs` into the groups the M-step will run, and
 /// say why any was left out or how it was combined.
 ///
-/// A mu-reference is dropped — its thetas then stay on the numerical M-step
-/// exactly as before #619 — when:
+/// A mu-reference is dropped — its thetas are then estimated exactly as before
+/// #619 — when:
 ///
-/// - a theta of it is also the anchor of a single-anchor pair on a
-///   **different** eta (`plain_pairs`): two channels moving one theta in the
-///   same iteration has no joint optimum;
 /// - its eta's initial IIV variance is below [`WEAK_GROUP_IIV_VAR`];
-/// - every theta of it is `FIX`ed (nothing to move).
+/// - every theta of it is `FIX`ed (nothing to move);
+/// - a free theta of it is also the anchor of a single-anchor pair on a
+///   **different** eta (`plain_pairs`) that runs and cannot join it (below).
+///
+/// A colliding pair is resolved, not declined, in the two cases that cover
+/// nearly every model (#1630). Two channels moving one theta in the same
+/// iteration have no joint optimum, so the pair must not run beside the group:
+///
+/// - when the pair's eta has an admitted group of its own, the pair never
+///   runs (the caller drops it for that group), so there is nothing to collide
+///   with — the two groups share the theta and merge below;
+/// - otherwise the pair joins the group as a one-theta member — one of
+///   [`CovariateMuRef::colliding_anchors`] — and the caller drops its
+///   closed-form shift like any member's. It cannot join when the parser
+///   recorded no anchor for it (its typical value is not log- or logit-scale in
+///   that theta alone) or its eta's IIV is below the floor; the group is then
+///   declined, which can un-supersede that group's own pair and decline
+///   another in turn, so this runs to a fixed point.
 ///
 /// The single-anchor pair on the mu-reference's **own** eta is not a conflict:
 /// it is the same eta, and the caller drops that pair in favour of the group.
@@ -218,10 +246,37 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
 ) -> (Vec<CovariateMuGroup<'m>>, Vec<String>) {
     let is_free = |t: usize| !theta_fixed.get(t).copied().unwrap_or(false);
     let theta_name = |t: usize| model.theta_names.get(t).map(String::as_str).unwrap_or("?");
+    let eta_name = |e: usize| model.eta_names.get(e).map(String::as_str).unwrap_or("?");
+    let eta_var = |e: usize| omega.get((e, e)).copied().unwrap_or(f64::INFINITY);
+    // The recorded single anchor `(t, e)` a group `spec` collides with, or why
+    // it cannot join the group as a one-theta member (#1630). The parser records
+    // an anchor only for the shapes and reads a group itself admits, so a
+    // missing one is a typical value the joint step could not evaluate; and the
+    // anchor's eta must clear the IIV floor a group's own eta must clear.
+    let anchor_of =
+        |spec: &'m CovariateMuRef, t: usize, e: usize| -> Result<&'m CovariateMuRef, String> {
+            let found = spec.colliding_anchors.iter().find(|a| {
+                a.eta_name == eta_name(e)
+                    && a.theta_names.len() == 1
+                    && a.theta_names[0] == theta_name(t)
+            });
+            let Some(anchor) = found else {
+                return Err(format!(
+                    "whose typical value is not a log- or logit-scale function of {} alone",
+                    theta_name(t)
+                ));
+            };
+            if eta_var(e) < WEAK_GROUP_IIV_VAR {
+                return Err(format!(
+                    "whose random effect has negligible variance (ω² < {WEAK_GROUP_IIV_VAR:.0e})"
+                ));
+            }
+            Ok(anchor)
+        };
     let mut notes: Vec<String> = Vec::new();
 
-    // 1. The per-mu-reference filters.
-    let mut admitted: Vec<Admitted<'m>> = Vec::new();
+    // 1. The filters that need no other mu-reference.
+    let mut candidates: Vec<Admitted<'m>> = Vec::new();
     for spec in &model.covariate_mu_refs {
         let Some(eta_idx) = model.eta_names.iter().position(|n| n == &spec.eta_name) else {
             continue;
@@ -238,29 +293,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         if !theta_idx.iter().any(|&t| is_free(t)) {
             continue;
         }
-        let shared_with_pair = plain_pairs
-            .iter()
-            .filter(|&&(_t, e)| e != eta_idx)
-            .find(|&&(t, _e)| theta_idx.contains(&t));
-        if let Some(&(t, e)) = shared_with_pair {
-            notes.push(format!(
-                "covariate mu-reference on {} (typical value of {} reads {}) is not used: {} is \
-                 also the mu-reference anchor of {}, and one theta cannot take two closed-form \
-                 updates in the same iteration; {} stay on the numerical M-step (#619).",
-                spec.eta_name,
-                spec.eta_name.trim_start_matches("ETA_"),
-                names,
-                theta_name(t),
-                model.eta_names.get(e).map(String::as_str).unwrap_or("?"),
-                names
-            ));
-            continue;
-        }
-        let var = omega
-            .get((eta_idx, eta_idx))
-            .copied()
-            .unwrap_or(f64::INFINITY);
-        if var < WEAK_GROUP_IIV_VAR {
+        if eta_var(eta_idx) < WEAK_GROUP_IIV_VAR {
             notes.push(format!(
                 "covariate mu-reference on {} (reads {}) is not used: its random effect has \
                  negligible variance (ω² < {WEAK_GROUP_IIV_VAR:.0e}), so the population of \
@@ -270,14 +303,96 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
             ));
             continue;
         }
-        admitted.push(Admitted {
+        candidates.push(Admitted {
             eta_idx,
             theta_idx,
             spec,
+            absorbed_anchor: false,
         });
     }
 
-    // 2. Union-find over the survivors, linking on a shared free theta. The
+    // 2. Collisions with a single-anchor pair on another eta (#1630). Only a
+    //    free theta can collide — no step moves a FIXed one. A pair whose eta
+    //    has a group of its own never runs (the caller drops it for that
+    //    group), so it collides with nothing: the two groups share the theta
+    //    and step 3 merges them. A pair that does run joins the group as a
+    //    one-theta member when it can, and declines the group when it cannot.
+    //
+    //    Declines cascade, so this iterates to a fixed point: a declined group
+    //    un-supersedes its own eta's pair, and that pair's statement is the
+    //    group's multi-theta typical value, not a single anchor — so another
+    //    group reading the pair's theta now collides with a pair it cannot take
+    //    in, and must decline too.
+    let mut declined: Vec<Option<String>> = vec![None; candidates.len()];
+    loop {
+        // Each group's own eta is in here too, so its own pair is skipped.
+        let grouped: Vec<usize> = candidates
+            .iter()
+            .zip(&declined)
+            .filter(|(_, d)| d.is_none())
+            .map(|(c, _)| c.eta_idx)
+            .collect();
+        let mut changed = false;
+        for (c, slot) in candidates.iter().zip(declined.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            let blocker = plain_pairs.iter().find_map(|&(t, e)| {
+                if grouped.contains(&e) || !is_free(t) || !c.theta_idx.contains(&t) {
+                    return None;
+                }
+                anchor_of(c.spec, t, e).err().map(|why| (t, e, why))
+            });
+            let Some((t, e, why)) = blocker else {
+                continue;
+            };
+            let names = c.spec.theta_names.join(", ");
+            *slot = Some(format!(
+                "covariate mu-reference on {} (typical value of {} reads {}) is not used: {} is \
+                 also the mu-reference anchor of {}, {why}, so the two cannot take one joint \
+                 M-step; {} are estimated as if this mu-reference were absent (#619, #1630).",
+                c.spec.eta_name,
+                c.spec.eta_name.trim_start_matches("ETA_"),
+                names,
+                theta_name(t),
+                eta_name(e),
+                names
+            ));
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut admitted: Vec<Admitted<'m>> = Vec::with_capacity(candidates.len());
+    for (c, d) in candidates.into_iter().zip(declined) {
+        match d {
+            Some(note) => notes.push(note),
+            None => admitted.push(c),
+        }
+    }
+    let mut absorbed: Vec<Admitted<'m>> = Vec::new();
+    for a in &admitted {
+        for &(t, e) in plain_pairs {
+            if !is_free(t) || !a.theta_idx.contains(&t) || absorbed.iter().any(|b| b.eta_idx == e) {
+                continue;
+            }
+            // At the fixed point every such pair either joins or belongs to an
+            // admitted group — whose eta has no recorded anchor (its statement
+            // is the group's), so `anchor_of` declines to take it in twice.
+            if let Ok(spec) = anchor_of(a.spec, t, e) {
+                absorbed.push(Admitted {
+                    eta_idx: e,
+                    theta_idx: vec![t],
+                    spec,
+                    absorbed_anchor: true,
+                });
+            }
+        }
+    }
+    admitted.extend(absorbed);
+
+    // 3. Union-find over the survivors, linking on a shared free theta. The
     //    root of a component is its earliest member, so groups come out in
     //    declaration order of their first member.
     let mut parent: Vec<usize> = (0..admitted.len()).collect();
@@ -315,7 +430,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         }
     }
 
-    // 3. One group per component.
+    // 4. One group per component.
     let mut groups: Vec<CovariateMuGroup<'m>> = Vec::with_capacity(components.len());
     for component in components {
         let members: Vec<&Admitted<'m>> = component.iter().map(|&a| &admitted[a]).collect();
@@ -328,13 +443,16 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         let free: Vec<usize> = theta_idx.iter().copied().filter(|&t| is_free(t)).collect();
         let joint = members.len() > 1;
         let eta_list = join_names(members.iter().map(|m| m.spec.eta_name.as_str()));
+        // An absorbed anchor is not a covariate mu-reference (#1630).
+        let anchors: Vec<&&Admitted<'m>> = members.iter().filter(|m| m.absorbed_anchor).collect();
+        let kind = if anchors.is_empty() {
+            "covariate mu-references"
+        } else {
+            "mu-references"
+        };
         // How a note names the group: one member keeps the historical wording.
         let (subject, keeps, its) = if joint {
-            (
-                format!("covariate mu-references on {eta_list}"),
-                "keep",
-                "their joint",
-            )
+            (format!("{kind} on {eta_list}"), "keep", "their joint")
         } else {
             (
                 format!(
@@ -355,8 +473,13 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 .map(theta_name)
                 .collect();
             let described = join_names(members.iter().map(|m| {
+                let reads = if m.absorbed_anchor {
+                    "anchored on"
+                } else {
+                    "reads"
+                };
                 format!(
-                    "{} (reads {})",
+                    "{} ({reads} {})",
                     m.spec.eta_name,
                     m.spec.theta_names.join(", ")
                 )
@@ -366,9 +489,14 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
             } else {
                 format!("all {} of them", members.len())
             };
+            let issue = if anchors.is_empty() {
+                "#1620"
+            } else {
+                "#1620, #1630"
+            };
             notes.push(format!(
-                "covariate mu-references on {described} share {} and take one joint M-step that \
-                 re-centres {all} (#1620).",
+                "{kind} on {described} share {} and take one joint M-step that re-centres {all} \
+                 ({issue}).",
                 linking.join(", ")
             ));
         }
@@ -386,14 +514,31 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         // subject-constant, so the exact engine — which drops that term — is
         // not an M-step for it. A FIXed one never moves, so no term can be
         // mis-maximised in it.
+        //
+        // The parser's walk stops at every group *and* every single anchor
+        // (`read_outside_groups_and_anchors`); a member's anchor that this group
+        // did not take in (#1630) is not held by any `φ_i` the step freezes, so
+        // its theta is added back. That pair is exactly
+        // `read_outside_groups` whenever nothing was absorbed: an anchor reads
+        // its one theta, so stopping at it hides no other theta's route.
+        let unabsorbed_anchor_thetas: Vec<&str> = members
+            .iter()
+            .flat_map(|m| m.spec.colliding_anchors.iter())
+            .filter(|a| !members.iter().any(|m| m.spec.eta_name == a.eta_name))
+            .map(|a| a.theta_names[0].as_str())
+            .collect();
         let outside: Vec<&str> = free
             .iter()
             .copied()
             .map(theta_name)
             .filter(|n| {
-                members
-                    .iter()
-                    .any(|m| m.spec.read_outside_groups.iter().any(|r| r == n))
+                unabsorbed_anchor_thetas.contains(n)
+                    || members.iter().any(|m| {
+                        m.spec
+                            .read_outside_groups_and_anchors
+                            .iter()
+                            .any(|r| r == n)
+                    })
             })
             .collect();
         if !outside.is_empty() {
@@ -445,10 +590,15 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         // prediction moved while `φ_i` stays put, and the data term is live in
         // the group's thetas after all (#918 review).
         for m in members.iter().filter(|m| m.spec.eta_shared) {
+            let (what, reads) = if m.absorbed_anchor {
+                ("mu-reference", "anchored on")
+            } else {
+                ("covariate mu-reference", "reads")
+            };
             notes.push(format!(
-                "covariate mu-reference on {} (reads {}) keeps the observation term in its \
-                 M-step: {} is also read by another individual parameter, so re-centring it to \
-                 hold this typical value's φ fixed changes that parameter's prediction (#619).",
+                "{what} on {} ({reads} {}) keeps the observation term in its M-step: {} is also \
+                 read by another individual parameter, so re-centring it to hold this typical \
+                 value's φ fixed changes that parameter's prediction (#619).",
                 m.spec.eta_name,
                 m.spec.theta_names.join(", "),
                 m.spec.eta_name
