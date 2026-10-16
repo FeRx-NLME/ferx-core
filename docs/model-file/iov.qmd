@@ -407,7 +407,7 @@ All levels are integrated inside one subject. The coarsest grouping that needs a
 
 ### The data {#nested-levels-data}
 
-The level columns are read with the data, like covariates, so they need no `[covariates]` declaration. Every record needs a value in every level column, since its group at each level is identified by those values. A record with no value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time. As with any covariate column, a blank cell *between* records takes the value of the record before it, so write the label on every row rather than relying on the first row of a group.
+The level columns are read with the data, like covariates, so they need no `[covariates]` declaration. Every record needs a value in every level column, since its group at each level is identified by those values. A record with no value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time. Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group.
 
 A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits.
 

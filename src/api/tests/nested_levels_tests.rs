@@ -650,12 +650,13 @@ fn a_weight_varying_inside_its_kappas_group_warns_per_level() {
     );
 }
 
-/// What the docs say about a blank level cell, read from a CSV: a blank cell *between*
-/// records carries the label of the record before it (the level columns are read like
-/// covariates), so the record joins that arm and is not refused; a column with no value on
-/// any of a subject's records is refused.
+/// A blank level cell, read from a CSV, is a missing label: the level columns are not
+/// carried forward like covariates (`ObsRouting::no_carry_forward`), so the record is
+/// refused at its own row instead of silently joining the group of the record before
+/// it. An ordinary covariate's blank cell on the same row still carries forward — the
+/// two sides of the gate in one read.
 #[test]
-fn a_blank_level_cell_between_records_carries_the_previous_label() {
+fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_forward() {
     let m = model();
     let read = |csv: &str| {
         let path = std::env::temp_dir().join(format!(
@@ -677,16 +678,33 @@ fn a_blank_level_cell_between_records_carries_the_previous_label() {
         let _ = std::fs::remove_file(&path);
         pop
     };
-    let csv = "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,50\n1,3,12,1,,50\n\
-               1,4,13,2,1,50\n";
+    // TIME 3 has a blank ARM and a blank NARM.
+    let csv = "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,40\n1,3,12,1,,\n\
+               1,4,13,2,1,30\n";
     let pop = read(csv);
-    assert!(code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").is_none());
-    let mut prepared = pop.clone();
-    crate::stats::nested_levels::assign_level_cells(&m, &mut prepared);
-    // The blank row (TIME 3) joins study 1, arm 2 — the row before it.
-    assert_eq!(prepared.subjects[0].occasions, vec![1, 2, 2, 3]);
-    // No ARM value on any record of subject 2: refused.
+    let s = &pop.subjects[0];
+    assert!(s.obs_cov(2)["ARM"].is_nan(), "the blank label is missing");
+    assert_eq!(
+        s.obs_cov(2)["NARM"],
+        40.0,
+        "the blank covariate carries forward"
+    );
+    let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
+    assert!(
+        msg.contains(
+            "level `ARM` reads column `ARM`, which has no value on the observation \
+                      record of subject `1` at TIME 3"
+        ),
+        "{msg}"
+    );
+    // A label blank on the first row is missing too, not the first value below it.
+    let first = read("ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,,50\n1,2,11,1,2,50\n");
+    assert!(first.subjects[0].obs_cov(0)["ARM"].is_nan());
+    // No ARM value on any record of a subject: refused as well.
     let none = read("ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n2,1,10,1,,50\n2,2,11,1,,50\n");
     let msg = code_in(&check_model_data(&m, &none), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(msg.contains("subject `2`"), "{msg}");
+    // Without blanks every record keeps its own label.
+    let full = read("ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,50\n");
+    assert!(code_in(&check_model_data(&m, &full), "E_LEVEL_MISSING_LABEL").is_none());
 }
