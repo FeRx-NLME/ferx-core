@@ -201,10 +201,6 @@ pub fn ferx_core::diagnostics::EngineError::context(&self) -> core::option::Opti
 pub fn ferx_core::diagnostics::EngineError::diagnostic(&self) -> core::option::Option<&ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::diagnostics::EngineError::message(&self) -> &str
 pub fn ferx_core::diagnostics::EngineError::suggestion(&self) -> core::option::Option<&str>
-impl core::convert::From<&str> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: &str) -> Self
-impl core::convert::From<alloc::string::String> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: alloc::string::String) -> Self
 impl core::error::Error for ferx_core::diagnostics::EngineError
 impl core::fmt::Display for ferx_core::diagnostics::EngineError
 pub fn ferx_core::diagnostics::EngineError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -4420,10 +4416,6 @@ pub fn ferx_core::diagnostics::EngineError::context(&self) -> core::option::Opti
 pub fn ferx_core::diagnostics::EngineError::diagnostic(&self) -> core::option::Option<&ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::diagnostics::EngineError::message(&self) -> &str
 pub fn ferx_core::diagnostics::EngineError::suggestion(&self) -> core::option::Option<&str>
-impl core::convert::From<&str> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: &str) -> Self
-impl core::convert::From<alloc::string::String> for ferx_core::diagnostics::EngineError
-pub fn ferx_core::diagnostics::EngineError::from(message: alloc::string::String) -> Self
 impl core::error::Error for ferx_core::diagnostics::EngineError
 impl core::fmt::Display for ferx_core::diagnostics::EngineError
 pub fn ferx_core::diagnostics::EngineError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result

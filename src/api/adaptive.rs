@@ -813,7 +813,7 @@ where
                     format!("subject '{}' (sim {sim}): {message}", subject.id),
                 ),
                 crate::ode::AdaptiveDriverError::Runtime(message) => {
-                    EngineError::from(format!("subject '{}' (sim {sim}): {message}", subject.id))
+                    EngineError::uncoded(format!("subject '{}' (sim {sim}): {message}", subject.id))
                 }
             })?;
 
@@ -839,7 +839,7 @@ where
                     event_pk,
                 )
                 .map_err(|e| {
-                    EngineError::from(format!(
+                    EngineError::uncoded(format!(
                         "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
                     ))
@@ -858,7 +858,7 @@ where
                     &run,
                 )
                 .map_err(|e| {
-                    EngineError::from(format!(
+                    EngineError::uncoded(format!(
                         "frozen-schedule replay verification failed for subject '{}' (sim {sim}): {e}",
                         subject.id
                     ))

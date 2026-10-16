@@ -205,7 +205,7 @@ const BECAUSE: &str = " The population is re-read with this file's `[data]` rena
 /// `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_THETA_LENGTH` and
 /// `E_FIT_INPUT_MODEL` on the η̂ width: the post-hoc codes with no model statistics.
 ///
-/// Mutations — any site back on `EngineError::from` (its rows' `code()` is `None`);
+/// Mutations — any site back on `EngineError::uncoded` (its rows' `code()` is `None`);
 /// `fit_input_missing` / `fit_input_changed` / `fit_input_model` / `theta_length`
 /// swapped at a site (its rows' code); `in_context` dropped from either η̂ check or
 /// added to the covariance check (`context()`); a sentence deleted from any message
@@ -565,7 +565,7 @@ fn the_re_reads_carry_ferx_checks_codes() {
 /// statistics' own `E_COVARIATE_STATS_BINDING` where the population cannot summarise
 /// a covariate (the code `bind_covariate_stats` gives the same data).
 ///
-/// Mutations — either `fit_input_model` site back on `String` / `EngineError::from`
+/// Mutations — either `fit_input_model` site back on `String` / `EngineError::uncoded`
 /// (`code()` `None`); `check_stats_on`'s summary failure left uncoded (the no-value row);
 /// a sentence of the #1729 refusal deleted (`to_string()`).
 #[test]
