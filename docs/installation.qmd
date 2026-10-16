@@ -154,12 +154,14 @@ the main thread every ~100 ms, so **Ctrl-C** (or RStudio's red stop button) abor
 the fit cleanly. The worker exits at the next safe checkpoint, typically within a
 second or two. With the NLopt outer optimizers (`auto`, `nlopt_lbfgs`, `bobyqa`,
 `slsqp`, `mma`) and the `global_search` pre-search, FOCE, FOCEI and Laplace check
-again before each subject's EBE solve in an objective evaluation. A cancel that
-arrives during that pass waits only for the solves already running, one per thread.
-Other phases finish the pass they are in first: the outer gradient, the Laplace/AGQ
-quadrature, the final EBE readout, `trust_region`, `method = gn`, mixture models and
-the other estimators. For a heavy ODE model that can take one population pass. The
-call then returns with an R error:
+again before each subject's EBE solve in an objective evaluation (except for mixture
+models). A cancel that arrives during that pass waits only for the solves already
+running, one per thread. Other phases finish the pass they are in first: the outer
+gradient, the Laplace/AGQ quadrature, `trust_region`, `method = gn`, mixture models
+and the other estimators. Once the optimizer stops, it still runs its final EBE
+readout at the best estimates, which is one or two full population passes. On a heavy
+ODE model, cleanup can therefore take a few population passes. The call then returns
+with an R error:
 
 ```
 Error: ferx_fit: cancelled by user

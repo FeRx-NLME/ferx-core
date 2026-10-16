@@ -1646,6 +1646,29 @@ mod tests {
         );
     }
 
+    /// #574 review r2: the cancel check runs at every iteration boundary, not only before
+    /// the first. A tracker whose flag trips after a non-cancelled boundary must stop at the
+    /// next one, with the run already past iteration 0.
+    #[test]
+    fn a_cancel_after_the_first_iteration_stops_the_trust_region() {
+        let mut tracker = stall_tracker();
+        tracker.cancel = Some(crate::cancel::CancelFlag::trip_after(1));
+        let mut state = TrState::new().param(vec![0.0, 1.0]).cost(1.0);
+        state.increment_iter();
+        assert!(state.get_iter() > 0, "fixture: past iteration 0");
+        assert!(matches!(
+            tracker.terminate(&state),
+            TerminationStatus::NotTerminated
+        ));
+        state.increment_iter();
+        match tracker.terminate(&state) {
+            TerminationStatus::Terminated(TerminationReason::SolverExit(reason)) => {
+                assert_eq!(reason, TRUST_REGION_CANCELLED)
+            }
+            other => panic!("expected the cancel stop, got {other:?}"),
+        }
+    }
+
     fn warfarin_model() -> crate::types::CompiledModel {
         crate::parser::model_parser::parse_model_file(std::path::Path::new(
             "examples/warfarin.ferx",

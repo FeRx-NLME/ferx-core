@@ -3582,6 +3582,16 @@ fn optimize_nlopt_once(
             contribs = nll_i.iter().map(|v| 2.0 * v).collect();
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
+        // The pass above polls the flag per subject (#574), so a cancel that lands inside
+        // it comes back here as placeholders. Leave the way the entry check does, before
+        // the guard accounting, the state caches, the trace and any gradient pass see the
+        // evaluation.
+        if crate::cancel::is_cancelled(&options.cancel) {
+            if let Some(g) = grad {
+                g.fill(0.0);
+            }
+            return 1e20;
+        }
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         // When a gradient is wanted the penalty gradient comes out of the same
         // pass (one network evaluation per curvature node) and is spliced into

@@ -681,7 +681,13 @@ fn a_cancel_inside_the_first_nlopt_evaluation_solves_nothing_more() {
             })
         };
         let (_, pre_cancelled) = run(crate::cancel::CancelFlag::trip_after(0));
-        let (_, mid_eval) = run(crate::cancel::CancelFlag::trip_after(1));
+        let (mid_result, mid_eval) = run(crate::cancel::CancelFlag::trip_after(1));
+        // The cancelled evaluation leaves before the EBE-guard accounting: it is not a
+        // rejected trial, so it must not show up as one in the result (#574 review r2).
+        assert_eq!(
+            mid_result.ebe_convergence_warnings, 0,
+            "{optimizer:?}: the cancelled evaluation was booked as a guard rejection"
+        );
         let (_, control) = run(crate::cancel::CancelFlag::new());
         assert!(
             control > pre_cancelled + pop.subjects.len(),
@@ -742,4 +748,39 @@ fn a_cancel_inside_the_global_pre_search_solves_nothing_more() {
         baseline + n,
         "the first CRS2-LM evaluation solved after a cancel"
     );
+}
+
+/// The built-in BFGS loop (`Optimizer::Bfgs` / `Lbfgs` from Rust) polls only between
+/// iterations: its passes install their EBEs as the next warm start and its iterate as
+/// the checkpoint's best point, so none may be cut short. Whatever poll the cancel lands
+/// on, every pass the run starts must run to completion — the solve count is a whole
+/// number of population passes.
+#[test]
+fn the_built_in_bfgs_never_cancels_inside_a_pass() {
+    let pool = single_thread_pool();
+    let (model, pop) = fixture(false, false);
+    let n = pop.subjects.len();
+    for optimizer in [Optimizer::Bfgs, Optimizer::Lbfgs] {
+        for k in 0..=3 * n {
+            let opts = FitOptions {
+                optimizer,
+                outer_maxiter: 5,
+                inner_maxiter: 20,
+                run_covariance_step: false,
+                global_search: false,
+                verbose: false,
+                cancel: Some(crate::cancel::CancelFlag::trip_after(k)),
+                ..Default::default()
+            };
+            let (_, solves) = solves_during(&pool, || {
+                optimize_population(&model, &pop, &model.default_params, &opts)
+            });
+            assert_eq!(
+                solves % n,
+                0,
+                "{optimizer:?}, cancel at poll {}: {solves} solves is a cut-short pass",
+                k + 1
+            );
+        }
+    }
 }
