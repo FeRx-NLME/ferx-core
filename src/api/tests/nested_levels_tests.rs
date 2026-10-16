@@ -229,6 +229,10 @@ fn levels_do_not_mix_with_the_occasion_options_or_an_unattached_kappa() {
     .expect("iov_column refused");
     assert!(column.contains("declares `level STUDY`"), "{column}");
     assert!(column.contains("also sets `iov_column`"), "{column}");
+    assert!(
+        column.contains("A `level` declaration replaces the occasion option"),
+        "{column}"
+    );
     assert!(column.contains("remove it from [fit_options]"), "{column}");
     let derived = check(&src_with(
         "",
@@ -241,6 +245,11 @@ fn levels_do_not_mix_with_the_occasion_options_or_an_unattached_kappa() {
         .expect("an unattached kappa refused");
     assert!(
         unattached.contains("kappa K_ST has no `at LEVEL`"),
+        "{unattached}"
+    );
+    assert!(
+        unattached
+            .contains("Once a `level` is declared, every kappa says which level it lives at."),
         "{unattached}"
     );
     // The model itself is accepted.
@@ -546,6 +555,9 @@ fn simulate_refuses_a_nested_model() {
     assert!(err
         .to_string()
         .contains("a kappa at an outer level must be drawn once per group"));
+    assert!(err
+        .to_string()
+        .contains("Fit the model; simulate from it in a later release."));
 }
 
 #[test]
