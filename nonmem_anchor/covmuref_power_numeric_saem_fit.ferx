@@ -4,7 +4,7 @@
 # `classify_covariate_mu_ref` rejects a typical value that reads a local the
 # inliner cannot resolve (assigned conditionally or later), so unlike
 # `covmuref_power_saem_fit.ferx` this model has *no* covariate mu-reference
-# group: TVCL keeps its single-anchor mu-reference and TH_WT carries no ETA and
+# group: TVCL keeps its single-anchor mu-reference and TH_WT anchors none and
 # rides the eta-frozen numerical M-step. (#1422 tracks inlining an if/else-
 # assigned local; when that lands, this fixture needs a shape that still
 # defeats detection — the test asserts `covariate_mu_refs.is_empty()`.) That is the shape #1415 reports on

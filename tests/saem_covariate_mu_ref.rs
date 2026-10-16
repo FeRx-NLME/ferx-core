@@ -229,7 +229,7 @@ fn saem_recovers_the_allometric_exponent() {
 
 /// Tier-3, #1415: the same allometric exponent with **no** mu-reference group —
 /// the weight covariate goes through a conditionally assigned local, which the
-/// #619 classifier rejects, so `TH_WT` carries no ETA and is moved only by the
+/// #619 classifier rejects, so `TH_WT` anchors no mu-reference and is moved only by the
 /// eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
 /// [`saem_recovers_the_allometric_exponent`].
 ///
@@ -265,8 +265,10 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT")),
-        "TH_WT must be reported as the no-ETA numerical-M-step theta: {:?}",
+            // #1715: TH_WT shares `CL` with ETA_CL, so it is named in the
+            // carries-an-ETA advisory, not the ETA-less one.
+            .any(|w| w.contains("but not as a mu-referenced typical value") && w.contains("TH_WT")),
+        "TH_WT must be reported as the un-anchored numerical-M-step theta: {:?}",
         result.warnings
     );
     let th_wt = theta(&result, "TH_WT");
@@ -336,7 +338,7 @@ fn imp_recovers_the_additive_renal_gradient() {
 /// nightly runs behind `score_sa` (#1475).
 ///
 /// **Why this fixture is the right regression.** `TH_WT` here is the whole
-/// point of #1458: it carries no ETA, defeats covariate mu-reference detection
+/// point of #1458: it shares `CL` with `ETA_CL` but defeats covariate mu-reference detection
 /// (asserted below, as in the test above), and therefore moves *only* through
 /// the numerical M-step. NONMEM 7.5.1 `METHOD=SAEM` on the same data and the
 /// same start puts it at 0.921283, which is an external reference rather than

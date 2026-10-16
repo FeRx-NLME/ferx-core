@@ -198,7 +198,7 @@ fn covariance_to_proposal_hessian(
 
 /// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
 /// position — the proxy both the #406 IMP/IMPMAP advisory
-/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate use
+/// ([`non_fixed_unanchored_thetas`]) and the #1011 SAEM M-step damping gate use
 /// for "this θ carries an ETA", read from here so the two cannot drift apart.
 ///
 /// **It is mu-reference *detection*, not a scan of ETA usage.** `true` means the
@@ -212,10 +212,10 @@ fn covariance_to_proposal_hessian(
 /// the *channel that moves the θ*, not about η bookkeeping: an un-anchored θ has
 /// no closed-form shift and is moved solely by the numerical / importance-
 /// weighted M-step, which is exactly the biased channel #406 and #1011 are
-/// about. The cost is that the advisory's wording ("no associated ETA") is
-/// stricter than the predicate, and says "attach an ETA" to a model that has one
-/// in an unrecognised form — where the fix is to put it in a mu-referenceable
-/// form, which is the same remedy.
+/// about. What the advisories must *not* do is call every un-anchored θ
+/// "ETA-less": [`partition_by_eta`] separates the θ that share a value with an
+/// η in an unrecognised form (a Box-Cox ETA, its shape θ — where removing the
+/// transform is the wrong advice) from the ones with no η at all (#1715).
 ///
 /// A MIXNUM-switched typical value carries an ETA in every class arm, so its
 /// class thetas must not be counted as fixed-effect-only (#996) — they are
@@ -263,20 +263,22 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
         .collect()
 }
 
-/// Names of non-fixed thetas that have **no associated ETA** (are not the target
-/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// Names of non-fixed thetas that do **not** anchor a mu-reference this fit, so
+/// no closed-form shift moves them. Under IMP/IMPMAP such parameters are
 /// estimated solely through the importance-weighted θ M-step, which carries an
 /// IS-weight bias for weakly-identified parameters and can converge to the wrong
 /// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
-/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
-/// parameter to carry a random effect; ferx applies mu-referencing
-/// automatically, so the user only needs to add the ETA.
+/// FOCEI/NONMEM value of ~0.4); under SAEM they ride the η-frozen numerical
+/// M-step.
 ///
-/// See [`theta_is_mu_ref_anchor_mask`] for the exact predicate this uses as the
-/// stand-in for "carries an ETA" — it is mu-reference detection, so an η in a
-/// form the detector does not recognise is reported here too — and for what
-/// `cov_group_thetas` and `class_mu_ref_thetas` must contain.
-pub(crate) fn non_fixed_thetas_without_eta(
+/// "Not anchored" is not "no ETA" (#1715): a θ can share a value with an η in a
+/// form the shift cannot use — a Box-Cox / power transform of the η, a shape
+/// θ inside that transform, a covariate coefficient. Split the list with
+/// [`partition_by_eta`] before telling the user to attach an ETA.
+///
+/// See [`theta_is_mu_ref_anchor_mask`] for the exact anchor predicate and for
+/// what `cov_group_thetas` and `class_mu_ref_thetas` must contain.
+pub(crate) fn non_fixed_unanchored_thetas(
     model: &CompiledModel,
     theta_fixed: &[bool],
     cov_group_thetas: &[usize],
@@ -293,6 +295,72 @@ pub(crate) fn non_fixed_thetas_without_eta(
         })
         .map(|(_, name)| name.clone())
         .collect()
+}
+
+/// Split θ names into `(with_eta, without_eta)` (#1715): the first enter an
+/// individual parameter that carries a random effect, the second share a value
+/// with no η at all. Order within each half is preserved.
+///
+/// "Carries" is [`CompiledModel::theta_eta_linked`], the #1177 Delattre class:
+/// transitive through intermediate assignments and `if` conditions, κ
+/// included, classified after `[covariate_model]` desugaring. It is empty on a
+/// hand-built fixture, which then lands every name in `without_eta` — the
+/// pre-#1715 wording.
+///
+/// Applied to [`non_fixed_unanchored_thetas`] it separates the two advisories
+/// the old single "NO associated ETA" list conflated: a θ with no η, where
+/// attaching one is the remedy, and a θ whose η is there but not in a
+/// mu-referenceable form, where it is not — removing a Box-Cox transform the
+/// user chose on purpose would change the model, not fix the fit.
+pub(crate) fn partition_by_eta(
+    model: &CompiledModel,
+    names: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    names.into_iter().partition(|n| {
+        model
+            .theta_names
+            .iter()
+            .position(|t| t == n)
+            .is_some_and(|t| model.theta_eta_linked.get(t).copied().unwrap_or(false))
+    })
+}
+
+/// The IMP/IMPMAP advisory for a non-fixed θ the closed-form mu-reference shift
+/// cannot move, split by whether it carries an ETA (#1715). Empty when both
+/// lists are. `label` prefixes each message (`IMPMAP`, `FREM conversion`, …).
+pub(crate) fn imp_unanchored_theta_warnings(
+    label: &str,
+    with_eta: &[String],
+    without_eta: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !without_eta.is_empty() {
+        out.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
+             parameter FIX, or use FOCEI.",
+            without_eta.join(", ")
+        ));
+    }
+    if !with_eta.is_empty() {
+        out.push(format!(
+            "{label}: estimated parameter(s) [{}] enter an individual parameter that carries \
+             an ETA, but not as a mu-referenced typical value. The closed-form mu-reference \
+             shift needs `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA \
+             (Box-Cox, power), a parameter inside that transform, one scaling the ETA, or a \
+             covariate coefficient leaves no closed-form shift. They are therefore estimated \
+             solely through the importance-weighted M-step, which is biased for \
+             weakly-identified parameters and may converge to the wrong value. This is \
+             expected for such a model and no reason to remove the transform: cross-check the \
+             fit against FOCEI, or hold the parameter FIX.",
+            with_eta.join(", ")
+        ));
+    }
+    out
 }
 
 /// Split the class-aware mu-ref θ into those the closed-form shift can move this
@@ -824,29 +892,25 @@ fn run_mcem(
         .flat_map(|g| g.theta_idx.iter().copied())
         .collect();
 
-    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
-    // handled only by the weighted M-step, which is biased for such parameters
-    // under importance sampling. ferx mu-references automatically, so the user
-    // only needs to attach a random effect.
+    // STRONG warning: any estimated (non-fixed) θ the closed-form mu-ref shift
+    // cannot move is handled only by the weighted M-step, which is biased for
+    // such parameters under importance sampling. One with no ETA at all needs
+    // one attached; one whose ETA is there in a non-mu-referenceable form
+    // (#1715) needs a cross-check instead.
     //
     // Assembled *after* the groups resolve, and from the resolved list: a
     // theta whose #619 group was dropped (weak IIV, a conflicting anchor, an
     // all-FIXed list) has no group moving it, so it belongs in this warning
     // (#918 review).
-    let thetas_without_eta =
-        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &cov_group_thetas, &[]);
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
-             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
-             fixed-effect-only parameter is estimated solely through the importance-weighted \
-             M-step, which is biased for weakly-identified parameters and may converge to the \
-             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
-             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
-             parameter FIX, or use FOCEI.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+    let (thetas_with_eta, thetas_without_eta) = partition_by_eta(
+        model,
+        non_fixed_unanchored_thetas(model, &init_params.theta_fixed, &cov_group_thetas, &[]),
+    );
+    warnings.extend(imp_unanchored_theta_warnings(
+        label,
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
 
     let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
         .into_iter()
@@ -2213,25 +2277,20 @@ fn run_mcem_mixture(
         .iter()
         .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
         .collect();
-    let (shift_disabled, thetas_without_eta): (Vec<String>, Vec<String>) =
+    let (shift_disabled, unanchored): (Vec<String>, Vec<String>) =
         // `&[]` for the covariate groups: `run_mcem_mixture` builds none — the
         // class draw would have to enter the group's prior term — so no theta
         // is anchored by one here.
-        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &[], &mu_ref_pinned)
+        non_fixed_unanchored_thetas(model, &init_params.theta_fixed, &[], &mu_ref_pinned)
             .into_iter()
             .filter(|n| !mixing_names.contains(n.as_str()))
             .partition(|n| anchor_names.contains(n.as_str()));
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
-             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
-             fixed-effect-only parameter is estimated solely through the importance-weighted \
-             M-step, which is biased for weakly-identified parameters and may converge to the \
-             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
-             optionally FIX, omega), or hold the parameter FIX, or use FOCEI.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+    let (thetas_with_eta, thetas_without_eta) = partition_by_eta(model, unanchored);
+    warnings.extend(imp_unanchored_theta_warnings(
+        label,
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
     if !shift_disabled.is_empty() {
         warnings.push(format!(
             "{label}: class typical value(s) [{}] carry an ETA, but their class-aware mu-ref \
@@ -3763,6 +3822,82 @@ mod tests {
         );
     }
 
+    /// #1715 end to end through IMPMAP's `fit()`: a Box-Cox typical value and
+    /// its shape θ are reported as carrying a non-mu-referenceable ETA, and only
+    /// the genuinely ETA-less `TVV` gets the "add an ETA" advice.
+    #[test]
+    fn impmap_boxcox_typical_value_is_not_reported_as_eta_less() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta LAMBDA(0.5, 0.05, 2.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  ETAT = (exp(ETA_CL)^LAMBDA - 1) / LAMBDA
+  CL   = TVCL * exp(ETAT)
+  V    = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP Ok")
+            .warnings;
+        let no_eta = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the ETA-less advisory, got {ws:?}"));
+        assert!(no_eta.contains("[TVV]"), "only TVV is ETA-less: {no_eta}");
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVCL, LAMBDA]"), "{with_eta}");
+    }
+
+    /// The same split on the mixture (`run_mcem_mixture`) site: a Box-Cox `V`
+    /// shared by both classes carries `ETA_V` but no mu-reference, so `TVV` is
+    /// named in the transformed-ETA advisory and not as ETA-less (#1715).
+    #[test]
+    fn impmap_mixture_reports_a_boxcox_typical_value_as_carrying_an_eta() {
+        let model = mix996_model("TVV * exp((exp(ETA_V)^0.5 - 1) / 0.5)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP Ok")
+            .warnings;
+        assert!(
+            !ws.iter().any(|w| w.contains("NO associated ETA")),
+            "TVV carries ETA_V, got {ws:?}"
+        );
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVV]"), "{with_eta}");
+    }
+
     #[test]
     fn impmap_mixture_active_shift_suppresses_the_class_anchor_advisory() {
         // The other side of the switch: with the shift active the class thetas
@@ -3925,7 +4060,7 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
+        let flagged = non_fixed_unanchored_thetas(&model, fixed, &[], &[]);
         assert!(
             flagged.contains(&"FRAC".to_string()),
             "FRAC flagged: {flagged:?}"
@@ -3933,6 +4068,108 @@ mod tests {
         assert!(!flagged.contains(&"TVCL".to_string()), "TVCL has ETA");
         assert!(!flagged.contains(&"TVV".to_string()), "TVV has ETA");
         assert!(!flagged.contains(&"TVFIX".to_string()), "TVFIX is FIX");
+    }
+
+    /// One required fragment per sentence of the IMP/IMPMAP transformed-ETA
+    /// advisory, so deleting any sentence fails
+    /// [`imp_transformed_eta_advisory_text`].
+    const IMP_WITH_ETA_SENTENCES: [&str; 4] = [
+        "enter an individual parameter that carries an ETA, but not as a mu-referenced typical value",
+        "needs `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA",
+        "estimated solely through the importance-weighted M-step",
+        "no reason to remove the transform: cross-check the fit against FOCEI, or hold the parameter FIX",
+    ];
+
+    /// #1715 on the IMP/IMPMAP side: a θ whose ETA is there in a
+    /// non-mu-referenceable form gets its own message, without the "STRONGLY
+    /// add an ETA" advice; an ETA-less θ keeps the pre-#1715 text. Every cell of
+    /// (with-ETA list, ETA-less list) is asserted.
+    #[test]
+    fn imp_transformed_eta_advisory_text() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(imp_unanchored_theta_warnings("IMPMAP", &[], &[]).is_empty());
+
+        let ws = imp_unanchored_theta_warnings("IMPMAP", &names(&["TVCL", "LAMBDA"]), &[]);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("IMPMAP: estimated parameter(s) [TVCL, LAMBDA] "),
+            "{w}"
+        );
+        for frag in IMP_WITH_ETA_SENTENCES {
+            assert!(w.contains(frag), "missing {frag:?} in: {w}");
+        }
+        assert!(!w.contains("NO associated ETA"), "{w}");
+        assert!(!w.contains("STRONGLY add an ETA"), "{w}");
+
+        let ws = imp_unanchored_theta_warnings("IMP", &[], &names(&["TVKA"]));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("IMP: estimated parameter(s) [TVKA] have NO associated ETA"),
+            "{w}"
+        );
+        assert!(w.contains("STRONGLY add an ETA"), "{w}");
+        assert!(!w.contains(IMP_WITH_ETA_SENTENCES[0]), "{w}");
+
+        let ws = imp_unanchored_theta_warnings("IMP", &names(&["LAMBDA"]), &names(&["TVKA"]));
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        let no_eta = ws.iter().find(|w| w.contains("NO associated ETA")).unwrap();
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap();
+        assert!(
+            no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"),
+            "{no_eta}"
+        );
+        assert!(
+            with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"),
+            "{with_eta}"
+        );
+    }
+
+    /// The covariate exponent `TH_WT` of the #1415 fixture shape shares `CL` with
+    /// `ETA_CL` but anchors no mu-reference (the conditional local defeats #619
+    /// detection), so it lands in the carries-an-ETA list, not the ETA-less one
+    /// whose advice is "add an ETA" (#1715).
+    #[test]
+    fn a_covariate_exponent_sharing_cl_with_its_eta_is_classified_as_carrying_one() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TH_WT(0.75, -2.0, 3.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  if (WT > 0) {
+    WTN = WT / 70.0
+  } else {
+    WTN = 1.0
+  }
+  CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        assert!(
+            model.covariate_mu_refs.is_empty(),
+            "premise: the conditional local defeats #619 detection, so TH_WT is un-anchored"
+        );
+        let (with_eta, without_eta) = partition_by_eta(
+            &model,
+            non_fixed_unanchored_thetas(&model, &model.default_params.theta_fixed, &[], &[]),
+        );
+        assert_eq!(with_eta, ["TH_WT"]);
+        assert!(without_eta.is_empty(), "{without_eta:?}");
     }
 
     #[test]
@@ -3957,7 +4194,7 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
+        let flagged = non_fixed_unanchored_thetas(&model, fixed, &[], &[]);
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
     }
 
@@ -4002,7 +4239,7 @@ mod tests {
         let dropped = theta_is_mu_ref_anchor_mask(&model, &[], &[]);
         assert!(!dropped[tvcl] && !dropped[th], "got {dropped:?}");
         let flagged =
-            non_fixed_thetas_without_eta(&model, &model.default_params.theta_fixed, &[], &[]);
+            non_fixed_unanchored_thetas(&model, &model.default_params.theta_fixed, &[], &[]);
         assert!(
             flagged.contains(&"TVCL".to_string()) && flagged.contains(&"TH_CRCL".to_string()),
             "a dropped group leaves its thetas M-step-only: {flagged:?}"
@@ -4011,7 +4248,7 @@ mod tests {
         // Group resolved: both are anchors and neither is flagged.
         let live = theta_is_mu_ref_anchor_mask(&model, &[tvcl, th], &[]);
         assert!(live[tvcl] && live[th], "got {live:?}");
-        let flagged = non_fixed_thetas_without_eta(
+        let flagged = non_fixed_unanchored_thetas(
             &model,
             &model.default_params.theta_fixed,
             &[tvcl, th],

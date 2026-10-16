@@ -586,7 +586,9 @@ A θ whose paired ω is negligible (`ω < 1e-3`) carries no mean-shift informati
 so it is routed to the weighted M-step with a warning, as in the single-population
 MCEM; so is a θ declared with a negative lower bound (identity-packed, so the
 additive log-scale shift is not its EM optimum). The fit also names any estimated
-θ that carries no ETA at all — the mixing thetas are excluded, since they are
+θ that no mu-reference shift moves — split, as in the single-population MCEM, into
+those with no ETA at all and those whose ETA is there in a form the shift cannot
+use (#1715). The mixing thetas are excluded, since they are
 owned by the mixing M-step.
 
 The per-subject proposal machinery is the same as the single-population MCEM:
