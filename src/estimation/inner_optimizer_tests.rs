@@ -4391,7 +4391,9 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
 /// fit whose reported EBEs are not a cold solve, so any drift from the solve's own `H` is a
 /// wrong `s` / `rsr` covariance. The init parameters put every fixture's EBEs off zero
 /// (asserted), and a second call at moved EBEs must change `H`, so a rebuild that ignored
-/// its `etas` (or `kappas`) could not pass.
+/// its `etas` (or `kappas`) could not pass. Each row also asserts the route it names:
+/// mutation — drop `GradientMethod::forced_fd` from `analytic_inner_common_bail` → the
+/// `warfarin fd` row dies on its premise instead of passing as a second analytic row.
 #[test]
 fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
     let cases = [
@@ -4477,6 +4479,23 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
             kappas.iter().any(|k| !k.is_empty()),
             "{what}: premise — κ̂ present exactly on the IOV fixtures"
         );
+        // The predicates `ebe_h_matrix` / `iov_ebe_h_matrix` branch on, so an `fd` row
+        // that stopped reaching the FD Jacobian would fail here, not pass as a second
+        // analytic row.
+        for subject in &population.subjects {
+            let analytic = if is_iov {
+                analytic_iov_inner_supported(&model, subject, &params)
+            } else {
+                analytic_inner_grad_supported(&model, subject)
+            };
+            assert_eq!(
+                analytic,
+                !fd,
+                "{what}: premise — subject {} takes the {} H route",
+                subject.id,
+                if fd { "FD" } else { "analytic" }
+            );
+        }
         let rebuilt = ebe_h_matrices_at(&model, &population, &params, &etas, &kappas);
         if capture {
             // The captured Jacobian comes out of the full `subject_sensitivities` pass, the
@@ -4489,7 +4508,10 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
                     a.iter().chain(b.iter()).all(|v| v.is_finite()),
                     "{what}: non-finite H"
                 );
-                worst = worst.max((a - b).abs().max() / b.abs().max());
+                // An all-zero `b` makes the ratio `0/0`, which `f64::max` would drop.
+                let rel = (a - b).abs().max() / b.abs().max();
+                assert!(rel.is_finite(), "{what}: relative H error {rel}");
+                worst = worst.max(rel);
             }
             assert!(
                 worst <= 1e-14,

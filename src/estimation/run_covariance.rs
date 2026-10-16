@@ -112,7 +112,13 @@ use nalgebra::{DMatrix, DVector};
 ///   (`inner_optimizer = Auto` on a fit recorded `lbfgs`) cannot be told from an unset one
 ///   and yields to the record; to override with a default value, clear or edit
 ///   `fit.scoring_settings` first. A fit without that record (a `.fitrx` written before
-///   #426) falls back to `fit.sir_settings.scoring`, then to `options` as given. The step
+///   #426) falls back to `fit.sir_settings.scoring`, then to `options` as given. The EBEs
+///   the step starts from are not among these settings: they are the fit's own, to within
+///   the `.fitrx` rounding, whatever the inner settings say (#2026). A non-default
+///   `inner_maxiter` / `inner_tol` / `inner_restarts` changes the cold re-solve they are
+///   compared against, which can only move the start onto the fit's EBEs, and it changes
+///   the reconvergence at every FD point; it does not change the central EBEs at which
+///   `covariance_method = s` / `rsr` take their scores. The step
 ///   settings are not recorded: on a fit that ran a non-default `covariance_method`,
 ///   default options compute the default step, not the fit's. `run_covariance_step` on
 ///   `options` is **ignored** — calling this function is itself the request to run the
@@ -346,8 +352,19 @@ const REPORTED_EBE_TOL: f64 = 1e-6;
 /// reloaded fit of that kind runs from the rounded EBEs and is close to the inline result,
 /// not bit-identical to it.
 ///
-/// A `[mixture]` fit reports its MIXEST-class EBEs from a solve with no cold/warm split,
-/// and keeps the cold solve.
+/// The selection above is FOCE's, but the test is on the EBEs, not on the engine. SAEM, VI,
+/// Gauss–Newton and importance-sampling fits report the EBEs of their own warm-started mode
+/// solves, which need not agree with a cold one either, and whenever they do not they take
+/// the reported branch too. Whether that brings them closer to their inline step is not
+/// measured (#1847).
+///
+/// A `[mixture]` fit keeps the cold triple, and the guard only saves work: the mixture
+/// step reads none of the three. Its `r` stencil and base point score the K-fold
+/// `mixture_ofv`, which solves each class's modes itself (`compute_covariance_for`), and
+/// its `s` / `rsr` rows come from `MixtureScoreContext`, which does the same
+/// (`assemble_score_cross_product`). So the guard skips rebuilding an `H` nothing reads,
+/// and no covariance can tell whether it is there: that removing it leaves the mixture
+/// rows of `tests/sir_scores_fitted_marginal.rs` green is by construction, not a gap.
 fn reported_ebe_inputs(
     fit: &FitResult,
     model: &CompiledModel,
@@ -379,13 +396,17 @@ fn reported_ebe_inputs(
     );
 
     let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
-    let reported_kappas = if fit.ebe_kappas.is_empty() {
+    // A model without κ reports none, and the cold solve's empty slots stand in for them.
+    // An IOV fit that reports none has no κ̂ to pair with its η̂: borrowing the cold κ̂
+    // would run the step from a state that is neither the fit's nor the cold solve's, so
+    // the empty list stays and fails the length check below.
+    let reported_kappas = if fit.ebe_kappas.is_empty() && model.n_kappa == 0 {
         cold_kappas.clone()
     } else {
         fit.ebe_kappas.clone()
     };
-    // A fit whose `subjects` do not line up with this population has no reported EBEs
-    // to run from; the cold solve is the only input there is.
+    // A fit whose `subjects` (or κ̂) do not line up with this population has no reported
+    // EBEs to run from; the cold solve is the only input there is.
     let comparable = reported.len() == cold_ehs.len()
         && reported_kappas.len() == cold_kappas.len()
         && reported.iter().all(|e| e.len() == model.n_eta)
@@ -1853,5 +1874,63 @@ mod reported_ebes {
             "dimension"
         );
         assert!(!reported_matches(&[], &cold), "subject count");
+    }
+
+    /// #2026 review: an IOV fit that reports η̂ off the cold solve but no κ̂ has no
+    /// consistent state to run from, so `reported_ebe_inputs` keeps the cold triple rather
+    /// than pair the reported η̂ with the cold κ̂. Both sides of the gate in one test: the
+    /// same η̂ with κ̂ reported runs from the reported pair, so a guard stuck on cold fails
+    /// the second half. Mutation: fall back to the cold κ̂ for any empty `ebe_kappas` (the
+    /// pre-review code) → the first half returns the reported η̂ and dies. Mutation: the
+    /// reported branch returns the cold κ̂ in place of the reported ones → the second half
+    /// dies, since its κ̂ are moved off the cold solve as well.
+    #[test]
+    fn an_iov_fit_reporting_no_kappas_keeps_the_cold_solve() {
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let (model, population, params) = (prep.parsed.model, prep.population, prep.init_params);
+        assert!(model.n_kappa > 0, "premise: an IOV model");
+        let options = FitOptions::default();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        let template = fit.subjects[0].clone();
+        // No subjects is not comparable, so this is the cold triple itself.
+        fit.subjects.clear();
+        let (cold_etas, _, cold_kappas) =
+            reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            cold_kappas.iter().any(|k| !k.is_empty()),
+            "premise: the cold solve has κ̂"
+        );
+
+        fit.subjects = population
+            .subjects
+            .iter()
+            .zip(&cold_etas)
+            .map(|(s, e)| crate::types::SubjectResult {
+                id: s.id.clone(),
+                eta: e.add_scalar(0.1),
+                ..template.clone()
+            })
+            .collect();
+
+        fit.ebe_kappas = Vec::new();
+        let (etas, _, kappas) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == cold_etas && kappas == cold_kappas,
+            "no κ̂ reported: the cold triple must be kept"
+        );
+
+        // κ̂ off the cold solve too, so the reported κ̂ and the cold κ̂ are told apart.
+        fit.ebe_kappas = cold_kappas
+            .iter()
+            .map(|occ| occ.iter().map(|k| k.add_scalar(0.1)).collect())
+            .collect();
+        assert!(fit.ebe_kappas != cold_kappas, "premise: reported κ̂ differ");
+        let (etas, _, kappas) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+        assert!(
+            etas == reported && kappas == fit.ebe_kappas,
+            "κ̂ reported: the step must run from the reported η̂ and κ̂"
+        );
     }
 }
