@@ -1233,8 +1233,20 @@ mod fitted_population_1783 {
     /// fingerprint hashes the labels and refuses first, asserted last.
     ///
     /// Mutation — drop the guard: every refused cell returns `Ok` with `Failed`.
+    ///
+    /// #1774: every refused cell is `E_FIT_INPUT_MISSING`, no block, the entry point
+    /// as context (`refused`). Mutation — `unrecorded_rule_refusal` back on
+    /// `EngineError::from`: each cell's code is `None`.
     #[test]
     fn unrecorded_rule_without_labels_is_refused() {
+        // The text, after asserting the code a missing record carries.
+        let err_of = |r: Result<FitResult, EngineError>| {
+            let e = r.map(|_| ()).expect_err("refused");
+            assert_eq!(e.code(), Some("E_FIT_INPUT_MISSING"), "{e}");
+            assert_eq!(e.block(), None, "{e}");
+            assert_eq!(e.context(), Some("run_covariance"), "{e}");
+            e.to_string()
+        };
         // No file read: `model = Some`, `population = Some(read)`.
         let f = dose();
         let m = &f.prep.parsed.model;
@@ -1304,7 +1316,7 @@ mod fitted_population_1783 {
             s.occasions.clear();
             s.dose_occasions.clear();
         }
-        let e = err_of(run_covariance(&c.fit, None, Some(&stripped), &c.opts));
+        let e = super::err_of(run_covariance(&c.fit, None, Some(&stripped), &c.opts));
         assert!(e.contains("not the one the fit was given"), "{e}");
     }
 }

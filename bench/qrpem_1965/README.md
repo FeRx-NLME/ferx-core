@@ -147,11 +147,112 @@ Phase 0 binary to the printed digit (`bitid.py runs runs_bitid`; 9 fits).
   across-seed SD is 60–90× smaller than SAEM's (0.01 vs 0.89).
 - **IMPMAP vs SAEM on cost.** IMPMAP is 30–100× slower than SAEM: 52 s against
   0.6 s on sparse_combined at K = 300.
-  - A likely large share of that cost, **not yet profiled**, is the weighted
-    θ/σ M-step: `theta_sigma_weighted_mstep` re-scores all K draws for every
-    subject on every BOBYQA evaluation.
-  - QRPEM instead uses only ~10 SIR-resampled draws per subject for this step
-    (Phoenix "Number of SIR samples", default 10).
-  - This is untested here, but it is the most promising speed lever.
+  - Most of that cost is the weighted θ/σ M-step (profiled in Phase 3 below).
+  - QRPEM uses only ~10 SIR-resampled draws per subject for this step
+    (Phoenix "Number of SIR samples", default 10). Tested in Phase 2 and
+    rejected: it is 2–6× faster but collapses a weakly identified σ.
 - **Sample count.** K is not a power of two, but Sobol points balance best at
-  K = 2^m. This is a free improvement for Phase 1 or Phase 2.
+  K = 2^m. Tested in Phase 2: no gain on the IS fits (see below).
+
+## Phase 2: Owen scrambling, and three ideas that lost
+
+Same four models, t₄ proposal, K = 300, 200 iterations with the last 50
+averaged, 10 seeds, scored by the common K = 20000 evaluator. Full table:
+`summary_phase2.md`. The toggles for the rejected arms existed only in an
+experiment binary; the harness keeps them as `PHASE2_ENV` for the record.
+
+Spread of the final −2LL across seeds:
+
+| model | pseudo-random | Sobol, shift | Sobol, Owen |
+|---|--:|--:|--:|
+| sparse_combined | 0.0099 | 0.0050 | 0.0037 |
+| three_cpt_iv | 0.0034 | 0.00072 | 0.00040 |
+| two_cpt_oral_cov | 0.0014 | 0.0021 | 0.00095 |
+| warfarin (noise floor) | 4.2e-5 | 6.7e-7 | 2.0e-6 |
+
+- **Owen scrambling: adopted.** It replaces the Cranley–Patterson shift
+  outright, with no option to keep the shift: it beats the shift on every model
+  above the warfarin noise floor, and on `two_cpt_oral_cov` the shift was worse
+  than pseudo-random. On a smooth test integrand (the unit test
+  `owen_scrambled_sobol_integrates_faster_than_shifted`) the RMSE at K = 1024 is
+  3.1e-4 against 5.2e-3 for the shift.
+- **Common random numbers (the same points every iteration): rejected.** The
+  per-iteration objective goes smooth, but the fixed points bias the
+  fit: the spread across seeds is 7–200× worse and the means move (e.g.
+  `two_cpt_oral_cov` Sobol+CRN −1199.628 against −1199.652).
+- **SIR M-step (10 resampled draws per subject, as in QRPEM): rejected.** It is
+  2.3–6× faster (sparse_combined 76 s → 12 s), but on sparse_combined the
+  additive σ collapsed to 0.0003 (from 1.63) on all 10 seeds and the mean −2LL
+  is 0.31 worse, about 3× the evaluator's Monte Carlo error. 30 resamples still
+  collapsed 1 seed in 10. Using SIR only during burn-in (full K while averaging)
+  was fine on the other three models (1.5–2× faster) but still collapsed σ on 5
+  of 10 sparse_combined seeds, and it never recovered. A weakly identified σ
+  under a noisy M-step walks down the log scale.
+- **Round K down to a power of two under Sobol (300 → 256): rejected.** On the
+  smooth test integrand Owen at K = 256 beats K = 300 by 3.4×, but on the IS
+  fits the spread was the same or slightly worse.
+
+## Phase 3: the MAP step does not dominate
+
+Profiled with macOS `sample` on `main` after #1997 (which re-solves every MAP
+from a cold start too). Share of the fit thread's wall time:
+
+| model | weighted M-step | IS draws | ISCALE | MAP |
+|---|--:|--:|--:|--:|
+| two_cpt_oral_cov | 70% | 19% | 10% | 8% |
+| sparse_combined | 83% | 14% | 8% | 2% |
+| three_cpt_iv | 70% | 17% | 9% | 11% |
+
+The M-step is `theta_sigma_weighted_mstep`, BOBYQA re-scoring all K draws per
+subject. Speeding up the MAP step would save at most 2–11%, so the Phase 3
+gate fails and the MAP-skipping work was not started. The M-step is the lever,
+and the cheap way to shrink it (SIR, above) is not safe.
+
+## Phase 4: should `impmap_sobol` default to on?
+
+Default IMPMAP settings (`impmap_auto` grows K from 300 up to 10000), with and
+without `impmap_sobol = true`, 10 seeds. Full table: `summary_phase4.md`.
+
+| model | spread, pseudo-random | spread, Sobol | evaluator MC error |
+|---|--:|--:|--:|
+| sparse_combined | 0.0044 | 0.0025 | 0.10 |
+| three_cpt_iv | 0.00012 | 0.00005 | 0.049 |
+| two_cpt_oral_cov | 0.00050 | 0.00078 | 0.24 |
+| warfarin | 4.2e-5 | 2.0e-6 | 0.016 |
+
+At these settings the wall time is dominated by how long `impmap_auto` runs,
+and the timings above could not separate the arms: serial and alternating, but
+on a shared machine (load 5–11), `three_cpt_iv` took 71/54/82 s pseudo-random
+against 49/46/54 s Sobol over seeds 1–3, and `sparse_combined` 202/484 s against
+258/488 s over seeds 1–2. At fixed K the cost is measurable (next section).
+
+**Decision: keep the default off.** At default settings the spread across seeds
+is already 20–500× below the Monte Carlo error of the −2LL itself, so halving it
+buys nothing a user can see, and on `two_cpt_oral_cov` Sobol widened it. Turning
+it on by default would change every seeded IMPMAP fit and re-pin every anchor
+for that. Sobol stays the recommendation for a fixed, small K.
+
+## Old vs new Sobol on an idle machine
+
+The merge-base binary (`ac14b56a`, Cranley–Patterson shift) against this
+branch (Owen), at t₄, K = 300, 200 iterations, 10 seeds. One fit at a time on 2
+threads, binaries alternated seed by seed, load 4–5 (an idle desktop plus the
+fit). Tables: `summary_ovn_old.md`, `summary_ovn_new.md`.
+
+| model | spread, shift | spread, Owen | wall s, shift | wall s, Owen |
+|---|--:|--:|--:|--:|
+| sparse_combined | 0.0050 | 0.0037 | 60.6 | 60.8 |
+| three_cpt_iv | 0.00072 | 0.00040 | 4.13 | 4.09 |
+| two_cpt_oral_cov | 0.0021 | 0.00095 | 4.76 | 4.78 |
+| warfarin | 6.7e-7 | 2.0e-6 | 1.31 | 1.31 |
+
+- The spreads reproduce the Phase 2 numbers to every printed digit: the fits
+  are deterministic given the seed.
+- Owen costs nothing over the shift (medians within 1%).
+- Control: the pseudo-random arm (seeds 1–3) gives byte-identical fit YAML on
+  both binaries apart from the wall-time fields, so Sobol is the only change.
+- **Sobol itself is not free at fixed K.** In both binaries the Sobol fits ran
+  8–18% longer than the pseudo-random ones over the same seeds 1–3:
+  sparse_combined 51 → 60 s, three_cpt_iv 3.8 → 4.1 s, two_cpt_oral_cov
+  4.3 → 4.8 s, warfarin 1.13 → 1.33 s. This predates this branch; it was not
+  profiled.

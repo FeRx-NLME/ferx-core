@@ -92,11 +92,15 @@ enum ModelFileUse {
 /// Read, hash and parse `fit.model_path` from **one** read of the file, so the
 /// hashed bytes, the parsed declarations and the text `bind_from_fit` compiles are
 /// the same version of it.
+///
+/// A failure is coded by `ferx check`'s model-read classifier (#1774): a file that
+/// cannot be read `E_MODEL_READ`, one that does not parse the parse's code, and one
+/// edited since the fit `E_FIT_INPUT_CHANGED`.
 fn read_model_file(
     fit: &FitResult,
     path: &str,
     why: ModelFileUse,
-) -> Result<(ParsedModel, String), String> {
+) -> Result<(ParsedModel, String), EngineError> {
     // In the reader-settings cell the caller holds a model already, so a failure
     // here says why the file is still needed, and how to not need it.
     let because = match why {
@@ -112,7 +116,7 @@ fn read_model_file(
         "",
         &because,
     )
-    .map_err(crate::io::model_source::ModelSourceError::into_message)?;
+    .map_err(|e| EngineError::from_diagnostic(crate::api::model_source_diagnostic(e)))?;
     Ok((src.parsed, src.text))
 }
 
@@ -238,8 +242,9 @@ fn check_lent_stats(
     population: &Population,
     supplied: bool,
     with_model_file: bool,
-) -> Result<(), String> {
-    let mismatch = crate::api::check_stats_on(m, population)?;
+) -> Result<(), EngineError> {
+    let mismatch =
+        crate::api::check_stats_on(m, population).map_err(EngineError::from_diagnostic)?;
     let Some(d) = mismatch else {
         return Ok(());
     };
@@ -264,7 +269,7 @@ fn check_lent_stats(
         "`prepare_run` on the fit's model and data files. The model has a theta level \
          block, which `bind_covariate_stats` does not bind."
     };
-    Err(format!(
+    Err(crate::api::fit_input_model(format!(
         "this fit records no data-derived bindings (an older `.fitrx`), so the \
          supplied model's covariate statistics were checked against {against}, and they \
          differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
@@ -275,7 +280,7 @@ fn check_lent_stats(
         cov = d.covariate,
         mv = d.model,
         dv = d.data,
-    ))
+    )))
 }
 
 /// Resolve the model and population `entry` (`"run_sir"` / `"run_covariance"`)
@@ -326,11 +331,17 @@ fn check_lent_stats(
 /// | neither (an older `.fitrx`) | the model file's | refused | no |
 ///
 /// Every refusal is attributed to `entry` as the [`EngineError`]'s context, so it
-/// prints as `"{entry}: {message}"`; a refusal `ferx check` codes
-/// (`E_COV_LEVEL_UNKNOWN`, `E_COVSTAT_UNRESOLVED`, `E_ENDPOINT_UNROUTED`,
-/// `E_THETA_LEVELS_DATA_UNBOUND`) keeps its diagnostic (#1746), and a population
-/// that is not the fit's carries `E_POPULATION_MISMATCH`, which has no `ferx check`
-/// counterpart (#1813).
+/// prints as `"{entry}: {message}"`, and every one carries a code (#1774). A refusal
+/// `ferx check` codes (`E_COV_LEVEL_UNKNOWN`, `E_COVSTAT_UNRESOLVED`,
+/// `E_ENDPOINT_UNROUTED`, `E_THETA_LEVELS_DATA_UNBOUND`) keeps its diagnostic
+/// (#1746), and so does a failed re-read of the model or data file, coded by `ferx
+/// check`'s own read classifiers (`E_MODEL_READ`, the parse codes, `E_DATA`,
+/// `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` on `data_selection`).
+/// The rest have no `ferx check` counterpart: a population that is not the fit's
+/// (`E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, #1813), an input neither
+/// passed nor recorded (`E_FIT_INPUT_MISSING`), a file changed since the fit
+/// (`E_FIT_INPUT_CHANGED`), a model that is not the fit's (`E_FIT_INPUT_MODEL`, and
+/// `E_THETA_LENGTH` for its θ count), from `crate::api::entry_refusals`.
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult,
     model: Option<&'a CompiledModel>,
@@ -367,7 +378,7 @@ fn resolve_fit_inputs_unattributed<'a>(
     // `iov_column` the fit read with, so they need no refusal.
     if let (Some(m), None, None) = (model, population, settings) {
         if m.n_kappa > 0 {
-            return Err(EngineError::from(
+            return Err(crate::api::fit_input_missing(
                 "caller-supplied `model` for an IOV (n_kappa > 0) model \
                  requires `population` to also be supplied — the model carries no \
                  `iov_column`, and per-occasion kappas are parsed with it.",
@@ -380,11 +391,13 @@ fn resolve_fit_inputs_unattributed<'a>(
 
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
-        let path = fit.model_path.as_deref().ok_or(
-            "no model supplied and fit.model_path is None. \
-             Either pass `model = Some(&model)` or re-fit via fit_from_files \
-             so the path is recorded.",
-        )?;
+        let path = fit.model_path.as_deref().ok_or_else(|| {
+            crate::api::fit_input_missing(
+                "no model supplied and fit.model_path is None. \
+                 Either pass `model = Some(&model)` or re-fit via fit_from_files \
+                 so the path is recorded.",
+            )
+        })?;
         file = Some(read_model_file(fit, path, ModelFileUse::Rebuild)?);
     } else if population.is_none() && settings.is_none() {
         if let Some(path) = fit.model_path.as_deref() {
@@ -396,15 +409,21 @@ fn resolve_fit_inputs_unattributed<'a>(
     let mut population: Cow<'a, Population> = match population {
         Some(p) => Cow::Borrowed(p),
         None => {
-            let path = fit.data_path.as_deref().ok_or(
-                "no population supplied and fit.data_path is None. \
-                 Either pass `population = Some(&pop)` or re-fit via fit_from_files \
-                 so the path is recorded.",
-            )?;
+            let path = fit.data_path.as_deref().ok_or_else(|| {
+                crate::api::fit_input_missing(
+                    "no population supplied and fit.data_path is None. \
+                     Either pass `population = Some(&pop)` or re-fit via fit_from_files \
+                     so the path is recorded.",
+                )
+            })?;
+            // A data-file failure is coded as `ferx check` codes it (#1774): one
+            // classifier, `data_read_diagnostic`, for the hash's read and the reader's.
+            let read_failed =
+                |e: String| EngineError::from_diagnostic(crate::api::data_read_diagnostic(&e));
             if let Some(expected) = &fit.data_hash {
-                let actual = sha256_file(Path::new(path))?;
+                let actual = sha256_file(Path::new(path)).map_err(read_failed)?;
                 if &actual != expected {
-                    return Err(EngineError::from(format!(
+                    return Err(crate::api::fit_input_changed(format!(
                         "data hash mismatch for {path}. Stored: {expected}, current: \
                          {actual}. The dataset has changed since the fit was produced — \
                          refusing to run against stale data."
@@ -420,13 +439,18 @@ fn resolve_fit_inputs_unattributed<'a>(
                         (None, Some((parsed, _))) => &parsed.model,
                         (None, None) => unreachable!("model = None always reads the model file"),
                     };
-                    crate::api::read_population_with(router, s, path)?.0
+                    crate::api::read_population_with_diag(router, s, path)
+                        .map_err(EngineError::from_diagnostic)?
+                        .0
                 }
                 (None, Some((parsed, _)), _) => {
-                    crate::api::read_population_as_fitted(parsed, path)?.0
+                    crate::api::read_population_as_fitted(parsed, path)
+                        .map_err(EngineError::from_diagnostic)?
+                        .0
                 }
                 (None, None, Some(m)) => {
-                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])?
+                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])
+                        .map_err(read_failed)?
                 }
                 (None, None, None) => unreachable!("model = None always reads the model file"),
             };
@@ -471,7 +495,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         }
         Some(m) => {
             if !fit.data_bindings.is_empty() && m.data_bindings() != &fit.data_bindings {
-                return Err(EngineError::from(
+                return Err(crate::api::fit_input_model(
                     "the supplied model is not bound with this fit's bindings: its \
                      data-derived bindings (level layout, covariate statistics) differ from \
                      the fit's `data_bindings`. Pass `model = None` to rebuild it from the \
@@ -503,7 +527,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         warnings,
     };
     if inputs.model().n_theta != fit.theta.len() {
-        return Err(EngineError::from(format!(
+        return Err(crate::api::theta_length(format!(
             "the model has n_theta = {} but the fit has {} θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with \
              the fit's `data_bindings`).",
@@ -589,7 +613,7 @@ fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>)
          occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
          ran with, or refit so the rule is recorded.",
     );
-    EngineError::from(msg)
+    crate::api::fit_input_missing(msg)
 }
 
 /// A rule in the DSL's spelling: `dose`, `time(24, 48)`.
@@ -1054,6 +1078,10 @@ pub(crate) fn resolve_scoring_options(fit: &FitResult, options: &FitOptions) -> 
 #[cfg(test)]
 #[path = "fit_inputs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fit_inputs_codes_tests.rs"]
+mod codes_tests;
 
 /// The #1619 / #1622 fixture, shared by the `run_covariance` and `run_sir` tests:
 /// the analytic two-compartment oral model on `data/two_cpt_oral_cov.csv` (30

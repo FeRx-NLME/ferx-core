@@ -207,6 +207,9 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
+    if model.has_nested_levels() {
+        return "nested variability levels";
+    }
     if analytic_inner_common_bail(model) {
         return "model-level analytic inner fallback";
     }
@@ -479,8 +482,11 @@ pub struct EbeResult {
     /// sensitivity provider can produce it.  Laplace/AGQ may reuse this instead
     /// of immediately repeating the same `Dual2` evaluation.
     pub(crate) terminal_hessian: Option<DMatrix<f64>>,
-    /// True when the optimizer (BFGS or Nelder-Mead) met its tolerance criterion.
-    /// False on iteration-limit exit regardless of which optimizer was used.
+    /// True when the returned η̂ is certified stationary: BFGS met `gnorm < tol` (or its
+    /// objective-stall stop on a noise-floored objective), or a Nelder–Mead fallback result
+    /// passed `FallbackCertifier`'s stationarity tests. Nelder–Mead's own simplex-spread
+    /// stop never sets it (#1527). False on iteration-limit exit regardless of which
+    /// optimizer was used.
     pub converged: bool,
     /// True when the BFGS optimizer failed and Nelder-Mead was invoked as fallback.
     pub used_fallback: bool,
@@ -940,6 +946,219 @@ fn cold_eta_seed(
     eta
 }
 
+/// Certifies an EBE that a derivative-free search (Nelder–Mead) returned, on **stationarity at
+/// the returned point** — the question the BFGS path asks of its own result (#1527).
+///
+/// Nelder–Mead stops when its simplex's objective spread falls under `tol`: an absolute spread
+/// of the objective, compared against a tolerance the BFGS path applies to a *gradient norm*.
+/// The two are in different units — on a bowl of curvature `c` a simplex with spread `< tol`
+/// sits at `‖∇‖ ≈ 2√(c·tol)`, ~1e-2 at the default `inner_tol = 1e-5` — so the spread is a fine
+/// *stopping* rule and no certificate at all. Measured on `main` before this change, every
+/// Nelder–Mead-recovered EBE across the bundled examples reported `converged = true`, at
+/// gradient norms up to 2.4e7, which left `InnerLoopStats::n_unconverged`,
+/// `max_unconverged_frac` and AGQ's per-subject acceptance structurally blind to them.
+///
+/// [`Self::certify`] accepts the returned point by the first of three tests that holds:
+///
+/// 1. **Gradient norm** — `grad_norm_metric(∇l(η̂), stop_precond) < tol`, with the same gradient
+///    closure and metric the BFGS stop used (so FREM's preconditioned stop, #406, stays
+///    authoritative). The point is returned unchanged.
+/// 2. **Newton step** — on an exact objective only: the Hessian of the same gradient closure
+///    (central differences) is positive definite, and either
+///    * the Newton step `‖H⁻¹∇l(η̂)‖₂ < tol` — η̂ lies within `tol` of its local mode, test 1
+///      measured in η units: the two agree at unit curvature and part along stiff directions,
+///      where a point ~1e-8 from the mode can carry a gradient far above `tol`; or
+///    * the decrease that step predicts, `½∇ᵀH⁻¹∇`, is at or below `INNER_FTOL_REL·(1 + |f|)`
+///      — the change the objective-stall stop already treats as flat — so nothing left to gain
+///      is resolvable in the objective at all. This arm is what makes the certificate hold
+///      at tight `inner_tol`, where the remaining distance to the mode falls below what any
+///      line search can resolve.
+///
+///    Both describe the subjects whose BFGS failed *because* the objective could not resolve
+///    the last decrease (measured 1e-22 … 1e-10 on most fallback points across the bundled
+///    examples), which is why they reached the fallback at all; reporting them unconverged
+///    hands `max_unconverged_frac` subjects that are at their mode — a step-only test made
+///    the EBE guard reject every trial of the Schnider NONMEM anchor fit
+///    (`tests/schnider_propofol_nonmem.rs`, `inner_tol = 1e-8`; `W_NO_FEASIBLE_EVAL`). An
+///    indefinite `H` (a saddle or a non-convex region) fails the test. The point is returned
+///    unchanged. Skipped on a numerical objective (below), where a finite-difference Hessian
+///    of a noise-floored gradient is not trustworthy and the stall-armed polish decides.
+/// 3. **Gradient polish** — the inner BFGS / L-BFGS driver run from η̂ (never Nelder–Mead, even
+///    under `inner_optimizer = nelder_mead`), whose own exit is the certificate. It carries the per-iterate objective-stall predicate
+///    (`stall_at`, #555 / #1521), so a subject whose objective is numerical (an ODE, or a
+///    transit/IG closed form rerouted to its ODE twin) is certified by the stall stop at its
+///    noise floor rather than held to a `tol` below it. The polished point replaces η̂ only
+///    when the polish certifies it (it is never worse: every accepted step is an Armijo
+///    decrease), so the flag always belongs to the returned point (the #1337 rule).
+///
+/// A point that passes none of them is returned unchanged and reported **unconverged**.
+pub(crate) struct FallbackCertifier<'a> {
+    /// The inner search's own gradient closure — the one BFGS used, so the two agree.
+    pub(crate) grad: &'a dyn Fn(&[f64]) -> Vec<f64>,
+    /// BFGS `H0` preconditioner (FREM only; `None` → identity).
+    pub(crate) precond: Option<&'a [f64]>,
+    /// Stopping-metric preconditioner, as in the BFGS `gnorm < tol` test (FREM only).
+    pub(crate) stop_precond: Option<&'a [f64]>,
+    /// Per-iterate objective-stall predicate (see [`inner_stall_enabled_at`]).
+    pub(crate) stall_at: &'a dyn Fn(&[f64]) -> bool,
+    pub(crate) n: usize,
+    pub(crate) max_iter: usize,
+    pub(crate) tol: f64,
+}
+
+impl FallbackCertifier<'_> {
+    /// Whether `x` is a certified stationary point of `obj`; may move `x` to a polished,
+    /// certified point that is no worse (see the type's docs). A non-finite `x` is never
+    /// certified.
+    fn certify(&self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>) -> bool {
+        self.certify_within(obj, x, &|_| true)
+    }
+
+    /// A Nelder–Mead recovery from `seed`, certified: NM runs on its own stopping rule, then
+    /// [`Self::certify_within`] decides the flag (and may polish the point). The FREM
+    /// re-centring arm and both runaway-EBE guards recover through this, so no Nelder–Mead
+    /// end point reaches a caller with the simplex spread as its certificate.
+    fn nelder_mead_recover(
+        &self,
+        obj: &dyn Fn(&[f64]) -> f64,
+        seed: Vec<f64>,
+        admissible: &dyn Fn(&[f64]) -> bool,
+    ) -> (Vec<f64>, bool) {
+        let mut x = seed;
+        nelder_mead_minimize(obj, &mut x, self.n, self.max_iter * 5, self.tol);
+        let ok = self.certify_within(obj, &mut x, admissible);
+        (x, ok)
+    }
+
+    /// [`Self::certify`], accepting a polished point only when `admissible` holds there. The
+    /// runaway-EBE guard (#958) uses it: it recovers with Nelder–Mead precisely because the
+    /// gradient there may not be trustworthy, so a gradient polish that marches back past the
+    /// runaway limit must not be the point it returns.
+    fn certify_within(
+        &self,
+        obj: &dyn Fn(&[f64]) -> f64,
+        x: &mut Vec<f64>,
+        admissible: &dyn Fn(&[f64]) -> bool,
+    ) -> bool {
+        if !x.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let g = (self.grad)(x);
+        // `is_finite` before the comparison: a NaN gradient must not certify (and
+        // `NaN < tol` is already false, but an infinite metric from a finite-but-huge
+        // component should read as "not stationary", which it does).
+        let gnorm = grad_norm_metric(&g, self.stop_precond);
+        if gnorm.is_finite() && gnorm < self.tol {
+            return true;
+        }
+        if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g) {
+            return true;
+        }
+        // A gradient driver, whatever `inner_optimizer` selects: under `nelder_mead` the
+        // fit-scoped dispatch (`inner_minimize_with_grad`) would hand the polish straight back
+        // to Nelder–Mead, whose exit is the simplex spread this certificate exists to replace
+        // (#1527 review). `inner_use_lbfgs` keeps an explicit `bfgs` / `lbfgs` choice and the
+        // `auto` dimension rule, and sends `nelder_mead` to dense BFGS.
+        let mut polished = x.clone();
+        let ok = if inner_use_lbfgs(self.n) {
+            lbfgs_core(
+                obj,
+                self.grad,
+                &mut polished,
+                self.n,
+                self.max_iter,
+                self.tol,
+                self.precond,
+                self.stop_precond,
+                self.stall_at,
+                false,
+            )
+        } else {
+            dense_bfgs_core(
+                obj,
+                self.grad,
+                &mut polished,
+                self.n,
+                self.max_iter,
+                self.tol,
+                self.precond,
+                None,
+                self.stop_precond,
+                self.stall_at,
+                false,
+            )
+        };
+        if !ok || !polished.iter().all(|v| v.is_finite()) || !admissible(&polished) {
+            return false;
+        }
+        // No objective comparison against the handed-in point: both drivers take only steps
+        // that pass the Armijo test along a descent direction (`backtracking_line_search`), so
+        // a polished point is never worse than its start. A gate re-checking that could not
+        // fail, and no test could pin it (#1527 mutation sweep).
+        *x = polished;
+        true
+    }
+
+    /// Test 2 of [`Self::certify`]: the Hessian of `grad` at `x` (symmetrised central
+    /// differences, `2n` gradient evaluations) is positive definite, and either the Newton
+    /// step `‖H⁻¹g‖₂` is below `tol` or the decrease it predicts, `½gᵀH⁻¹g`, is at or below
+    /// the objective's resolution `INNER_FTOL_REL·(1 + |f|)`. Any non-finite entry, or a
+    /// failed Cholesky, is "not certified".
+    fn newton_certifies(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64], g: &[f64]) -> bool {
+        let n = x.len();
+        if n == 0 || !g.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let mut h = DMatrix::<f64>::zeros(n, n);
+        let mut probe = x.to_vec();
+        for j in 0..n {
+            let step = NEWTON_CERT_FD_STEP * (1.0 + x[j].abs());
+            probe[j] = x[j] + step;
+            let gp = (self.grad)(&probe);
+            probe[j] = x[j] - step;
+            let gm = (self.grad)(&probe);
+            probe[j] = x[j];
+            for i in 0..n {
+                h[(i, j)] = (gp[i] - gm[i]) / (2.0 * step);
+            }
+        }
+        let h = (&h + h.transpose()) * 0.5;
+        if !h.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let Some(chol) = h.cholesky() else {
+            return false;
+        };
+        let gv = DVector::from_column_slice(g);
+        let newton = chol.solve(&gv);
+        let step_norm = newton.norm();
+        if !step_norm.is_finite() {
+            return false;
+        }
+        if step_norm < self.tol {
+            return true;
+        }
+        // The resolution arm. `½gᵀH⁻¹g` is what a full Newton step would still gain; when it
+        // is no larger than the relative change the objective-stall stop already treats as
+        // *flat* (`INNER_FTOL_REL`, #555), no step from here is distinguishable from rounding
+        // in the objective, and the point is a mode to the precision the objective defines.
+        // This is what makes the certificate independent of `tol`: at `inner_tol = 1e-8` a
+        // well-curved η sits ~1e-7 from its mode before the line search can no longer resolve
+        // a decrease, so a step test alone reported the converged subjects of the Schnider
+        // NONMEM anchor fit unconverged and the EBE guard rejected its start (#1527).
+        let f = obj(x);
+        let decrement = 0.5 * gv.dot(&newton);
+        f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs())
+    }
+}
+
+/// Relative central-difference step for the Hessian in the fallback's Newton-step certificate
+/// ([`FallbackCertifier`] test 2): `h_j = NEWTON_CERT_FD_STEP·(1 + |η_j|)`. The certificate needs
+/// `H` only to the accuracy that decides `‖H⁻¹∇‖ < tol` — a few significant digits — and this
+/// step sits well clear of both the truncation (`O(h²)`) and rounding (`O(ε/h)`) regimes for the
+/// analytic and finite-difference inner gradients.
+const NEWTON_CERT_FD_STEP: f64 = 1e-5;
+
 /// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
 /// BFGS reports non-convergence. Keeps the lower-objective of the BFGS partial and a single
 /// Nelder–Mead restart, so a `false`-on-a-converged search (gradient-noise floor / line-
@@ -956,22 +1175,21 @@ fn cold_eta_seed(
 /// Returns `(eta, converged)`. The **value** is the lower-objective of the BFGS partial
 /// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
 /// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
-/// gnorm-verified. `converged` is the Nelder–Mead flag **of the run that ended at the
-/// returned point** (PR #1337 review): when the restart wins it is that restart's flag;
-/// when the partial wins, the partial — which its own BFGS run did *not* certify — is
-/// polished by an NM started from it, and that run's end point and flag are returned (the
-/// end point is never worse than the partial). Returning the restart's flag with the
-/// partial's point reported a converged EBE whenever NM had converged in a *worse* basin,
-/// which bypassed `max_unconverged_frac` and AGQ's per-subject acceptance. A non-finite
-/// `obj(partial)` (NaN/∞) makes the partial unusable so the NM result is taken.
+/// gnorm-verified. When the partial wins it is first polished by an NM started from it
+/// (never worse than the partial: NM keeps its best vertex).
+///
+/// `converged` is [`FallbackCertifier::certify`] **of the returned point** — stationarity,
+/// not Nelder–Mead's simplex spread (#1527). Until #1527 it was the NM flag of the run that
+/// ended at the returned point (which PR #1337 had already corrected from "the restart's flag
+/// with the partial's point"), and an NM flag certifies an objective spread, not a mode.
+/// A non-finite `obj(partial)` (NaN/∞) makes the partial unusable so the NM result is taken.
 fn argmin_inner_fallback(
     obj: &dyn Fn(&[f64]) -> f64,
     partial: &[f64],
     cold_seed: &[f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
+    cert: &FallbackCertifier,
 ) -> (Vec<f64>, bool) {
+    let (n, max_iter, tol) = (cert.n, cert.max_iter, cert.tol);
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
     let warm = ebe_warm_start_enabled() && partial_usable;
@@ -980,37 +1198,33 @@ fn argmin_inner_fallback(
     } else {
         cold_seed.to_vec()
     };
-    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
+    // NM's own `frange < tol` exit is its stopping rule only; certification is below.
+    nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
     let f_nm = obj(&eta_nm);
     // Keep the partial unless NM is *strictly* better. Written as a positive comparison so a
     // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
     // partial is kept.
     let nm_strictly_better = f_nm < partial_f;
-    if !partial_usable || nm_strictly_better {
-        return (eta_nm, nm_ok);
-    }
-    // The partial wins on objective. Its own BFGS run did not certify it, and `nm_ok`
-    // describes a point we are not returning (NM may well have *converged* — in a worse
-    // basin), so it must not be reported as this point's status: `EbeResult.converged`
-    // feeds `max_unconverged_frac` and AGQ's per-subject acceptance (PR #1337 review).
-    // Certify the partial the same derivative-free way NM certifies its own result: a
-    // second NM started *from the partial*. Its end point is what is returned (never
-    // worse than the partial, NM keeps its best vertex) and its flag is the flag — a
-    // genuine mode collapses the simplex within `tol` in a few iterations, a
-    // non-stationary partial keeps descending and reports `false` when the budget ends.
-    // Under `ebe_warm_start` the single NM above already ran from the partial and ended
-    // at its value, so that run is the certification and nothing is re-run.
-    if warm {
-        return (partial.to_vec(), nm_ok);
-    }
-    let mut polished = partial.to_vec();
-    let polished_ok = nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol);
-    let f_polished = obj(&polished);
-    if f_polished.is_finite() && f_polished <= partial_f {
-        (polished, polished_ok)
+    let mut best = if !partial_usable || nm_strictly_better {
+        eta_nm
+    } else if warm {
+        // Under `ebe_warm_start` the single NM above already ran from the partial and did
+        // not beat it, so there is nothing further to polish with NM.
+        partial.to_vec()
     } else {
-        (partial.to_vec(), false)
-    }
+        // The partial wins on objective against a cold restart: polish it with an NM
+        // started *from the partial*, keeping the polish only if it is no worse.
+        let mut polished = partial.to_vec();
+        nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol);
+        let f_polished = obj(&polished);
+        if f_polished.is_finite() && f_polished <= partial_f {
+            polished
+        } else {
+            partial.to_vec()
+        }
+    };
+    let ok = cert.certify(obj, &mut best);
+    (best, ok)
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -1453,6 +1667,23 @@ fn find_ebe_impl(
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // A nested-level subject that was never given its cells (#1082): refused, never
+    // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
+    // from averaging the placeholder into an objective.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1e20,
+            kappas: Vec::new(),
+            hard_reject: true,
+        };
+    }
+
     // ── IOV branch ─────────────────────────────────────────────────────────
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
@@ -1802,6 +2033,17 @@ fn find_ebe_solve(
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
     let bfgs_converged = result;
+    // Every Nelder–Mead end point below is certified on stationarity with the gradient,
+    // metric and stall predicate this BFGS used — never on NM's own simplex spread (#1527).
+    let cert = FallbackCertifier {
+        grad: &agrad,
+        precond: precond.as_deref(),
+        stop_precond,
+        stall_at: &stall_at,
+        n: n_eta,
+        max_iter,
+        tol,
+    };
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         // A final BFGS update can meet the requested tolerance exactly as the iteration
@@ -1818,7 +2060,7 @@ fn find_ebe_solve(
         } else {
             let cold = cold_eta_seed(model, subject, params, n_eta);
             let outcome = if enable_stall {
-                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, &cert);
                 eta = best;
                 (ok, true)
             } else if model.frem_config.is_some() {
@@ -1830,9 +2072,10 @@ fn find_ebe_solve(
                 // point it returned had its covariate etas still at zero and its PK etas carrying
                 // the resulting block-Ω⁻¹ force.
                 let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
-                eta = if warm { partial } else { cold };
-                let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
-                (nm_ok, true)
+                let seed = if warm { partial } else { cold };
+                let (recovered, ok) = cert.nelder_mead_recover(&obj, seed, &|_| true);
+                eta = recovered;
+                (ok, true)
             } else {
                 // Non-FREM exact objective (#378): a BFGS "failure" is often a *near-stationary*
                 // partial that merely could not reach a tightened `inner_tol` — on a multimodal
@@ -1844,7 +2087,7 @@ fn find_ebe_solve(
                 // ODE↔analytical marginal-OFV divergence in #378. Keep the lower-objective of
                 // {partial, NM} instead, so a good partial is never traded for a worse NM basin —
                 // the same guard the ODE path already uses (#555).
-                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, &cert);
                 eta = best;
                 (ok, true)
             };
@@ -1974,14 +2217,17 @@ fn find_ebe_solve(
     // or merely extreme.
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_eta as f64;
     if ebe_prior_maha(&eta, &params.omega) > runaway_limit {
-        let mut cold = vec![0.0; n_eta];
-        let nm_ok = nelder_mead_minimize(&obj, &mut cold, n_eta, max_iter * 5, tol);
+        // Certified on stationarity (#1527), and a certifying polish may not march back past
+        // the runaway limit — the gradient is exactly what this guard does not trust.
+        let (cold, cold_ok) = cert.nelder_mead_recover(&obj, vec![0.0; n_eta], &|e| {
+            ebe_prior_maha(e, &params.omega) <= runaway_limit
+        });
         if cold.iter().all(|v| v.is_finite()) {
             let cold_nll = obj(&cold);
             if cold_nll < nll {
                 nll = cold_nll;
                 eta = cold;
-                ebe_converged = nm_ok;
+                ebe_converged = cold_ok;
                 used_fallback = true;
             }
         }
@@ -2089,12 +2335,44 @@ fn find_ebe_iov(
 
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
-    let n_flat = stacked_width(n_eta, n_kappa, k_occasions);
+    // #1082: under nested levels the search runs over the compact vector — one κ block
+    // per group of each level — and each candidate is expanded to the per-cell κ vectors
+    // the prediction reads. Without nested levels the compact vector *is* the
+    // per-occasion stack, and every line below reads exactly as before.
+    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    let n_flat = match &nested {
+        Some(n) => n.n_compact(),
+        None => stacked_width(n_eta, n_kappa, k_occasions),
+    };
+    let to_kappas = |p: &[f64]| -> Vec<Vec<f64>> {
+        match &nested {
+            Some(n) => n.expand(p),
+            None => (0..k_occasions)
+                .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
+                .collect(),
+        }
+    };
 
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
-    let mut x = iov_initial_vector(n_eta, n_flat, &mu, eta_init);
+    // A joint warm start arrives in the per-occasion layout (`η̂` then each cell's κ̂,
+    // as `EbeResult` reports them); under nested levels it is compacted first.
+    let nested_warm: Option<Vec<f64>> = match (&nested, eta_init) {
+        (Some(n), Some(w)) if w.len() == stacked_width(n_eta, n_kappa, k_occasions) => {
+            let cells: Vec<&[f64]> = (0..k_occasions)
+                .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
+                .collect();
+            n.compact(&w[..n_eta], &cells)
+        }
+        (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
+        _ => None,
+    };
+    let warm = match &nested {
+        Some(_) => nested_warm.as_deref(),
+        None => eta_init,
+    };
+    let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -2122,9 +2400,7 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(pi, mi)| pi - mi)
             .collect();
-        let kappas: Vec<Vec<f64>> = (0..k_occasions)
-            .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
-            .collect();
+        let kappas = to_kappas(p);
         individual_nll_iov_frozen(
             model,
             subject,
@@ -2179,6 +2455,11 @@ fn find_ebe_iov(
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
         }
+        if nested.is_some() {
+            // The predicate reads the per-occasion stack the prediction sees.
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
         inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
     };
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
@@ -2229,8 +2510,9 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(p, m)| p - m)
             .collect();
-        let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-            .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+        let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
             .collect();
         // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
         // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
@@ -2267,6 +2549,18 @@ fn find_ebe_iov(
     // sat 9 300 above the value the optimizer had minimised. IOV + FREM is unsupported
     // (`foce_subject_nll_iov` returns a sentinel for it), so the FREM-only "take NM
     // unconditionally to re-center the proposal" arm of the non-IOV path has no twin here.
+    // Nelder–Mead end points are certified on stationarity with this solve's own gradient and
+    // stall predicate, never on NM's simplex spread (#1527). No `stop_precond`: the IOV BFGS
+    // above stops on the raw L2 norm.
+    let cert = FallbackCertifier {
+        grad: &agrad,
+        precond: None,
+        stop_precond: None,
+        stall_at: &stall_at,
+        n: n_flat,
+        max_iter,
+        tol,
+    };
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -2274,7 +2568,7 @@ fn find_ebe_iov(
         if skip_ode_iov_nm_fallback(model) {
             (false, false)
         } else {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, &cert);
             x = best;
             (ok, true)
         }
@@ -2298,15 +2592,27 @@ fn find_ebe_iov(
     let mut nm_converged = nm_converged;
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
-        && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, params) > runaway_limit
+        && iov_prior_maha(
+            &x,
+            &mu,
+            n_eta,
+            n_kappa,
+            k_occasions,
+            nested.as_ref(),
+            params,
+        ) > runaway_limit
     {
-        let mut cold = vec![0.0; n_flat];
-        cold[..n_eta].copy_from_slice(&mu);
-        let ok = nelder_mead_minimize(&obj, &mut cold, n_flat, max_iter * 5, tol);
+        let mut seed = vec![0.0; n_flat];
+        seed[..n_eta].copy_from_slice(&mu);
+        // Certified on stationarity, polish held inside the runaway limit (#1527).
+        let (cold, cold_ok) = cert.nelder_mead_recover(&obj, seed, &|p| {
+            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested.as_ref(), params)
+                <= runaway_limit
+        });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
             bfgs_converged = false;
-            nm_converged = ok;
+            nm_converged = cold_ok;
             used_fallback = true;
         }
     }
@@ -2318,8 +2624,9 @@ fn find_ebe_iov(
         .zip(mu.iter())
         .map(|(p, m)| p - m)
         .collect();
-    let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+    let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+        .iter()
+        .map(|k| DVector::from_column_slice(k))
         .collect();
 
     // H-matrix: BSV columns only (∂f/∂η_bsv with κ fixed at the EBE). The BSV block of
@@ -4376,6 +4683,7 @@ fn iov_prior_maha(
     n_eta: usize,
     n_kappa: usize,
     k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>,
     params: &ModelParameters,
 ) -> f64 {
     let bsv: Vec<f64> = x[..n_eta]
@@ -4385,8 +4693,27 @@ fn iov_prior_maha(
         .collect();
     let mut q = ebe_prior_maha(&bsv, &params.omega);
     if let Some(oi) = params.omega_iov.as_ref() {
-        for k in 0..k_occasions {
-            q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+        match nested {
+            // #1082: one block per group of each level, against that level's Ω_L⁻¹ — the
+            // compact prior's own quadratic form.
+            Some(n) => {
+                for (l, block) in n.blocks(x) {
+                    if !block.iter().all(|v| v.is_finite()) {
+                        return f64::INFINITY;
+                    }
+                    let ks = n.kappas_at(l);
+                    for (a, &ka) in ks.iter().enumerate() {
+                        for (c, &kc) in ks.iter().enumerate() {
+                            q += block[a] * oi.inv[(ka, kc)] * block[c];
+                        }
+                    }
+                }
+            }
+            None => {
+                for k in 0..k_occasions {
+                    q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+                }
+            }
         }
     }
     q

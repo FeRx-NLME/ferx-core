@@ -1,0 +1,37 @@
+# ferx twin (ode) of nonmem_anchor/param_time_pkonly.ctl (#1969): the TIME that
+# [individual_parameters] reads is the TIME as written. Parameters at NONMEM's optimum
+# (results/param_time_pkonly.ext), evaluated once (maxiter = 0) by
+# tests/param_time_written_nonmem_anchor.rs.
+[parameters]
+  theta TVCL(2.1694123468525897, 0.01, 100.0)
+  theta TVV(20.463080344399653, 1.0, 500.0)
+  theta TVIND(1.9469261641113909, 0.1, 10.0)
+  omega ETA_CL ~ 0.09781448615391886
+  omega ETA_V  ~ 0.04656329223470726
+  sigma PROP_ERR ~ 0.10428603946435569 (sd)
+  sigma ADD_ERR ~ 0.0001 (variance) FIX
+
+[individual_parameters]
+  IND = if (TIME >= 24.0) TVIND else 1.0
+  CL = TVCL * IND * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

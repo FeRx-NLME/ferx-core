@@ -43,6 +43,8 @@ fn population(n: usize) -> Population {
                     dose_covariates: vec![],
                     obs_covariates: vec![],
                     pk_only_times: vec![],
+                    pk_only_raw_times: vec![],
+                    reset_period_times: vec![],
                     pk_only_covariates: vec![],
                     reset_times: vec![],
                     reset_covariates: vec![],

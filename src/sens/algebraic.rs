@@ -26,10 +26,11 @@
 //!   parameters per observation only when a covariate can move them between rows
 //!   (`has_tv_covariates`) or the model reads the `TIME` built-in; otherwise one
 //!   subject-static snapshot at `(subject.covariates, t = 0)` drives every row.
-//! - **Two different clocks.** The parameter snapshot uses the *observation* time
-//!   (`obs_times[j]`), the readout evaluation uses the *raw data-file* time
-//!   (`readout_time(j)`, the `$ERROR` convention, #1028). They differ only under
-//!   stacked reset occasions, but they differ.
+//! - **One clock.** Both the parameter snapshot and the readout evaluation read
+//!   the TIME as written (`param_time_obs(j)` / `readout_time(j)`): the readout
+//!   since #1028 (the `$ERROR` convention), the parameters since #1969 (the `$PK`
+//!   convention). Before #1969 the snapshot read the engine clock `obs_times[j]`,
+//!   which differs under stacked reset occasions and by one ULP at a moved trough.
 //! - **The output transform.** LTBS is applied to the readout output, through the
 //!   shared generic [`apply_output_transform`] so the floor-then-log semantics
 //!   (and their derivative at the floor) cannot drift from the f64 path.
@@ -141,7 +142,7 @@ pub(crate) fn supported(model: &CompiledModel) -> bool {
 ///
 /// Mirrors `pk::apply_analytic_readout`'s cadence: one subject-static snapshot
 /// unless a covariate or the `TIME` built-in can move the individual parameters
-/// between rows. The two times are deliberately different — see the module note.
+/// between rows. Both times are the TIME as written — see the module note.
 fn obs_context(
     subject: &Subject,
     j: usize,
@@ -149,11 +150,7 @@ fn obs_context(
 ) -> (f64, f64, &std::collections::HashMap<String, f64>) {
     let readout_time = subject.readout_time(j);
     if per_obs {
-        (
-            subject.obs_times.get(j).copied().unwrap_or(0.0),
-            readout_time,
-            subject.obs_cov(j),
-        )
+        (subject.param_time_obs(j), readout_time, subject.obs_cov(j))
     } else {
         (0.0, readout_time, &subject.covariates)
     }
@@ -427,7 +424,7 @@ fn run_obs_iov<const M: usize>(
             None => layout.combined_pk_only(stacked_eta),
         };
         let cov = subject.obs_cov(j);
-        let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
+        let param_time = subject.param_time_obs(j);
         let pk = {
             let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
             (model.pk_param_fn)(theta, &combined, cov, param_time)
@@ -523,7 +520,7 @@ fn run_obs_grad_iov<const N: usize>(
             None => layout.combined_pk_only(stacked_eta),
         };
         let cov = subject.obs_cov(j);
-        let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
+        let param_time = subject.param_time_obs(j);
         let pk = {
             let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
             (model.pk_param_fn)(theta, &combined, cov, param_time)

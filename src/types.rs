@@ -975,6 +975,20 @@ pub struct Subject {
     /// that does not mutate compartment amounts but does refresh the
     /// piecewise-constant rate matrix from the row's covariate values.
     pub pk_only_times: Vec<f64>,
+    /// The `TIME` each pk-only record was written with, parallel to `pk_only_times`
+    /// (#1969). The two differ by one ULP for a row the reader moved below a co-timed
+    /// dose to keep file order (#1810), and by the reset shift in a period whose `TIME`
+    /// restarts. Empty for an in-memory subject; `Subject::param_time_pk_only` then
+    /// falls back to `pk_only_times`.
+    pub pk_only_raw_times: Vec<f64>,
+    /// `(engine time, TIME as written)` of every dose and reset row the reader shifted
+    /// onto the monotonic timeline because a reset restarted `TIME` (#1969), ascending
+    /// in engine time. Empty for a subject with no such period. Read through
+    /// `Subject::param_time_at`: a dose or reset row is never moved one ULP, so its
+    /// engine time finds its row here exactly. The written time is stored rather than
+    /// recomputed as `engine − offset`, which is inexact for most decimal times
+    /// (`(0.1 + 73.1) − 73.1` is `0.09999999999999432`).
+    pub reset_period_times: Vec<(f64, f64)>,
     /// Per-pk-only-record covariate snapshot (LOCF), parallel to
     /// `pk_only_times`. Empty when no TV covariates (NONMEM-equivalent: `$PK`
     /// runs at the record but with the same values), and then
@@ -1211,6 +1225,37 @@ impl Subject {
     /// A level key or a message that names a record's time reads this (#1959).
     pub fn readout_time(&self, j: usize) -> f64 {
         written_time(&self.obs_times, &self.obs_raw_times, j)
+    }
+
+    /// The `TIME` `[individual_parameters]` (and a kappa `weight`) reads at observation
+    /// `j`: the TIME as written, as NONMEM's `$PK` sees it (#1969). The same value as
+    /// [`Subject::readout_time`]; the engines keep ordering and integrating on
+    /// `obs_times`.
+    pub(crate) fn param_time_obs(&self, j: usize) -> f64 {
+        self.readout_time(j)
+    }
+
+    /// The `TIME` `[individual_parameters]` reads at pk-only record `m` (EVID=2 or
+    /// EVID=0/MDV=1): [`Subject::pk_only_raw_times`], falling back to the engine
+    /// clock `pk_only_times` for an in-memory subject (#1969).
+    pub(crate) fn param_time_pk_only(&self, m: usize) -> f64 {
+        written_time(&self.pk_only_times, &self.pk_only_raw_times, m)
+    }
+
+    /// The `TIME` `[individual_parameters]` reads at a dose or reset row at engine time
+    /// `engine_t` (#1969). A row of a reset period that restarts `TIME` finds its
+    /// written time in [`Subject::reset_period_times`]. An engine time with no row there
+    /// (a dose the adaptive engine appended, a decision time) takes the offset of the
+    /// latest row at or before it. Before the first shifted row, and for a subject
+    /// with none, the engine clock is the written clock.
+    pub(crate) fn param_time_at(&self, engine_t: f64) -> f64 {
+        let table = &self.reset_period_times;
+        let after = table.partition_point(|&(e, _)| e <= engine_t);
+        match after.checked_sub(1).map(|i| table[i]) {
+            Some((e, w)) if e == engine_t => w,
+            Some((e, w)) => engine_t - (e - w),
+            None => engine_t,
+        }
     }
 
     /// Whether observations `j` and `k` are one instant: see [`same_instant`].
@@ -3630,7 +3675,8 @@ pub struct CovariateMuRef {
     /// The BSV eta this typical value carries.
     pub eta_name: String,
     /// Every theta the typical value reads, in declaration order. At least two —
-    /// a single-theta typical value is a plain [`MuRef`].
+    /// a single-theta typical value is a plain [`MuRef`] (the crate-internal
+    /// `colliding_anchors` entries are the one exception).
     pub theta_names: Vec<String>,
     /// Which link relates the typical value to the individual parameter:
     /// [`MuTransform::Log`] for `A * exp(η)` / `exp(log(A) + η)`,
@@ -3674,6 +3720,22 @@ pub struct CovariateMuRef {
     /// the group — it forces the prior-plus-data engine, which evaluates the
     /// observation term with the shift applied.
     pub(crate) eta_shared: bool,
+    /// [`Self::read_outside_groups`] with the taint also stopped at every
+    /// recorded **single-anchor** statement (`V2 = TVV2 * exp(ETA_V2)`, see
+    /// [`Self::colliding_anchors`]).
+    ///
+    /// That anchor's `φ_i` is frozen only when the estimator takes it into the
+    /// group (#1630); when it does not, the anchor's theta is live in the data
+    /// after all, and the estimator adds it back. So this field is exact only
+    /// together with that add-back, which is why `read_outside_groups` stays.
+    pub(crate) read_outside_groups_and_anchors: Vec<String>,
+    /// The single-anchor mu-references whose one theta this typical value also
+    /// reads — `V2 = TVV2 * exp(ETA_V2)` next to a group on `V1 = TVV2 * TH_R *
+    /// (WT/70)^TH_WT * exp(ETA_V1)` (#1630). Each is a one-theta entry of this
+    /// same type, its reachability fields filled the same way, so SAEM and
+    /// IMP/IMPMAP can take it into the group's joint M-step as a member instead
+    /// of declining the group. Empty on the entries themselves.
+    pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced already inlined.
     pub(crate) typical: crate::parser::model_parser::Expression,
@@ -4088,6 +4150,41 @@ pub struct EndpointPredictionResult {
     /// re-joining against the input population.
     pub observed: Option<f64>,
     pub prediction: Prediction,
+}
+
+/// One `level NAME by COLUMN in PARENT` declaration in `[parameters]` (#1082): the
+/// records of a subject that share a `COLUMN` value inside one group of `PARENT` (`ID`,
+/// or the level declared just before it) form one group of this level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LevelSpec {
+    /// The level's name, which `kappa … at NAME` refers to.
+    pub(crate) name: String,
+    /// The data column whose value labels a record's group.
+    pub(crate) column: String,
+    /// `ID`, or the name of the level this one nests in.
+    pub(crate) parent: String,
+}
+
+/// The variability levels below `ID` of a model that declares more than one (#1082).
+///
+/// The levels form one chain, `levels[0]` in `ID` and each later level in the one before
+/// it, and a group is identified by its key path: `ARM = 1` in study 1 and `ARM = 1` in
+/// study 2 are different groups. Each κ lives at exactly one level and is drawn once per
+/// group of it, and all levels of a subject are integrated jointly in that subject's
+/// marginal.
+///
+/// A model with one level — `iov_column` / `iov_occasion`, or a single `level` line,
+/// which is its explicit spelling — has `None` here and is today's inter-occasion
+/// variability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedLevels {
+    /// The levels, outermost first.
+    pub(crate) levels: Vec<LevelSpec>,
+    /// The level index of each κ, parallel to `CompiledModel::kappa_names`.
+    pub(crate) kappa_level: Vec<usize>,
+    /// Per random effect in `[η…, κ…]` order, the individual parameters whose own
+    /// expression reads it — the `readers` the single-member check compares.
+    pub(crate) readers: Vec<Vec<String>>,
 }
 
 /// A compiled model ready for estimation
@@ -5711,6 +5808,19 @@ impl CompiledModel {
     #[inline]
     pub fn has_weighted_kappa(&self) -> bool {
         self.kappa_weights.iter().any(|w| w.is_some())
+    }
+
+    /// Whether the model declares more than one variability level below `ID` (#1082).
+    #[inline]
+    pub(crate) fn has_nested_levels(&self) -> bool {
+        self.indiv_param_partials.nested_levels.is_some()
+    }
+
+    /// The nested variability levels of a model that declares more than one `level`
+    /// (#1082); `None` for every other model, including one with a single level.
+    #[inline]
+    pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
+        self.indiv_param_partials.nested_levels.as_ref()
     }
 
     /// Whether an *active* custom residual magnitude depends on `θ`
@@ -7359,10 +7469,12 @@ pub struct FitResult {
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
     pub nlopt_missing_algorithms: Vec<String>,
-    /// Estimated OFV evaluations for the covariance step's finite-difference
-    /// `R` matrix (`2·n_params² + 2·n_params`), set when `run_covariance_step =
+    /// Estimated OFV evaluations for the covariance step's `R` matrix on the
+    /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
     /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
-    /// under `covariance_method = s`, which builds no `R` (#1803).
+    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
+    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
+    /// applies, which evaluates none of them.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -8093,7 +8205,7 @@ pub struct FitOptions {
     /// default. Exists only so the high-dimension routing guard (#1064) can
     /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
     /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
-    /// subject's EBEs at each of `2·n² + 2·n` objective evaluations, so a *defaulted*
+    /// subject's EBEs at each of `2·n²` objective evaluations, so a *defaulted*
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
@@ -9292,8 +9404,9 @@ pub enum SaemMstepSolver {
     /// Opt-in, and **restricted to the plain Gaussian residual scope** the
     /// expected information has a closed form on: no IOV, no mixture, no M3, no
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
-    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
     ///
     /// It was a **candidate default** in #1449 and did not become one: it is
     /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
@@ -9466,7 +9579,7 @@ pub const BOBYQA_MAX_DIM: usize = 64;
 /// routes to the cross-product (#1064).
 ///
 /// The `R` matrix is a finite-difference Hessian of the objective that
-/// reconverges every subject's EBEs at each of `2·n² + 2·n` objective
+/// reconverges every subject's EBEs at each of `2·n²` objective
 /// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
 /// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`
 /// builds no `R` (#1803) and needs one pass.

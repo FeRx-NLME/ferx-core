@@ -310,7 +310,7 @@ fn families() -> Vec<Family> {
         Family {
             name: "analytic readout support (#650)",
             phrase: "EVID=3/4 reset",
-            code: None,
+            code: Some("E_READOUT_DEPOT_UNSUPPORTED"),
             model: parse_model_string(DEPOT_READOUT).expect("parse"),
             pop: {
                 let mut s = subject_with(vec![bolus()], 2);
@@ -365,7 +365,7 @@ fn survival_families() -> Vec<Family> {
         Family {
             name: "survival time-varying covariate (#741)",
             phrase: "#741",
-            code: None,
+            code: Some("E_ENDPOINT_TV_COVARIATE"),
             model: tv_model,
             pop: population_of(vec![tv_subject], &["CRCL"]),
             theta: None,
@@ -428,9 +428,9 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             f.name
         );
         // #1746: the `Err` carries the diagnostic `ferx check` reports for the same input
-        // — code, block and suggestion — or none when `ferx check` has no code for it.
-        // Both sides of that gate are in this one loop: nine families are coded, two
-        // (#650, #741) are not.
+        // — code, block and suggestion. Since #1774 every family here is coded: the two
+        // that were not (#650, #741) are now in `check_model_data_rule`, so dropping either
+        // from that list leaves `want` empty and the comparison below names the family.
         assert_eq!(got.code(), f.code, "{}: code", f.name);
         let checked = check_diagnostics(&f.model, &f.pop, &params);
         let want = checked.iter().find(|d| d.is_error());
@@ -533,11 +533,9 @@ fn checked_by(family: &str) -> [Option<bool>; 4] {
         "dose compartments (#375)" => [Y, Y, Y, N],
         "absorption closed-form support" => [Y, N, N, N],
         "flip-flop, no twin (#776)" => [Y, N, N, N],
-        // `simulate*` has never run `check_analytic_readout_support`, and on this fixture the
-        // emitter then trips a `debug_assert!` in `pk::analytical_state_at_times` (measured; in
-        // release it returns rows instead). Pre-existing and filed separately — not called
-        // here, so this test does not pin a panic as the contract.
-        "analytic readout support (#650)" => [None, N, N, N],
+        // #1488: before it, `simulate*` never ran this check — a debug build panicked in
+        // `pk::analytical_state_at_times` and a release build returned phantom-depot rows.
+        "analytic readout support (#650)" => [Y, N, N, N],
         "absorption dosing (#588)" => [Y, N, N, N],
         "survival time-varying covariate (#741)" => [Y, N, Y, Y],
         "endpoint routing (#1199)" => [Y, N, N, Y],
@@ -605,6 +603,96 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
         #[cfg(not(feature = "survival"))]
         let _ = (surv, cat);
     }
+}
+
+/// #1488: every `simulate*` form refuses a Form C readout of the oral depot amount on a
+/// subject dose superposition cannot reconstruct — **both** arms of
+/// `check_analytic_readout_support`, an EVID=3/4 reset (#650) and a bolus into `CMT=2` (#375) —
+/// with exactly the text `predict_diag()` and `fit()` give, and `E_READOUT_DEPOT_UNSUPPORTED`.
+///
+/// Before the fix none of them ran the check. Measured on this fixture in a release build
+/// (`simulate_with_options`, seed 1, against an `ode(states=[depot, central])` twin with the
+/// same readout): the reset arm returned `IPRED` 0.036631 at t = 4 where the twin, whose reset
+/// zeroes the depot, gives 0; the `CMT=2` arm returned 2.432018 at t = 1 against the twin's
+/// 1.696259 (+43%, the bolus reconstructed as if absorbed through the depot). A debug build
+/// panics on the reset arm instead, in `pk::analytical_state_at_times`'s `debug_assert!` — so
+/// this test is red under both profiles without the fix, and runs in the `release-semantics`
+/// lane too.
+///
+/// The control is the same model with the default-compartment bolus and no reset: it must
+/// simulate, so a check that refused every depot readout would die here too.
+///
+/// Mutation: delete the `check_analytic_readout_support` line in `check_simulate_preconditions`
+/// → both arms die (reset: panic in debug / `Ok` in release; `CMT=2`: `Ok`), naming the form.
+#[test]
+fn every_simulate_form_refuses_a_depot_readout_superposition_cannot_reconstruct() {
+    let model = parse_model_string(DEPOT_READOUT).expect("parse");
+    let params = &model.default_params;
+    let reset = {
+        let mut s = subject_with(vec![bolus()], 1);
+        s.reset_times = vec![2.0];
+        s.reset_covariates = vec![HashMap::new()];
+        s.reset_occasions = vec![1];
+        s
+    };
+    let central_bolus = subject_with(vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)], 2);
+    let arms = [
+        ("EVID=3/4 reset", "EVID=3/4 reset (subject 1)", reset),
+        (
+            "CMT=2 bolus",
+            "non-default compartment (subject 1)",
+            central_bolus,
+        ),
+    ];
+    let opts = SimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let unc = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2,
+        n_sim_per_draw: 1,
+        seed: Some(7),
+        ..Default::default()
+    };
+    let fit_result = synthetic_fit(&model);
+    for (arm, phrase, subject) in arms {
+        let pop = population_of(vec![subject], &[]);
+        let want = predict_diag(&model, &pop, params).expect_err("predict_diag refuses");
+        assert!(want.to_string().contains(phrase), "{arm}: {want}");
+        assert_eq!(want.to_string(), fit_err(&model, &pop, params), "{arm}");
+        let forms: [(&str, Option<crate::EngineError>); 5] = [
+            ("simulate", simulate(&model, &pop, params, 1).err()),
+            (
+                "simulate_with_seed",
+                simulate_with_seed(&model, &pop, params, 1, 3).err(),
+            ),
+            (
+                "simulate_with_options",
+                simulate_with_options(&model, &pop, params, 1, &opts).err(),
+            ),
+            (
+                "simulate_with_options_diag",
+                simulate_with_options_diag(&model, &pop, params, 1, &opts).err(),
+            ),
+            (
+                "simulate_with_uncertainty",
+                simulate_with_uncertainty(&model, &pop, &fit_result, &unc).err(),
+            ),
+        ];
+        for (form, got) in forms {
+            let got = got.unwrap_or_else(|| panic!("{form} × {arm}: accepted"));
+            assert_eq!(got.to_string(), want.to_string(), "{form} × {arm}");
+            assert_eq!(
+                got.code(),
+                Some("E_READOUT_DEPOT_UNSUPPORTED"),
+                "{form} × {arm}"
+            );
+        }
+    }
+    // The control: the default-compartment bolus, no reset — the readout itself is supported.
+    let pop = population_of(vec![subject_with(vec![bolus()], 1)], &[]);
+    let rows = simulate_with_options(&model, &pop, params, 1, &opts).expect("control simulates");
+    assert_eq!(rows.len(), 3, "one row per observation");
 }
 
 // ── T3: simulate_with_uncertainty ────────────────────────────────────────────

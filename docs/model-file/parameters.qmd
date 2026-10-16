@@ -358,12 +358,28 @@ at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model wit
 a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
 measured, so it keeps the refusal.
 
-The two contrasts can disagree. A θ read on one study's records alone carries the
-levels' sum but not study 1's reference level, so sum-to-zero is refused and
-`ref` binds. `auto` then takes `ref`. On `[STUDY, TIME]` with `TIME = 0` as the
-reference, an Emax term `EMAX * TIME / (TIME + ET50)` carries the sum and is 0
-at the reference, which splits the two the same way. The refusal names the
-contrast that binds.
+A θ whose effect is itself a combination of the levels rescues nothing (#1977).
+`TVB * D2`, on study 2's records alone, carries the levels' sum but not study 1's
+reference level. Under `ref` it is then one of the coded levels' own sums, so the
+model is aliased there too. The binder refuses a contrast whose coded levels are
+not independent of the other θ, by the same `1e-6`. So `TVB * D2` is refused
+under every contrast. So is an Emax term `EMAX * TIME / (TIME + ET50)` under
+global sum-to-zero and `ref` on `[STUDY, TIME]`, and a hand-coded region effect
+`TVB1 * (R1 - R2)` over two equal-size regions under sum-to-zero.
+
+The two contrasts can still disagree when a coarser random effect shares a
+direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
+column minus `TVC`'s is study 2's level. That carries the levels' sum but not the
+reference, so sum-to-zero is refused and `ref` binds; `auto` takes `ref`. The
+refusal names the contrast that binds.
+
+Another level block counts as it will be coded (#1963). In
+`E0 = TVE0 * (1 + 0.01 * TIME * TIME) + B2 + PLACEBO + ETA_E0`, with
+`theta B2[OCC]` over three arms, B2 under sum-to-zero or `ref` carries none of
+the levels' mean, so `PLACEBO[STUDY]` binds as it would without B2, exactly as
+for B2 written out as θ of that coding. Under `contrast = none` B2's levels add up
+to a constant, which carries the mean, and `PLACEBO` is refused. A block that
+absorbs a random effect itself counts with every level.
 
 ##### When no single expression reads both
 
@@ -508,7 +524,7 @@ this engine is, and switch automatically once a block makes the problem large:
   is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
 - **Covariance.** The default `covariance_method = r` builds a
   finite-difference Hessian that re-converges every subject's EBEs at each of
-  `2n² + 2n` objective evaluations — around 1.3 million population objectives at 800
+  `2n²` objective evaluations — around 1.3 million population objectives at 800
   parameters. Above 100 free coordinates a *defaulted* covariance method routes
   to the score cross-product (`covariance_method = s`, one pass) with a warning.
   Setting `covariance_method = r` explicitly forces it, and says what it costs.
