@@ -545,7 +545,7 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
   covariance_method = rsr
 ```
 
-`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite covariance Hessian, analytic R-matrix or FD stencil alike (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
+`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. `s` builds no `R` (#1803): `S⁻¹` reads only the per-subject scores, so it needs a full-rank `S` and nothing else, and it costs one pass over those scores instead of the `2n²` re-converged objective evaluations of `R`'s finite-difference stencil. An `R` with no usable curvature therefore no longer fails an `s` step whose `S⁻¹` exists. `rsr` reads both matrices and still needs a positive-definite `R`.
 
 #### NONMEM cross-check (S / RSR, FOCEI)
 
