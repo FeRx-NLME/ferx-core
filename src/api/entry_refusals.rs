@@ -14,8 +14,9 @@
 //! `run_covariance` (#1774 part b): `ferx check` has no fit, so it cannot reach an
 //! input missing from one (`E_FIT_INPUT_MISSING`), a file changed since it
 //! (`E_FIT_INPUT_CHANGED`) or a model that is not its own (`E_FIT_INPUT_MODEL`,
-//! and `E_THETA_LENGTH` for the θ count). Their re-reads of the model and data files
-//! are not here: those failures are `ferx check`'s own, and are coded by its read
+//! and `E_THETA_LENGTH` for the θ count), and it runs no SIR, so it cannot refuse
+//! SIR's settings (`E_SIR_OPTIONS`). Their re-reads of the model and data files are
+//! not here: those failures are `ferx check`'s own, and are coded by its read
 //! classifiers in `validation.rs`.
 
 use crate::diagnostics::{Diagnostic, EngineError};
@@ -120,8 +121,10 @@ pub(crate) fn theta_length(message: impl Into<String>) -> EngineError {
 /// `E_FIT_INPUT_MISSING`: a post-hoc step on a fit (`run_sir`, `run_covariance`)
 /// needs an input that neither the caller passed nor the fit records — the model
 /// file's path, the data file's path, SIR's covariance matrix, the population of an
-/// IOV model passed as `model = Some` on a fit with no recorded reader settings, or
-/// the occasion rule of an IOV fit whose population carries no occasion labels.
+/// IOV model passed as `model = Some` on a fit with no recorded reader settings, the
+/// occasion rule of an IOV fit whose population carries no occasion labels, or the
+/// fitted values of a `[mixture]` fit's per-class overrides (which
+/// `simulate_with_uncertainty` needs too).
 pub(crate) fn fit_input_missing(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MISSING", None, message.into())
 }
@@ -142,8 +145,17 @@ pub(crate) fn fit_input_changed_diag(message: impl Into<String>) -> Diagnostic {
 /// `E_FIT_INPUT_MODEL`: the model a post-hoc step would run on is not the one the
 /// fit was made with — a supplied model bound with other data-derived bindings than
 /// the fit's, or (on a fit that records none) with covariate statistics the
-/// population does not reproduce, or a model whose η count is not the width of the
-/// fit's per-subject η̂.
+/// population does not reproduce, a model whose η count is not the width of the
+/// fit's per-subject η̂, a `[mixture]` fit whose packed estimate has another layout
+/// or no longer reproduces its reported estimates, or a covariance matrix that is
+/// not the size of the model's packed parameters (SIR's proposal).
 pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MODEL", None, message.into())
+}
+
+/// `E_SIR_OPTIONS`: SIR settings the importance resampler cannot run with —
+/// `sir_resamples` above `sir_samples`, a `sir_df` that is not a valid Student-t
+/// degrees of freedom, or `sir_scale = natural` on a model with `prior(...)`.
+pub(crate) fn sir_options(message: impl Into<String>) -> EngineError {
+    coded("E_SIR_OPTIONS", None, message.into())
 }

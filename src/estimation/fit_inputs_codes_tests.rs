@@ -634,3 +634,61 @@ fn a_model_that_is_not_the_fits_carries_its_code() {
     }
     check_rows(rows);
 }
+
+/// SIR's own input refusals through `run_sir`, from the shared core
+/// (`run_sir_core_coded`): `E_SIR_OPTIONS` for settings the resampler cannot run with,
+/// `E_FIT_INPUT_MODEL` for a covariance matrix that is not the size of the model's
+/// packed parameters. Not attributed to the entry point, as before. The fourth option
+/// refusal, `sir_scale = natural` under a prior, is pinned on the core in
+/// `sir_low_ess_tests::natural_scale_is_refused_with_a_prior_only`.
+///
+/// Mutations — any of the three sites back on a bare `String` (`code()` `None`);
+/// `sir_options` / `fit_input_model` swapped (code); `run_sir` calling the `String`
+/// wrapper `run_sir_core` (every row's code); a sentence deleted (`to_string()`).
+#[test]
+fn sirs_own_input_refusals_carry_their_codes() {
+    let c = super::test_fixtures::sir_case(Kind::Plain);
+    let cov = c
+        .fit
+        .covariance_matrix
+        .as_ref()
+        .expect("the SIR case carries one");
+    let n = cov.nrows();
+    let mut wrong = c.fit.clone();
+    wrong.covariance_matrix = Some(nalgebra::DMatrix::identity(2, 2));
+    let mut resamples = c.opts.clone();
+    resamples.sir_samples = 10;
+    resamples.sir_resamples = 20;
+    let mut df = c.opts.clone();
+    df.sir_df = 0.0;
+    let chi2 = rand_distr::ChiSquared::<f64>::new(0.0).unwrap_err();
+    let sir = |fit: &FitResult, o: &FitOptions| run_sir(fit, None, None, o).map(|_| ());
+    let plain = |name: &str, got, code, text: String| Row {
+        name: format!("run_sir/{name}"),
+        got,
+        code,
+        block: None,
+        context: None,
+        text,
+    };
+    check_rows(vec![
+        plain(
+            "sir_resamples above sir_samples",
+            sir(&c.fit, &resamples),
+            "E_SIR_OPTIONS",
+            "sir_resamples must be <= sir_samples".to_string(),
+        ),
+        plain(
+            "sir_df",
+            sir(&c.fit, &df),
+            "E_SIR_OPTIONS",
+            format!("sir_df invalid: {chi2}"),
+        ),
+        plain(
+            "proposal dimension",
+            sir(&wrong, &c.opts),
+            "E_FIT_INPUT_MODEL",
+            format!("Covariance matrix dimensions (2,2) don't match packed parameters ({n})"),
+        ),
+    ]);
+}

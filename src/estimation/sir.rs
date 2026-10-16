@@ -869,6 +869,33 @@ pub fn run_sir_core(
     ofv_hat: f64,
     options: &FitOptions,
 ) -> Result<SirResult, String> {
+    run_sir_core_coded(
+        model,
+        population,
+        params,
+        eta_hats,
+        proposal_cov,
+        ofv_hat,
+        options,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// [`run_sir_core`], refusing with an [`EngineError`](crate::EngineError) that carries
+/// the code of a refusal of its input (#1774): `E_SIR_OPTIONS` for SIR settings it
+/// cannot run with, `E_FIT_INPUT_MODEL` for a proposal covariance that is not the
+/// size of the packed parameters. `run_sir` returns it as is; `run_sir_core`, and
+/// through it `fit()`'s in-fit SIR, keep the text, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_sir_core_coded(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    proposal_cov: &DMatrix<f64>,
+    ofv_hat: f64,
+    options: &FitOptions,
+) -> Result<SirResult, crate::EngineError> {
     // #1212: the math kernel is public API in its own right, so it opens the fit-scoped ODE
     // scope too rather than relying on its caller having done so. Inside `fit()` the current
     // worker already carries that override, which the scope detects without leasing a second
@@ -900,7 +927,7 @@ fn run_sir_core_scoped(
     proposal_cov: &DMatrix<f64>,
     ofv_hat: f64,
     options: &FitOptions,
-) -> Result<SirResult, String> {
+) -> Result<SirResult, crate::EngineError> {
     run_sir_in_box(
         model,
         population,
@@ -926,7 +953,7 @@ fn run_sir_in_box(
     ofv_hat: f64,
     options: &FitOptions,
     adjust_box: impl FnOnce(&mut PackedBounds),
-) -> Result<SirResult, String> {
+) -> Result<SirResult, crate::EngineError> {
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 
@@ -939,19 +966,23 @@ fn run_sir_in_box(
                 "run_sir_core: the model declares [mixture] but the parameters carry \
                  no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
                  fitted_params_from_result or pass the fit's own parameters."
-                    .to_string(),
+                    .to_string()
+                    .into(),
             )
         }
         (false, true) => {
             return Err("run_sir_core: the parameters carry per-class Ω/Σ \
                  (ModelParameters::mixture) but the model declares no [mixture]."
-                .to_string())
+                .to_string()
+                .into())
         }
         _ => {}
     }
 
     if n_resamples > n_samples {
-        return Err("sir_resamples must be <= sir_samples".to_string());
+        return Err(crate::api::sir_options(
+            "sir_resamples must be <= sir_samples",
+        ));
     }
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
@@ -985,21 +1016,20 @@ fn run_sir_in_box(
     // already `L · p(x)` with no flat prior left to move to the reported scale;
     // the natural Jacobian would tilt the prior the fit was estimated under.
     if options.sir_scale == SirScale::Natural && priors.is_active() {
-        return Err(
+        return Err(crate::api::sir_options(
             "sir_scale = natural is not defined for a model with prior(...): the SIR \
              target is already the likelihood times the declared prior on the packed scale, \
-             so there is no flat prior to move to the reported scale. Use sir_scale = packed."
-                .to_string(),
-        );
+             so there is no flat prior to move to the reported scale. Use sir_scale = packed.",
+        ));
     }
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
-        return Err(format!(
+        return Err(crate::api::fit_input_model(format!(
             "Covariance matrix dimensions ({},{}) don't match packed parameters ({})",
             proposal_cov.nrows(),
             proposal_cov.ncols(),
             n_packed,
-        ));
+        )));
     }
 
     // Restrict the proposal to the free subspace. `compute_covariance` zeroes
@@ -1014,7 +1044,7 @@ fn run_sir_in_box(
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
-        return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".to_string());
+        return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".into());
     }
 
     // A `LogitProbability` θ is proposed on the logit scale (#1548): a proposal
@@ -1112,7 +1142,8 @@ fn run_sir_in_box(
     // Sampling: draw z ~ N(0,I), chi2 ~ chi2(nu), then scale z by sqrt(nu/chi2).
     // Heavier tails than MVN improve ESS for parameters near boundaries (e.g. omega variances).
     let nu = options.sir_df;
-    let chi2_dist = ChiSquared::new(nu).map_err(|e| format!("sir_df invalid: {e}"))?;
+    let chi2_dist =
+        ChiSquared::new(nu).map_err(|e| crate::api::sir_options(format!("sir_df invalid: {e}")))?;
 
     let d = n_free as f64;
     // Cache lgamma terms that are constant across all samples.
@@ -1205,11 +1236,7 @@ fn run_sir_in_box(
         .fold(f64::NEG_INFINITY, f64::max);
 
     if max_log_w == f64::NEG_INFINITY {
-        return Err(all_invalid_weights_message(
-            &outcomes,
-            &coord_names,
-            &conditioned,
-        ));
+        return Err(all_invalid_weights_message(&outcomes, &coord_names, &conditioned).into());
     }
 
     let weights: Vec<f64> = log_weights

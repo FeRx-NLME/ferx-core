@@ -259,7 +259,7 @@ fn run_sir_scoped(
     })?;
 
     // --- Run SIR (identical to the inline path in fit()) ------------------
-    let sir = crate::estimation::sir::run_sir_core(
+    let sir = crate::estimation::sir::run_sir_core_coded(
         model_ref,
         pop_ref,
         &params,
