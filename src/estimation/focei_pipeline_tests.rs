@@ -125,6 +125,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             warm,
                             Some(&mu),
                             None,
+                            None,
                         );
                         assert_eq!(expected_nll.to_bits(), fused.4.to_bits());
                         for (a, b) in separate.0.iter().zip(&fused.0) {
@@ -184,7 +185,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &separate.3,
             &opts,
         );
-        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None);
+        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None, None);
         assert_eq!(expected.to_bits(), fused.4.to_bits());
     }
 }
@@ -406,32 +407,65 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
 //
 // The outer optimizers poll `FitOptions.cancel` only between objective evaluations, and
 // one evaluation of a large ODE population is minutes of EBE solves — so an R Ctrl-C used
-// to wait out the whole pass. These pin that a cancel landing *inside* a pass stops the
-// subjects not yet started.
+// to wait out the whole pass. These pin that a cancel landing *inside* an NLopt
+// evaluation stops the subjects not yet started, and that the passes whose output is
+// kept (final readouts, Gauss–Newton, trust region, built-in BFGS) are never cut short.
 
-/// A cancel flipped by the first subject's finish skips every later subject. One worker
-/// thread makes "later" deterministic. The same run with the flag present but never
-/// flipped is the other side of the gate: every subject is solved and none is rejected.
+/// `fixture(iov, false)`'s population under a model with `n_eta = 2` and `n_kappa = 1`
+/// when `iov`, so a placeholder κ sized by the wrong dimension cannot pass.
+fn cancel_fixture(iov: bool) -> (CompiledModel, Population) {
+    let (model, pop) = fixture(iov, false);
+    if !iov {
+        return (model, pop);
+    }
+    let model = parse_model_string(
+        "[parameters]\n theta TVCL(5, 0.1, 50)\n theta TVV(50, 5, 500)\n omega ETA_CL ~ 0.04\n omega ETA_V ~ 0.04\n kappa KAPPA_CL ~ 0.03\n sigma PROP ~ 0.01\n[individual_parameters]\n CL = TVCL * exp(ETA_CL + KAPPA_CL)\n V = TVV * exp(ETA_V)\n F = 0.7\n[structural_model]\n pk one_cpt_iv(cl=CL, v=V, f=F)\n[error_model]\n DV ~ proportional(PROP)",
+    )
+    .unwrap();
+    assert_eq!(
+        (model.n_eta, model.n_kappa),
+        (2, 1),
+        "fixture: η and κ widths differ"
+    );
+    (model, pop)
+}
+
+fn single_thread_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap()
+}
+
+/// EBE solves started on the pool's one worker while `f` runs.
+fn solves_during<R: Send>(pool: &rayon::ThreadPool, f: impl FnOnce() -> R + Send) -> (R, usize) {
+    use crate::estimation::inner_optimizer::EBE_SOLVES_STARTED;
+    pool.install(|| {
+        let before = EBE_SOLVES_STARTED.with(|n| n.get());
+        let out = f();
+        (out, EBE_SOLVES_STARTED.with(|n| n.get()) - before)
+    })
+}
+
+/// A cancel flipped by the first subject's finish skips every later subject: their solve
+/// never starts (counted at `find_ebe_cached`, not at the finish). One worker thread makes
+/// "later" deterministic. The same run with the flag present but never flipped is the
+/// other side of the gate: every subject is solved and none is rejected.
 #[test]
 fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = single_thread_pool();
     for iov in [false, true] {
-        let (model, pop) = fixture(iov, false);
+        let (model, pop) = cancel_fixture(iov);
         let n = pop.subjects.len();
         let params = &model.default_params;
         // A non-zero warm start, so the placeholder's η is distinguishable from zeros.
         let warm: Vec<DVector<f64>> = (0..n)
             .map(|i| DVector::from_element(model.n_eta, 0.01 * (i + 1) as f64))
             .collect();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .stack_size(crate::FIT_RAYON_STACK_SIZE)
-            .build()
-            .unwrap();
         let run = |flip: bool| {
             let flag = crate::cancel::CancelFlag::new();
-            let finished = AtomicUsize::new(0);
-            let out = pool.install(|| {
+            solves_during(&pool, || {
                 run_inner_loop_warm_map(
                     &model,
                     &pop,
@@ -445,20 +479,18 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
                     InnerSolvePolicy::default(),
                     Some(&flag),
                     |_, ebe| {
-                        finished.fetch_add(1, Ordering::SeqCst);
                         if flip {
                             flag.cancel();
                         }
                         ebe.nll
                     },
                 )
-            });
-            (out, finished.into_inner())
+            })
         };
 
-        let (control, control_finished) = run(false);
+        let (control, control_solves) = run(false);
         assert_eq!(
-            control_finished, n,
+            control_solves, n,
             "iov={iov}: control must solve every subject"
         );
         assert_eq!(
@@ -473,9 +505,9 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
             );
         }
 
-        let (cancelled, cancelled_finished) = run(true);
+        let (cancelled, cancelled_solves) = run(true);
         assert_eq!(
-            cancelled_finished, 1,
+            cancelled_solves, 1,
             "iov={iov}: subjects after the cancel must not be solved"
         );
         assert_eq!(
@@ -510,6 +542,10 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
                 control.3[i].len(),
                 "iov={iov} subj {i}"
             );
+            for (k, (got, want)) in cancelled.3[i].iter().zip(&control.3[i]).enumerate() {
+                assert_eq!(got.len(), want.len(), "iov={iov} subj {i} κ {k}: width");
+                assert!(got.iter().all(|&v| v == 0.0), "iov={iov} subj {i} κ {k}");
+            }
             assert_eq!(
                 cancelled.4[i], 0.0,
                 "iov={iov}: skipped subject ran its finish"
@@ -518,18 +554,22 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
     }
 }
 
-/// The stage-seeded entry point the trust region, Gauss–Newton and the final inner pass
-/// use reads the cancel flag off the stage options it is handed — not only callers that
-/// pass a flag explicitly.
+/// The stage-seeded entry point feeds the passes whose output is kept — final readouts,
+/// Gauss–Newton, the trust region — so it must never hand back a placeholder, even with
+/// the stage's flag set. Those callers poll at their own iteration boundaries.
 #[test]
-fn the_stage_seeded_inner_pass_reads_the_stage_cancel_flag() {
+fn the_stage_seeded_inner_pass_ignores_a_cancel() {
+    let pool = single_thread_pool();
     let (model, pop) = fixture(false, false);
     let params = &model.default_params;
-    let base = FitOptions {
+    let flag = crate::cancel::CancelFlag::new();
+    flag.cancel();
+    let stage = FitOptions {
         inner_maxiter: 20,
+        cancel: Some(flag),
         ..Default::default()
     };
-    let run = |stage: &FitOptions| {
+    let (stats, solves) = solves_during(&pool, || {
         run_inner_loop_warm_seeded(
             &model,
             &pop,
@@ -540,58 +580,67 @@ fn the_stage_seeded_inner_pass_reads_the_stage_cancel_flag() {
             None,
             0,
             0,
-            InnerHessianSeed::for_options(stage),
-            stage,
+            InnerHessianSeed::for_options(&stage),
+            &stage,
         )
         .2
-        .n_start_rejected
-    };
-    assert_eq!(run(&base), 0, "control rejected a subject");
-    let flag = crate::cancel::CancelFlag::new();
-    flag.cancel();
-    let cancelled = FitOptions {
-        cancel: Some(flag),
-        ..base
-    };
-    assert_eq!(run(&cancelled), pop.subjects.len());
+    });
+    assert_eq!(solves, pop.subjects.len());
+    assert_eq!(stats.n_start_rejected, 0);
 }
 
-/// The FOCE/FOCEI pass the outer optimizers score never reports a cancelled pass as an
-/// objective: the placeholders' zero contributions would otherwise sum to a finite — and
-/// spuriously low — OFV, which the derivative-free and legacy-BFGS callers do not guard
-/// against. Both branches of `run_inner_loop_and_nll_prepared`: the FOCE marginal, and
-/// the AGQ quadrature, which must not run on placeholders at all.
+/// The scorer the outer optimizers read never reports a cancelled pass as an objective:
+/// the placeholders' zero contributions would otherwise sum to a finite — and spuriously
+/// low — OFV, which the derivative-free pre-search does not guard against. Both branches
+/// of `run_inner_loop_and_nll_prepared`: the FOCE marginal, and the AGQ quadrature, which
+/// must not run on placeholders at all (no fused evaluation comes back). The gate is the
+/// `cancel` argument, not `options.cancel`: a caller passing `None` (built-in BFGS) gets a
+/// full pass with the stage's flag set.
 #[test]
 fn a_cancelled_inner_pass_scores_no_objective() {
     let (model, pop) = fixture(false, false);
     let params = &model.default_params;
+    let x = crate::estimation::parameterization::pack_params(params);
+    let bounds = crate::estimation::parameterization::compute_bounds(params);
+    let flag = crate::cancel::CancelFlag::new();
+    flag.cancel();
     for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
-        let base = FitOptions {
+        let agq = method == EstimationMethod::Laplace;
+        let opts = FitOptions {
             method,
             inner_maxiter: 20,
+            cancel: Some(flag.clone()),
             ..Default::default()
         };
         assert_eq!(
-            base.agq_nodes().is_some(),
-            method == EstimationMethod::Laplace,
+            opts.agq_nodes().is_some(),
+            agq,
             "fixture: one arm per branch"
         );
-        let (_, _, stats, _, nll) =
-            run_inner_loop_and_nll(&model, &pop, params, &base, None, None, None);
+        let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds));
+        let run = |cancel| {
+            run_inner_loop_and_nll_prepared(
+                &model,
+                &pop,
+                params,
+                &opts,
+                None,
+                None,
+                gradient_inputs,
+                None,
+                cancel,
+            )
+        };
+
+        let (_, _, stats, _, nll, evaluation, _) = run(None);
         assert!(
             nll.is_finite(),
-            "{method:?}: control objective must be finite"
+            "{method:?}: an uncancellable pass must score"
         );
         assert_eq!(stats.n_start_rejected, 0, "{method:?}");
+        assert_eq!(evaluation.is_some(), agq, "{method:?}: control evaluation");
 
-        let flag = crate::cancel::CancelFlag::new();
-        flag.cancel();
-        let cancelled = FitOptions {
-            cancel: Some(flag),
-            ..base
-        };
-        let (etas, _, stats, _, nll) =
-            run_inner_loop_and_nll(&model, &pop, params, &cancelled, None, None, None);
+        let (etas, _, stats, _, nll, evaluation, _) = run(Some(&flag));
         assert_eq!(
             nll,
             f64::INFINITY,
@@ -599,5 +648,98 @@ fn a_cancelled_inner_pass_scores_no_objective() {
         );
         assert_eq!(stats.n_start_rejected, pop.subjects.len(), "{method:?}");
         assert_eq!(etas.len(), pop.subjects.len(), "{method:?}");
+        assert!(
+            evaluation.is_none(),
+            "{method:?}: quadrature ran on placeholders"
+        );
     }
+}
+
+/// End to end through the NLopt objective — the default FOCEI path. A cancel landing on
+/// the first subject of the first evaluation (the entry check is poll 1) must start no
+/// solve in that evaluation, so the run solves exactly as many subjects as a run cancelled
+/// before it began: only the uncancellable final readout. Without the per-subject poll at
+/// the objective's call site, the first evaluation solves every subject first.
+#[test]
+fn a_cancel_inside_the_first_nlopt_evaluation_solves_nothing_more() {
+    let pool = single_thread_pool();
+    let (model, pop) = fixture(false, false);
+    for optimizer in [Optimizer::Bobyqa, Optimizer::NloptLbfgs] {
+        let run = |flag: crate::cancel::CancelFlag| {
+            let opts = FitOptions {
+                optimizer,
+                outer_maxiter: 5,
+                inner_maxiter: 20,
+                run_covariance_step: false,
+                global_search: false,
+                verbose: false,
+                cancel: Some(flag),
+                ..Default::default()
+            };
+            solves_during(&pool, || {
+                optimize_population(&model, &pop, &model.default_params, &opts)
+            })
+        };
+        let (_, pre_cancelled) = run(crate::cancel::CancelFlag::trip_after(0));
+        let (_, mid_eval) = run(crate::cancel::CancelFlag::trip_after(1));
+        let (_, control) = run(crate::cancel::CancelFlag::new());
+        assert!(
+            control > pre_cancelled + pop.subjects.len(),
+            "{optimizer:?}: fixture must run real evaluations ({control} vs {pre_cancelled})"
+        );
+        assert_eq!(
+            mid_eval,
+            pre_cancelled,
+            "{optimizer:?}: the cancelled evaluation solved {} subjects",
+            mid_eval as isize - pre_cancelled as isize
+        );
+    }
+}
+
+/// The global pre-search's two passes are cancellable too. Its user-start evaluation
+/// (`eval_at_scaled`) has no entry check, so a pre-cancelled flag reaches its inner pass
+/// directly and must solve nothing. A flag that trips on the first subject of the first
+/// CRS2-LM evaluation must add exactly the start pass's `n` solves. That poll is number
+/// `n + 3`: the start pass polls `n + 1` times (each subject, then the `+inf` gate), and the
+/// CRS2-LM evaluation's entry check is one more. Measured, not assumed: one poll earlier
+/// trips the entry check instead and passes with the pass's own poll deleted.
+/// Baseline: the same pre-cancelled run without the pre-search.
+#[test]
+fn a_cancel_inside_the_global_pre_search_solves_nothing_more() {
+    let pool = single_thread_pool();
+    let (model, pop) = fixture(false, false);
+    let n = pop.subjects.len();
+    let run = |global_search: bool, flag: crate::cancel::CancelFlag| {
+        let opts = FitOptions {
+            optimizer: Optimizer::Bobyqa,
+            global_search,
+            global_maxeval: 20,
+            outer_maxiter: 5,
+            inner_maxiter: 20,
+            run_covariance_step: false,
+            verbose: false,
+            cancel: Some(flag),
+            ..Default::default()
+        };
+        solves_during(&pool, || {
+            optimize_population(&model, &pop, &model.default_params, &opts)
+        })
+        .1
+    };
+    let baseline = run(false, crate::cancel::CancelFlag::trip_after(0));
+    let control = run(true, crate::cancel::CancelFlag::new());
+    assert!(
+        control > baseline + 2 * n,
+        "fixture: the pre-search must run ({control})"
+    );
+    assert_eq!(
+        run(true, crate::cancel::CancelFlag::trip_after(0)),
+        baseline,
+        "the pre-search's start pass solved after a cancel"
+    );
+    assert_eq!(
+        run(true, crate::cancel::CancelFlag::trip_after(n + 2)),
+        baseline + n,
+        "the first CRS2-LM evaluation solved after a cancel"
+    );
 }

@@ -1625,9 +1625,18 @@ pub(crate) fn find_ebe_cached(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    #[cfg(test)]
+    EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
     find_ebe_impl(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
     )
+}
+
+// Solves entered through `find_ebe_cached` on this thread, so a test can observe which
+// subjects an inner pass actually solved rather than which it finished (#574 review).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
@@ -4968,7 +4977,10 @@ pub(crate) fn run_inner_loop_warm_seeded(
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
         },
-        stage.cancel.as_ref(),
+        // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
+        // Gauss–Newton and the trust region, which would carry a placeholder into a
+        // returned result or an accepted state. Those poll at their own boundaries.
+        None,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)

@@ -193,11 +193,6 @@ impl CostFunction for FoceiProblem<'_> {
 
     fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
         let (etas, h_mats) = self.run_inner(p);
-        // A cancel during the inner pass leaves placeholder EBEs (#574): score the trial
-        // as rejected and keep it out of the gradient cache.
-        if crate::cancel::is_cancelled(&self.options.cancel) {
-            return Ok(1e20);
-        }
         let ofv = self.ofv_fixed(p, &etas, &h_mats);
         // Pre-warm the gradient cache with EBEs so that a subsequent
         // gradient() call on the same x skips the redundant run_inner().
@@ -1648,62 +1643,6 @@ mod tests {
         assert!(
             res.final_gradient.is_none(),
             "a cancelled run paid a gradient pass"
-        );
-    }
-
-    /// #574: a trial whose inner pass saw the cancel scores as rejected and leaves the
-    /// gradient cache empty, so no placeholder EBE is reused. Same problem, flag unset,
-    /// is the other side of the gate.
-    #[test]
-    fn a_cancelled_cost_is_rejected_and_not_cached() {
-        use crate::estimation::parameterization::compute_bounds;
-        use crate::io::datareader::read_nonmem_csv;
-        use std::path::Path;
-
-        let model = warfarin_model();
-        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
-            .expect("warfarin data must load");
-        let init = &model.default_params;
-        let x = pack_params(init);
-        let problem = |options: &FitOptions| -> (f64, bool) {
-            let p = FoceiProblem {
-                model: &model,
-                population: &population,
-                options,
-                init_params: init,
-                bounds: compute_bounds(init),
-                cached_etas: std::sync::Mutex::new(Vec::new()),
-                grad_cache: std::sync::Mutex::new(None),
-                nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
-                    &model,
-                    &population,
-                    options,
-                ),
-                priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
-            };
-            let cost = p.cost(&x).unwrap();
-            let cached = p.grad_cache.lock().unwrap().is_some();
-            (cost, cached)
-        };
-        let base = FitOptions {
-            inner_maxiter: 20,
-            verbose: false,
-            ..FitOptions::default()
-        };
-        let (cost, cached) = problem(&base);
-        assert!(cost.is_finite() && cost < 1e19, "control cost {cost}");
-        assert!(cached, "control must warm the gradient cache");
-
-        let flag = crate::cancel::CancelFlag::new();
-        flag.cancel();
-        let (cost, cached) = problem(&FitOptions {
-            cancel: Some(flag),
-            ..base
-        });
-        assert_eq!(cost, 1e20);
-        assert!(
-            !cached,
-            "a cancelled trial's placeholder EBEs reached the cache"
         );
     }
 
