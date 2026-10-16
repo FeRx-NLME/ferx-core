@@ -1388,8 +1388,11 @@ fn read_bundled_population(
     match (parsed, &fit.reader_settings, fingerprint) {
         (Ok(mut parsed), Some(settings), Some(fingerprint)) => {
             let replayed = (|| -> Result<Population, String> {
+                // Both codes below are dropped on purpose: the text only feeds the
+                // replay warning. Both are listed among the uncoded sites (#1772).
                 let (mut population, _) =
-                    crate::api::read_population_with(&parsed.model, settings, data_path)?;
+                    crate::api::read_population_with_diag(&parsed.model, settings, data_path)
+                        .map_err(|d| d.message)?;
                 // The fit's population carries the level index columns its binding
                 // wrote; write them the same way, from the fit's own bindings.
                 if !parsed.model.theta_blocks().level_blocks().is_empty() {

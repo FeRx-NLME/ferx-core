@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -108,7 +108,7 @@ pub fn fit_from_files(
     data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, EngineError> {
     // Parse the full model so an authoritative `[covariates]` block is visible
     // here (the file's `[fit_options]` are still ignored — the caller's
     // `options` win, preserving historical behaviour).
@@ -121,7 +121,7 @@ pub fn fit_from_files(
         hash: model_hash,
         mut parsed,
         ..
-    } = crate::io::model_source::ModelSource::read(model_path)?;
+    } = crate::api::run::read_model_source(model_path)?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
@@ -146,25 +146,21 @@ pub fn fit_from_files(
         ignore_subjects: reader_settings.ignore_subjects.clone(),
         ..opts
     };
-    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let (data_path, data_path_warning) =
+        resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
     let data_path = data_path.as_str();
     let (mut population, covariate_table) =
-        read_population_with(&parsed.model, &reader_settings, data_path)?;
+        read_population_with_diag(&parsed.model, &reader_settings, data_path)
+            .map_err(EngineError::from_diagnostic)?;
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
     // property of the dataset. Mirrors `run_model_with_data_inits`.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
     // #1111: resolve any symbolic `[covariate_model]` statistic
     // (`center = median`, `ref = mode`, `levels = auto`) against the same
     // dataset. `assert_covariate_model_bound` names this entry point as one
     // that binds them, so it has to actually do it.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     let model = parsed.model;
     // No model stamps: `fit` resolves `opts.gradient_method` (#1613) and `opts.bloq_method`
     // (#1824) per call. One options-side pin keeps this entry point's contract — the file's
@@ -498,7 +494,7 @@ pub fn fit(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, EngineError> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
     // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
     // the ones the population carries are not part of what it was given (#1685
@@ -612,7 +608,7 @@ fn fit_unstamped(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, EngineError> {
     // #426: this call's `inner_optimizer` / `ebe_warm_start` are armed by `install_on_fit_pool`
     // (on the thread that runs the fit, and on the workers of the pool it picks), not here: unlike the ODE
     // override below, nothing before the pool solves an EBE. They were process globals that
@@ -650,28 +646,17 @@ fn fit_unstamped(
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the ways out — first the public
     // binder, since a caller that reached `fit()` assembled the inputs itself (#1384).
-    if !model.theta_blocks().unbound_level_blocks().is_empty() {
-        return Err(format!(
-            "`theta {}[...]` was never bound to data, so it has no levels. Call \
-             `bind_theta_levels(&mut parsed, &model_text, &mut population)` after \
-             reading the population (`read_population_for`) and before `fit`. \
-             `prepare_run` and the file entry points (`fit_from_files`, \
-             `run_model_with_data`, the CLI) bind for you. Or declare the block \
-             explicitly as `theta {}[N](...)` and index it with your own column.",
-            model
-                .theta_blocks()
-                .unbound_level_blocks()
-                .join("`, `theta "),
-            model.theta_blocks().unbound_level_blocks()[0],
-        ));
-    }
+    // `E_THETA_LEVELS_UNBOUND`, the code `predict` and `simulate` give it (#1772).
+    first_error(&crate::api::validation::check_unbound_theta_levels(
+        model,
+        crate::api::validation::UnboundLevelsEntry::Fit,
+    ))?;
     // #1764: `init_params` against the model's layout. A short θ fitted to a finite,
     // meaningless objective; a long θ or a mis-sized Ω / σ / Ω_IOV panicked in the
     // gradient or the inner solve, and a long σ was carried into the result unused.
     // The same checks the post-fit entry points run; `fit` returns their message.
-    crate::api::check_theta_length(model, &init_params.theta).map_err(|e| e.to_string())?;
-    crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))
-        .map_err(|e| e.to_string())?;
+    crate::api::check_theta_length(model, &init_params.theta)?;
+    crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Other
     // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
@@ -685,16 +670,15 @@ fn fit_unstamped(
         // with `MIXNUM` pinned to the class-1 default. Fail loudly instead: the
         // per-class Omega/Sigma must be present.
         if init_params.mixture.is_none() {
-            return Err(
+            return Err(EngineError::uncoded(
                 "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
                  `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
-                 them from the model file) rather than params with `mixture: None`"
-                    .to_string(),
-            );
+                 them from the model file) rather than params with `mixture: None`",
+            ));
         }
         for m in options.method_chain() {
             if m == EstimationMethod::FoceI && options.n_agq > 1 {
-                return Err("mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid.".to_string());
+                return Err(EngineError::uncoded("mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid."));
             }
             if !matches!(
                 m,
@@ -711,11 +695,11 @@ fn fit_unstamped(
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
             ) {
-                return Err(format!(
+                return Err(EngineError::uncoded(format!(
                     "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
                      IMPMAP; the {} method is not yet wired for mixtures (#985)",
                     m.label()
-                ));
+                )));
             }
         }
         // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
@@ -726,13 +710,12 @@ fn fit_unstamped(
         if options.method_chain().contains(&EstimationMethod::Bayes) {
             if let Some(mp) = init_params.mixture.as_ref() {
                 if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
-                    return Err(
+                    return Err(EngineError::uncoded(
                         "Bayesian estimation (method = bayes) does not yet support per-class \
                          Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
                          shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
-                         overrides (#985)."
-                            .to_string(),
-                    );
+                         overrides (#985).",
+                    ));
                 }
             }
         }
@@ -748,39 +731,43 @@ fn fit_unstamped(
     crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
-    if let Some(e) = check_absorption_closed_form_support(model, population) {
-        return Err(e);
-    }
+    // `E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`, as `ferx check` and `predict` (#1772).
+    first_error(&check_absorption_closed_form_support_diags(
+        model, population,
+    ))?;
     // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
     // it returns an identically-zero profile that silently degenerates the objective and,
     // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
     // evaluated at η = 0 typical values here rather than in `check_absorption_closed_form_support`.
-    if let Some(e) = check_absorption_flip_flop_no_twin(model, population, &init_params.theta) {
-        return Err(e);
-    }
+    // `E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP` (#1772).
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model,
+        population,
+        &init_params.theta,
+    ))?;
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
-    first_error(&check_analytic_readout_support(model, population)).map_err(|e| e.to_string())?;
+    first_error(&check_analytic_readout_support(model, population))?;
     // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
     // gap-time — require time-sorted records and do not support interval-censored /
     // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
     // Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
     if let Some(e) = check_rtte_records(model, population) {
-        return Err(e);
+        return Err(EngineError::uncoded(e));
     }
     // A survival hazard that references a time-varying covariate would be silently
     // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
     // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
     #[cfg(feature = "survival")]
-    first_error(&check_survival_tv_covariates(model, population)).map_err(|e| e.to_string())?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // The `TIME` axis of the same freeze: an ODE-accumulated hazard integrates the
     // disposition at its TIME=0 snapshot while the Gaussian half reads `$PK` at every
     // record, so a TIME-dependent CL/V/init would put the two halves of the objective on
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
-    first_error(&check_survival_time_dependent_pk_diags(model)).map_err(|e| e.to_string())?;
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
@@ -788,7 +775,8 @@ fn fit_unstamped(
     #[cfg(feature = "survival")]
     for cmt in model.binary_cmts() {
         for subject in &population.subjects {
-            crate::categorical::validate_binary_states(cmt, &subject.obs_records)?;
+            crate::categorical::validate_binary_states(cmt, &subject.obs_records)
+                .map_err(EngineError::uncoded)?;
         }
     }
     // CTMM (#759): reject an observed DV code that is not one of the endpoint's declared
@@ -808,20 +796,22 @@ fn fit_unstamped(
             // parse (`generator_states` indices point into `ode_spec`), asserted here for a
             // hand-built `CompiledModel`.
             if !generator_states.is_empty() && model.ode_spec.is_none() {
-                return Err(format!(
+                return Err(EngineError::uncoded(format!(
                     "[markov_model] cmt = {cmt}: a transition intensity references a model state \
                      (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
-                ));
+                )));
             }
             for subject in &population.subjects {
                 crate::markov::endpoint::validate_ctmm_states(
                     *cmt,
                     state_codes,
                     &subject.obs_records,
-                )?;
+                )
+                .map_err(EngineError::uncoded)?;
                 // Out-of-order observation times would otherwise silently collapse the
                 // subject to the 1e20 sentinel (datareader sorts doses, not obs).
-                crate::markov::endpoint::validate_ctmm_times(*cmt, &subject.obs_records)?;
+                crate::markov::endpoint::validate_ctmm_times(*cmt, &subject.obs_records)
+                    .map_err(EngineError::uncoded)?;
             }
         }
     }
@@ -832,25 +822,22 @@ fn fit_unstamped(
     // log-wrapped while variance still expects natural-scale `f`). Fail fast.
     if model.log_transform {
         if !matches!(model.error_model, ErrorModel::Additive) {
-            return Err(
+            return Err(EngineError::uncoded(
                 "LTBS (`log_transform = true`) requires `error_model = Additive`; \
-                 proportional/combined error on the log scale is not supported"
-                    .to_string(),
-            );
+                 proportional/combined error on the log scale is not supported",
+            ));
         }
         if !matches!(model.error_spec, ErrorSpec::Single(_)) {
-            return Err(
+            return Err(EngineError::uncoded(
                 "LTBS (`log_transform = true`) is not supported with per-CMT \
-                 (`ErrorSpec::PerCmt`) error models"
-                    .to_string(),
-            );
+                 (`ErrorSpec::PerCmt`) error models",
+            ));
         }
         if model.diffusion_theta_start.is_some() {
-            return Err(
+            return Err(EngineError::uncoded(
                 "LTBS (`log_transform = true`) is not supported with an SDE \
-                 model (`diffusion_theta_start = Some(_)`)"
-                    .to_string(),
-            );
+                 model (`diffusion_theta_start = Some(_)`)",
+            ));
         }
     }
     // IIV on residual error (`iiv_on_ruv`, #409) validation.
@@ -860,11 +847,11 @@ fn fit_unstamped(
         // structural/individual-parameter eta). Reject a dual-use eta.
         if let Some(name) = model.eta_names.get(k) {
             if model.eta_param_info.iter().any(|e| &e.eta_name == name) {
-                return Err(format!(
+                return Err(EngineError::uncoded(format!(
                     "[error_model] iiv_on_ruv = {name}: this eta is also used in \
                      [individual_parameters]; the residual-error random effect must be a \
                      dedicated omega not shared with a structural parameter"
-                ));
+                )));
             }
         }
         // IIV-on-RUV is inherently an interaction model (`Y = IPRED + EPS·EXP(ETA)`
@@ -874,12 +861,12 @@ fn fit_unstamped(
         // Monte-Carlo estimator (IMP/IMPMAP/SAEM), at every stage of a chain —
         // the one predicate `ruvsearch` consults before proposing the feature.
         if let Some(m) = options.non_interaction_stage() {
-            return Err(format!(
+            return Err(EngineError::uncoded(format!(
                 "IIV on residual error (iiv_on_ruv) requires an interaction or \
                  Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
                  with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
                  INTERACTION model."
-            ));
+            )));
         }
     }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
@@ -892,8 +879,7 @@ fn fit_unstamped(
         population,
         &options.iov_occasion,
         init_params,
-    ))
-    .map_err(|e| e.to_string())?;
+    ))?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
     // occasion count) is a property of the *data*, not the model — so this cap cannot be
     // checked in `check_model_options`, which never sees the population. Check it here, once
@@ -925,7 +911,7 @@ fn fit_unstamped(
                 } else {
                     "focei"
                 };
-                return Err(format!(
+                return Err(EngineError::uncoded(format!(
                     "method = {label} with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
                      tensor grid per subject per iteration — over the {} limit. Under IOV the \
                      integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
@@ -935,7 +921,7 @@ fn fit_unstamped(
                     crate::estimation::agq::MAX_AGQ_GRID,
                     model.n_eta,
                     model.n_kappa,
-                ));
+                )));
             }
         }
     }
@@ -979,14 +965,13 @@ fn fit_unstamped(
         };
         let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
         if max_occ <= 1 {
-            return Err(
+            return Err(EngineError::uncoded(
                 "The `iov_occasion` rule produced only a single occasion for every subject, \
                  so the per-occasion kappa (IOV) cannot be separated from between-subject \
                  variability (it is unidentifiable). Use `iov_occasion = time(...)` with \
                  breakpoints inside the sampling window, `iov_occasion = dose` on a \
-                 multiple-dose design, or supply an `iov_column`."
-                    .to_string(),
-            );
+                 multiple-dose design, or supply an `iov_column`.",
+            ));
         }
         // Above this many occasions per subject the derivation has almost
         // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
@@ -1013,7 +998,7 @@ fn fit_unstamped(
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
         // rather than turning a previously-successful default fit into an `Err`.
-        let res = install_on_fit_pool(options, run)?;
+        let res = install_on_fit_pool(options, run).map_err(EngineError::uncoded)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
             // Surface any SS-equilibration non-convergence seen during this (default, single-start)
@@ -1055,7 +1040,7 @@ fn fit_unstamped(
         ));
     }
 
-    let par_starts = || -> Vec<(usize, Result<FitResult, String>)> {
+    let par_starts = || -> Vec<(usize, Result<FitResult, EngineError>)> {
         (0..n)
             .into_par_iter()
             .map(|k| {
@@ -1088,8 +1073,8 @@ fn fit_unstamped(
 
     // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
     // shared big-stack pool; fall back to the ambient pool only if that one-time build failed.
-    let results: Vec<(usize, Result<FitResult, String>)> =
-        install_on_fit_pool(options, par_starts)?;
+    let results: Vec<(usize, Result<FitResult, EngineError>)> =
+        install_on_fit_pool(options, par_starts).map_err(EngineError::uncoded)?;
 
     // Pick the best start (see `multistart_prefers` for the ranking). Under
     // covariate-NN regularization every start minimised the *penalized*
@@ -1122,10 +1107,10 @@ fn fit_unstamped(
         // multi-start fits failed" over a candidate whose model the engine
         // refused to start at all (#1256: a seeded ω block at the rail),
         // which is a different repair from a fit that diverged.
-        None => Err(format!(
+        None => Err(EngineError::uncoded(format!(
             "All multi-start fits failed: {}",
             failed_starts.join("; ")
-        )),
+        ))),
         Some((k, mut result)) => {
             result.warnings.splice(0..0, pre_warnings);
             if !failed_starts.is_empty() {
@@ -1250,7 +1235,7 @@ fn fit_inner(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, EngineError> {
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -1472,7 +1457,7 @@ fn fit_inner(
     // is always single-endpoint here, which the EKF residual-variance
     // assumption in stats/likelihood.rs relies on.)
     let option_diags = check_model_options(model, options);
-    first_error(&option_diags).map_err(|e| e.to_string())?;
+    first_error(&option_diags)?;
 
     // A free variance whose initial value packs onto the optimizer's own lower
     // rail (#1229). Evaluated on `init_params`, not `model.default_params`:
@@ -1480,7 +1465,7 @@ fn fit_inner(
     // inits, and it is the vector the optimizer actually starts from that gets
     // clamped. Placed here — before every population-dependent check — because
     // the predicate needs no data and fails identically for every method.
-    first_error(&check_variance_init_rails(init_params, options)).map_err(|e| e.to_string())?;
+    first_error(&check_variance_init_rails(init_params, options))?;
     // #254: refuse a prior that cannot be applied, before any optimizer runs.
     // See `check_parameter_priors` for why an unapplied prior is an error and
     // not a warning.
@@ -1488,8 +1473,7 @@ fn fit_inner(
         model,
         init_params,
         options,
-    ))
-    .map_err(|e| e.to_string())?;
+    ))?;
 
     // An initial estimate that packs strictly outside its own box and is
     // silently clamped there (#1251). Computed **once**, into a local: it
@@ -1501,7 +1485,7 @@ fn fit_inner(
     // Getting that wrong reports every one of these from `ferx check` and drops
     // them silently from `fit()`, the #1033 failure mode.
     let start_box_diags = check_packed_start_in_box(init_params, options);
-    first_error(&start_box_diags).map_err(|e| e.to_string())?;
+    first_error(&start_box_diags)?;
 
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
@@ -1659,8 +1643,7 @@ fn fit_inner(
         // The `?` is defensive, not reachable through `fit()`: both checks `inits_from_nca`
         // can fail on are in `check_model_data_rule`, whose first error `fit()` has already
         // returned before entering this function. No test covers it for that reason.
-        let suggested = crate::suggest_start::inits_from_nca(model, population, method)
-            .map_err(|e| e.to_string())?;
+        let suggested = crate::suggest_start::inits_from_nca(model, population, method)?;
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }
@@ -1895,7 +1878,7 @@ fn fit_inner(
             continue;
         }
         if crate::cancel::is_cancelled(&options.cancel) {
-            return Err("cancelled by user".to_string());
+            return Err(EngineError::uncoded("cancelled by user"));
         }
         crate::io::checkpoint::set_stage(stage_idx);
         let stage_start = std::time::Instant::now();
@@ -2237,9 +2220,8 @@ fn fit_inner(
         }
 
         let stage_result = match method {
-            EstimationMethod::Saem => {
-                saem::run_saem(model, population, &stage_params, &stage_opts)?
-            }
+            EstimationMethod::Saem => saem::run_saem(model, population, &stage_params, &stage_opts)
+                .map_err(EngineError::uncoded)?,
             EstimationMethod::Impmap => {
                 // Warm-start the first MAP inner loop from the preceding stage's
                 // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
@@ -2250,7 +2232,8 @@ fn fit_inner(
                     &stage_params,
                     warm,
                     &stage_opts,
-                )?
+                )
+                .map_err(EngineError::uncoded)?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
                 crate::estimation::gauss_newton::run_foce_gn(
@@ -2272,13 +2255,16 @@ fn fit_inner(
                     &stage_params,
                     warm,
                     &stage_opts,
-                )?
+                )
+                .map_err(EngineError::uncoded)?
             }
             EstimationMethod::Bayes => {
-                crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
+                crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)
+                    .map_err(EngineError::uncoded)?
             }
             EstimationMethod::Vi => {
-                crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)?
+                crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)
+                    .map_err(EngineError::uncoded)?
             }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
@@ -2363,7 +2349,7 @@ fn fit_inner(
     }
 
     if crate::cancel::is_cancelled(&options.cancel) {
-        return Err("cancelled by user".to_string());
+        return Err(EngineError::uncoded("cancelled by user"));
     }
 
     let mut result = result.expect("method chain must have at least one stage");
@@ -2538,8 +2524,7 @@ fn fit_inner(
             // `population` already carries the labels a derived `iov_occasion` rule gives
             // (`fitted_population`), so there is no rule to apply here (#1980).
             None,
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;

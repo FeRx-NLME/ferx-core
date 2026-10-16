@@ -147,7 +147,8 @@ fn fit_rejects_an_unrouted_joint_population() {
     );
 
     let err = fit(&m, &u, &m.default_params, &FitOptions::default())
-        .expect_err("fit() must refuse the unrouted population");
+        .expect_err("fit() must refuse the unrouted population")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "fit() error: {err}");
 }
 
@@ -205,7 +206,8 @@ fn fit_rejects_a_routed_population_whose_endpoint_has_no_rows() {
     );
 
     let err = fit(&m, &r, &m.default_params, &FitOptions::default())
-        .expect_err("fit() must refuse an endpoint with no rows");
+        .expect_err("fit() must refuse an endpoint with no rows")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_NO_RECORDS"), "fit() error: {err}");
 }
 

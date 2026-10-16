@@ -495,7 +495,9 @@ fn a_fit_whose_every_start_is_refused_says_why() {
     );
     let mut opts = short_fit_opts();
     opts.n_starts = 2;
-    let err = fit(&model, &pop, &params, &opts).expect_err("every start is refused");
+    let err = fit(&model, &pop, &params, &opts)
+        .expect_err("every start is refused")
+        .to_string();
     assert!(
         err.starts_with("All multi-start fits failed: start 0:"),
         "{err}"

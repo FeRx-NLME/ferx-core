@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -119,7 +119,7 @@ pub fn resolve_data_path(
 pub fn run_model_with_data(
     model_path: &str,
     data_path: Option<&str>,
-) -> Result<(FitResult, Population), String> {
+) -> Result<(FitResult, Population), EngineError> {
     run_model_with_data_inits(model_path, data_path, None)
 }
 
@@ -175,7 +175,7 @@ pub struct PreparedRun {
 ///
 /// Unlike [`run_model_with_data`] this is **quiet** — it prints nothing — because
 /// its caller may be running it hundreds of times.
-pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<PreparedRun, String> {
+pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<PreparedRun, EngineError> {
     prepare_run_with_inits(model_path, data_path, None)
 }
 
@@ -185,7 +185,7 @@ pub fn prepare_run_with_inits(
     model_path: &str,
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
-) -> Result<PreparedRun, String> {
+) -> Result<PreparedRun, EngineError> {
     // One read of the model file (#1752): the parse, the binders, `model_hash` and
     // the stored `model_text` are all this read, never a later version of the file.
     let crate::io::model_source::ModelSource {
@@ -193,36 +193,32 @@ pub fn prepare_run_with_inits(
         hash: model_hash,
         mut parsed,
         ..
-    } = crate::io::model_source::ModelSource::read(model_path)?;
+    } = read_model_source(model_path)?;
     set_model_name(&mut parsed.model, model_path);
     if let Some(method) = inits_override {
         parsed.fit_options.inits_from_nca = Some(method);
     }
 
-    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let (data_path, data_path_warning) =
+        resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
 
     // The settings this read uses are the ones the fit records (#1685).
     let reader_settings = ReaderSettings::from_parsed(&parsed);
     let (mut population, covariate_table) =
-        read_population_with(&parsed.model, &reader_settings, &data_path)?;
+        read_population_with_diag(&parsed.model, &reader_settings, &data_path)
+            .map_err(EngineError::from_diagnostic)?;
 
     // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
     // combination, so its level count is a property of the data. Bind it now —
     // this synthesizes the per-record index column on every subject and
     // re-parses the model with the real θ count — before anything reads
     // `parsed.model`'s parameter vector.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
     // #1111: and resolve any symbolic `[covariate_model]` statistic
     // (`center = median`, `ref = mode`, `levels = auto`) against the same
     // dataset, which likewise re-parses so the desugared expression carries
     // the resolved constant.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
 
     let init_params = build_init_params(&parsed);
     // `fit` honours `fit_options.gradient_method` by itself (#1613), so this stamp is not what
@@ -311,7 +307,7 @@ pub fn run_model_with_data_inits(
     model_path: &str,
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
-) -> Result<(FitResult, Population), String> {
+) -> Result<(FitResult, Population), EngineError> {
     run_model_with_overrides(
         model_path,
         data_path,
@@ -330,7 +326,7 @@ pub fn run_model_with_overrides(
     model_path: &str,
     data_path: Option<&str>,
     overrides: &RunOverrides,
-) -> Result<(FitResult, Population), String> {
+) -> Result<(FitResult, Population), EngineError> {
     let inits_override = overrides.inits_from_nca;
     let PreparedRun {
         mut parsed,
@@ -506,7 +502,7 @@ pub(crate) fn simulation_design_covariates(
     Ok((names, per_subject))
 }
 
-pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), String> {
+pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), EngineError> {
     run_model_simulate_with_overrides(model_path, &RunOverrides::default())
 }
 
@@ -517,7 +513,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
 pub fn run_model_simulate_with_overrides(
     model_path: &str,
     overrides: &RunOverrides,
-) -> Result<(FitResult, Population), String> {
+) -> Result<(FitResult, Population), EngineError> {
     use std::collections::HashMap;
 
     // One read of the model file (#1752), as in `prepare_run_with_inits`.
@@ -526,11 +522,10 @@ pub fn run_model_simulate_with_overrides(
         hash: model_hash,
         mut parsed,
         ..
-    } = crate::io::model_source::ModelSource::read(model_path)?;
-    let sim_spec = parsed
-        .simulation
-        .clone()
-        .ok_or("Model file has no [simulation] block — use --data instead")?;
+    } = read_model_source(model_path)?;
+    let sim_spec = parsed.simulation.clone().ok_or_else(|| {
+        EngineError::uncoded("Model file has no [simulation] block — use --data instead")
+    })?;
     set_model_name(&mut parsed.model, model_path);
 
     eprintln!("Model: {}", parsed.model.name);
@@ -545,10 +540,11 @@ pub fn run_model_simulate_with_overrides(
     let tte_cmts: Vec<usize> = parsed.model.tte_cmts();
     #[cfg(feature = "survival")]
     if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
-        return Err("[simulation] with a TTE endpoint requires `horizon = <t>` \
+        return Err(EngineError::uncoded(
+            "[simulation] with a TTE endpoint requires `horizon = <t>` \
              (the administrative censoring time at which event-free subjects are \
-             right-censored)"
-            .to_string());
+             right-censored)",
+        ));
     }
 
     // A synthetic design must have something to observe. The parser's
@@ -571,12 +567,11 @@ pub fn run_model_simulate_with_overrides(
     // (with `times`); the library `simulate()` chokepoint panics on the same case.
     #[cfg(feature = "markov")]
     if parsed.model.has_ctmm() {
-        return Err(
+        return Err(EngineError::uncoded(
             "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet — \
              sampling a discrete-state trajectory from the generator is a later slice. \
-             fit() supports CTMM; --simulate does not."
-                .to_string(),
-        );
+             fit() supports CTMM; --simulate does not.",
+        ));
     }
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
     let model_has_tte = parsed.model.has_tte();
@@ -588,29 +583,26 @@ pub fn run_model_simulate_with_overrides(
     let binary_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
-            return Err(
+            return Err(EngineError::uncoded(
                 "[simulation] has no `times`, but the model has a continuous \
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
-                 `horizon`)"
-                    .to_string(),
-            );
+                 `horizon`)",
+            ));
         }
         if !binary_cmts.is_empty() {
-            return Err(
+            return Err(EngineError::uncoded(
                 "[simulation] has no `times`, but the model has a [binary_model] endpoint. \
                  A binary outcome is observed on a fixed schedule, not located in time like \
                  a TTE event, so it needs `times = [...]` (a `horizon` alone gives it nothing \
-                 to observe)"
-                    .to_string(),
-            );
+                 to observe)",
+            ));
         }
         if !model_has_tte {
-            return Err(
+            return Err(EngineError::uncoded(
                 "[simulation] has no `times` and the model has no TTE endpoint \
-                 to observe at a `horizon` — nothing to simulate"
-                    .to_string(),
-            );
+                 to observe at a `horizon` — nothing to simulate",
+            ));
         }
     }
 
@@ -628,7 +620,7 @@ pub fn run_model_simulate_with_overrides(
     };
     // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
     let (sim_covariate_names, sim_subject_covariates) =
-        simulation_design_covariates(&sim_spec, &parsed.model)?;
+        simulation_design_covariates(&sim_spec, &parsed.model).map_err(EngineError::uncoded)?;
     let subject_covariates = |i: usize| -> HashMap<String, f64> {
         sim_subject_covariates
             .get(i - 1)
@@ -730,16 +722,10 @@ pub fn run_model_simulate_with_overrides(
     // declaration's broadcast init, since the DSL has no way to state per-level
     // simulation values; a design that needs distinct ones should use the
     // explicit `theta NAME[N]` form and its own index column.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
     // #1111: the simulation design is the dataset here, so a symbolic
     // covariate statistic resolves against the simulated covariates.
-    // #1772 removes: the binder's code is dropped until this entry point
-    // returns `EngineError`.
-    crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)
-        .map_err(|e| e.to_string())?;
+    crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
     let template = template;
 
     // Simulate
@@ -765,7 +751,7 @@ pub fn run_model_simulate_with_overrides(
             horizon: sim_spec.horizon,
         },
     )
-    .map_err(|e| format!("simulation failed: {e}"))?;
+    .map_err(|e| e.in_context("simulation failed"))?;
 
     // Group the simulation results by subject id once (they are emitted in
     // subject order, but a map keeps the write-back independent of that), then
@@ -996,9 +982,23 @@ pub fn run_model_simulate_with_overrides(
     Ok((result, population))
 }
 
-/// Legacy alias
-pub fn run_from_file(path: &str) -> Result<FitResult, String> {
+/// Legacy alias of [`run_model_simulate`], keeping only the [`FitResult`]. Despite
+/// its name it simulates from the model's `[simulation]` block; it reads no data file.
+#[deprecated(
+    note = "use `run_model_simulate` (simulate, then fit) or `fit_from_files` (fit a data file)"
+)]
+pub fn run_from_file(path: &str) -> Result<FitResult, EngineError> {
     run_model_simulate(path).map(|(r, _)| r)
+}
+
+/// Read and parse a model file once (#1752), coded by `ferx check`'s model-read
+/// classifier (#1772): a file that cannot be read is `E_MODEL_READ`, one that does
+/// not parse the parse's code. The message is `ModelSource::read`'s, byte for byte.
+pub(crate) fn read_model_source(
+    model_path: &str,
+) -> Result<crate::io::model_source::ModelSource, EngineError> {
+    crate::io::model_source::ModelSource::load(Path::new(model_path), None, "", "")
+        .map_err(|e| EngineError::from_diagnostic(crate::api::model_source_diagnostic(e)))
 }
 
 /// Give a model that declares no `model NAME` line the file stem as its name.
@@ -1351,12 +1351,17 @@ impl ReaderSettings {
 /// Read `data_path` for `model` with `settings`: [`read_population_for`] with every
 /// argument taken from one [`ReaderSettings`] (#1685). The file entry points read
 /// through this, so the settings they record on the fit are the ones they used.
+///
+/// A failure carries the code `ferx check` gives it (#1772): `E_PARSE` on block
+/// `data_selection` for a clause that does not compile, `E_MISSING_COVARIATE` /
+/// `E_COVARIATE_NOT_NUMERIC` for a covariate the reader finds missing or non-numeric,
+/// `E_DATA` for any other read failure.
 pub fn read_population_with(
     model: &CompiledModel,
     settings: &ReaderSettings,
     data_path: &str,
-) -> Result<(Population, Option<CovariateTable>), String> {
-    read_population_with_diag(model, settings, data_path).map_err(|d| d.message)
+) -> Result<(Population, Option<CovariateTable>), EngineError> {
+    read_population_with_diag(model, settings, data_path).map_err(EngineError::from_diagnostic)
 }
 
 /// [`read_population_with`], refusing with the [`Diagnostic`](crate::Diagnostic)

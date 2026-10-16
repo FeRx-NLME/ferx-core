@@ -480,7 +480,8 @@ fn fit_error_matches_check_diagnostic_for_missing_covariate() {
     let fit_err = fit(&model, &pop, &model.default_params, &FitOptions::default())
         .expect_err("fit must reject the missing covariate before fitting");
 
-    assert_eq!(diag_msg, fit_err);
+    assert_eq!(diag_msg, fit_err.to_string());
+    assert_eq!(fit_err.code(), Some("E_MISSING_COVARIATE"));
     let _ = std::fs::remove_file(&model_path);
 }
 
@@ -1067,7 +1068,8 @@ fn free_zero_omega_fails_fit_with_the_check_message() {
     let model = parse_full_model_file(&model_path).unwrap().model;
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("a free zero variance must be refused before fitting");
+        .expect_err("a free zero variance must be refused before fitting")
+        .to_string();
 
     assert_eq!(diag_msg, err);
     assert!(err.contains("`FIX`"), "{err}");
@@ -1123,7 +1125,8 @@ fn overridden_zero_variance_fails_fit_even_though_the_file_is_fine() {
     inits.omega = ferx_core::OmegaMatrix::from_diagonal(&[0.0], inits.omega.eta_names.clone());
 
     let err = fit(&model, &pop, &inits, &FitOptions::default())
-        .expect_err("the caller's own initial estimates must be judged, not the file's");
+        .expect_err("the caller's own initial estimates must be judged, not the file's")
+        .to_string();
     assert!(err.contains("ETA_CL"), "{err}");
     assert!(err.contains("`FIX`"), "{err}");
     let _ = std::fs::remove_file(&model_path);
@@ -1254,7 +1257,16 @@ fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fi
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
         .expect_err("a start outside its own declared range must be refused");
-    assert_eq!(d.message, err, "check and fit must agree byte for byte");
+    assert_eq!(
+        d.message,
+        err.to_string(),
+        "check and fit must agree byte for byte"
+    );
+    assert_eq!(
+        err.code(),
+        Some(d.code.as_str()),
+        "check and fit carry one code"
+    );
 
     // The differential half: the same declaration with the start moved inside
     // its range is silent, so the two assertions above cannot be passing on a
@@ -1412,7 +1424,11 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
         };
         let err0 = fit(&model, &pop, &model.default_params, &eval_only)
             .expect_err("the empty-box error is not exempt at maxiter = 0");
-        assert_eq!(err0, err, "{tag}: same refusal at maxiter = 0");
+        assert_eq!(
+            err0.to_string(),
+            err.to_string(),
+            "{tag}: same refusal at maxiter = 0"
+        );
 
         let report = validate_model_file(model_path.to_str().unwrap(), None);
         assert!(!report.valid, "{tag}: {:?}", report.diagnostics);
@@ -1423,9 +1439,11 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
             .unwrap_or_else(|| panic!("{tag}: code absent: {:?}", report.diagnostics));
         assert!(d.message.contains(cause), "{tag}: {}", d.message);
         assert_eq!(
-            d.message, err,
+            d.message,
+            err.to_string(),
             "{tag}: check and fit must agree byte for byte"
         );
+        assert_eq!(err.code(), Some("E_INIT_BOUNDS_INVERTED"), "{tag}");
 
         let _ = std::fs::remove_file(&model_path);
     }

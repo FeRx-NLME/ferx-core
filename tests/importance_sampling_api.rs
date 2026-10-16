@@ -61,7 +61,8 @@ fn imp_before_estimator_is_rejected() {
     opts.methods = vec![EstimationMethod::Imp, EstimationMethod::FoceI];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("methods = [imp, focei] must be rejected");
+        .expect("methods = [imp, focei] must be rejected")
+        .to_string();
     assert!(
         err.contains("final stage"),
         "expected `final stage` in error, got: {err}"
@@ -78,7 +79,8 @@ fn imp_non_terminal_in_chain_is_rejected() {
     ];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("non-terminal `imp` must be rejected");
+        .expect("non-terminal `imp` must be rejected")
+        .to_string();
     assert!(
         err.contains("final stage"),
         "expected `final stage` in error, got: {err}"
@@ -95,7 +97,8 @@ fn imp_duplicated_in_chain_is_rejected() {
     ];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("duplicated `imp` must be rejected");
+        .expect("duplicated `imp` must be rejected")
+        .to_string();
     assert!(
         err.contains("at most once"),
         "expected `at most once` in error, got: {err}"

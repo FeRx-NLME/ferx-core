@@ -137,7 +137,8 @@ fn an_unbound_level_block_declares_no_thetas_and_refuses_to_fit() {
         &parsed.model.default_params,
         &FitOptions::default(),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(
         err.contains("never bound to data"),
         "unexpected error: {err}"
@@ -1644,7 +1645,8 @@ mod from_fit {
 
         let err = crate::api::fit(&fit.model, &never, &params, &FitOptions::default())
             .err()
-            .expect("fit");
+            .expect("fit")
+            .to_string();
         assert!(err.starts_with(NEVER_BOUND), "fit: the cause: {err}");
         assert!(err.ends_with(FIT_BINDER), "fit: the binder: {err}");
         assert!(!err.contains("bind_from_fit"), "fit: {err}");
@@ -2026,7 +2028,8 @@ mod from_fit {
 
         let err = crate::api::fit(&fit.model, &b, &params, &FitOptions::default())
             .err()
-            .expect("fit");
+            .expect("fit")
+            .to_string();
         assert!(err.starts_with(OTHER_LEVELS), "fit: the cause: {err}");
         assert!(err.contains(NO_THETA), "fit: {err}");
         assert!(err.ends_with(FIT_BINDER), "fit: the binder: {err}");
@@ -2087,7 +2090,8 @@ mod from_fit {
             &FitOptions::default(),
         )
         .err()
-        .expect("fit");
+        .expect("fit")
+        .to_string();
         assert!(err.starts_with(some) && err.ends_with(FIT_BINDER), "{err}");
 
         // The other side: nobody bound is still "never bound", byte for byte.

@@ -147,7 +147,9 @@ fn an_imp_chain_at_zero_eta_fails_before_the_focei_stage_runs() {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
         ..Default::default()
     };
-    let err = fit(&model, &pop, &model.default_params, &opts).expect_err("must be rejected");
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("must be rejected")
+        .to_string();
     assert!(
         err.contains("method = imp requires at least one random effect"),
         "expected the up-front check_model_options message, got: {err}"

@@ -109,11 +109,14 @@ pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
     read_population_with_diag,
 };
+// Deprecated: a legacy alias of `run_model_simulate` (#1772).
+#[allow(deprecated)]
+pub use run::run_from_file;
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    read_population_with, resolve_data_path, run_from_file, run_model_simulate,
-    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
-    run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
+    read_population_with, resolve_data_path, run_model_simulate, run_model_simulate_with_overrides,
+    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
+    ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
 pub(crate) use simulate::obs_row_time;

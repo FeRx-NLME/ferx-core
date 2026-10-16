@@ -3303,7 +3303,8 @@ mod tests {
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Bayes;
         let err = crate::api::fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("per-class overrides under Bayes must be rejected");
+            .expect_err("per-class overrides under Bayes must be rejected")
+            .to_string();
         assert!(
             err.contains("per-class Omega/Sigma overrides") && err.contains("bayes"),
             "got: {err}"
@@ -3318,7 +3319,8 @@ mod tests {
             crate::types::EstimationMethod::Bayes,
         ];
         let err = crate::api::fit(&model, &pop, &model.default_params, &chain_opts)
-            .expect_err("per-class overrides in a bayes chain must be rejected");
+            .expect_err("per-class overrides in a bayes chain must be rejected")
+            .to_string();
         assert!(
             err.contains("per-class Omega/Sigma overrides"),
             "got: {err}"

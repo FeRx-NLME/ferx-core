@@ -14,7 +14,7 @@ pub fn fit(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> Result<FitResult, String>
+) -> Result<FitResult, EngineError>
 ```
 
 **Parameters:**
@@ -24,6 +24,12 @@ pub fn fit(
 - `options`: Estimation configuration
 
 **Returns:** `FitResult` with parameter estimates, standard errors, and per-subject diagnostics.
+
+**Errors:** an `EngineError`. Its `to_string()` is the refusal's message. When
+`ferx check` gives the same refusal a code, `code()` returns it, so a caller can
+match on the code instead of the text; see
+[Matching on the code](../warnings.qmd#entry-point-error-codes). The same holds
+for every function on this page.
 
 **Example:**
 ```rust
@@ -54,7 +60,7 @@ pub fn fit_from_files(
     data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
-) -> Result<FitResult, String>
+) -> Result<FitResult, EngineError>
 ```
 
 **Example:**
@@ -76,7 +82,7 @@ Full pipeline: parse model file, read data, fit. Returns both the fit result and
 pub fn run_model_with_data(
     model_path: &str,
     data_path: Option<&str>,
-) -> Result<(FitResult, Population), String>
+) -> Result<(FitResult, Population), EngineError>
 ```
 
 Uses the `[fit_options]` from the model file.
@@ -88,7 +94,7 @@ Simulation-estimation: parse model, generate data from `[simulation]` block, fit
 ```rust
 pub fn run_model_simulate(
     model_path: &str,
-) -> Result<(FitResult, Population), String>
+) -> Result<(FitResult, Population), EngineError>
 ```
 
 Requires a `[simulation]` block in the model file.

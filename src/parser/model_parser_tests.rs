@@ -21314,7 +21314,8 @@ fn fit_on_mixture_model_rejects_missing_mixture_params() {
     params.mixture = None;
     let opts = crate::types::FitOptions::default();
     let err = crate::api::fit(&model, &pop, &params, &opts)
-        .expect_err("mixture model with mixture: None params must be rejected");
+        .expect_err("mixture model with mixture: None params must be rejected")
+        .to_string();
     assert!(
         err.contains("per-class Omega/Sigma") && err.contains("init_params.mixture"),
         "got: {err}"
@@ -21343,7 +21344,8 @@ fn fit_on_mixture_model_rejects_unsupported_method() {
         ..crate::types::FitOptions::default()
     };
     let err = crate::api::fit(&model, &pop, &params, &opts)
-        .expect_err("Gauss-Newton on a mixture model must be rejected");
+        .expect_err("Gauss-Newton on a mixture model must be rejected")
+        .to_string();
     assert!(
         err.contains("mixture") && err.contains("FOCE"),
         "got: {err}"

@@ -12,10 +12,12 @@ use std::path::Path;
 /// `(file, enclosing fn, number of sites in it, why it has no code)`.
 ///
 /// Those two literal spellings are what is counted, so the scan has no false positives.
-/// It does not see a coded `EngineError` dropped to `String` (`.map_err(|e|
-/// e.to_string())` on the `String` entry points, which #1772 retires), the same drop
-/// under another binding name, or N calls of a helper that wraps `uncoded` once. A new site fails `every_uncoded_site_is_listed` until it is listed here; a
-/// listed site that is gone fails it too, so the list cannot go stale.
+/// It does not see a coded `EngineError` dropped to `String` under another spelling
+/// (`.map_err(|e| e.to_string())`; since #1772 no entry point returns `String`, so such a
+/// drop is a bug, not a listed site), the same drop under another binding name, or N
+/// calls of a helper that wraps `uncoded` once. A new site fails
+/// `every_uncoded_site_is_listed` until it is listed here; a listed site that is gone
+/// fails it too, so the list cannot go stale.
 ///
 /// Before adding a row, check `ferx check`'s codes: a refusal some helper already codes
 /// goes through that helper's `Diagnostic`, not through `uncoded`.
@@ -70,14 +72,47 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/io/fitrx.rs",
         "read_bundled_population",
+        2,
+        "the bundled-data replay only warns: the data re-read's and the binder's text feed a \
+         warning, never an EngineError",
+    ),
+    (
+        "src/api/fit.rs",
+        "fit_from_files",
         1,
-        "the bundled-data replay only warns: this text feeds a warning, never an EngineError",
+        "resolve_data_path: neither a data path nor a [data] block; ferx check skips its data checks \
+         instead, so no code exists (#1788)",
     ),
     (
         "src/api/run.rs",
-        "read_population_with",
+        "prepare_run_with_inits",
         1,
-        "the String twin of read_population_with_diag, kept for String callers (#1772)",
+        "resolve_data_path: neither a data path nor a [data] block; no code exists (#1788)",
+    ),
+    (
+        "src/api/run.rs",
+        "run_model_simulate_with_overrides",
+        7,
+        "[simulation] design refusals ferx check does not code: no [simulation] block, a TTE \
+         endpoint without horizon, a CTMM endpoint, no times for a continuous or binary endpoint, \
+         nothing to observe, a design missing a referenced covariate (#1788)",
+    ),
+    (
+        "src/api/fit.rs",
+        "fit_unstamped",
+        19,
+        "fit()-only refusals with no ferx check code yet (#1788): mixture options (4), RTTE \
+         records, binary states, CTMM states/times and a Q(t) with no ODE (3), LTBS on a \
+         hand-built model (3), iiv_on_ruv (2), the AGQ grid under IOV, a derived iov_occasion \
+         giving one occasion; ODE solver options (FitScope::validate, #2044) at the two pool \
+         installs; runtime: every multi-start failed",
+    ),
+    (
+        "src/api/fit.rs",
+        "fit_inner",
+        7,
+        "runtime: cancellation (2), and an estimator stage's own failure (SAEM, IMPMAP, IMP, \
+         Bayes, VI), which returns String",
     ),
 ];
 

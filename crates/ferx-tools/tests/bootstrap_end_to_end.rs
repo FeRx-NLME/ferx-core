@@ -212,7 +212,8 @@ fn a_replicate_that_railed_still_gets_a_delta_ofv() {
     let mut fitting = options.clone();
     fitting.outer_maxiter = 5;
     let err = fit(&p.parsed.model, &p.population, &rebuilt, &fitting)
-        .expect_err("a fitting run must still reject a start on the rail");
+        .expect_err("a fitting run must still reject a start on the rail")
+        .to_string();
     assert!(err.contains("ETA_CL"), "{err}");
 }
 

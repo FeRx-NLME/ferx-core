@@ -268,7 +268,7 @@ fn sde_gn_returns_error() {
         };
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts);
         assert!(result.is_err(), "expected error for {:?} + SDE", method);
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("gn") || msg.contains("gn_hybrid"),
             "error message should mention gn: {msg}"

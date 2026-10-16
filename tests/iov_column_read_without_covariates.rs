@@ -54,6 +54,7 @@ fn ofv(dir: &Path, name: &str, text: &str) -> Result<ferx_core::FitResult, Strin
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/warfarin_iov.csv");
     ferx_core::run_model_with_data(model_path.to_str().unwrap(), Some(data.to_str().unwrap()))
         .map(|(fit, _)| fit)
+        .map_err(|e| e.to_string())
 }
 
 #[test]

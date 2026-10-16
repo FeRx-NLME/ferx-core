@@ -21,7 +21,7 @@
 //! | R4 / TTE-only / binary-only | no | | | |
 //!
 //! R1 and R3 sit in **one** test, so a gate stuck on either branch fails half of it.
-//! Asserted by code at the check level and by message at `fit()` (a `String` until #1772).
+//! Asserted by code and message at the check level and at `fit()` (an `EngineError` since #1772).
 
 use super::*;
 
@@ -118,6 +118,8 @@ fn refused(selection: Option<&str>, csv: &str) -> (String, String) {
     let err = run_model_with_data(&model, Some(&data))
         .map(|(r, _)| r.ofv)
         .expect_err("fit must refuse a population with nothing to score");
+    assert_eq!(err.code(), Some(CODE), "fit() and check carry one code");
+    let err = err.to_string();
     assert_eq!(err, hits[0].message, "fit() and check carry one message");
     assert!(err.contains(S1_CONSEQUENCE), "S1's consequence: {err}");
     (hits[0].message.clone(), err)
@@ -222,6 +224,8 @@ fn an_empty_in_memory_population_is_refused_by_fit() {
     )
     .map(|r| r.ofv)
     .expect_err("fit must refuse an empty population");
+    assert_eq!(err.code(), Some(CODE));
+    let err = err.to_string();
     assert_eq!(err, hits[0].message);
     assert!(err.contains(S1_CONSEQUENCE), "R6 S1's consequence: {err}");
     assert!(
@@ -312,7 +316,8 @@ fn an_unrouted_endpoint_still_wins_the_first_error() {
     assert_eq!(codes.iter().filter(|c| **c == CODE).count(), 1, "{codes:?}");
     let err = run_model_with_data(model, Some(data))
         .map(|(r, _)| r.ofv)
-        .expect_err("refused");
+        .expect_err("refused")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_NO_RECORDS"), "{err}");
     assert!(!err.contains(S1), "{err}");
 }

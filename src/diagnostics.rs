@@ -101,7 +101,7 @@
 //! | `E_READOUT_DEPOT_UNSUPPORTED` | an analytic `[scaling] y` readout reads the oral `depot` amount on a subject dose superposition cannot reconstruct it for: an EVID=3/4 reset (#650) or a dose into a non-default compartment (#375). Block `scaling`. Raised by `fit()`, `ferx check` (since #1774) and `predict` / `predict_diag` |
 //! | `E_CTMM_UNSUPPORTED`      | a `[markov_model]` endpoint reached `predict` / `predict_diag` with no continuous observation, or a `simulate*` entry point; neither has an occupancy path (#759, #820). Block `markov_model`. Never by `ferx check` or `fit()`, which supports CTMM (#1774) |
 //! | `E_TTE_NOT_SIMULATABLE`   | a TTE endpoint the event-time simulator cannot draw for this population: two repeated-event streams on a subject, a repeated-event cause beside a single-event one, a reset under a repeated-event or ODE-accumulated hazard, left truncation under an ODE-accumulated hazard; or a repeated-event or ODE-accumulated TTE endpoint on `simulate_with_uncertainty`, which needs a horizon and takes none. Block `event_model`. Raised by the `simulate*` entry points (#1774) |
-//! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check still returns a `String` (#1772) |
+//! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check has no code yet (#1788) |
 //! | `E_PROPENSITY_INPUT`      | propensity-score matching was requested on a population it cannot compute posthoc etas from: empty, a subject with no observations, a non-finite `DV`. Raised by `simulate_with_options*` (#1774) |
 //! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), an `auc_target` on a time-varying-covariate, IOV or reset subject, or a base regimen × EVID=3/4 reset under a time-varying covariate or IOV (before any subject runs). Once the driver runs (#1983): a base dose under a time-varying covariate or IOV that is not a plain bolus / infusion, a non-finite break time, a `TAD` / `TAFD` read before any dose. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
 //! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite, not strictly increasing, or past `max_decisions`), a monitor compartment out of range, a `Dv` monitor on a compartment no `[error_model]` covers, or `decision_times` / `monitors` set beside a spec that owns them — all before any subject runs. Once the driver runs (#1983): two of a subject's times within 1e-15 of each other but not equal. Raised by the adaptive entry points (#1774) |
@@ -264,9 +264,11 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
     }
 }
 
-/// The error a non-`fit` entry point (`predict*`, `simulate*`, `compute_npde_npd`,
-/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca`) returns when it
-/// refuses its input (#1746).
+/// The error an entry point (`predict*`, `simulate*`, `compute_npde_npd`,
+/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca` since #1746; [`crate::fit`]
+/// and the file entry points built on it — [`crate::fit_from_files`],
+/// [`crate::prepare_run`], [`crate::run_model_with_data`], [`crate::run_model_simulate`]
+/// and their variants — since #1772) returns when it refuses its input or fails.
 ///
 /// When `ferx check` reports the same refusal with a code, the error carries that
 /// [`Diagnostic`] — so a caller matches on [`code`](Self::code) instead of parsing

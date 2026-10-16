@@ -123,9 +123,12 @@ explicit ODE `transit()` / `igd()` model simulates every draw.
 
 #### Matching on the code {#entry-point-error-codes}
 
-Every entry point in the table above except `fit()` returns its `Err` as an
-`EngineError` rather than a `String`. Its `to_string()` is the message described
-above, unchanged, so code that only prints or searches the text keeps working.
+Every entry point in the table above returns its `Err` as an `EngineError`
+rather than a `String`, and so do the file entry points built on `fit()`
+(`fit_from_files`, `prepare_run`, `run_model_with_data`, `run_model_simulate` and
+their variants). Its `to_string()` is the message described above, unchanged, so
+code that only prints or searches the text calls `.to_string()` and keeps
+working.
 
 When `ferx check` reports the same refusal with a code, the `EngineError`
 carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
@@ -177,7 +180,17 @@ found:
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
 | re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 
-`fit()` keeps returning a `String`.
+##### `fit()` and the file entry points {#fit-error-codes}
+
+`fit()`'s refusal of a model or data precondition carries the code in its row of
+the table above, as `predict()`'s does, and an unbound `theta NAME[...]` block is
+`E_THETA_LEVELS_UNBOUND`. On the file entry points the steps before the fit carry
+codes too: a model file that cannot be read or parsed, and a dataset that cannot
+be read, carry what `ferx check` reports on the same file, and the binders carry
+`E_THETA_LEVEL_BINDING` / `E_COVARIATE_STATS_BINDING`. A `fit()`-only refusal
+`ferx check` has no code for (a mixture option, LTBS on a hand-built model,
+`iiv_on_ruv`, RTTE / binary / CTMM records, the AGQ grid under IOV, a derived
+`iov_occasion` with one occasion) has `code()` `None` for now.
 
 ##### `run_sir()` and `run_covariance()` {#post-hoc-step-error-codes}
 

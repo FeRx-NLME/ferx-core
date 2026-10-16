@@ -188,7 +188,7 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
     let data_path = value(args, "--data").map(String::as_str);
     let options = parse_options(args, Some(model_path))?;
 
-    let prepared = ferx_core::prepare_run(model_path, data_path)?;
+    let prepared = ferx_core::prepare_run(model_path, data_path).map_err(|e| e.to_string())?;
     if let Some(w) = &prepared.data_path_warning {
         eprintln!("Warning: {w}");
     }

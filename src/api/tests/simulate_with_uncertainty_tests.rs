@@ -2566,7 +2566,9 @@ fn fit_rejects_ltbs_with_proportional_error() {
     model.log_transform = true;
     let pop = tiny_population();
     let opts = FitOptions::default();
-    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("LTBS") && err.contains("Additive"),
         "expected LTBS+proportional rejection, got: {err}"

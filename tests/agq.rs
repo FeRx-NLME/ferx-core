@@ -100,6 +100,7 @@ fn fit_from_src(src: &str) -> Result<FitResult, String> {
         &parsed.model.default_params,
         &opts,
     )
+    .map_err(|e| e.to_string())
 }
 
 /// The `[fit_options]` a model source parses to.
@@ -175,7 +176,8 @@ fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
             ..options.clone()
         };
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("mixture engine does not evaluate quadrature");
+            .expect_err("mixture engine does not evaluate quadrature")
+            .to_string();
         assert!(err.contains("mixture") && err.contains("n_agq"), "{err}");
     }
 }
@@ -197,7 +199,7 @@ fn audit_zero_nodes_from_rust_api_cannot_change_the_method() {
             result.is_err(),
             "zero nodes must not become plain FOCEI / Laplace"
         );
-        assert!(result.err().unwrap().contains("n_agq"));
+        assert!(result.err().unwrap().to_string().contains("n_agq"));
         let valid = FitOptions { n_agq: 1, ..opts };
         assert!(fit(&model, &pop, &model.default_params, &valid).is_ok());
     }
@@ -1025,7 +1027,8 @@ fn focei_iov_grid_cap_reports_focei() {
         &parsed.model.default_params,
         &opts,
     )
-    .expect_err("an intractable FOCEI-IOV grid must be rejected");
+    .expect_err("an intractable FOCEI-IOV grid must be rejected")
+    .to_string();
     assert!(
         err.contains("method = focei") && err.contains("n_agq"),
         "the FOCEI-IOV grid-cap error must name focei and the lever: {err}"
@@ -1050,11 +1053,15 @@ fn audit_later_quadrature_stage_cannot_bypass_the_iov_grid_cap() {
             run_covariance_step: false,
             ..parsed.fit_options.clone()
         };
-        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap_err();
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("grid") && err.contains("occasions"), "{err}");
         assert!(err.contains(&method.label().to_lowercase()), "{err}");
         let one_node = FitOptions { n_agq: 1, ..opts };
-        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node).unwrap_err();
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("cancelled"),
             "one-node chain must pass the grid validation: {err}"
@@ -1744,7 +1751,8 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
         &parsed.model.default_params,
         &opts,
     )
-    .expect_err("an intractable IOV grid must be rejected");
+    .expect_err("an intractable IOV grid must be rejected")
+    .to_string();
     assert!(
         err.contains("stacked") || err.contains("occasions"),
         "the rejection must explain that IOV raised the dimension: {err}"
@@ -2060,7 +2068,8 @@ fn agq_eval_only_requires_a_terminal_laplace_stage() {
         ..base.clone()
     };
     let err = fit(&model, &population, &model.default_params, &mid)
-        .expect_err("laplace mid-chain with agq_eval_only must be rejected");
+        .expect_err("laplace mid-chain with agq_eval_only must be rejected")
+        .to_string();
     assert!(
         err.contains("final stage"),
         "error should name the terminal-stage rule, got: {err}"
@@ -2073,7 +2082,8 @@ fn agq_eval_only_requires_a_terminal_laplace_stage() {
         ..base
     };
     let err = fit(&model, &population, &model.default_params, &missing)
-        .expect_err("agq_eval_only without a laplace stage must be rejected");
+        .expect_err("agq_eval_only without a laplace stage must be rejected")
+        .to_string();
     assert!(
         err.contains("requires a `laplace` stage"),
         "error should name the missing stage, got: {err}"

@@ -379,7 +379,8 @@ fn impmap_rejects_iov_models() {
 
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("impmap on an IOV model must be rejected (v1)");
+        .expect("impmap on an IOV model must be rejected (v1)")
+        .to_string();
     assert!(
         err.to_lowercase().contains("inter-occasion") || err.contains("IOV"),
         "expected IOV-not-supported error, got: {err}"
@@ -484,7 +485,8 @@ fn impmap_rejects_invalid_proposal_df() {
     opts.impmap_proposal_df = 0.0;
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("impmap_proposal_df = 0 must be rejected");
+        .expect("impmap_proposal_df = 0 must be rejected")
+        .to_string();
     assert!(
         err.contains("impmap_proposal_df"),
         "expected impmap_proposal_df error, got: {err}"

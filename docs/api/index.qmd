@@ -38,8 +38,10 @@ fn main() -> Result<(), String> {
     bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
     bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
-    // Run estimation from the model's own initial estimates and options
-    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
+    // Run estimation from the model's own initial estimates and options. `fit` also
+    // returns an `EngineError`.
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+        .map_err(|e| e.to_string())?;
 
     // Access results
     println!("OFV: {}", result.ofv);

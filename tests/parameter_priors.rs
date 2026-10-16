@@ -60,7 +60,7 @@ fn fit_model(
     pop: &Population,
     opts: &FitOptions,
 ) -> Result<ferx_core::types::FitResult, String> {
-    fit(model, pop, &model.default_params, opts)
+    fit(model, pop, &model.default_params, opts).map_err(|e| e.to_string())
 }
 
 /// A couple of outer iterations — Tier-2, no convergence loop.

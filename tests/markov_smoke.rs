@@ -188,7 +188,8 @@ mod ctmm_smoke {
         // DV = 2 is not a declared state (states are coded 0/1).
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 2)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("DV = 2 on a CTMM CMT must be rejected");
+            .expect_err("DV = 2 on a CTMM CMT must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5"),
             "message should name the CMT, got: {err}"
@@ -522,7 +523,8 @@ mod ctmm_smoke {
         // Times 2.0 then 1.0 on CMT 5 — decreasing.
         let pop = common::binary_pop(&[(0.0, vec![(2.0, 0), (1.0, 1)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("out-of-order CTMM times must be rejected");
+            .expect_err("out-of-order CTMM times must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5") && err.contains("non-decreasing"),
             "message should name the CMT and the constraint, got: {err}"

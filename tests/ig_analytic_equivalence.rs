@@ -571,6 +571,7 @@ fn ig_fit_err(pop: &Population) -> String {
     let model = parse_full_model(&an_src).expect("IG model parses").model;
     fit(&model, pop, &model.default_params, &FitOptions::default())
         .expect_err("fit should reject the unsupported IG configuration")
+        .to_string()
 }
 
 /// Steady-state (`SS=1`) dosing on a closed-form inverse-Gaussian model reroutes to its

@@ -548,7 +548,7 @@ fn test_iov_trust_region_returns_err() {
         result.is_err(),
         "trust_region with IOV must return an error"
     );
-    let msg = result.unwrap_err();
+    let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("trust_region") && msg.contains("IOV"),
         "error message should mention trust_region and IOV, got: {msg}"
@@ -572,7 +572,7 @@ fn test_iov_missing_occ_returns_err() {
         result.is_err(),
         "IOV model without occasion labels must error"
     );
-    let msg = result.unwrap_err();
+    let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("iov_column") || msg.contains("OCC") || msg.contains("occasion"),
         "error message should mention the missing occasion column, got: {msg}"
@@ -854,7 +854,9 @@ fn test_iov_occasion_degenerate_single_occasion_errors() {
     // Breakpoint past the last observation (max 6.0) → one occasion for all.
     opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
     let res = fit(&model, &pop, &model.default_params, &opts);
-    let msg = res.expect_err("single-occasion derivation must error");
+    let msg = res
+        .expect_err("single-occasion derivation must error")
+        .to_string();
     assert!(
         msg.contains("single occasion") || msg.contains("unidentifiable"),
         "unexpected error: {msg}"
@@ -883,7 +885,8 @@ fn test_iov_occasion_single_occasion_errors_despite_a_later_pk_only_row() {
         assert_eq!(crate::stats::likelihood::iov_occasion_groups(s).len(), 2);
     }
     let msg = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("a pk-only row after every observation must not make kappa identifiable");
+        .expect_err("a pk-only row after every observation must not make kappa identifiable")
+        .to_string();
     assert!(msg.contains("single occasion"), "unexpected error: {msg}");
 }
 

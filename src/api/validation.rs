@@ -983,6 +983,31 @@ pub(crate) fn check_unbound_theta_levels(
     model: &CompiledModel,
     entry: UnboundLevelsEntry,
 ) -> Vec<Diagnostic> {
+    let unbound = model.theta_blocks().unbound_level_blocks();
+    // `fit()`'s refusal names every unbound block in one message, with the way out
+    // in the message itself (its historical text, #1772), so it is one diagnostic.
+    if entry == UnboundLevelsEntry::Fit {
+        return unbound
+            .first()
+            .map(|first| {
+                Diagnostic::error(
+                    "E_THETA_LEVELS_UNBOUND",
+                    format!(
+                        "`theta {}[...]` was never bound to data, so it has no levels. Call \
+                         `bind_theta_levels(&mut parsed, &model_text, &mut population)` after \
+                         reading the population (`read_population_for`) and before `fit`. \
+                         `prepare_run` and the file entry points (`fit_from_files`, \
+                         `run_model_with_data`, the CLI) bind for you. Or declare the block \
+                         explicitly as `theta {}[N](...)` and index it with your own column.",
+                        unbound.join("`, `theta "),
+                        first,
+                    ),
+                )
+                .with_block("parameters")
+            })
+            .into_iter()
+            .collect();
+    }
     model
         .theta_blocks()
         .unbound_level_blocks()
@@ -1014,6 +1039,7 @@ pub(crate) fn check_unbound_theta_levels(
                      declare the block explicitly as `theta {name}[N](...)` and index it \
                      with your own column"
                 ),
+                UnboundLevelsEntry::Fit => unreachable!("`fit()`'s diagnostic is returned above"),
             };
             Diagnostic::error(
                 "E_THETA_LEVELS_UNBOUND",
@@ -1055,6 +1081,9 @@ pub(crate) enum UnboundLevelsEntry {
     /// `predict_diag` (#1644), `predict_survival`, `predict_categorical`,
     /// `compute_npde_npd` (#1763) — carrying the name the suggestion gives it.
     Predict(&'static str),
+    /// `fit()` (#1772): one diagnostic naming every unbound block, the advice in its
+    /// message and no suggestion.
+    Fit,
 }
 
 /// Every `NAME[COLUMN]` gather index the data carries must be an integer level

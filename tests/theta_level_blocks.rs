@@ -188,7 +188,8 @@ fn a_zero_based_index_column_fails_loudly_before_the_fit() {
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
     )
-    .expect_err("a 0-based index must be rejected");
+    .expect_err("a 0-based index must be rejected")
+    .to_string();
     assert!(
         err.contains("1-based") && err.contains("PLA_IDX"),
         "the error must name the column and the convention, got: {err}"
@@ -203,7 +204,8 @@ fn an_index_past_the_declared_level_count_fails_loudly() {
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
     )
-    .expect_err("an out-of-range index must be rejected");
+    .expect_err("an out-of-range index must be rejected")
+    .to_string();
     assert!(
         err.contains("has 4 levels"),
         "the error must name the declared count, got: {err}"
@@ -226,7 +228,8 @@ fn a_level_block_model_cannot_be_fit_without_binding() {
         &parsed.model.default_params,
         &ferx_core::FitOptions::default(),
     )
-    .expect_err("an unbound level block must not fit");
+    .expect_err("an unbound level block must not fit")
+    .to_string();
     // One assertion per sentence of the message (#1384): each one dies when
     // its sentence is deleted.
     assert!(
@@ -273,7 +276,8 @@ fn the_unbound_refusal_names_every_unbound_block() {
         &parsed.model.default_params,
         &ferx_core::FitOptions::default(),
     )
-    .expect_err("unbound level blocks must not fit");
+    .expect_err("unbound level blocks must not fit")
+    .to_string();
     assert!(
         err.contains("`theta PLACEBO`, `theta DRUG[...]` was never bound to data"),
         "both block names: {err}"
@@ -509,7 +513,8 @@ fn fit_composable(
         &population,
         &parsed.model.default_params,
         &parsed.fit_options,
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok((result, parsed.model))
 }
 

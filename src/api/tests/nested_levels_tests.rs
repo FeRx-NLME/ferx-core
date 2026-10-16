@@ -574,7 +574,8 @@ fn fit_refuses_a_nested_model_under_saem_with_its_code() {
     };
     let err = crate::api::fit(&m, &full_design(), &m.default_params, &opts)
         .err()
-        .expect("refused");
+        .expect("refused")
+        .to_string();
     assert!(
         err.contains("method = saem is not yet supported on a model with nested levels"),
         "{err}"
@@ -831,7 +832,8 @@ fn a_fit_time_occasion_rule_is_refused_on_a_nested_model() {
         );
         let err = crate::api::fit(&m, &full_design(), &m.default_params, &with(rule))
             .err()
-            .expect("fit refuses it");
+            .expect("fit refuses it")
+            .to_string();
         assert!(err.contains("the fit options set `iov_occasion`"), "{err}");
     }
     // A one-level model keeps the rule.

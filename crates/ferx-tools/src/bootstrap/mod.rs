@@ -1033,7 +1033,7 @@ pub fn run_bootstrap_with_progress(
             )
             // Not a bare `?`: `fit` signals a cancelled fit with an ordinary
             // `Err`, and the flag is not polled again until after this call.
-            .map_err(|e| cancel_aware(e, &cancel))?;
+            .map_err(|e| cancel_aware(e.to_string(), &cancel))?;
             let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
             let base = ReplicateResult {
                 index: 0,
@@ -1132,7 +1132,7 @@ pub fn run_bootstrap_with_progress(
                 covariance_step_successful: false,
                 covariance_step_warnings: false,
                 seconds,
-                error: Some(e),
+                error: Some(e.to_string()),
                 delta_ofv: None,
             },
         };
