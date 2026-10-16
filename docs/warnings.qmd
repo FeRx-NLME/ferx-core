@@ -139,9 +139,7 @@ parameter vector, no fit, no simulation options and no adaptive controller: the 
 length and parameter shape codes, the binding codes on a fit's bindings, a population
 that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation, adaptive-dosing
 and post-hoc codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
-`code()` is still `None` for ODE solver settings out of range (`ode_reltol`,
-`ode_abstol`, `ode_max_steps`) and for a failure that is not a refusal of the input,
-such as a posthoc eta that does not converge, a SIR run whose every draw is invalid,
+`code()` is `None` only for a failure that is not a refusal of the input, such as a posthoc eta that does not converge, a SIR run whose every draw is invalid,
 or an adaptive-dosing run whose frozen-schedule replay disagrees with it.
 
 Each precondition check emits one of a fixed set of codes, depending on what it
@@ -175,6 +173,8 @@ found:
 | adaptive dosing: the model, the options, the spec, the controller's actions | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
+| ODE solver settings on a `FitOptions` built in code (`run_sir()`, `run_covariance()`) | `E_ODE_SOLVER_OPTIONS` |
+| a logit-scaled θ estimated outside (0, 1) (`simulate_with_uncertainty()`, asymptotic method) | `E_LOGIT_THETA_OUT_OF_RANGE` |
 | re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 
 `fit()` keeps returning a `String`.
@@ -223,6 +223,10 @@ Of the input refusals, these carry a code:
   longer reproduces the reported estimates (`E_FIT_INPUT_MODEL`), and a SIR
   proposal that is not the size of the model's packed parameters
   (`E_FIT_INPUT_MODEL`);
+- ODE solver settings on a `FitOptions` built in code that no solver can run
+  with (`E_ODE_SOLVER_OPTIONS`): an `ode_reltol` or `ode_abstol` that is not
+  finite and positive, or `ode_max_steps = 0`. A model file's `[fit_options]`
+  refuses the same values when it is parsed (`E_PARSE`);
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
   above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
   prior. `fit()` with `sir = true` reports the same text as a warning;

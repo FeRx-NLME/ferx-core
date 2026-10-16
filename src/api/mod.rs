@@ -65,7 +65,8 @@ pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub(crate) use entry_refusals::{
     adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
-    fit_input_model, sir_nothing_to_sample, sir_options, theta_length,
+    fit_input_model, logit_theta_out_of_range, param_shape, sir_nothing_to_sample, sir_options,
+    theta_length,
 };
 pub use fit::{fit, fit_from_files};
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.

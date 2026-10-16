@@ -404,11 +404,12 @@ impl LogitThetaCoord {
 /// falling back to the packed-scale draw would hand back the draws above 1
 /// that `Op::Logit` clamps to a point mass. It is reachable only with a
 /// declared upper bound above 1, where the clamped likelihood is flat past 1.
+/// It is `E_LOGIT_THETA_OUT_OF_RANGE` (#2044), whose suggestion is that fix.
 pub(crate) fn logit_theta_coords(
     template: &ModelParameters,
     theta_transform: &[ThetaTransform],
     fixed_mask: &[bool],
-) -> Result<Vec<LogitThetaCoord>, String> {
+) -> Result<Vec<LogitThetaCoord>, crate::diagnostics::Diagnostic> {
     let mut coords = Vec::new();
     for i in 0..template.theta.len() {
         if theta_transform.get(i) != Some(&ThetaTransform::LogitProbability) || fixed_mask[i] {
@@ -421,12 +422,7 @@ pub(crate) fn logit_theta_coords(
                 .get(i)
                 .map(String::as_str)
                 .unwrap_or("?");
-            return Err(format!(
-                "Cannot draw parameter uncertainty for {name}: it is used as \
-                 inv_logit(logit({name}) + ETA), so it must lie strictly inside \
-                 (0, 1), but its estimate is {t}. Declare its upper bound below 1 \
-                 (e.g. 0.999) and refit."
-            ));
+            return Err(crate::api::logit_theta_out_of_range(name, t));
         }
         coords.push(LogitThetaCoord {
             index: i,
@@ -621,6 +617,25 @@ pub(crate) fn admissible_values(p: &ModelParameters) -> bool {
         && p.omega_iov.as_ref().is_none_or(omega_ok)
 }
 
+/// The input refusal of [`draw_parameter_samples`] that has a code: under
+/// `Asymptotic`, a free logit-scaled θ whose estimate is not strictly inside (0, 1)
+/// (`E_LOGIT_THETA_OUT_OF_RANGE`, #2044). `Sir` resamples a stored pool and draws
+/// nothing on the logit scale, so it is not refused. The sampler's other failures stay
+/// in its `String`.
+pub(crate) fn check_logit_draw_bounds(
+    fit_result: &FitResult,
+    template: &ModelParameters,
+    method: UncertaintyMethod,
+) -> Result<(), EngineError> {
+    if method != UncertaintyMethod::Asymptotic {
+        return Ok(());
+    }
+    let fixed = pack_with_bounds(template).fixed;
+    logit_theta_coords(template, &fit_result.theta_transform, &fixed)
+        .map(|_| ())
+        .map_err(EngineError::with_suggestion_in_display)
+}
+
 /// Draw `n_draws` parameter samples from the uncertainty distribution.
 ///
 /// Each draw is a fully unpacked `ModelParameters` (theta, Omega, Sigma —
@@ -673,7 +688,10 @@ fn draw_asymptotic(
     }
     // Draw a `LogitProbability` θ on the logit scale (#1548); every other
     // coordinate is drawn on its packed scale as before.
-    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask)?;
+    // `simulate_with_uncertainty` has refused this already, with its code
+    // (`check_logit_draw_bounds`); this `String` is the public sampler's own.
+    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask)
+        .map_err(|d| EngineError::with_suggestion_in_display(d).to_string())?;
     let (y_hat, cov_y) = to_draw_scale(&x_hat, cov, &logit_coords);
     let chol = regularised_cholesky(&cov_y)?;
 
@@ -1589,10 +1607,21 @@ mod tests {
         for (f_hat, lower) in [(1.0, 0.001), (1.2, 0.001), (0.0, -1.0), (-0.3, -1.0)] {
             let (template, _) =
                 logit_fixture(f_hat, lower, 5.0, 0.09, ThetaTransform::LogitProbability);
-            let err = logit_theta_coords(&template, &tt, &[false; 5]).unwrap_err();
-            assert!(
-                err.contains("uncertainty for F") && err.contains(&format!("is {f_hat}")),
-                "{err}"
+            let d = logit_theta_coords(&template, &tt, &[false; 5]).unwrap_err();
+            // #2044: coded on `[parameters]`, the fix in the suggestion and only there.
+            assert_eq!(d.code, "E_LOGIT_THETA_OUT_OF_RANGE");
+            assert_eq!(d.block.as_deref(), Some("parameters"));
+            assert_eq!(
+                d.message,
+                format!(
+                    "Cannot draw parameter uncertainty for F: it is used as \
+                     inv_logit(logit(F) + ETA), so it must lie strictly inside \
+                     (0, 1), but its estimate is {f_hat}."
+                )
+            );
+            assert_eq!(
+                d.suggestion.as_deref(),
+                Some("declare its upper bound below 1 (e.g. 0.999) and refit")
             );
             let mut fixed = [false; 5];
             fixed[2] = true;
@@ -1602,7 +1631,8 @@ mod tests {
         }
     }
 
-    /// The `Err` reaches `draw_parameter_samples`'s caller.
+    /// The `Err` reaches `draw_parameter_samples`'s caller, as the text it had before
+    /// #2044 coded it: message then advice, byte for byte.
     #[test]
     fn asymptotic_errors_on_a_logit_probability_estimate_above_one() {
         let (template, fit) =
@@ -1611,7 +1641,37 @@ mod tests {
         let err =
             draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
                 .unwrap_err();
-        assert!(err.contains("uncertainty for F"), "{err}");
+        assert_eq!(
+            err,
+            "Cannot draw parameter uncertainty for F: it is used as \
+             inv_logit(logit(F) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is 1.2. Declare its upper bound below 1 \
+             (e.g. 0.999) and refit."
+        );
+    }
+
+    /// #2044: the coded pre-check `simulate_with_uncertainty` runs. `Asymptotic` refuses
+    /// with the code and the same `Display` as the sampler's `String`; `Sir` draws
+    /// nothing on the logit scale, so the same fit passes — mutating the method gate
+    /// away reddens the second assertion.
+    #[test]
+    fn check_logit_draw_bounds_codes_the_asymptotic_refusal_only() {
+        let (template, fit) =
+            logit_fixture(1.2, 0.001, 5.0, 0.09, ThetaTransform::LogitProbability);
+        let e =
+            check_logit_draw_bounds(&fit, &template, UncertaintyMethod::Asymptotic).unwrap_err();
+        assert_eq!(e.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"));
+        let mut rng = StdRng::seed_from_u64(0);
+        let sampler =
+            draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap_err();
+        assert_eq!(e.to_string(), sampler);
+        assert!(check_logit_draw_bounds(&fit, &template, UncertaintyMethod::Sir).is_ok());
+        let (inside, fit_inside) =
+            logit_fixture(0.7, 0.001, 5.0, 0.09, ThetaTransform::LogitProbability);
+        assert!(
+            check_logit_draw_bounds(&fit_inside, &inside, UncertaintyMethod::Asymptotic).is_ok()
+        );
     }
 
     /// From `y ≈ 36.7` on, `inv_logit(y)` rounds to exactly 1.0 — through

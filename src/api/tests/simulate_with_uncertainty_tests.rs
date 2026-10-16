@@ -3342,6 +3342,62 @@ fn asymptotic_errors_without_covariance_step() {
     assert!(err.to_string().contains("covariance"));
 }
 
+/// #2044: a logit-scaled θ whose estimate is not strictly inside (0, 1) is
+/// `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` from `simulate_with_uncertainty` (and
+/// its `_diag` form, which it wraps), with the advice in `suggestion()` and folded into
+/// `to_string()` once — `message()` carries none. Zero draws sample nothing and stay
+/// `Ok`, as before #2044 (the pre-check is gated on them); `Sir` draws nothing on the
+/// logit scale, so its refusal here is its own missing pool, not this code.
+///
+/// Mutations — the pre-check deleted from `simulate_with_uncertainty_diag` (the
+/// sampler's uncoded `String` comes back: `code()` `None`); its zero-draw gate dropped
+/// (the zero-draw run is refused); the method gate dropped (`Sir` gets this code); a
+/// sentence of the message or the suggestion deleted (`to_string()`).
+#[test]
+fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
+    let model = tiny_model();
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    // TVV = 50 under `inv_logit(logit(TVV) + ETA)`: reachable only with an upper bound
+    // above 1, which TVV's 500 is.
+    fit.theta_transform = vec![ThetaTransform::Log, ThetaTransform::LogitProbability];
+    let opts = |n: usize, method| SimulateUncertaintyOptions {
+        n_uncertainty_draws: n,
+        n_sim_per_draw: 1,
+        method,
+        seed: Some(0),
+    };
+    let e = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Asymptotic))
+        .unwrap_err();
+    assert_eq!(e.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"), "{e}");
+    assert_eq!(e.block(), Some("parameters"));
+    assert_eq!(
+        e.message(),
+        "Cannot draw parameter uncertainty for TVV: it is used as \
+         inv_logit(logit(TVV) + ETA), so it must lie strictly inside \
+         (0, 1), but its estimate is 50."
+    );
+    assert_eq!(
+        e.suggestion(),
+        Some("declare its upper bound below 1 (e.g. 0.999) and refit")
+    );
+    assert_eq!(
+        e.to_string(),
+        "Cannot draw parameter uncertainty for TVV: it is used as \
+         inv_logit(logit(TVV) + ETA), so it must lie strictly inside \
+         (0, 1), but its estimate is 50. Declare its upper bound below 1 \
+         (e.g. 0.999) and refit."
+    );
+    assert!(
+        simulate_with_uncertainty(&model, &pop, &fit, &opts(0, UncertaintyMethod::Asymptotic))
+            .unwrap()
+            .is_empty()
+    );
+    let sir = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Sir))
+        .unwrap_err();
+    assert_ne!(sir.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"), "{sir}");
+}
+
 // ---------------------------------------------------------------------------
 // #529 — `Default` at the R boundary
 // ---------------------------------------------------------------------------

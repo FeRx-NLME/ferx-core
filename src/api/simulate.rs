@@ -1459,6 +1459,15 @@ pub fn simulate_with_uncertainty_diag(
         population,
         &template.theta,
     ))?;
+    // The sampler's one coded input refusal, raised before it runs so it keeps its code
+    // (#2044); zero draws sample nothing, so nothing is refused, as before.
+    if opts.n_uncertainty_draws > 0 {
+        crate::estimation::uncertainty_samples::check_logit_draw_bounds(
+            fit_result,
+            &template,
+            opts.method,
+        )?;
+    }
     let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
         fit_result,
         &template,

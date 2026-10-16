@@ -637,6 +637,75 @@ fn a_model_that_is_not_the_fits_carries_its_code() {
 
 /// SIR's own input refusals through `run_sir`, from the shared core
 /// (`run_sir_core_coded`): `E_SIR_OPTIONS` for settings the resampler cannot run with,
+/// #2044: ODE solver settings no solver can run with, on a hand-built `FitOptions`
+/// (a model file's `[fit_options]` refuses them at parse time, as `E_PARSE`), are
+/// `E_ODE_SOLVER_OPTIONS` on every entry point that opens the fit scope: `run_sir`,
+/// `run_covariance` and `run_sir_core_coded`. No block, no context. Each of the three
+/// texts, through each entry, with its whole text pinned.
+///
+/// Mutations — `with_fit_scope`'s validate back on `EngineError::uncoded` (every
+/// row's `code()`); a constructor naming another code (code); a sentence of a text
+/// deleted in `OdeSolverOverride::validate` (`to_string()`). `with_fit_scope` is the
+/// one site, so a mutation there reddens all three entries at once.
+#[test]
+fn invalid_ode_solver_options_carry_their_code_on_every_entry() {
+    let c = super::test_fixtures::sir_case(Kind::Plain);
+    let model = &c.prep.parsed.model;
+    let pop = &c.prep.population;
+    let params = &c.prep.init_params;
+    let n_packed = crate::estimation::parameterization::packed_len(params);
+    let cov = nalgebra::DMatrix::identity(n_packed, n_packed);
+    let etas = vec![nalgebra::DVector::zeros(model.n_eta); pop.subjects.len()];
+    let bad = |set: &dyn Fn(&mut FitOptions)| {
+        let mut o = c.opts.clone();
+        set(&mut o);
+        o
+    };
+    let cases: [(&str, FitOptions, &str); 3] = [
+        (
+            "ode_reltol NaN",
+            bad(&|o| o.ode_reltol = f64::NAN),
+            "ode_reltol must be finite and positive, got NaN",
+        ),
+        (
+            "ode_abstol zero",
+            bad(&|o| o.ode_abstol = 0.0),
+            "ode_abstol must be finite and positive, got 0",
+        ),
+        (
+            "ode_max_steps zero",
+            bad(&|o| o.ode_max_steps = 0),
+            "ode_max_steps must be positive, got 0",
+        ),
+    ];
+    let mut rows = Vec::new();
+    for (name, o, text) in &cases {
+        let entries: [(&str, Result<(), EngineError>); 3] = [
+            ("run_sir", run_sir(&c.fit, None, None, o).map(|_| ())),
+            (
+                "run_covariance",
+                run_covariance(&c.fit, None, None, o).map(|_| ()),
+            ),
+            (
+                "run_sir_core_coded",
+                crate::estimation::sir::run_sir_core_coded(model, pop, params, &etas, &cov, 0.0, o)
+                    .map(|_| ()),
+            ),
+        ];
+        for (entry, got) in entries {
+            rows.push(Row {
+                name: format!("{entry}/{name}"),
+                got,
+                code: "E_ODE_SOLVER_OPTIONS",
+                block: None,
+                context: None,
+                text: text.to_string(),
+            });
+        }
+    }
+    check_rows(rows);
+}
+
 /// `E_FIT_INPUT_MODEL` for a covariance matrix that is not the size of the model's
 /// packed parameters, `E_SIR_NOTHING_TO_SAMPLE` on `[parameters]` for a fit whose
 /// θ, Ω and σ are all FIX. Not attributed to the entry point, as before. The fourth option

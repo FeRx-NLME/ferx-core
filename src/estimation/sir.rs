@@ -886,7 +886,10 @@ pub fn run_sir_core(
 /// the code of a refusal of its input (#1774): `E_SIR_OPTIONS` for SIR settings it
 /// cannot run with, `E_FIT_INPUT_MODEL` for a proposal covariance that is not the
 /// size of the packed parameters, `E_SIR_NOTHING_TO_SAMPLE` for a fit whose packed
-/// parameters are all FIX. `run_sir` returns it as is; `run_sir_core`, and
+/// parameters are all FIX, `E_ODE_SOLVER_OPTIONS` for ODE solver settings no solver
+/// can run with, `E_PARAM_SHAPE` for parameters whose per-class Ω/Σ disagree with the
+/// model's `[mixture]`, `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` for a logit-scaled
+/// θ outside (0, 1) (#2044). `run_sir` returns it as is; `run_sir_core`, and
 /// through it `fit()`'s in-fit SIR, keep the text, unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sir_core_coded(
@@ -917,8 +920,7 @@ pub(crate) fn run_sir_core_coded(
             ofv_hat,
             options,
         )
-    })
-    .map_err(EngineError::uncoded)?
+    })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -962,17 +964,18 @@ fn run_sir_in_box(
 
     // `sir_draw_ofv` scores a `[mixture]` model with the K-class marginal, which needs
     // the per-class Ω/Σ (#1755); and a non-mixture model has no class to score. A
-    // mismatch is a caller error, refused here rather than panicking in `mixture_ofv`.
+    // mismatch is a caller error, refused here rather than panicking in `mixture_ofv`:
+    // parameters whose shape is not the model's, so `E_PARAM_SHAPE` (#2044).
     match (model.mixture.is_some(), params.mixture.is_some()) {
         (true, false) => {
-            return Err(EngineError::uncoded(
+            return Err(crate::api::param_shape(
                 "run_sir_core: the model declares [mixture] but the parameters carry \
                  no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
                  fitted_params_from_result or pass the fit's own parameters.",
             ))
         }
         (false, true) => {
-            return Err(EngineError::uncoded(
+            return Err(crate::api::param_shape(
                 "run_sir_core: the parameters carry per-class Ω/Σ \
                  (ModelParameters::mixture) but the model declares no [mixture].",
             ))
@@ -1057,7 +1060,7 @@ fn run_sir_in_box(
     // `y`; the samples are stored, bounds-checked and scored on the packed
     // scale `x`, and the weights carry `|dx/dy|` so the target is unchanged.
     let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)
-        .map_err(EngineError::uncoded)?;
+        .map_err(EngineError::with_suggestion_in_display)?;
     let draw_bounds = bounds_to_draw_scale(&bounds, &logit_coords);
     let log_jac_hat = log_abs_jacobian(&x_hat, &logit_coords);
 
@@ -1630,6 +1633,24 @@ mod tests {
         // SIR refuses rather than falling back to the packed-scale proposal.
         let err = run("5.0", 1.2).unwrap_err();
         assert!(err.contains("uncertainty for TVP"), "{err}");
+        // #2044: coded on the coded core, the `String` above being its `to_string()`.
+        // Back on `EngineError::uncoded`, `code()` is `None`.
+        let model =
+            crate::parser::model_parser::parse_model_string(&model_src.replace("UPPER", "5.0"))
+                .expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta[3] = 1.2;
+        let n_packed = crate::estimation::parameterization::packed_len(&params);
+        let cov = DMatrix::identity(n_packed, n_packed);
+        let etas = vec![DVector::zeros(2); pop.subjects.len()];
+        let opts = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let e = run_sir_core_coded(&model, &pop, &params, &etas, &cov, 0.0, &opts).unwrap_err();
+        assert_eq!(e.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"));
+        assert_eq!(e.block(), Some("parameters"));
+        assert_eq!(e.to_string(), err);
     }
     // Target sd of ln θ is 6.9/sqrt(12) = 2.0, so 4000 resamples give SE >= 0.03
     // (more after weighting); measured error 0.005. 0.25 is ~5 SE and 6x short

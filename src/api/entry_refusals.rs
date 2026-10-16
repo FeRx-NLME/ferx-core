@@ -208,6 +208,33 @@ pub(crate) fn sir_options(message: impl Into<String>) -> EngineError {
     coded("E_SIR_OPTIONS", None, message.into())
 }
 
+/// `E_ODE_SOLVER_OPTIONS`: ODE solver settings on a caller's `FitOptions` that no
+/// solver can run with — an `ode_reltol` / `ode_abstol` that is not finite and
+/// positive, or `ode_max_steps = 0` (#2044). A model file's `[fit_options]` never
+/// gets here: the parser refuses the same values as `E_PARSE`, so only a hand-built
+/// `FitOptions` handed to `run_sir` / `run_covariance` / `run_sir_core` reaches it.
+pub(crate) fn ode_solver_options(message: impl Into<String>) -> EngineError {
+    coded("E_ODE_SOLVER_OPTIONS", None, message.into())
+}
+
+/// `E_LOGIT_THETA_OUT_OF_RANGE` on block `parameters`: a free θ used as
+/// `inv_logit(logit(θ) + ETA)` whose estimate is not strictly inside (0, 1), so it has
+/// no logit-scale draw (#1548, #2044). Reachable only with a declared upper bound
+/// above 1; the suggestion is that fix, and `Display` folds it in after the message,
+/// so `to_string()` is the text the refusal had before it carried a code.
+pub(crate) fn logit_theta_out_of_range(name: &str, estimate: f64) -> Diagnostic {
+    diag(
+        "E_LOGIT_THETA_OUT_OF_RANGE",
+        Some("parameters"),
+        format!(
+            "Cannot draw parameter uncertainty for {name}: it is used as \
+             inv_logit(logit({name}) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is {estimate}."
+        ),
+    )
+    .with_suggestion("declare its upper bound below 1 (e.g. 0.999) and refit")
+}
+
 /// `E_SIR_NOTHING_TO_SAMPLE`: every packed parameter of the fit is FIX, so SIR has
 /// no free direction to propose in. The model's own `[parameters]`, not the SIR
 /// settings, which is why it is not `E_SIR_OPTIONS`.
