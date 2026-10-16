@@ -5325,15 +5325,24 @@ pub fn parse_full_model_with(
     // asking for the exact path, so a model that cannot take it is an error here rather than a
     // silent fall back to integration (which is what `auto` does, by design).
     if fit_options.ode_method == crate::ode::OdeMethod::Linear {
-        if let Some(reason) = model
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.linear_ineligibility())
-        {
-            return Err(format!(
-                "fit option `ode_method = linear`: this [odes] model cannot be propagated \
-                 exactly — {reason}. Use `ode_method = auto` (the default) to integrate it."
-            ));
+        match model.ode_spec.as_ref() {
+            None => {
+                return Err(
+                    "fit option `ode_method = linear` applies to an [odes] model, and \
+                     this model has none. An analytical structural model is already exact; \
+                     remove the option."
+                        .to_string(),
+                );
+            }
+            Some(ode) => {
+                if let Some(reason) = ode.linear_ineligibility() {
+                    return Err(format!(
+                        "fit option `ode_method = linear`: this [odes] model cannot be \
+                         propagated exactly — {reason}. Use `ode_method = auto` (the default) \
+                         to integrate it."
+                    ));
+                }
+            }
         }
     }
 

@@ -104,10 +104,12 @@ fn linear_error(odes: &str, extra_block: &str) -> String {
 
 /// One case per ineligibility reason. Each asserts the clause that names its own cause, so
 /// deleting any one sentence of the message reddens exactly the case that needs it, and every
-/// case asserts the shared remedy.
+/// case asserts the shared lead and remedy.
 #[test]
 fn ode_method_linear_names_why_a_model_cannot_take_the_exact_path() {
     let remedy = "Use `ode_method = auto` (the default) to integrate it.";
+    let lead =
+        "fit option `ode_method = linear`: this [odes] model cannot be propagated exactly — ";
 
     let e = linear_error(
         "  d/dt(depot) = -KA * depot
@@ -116,6 +118,7 @@ fn ode_method_linear_names_why_a_model_cannot_take_the_exact_path() {
     );
     assert!(e.contains("not linear in the states"), "{e}");
     assert!(e.contains(remedy), "{e}");
+    assert!(e.starts_with(lead), "{e}");
 
     let e = linear_error(
         "  d/dt(depot) = -KA * depot
@@ -124,6 +127,7 @@ fn ode_method_linear_names_why_a_model_cannot_take_the_exact_path() {
     );
     assert!(e.contains("reads model time"), "{e}");
     assert!(e.contains(remedy), "{e}");
+    assert!(e.starts_with(lead), "{e}");
 
     let e = linear_error(
         "  d/dt(depot) = 0 * depot
@@ -133,14 +137,49 @@ fn ode_method_linear_names_why_a_model_cannot_take_the_exact_path() {
     assert!(e.contains("absorption input function"), "{e}");
     assert!(e.contains("depot state instead"), "{e}");
     assert!(e.contains(remedy), "{e}");
+    assert!(e.starts_with(lead), "{e}");
 
     let e = linear_error(LINEAR, "\n[diffusion]\n  central ~ 0.01\n");
     assert!(e.contains("stochastic ([diffusion]) model"), "{e}");
     assert!(e.contains(remedy), "{e}");
+    assert!(e.starts_with(lead), "{e}");
 }
 
 #[test]
 fn ode_method_linear_is_accepted_on_a_certified_model() {
     parse_full_model(&source(LINEAR, "  ode_method = linear"))
         .unwrap_or_else(|e| panic!("a linear model must accept `ode_method = linear`: {e}"));
+}
+
+#[test]
+fn ode_method_linear_is_refused_on_an_analytical_model() {
+    // The assertion has nothing to hold on a model without [odes]; accepting it silently would
+    // let a deleted or misspelled [odes] block pass as "certified exact".
+    let analytical = source(LINEAR, "  ode_method = linear")
+        .replace(
+            "ode(obs_cmt=central, states=[depot, central])",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        )
+        .replace(&format!("[odes]\n{LINEAR}\n"), "");
+    assert!(
+        !analytical.contains("[odes]"),
+        "fixture must have no [odes] block"
+    );
+    let e = match parse_full_model(&analytical) {
+        Ok(_) => panic!("`ode_method = linear` must be refused on an analytical model"),
+        Err(e) => e,
+    };
+    assert!(
+        e.contains(
+            "fit option `ode_method = linear` applies to an [odes] model, and this model has none."
+        ),
+        "{e}"
+    );
+    assert!(
+        e.contains("An analytical structural model is already exact; remove the option."),
+        "{e}"
+    );
+    // The same model without the option parses: the refusal is the option's, not the fixture's.
+    parse_full_model(&analytical.replace("  ode_method = linear", ""))
+        .unwrap_or_else(|e| panic!("analytical twin must parse: {e}"));
 }

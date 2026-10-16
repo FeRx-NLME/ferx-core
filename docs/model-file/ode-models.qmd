@@ -284,6 +284,12 @@ Infusions, bolus doses, lag times, bioavailability, `init(...)`, resets, IOV and
 covariates all work on this path — each is constant between two events, which is all the
 exponential needs.
 
+One computation still steps with the integrator on a linear model: locating the time at which
+a cumulative hazard crosses its drawn threshold, when `simulate()` draws event times for an
+ODE time-to-event model. That search needs the crossing inside a segment, not the state at
+its end, so its event times carry `ode_reltol`-level error; predictions and the objective do
+not.
+
 ### Asserting it, or opting out {#linear-exact-control}
 
 `ode_method = linear` states that a model must take the exact path. On a model that does not
@@ -302,7 +308,9 @@ The settings record `ode_method` as you wrote it, so `auto` stays `auto`. Which 
 ran is reported separately: the console header prints
 `ODE solution: exact (linear system, matrix exponential)`, and the fit YAML carries
 `ode_linear_exact: true` (or `false` for an integrated ODE model; the key is absent for an
-analytical one). The same flag is `FitResult::ode_linear_exact` in Rust.
+analytical one). The same flag is `FitResult::ode_linear_exact` in Rust. It is also `false` on a
+linear model if the exponential declined any segment at the final estimates — overflow on an
+extremely fast rate, say — since that segment was integrated instead.
 
 ### Measured {#linear-exact-measured}
 

@@ -20,7 +20,11 @@ fn nalgebra_expm(a: &[f64], n: usize) -> Vec<f64> {
 fn max_rel_err(got: &[f64], want: &[f64]) -> f64 {
     let scale = want.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
     got.iter().zip(want).fold(0.0_f64, |worst, (g, w)| {
-        assert!(g.is_finite(), "non-finite expm entry {g}");
+        // Both sides: `worst.max(NaN)` keeps `worst`.
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "non-finite entry: got {g}, want {w}"
+        );
         worst.max((g - w).abs() / scale)
     })
 }
@@ -242,6 +246,30 @@ fn segment_matches_closed_form_infusion() {
     }
 }
 
+#[test]
+fn segment_reads_a_column_the_forcing_dwarfs() {
+    // `b = f(0)` is cancelled out of every probe, so a unit probe reads `A_ij` to ~ε·|b_i|
+    // absolutely. Each case puts the forcing many orders above the coefficient: a unit probe
+    // reads A = 0 on the first and third, and the segment is declined (and integrated) on all
+    // three. The first also needs the forcing column of the augmented generator scaled down,
+    // or ‖M‖ = 1e20 exhausts the squaring budget.
+    for (k, r, t) in [(1.0, 1e20, 1.0), (1e-3, 1e9, 24.0), (0.37, 3.3e19, 1.7)] {
+        let (hard, _) =
+            linear_segment_g::<f64>(&one_cpt_infusion, &[0.0], (0.0, t), &[k, r], &[t], &[])
+                .expect("affine, autonomous");
+        let exact = r / k * -(-k * t).exp_m1();
+        let rel = (hard[0].u[0] - exact).abs() / exact;
+        assert!(hard[0].u[0].is_finite());
+        // Measured ≤ 3.2e-16 across the three. A single rescale reads the third case's A to
+        // 3e-13 (answer 8.3e-14 off), which this bound rejects.
+        assert!(
+            rel < 1e-14,
+            "k={k}, r={r}: {} vs {exact} (rel {rel:e})",
+            hard[0].u[0]
+        );
+    }
+}
+
 /// Two compartments, depot absorption, constant infusion into central — the shape the
 /// integrator comparison below runs on.
 fn two_cpt_depot<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
@@ -272,7 +300,8 @@ fn segment_agrees_with_a_tight_integrator() {
     for (got, want) in hard.iter().zip(&reference) {
         assert_eq!(got.t, want.t);
         for (g, w) in got.u.iter().zip(&want.u) {
-            assert!(g.is_finite());
+            // Both sides: `worst.max(NaN)` keeps `worst`, so a NaN on either would fold away.
+            assert!(g.is_finite() && w.is_finite(), "linear {g}, rodas5p {w}");
             worst = worst.max((g - w).abs() / w.abs().max(1e-12));
         }
     }
@@ -292,9 +321,22 @@ fn segment_declines_a_nonlinear_rhs() {
         du[0] = -p[0] * u[0] / (p[1] + u[0]);
     };
     assert!(linear_segment_g::<f64>(&mm, &[50.0], (0.0, 4.0), &[10.0, 5.0], &[4.0], &[]).is_none());
-    // With Km far above every probe point (u0 and the unit columns) the backstop cannot tell —
-    // which is exactly why it is not the certification. Pinned so nobody promotes it to one.
-    assert!(linear_segment_g::<f64>(&mm, &[0.5], (0.0, 4.0), &[10.0, 1e12], &[4.0], &[]).is_some());
+    // `du/dt = u²` from `u0 = 1` agrees with its unit-probe secant (A = 1, b = 0) at `u0`
+    // itself, so the entry-state checks pass; only the state the propagation reaches
+    // (e^0.5 against the true 2) exposes it.
+    let square = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+    assert!(linear_segment_g::<f64>(&square, &[1.0], (0.0, 0.5), &[], &[0.5], &[]).is_none());
+    // With Km far above every state reached, MM is affine to rounding at every checked point
+    // and the backstop accepts it — which is why it is not the certification. Accepting it is
+    // harmless because the answer is then right to that same precision: pinned here.
+    let (hard, _) =
+        linear_segment_g::<f64>(&mm, &[0.5], (0.0, 4.0), &[10.0, 1e12], &[4.0], &[]).unwrap();
+    let linearised = 0.5 * (-10.0 / 1e12 * 4.0_f64).exp();
+    assert!(
+        (hard[0].u[0] - linearised).abs() < 1e-15,
+        "{}",
+        hard[0].u[0]
+    );
 }
 
 #[test]

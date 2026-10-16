@@ -125,7 +125,12 @@ fn worst_pred_error(tail: &str) -> f64 {
         assert_eq!(got.id, format!("{}", want[0] as i64));
         assert!((got.time - want[1]).abs() < 1e-9, "row order");
         // `f64::max` would discard a NaN; a broken solver must fail here instead.
-        assert!(got.pred.is_finite(), "ferx PRED not finite at {:?}", want);
+        assert!(
+            got.pred.is_finite() && want[3].is_finite(),
+            "non-finite PRED: ferx {} vs NONMEM {:?}",
+            got.pred,
+            want
+        );
         worst.max((got.pred - want[3]).abs() / want[3].abs())
     })
 }

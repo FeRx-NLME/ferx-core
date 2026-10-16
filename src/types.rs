@@ -7401,7 +7401,10 @@ pub struct FitResult {
     /// True when the `[odes]` system was certified linear and propagated exactly by the matrix
     /// exponential instead of integrated (#852) — `ode_method = auto` on a qualifying model,
     /// or `ode_method = linear`. False for an analytical model, a nonlinear system, or a
-    /// linear one whose `ode_method` names an integrator.
+    /// linear one whose `ode_method` names an integrator. Also false when the propagator
+    /// declined any segment of the prediction pass at the final estimates
+    /// ([`OdeSolverStats::linear_declined_segments`](crate::ode::OdeSolverStats)), since those
+    /// segments were integrated.
     pub ode_linear_exact: bool,
     /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
     pub uses_sde: bool,

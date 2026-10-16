@@ -805,6 +805,16 @@ pub struct OdeSolverStats {
     /// parameter values. Like the other step counters it is a floor:
     /// [`solve_ode_until_threshold`] takes no stats.
     pub diverged_segments: usize,
+    /// Segments of a model on the exact linear path ([`OdeMethod::Linear`], #852) that the
+    /// matrix-exponential propagator **declined** and that were integrated instead — its
+    /// self-check found the right-hand side not affine at a checked state, the exponential
+    /// overflowed, or the Padé denominator was singular.
+    ///
+    /// Zero on every model off that path, and on every certified-linear fit measured so far.
+    /// Non-zero means `ode_linear_exact` in the fit output is `false` even though the model was
+    /// routed to the exact path: some of its predictions carry integrator error. A zero-length
+    /// segment is not counted — it is returned unchanged by either route.
+    pub linear_declined_segments: usize,
 }
 
 impl OdeSolverStats {
@@ -847,6 +857,7 @@ impl OdeSolverStats {
             discarded_unfinished_segments,
             abandoned_non_finite_timeline,
             diverged_segments,
+            linear_declined_segments,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -864,6 +875,7 @@ impl OdeSolverStats {
         self.discarded_unfinished_segments += discarded_unfinished_segments;
         self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
         self.diverged_segments += diverged_segments;
+        self.linear_declined_segments += linear_declined_segments;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -2212,6 +2224,9 @@ fn integrate_resolved_g_inner<T: PkNum>(
                 super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
             {
                 return out;
+            }
+            if let Some(s) = stats.as_deref_mut() {
+                s.linear_declined_segments += 1;
             }
         }
         return integrate_resolved_g_inner(
