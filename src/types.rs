@@ -9400,8 +9400,9 @@ pub enum SaemMstepSolver {
     /// Opt-in, and **restricted to the plain Gaussian residual scope** the
     /// expected information has a closed form on: no IOV, no mixture, no M3, no
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
-    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
     ///
     /// It was a **candidate default** in #1449 and did not become one: it is
     /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all

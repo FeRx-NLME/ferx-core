@@ -428,12 +428,13 @@ const SIGMA_SA_MAX_STEP: f64 = 0.2;
 /// settles near `TVFRD1` 0.18 from either start on the default schedule and
 /// keeps drifting on a 3× longer one (0.032), and 200 MH steps per iteration
 /// do not change it — so it is not plain E-step under-mixing. The
-/// importance-sampled objective cannot rank the two points on that 12-eta
-/// model (ESS/K = 0.001); the FOCEI objective can, and the drifted fit is 47
-/// units worse than the held one (7492.7 against 7445.3). It is tracked as
-/// #1421; `mstep_damping = 0.03`
-/// remains available as the documented hold for that shape of model, and its
-/// gate and no-effect warnings are unchanged.
+/// importance-sampled −2 log L with the covariate etas Rao-Blackwellised ranks
+/// the drifted point 7.2 units behind IMPMAP's at K = 20000 (6864.4 ± 1.4
+/// against 6857.1 ± 1.8), and the 3× point 11.1 behind. (The FOCEI objective
+/// once used for this ranking is not reliable at `ω_RUV ≈ 0.3` — see the SAEM
+/// docs page, "What #1421 measured".) It is tracked as #1421; `mstep_damping =
+/// 0.03` remains available as the documented hold for that shape of model, and
+/// its gate and no-effect warnings are unchanged.
 ///
 /// `cap >= 1.0` is the "off" sentinel of [`mstep_sa_step`] — assignment in
 /// both phases — which is now the default for every model except one shape,
@@ -444,19 +445,25 @@ const MSTEP_SA_MAX_STEP: f64 = 1.0;
 /// `iiv_on_ruv` — the one shape on which the undamped numerical channel was
 /// measured to drift, and exactly the shape #1011 fixed.
 ///
-/// The drift is the `iiv_on_ruv` coupling, not FREM and not the no-ETA channel
-/// as such: the #1011 reprex with its `iiv_on_ruv` line and `ETA_RUV` omega
-/// removed, otherwise identical (475 subjects, FREM block of 11), lands undamped
-/// at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 /
-/// 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With
-/// `iiv_on_ruv` back in, undamped drifts to 0.18 from either start (47 FOCEI
-/// units worse than the capped 0.36), 200 MH steps per iteration do not change
-/// it, and #1011 had already ruled out sampler mixing and σ. Under `iiv_on_ruv`
-/// the E-step is modified — `η_RUV` is re-centred into σ every iteration (#904)
-/// — and a σ that shares the numerical M-step with the no-ETA thetas is what
-/// that channel's σ-side of the blend acts on; that is where the pathology
-/// lives, and it needs its own fix (#1421). Until then this cap holds those
-/// thetas near their start, which on that reprex is the better answer.
+/// The drift needs both `iiv_on_ruv` and FREM's covariate rows. The #1011
+/// reprex with its `iiv_on_ruv` line and `ETA_RUV` omega removed, otherwise
+/// identical (475 subjects, FREM block of 11), lands undamped at `TVFRD1`
+/// 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 / 2.680 / 133.8 —
+/// where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With `iiv_on_ruv` but
+/// without the FREM rows, every SAEM variant lands somewhere the
+/// importance-sampled objective cannot tell from the optimum. With both,
+/// undamped drifts to 0.15–0.18 and is worse by that objective; #1421 ruled out
+/// the η_RUV re-centring (#904), Ω feedback, σ, and the single-draw Jensen bias
+/// (`score_sa` drifts too), each by a run changing it alone. The cause is
+/// still open (#1421). Until it is found this cap holds those thetas near their
+/// start, which on that reprex is the better answer.
+///
+/// The default stays keyed on `iiv_on_ruv` alone, not on `iiv_on_ruv` with FREM,
+/// because the one non-FREM `iiv_on_ruv` measurement does not support lifting it:
+/// `TVFRD1` is barely identified on that data, so the cap and the undamped update
+/// score the same, which shows neither is harmful *there* — not that undamped is
+/// safe on a non-FREM `iiv_on_ruv` model whose no-ETA thetas are identified.
+/// Narrowing the default needs such a model, ranked by importance sampling.
 const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
 
 /// Default `mstep_damping` for a fit that did not set one (#1415).
@@ -923,8 +930,15 @@ fn sigma_log_se(
 ///   the per-subject gradient takes the whole-NLL finite-difference path there
 ///   and never forms a per-observation prediction derivative.
 /// * **`[covariate_nn]`** — its θ derivatives are assembled in output space.
-/// * a **residual magnitude** (#484/#1029) and **FREM** — θ reaches the residual
-///   variance through a channel the closed form does not carry.
+/// * a **residual magnitude** (#484/#1029) — θ reaches the residual variance
+///   through a channel the closed form does not carry.
+///
+/// **FREM is in scope** (#1421). Its covariate pseudo-observations predict
+/// `θ_cov + η_cov` with variance `σ_cov²`, so their `∂f/∂θ` is an ordinary
+/// prediction difference and their variance depends on no free coordinate but
+/// the covariate σ — which the per-observation σ derivative now knows
+/// (`fixed_eta_gradient::obs_dvar_dlogsigma`). It was listed here while that
+/// derivative still read the PK error model on those rows.
 fn numerical_mstep_scope_gap(
     model: &CompiledModel,
     n_kappa: usize,
@@ -949,9 +963,6 @@ fn numerical_mstep_scope_gap(
     #[cfg(feature = "nn")]
     if !model.covariate_nns.is_empty() {
         return Some("the model has a `[covariate_nn]` block");
-    }
-    if model.frem_config.is_some() {
-        return Some("the model is a FREM model");
     }
     if model.has_custom_ruv_magnitude() {
         return Some("the residual error carries a magnitude term");
@@ -7013,7 +7024,7 @@ mod tests {
 
     /// The default cap is keyed to the one shape it was measured to help
     /// (#1415): `iiv_on_ruv` keeps #1011's 0.03 (its reprex drifts undamped —
-    /// TVFRD1 0.18 against the held 0.36, 47 FOCEI units worse — and the same
+    /// TVFRD1 0.15 against IMPMAP's 0.32, 7 IS units worse (#1421) — and the same
     /// model without `iiv_on_ruv` lands on NONMEM IMP undamped), everything
     /// else is off. Mutation check: returning 0.03 for both freezes the Tier-3
     /// `saem_recovers_the_allometric_exponent_on_the_numerical_mstep`; returning
