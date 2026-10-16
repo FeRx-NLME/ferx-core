@@ -289,15 +289,19 @@ pub(crate) struct StatMismatch {
 /// are compared exactly: a tolerance would accept a design whose median sits
 /// within it. Covariates are visited in name order, so the one named is
 /// reproducible.
+///
+/// A statistic the population cannot summarise (a covariate with no non-missing
+/// value) is the binder's own refusal, `E_COVARIATE_STATS_BINDING`
+/// ([`stats_binding_error`]), as `bind_covariate_stats` gives it on the same data.
 pub(crate) fn check_stats_on(
     model: &CompiledModel,
     population: &Population,
-) -> Result<Option<StatMismatch>, String> {
+) -> Result<Option<StatMismatch>, Diagnostic> {
     let stats = &model.data_bindings().covariate_stats;
     let mut names: Vec<&String> = stats.keys().collect();
     names.sort_unstable();
     for name in names {
-        let data = summarize(name, population)?;
+        let data = summarize(name, population).map_err(stats_binding_error)?;
         if let Some((field, model, data)) = first_difference(&stats[name], &data) {
             return Ok(Some(StatMismatch {
                 covariate: name.clone(),

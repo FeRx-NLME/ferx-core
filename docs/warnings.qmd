@@ -137,12 +137,13 @@ unbound `theta NAME[...]` block is the one whose `to_string()` also ends with it
 suggestion.) A refusal `ferx check` cannot reach has a code too, since it has no
 parameter vector, no fit, no simulation options and no adaptive controller: the θ
 length and parameter shape codes, the binding codes on a fit's bindings, a population
-that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation and adaptive-dosing
-codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
-`code()` is still `None` for the other input checks of `run_sir()` and `run_covariance()`,
-for what the adaptive-dosing driver refuses once it runs (a controller's dose action,
-a decision time that collides with a reset), and for a failure that is not a refusal
-of the input, such as a posthoc eta that does not converge.
+that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation, adaptive-dosing
+and post-hoc codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
+`code()` is still `None` for what the adaptive-dosing driver refuses once it runs (a
+controller's dose action, a decision time that collides with a reset), for ODE solver
+settings out of range (`ode_reltol`, `ode_abstol`, `ode_max_steps`), for SIR on a model
+whose every parameter is FIX, and for a failure that is not a refusal of the input,
+such as a posthoc eta that does not converge or a SIR run whose every draw is invalid.
 
 Each precondition check emits one of a fixed set of codes, depending on what it
 found:
@@ -173,6 +174,9 @@ found:
 | `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
 | adaptive dosing: the model, the options, the spec | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
+| a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
+| SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
+| re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 
 `fit()` keeps returning a `String`.
 
@@ -204,9 +208,34 @@ Of the input refusals, these carry a code:
 - the fit's population, but per-subject results (`fit.subjects`) in another
   count or order (`E_FIT_SUBJECTS_MISMATCH`). The two steps read those results by
   position, so the fit's rows are what is wrong, not the population. A fit
-  rebuilt from separate fields can get there; a `fit()` result cannot.
-
-The rest have `code()` `None`.
+  rebuilt from separate fields can get there; a `fit()` result cannot;
+- an input neither passed nor recorded on the fit (`E_FIT_INPUT_MISSING`): the
+  model or data file's path, SIR's covariance matrix, the population of an IOV
+  model passed in on a fit with no recorded reader settings, or the occasion rule
+  of an IOV fit saved before ferx recorded one;
+- a model or data file whose SHA-256 is not the one the fit recorded
+  (`E_FIT_INPUT_CHANGED`);
+- a model that is not the fit's (`E_FIT_INPUT_MODEL`): one passed in with other
+  data-derived bindings, or with covariate statistics the population does not
+  reproduce, or one whose η count is not the width of the fit's η̂; its θ count
+  is `E_THETA_LENGTH` and its Ω, σ and Ω~IOV~ shape `E_PARAM_SHAPE`;
+- a `[mixture]` fit's per-class override values: not stored on the fit
+  (`E_FIT_INPUT_MISSING`), or a packed estimate of another layout or one that no
+  longer reproduces the reported estimates (`E_FIT_INPUT_MODEL`), and a SIR
+  proposal that is not the size of the model's packed parameters
+  (`E_FIT_INPUT_MODEL`);
+- SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
+  above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
+  prior. `fit()` with `sir = true` reports the same text as a warning;
+- a fit whose θ, Ω and σ are all FIX, so SIR has nothing to sample
+  (`E_SIR_NOTHING_TO_SAMPLE`, on `[parameters]`). `fit()` with `sir = true`
+  reports the same text as a warning;
+- a re-read of the fit's model or data file that fails: the code and block
+  `ferx check` gives the same file, so a re-read with a covariate column missing
+  is `E_MISSING_COVARIATE` on `covariates`. The message is the read's own: an
+  `E_DATA` refusal has no `Failed to read data file` lead (and one from the hash
+  step names the file it could not open), and a model file read only for its
+  reader settings adds why it was read and how not to need it.
 
 ##### The binders {#binder-error-codes}
 
