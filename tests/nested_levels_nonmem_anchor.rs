@@ -236,28 +236,51 @@ fn the_anchor_files_are_where_the_tests_read_them() {
 }
 
 /// The covariance step on a nested model is the finite-difference one. Its analytic
-/// R-matrix assembly is reached on `analytic_cov_hessian` alone, and its stacked prior is
-/// the one-level `Ω ⊕ (I_K ⊗ Ω_IOV)`, which would treat every arm as owning its own study
-/// κ; each subject declines it, so asking for the analytic matrix and asking for the
-/// stencil give the same bits. Three sponsors and two θ fixed keep the stencil small.
+/// R-matrix assembly is reached on `analytic_cov_hessian` and the covariance scope walk,
+/// which serves a closed-form one-compartment IOV model; its jets and stacked prior are
+/// laid out per occasion, which would treat every phase as owning its own occasion κ. A
+/// nested model declines it, so asking for the analytic matrix and asking for the stencil
+/// give the same bits — any analytic route would differ from the stencil in the last bits.
+///
+/// The fixture is closed-form PK on purpose: a compartment-free model is outside the
+/// analytic covariance scope for a reason of its own, so it could not see the gate.
+/// `data/warfarin_iov.csv` gains a `PHASE` level inside each occasion (its dose and first
+/// four samples, then the rest); three subjects keep the stencil small.
 #[test]
-fn the_covariance_step_finite_differences_a_nested_model() {
-    let src = MODEL
-        .replace(
-            "theta ED50(33.4048, 0.1, 10000.0)",
-            "theta ED50(33.4048, 0.1, 10000.0, FIX)",
-        )
-        .replace(
-            "theta ET50(3.20150, 0.01, 1000.0)",
-            "theta ET50(3.20150, 0.01, 1000.0, FIX)",
-        );
-    assert_ne!(src, MODEL);
+fn the_covariance_step_finite_differences_a_nested_pk_model() {
+    let csv = std::fs::read_to_string("data/warfarin_iov.csv").unwrap();
+    let mut out = String::new();
+    let mut seen: std::collections::HashMap<(String, String), usize> = Default::default();
+    for (i, line) in csv.lines().enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            out.push_str(",PHASE\n");
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let n = seen
+            .entry((f[0].to_string(), f[8].to_string()))
+            .or_insert(0);
+        *n += 1;
+        out.push_str(&format!("{line},{}\n", if *n <= 5 { 1 } else { 2 }));
+    }
+    let path = std::env::temp_dir().join(format!("ferx_nested_pk_{}.csv", std::process::id()));
+    std::fs::write(&path, out).unwrap();
+    let src = "[parameters]\n  theta TVCL(0.13, 0.001, 10.0)\n  theta TVV(8.0, 0.1, 500.0)\n  \
+               theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+               level OCC by OCC in ID\n  level PHASE by PHASE in OCC\n  \
+               kappa K_OCC ~ 0.02 at OCC\n  kappa K_PH ~ 0.01 at PHASE\n  \
+               sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  \
+               CL = TVCL * exp(ETA_CL + K_OCC)\n  V = TVV * exp(K_PH)\n  KA = TVKA\n\
+               [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  \
+               DV ~ proportional(PROP)\n";
     let run = |analytic: bool| {
-        let parsed = parse_full_model(&src).unwrap();
+        let parsed = parse_full_model(src).unwrap();
+        assert!(parsed.model.n_kappa == 2 && parsed.fit_options.iov_column.is_none());
         let (mut pop, _) = read_population_for(
             &parsed.model,
             &parsed.covariate_decls,
-            "nonmem_anchor/nested_levels_3.csv",
+            path.to_str().unwrap(),
             None,
             None,
             None,
@@ -275,14 +298,19 @@ fn the_covariance_step_finite_differences_a_nested_model() {
         fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap()
     };
     let (a, fd) = (run(true), run(false));
+    let _ = std::fs::remove_file(&path);
+    // Three subjects, two occasions, two phases each: four cells per subject.
+    assert!(
+        a.ebe_kappas.iter().all(|k| k.len() == 4),
+        "{:?}",
+        a.ebe_kappas
+    );
     let cov = |r: &FitResult| r.covariance_matrix.clone().expect("a covariance matrix");
     assert!(cov(&fd).iter().all(|v| v.is_finite()), "{}", cov(&fd));
-    // The two FIXed θ have zero rows; the six free parameters (two θ, ω²_sponsor, the
-    // two κ variances, σ) have variances.
     let free = (0..cov(&fd).nrows())
         .filter(|&i| cov(&fd)[(i, i)] > 0.0)
         .count();
-    assert_eq!(free, 6, "{}", cov(&fd));
+    assert_eq!(free, 7, "three θ, ω², two κ variances, σ: {}", cov(&fd));
     let bits = |m: nalgebra::DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     assert_eq!(
         bits(cov(&a)),

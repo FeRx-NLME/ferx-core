@@ -1024,10 +1024,6 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// forced?" — off the *same* predicate the live decision uses, rather than a second
 /// copy of the scope list that would drift from it.
 pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
-    // Nested levels (#1082): no walk lays out the compact vector yet (PR3).
-    if model.has_nested_levels() {
-        return false;
-    }
     // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
     // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
     // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
@@ -5729,7 +5725,15 @@ fn walk_covariance_scope(
     iov: bool,
     sink: &mut DeclineSink,
 ) {
-    let model_supported = if model.ode_spec.is_some() && iov {
+    // Nested levels (#1082): the covariance jets and the stacked prior are laid out per
+    // occasion, not over the compact per-level vector, so the covariance step
+    // finite-differences the objective. This is the analytic covariance path's gate:
+    // `analytic_cov_assembly` is reached on `FitOptions::analytic_cov_hessian` and this
+    // scope walk, which reads the closed-form `iov_analytical_supported` rather than
+    // `iov_sens_supported`.
+    let model_supported = if model.has_nested_levels() {
+        false
+    } else if model.ode_spec.is_some() && iov {
         crate::sens::ode_provider::ode_iov_supported(model)
     } else if model.ode_spec.is_some() {
         crate::sens::ode_provider::ode_analytical_supported(model)

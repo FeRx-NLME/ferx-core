@@ -637,3 +637,44 @@ fn a_weight_varying_inside_its_kappas_group_warns_per_level() {
         "{msg}"
     );
 }
+
+/// What the docs say about a blank level cell, read from a CSV: a blank cell *between*
+/// records carries the label of the record before it (the level columns are read like
+/// covariates), so the record joins that arm and is not refused; a column with no value on
+/// any of a subject's records is refused.
+#[test]
+fn a_blank_level_cell_between_records_carries_the_previous_label() {
+    let m = model();
+    let read = |csv: &str| {
+        let path = std::env::temp_dir().join(format!(
+            "ferx_nested_blank_{}_{}.csv",
+            std::process::id(),
+            csv.len()
+        ));
+        std::fs::write(&path, csv).unwrap();
+        let (pop, _) = crate::api::read_population_for(
+            &m,
+            &None,
+            path.to_str().unwrap(),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        pop
+    };
+    let csv = "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,50\n1,3,12,1,,50\n\
+               1,4,13,2,1,50\n";
+    let pop = read(csv);
+    assert!(code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").is_none());
+    let mut prepared = pop.clone();
+    crate::stats::nested_levels::assign_level_cells(&m, &mut prepared);
+    // The blank row (TIME 3) joins study 1, arm 2 — the row before it.
+    assert_eq!(prepared.subjects[0].occasions, vec![1, 2, 2, 3]);
+    // No ARM value on any record of subject 2: refused.
+    let none = read("ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n2,1,10,1,,50\n2,2,11,1,,50\n");
+    let msg = code_in(&check_model_data(&m, &none), "E_LEVEL_MISSING_LABEL").expect("refused");
+    assert!(msg.contains("subject `2`"), "{msg}");
+}

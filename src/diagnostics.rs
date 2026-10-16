@@ -99,6 +99,13 @@
 //! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), or an `auc_target` on a time-varying-covariate, IOV or reset subject. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
 //! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite or not strictly increasing), or `decision_times` / `monitors` set beside a spec that owns them. Raised by the adaptive entry points (#1774) |
 //! | `E_ADAPTIVE_SPEC`         | an `[adaptive_dosing]` spec that does not compile against the model: a parser invariant (on a spec built in code), `assay_cmt` out of range, an `observe` that does not compile. Block `adaptive_dosing`. Raised by `simulate_adaptive_from_spec`, whose context it carries (#1774). An `observe` covariate absent from the data is `E_MISSING_COVARIATE` there, block `adaptive_dosing` |
+//! | `E_LEVEL_MIXED_WITH_IOV_COLUMN` | a `level` declaration beside `iov_column` / `iov_occasion`, or a `kappa` with no `at LEVEL` once levels are declared (#1082). Block `parameters`; raised at parse time, so a parse error's message carries the code |
+//! | `E_LEVEL_MISSING_LABEL`   | a record with no value in a level column of a nested model (#1082). Block `parameters`. Raised by `fit()` and `ferx check --data` |
+//! | `E_LEVEL_SINGLE_MEMBER`   | a level with at most one group in every parent group whose kappa reads the same parameters as a random effect of the parent level (#1082). Block `parameters` |
+//! | `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED` | a `theta NAME[COL, …]` level block nested in the groups of a kappa-carrying level of a nested model, which the binder cannot yet certify (#1082). Block `parameters` |
+//! | `E_NESTED_LEVEL_METHOD_UNSUPPORTED` | a nested model fitted with a stage other than `foce` / `focei` at `n_agq = 1`, or with a `[mixture]` / FREM (#1082). Block `fit_options` |
+//! | `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED` | a residual `correlation … by` line on a nested model (#1082). Block `error_model` |
+//! | `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED` | a nested model reached a `simulate*` or adaptive entry point, which draw one kappa per occasion (#1082). Block `parameters`. Never by `ferx check` |
 
 use serde::Serialize;
 

@@ -3134,11 +3134,6 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// caught separately by `fd_fallback_warning` (mixed populations) and, for an all-FD in-scope
 /// population, by that same warning *because* this predicate reports analytic.
 pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
-    // Nested levels (#1082): every inner gradient is finite-differenced until PR3, and the
-    // compartment-free arm below would otherwise report a route the IOV inner never takes.
-    if model.has_nested_levels() {
-        return false;
-    }
     analytic_inner_grad_supported_model(model)
         // Compartment-free (#811): served by neither the closed-form predicate (which
         // declines the placeholder `pk_model` outright) nor the ODE one (no `ode_spec`).

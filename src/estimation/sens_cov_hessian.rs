@@ -468,13 +468,6 @@ fn iov_stack(
     params: &ModelParameters,
     b: &[f64],
 ) -> Option<Option<IovStack>> {
-    // Nested levels (#1082): the stacked prior below is the one-level one, so the subject
-    // declines and the covariance step finite-differences the objective. This is the
-    // analytic covariance path's only gate: `analytic_cov_assembly` is reached on
-    // `FitOptions::analytic_cov_hessian` alone, not through `iov_sens_supported`.
-    if model.has_nested_levels() {
-        return None;
-    }
     if model.n_kappa == 0 {
         if params.omega_iov.is_some() {
             return None;
