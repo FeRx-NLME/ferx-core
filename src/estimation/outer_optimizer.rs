@@ -2350,6 +2350,45 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
     }
 }
 
+/// How many subject IDs [`ebe_screen_moved_warning`] lists before it counts the rest.
+const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
+
+/// The user-facing message for subjects whose EBE the cold final re-solve's Sobol screen
+/// moved (#2013), or `None` when it moved none.
+///
+/// Filed under `ebe_start_dependent` by its `W_` token, like #833's and #1565's: the
+/// screen accepts a descent only when it reaches a lower objective at a point more than
+/// 0.5 from the cold descent's in the Ω⁻¹ metric, so each named subject's EBE is one a
+/// start from η = 0 does not reach. Like #833's warning it does not diagnose
+/// multimodality, since a cold descent that stops short of the mode moves the same way.
+/// It names no candidate either: the reported EBEs may still be the #833 incumbent's.
+fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
+    let n = ids.len();
+    if n == 0 {
+        return None;
+    }
+    let listed = ids[..n.min(SCREEN_MOVED_ID_LIST_CAP)].join(", ");
+    let list = if n > SCREEN_MOVED_ID_LIST_CAP {
+        format!("{listed} and {} more", n - SCREEN_MOVED_ID_LIST_CAP)
+    } else {
+        listed
+    };
+    let who = if n == 1 {
+        "1 subject".to_string()
+    } else {
+        format!("{n} subjects")
+    };
+    Some(format!(
+        "W_EBE_START_DEPENDENT: at the final parameters, the inner loop's Sobol screen \
+         (`inner_screen`) moved the empirical Bayes estimates of {who} ({list}) to a lower \
+         individual objective than the descent from η = 0 reached. Either the individual \
+         objective has more than one mode there, or that descent stopped short of it; in \
+         both cases these EBEs, and the diagnostics built on them (IPRED, IWRES, CWRES, \
+         shrinkage), depend on where the inner loop starts. `inner_screen = 0` turns the \
+         screen off."
+    ))
+}
+
 /// How far, in absolute OFV units, a cold re-solve may land *below* the best-seen
 /// objective before the run counts as having been optimized under trapped EBEs (#1565).
 ///
@@ -4289,6 +4328,9 @@ fn optimize_nlopt_once(
     // optimizer's own EBEs, when it beat the best-seen objective and the count is
     // measurable (see `subjects_in_a_lower_cold_mode`). Feeds the warning only.
     let mut basin_subjects: Option<usize> = None;
+    // #2013: the IDs of the subjects whose EBE the cold solve's Sobol screen moved off the
+    // mode the cold descent found. Feeds the warning only.
+    let mut screen_moved_ids: Vec<String> = Vec::new();
 
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
@@ -4331,8 +4373,10 @@ fn optimize_nlopt_once(
                     );
                     (ehs, hms, kappas, 2.0 * nll)
                 };
-            let solve_at = |seed: Option<&[DVector<f64>]>| {
-                let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+            // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013
+            // `screen_moved` flag read back alongside it.
+            let solve_flagged = |seed: Option<&[DVector<f64>]>| {
+                let (ehs, hms, _, kappas, moved) = run_inner_loop_warm_map(
                     model,
                     population,
                     &final_params,
@@ -4342,17 +4386,27 @@ fn optimize_nlopt_once(
                     Some(&final_mu_k),
                     options.min_obs_for_convergence_check as usize,
                     options.inner_restarts,
-                    InnerHessianSeed::for_options(options),
-                    options,
+                    InnerSolvePolicy::for_stage(options, model),
+                    None,
+                    |_, ebe| ebe.screen_moved,
                 );
-                score(ehs, hms, kappas)
+                (score(ehs, hms, kappas), moved)
             };
+            let solve_at = |seed: Option<&[DVector<f64>]>| solve_flagged(seed).0;
 
             // The cold solve is kept for its own sake: `failure_is_converged_plateau`
             // reads it as the warm-start-artifact probe (#751), and that check is only
             // worth anything while the number it reads is genuinely cold.
-            let (cold_ehs, cold_hms, cold_kappas, cold) = solve_at(None);
+            let ((cold_ehs, cold_hms, cold_kappas, cold), moved) = solve_flagged(None);
             cold_ofv = Some(cold);
+            // Only the cold solve can screen: the seeded re-solve below is warm.
+            screen_moved_ids = population
+                .subjects
+                .iter()
+                .zip(&moved)
+                .filter(|&(_, &m)| m)
+                .map(|(subject, _)| subject.id.clone())
+                .collect();
 
             // #833: the cold EBEs are not automatically the ones the optimizer's own
             // objective was measured at. On a weakly-identified or multimodal inner
@@ -4429,7 +4483,13 @@ fn optimize_nlopt_once(
                         candidates.push(score(inc.etas, inc.h_mats, inc.kappas));
                     }
                     let objectives: Vec<f64> = candidates.iter().map(|c| c.3).collect();
-                    candidates.swap_remove(reported_candidate(&objectives))
+                    let pick = reported_candidate(&objectives);
+                    // The #2013 warning names EBEs the cold solve moved; reported EBEs
+                    // from another candidate were not.
+                    if pick != 0 {
+                        screen_moved_ids.clear();
+                    }
+                    candidates.swap_remove(pick)
                 }
                 None => (cold_ehs, cold_hms, cold_kappas, cold),
             };
@@ -4552,6 +4612,9 @@ fn optimize_nlopt_once(
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
+        warnings.push(w);
+    }
+    if let Some(w) = ebe_screen_moved_warning(&screen_moved_ids) {
         warnings.push(w);
     }
     if latch_overrode_veto.load(Ordering::Relaxed) {

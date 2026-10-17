@@ -847,6 +847,12 @@ pub struct ScoringSettings {
     pub inner_tol: f64,
     /// `inner_restarts`: the inner multi-start of a cold EBE solve.
     pub inner_restarts: usize,
+    /// `inner_screen`: the Sobol screen of that multi-start (#2013).
+    ///
+    /// Absent from a record written before #2013, which reads `0`: such a fit ran no
+    /// screen, so a post-hoc step re-scores it without one.
+    #[serde(default)]
+    pub inner_screen: usize,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -885,6 +891,7 @@ impl ScoringSettings {
             inner_maxiter: options.inner_maxiter,
             inner_tol: options.inner_tol,
             inner_restarts: options.inner_restarts,
+            inner_screen: options.inner_screen,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -933,6 +940,7 @@ impl ScoringSettings {
             inner_maxiter,
             inner_tol,
             inner_restarts,
+            inner_screen,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -949,6 +957,7 @@ impl ScoringSettings {
             inner_maxiter,
             inner_tol,
             inner_restarts,
+            inner_screen,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -993,6 +1002,7 @@ pub(crate) fn with_scoring_record(
         inner_maxiter,
         inner_tol,
         inner_restarts,
+        inner_screen,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1016,6 +1026,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_maxiter);
     recorded!(inner_tol);
     recorded!(inner_restarts);
+    recorded!(inner_screen);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);

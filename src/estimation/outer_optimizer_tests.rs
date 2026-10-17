@@ -4606,6 +4606,63 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
+/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// and where, who, the two causes it does not choose between, what depends on it, and the
+/// switch — plus its count, its cap and its silence.
+#[test]
+fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
+    let ids = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("S{i}")).collect() };
+    assert!(ebe_screen_moved_warning(&[]).is_none());
+
+    let one = ebe_screen_moved_warning(&ids(1)).unwrap();
+    assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
+    assert!(
+        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        "{one}"
+    );
+    assert!(
+        one.contains("estimates of 1 subject (S1) to a lower"),
+        "{one}"
+    );
+    assert!(
+        one.contains("lower individual objective than the descent from η = 0 reached"),
+        "{one}"
+    );
+    assert!(
+        one.contains("more than one mode there, or that descent stopped short of it"),
+        "{one}"
+    );
+    assert!(
+        one.contains("(IPRED, IWRES, CWRES, shrinkage), depend on where the inner loop starts"),
+        "{one}"
+    );
+    assert!(
+        one.ends_with("`inner_screen = 0` turns the screen off."),
+        "{one}"
+    );
+    let entry = crate::types::classify_warning(&one);
+    assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+
+    let two = ebe_screen_moved_warning(&ids(2)).unwrap();
+    assert!(two.contains("of 2 subjects (S1, S2) to"), "{two}");
+
+    // At the cap every ID is listed; one past it, the last is counted instead.
+    let cap = SCREEN_MOVED_ID_LIST_CAP;
+    let at = ebe_screen_moved_warning(&ids(cap)).unwrap();
+    assert!(
+        at.contains(&format!("S{cap})")) && !at.contains(" more)"),
+        "{at}"
+    );
+    let past = ebe_screen_moved_warning(&ids(cap + 2)).unwrap();
+    assert!(
+        past.contains(&format!("{} subjects (S1, ", cap + 2))
+            && past.contains(&format!("S{cap} and 2 more)"))
+            && !past.contains(&format!("S{}", cap + 1)),
+        "{past}"
+    );
+}
+
 #[test]
 fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold

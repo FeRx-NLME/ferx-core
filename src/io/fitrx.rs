@@ -601,6 +601,10 @@ struct ScoringSettingsWire {
     /// those draws ran no inner multi-start, so the default stands in.
     #[serde(default = "default_inner_restarts")]
     inner_restarts: usize,
+    /// Absent from a bundle written before #2013, whose fit ran no inner screen: `0`
+    /// stands in, not today's default, so a post-hoc step re-scores it as it ran.
+    #[serde(default)]
+    inner_screen: usize,
     mu_referencing: bool,
     n_agq: usize,
     inner_optimizer: String,
@@ -664,6 +668,7 @@ impl From<&crate::ScoringSettings> for ScoringSettingsWire {
             inner_maxiter: s.inner_maxiter,
             inner_tol: s.inner_tol,
             inner_restarts: s.inner_restarts,
+            inner_screen: s.inner_screen,
             mu_referencing: s.mu_referencing,
             n_agq: s.n_agq,
             inner_optimizer: enum_token(&s.inner_optimizer),
@@ -750,6 +755,7 @@ impl ScoringSettingsWire {
             inner_maxiter: self.inner_maxiter,
             inner_tol: self.inner_tol,
             inner_restarts: self.inner_restarts,
+            inner_screen: self.inner_screen,
             mu_referencing: self.mu_referencing,
             n_agq: self.n_agq,
             inner_optimizer: enum_from_token(block, "inner_optimizer", self.inner_optimizer)?,
@@ -3576,6 +3582,7 @@ mod tests {
             inner_maxiter: 17,
             inner_tol: 3e-4,
             inner_restarts: 4,
+            inner_screen: 7,
             mu_referencing: false,
             n_agq: 5,
             inner_optimizer: crate::types::InnerOptimizer::NelderMead,
@@ -4993,10 +5000,12 @@ mod tests {
     /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
     /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
     /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
-    /// emits exactly those keys plus `inner_restarts` and `gradient_method` (#1835), still
-    /// flat; the unrecorded `gradient_method` loads as `auto`. Mutations: drop
-    /// `#[serde(flatten)]` (the frozen object fails to load, and the writer nests a `scoring`
-    /// key); drop the `inner_restarts` default (the frozen object fails to load).
+    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835) and
+    /// `inner_screen` (#2013), still flat; the unrecorded `gradient_method` loads as `auto`
+    /// and the unrecorded `inner_screen` as `0`, the screen such a fit did not run.
+    /// Mutations: drop `#[serde(flatten)]` (the frozen object fails to load, and the writer
+    /// nests a `scoring` key); drop the `inner_restarts` or `inner_screen` default (the
+    /// frozen object fails to load).
     #[test]
     fn a_flat_pre_426_sir_record_still_loads() {
         let frozen = serde_json::json!({
@@ -5012,6 +5021,7 @@ mod tests {
         let want = crate::estimation::sir::SirSettings {
             scoring: crate::ScoringSettings {
                 inner_restarts: crate::types::FitOptions::default().inner_restarts,
+                inner_screen: 0,
                 gradient_method: crate::types::GradientMethod::Auto,
                 ..off_default_scoring_settings()
             },
@@ -5031,6 +5041,8 @@ mod tests {
         want_keys.push(&restarts);
         let gradient = "gradient_method".to_string();
         want_keys.push(&gradient);
+        let screen = "inner_screen".to_string();
+        want_keys.push(&screen);
         want_keys.sort();
         assert_eq!(keys, want_keys);
     }
