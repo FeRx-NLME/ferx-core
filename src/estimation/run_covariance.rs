@@ -462,7 +462,10 @@ fn reported_matches(reported: &[DVector<f64>], cold: &[DVector<f64>], tol: f64) 
 /// Is every reported η̂ and κ̂ a value a six-decimal `.fitrx` bundle could have written —
 /// the double nearest some `x.xxxxxx`? A bundle saved before #1847 wrote them that way
 /// (`{:.6}`), and so does nothing else: a full-precision EBE is such a value with odds of
-/// about one in 1e10, and a fit has at least one per subject and random effect. The lone
+/// about one in 1e10, a fit holds one such value per subject and random effect, and all of
+/// them must have the spelling. A false positive costs nothing beyond the improvement: it
+/// falls back to the pre-#1847 band. Re-saving a reloaded old fit keeps the spelling, since
+/// the exact write gives back the value it was handed. The lone
 /// exception is an EBE that is exactly zero, which carries no information either way; a fit
 /// whose EBEs are all zero is compared within the band, as every fit was before #1847.
 ///

@@ -18,7 +18,9 @@
 //! solve *is* the reported one, so that is bit-identical to the inline step; starting from
 //! the rounded EBEs instead would not be (measured 5.4e-8 to 2.8e-7 on #1847). On the five
 //! warm-started engines it is not bit-identical, which is the premise that the claim
-//! above discriminates: the same fit can miss.
+//! above discriminates: the same fit can miss. The old bundle's fit is then saved again by
+//! today's writer and reloaded: it must keep its EBEs bit for bit and give the same
+//! covariance, so a re-saved old fit is still recognised.
 //!
 //! Mutations (measured, see the PR):
 //! - compare within the legacy 1e-6 band always (the pre-#1847 start rule): the five
@@ -281,6 +283,38 @@ fn check_row(model_path: &str, data_path: &str, methods: &[EstimationMethod], eb
             );
         }
     }
+
+    // Re-saved (#2092 review): a pre-#1847 fit saved again by today's writer keeps its
+    // six-decimal EBEs bit for bit, so it is still recognised as one and still runs from the
+    // cold solve. Losing that would start it from its rounded EBEs instead — off the
+    // controls' inline step, and off the cold start on the warm-started rows.
+    let resaved_path = dir.path().join("resaved.fitrx");
+    save_fit(
+        &legacy,
+        &f.population,
+        "model\n",
+        &resaved_path,
+        SaveFitOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{row}: re-saving a pre-#1847 fit: {e}"));
+    let resaved = load_fit(&resaved_path)
+        .unwrap_or_else(|e| panic!("{row}: reloading a re-saved pre-#1847 fit: {e}"))
+        .fit;
+    let eta_bits = |r: &FitResult| {
+        r.subjects
+            .iter()
+            .flat_map(|s| s.eta.iter().map(|x| x.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (eta_bits(&resaved), kappa_bits(&resaved)),
+        (eta_bits(&legacy), kappa_bits(&legacy)),
+        "{row}: re-saving a pre-#1847 fit must keep its six-decimal EBEs and κ̂"
+    );
+    assert!(
+        rerun(&f, &resaved, &format!("{row} re-saved legacy")) == from_legacy,
+        "{row}: a re-saved pre-#1847 fit must still be recognised and run from the cold solve"
+    );
 }
 
 const WARFARIN: (&str, &str) = ("examples/warfarin.ferx", "data/warfarin.csv");
