@@ -224,6 +224,15 @@ fn a_fit_carried_fix_zero_is_recovered_from_the_declaration() {
         fitted.omega.matrix[(0, 0)] > 0.0,
         "the fit carries the floor, not 0"
     );
+    // How far the unpack path lands from the floor: `exp(ln 1e-4)²` is 10 ULP above 1e-8
+    // (measured, macOS arm64 and Linux aarch64). `SIM_ZERO_RECOVERY_CEILING` (2e-8) clears
+    // it by ~1e-8; the bound here is what the doc on that constant cites.
+    let carried_ulps = fitted.omega.matrix[(0, 0)].to_bits() as i64 - 1e-8f64.to_bits() as i64;
+    assert!(
+        (0..=64).contains(&carried_ulps),
+        "unpacked FIX-0 diagonal {:e} is {carried_ulps} ULP from 1e-8",
+        fitted.omega.matrix[(0, 0)]
+    );
     let f = fitted
         .omega
         .sim_draw_factor(Some(&declared.omega), &declared.omega_fixed);
@@ -245,6 +254,16 @@ fn a_fit_carried_fix_zero_is_recovered_from_the_declaration() {
     let supplied = OmegaMatrix::from_diagonal(&[0.04, 0.09], declared.omega.eta_names.clone());
     let f = supplied.sim_draw_factor(Some(&declared.omega), &declared.omega_fixed);
     assert!(std::ptr::eq(&*f, &supplied.chol));
+    // The ceiling is a gate, not a guess: a variance just above it (3e-8) is honoured as
+    // the caller's, while the unpacked floor above (10 ULP over 1e-8) is recovered as the
+    // zero. Moving the constant anywhere outside (1e-8 + 10 ULP, 3e-8) reddens one side of
+    // this pair.
+    let just_above = OmegaMatrix::from_diagonal(&[3e-8, 0.09], declared.omega.eta_names.clone());
+    let f = just_above.sim_draw_factor(Some(&declared.omega), &declared.omega_fixed);
+    assert!(
+        std::ptr::eq(&*f, &just_above.chol),
+        "a supplied 3e-8 on a FIX-0 η was read back as the declared zero"
+    );
 }
 
 // ── simulate ─────────────────────────────────────────────────────────────────────────
@@ -301,6 +320,57 @@ fn simulate_kappa_zero_fix_is_bit_equal_to_predict_iov_at_zero() {
         }
     }
     assert_rows_bit_equal("simulate κ", &rows, &reference);
+}
+
+/// `simulate_with_uncertainty` is the one consumer whose production branch is always the
+/// fit-carried recovery: each draw rebuilds Ω from `FitResult.omega` (the regularised 1e-8
+/// for a FIX-0 η, no `sim_chol`) through `from_matrix_with_mask` and `unpack_params`. θ is
+/// FIX here so the parameter draws cannot move IPRED; only a non-zero η could.
+#[test]
+fn simulate_with_uncertainty_draws_a_fit_carried_fix_zero_as_zero() {
+    let src = model_src("  omega ETA_CL ~ 0.0 FIX", "TVCL * exp(ETA_CL)", "TVV")
+        .replace(
+            "theta TVCL(2.0, 0.01, 50.0)",
+            "theta TVCL(2.0, 0.01, 50.0) FIX",
+        )
+        .replace(
+            "theta TVV(20.0, 0.5, 200.0)",
+            "theta TVV(20.0, 0.5, 200.0) FIX",
+        )
+        .replace(
+            "theta TVKA(0.15, 0.005, 20.0)",
+            "theta TVKA(0.15, 0.005, 20.0) FIX",
+        )
+        // An ordinary σ: the shared 1e-10 sits below the σ rail, where the asymptotic
+        // sampler rejects every draw. σ never reaches IPRED.
+        .replace("sigma PROP ~ 1e-10 (sd)", "sigma PROP ~ 0.04");
+    let m = parse_model_string(&src).expect("#1605 FIX-θ fixture parses");
+    let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+    // The fit carries the floor, not 0 — so this run reaches the recovery branch, not
+    // `sim_chol`.
+    assert_eq!(fit.omega[(0, 0)], 1e-8);
+    let pop = population("sim_uncertainty", 3, true, |t| (t / 10.0).sin().abs() + 0.5);
+    let mut opts = SimulateUncertaintyOptions::default();
+    opts.n_uncertainty_draws = 3;
+    opts.n_sim_per_draw = 2;
+    opts.seed = Some(17);
+    let rows = simulate_with_uncertainty(&m, &pop, &fit, &opts).expect("uncertainty sim runs");
+    assert_eq!(rows.len(), 3 * 2 * 3 * OBS.len());
+    // The reference takes θ through the same pack/unpack round trip every draw does (a
+    // FIX θ is pinned to its packed `x̂`, so `exp(ln θ)` — a couple of ULP off the
+    // declared value); against the declared θ the run is 2 ULP off with η exactly 0.
+    use crate::estimation::parameterization::{pack_params, unpack_params};
+    let round_tripped = unpack_params(&pack_params(&m.default_params), &m.default_params);
+    let reference: HashMap<(String, u64), f64> = predict(&m, &pop, &round_tripped)
+        .expect("predict runs")
+        .into_iter()
+        .map(|p| ((p.id, p.time.to_bits()), p.pred))
+        .collect();
+    assert_rows_bit_equal(
+        "simulate_with_uncertainty η (fit-carried FIX zero)",
+        &rows,
+        &reference,
+    );
 }
 
 /// The non-degenerate pair: `ETA_CL ~ 0.0 FIX` beside `ETA_V ~ 0.09`. The zero η is
@@ -457,7 +527,9 @@ fn adaptive_eta_zero_fix_matches_the_closed_form() {
         assert!(rel.is_finite(), "non-finite IPRED at t={}", r.time);
         worst = worst.max(rel);
     }
-    // Bound: the ODE engines' 1e-10 (as #1611's anchors). Realised: see the PR body.
+    // Bound: the ODE engines' 1e-10 (as #1611's anchors). Realised 4.2e-16 on Linux aarch64
+    // (`b76a810b`); the regression it targets, the regularised zero drawn with sd 1e-4,
+    // put it at 1.4e-4 at `3b88da7f` (seed 1).
     assert!(
         worst < 1e-10,
         "simulate_adaptive η: worst rel vs closed form {worst:.3e}"

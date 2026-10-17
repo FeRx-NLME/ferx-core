@@ -2324,9 +2324,10 @@ impl OmegaMatrix {
 /// The largest diagonal a fit-carried Ω may hold on a `FIX`-ed declared zero and
 /// still be read back as that zero by [`OmegaMatrix::sim_draw_factor`] (#1605).
 /// A fit holds such an η at the constructor's `1e-8` floor, reached as
-/// `exp(ln 1e-4)²`, which rounds to within a few ULP of `1e-8`; twice the floor
-/// clears that rounding by orders of magnitude and stays far below any variance a
-/// caller would supply on purpose.
+/// `exp(ln 1e-4)²`, which lands 10 ULP above `1e-8` (measured through the
+/// parameterisation round trip; `a_fit_carried_fix_zero_is_recovered_from_the_declaration`
+/// bounds it). Twice the floor clears that by ~1e-8 and stays far below any variance a
+/// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
 const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 
 /// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when

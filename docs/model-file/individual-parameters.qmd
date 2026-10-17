@@ -420,7 +420,9 @@ distribution) a zero `omega` or `kappa` draws exactly `ETA_CL = 0` for every
 subject, as NONMEM's `$SIMULATION` does with `$OMEGA 0 FIX`. The other random
 effects draw from exactly their declared variances (here 0.09). This also holds
 when you simulate from a fit, where the fitted Ω stores the `FIX`-ed zero as
-`1e-8`: the model's declaration identifies it. Before #1605 the zero
+`1e-8`: the model's declaration identifies it. A variance you supply yourself
+for that `ETA` (anything above `2e-8`) is honoured, not replaced by the
+declared zero. Before #1605 the zero
 was drawn with a standard deviation of `1e-4`, and `1e-8` was added to every
 other variance.
 
