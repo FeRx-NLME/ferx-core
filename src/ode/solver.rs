@@ -1954,9 +1954,13 @@ fn until_threshold_with(
             .is_some_and(|budget| clamps >= budget.max(1))
         {
             return failed(
-                format!(
-                    "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
-                     (ode_stiff_abort_after): the segment is stability-limited"
+                with_nonfinite_state_note(
+                    u,
+                    t,
+                    format!(
+                        "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
+                         (ode_stiff_abort_after): the segment is stability-limited"
+                    ),
                 ),
                 ran_stiff,
             );
@@ -1978,12 +1982,42 @@ fn until_threshold_with(
     }
 
     return failed(
-        format!(
-            "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
-            opts.max_steps
+        with_nonfinite_state_note(
+            u,
+            t,
+            format!(
+                "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
+                opts.max_steps
+            ),
         ),
         ran_stiff,
     );
+}
+
+/// Leads a step-budget / stiff-abort `Failed` message with the state(s) that went non-finite
+/// (#1578). The monitored-state guard only reads `u[monitor]`, so an *unmonitored* state that
+/// diverges is force-accepted at `min_dt` step after step until one of the two budgets runs
+/// out, and the message would then blame the budget or stiffness for a diverged right-hand
+/// side. The budget clause stays as the secondary fact. A finite `u` returns `clause`
+/// unchanged, byte for byte.
+fn with_nonfinite_state_note(u: &[f64], t: f64, clause: String) -> String {
+    let bad: Vec<String> = u
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| !x.is_finite())
+        .map(|(k, _)| k.to_string())
+        .collect();
+    match bad.len() {
+        0 => clause,
+        1 => format!(
+            "state {} became non-finite before t={t:.6}; {clause}",
+            bad[0]
+        ),
+        _ => format!(
+            "states {} became non-finite before t={t:.6}; {clause}",
+            bad.join(", ")
+        ),
+    }
 }
 
 /// Generic solution point for the [`solve_ode_g`] sensitivity path.
@@ -4466,5 +4500,127 @@ mod tests {
         }
         assert_eq!(finite.stiff_aborted_segments, 1);
         assert_eq!(finite.diverged_segments, 0);
+    }
+
+    // -- #1578: a diverged unmonitored state is named, not blamed on a budget -----------
+    //
+    // Fixture: the #1539 pole `X' = 0.5·X²` next to a monitored accumulator `u0' = 0.01` whose
+    // threshold (1e9) is never reached. The monitored guard reads only `u[0]`, so the pole in
+    // `X` is force-accepted at `min_dt` until a budget runs out; that message must lead with
+    // the state, not with the budget or stiffness.
+
+    fn accumulator_next_to_pole(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+        du[0] = 0.01;
+        du[1] = 0.5 * u[1] * u[1];
+    }
+
+    fn failed_text(outcome: ThresholdCrossing) -> String {
+        match outcome {
+            ThresholdCrossing::Failed(m) => m,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// T1: the step-budget return names state 1 and keeps the budget clause.
+    ///
+    /// Engine: `until_threshold_with` at `f64` (rk45). Mutation that reddens it: drop the
+    /// `with_nonfinite_state_note` call at the budget return.
+    #[test]
+    fn threshold_budget_failure_names_the_diverged_state() {
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &accumulator_next_to_pole,
+            &mut u,
+            (0.0, 10.0),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert!(
+            msg.starts_with("state 1 became non-finite before t=2.0"),
+            "{msg}"
+        );
+        assert!(msg.contains("; step budget ("), "{msg}");
+        assert!(!msg.contains("state 0"), "{msg}");
+    }
+
+    /// T1b: the `ode_stiff_abort_after` return names state 1 and keeps the abort clause.
+    ///
+    /// Engine: as T1. Mutation that reddens it: drop the helper call at the abort return only.
+    #[test]
+    fn threshold_stiff_abort_failure_names_the_diverged_state() {
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            stiff_abort_after: Some(5),
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &accumulator_next_to_pole,
+            &mut u,
+            (0.0, 10.0),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert!(
+            msg.starts_with("state 1 became non-finite before t=2.0"),
+            "{msg}"
+        );
+        assert!(msg.contains("; aborted at t=2.0"), "{msg}");
+        assert!(msg.contains("the segment is stability-limited"), "{msg}");
+    }
+
+    /// T1c twin: a budget exhausted on a **finite** state keeps today's text byte for byte.
+    /// `X' = 0` with `max_steps = 5` runs out of steps for want of steps, not because anything
+    /// diverged, independent of any stepper's stall behaviour.
+    ///
+    /// Engine: as T1. Mutation that reddens it: make the note unconditional.
+    #[test]
+    fn threshold_budget_failure_on_a_finite_state_is_unchanged() {
+        let flat = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 0.01;
+            du[1] = 0.0;
+        };
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            max_steps: 5,
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &flat,
+            &mut u,
+            (0.0, 1e6),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert_eq!(
+            msg,
+            "step budget (5) exhausted before reaching t_end=1000000.000000 (reached t=78.100000)",
+            "the finite-state budget text must be the pre-#1578 text"
+        );
+    }
+
+    /// The helper's own two-state leg (the plural form), which no fixture above reaches.
+    #[test]
+    fn nonfinite_state_note_lists_every_non_finite_state() {
+        let clause = "step budget (5) exhausted".to_string();
+        assert_eq!(
+            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, clause.clone()),
+            "states 0, 2 became non-finite before t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[0.0, 1.0], 2.0, clause.clone()),
+            clause
+        );
     }
 }
