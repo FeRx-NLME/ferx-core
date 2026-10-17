@@ -607,6 +607,48 @@ fn run_model_simulate_keeps_the_simulations_code_without_a_context() {
     assert_eq!(err.message(), text, "the prefix is part of the message");
 }
 
+/// #1772: two of `run_model_simulate`'s `[simulation]` design refusals, which have no
+/// code yet (#1788): their text is unchanged by the retype and `code()` is `None`, as
+/// `UNCODED_SITES` lists. A model with no `[simulation]` block; and (`survival`) a
+/// binary-only model whose design gives a `horizon` but no `times`, refused before the
+/// design's covariates are read. A test flips when #1788 gives either a code.
+#[test]
+fn run_model_simulate_design_refusals_keep_their_text_uncoded() {
+    let write = |text: &str| {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), text).unwrap();
+        f
+    };
+    let no_block = write(ONE_CPT_IV);
+    let err = crate::api::run_model_simulate(no_block.path().to_str().unwrap())
+        .err()
+        .expect("no [simulation] block");
+    assert_eq!(
+        err.to_string(),
+        "Model file has no [simulation] block — use --data instead"
+    );
+    assert_eq!(err.code(), None);
+
+    #[cfg(feature = "survival")]
+    {
+        let src = std::fs::read_to_string("examples/binary_logistic.ferx").expect("example");
+        let binary = write(&format!(
+            "{src}\n[simulation]\n  n_subjects = 2\n  dose_amt = 0\n  dose_cmt = 1\n  \
+             seed = 7\n  horizon = 10\n"
+        ));
+        let err = crate::api::run_model_simulate(binary.path().to_str().unwrap())
+            .err()
+            .expect("a binary endpoint with no times");
+        assert!(
+            err.to_string().starts_with(
+                "[simulation] has no `times`, but the model has a [binary_model] endpoint."
+            ),
+            "{err}"
+        );
+        assert_eq!(err.code(), None, "{err}");
+    }
+}
+
 /// #1772: the file entry points code their reads and binders as `ferx check` does. A
 /// model file that does not exist is `E_MODEL_READ` (`fit_from_files`, `prepare_run`,
 /// `run_model_simulate`); a dataset missing a covariate the model reads is
