@@ -459,7 +459,8 @@ pub fn transform_dataset_for_frem(
 ///
 /// The generated model extends the base with:
 /// - Fixed theta for each covariate's typical value (TV_COV)
-/// - Extended block omega with PK + covariate etas
+/// - Extended block omega with PK + covariate etas. An `iiv_on_ruv` eta the
+///   base leaves uncorrelated stays outside it, as its own diagonal omega
 /// - Fixed near-zero sigma for covariate observations (EPSCOV)
 /// - Individual parameters for covariates: `COV_X = TV_X + ETA_X_FREM`
 /// - FREM fit options mapping FREMTYPE → (theta, eta) predictions
@@ -509,11 +510,62 @@ pub fn generate_frem_model(
     model.push('\n');
 
     // Build extended block_omega: PK etas + covariate etas.
-    let n_pk = base_model.n_eta;
+    let n_base = base_model.n_eta;
     let n_cov = frem_info.covariate_names.len();
+
+    // PK-PK omega from base model, overridden entry-by-entry with the prior
+    // fit's omega (issue #239) when a matching eta pair is present.
+    let base_omega: Vec<Vec<f64>> = (0..n_base)
+        .map(|i| {
+            (0..n_base)
+                .map(|j| {
+                    let declared = base_model.default_params.omega.matrix[(i, j)];
+                    fit_init
+                        .and_then(|fi| {
+                            fit_omega_value(fi, &base_model.eta_names[i], &base_model.eta_names[j])
+                        })
+                        .unwrap_or(declared)
+                })
+                .collect()
+        })
+        .collect();
+
+    // The `iiv_on_ruv` eta scales the residual, not a structural parameter, so
+    // covariates do not explain it: NONMEM / PsN FREM keep it in its own
+    // diagonal $OMEGA outside the covariate block (#904). Emit it standalone
+    // when the base model declares no covariance between it and another eta;
+    // one the base puts in a block with a PK eta stays in the block to keep that
+    // covariance free, but starts with zero covariate cross-terms. The test is
+    // structural (`free_mask`), not numeric: a block entry declared or fitted as
+    // exactly 0.0 is still an estimable covariance.
+    let ruv_eta = base_model.residual_error_eta.filter(|&k| k < n_base);
+    let free = &base_model.default_params.omega.free_mask;
+    let standalone_ruv = ruv_eta.filter(|&k| (0..n_base).all(|j| j == k || !free[(k, j)]));
+    if let Some(k) = standalone_ruv {
+        let fix = if base_model
+            .default_params
+            .omega_fixed
+            .get(k)
+            .copied()
+            .unwrap_or(false)
+        {
+            " FIX"
+        } else {
+            ""
+        };
+        model.push_str(&format!(
+            "  omega {} ~ {:.6e}{}\n\n",
+            base_model.eta_names[k], base_omega[k][k], fix
+        ));
+    }
+    let block_base: Vec<usize> = (0..n_base).filter(|&i| Some(i) != standalone_ruv).collect();
+    let n_pk = block_base.len();
     let n_total = n_pk + n_cov;
 
-    let mut all_eta_names: Vec<String> = base_model.eta_names.clone();
+    let mut all_eta_names: Vec<String> = block_base
+        .iter()
+        .map(|&i| base_model.eta_names[i].clone())
+        .collect();
     for cov_name in &frem_info.covariate_names {
         all_eta_names.push(format!("ETA_{}_FREM", cov_name.to_uppercase()));
     }
@@ -521,16 +573,9 @@ pub fn generate_frem_model(
     // Build the omega matrix: PK diagonal from base, COV diagonal from variance,
     // off-diagonals = small scaled values.
     let mut omega_matrix = vec![vec![0.0f64; n_total]; n_total];
-    // PK-PK block from base model, overridden entry-by-entry with the prior
-    // fit's omega (issue #239) when a matching eta pair is present.
-    for i in 0..n_pk {
-        for j in 0..n_pk {
-            let declared = base_model.default_params.omega.matrix[(i, j)];
-            omega_matrix[i][j] = fit_init
-                .and_then(|fi| {
-                    fit_omega_value(fi, &base_model.eta_names[i], &base_model.eta_names[j])
-                })
-                .unwrap_or(declared);
+    for (a, &i) in block_base.iter().enumerate() {
+        for (b, &j) in block_base.iter().enumerate() {
+            omega_matrix[a][b] = base_omega[i][j];
         }
     }
     // COV-COV diagonal from sample variances.
@@ -538,11 +583,14 @@ pub fn generate_frem_model(
         omega_matrix[n_pk + k][n_pk + k] = frem_info.covariate_variances[k];
     }
     // PK-COV cross-terms: small initial values for gradient signal.
-    for i in 0..n_pk {
+    for (a, &i) in block_base.iter().enumerate() {
+        if Some(i) == ruv_eta {
+            continue;
+        }
         for k in 0..n_cov {
-            let cross = 0.01 * (omega_matrix[i][i] * omega_matrix[n_pk + k][n_pk + k]).sqrt();
-            omega_matrix[i][n_pk + k] = cross;
-            omega_matrix[n_pk + k][i] = cross;
+            let cross = 0.01 * (omega_matrix[a][a] * omega_matrix[n_pk + k][n_pk + k]).sqrt();
+            omega_matrix[a][n_pk + k] = cross;
+            omega_matrix[n_pk + k][a] = cross;
         }
     }
 
@@ -1800,6 +1848,169 @@ mod tests {
         // The generated model must still parse (block placement is valid).
         crate::parser::model_parser::parse_model_string(&model_text)
             .expect("generated FREM model parses");
+    }
+
+    /// FREM-converts `base_text` (covariates WT, AGE) and parses the result.
+    fn frem_convert_and_parse(
+        base_text: &str,
+        fit_init: Option<&FremFitInit>,
+    ) -> (String, CompiledModel) {
+        let base =
+            crate::parser::model_parser::parse_model_string(base_text).expect("base model parses");
+        let pop = make_test_population();
+        let covs = vec!["WT".to_string(), "AGE".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &base, &covs, &[], None).unwrap();
+        let text =
+            generate_frem_model(base_text, &base, &info, Path::new("t.csv"), fit_init).unwrap();
+        let parsed = crate::parser::model_parser::parse_model_string(&text)
+            .unwrap_or_else(|e| panic!("generated FREM model does not parse: {e}\n{text}"));
+        (text, parsed)
+    }
+
+    fn eta_index(model: &CompiledModel, name: &str) -> usize {
+        model
+            .eta_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("no eta {name} in {:?}", model.eta_names))
+    }
+
+    const IIV_ON_RUV_BASE: &str = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_RUV ~ 0.30
+  omega ETA_V   ~ 0.04
+  sigma ADD ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ log_additive(ADD)
+  iiv_on_ruv = ETA_RUV
+";
+
+    #[test]
+    fn generate_frem_model_keeps_the_iiv_on_ruv_eta_out_of_the_covariate_block() {
+        // #904: the generator put every base eta — the `iiv_on_ruv` one too —
+        // into the FREM block with nonzero covariate cross-terms, so covariates
+        // were modelled as explaining residual-error IIV. NONMEM / PsN FREM keep
+        // it in its own $OMEGA. ETA_RUV is declared *between* two PK etas so a
+        // wrong index map in the block rebuild shows up on ETA_V.
+        // The fit carries a nonzero ETA_CL × ETA_RUV covariance the diagonal
+        // base never declared: structure comes from the base, so ETA_RUV still
+        // leaves the block.
+        let fit_init = FremFitInit {
+            theta: Vec::new(),
+            eta_names: vec!["ETA_CL".into(), "ETA_RUV".into()],
+            omega: DMatrix::from_row_slice(2, 2, &[0.11, 0.02, 0.02, 0.25]),
+        };
+        let (text, m) = frem_convert_and_parse(IIV_ON_RUV_BASE, Some(&fit_init));
+
+        let block_line = text.lines().find(|l| l.contains("block_omega")).unwrap();
+        assert!(
+            !block_line.contains("ETA_RUV"),
+            "iiv_on_ruv eta is inside the FREM block:\n{text}"
+        );
+        assert!(
+            text.contains("omega ETA_RUV ~ 2.500000e-1\n"),
+            "no standalone ETA_RUV omega seeded from the fit:\n{text}"
+        );
+
+        let ruv = eta_index(&m, "ETA_RUV");
+        assert_eq!(
+            m.residual_error_eta,
+            Some(ruv),
+            "iiv_on_ruv no longer binds ETA_RUV"
+        );
+        let om = &m.default_params.omega.matrix;
+        let (cl, v) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_V"));
+        assert_eq!(om[(cl, cl)], 0.11, "ETA_CL lost its fitted variance");
+        assert_eq!(om[(v, v)], 0.04, "ETA_V lost its declared variance");
+        for cov in ["ETA_WT_FREM", "ETA_AGE_FREM"] {
+            let c = eta_index(&m, cov);
+            assert_eq!(om[(ruv, c)], 0.0, "ETA_RUV × {cov} is not zero");
+            // The straddle: a PK eta still gets its covariate cross-term.
+            assert!(om[(cl, c)] > 0.0, "ETA_CL × {cov} lost its cross-term");
+            assert!(om[(v, c)] > 0.0, "ETA_V × {cov} lost its cross-term");
+        }
+        assert!(!m.default_params.omega_fixed[ruv]);
+
+        // A FIXed base ETA_RUV stays FIXed.
+        let fixed = IIV_ON_RUV_BASE.replace("ETA_RUV ~ 0.30", "ETA_RUV ~ 0.30 FIX");
+        let (text, m) = frem_convert_and_parse(&fixed, None);
+        assert!(
+            m.default_params.omega_fixed[eta_index(&m, "ETA_RUV")],
+            "FIX on the iiv_on_ruv omega was dropped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn generate_frem_model_keeps_a_correlated_iiv_on_ruv_eta_in_the_block() {
+        // A base model that correlates the iiv_on_ruv eta with a PK eta keeps
+        // that covariance — so it stays in the block — but covariates still get
+        // no cross-term on it (#904).
+        let base = IIV_ON_RUV_BASE
+            .replace(
+                "  omega ETA_CL  ~ 0.09\n  omega ETA_RUV ~ 0.30\n",
+                "  block_omega (ETA_CL, ETA_RUV) = [0.09, 0.01, 0.30]\n",
+            )
+            .to_string();
+        assert!(base.contains("block_omega (ETA_CL, ETA_RUV)"));
+        let (text, m) = frem_convert_and_parse(&base, None);
+
+        let block_line = text.lines().find(|l| l.contains("block_omega")).unwrap();
+        assert!(
+            block_line.contains("ETA_RUV"),
+            "correlated ETA_RUV left the block:\n{text}"
+        );
+        let om = &m.default_params.omega.matrix;
+        let (cl, ruv) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_RUV"));
+        assert_eq!(
+            om[(cl, ruv)],
+            0.01,
+            "ETA_CL × ETA_RUV covariance lost:\n{text}"
+        );
+        for cov in ["ETA_WT_FREM", "ETA_AGE_FREM"] {
+            let c = eta_index(&m, cov);
+            assert_eq!(om[(ruv, c)], 0.0, "ETA_RUV × {cov} is not zero:\n{text}");
+            assert!(om[(cl, c)] > 0.0, "ETA_CL × {cov} lost its cross-term");
+        }
+
+        // The block membership is structural: a covariance declared as exactly
+        // 0.0 inside the block, or fitted to exactly 0.0, is still a free
+        // parameter and must stay estimable in the FREM block.
+        let zero_init = base.replace("[0.09, 0.01, 0.30]", "[0.09, 0.0, 0.30]");
+        assert!(zero_init.contains("[0.09, 0.0, 0.30]"));
+        let zero_fit = FremFitInit {
+            theta: Vec::new(),
+            eta_names: vec!["ETA_CL".into(), "ETA_RUV".into()],
+            omega: DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.30]),
+        };
+        for (label, b, fi) in [
+            ("declared 0.0", zero_init.as_str(), None),
+            ("fitted 0.0", base.as_str(), Some(&zero_fit)),
+        ] {
+            let (text, m) = frem_convert_and_parse(b, fi);
+            let block_line = text.lines().find(|l| l.contains("block_omega")).unwrap();
+            assert!(
+                block_line.contains("ETA_RUV"),
+                "{label}: ETA_RUV left the block, dropping a free covariance:\n{text}"
+            );
+            let (cl, ruv) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_RUV"));
+            assert!(
+                m.default_params.omega.free_mask[(cl, ruv)],
+                "{label}: ETA_CL × ETA_RUV is no longer a free covariance:\n{text}"
+            );
+        }
     }
 
     #[test]
