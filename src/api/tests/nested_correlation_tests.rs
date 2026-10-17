@@ -754,9 +754,10 @@ fn the_reported_cwres_whiten_by_the_dense_r_tilde() {
     }
     eprintln!("worst |CWRES − dense| {worst:.3e}; smallest per-subject gap to diag {gap:.3e}");
     // The reported H comes from the fit's own Jacobian, this one from central
-    // differences: measured 1.669e-9 (macOS arm64), against a smallest per-subject gap of
-    // 0.543 to the diagonal-R CWRES. Both bounds are ~10× inside those.
-    assert!(worst < 2e-8, "reported CWRES vs dense: {worst}");
+    // differences: measured 3.294e-9 on Linux aarch64 (1.669e-9 on macOS arm64), against a
+    // smallest per-subject gap of 0.543 to the diagonal-R CWRES. 4e-8 is 12× above the
+    // agreement; 0.05 is 10× below the gap.
+    assert!(worst < 4e-8, "reported CWRES vs dense: {worst}");
     assert!(
         gap > 0.05,
         "a subject's CWRES are the diagonal-R ones: {gap}"
