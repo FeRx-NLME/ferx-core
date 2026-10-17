@@ -375,13 +375,13 @@ fn bloated_slot_closed_form_model_engages_dual2_stack_arrays() {
     // provider. A silent FD fallback would build no dual arrays and
     // reduce this to a duplicate of the ODE test above.
     assert!(
-        ferx_core::sens::provider::analytical_supported(&model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&model),
         "closed-form analytic path must be armed on the bloated-slot model; \
          otherwise this test degenerates to the FD-only case already covered \
          by the ODE variant"
     );
     assert!(
-        ferx_core::sens::provider::sens_supported(&model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&model),
         "sens_supported must be true so the fit dispatches through the analytic \
          outer-gradient path (which is what constructs the Dual2 stack arrays)"
     );
@@ -457,11 +457,11 @@ fn bloated_slot_filler_positions_dont_shift_analytic_fit() {
     let mut m_plain =
         parse_model_string(&model_src_closed_form_unbloated()).expect("unbloated model must parse");
     assert!(
-        ferx_core::sens::provider::analytical_supported(&m_bloat),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&m_bloat),
         "analytic path must be armed on the bloated model"
     );
     assert!(
-        ferx_core::sens::provider::analytical_supported(&m_plain),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&m_plain),
         "analytic path must be armed on the unbloated model too"
     );
 

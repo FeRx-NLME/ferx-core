@@ -6,6 +6,22 @@ pub(crate) fn analytical_model(gradient_method: GradientMethod) -> CompiledModel
     make_compiled_model(false, gradient_method)
 }
 
+/// A parsed one-compartment oral model, so it carries the compiled individual-parameter
+/// program the adjoint recorders read. [`analytical_model`]'s hand-built stub has none
+/// (`IndivParamPartials::empty()`), which the gradient routing reads as out of scope.
+pub(crate) fn parsed_analytical_model(gradient_method: GradientMethod) -> CompiledModel {
+    let mut m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_CL ~ 0.1\n  sigma ADD ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ additive(ADD)\n",
+    )
+    .expect("helper model parses");
+    m.gradient_method = gradient_method;
+    m
+}
+
 /// Build an ODE-backed model (`tv_fn = None`, `ode_spec = Some`).
 pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
     make_compiled_model(true, gradient_method)
@@ -655,40 +671,4 @@ pub(crate) fn param_time_straddle_subject(kind: ParamTimeStraddle) -> Subject {
     s.obs_cmts = vec![1; n];
     s.cens = vec![0; n];
     s
-}
-
-/// The straddle assertion shared by the #1969 parity tests: the prediction on the written clock
-/// must differ from the one on the engine clock by far more than any parity tolerance (1e-9 on
-/// the value), or the fixture cannot tell which clock the parameters read. The weakest fixture
-/// is `PkOnly` (9.1e-3: only dose 1's residual crosses the moved interval), so the bar is 1e-3.
-pub(crate) fn assert_param_time_straddle_is_live(
-    on_written: &[f64],
-    on_engine: &[f64],
-    what: &str,
-) {
-    assert_eq!(on_written.len(), on_engine.len());
-    let worst = on_written
-        .iter()
-        .zip(on_engine)
-        .map(|(a, b)| {
-            assert!(a.is_finite() && b.is_finite(), "{what}: {a} / {b}");
-            (a - b).abs() / a.abs().max(1e-12)
-        })
-        .fold(0.0, f64::max);
-    assert!(
-        worst > 1e-3,
-        "{what}: the written and the engine clock give the same predictions \
-         (worst rel {worst:.3e}), so the fixture cannot tell which clock the parameters read"
-    );
-}
-
-/// The same subject with every written time dropped, so each record reads the engine clock:
-/// the pre-#1969 behaviour, for a test that must show the straddle moves the prediction.
-pub(crate) fn on_engine_clock(subject: &Subject) -> Subject {
-    Subject {
-        obs_raw_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        ..subject.clone()
-    }
 }

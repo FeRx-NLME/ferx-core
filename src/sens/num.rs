@@ -73,6 +73,72 @@ pub trait PkNum:
     /// therefore inert on the prediction path and only ever fires on a dual instantiation
     /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
     fn jets_finite(self) -> bool;
+
+    /// `φ(self)` for a scalar function known through its value and first two derivatives
+    /// at `self.val()` (`v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`): the special functions the
+    /// likelihood needs (e.g. `log Φ` for M3 rows) and a residual variance as a function of
+    /// the prediction. Exact to second order on every dual and tape type.
+    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self;
+
+    /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
+    /// second-order jet over a differentiable base (`sens::rtape::DualH`): their
+    /// `φ″` factor needs its own derivative. The default drops `d3`, which is exact for
+    /// every type tracking fewer orders.
+    #[inline]
+    fn lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self {
+        self.lift2(v, d1, d2)
+    }
+
+    /// `u + h·(c₀k₀ + c₁k₁ + …)` with exactly this association (left-to-right sum,
+    /// then `h·`, then `u +`): an explicit RK stage combination. The default *is* that
+    /// expression, so `f64` and the forward duals keep their trajectories bit for bit.
+    /// The adjoint tape type (`sens::vtape::DualV`) overrides it to record one
+    /// node instead of `~3j` binary ones.
+    #[inline]
+    fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
+        let mut s = Self::from_f64(cs[0]) * ks[0];
+        for j in 1..cs.len() {
+            s = s + Self::from_f64(cs[j]) * ks[j];
+        }
+        u + Self::from_f64(h) * s
+    }
+
+    /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
+    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The reverse tape (`sens::rtape::R`)
+    /// overrides it to record one node instead of three per term.
+    #[inline]
+    fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
+        let mut s = Self::from_f64(base);
+        for (a, x, y) in terms {
+            s = s + a * x * y;
+        }
+        s
+    }
+
+    /// Tape position for [`Self::tape_rollback`]; `0` for types that record nothing.
+    #[inline]
+    fn tape_mark() -> usize {
+        0
+    }
+
+    /// Discard every record made after `mark` (a rejected ODE step attempt). No-op for
+    /// types that record nothing.
+    #[inline]
+    fn tape_rollback(_mark: usize) {}
+
+    /// LU factorisation hook for a taping type: `Some(ok)` when the type factored `m`
+    /// itself (it may leave `m` unfactored and keep its state behind `piv`), `None` to
+    /// run the generic elimination (`sens::linsolve`).
+    #[inline]
+    fn lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> Option<bool> {
+        None
+    }
+
+    /// Solve hook paired with [`Self::lu_factor_hook`]; `true` when handled.
+    #[inline]
+    fn lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool {
+        false
+    }
 }
 
 impl PkNum for f64 {
@@ -132,6 +198,10 @@ impl PkNum for f64 {
     #[inline]
     fn ln_gamma(self) -> Self {
         crate::stats::special::ln_gamma(self)
+    }
+    #[inline]
+    fn lift2(self, v: f64, _d1: f64, _d2: f64) -> Self {
+        v
     }
     #[inline]
     fn jets_finite(self) -> bool {
@@ -221,6 +291,10 @@ macro_rules! impl_pknum_delegate {
             fn jets_finite(self) -> bool {
                 $ty::jets_finite(self)
             }
+            #[inline]
+            fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+                $ty::lift2(self, v, d1, d2)
+            }
         }
     };
 }
@@ -282,8 +356,8 @@ pub(crate) mod vm {
     /// [`super::PkNum`] plus the VM's in-place arithmetic: the bound for code that runs
     /// the bytecode VM over a generic numeric type. Kept off `PkNum` itself so `PkNum`
     /// stays implementable outside the crate; every in-crate `PkNum` type has it.
-    pub trait VmNum: super::PkNum + VmArith {}
-    impl<T: super::PkNum + VmArith> VmNum for T {}
+    pub trait VmNum: super::PkNum + VmArith + 'static {}
+    impl<T: super::PkNum + VmArith + 'static> VmNum for T {}
 
     /// `VmArith` as the by-value operators, for types small enough that moving them
     /// costs nothing worth saving.
@@ -341,6 +415,126 @@ pub(crate) mod vm {
     impl_vm_by_value!(f64, |c: f64| c, |a: &f64, b: &f64| a.to_bits()
         == b.to_bits());
     impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, Dual1::<N>::same_bits, N);
+    /// By-value `VmArith` for a type whose operators and `from_f64` are its own.
+    macro_rules! vm_ops_body {
+        ($same:expr) => {
+            #[inline]
+            fn add_in(&mut self, rhs: &Self) {
+                *self = *self + *rhs;
+            }
+            #[inline]
+            fn sub_in(&mut self, rhs: &Self) {
+                *self = *self - *rhs;
+            }
+            #[inline]
+            fn rsub_in(&mut self, rhs: &Self) {
+                *self = *rhs - *self;
+            }
+            #[inline]
+            fn mul_in(&mut self, rhs: &Self) {
+                *self = *self * *rhs;
+            }
+            #[inline]
+            fn div_in(&mut self, rhs: &Self) {
+                *self = *self / *rhs;
+            }
+            #[inline]
+            fn add_scalar_in(&mut self, c: f64) {
+                *self = *self + <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn sub_scalar_in(&mut self, c: f64) {
+                *self = *self - <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn rsub_scalar_in(&mut self, c: f64) {
+                *self = <Self as super::PkNum>::from_f64(c) - *self;
+            }
+            #[inline]
+            fn mul_scalar_in(&mut self, c: f64) {
+                *self = *self * <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn div_scalar_in(&mut self, c: f64) {
+                *self = *self / <Self as super::PkNum>::from_f64(c);
+            }
+            #[inline]
+            fn same_bits(&self, other: &Self) -> bool {
+                ($same)(self, other)
+            }
+        };
+    }
+
+    /// The scalar reverse tape: the same value *and* the same tape node.
+    impl VmArith for crate::sens::rtape::R {
+        vm_ops_body!(
+            |a: &crate::sens::rtape::R, b: &crate::sens::rtape::R| a.v.to_bits() == b.v.to_bits()
+                && a.i == b.i
+        );
+    }
+
+    impl<const N: usize, B: VmNum> VmArith for crate::sens::rtape::DualT<N, B> {
+        vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
+            && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y)));
+    }
+
+    impl<const N: usize, const M: usize, B: VmNum, const D: bool> VmArith
+        for crate::sens::rtape::DualH<N, M, B, D>
+    {
+        vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
+            && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y))
+            && a.h.iter().zip(&b.h).all(|(x, y)| x.same_bits(y)));
+    }
+
+    /// Both tape modes of [`crate::sens::vtape::DualV`] (the macro takes `usize` consts only).
+    impl<const N: usize, const M: usize, const TH: bool> VmArith
+        for crate::sens::vtape::DualV<N, M, TH>
+    {
+        #[inline]
+        fn add_in(&mut self, rhs: &Self) {
+            *self = *self + *rhs;
+        }
+        #[inline]
+        fn sub_in(&mut self, rhs: &Self) {
+            *self = *self - *rhs;
+        }
+        #[inline]
+        fn rsub_in(&mut self, rhs: &Self) {
+            *self = *rhs - *self;
+        }
+        #[inline]
+        fn mul_in(&mut self, rhs: &Self) {
+            *self = *self * *rhs;
+        }
+        #[inline]
+        fn div_in(&mut self, rhs: &Self) {
+            *self = *self / *rhs;
+        }
+        #[inline]
+        fn add_scalar_in(&mut self, c: f64) {
+            *self = *self + Self::constant(c);
+        }
+        #[inline]
+        fn sub_scalar_in(&mut self, c: f64) {
+            *self = *self - Self::constant(c);
+        }
+        #[inline]
+        fn rsub_scalar_in(&mut self, c: f64) {
+            *self = Self::constant(c) - *self;
+        }
+        #[inline]
+        fn mul_scalar_in(&mut self, c: f64) {
+            *self = *self * Self::constant(c);
+        }
+        #[inline]
+        fn div_scalar_in(&mut self, c: f64) {
+            *self = *self / Self::constant(c);
+        }
+        #[inline]
+        fn same_bits(&self, other: &Self) -> bool {
+            crate::sens::vtape::DualV::same_bits(self, other)
+        }
+    }
 
     impl<const NA: usize, const N: usize> VmArith for DualMixed<NA, N> {
         #[inline]

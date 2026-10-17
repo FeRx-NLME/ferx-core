@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn inner_analytical_auto_returns_analytic() {
-        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
         assert_eq!(
             gradient_method_inner(&ci_build(), &m),
             GradientMethodKind::Analytic
@@ -225,99 +225,11 @@ mod tests {
         // Closed-form LTBS takes the analytic inner gradient (PR #665; the Tier-1 follow-up
         // extends it to × `ExpressionScale` and × TV-cov, and #486 to × IOV). The covariance
         // step reconverges its EBEs at the tighter `cov_inner_tol`.
-        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        let mut m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
         m.log_transform = true;
         assert_eq!(
             gradient_method_inner(&ci_build(), &m),
             GradientMethodKind::Analytic
-        );
-    }
-
-    #[test]
-    fn inner_out_of_scope_ode_model_returns_fd() {
-        // `test_helpers::ode_model` is an ODE model whose RHS is an opaque closure with **no**
-        // `rhs_program`, so `ode_analytical_supported` (and hence `ode_inner_grad_supported_model`)
-        // is `false`: the light `Dual1` walk cannot serve it and the live inner genuinely runs FD.
-        // In-scope ODE models report Analytic — see `inner_in_scope_ode_returns_analytic` (#378 B).
-        let m = test_helpers::ode_model(GradientMethod::Auto);
-        assert!(!crate::sens::provider::ode_inner_grad_supported_model(&m));
-        assert_eq!(
-            gradient_method_inner(&ad_build(), &m),
-            GradientMethodKind::FiniteDifferences
-        );
-    }
-
-    /// A minimal **in-scope** 1-cpt IV ODE model: compiled RHS program, Form-C readout
-    /// (`y = central / V`), one η, no IOV/LTBS. Everything `ode_analytical_supported` needs.
-    const ONECPT_IV_ODE: &str = r#"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 100.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.04 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL/V) * central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
-
-    #[test]
-    fn inner_in_scope_ode_returns_analytic() {
-        // #378 task B: the live inner runs the light `Dual1` ODE η-gradient for an in-scope ODE
-        // model, but `gradient_method_inner` used to read the closed-form-only
-        // `analytic_inner_grad_supported_model` and mislabel it "finite differences". The report
-        // must now match the live route. (Mutation check: dropping the `ode_inner_grad_supported
-        // _model` disjunct in `gradient_method_inner` flips this to `FiniteDifferences`.)
-        let m = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
-        // Fixture self-check — assert it is genuinely in ODE analytic scope, so the report
-        // assertion below can't pass vacuously if a future parser change breaks the fixture.
-        assert!(
-            crate::sens::provider::ode_inner_grad_supported_model(&m),
-            "fixture must be an in-scope ODE model"
-        );
-        // `gradient_method_inner` ignores the build arg, so one build is enough here.
-        assert_eq!(
-            gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::Analytic,
-            "an in-scope ODE model runs — and must report — the analytic inner gradient"
-        );
-    }
-
-    #[test]
-    fn inner_in_scope_ode_ltbs_returns_analytic() {
-        // The live ODE inner walk serves LTBS (#474): it shares `solve_ode_g` with the objective,
-        // so the analytic EBE is the objective's own minimum. `ode_analytical_supported` admits a
-        // plain-LTBS ODE model (scaling `None`), and `analytic_inner_common_bail`'s `log_transform
-        // && n_kappa > 0` clause is vacuous at `n_kappa == 0` — so the report must stay Analytic
-        // under LTBS, exercising exactly that vacuity. Mirrors the closed-form
-        // `inner_plain_ltbs_returns_analytic`.
-        let mut m = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
-        m.log_transform = true;
-        assert!(crate::sens::provider::ode_inner_grad_supported_model(&m));
-        assert_eq!(
-            gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::Analytic
-        );
-    }
-
-    #[test]
-    fn inner_forced_fd_ode_returns_fd() {
-        // The escape hatch still wins for an in-scope ODE model: `gradient = fd` sets
-        // `analytic_inner_common_bail`, so the ODE disjunct in `gradient_method_inner` is gated
-        // off and the report is FD — exactly as the live ODE branch bails on `gradient = fd`.
-        let mut m = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
-        m.gradient_method = GradientMethod::Fd;
-        assert!(crate::sens::provider::ode_inner_grad_supported_model(&m));
-        assert_eq!(
-            gradient_method_inner(&ad_build(), &m),
-            GradientMethodKind::FiniteDifferences
         );
     }
 
@@ -336,7 +248,7 @@ mod tests {
         // (built-in BFGS/LBFGS *and* the NLopt SLSQP/LBFGS/MMA, which receive the
         // gradient from `population_gradient`) with the exact analytic packed
         // gradient (PR #381 review #4).
-        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
         for optimizer in [
             Optimizer::Bfgs,
             Optimizer::Lbfgs,

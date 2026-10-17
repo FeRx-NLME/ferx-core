@@ -3802,42 +3802,6 @@ fn collect_dose_break_times<'a>(
     push_zero_order_break_times(break_times, &zo_windows);
 }
 
-/// Every timeline break the subject's pre-scheduled doses contribute under the per-dose PK
-/// snapshots `pk_for_dose(k)`, in the deterministic per-dose order
-/// [`collect_dose_break_times`] pushes them — **unsorted and undeduplicated**, so two calls
-/// at nearby parameter points can be compared entry by entry.
-///
-/// This is the moving-event enumerator behind the covariance step's kink bound (#1505):
-/// every entry that depends on an estimated quantity — a lagged arrival `t + ALAG`, an
-/// infusion end `t + ALAG + F·dur`, a per-route onset `t + ALAG + lag_route`, a
-/// `zero_order` window edge — moves when that parameter is perturbed, and an entry that does
-/// not (a dose record time under `SS`, an unlagged arrival) comes back bit-identical, so the
-/// caller finds the moving ones by differencing the two lists rather than by re-spelling
-/// which break depends on what. Reusing the engines' own builder is what keeps the bound
-/// honest: a new kind of moving break added there is seen here without a second edit.
-///
-/// Modeled-`RATE` doses (`RATE=-1/-2`) are read as coded — the covariance scope declines
-/// them before this runs (`ode_analytical_supported`'s `all_doses_fixed` gate), and a
-/// caller that admits them must resolve the doses first
-/// ([`crate::dosing::resolve_subject_doses`]).
-pub(crate) fn dose_break_times_per_dose<'a>(
-    ode: &OdeSpec,
-    subject: &Subject,
-    pk_for_dose: impl Fn(usize) -> &'a [f64] + Copy,
-) -> Vec<f64> {
-    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs_with(subject, ode, pk_for_dose);
-    let mut out = Vec::with_capacity(2 * subject.doses.len());
-    collect_dose_break_times(
-        &mut out,
-        ode,
-        subject,
-        &dose_lagtimes,
-        &dose_f_bio,
-        pk_for_dose,
-    );
-    out
-}
-
 /// Re-seed the state `u` for every pre-scheduled **steady-state** dose landing at
 /// `t_start`: the SS+lagtime tail seed at the record time, then SS equilibration at the
 /// lag-shifted arrival. Both overwrite `u` (they represent "the state the patient is in",

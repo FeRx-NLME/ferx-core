@@ -12,7 +12,7 @@ fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
         "TVCL * exp(ETA_CL)"
     };
     let model = parse_model_string(&format!(
-        "[parameters]\n theta TVCL(5, 0.1, 50)\n theta TVV(50, 5, 500)\n omega ETA_CL ~ 0.04\n {kappa}\n sigma PROP ~ 0.01\n[individual_parameters]\n CL = {cl}\n V = TVV\n F = 0.7\n[structural_model]\n pk one_cpt_iv(cl=CL, v=V, f=F)\n[error_model]\n DV ~ proportional(PROP)"
+        "[parameters]\n theta TVCL(5, 0.1, 50)\n theta TVV(50, 5, 500)\n omega ETA_CL ~ 0.04\n {kappa}\n sigma PROP ~ 0.01\n[individual_parameters]\n CL = {cl}\n V = TVV\n F = 0.7\n ALAG = 0.3\n[structural_model]\n pk one_cpt_iv(cl=CL, v=V, f=F, lagtime=ALAG)\n[error_model]\n DV ~ proportional(PROP)"
     )).unwrap();
     let mut pop = make_population(3);
     for (i, s) in pop.subjects.iter_mut().enumerate() {
@@ -30,9 +30,15 @@ fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
         }
     }
     if mixed_fallback {
-        // The analytic provider deliberately declines rate-defined infusion
-        // under F: F reshapes its duration. Other subjects remain analytic.
-        pop.subjects[0].doses[0] = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0);
+        // One subject the adjoint declines while the others stay exact: per-record
+        // covariate snapshots (constant, so predictions are unchanged) route it to the
+        // event walk, which declines an SS infusion under a lag time
+        // (`ss_lagtime_walk_unsupported`).
+        let s0 = &mut pop.subjects[0];
+        s0.doses[0] = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 24.0);
+        let snap: std::collections::HashMap<String, f64> = [("WT".to_string(), 70.0)].into();
+        s0.dose_covariates = vec![snap.clone(); s0.doses.len()];
+        s0.obs_covariates = vec![snap; s0.obs_times.len()];
     }
     (model, pop)
 }
@@ -249,8 +255,24 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &bounds,
                             &opts,
                         ),
-                        _ => held_ebe_salvage(
-                            &x, params, &model, &pop, i, &etas[i], &hms[i], &bounds, &opts,
+                        // The production dispatch: reconverged for a structural decline
+                        // (#1536), held-EBE otherwise.
+                        _ => non_iov_declined_salvage(
+                            is_structural_decline(
+                                &model,
+                                &pop.subjects[i],
+                                params,
+                                etas[i].as_slice(),
+                            ),
+                            &x,
+                            params,
+                            &model,
+                            &pop,
+                            i,
+                            &etas[i],
+                            &hms[i],
+                            &bounds,
+                            &opts,
                         ),
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {

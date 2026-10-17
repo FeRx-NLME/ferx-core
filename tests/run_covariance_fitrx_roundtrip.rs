@@ -40,28 +40,50 @@ use ferx_core::{
 /// Rows whose premise must hold, out of `ROWS` (module doc).
 const MIN_DISCRIMINATING: usize = 2;
 
-const ROWS: [(&str, &str, EstimationMethod); 4] = [
+/// `(model, data, method, analytic R-matrix)`. Since #486 every fixture's inline covariance
+/// is the exact `Uᵀ∇²Ψ U`, a smooth function of the packed vector, so a last-bit change in
+/// the re-decomposed Ω factor usually leaves its bits alone — the analytic rows alone
+/// left one discriminating row on Linux x86_64. The two finite-difference rows
+/// (`analytic_cov_hessian = false`) amplify that change by the stencil's `ε/h²`, so they
+/// discriminate by construction; the claim is asserted on every row either way.
+const ROWS: [(&str, &str, EstimationMethod, bool); 6] = [
     (
         "examples/warfarin.ferx",
         "data/warfarin.csv",
         EstimationMethod::Foce,
+        true,
     ),
     (
         "examples/two_cpt_oral_cov.ferx",
         "data/two_cpt_oral_cov.csv",
         EstimationMethod::FoceI,
+        true,
     ),
     // Review r1 #3: the docs' Laplace claim.
     (
         "examples/warfarin.ferx",
         "data/warfarin.csv",
         EstimationMethod::Laplace,
+        true,
     ),
     // The issue's "done when" fixture.
     (
         "examples/warfarin_iov.ferx",
         "data/warfarin_iov.csv",
         EstimationMethod::FoceI,
+        true,
+    ),
+    (
+        "examples/warfarin.ferx",
+        "data/warfarin.csv",
+        EstimationMethod::Foce,
+        false,
+    ),
+    (
+        "examples/two_cpt_oral_cov.ferx",
+        "data/two_cpt_oral_cov.csv",
+        EstimationMethod::FoceI,
+        false,
     ),
 ];
 
@@ -69,10 +91,17 @@ struct Fitted {
     model: CompiledModel,
     population: Population,
     fit: FitResult,
+    analytic_cov: bool,
 }
 
 /// `row` labels every panic: two rows share `model_path` (warfarin FOCE and Laplace).
-fn fit_inline(row: &str, model_path: &str, data_path: &str, method: EstimationMethod) -> Fitted {
+fn fit_inline(
+    row: &str,
+    model_path: &str,
+    data_path: &str,
+    method: EstimationMethod,
+    analytic_cov: bool,
+) -> Fitted {
     let prep =
         prepare_run(model_path, Some(data_path)).unwrap_or_else(|e| panic!("{row}: prepare: {e}"));
     let (model, population, init) = (prep.parsed.model, prep.population, prep.init_params);
@@ -81,6 +110,7 @@ fn fit_inline(row: &str, model_path: &str, data_path: &str, method: EstimationMe
         method,
         interaction: method != EstimationMethod::Foce,
         run_covariance_step: true,
+        analytic_cov_hessian: analytic_cov,
         sir: false,
         ..FitOptions::default()
     };
@@ -99,6 +129,7 @@ fn fit_inline(row: &str, model_path: &str, data_path: &str, method: EstimationMe
         model,
         population,
         fit,
+        analytic_cov,
     }
 }
 
@@ -119,6 +150,7 @@ fn reload(f: &Fitted) -> FitResult {
 fn covariance_bits(f: &Fitted, fit: &FitResult, what: &str) -> (Vec<u64>, Vec<u64>) {
     let options = FitOptions {
         verbose: false,
+        analytic_cov_hessian: f.analytic_cov,
         ..FitOptions::default()
     };
     let out = run_covariance(fit, Some(&f.model), Some(&f.population), &options)
@@ -163,8 +195,9 @@ fn roundtrip_row(
     model_path: &str,
     data_path: &str,
     method: EstimationMethod,
+    analytic_cov: bool,
 ) -> Option<f64> {
-    let f = fit_inline(row, model_path, data_path, method);
+    let f = fit_inline(row, model_path, data_path, method, analytic_cov);
     let inline = bits_of(&f.fit, &format!("{row} inline"));
     let reloaded = reload(&f);
     assert_eq!(
@@ -192,9 +225,10 @@ fn roundtrip_row(
 fn reload_repeats_inline_covariance() {
     let mut discriminating = Vec::new();
     let mut identical = Vec::new();
-    for (model_path, data_path, method) in ROWS {
-        let row = format!("{model_path} {method:?}");
-        match roundtrip_row(&row, model_path, data_path, method) {
+    for (model_path, data_path, method, analytic_cov) in ROWS {
+        let cov = if analytic_cov { "analytic R" } else { "FD R" };
+        let row = format!("{model_path} {method:?} ({cov})");
+        match roundtrip_row(&row, model_path, data_path, method, analytic_cov) {
             Some(gap) => {
                 eprintln!("premise {row}: max |legacy - inline| = {gap:e}");
                 discriminating.push(row);

@@ -424,6 +424,36 @@ pub fn trigamma(x: f64) -> f64 {
     2.0 / t - (y + 0.5) / (t * t) + dda / a - a_ratio * a_ratio
 }
 
+/// Tetragamma ψ″(x) = d³/dx³ ln Γ(x) — the exact derivative of [`trigamma`]'s Lanczos
+/// form, so the three stay mutually consistent; the third-order rule for `ln Γ` on the
+/// taped-Hessian vector tape. Reflection: ψ″(x) = ψ″(1 − x) − 2π³·cos(πx)/sin³(πx) for
+/// x < 0.5.
+pub(crate) fn tetragamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        let s = (pi * x).sin();
+        return tetragamma(1.0 - x) - 2.0 * pi * pi * pi * (pi * x).cos() / (s * s * s);
+    }
+
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    let mut dda = 0.0;
+    let mut ddda = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+        dda += 2.0 * c / (d * d * d);
+        ddda -= 6.0 * c / (d * d * d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    let r = da / a;
+    -3.0 / (t * t) + 2.0 * (y + 0.5) / (t * t * t) + ddda / a
+        - dda * da / (a * a)
+        - 2.0 * r * (dda / a - r * r)
+}
+
 /// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
 /// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
 /// `x ≥ 0` (returns `0` for `x ≤ 0`).
@@ -869,6 +899,21 @@ mod tests {
         assert_relative_eq!(trigamma(1.0), pi * pi / 6.0, max_relative = 1e-9);
         assert_relative_eq!(trigamma(2.0), pi * pi / 6.0 - 1.0, max_relative = 1e-9);
         assert_relative_eq!(trigamma(0.5), pi * pi / 2.0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn tetragamma_matches_fd_of_trigamma_incl_reflection() {
+        for &x in &[0.2, 0.45, 0.7, 1.0, 2.5, 7.0, 31.0] {
+            let h = 1e-5 * (1.0 + x);
+            let fd = (trigamma(x + h) - trigamma(x - h)) / (2.0 * h);
+            let t = tetragamma(x);
+            assert!(
+                (t - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+                "x = {x}: tetragamma {t} vs FD {fd}"
+            );
+        }
+        // Known value: ψ″(1) = −2ζ(3).
+        assert!((tetragamma(1.0) + 2.0 * 1.202_056_903_159_594_2).abs() < 1e-9);
     }
 
     #[test]

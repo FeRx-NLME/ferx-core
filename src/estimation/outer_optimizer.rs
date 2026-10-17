@@ -2488,7 +2488,7 @@ fn per_subject_outer_gradients(
     {
         return None;
     }
-    let iov = crate::sens::provider::iov_sens_supported(model);
+    let iov = model.n_kappa > 0;
     population
         .subjects
         .par_iter()
@@ -4942,7 +4942,8 @@ fn optimize_bfgs(
     // objective), so it engages for both FOCE and FOCEI on analytical models;
     // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
     // unavailable it degrades to plain warm-start from prior η̂.
-    let use_predictor = crate::sens::provider::sens_supported(model)
+    let use_predictor = model.n_kappa == 0
+        && crate::sens::ode_provider::adjoint::model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -5509,45 +5510,28 @@ fn subject_fixed_ebe_gradient(
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
-/// One cause today: a residual covariance correlated across observation rows (a paired
-/// `block_sigma`, or a `correlation` line) on a subject the dense assembly cannot serve.
-/// The scalar assembly serves only a diagonal residual covariance (`corr_residual_diag`
-/// declines on this same predicate), and the pairing depends on the data alone, so such
-/// a subject declines at every evaluation. For it the held-EBE gradient is not an
-/// occasional stand-in but the **only** gradient it ever contributes, and its missing
-/// EBE-response term then biases every step: on `fluconazole_radboudumc`, where all 31
-/// subjects have paired total/unbound rows, L-BFGS stalled at `‖g‖ ≈ 655` and OFV
-/// 807.88–810.28, against 738.05 with the reconverged gradient (NONMEM: 734.64).
-///
-/// Since #1960 FOCEI and FOCE serve those subjects with the exact dense assembly
-/// (`sens_outer_gradient_dense`) whenever [`dense_outer_supported`] holds, so for them a
-/// decline is parameter-dependent (a non-PD `R`, `R̃`, `H̃` or inner Hessian at a blown-up
-/// trial) and takes the same held-EBE salvage as any other. Two cases stay structural:
-/// a model the dense assembly excludes, and a subject the sensitivity provider itself
-/// cannot serve (`subject_sensitivities` is `None` — e.g. a rate-defined infusion under
-/// `F ≠ 1`, #419). The provider's subject gates are scope, not numerics, so its `None`
+/// For such a subject the held-EBE gradient would not be an occasional stand-in but the
+/// **only** gradient it ever contributes, and its missing EBE-response term then biases
+/// every step (on `fluconazole_radboudumc`, before the dense assembly served its paired
+/// rows, L-BFGS stalled at `‖g‖ ≈ 655`, OFV 807.88–810.28 against 738.05; NONMEM 734.64).
+/// The adjoint's kernel scores dense residual covariances itself, so the one structural
+/// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-///
-/// [`dense_outer_supported`]: crate::estimation::sens_outer_gradient::dense_outer_supported
 fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
     init_params: &ModelParameters,
     eta_hat: &[f64],
 ) -> bool {
-    crate::stats::residual_error::has_cross_observation_residual(
-        &model.error_spec,
+    // A subject no recorder can serve declines at every evaluation, as a model-level
+    // exclusion does; any other decline is numerical (a non-PD factor at a trial point).
+    crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        model,
         subject,
-        &init_params.sigma.values,
-        model.residual_cov_at(init_params),
-    ) && (!crate::estimation::sens_outer_gradient::dense_outer_supported(model)
-        || crate::sens::provider::subject_sensitivities(
-            model,
-            subject,
-            &init_params.theta,
-            eta_hat,
-        )
-        .is_none())
+        &init_params.theta,
+        eta_hat,
+    )
+    .is_none()
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed`]:
@@ -6770,7 +6754,7 @@ fn population_gradient_with_agq_evaluation(
     // Covers both the closed-form analytical IOV provider and the ODE IOV provider
     // (RHS-program models); both produce the stacked-η / block-Ω assembly the IOV
     // gradient entry points consume (#439 ODE IOV).
-    let iov_analytic = crate::sens::provider::iov_sens_supported(model);
+    let iov_analytic = model.n_kappa > 0;
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.

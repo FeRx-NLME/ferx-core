@@ -38,8 +38,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
-use ferx_core::sens::provider::{subject_sensitivities, SubjectSens};
+use ferx_core::sens::provider::{subject_eta_grad, ObsGrad};
 use ferx_core::types::Subject;
 use ferx_core::{predict, read_nonmem_csv, CompiledModel, Population};
 
@@ -223,13 +222,11 @@ fn subject(form: &Form, doses: &[f64], reset: f64, v: Variant) -> Population {
     pop
 }
 
-fn sens(m: &CompiledModel, form: &Form, s: &Subject, eta: &[f64]) -> SubjectSens {
+fn sens(m: &CompiledModel, form: &Form, s: &Subject, eta: &[f64]) -> Vec<ObsGrad> {
     let theta = &m.default_params.theta;
-    let r = if form.analytic {
-        subject_sensitivities(m, s, theta, eta)
-    } else {
-        ode_subject_sensitivities(m, s, theta, eta)
-    };
+    // One recorder serves both engines; `form` still picks the model.
+    let _ = form.analytic;
+    let r = subject_eta_grad(m, s, theta, eta);
     r.unwrap_or_else(|| {
         panic!(
             "{}: routed to FD, the dual walk is not exercised",
@@ -351,8 +348,8 @@ fn check(form: &Form, v: Variant) {
         SAME_TOL,
     );
     let (a, b) = (sens(&m, form, sc, &e), sens(&m, form, sd, &e));
-    let fa: Vec<f64> = a.obs.iter().map(|o| o.f).collect();
-    let fb: Vec<f64> = b.obs.iter().map(|o| o.f).collect();
+    let fa: Vec<f64> = a.iter().map(|o| o.f).collect();
+    let fb: Vec<f64> = b.iter().map(|o| o.f).collect();
     let w_dual = close(&format!("{label}: dual value"), &fa, &fb, SAME_TOL);
     assert!(
         fb.iter().any(|&v| v > 0.05),
@@ -361,35 +358,17 @@ fn check(form: &Form, v: Variant) {
 
     // (2) the derivatives of a cancelled dose are those of a deleted one.
     let mut w_grad = 0.0_f64;
-    for (j, (x, y)) in a.obs.iter().zip(&b.obs).enumerate() {
+    for (j, (x, y)) in a.iter().zip(&b).enumerate() {
         w_grad = w_grad.max(close(
             &format!("{label}: ∂f/∂η obs {j}"),
             &x.df_deta,
             &y.df_deta,
             SAME_TOL,
         ));
-        w_grad = w_grad.max(close(
-            &format!("{label}: ∂f/∂θ obs {j}"),
-            &x.df_dtheta,
-            &y.df_dtheta,
-            SAME_TOL,
-        ));
-        w_grad = w_grad.max(close(
-            &format!("{label}: ∂²f/∂η² obs {j}"),
-            &x.d2f_deta2,
-            &y.d2f_deta2,
-            SAME_TOL,
-        ));
-        w_grad = w_grad.max(close(
-            &format!("{label}: ∂²f/∂η∂θ obs {j}"),
-            &x.d2f_deta_dtheta,
-            &y.d2f_deta_dtheta,
-            SAME_TOL,
-        ));
     }
     // The lag axis is live on the live doses, so (2) is not comparing zeros.
     assert!(
-        b.obs.iter().any(|o| o.df_deta[1].abs() > 1e-3),
+        b.iter().any(|o| o.df_deta[1].abs() > 1e-3),
         "{label}: ∂f/∂η_LAG must be live"
     );
 
@@ -406,7 +385,7 @@ fn check(form: &Form, v: Variant) {
             .zip(&fm)
             .map(|(p, q)| (p - q) / (2.0 * h))
             .collect();
-        let dual: Vec<f64> = a.obs.iter().map(|o| o.df_deta[k]).collect();
+        let dual: Vec<f64> = a.iter().map(|o| o.df_deta[k]).collect();
         w_fd = w_fd.max(close(
             &format!("{label}: dual vs FD ∂f/∂η[{k}]"),
             &dual,

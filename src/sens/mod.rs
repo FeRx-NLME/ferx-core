@@ -15,10 +15,10 @@
 //!     dual number — the general path, used for lagtime / oral-infusion / `F`-on-IV
 //!     and any dose the explicit kernels don't cover.
 
-pub(crate) mod algebraic;
 pub mod dual1;
 pub mod dual2;
 pub mod dual_mixed;
+pub(crate) mod focei_kernel;
 pub mod jet;
 pub(crate) mod linsolve;
 pub mod num;
@@ -27,8 +27,9 @@ pub mod one_cpt;
 pub mod one_cpt_explicit;
 pub mod propagate;
 pub mod provider;
+pub(crate) mod rtape;
 pub mod three_cpt;
 pub mod three_cpt_explicit;
 pub mod two_cpt;
 pub mod two_cpt_explicit;
-pub(crate) mod widths;
+pub(crate) mod vtape;

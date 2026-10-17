@@ -2446,10 +2446,10 @@ pub(crate) fn with_solver_stats<T>(
 /// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
 /// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
 /// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
-/// for. When the model has an analytic **outer** gradient the sweep runs the second-order
-/// [`crate::sens::provider::subject_sensitivities`] (`Dual2`, gradient *and* Hessian), which
-/// is what FOCEI differentiates; when only the inner loop is analytic it runs the light
-/// first-order [`crate::sens::provider::subject_eta_grad`], which is all that fit computes.
+/// for. When the model has an analytic **outer** gradient the sweep runs the unified
+/// recorder's second-order η-jets (`adjoint::exact_inner_hessian`), which is what FOCEI
+/// differentiates; when only the inner loop is analytic it runs the first-order
+/// `adjoint::exact_obs_grads`, which is all that fit computes.
 ///
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
 /// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
@@ -2469,7 +2469,8 @@ pub(crate) fn sweep_sensitivity_solver_stats(
     mixest: Option<&[usize]>,
 ) -> crate::ode::solver::OdeSolverStats {
     let mut merged = crate::ode::solver::OdeSolverStats::default();
-    if !crate::sens::provider::ode_inner_grad_supported_model(model)
+    if model.ode_spec.is_none()
+        || !crate::sens::ode_provider::adjoint::recorder_in_scope(model)
         || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
     {
         return merged;
@@ -2492,9 +2493,12 @@ pub(crate) fn sweep_sensitivity_solver_stats(
                 .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
             let (theta, eta) = (&params.theta, eta.as_slice());
             if second_order {
-                let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+                let _ = crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                    model, subject, params, eta,
+                );
             } else {
-                let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+                let _ =
+                    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta);
             }
             stats_scope.collected()
         })

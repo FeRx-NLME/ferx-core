@@ -19,14 +19,15 @@ use ferx_core::types::{
 };
 use std::path::Path;
 
-/// Warfarin with a bioavailability `F < 1`.
+/// Warfarin with a bioavailability `F < 1` and a lag time.
 ///
-/// Under `F ≠ 1` a **rate-defined** (`RATE > 0`) infusion reshapes the dosing window —
-/// the rate is held and the window scaled to `F·dur` — which the closed-form walk cannot
-/// express, so `subject_sensitivities` declines any subject carrying one (#419). Every
+/// A **steady-state infusion** into the depot routes its subject to the closed-form event
+/// walk (an oral infusion), and the walk declines an SS infusion under a lag time
+/// (`ss_lagtime_walk_unsupported`), so the adjoint declines any subject carrying one. Every
 /// bolus-dosed subject is unaffected, and the model as a whole stays inside the analytic
 /// outer scope. That combination is exactly the shape this warning exists for: valid data,
-/// a model the report calls analytic, and one subject that quietly runs FD.
+/// a model the report calls analytic, and one subject that quietly runs FD. (Until #486 the
+/// fixture was a rate-defined infusion under `F`, which the adjoint now serves.)
 const WARFARIN_F: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -45,9 +46,10 @@ const WARFARIN_F: &str = r#"
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
   F  = TVF
+  ALAG = 0.5
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -79,9 +81,10 @@ const MIXTURE_F: &str = r#"
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
   F  = TVF
+  ALAG = 0.5
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -97,12 +100,12 @@ fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
         .find(|w| w.contains("could not be given the exact analytic outer gradient"))
 }
 
-/// The same population with subject 0's bolus replaced by a rate-defined infusion — the
-/// dose shape the provider declines under `F ≠ 1`. Replaced rather than added: the point
-/// is a data *shape* the provider declines, not a different amount of drug.
+/// The same population with subject 0's bolus replaced by a steady-state infusion — the
+/// dose shape the adjoint declines under a lag time. Replaced rather than added: the point
+/// is a data *shape* the adjoint declines, not a different amount of drug.
 fn make_subject_0_decline(population: &mut Population) -> String {
     let declining = &mut population.subjects[0];
-    let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
+    let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
     dose.rate_mode = RateMode::Fixed;
     declining.doses = vec![dose];
     declining.id.clone()
@@ -152,8 +155,8 @@ fn in_scope_population_emits_no_outer_fd_warning() {
     );
 }
 
-/// One subject whose dose is a rate-defined infusion falls out of the closed-form
-/// provider's scope under `F ≠ 1`. The fit still reports the model-level `analytic (Dual2)`
+/// One subject whose dose is a steady-state infusion falls out of the adjoint's scope
+/// under the model's lag time. The fit still reports the model-level `analytic (Dual2)`
 /// route — correctly, for the model — and the warning is what reconciles that with what
 /// the subject actually ran.
 #[test]

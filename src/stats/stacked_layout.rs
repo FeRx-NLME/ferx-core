@@ -144,11 +144,6 @@ impl StackedLayout {
         kappa_range(self.n_eta, self.n_kappa, g)
     }
 
-    /// Group `g`'s κ block, sliced from `stacked`.
-    pub(crate) fn kappa<'a>(&self, stacked: &'a [f64], g: usize) -> &'a [f64] {
-        &stacked[self.kappa_range(g)]
-    }
-
     /// The κ tail of `stacked` cut into `n_kappa`-wide blocks, tolerating a vector whose
     /// width does not match this subject (the last block is then short, or there is none).
     /// For the route decisions that must not panic on a malformed vector; a caller that

@@ -140,6 +140,46 @@ impl Activation {
         }
     }
 
+    /// [`Self::apply`] on any number type: the same branches on the value, so the value
+    /// is bit-identical and the derivatives are those of the branch taken.
+    pub(crate) fn apply_g<T: crate::sens::num::PkNum>(self, x: T) -> T {
+        let v = x.val();
+        let one = T::from_f64(1.0);
+        match self {
+            Activation::Identity => x,
+            Activation::Relu => {
+                if v > 0.0 {
+                    x
+                } else {
+                    T::from_f64(0.0)
+                }
+            }
+            Activation::Softplus => {
+                if v > 20.0 {
+                    x
+                } else if v < -20.0 {
+                    x.exp()
+                } else {
+                    (one + x.exp()).ln()
+                }
+            }
+            Activation::Tanh => {
+                let t = v.tanh();
+                let d1 = 1.0 - t * t;
+                x.lift3(t, d1, -2.0 * t * d1, -2.0 * d1 * (1.0 - 3.0 * t * t))
+            }
+            Activation::Sigmoid => {
+                if v >= 0.0 {
+                    one / (one + (-x).exp())
+                } else {
+                    let ex = x.exp();
+                    ex / (one + ex)
+                }
+            }
+            Activation::Exp => x.exp(),
+        }
+    }
+
     /// Solve `f(z) = y` for `z`, or `None` when `y` lies outside the
     /// activation's range.
     ///
@@ -747,6 +787,35 @@ impl MlpMapper {
         &weights[bias_start..bias_start + n_l]
     }
 
+    /// The forward pass on any number type (weights on it, inputs constant), in
+    /// [`Self::forward_cache`]'s exact association, so the value is bit-identical.
+    pub(crate) fn forward_g<T: crate::sens::num::PkNum>(&self, x: &[f64], weights: &[T]) -> Vec<T> {
+        let l_max = self.layers.len() - 1;
+        let mut a_prev: Vec<T> = x.iter().map(|&v| T::from_f64(v)).collect();
+        for l in 1..=l_max {
+            let (n_l, n_lm1) = (self.layers[l], self.layers[l - 1]);
+            let w_start = self.offsets[l - 1];
+            let w = &weights[w_start..w_start + n_l * n_lm1];
+            let b = &weights[w_start + n_l * n_lm1..w_start + n_l * n_lm1 + n_l];
+            let activation = if l == l_max {
+                self.output_activation
+            } else {
+                self.hidden_activation
+            };
+            a_prev = (0..n_l)
+                .map(|i| {
+                    let row = &w[i * n_lm1..(i + 1) * n_lm1];
+                    let mut acc = row[0] * a_prev[0];
+                    for (&w_ij, &a_j) in row.iter().zip(&a_prev).skip(1) {
+                        acc = acc + w_ij * a_j;
+                    }
+                    activation.apply_g(acc + b[i])
+                })
+                .collect();
+        }
+        a_prev
+    }
+
     /// Forward pass returning pre-activations and post-activations per layer.
     /// `pre[l-1]` is the pre-activation z_l (length `layers[l]`);
     /// `post[l-1]` is the post-activation a_l (length `layers[l]`).
@@ -1138,6 +1207,17 @@ impl NamedMlpMapper {
         self.mlp.forward(&x, weights)
     }
 
+    /// [`Self::forward_raw`] on any number type: the weights on it, the (zero-filled,
+    /// normalised) inputs constant.
+    pub(crate) fn forward_raw_g<T: crate::sens::num::PkNum>(
+        &self,
+        weights: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<T> {
+        self.mlp
+            .forward_g(&self.build_input_vec_zero_fill(covariates), weights)
+    }
+
     /// Pre-activation Jacobian `∂z_L/∂weights` at this subject's covariates,
     /// built with the **same zero-fill input construction as
     /// [`forward_raw`](Self::forward_raw)**.
@@ -1155,25 +1235,6 @@ impl NamedMlpMapper {
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.jacobian_preactivation(&x, weights)
-    }
-
-    /// Post-activation Jacobian `∂a_L/∂weights` (`n_outputs × n_weights`) at this
-    /// covariate snapshot, with the same zero-fill input construction as
-    /// [`forward_raw`](Self::forward_raw) — the output-side twin of
-    /// [`jacobian_preactivation_raw`](Self::jacobian_preactivation_raw).
-    ///
-    /// The `[individual_parameters]` program reads the *activated* output (`a_L`, what
-    /// `Op::PushNnOutput` pushes), so a chain rule that seeds the program on those
-    /// outputs (`ModelNnAxisGuard`) needs `∂a_L/∂w`, activation derivative included.
-    /// The pre-activation variant exists for the bias finite-difference identity, which
-    /// is a different chain and would need dividing back through `f'(z)`.
-    pub(crate) fn jacobian_raw(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Result<DMatrix<f64>, NnError> {
-        let x = self.build_input_vec_zero_fill(covariates);
-        self.mlp.jacobian(&x, weights)
     }
 
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors

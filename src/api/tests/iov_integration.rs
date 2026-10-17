@@ -322,8 +322,8 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     let ana = parse_model_string(ANALYTICAL).expect("parse analytical IOV");
     let ode = parse_model_string(ODE).expect("parse ODE IOV");
     assert!(
-        crate::sens::ode_provider::ode_iov_supported(&ode),
-        "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
+        crate::sens::ode_provider::adjoint::model_in_scope(&ode),
+        "ODE twin must be in the adjoint's scope (analytic inner+outer)"
     );
     let pop = make_iov_population();
     // Use the **default** optimizer (`Auto`) — exactly what a real user gets.

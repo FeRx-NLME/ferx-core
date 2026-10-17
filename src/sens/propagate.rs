@@ -805,10 +805,11 @@ fn record_pk_at_g<T: PkNum>(
 /// quiet sub-intervals with the exact **dual** window lengths, so the
 /// moving-boundary sensitivity flows through the closed-form flow to all orders —
 /// no explicit saltation is needed (the closed-form analogue of the ODE path's
-/// `inject_rate_saltation`). `rate_bare` is the F-agnostic rate (`amt/D` or `R`);
-/// the walk applies `F` as the existing `pk.f * rate` post-multiply, matching
-/// [`crate::types::DoseEvent::bioavailable_infusion`] for the duration-defined case.
-/// Empty (or `None` entries) recover the pre-#486 fixed-window behaviour.
+/// `inject_rate_saltation`). Under bioavailability every infusion carries such a pair,
+/// with its dose-time `F` already applied as production applies it
+/// ([`crate::types::DoseEvent::bioavailable_infusion`], #419): a rate-defined window
+/// stretched to `F·dur` (so its end moves with `F`), a duration-defined rate scaled. The
+/// walk injects that rate as-is. Empty (or `None` entries) recover the fixed-window walk.
 #[allow(clippy::too_many_arguments)]
 fn propagate_bounds_g<T: PkNum>(
     state: &mut [T],
@@ -964,8 +965,11 @@ fn active_rates_g<T: PkNum>(
             t_start <= mid
         };
         if d.rate > 0.0 && d.duration > 0.0 && started && t_end >= mid {
+            // A dual window already carries its dose-time `F` (`modeled_dose_inf_duals`,
+            // #419) and is injected as-is, as production injects its `F`-applied rate. A
+            // fixed window has one only without bioavailability, where `pk.f` is 1.
             let r = match dose_inf_dual.get(k).copied().flatten() {
-                Some((rate_bare, _)) => pk.f * rate_bare,
+                Some((rate, _)) => rate,
                 None => pk.f * T::from_f64(d.rate),
             };
             match pk_model.topology().dose_channel(d.cmt_raw()) {
