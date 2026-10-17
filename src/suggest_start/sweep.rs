@@ -6,7 +6,7 @@
 use nalgebra::DVector;
 use rayon::prelude::*;
 
-use crate::api::predict;
+use crate::api::predict_diag_undrained;
 use crate::diagnostics::EngineError;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::suggest_start::find_theta_for_slot;
@@ -19,12 +19,17 @@ use crate::types::{CompiledModel, ModelParameters, Population};
 ///
 /// `Err` is `predict()`'s precondition refusal, passed up so `inits_from_nca` returns it
 /// rather than panicking mid-sweep (#898).
+///
+/// Predicts through the non-draining `predict_diag_undrained`, not `predict()`: the sweep runs
+/// inside `fit()`'s SS-sink window, once per start of a multi-start fit and concurrently with
+/// the other starts' objective passes, so a draining `predict()` would delete their
+/// steady-state non-convergence notes (#1652 review r1 #1).
 fn rrmse(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
 ) -> Result<f64, EngineError> {
-    let preds = predict(model, population, params)?;
+    let preds = predict_diag_undrained(model, population, params)?.results;
 
     // Build (pred, obs) pairs — preds are returned in the same subject/time order as
     // population.subjects[i].obs_times.
@@ -401,6 +406,35 @@ mod tests {
         assert!(
             r.is_infinite() && r > 0.0,
             "empty population must give +∞ rRMSE, got {r}"
+        );
+    }
+
+    /// #1652 review r1 #1: the sweep runs inside `fit()`'s SS-sink window, once per start of a
+    /// multi-start fit and concurrently with the other starts' objective passes, so it must not
+    /// drain the process-global sink. A note already in the sink when `rrmse` runs must still be
+    /// there afterwards for `fit()`'s own take.
+    ///
+    /// Mutation: `rrmse` predicting through `crate::api::predict` (which clears and drains) kills
+    /// this. The write uses the not-contracting branch of the #867 tail check (`ρ = 2`,
+    /// last step 20% of the trough), so it is a real note, not a test-only string.
+    ///
+    /// Exposure: like every reader under `SS_WARN_SINK_READER_GUARD`, a concurrent lib test that
+    /// calls a draining `api` entry point can clear the sink inside this window (tracked with the
+    /// rest of that class, not here).
+    #[test]
+    fn rrmse_does_not_drain_the_ss_nonconvergence_sink() {
+        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (model, population) = warfarin();
+        crate::dosing::note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
+        rrmse(&model, &population, &model.default_params).expect("rrmse runs");
+        let left = crate::dosing::take_ss_nonconvergence_warnings();
+        assert!(
+            left.iter()
+                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            "the sweep's predictor drained the SS sink, deleting a note the enclosing fit had \
+             written; got {left:?}"
         );
     }
 

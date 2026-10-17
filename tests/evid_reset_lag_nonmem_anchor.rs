@@ -286,21 +286,19 @@ fn via_dual(
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
 /// adaptive driver, frozen-replay verifier on.
-/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: `omega ~ 0.0`
-/// is PD-regularised to Ω = 1e-8 (`OmegaMatrix`), so the default parameters would draw η
-/// with sd 1e-4 and put the driver ~3e-4 off the table (#1603). η threading is pinned
-/// elsewhere (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
+/// It runs at η = 0 exactly, as the NONMEM `PRED` it is judged against does: a declared
+/// `omega ~ 0.0` draws η = 0 in every simulation (#1605). Until then it drew η with sd
+/// 1e-4 and put the driver ~3e-4 off the table (#1603), which this function worked around
+/// by zeroing `chol` by hand. η threading is pinned elsewhere
+/// (`adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
 fn via_adaptive(model: &CompiledModel) -> Vec<(String, f64, f64)> {
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(1);
     opts.decision_times = vec![25.0];
-    let mut params = model.default_params.clone();
-    params.omega.chol.fill(0.0);
-    params.omega.matrix.fill(0.0);
     let res = simulate_adaptive(
         model,
         &pop(),
-        &params,
+        &model.default_params,
         1,
         || |_: &ControllerCtx| -> Vec<DoseAction> { Vec::new() },
         &opts,

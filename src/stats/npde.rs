@@ -282,10 +282,21 @@ pub fn compute_npde_npd_diag(
                     .as_ref()
                     .filter(|_| model.n_kappa > 0)
                     .map(|om| (om, &kappa_draws[i]));
+                // Draw from the declared Ω, a zero η / κ exactly 0 (#1605).
+                let eta_factor = params.omega.sim_draw_factor(
+                    Some(&model.default_params.omega),
+                    &model.default_params.omega_fixed,
+                );
+                let kappa_factor = iov.map(|(om, _)| {
+                    om.sim_draw_factor(
+                        model.default_params.omega_iov.as_ref(),
+                        &model.default_params.kappa_fixed,
+                    )
+                });
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                    let eta = &params.omega.chol * DVector::from_column_slice(&z);
+                    let eta = &*eta_factor * DVector::from_column_slice(&z);
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
@@ -300,8 +311,11 @@ pub fn compute_npde_npd_diag(
                     // baseline-only `pk_param_fn(subject.covariates)` — and draw no
                     // extra randoms, so their sims are byte-identical.
                     let ipreds = match &iov {
-                        Some((omega_iov, kappa_draw)) => {
-                            let kappas = kappa_draw.draw(&omega_iov.chol, normal, &mut rng);
+                        Some((_, kappa_draw)) => {
+                            let kappa_factor = kappa_factor
+                                .as_deref()
+                                .expect("kappa_factor is Some whenever iov is");
+                            let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
                             crate::pk::predict_iov(
                                 model,
                                 subject,

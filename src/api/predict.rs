@@ -43,9 +43,8 @@ use std::time::Instant;
 /// which is what #1280 / #1304 were filed about. It is kept because the R wrapper and every
 /// existing caller bind this signature.
 ///
-/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here **or** by
-/// [`predict_diag`]; callers that obtained `population` via [`crate::read_nonmem_csv`] should
-/// inspect `population.warnings` before calling either.
+/// Data-reader warnings (e.g. missing II for ADDL doses) are discarded here with everything
+/// else; [`predict_diag`] carries them in its `warnings`, filtered as `fit()` filters them.
 ///
 /// Subjects are evaluated in parallel when more than one worker is available.
 /// Calls made inside a [`PoolPlan`] reuse that enclosing pool; standalone calls
@@ -76,8 +75,9 @@ pub fn predict(
 /// `warnings` carries the non-fit diagnostics bundle: parse warnings, data-reader warnings,
 /// the model/data checks (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …),
 /// experimental-feature notices, and — for an `[odes]` model — the ODE-solver diagnostics of
-/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean prediction on a
-/// well-formed model.
+/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`) — plus, first, the steady-state (`SS=1`)
+/// equilibration non-convergence note of this pass, when a nonlinear pulse train hit its cycle
+/// cap short of steady state (#867, #1652). Empty for a clean prediction on a well-formed model.
 ///
 /// It is **not** everything `fit()` reports, and the difference is principled rather than a
 /// subset: findings whose subject is the *fit* — the estimator/optimizer option warnings, the
@@ -109,6 +109,11 @@ pub struct PredictionOutput {
 /// segment that exhausted `ode_max_steps` came back as a column of *identical* finite numbers
 /// (#959), which is worse: it is plottable.
 ///
+/// It also carries the steady-state (`SS=1`) equilibration non-convergence note of this pass —
+/// the one [`crate::simulate_with_options_diag`] reports on the same input (#1652). The note is
+/// collected in a process-global sink, so this function clears it on entry: a note left by an
+/// earlier call is never reported as this pass's.
+///
 /// Returns exactly what [`predict`] returns in `results`; the rows are unchanged and no
 /// prediction moves by a ULP. The scope that collects the solver counters is opened per subject
 /// task and only on a model that integrates something, so a closed-form model takes the
@@ -134,6 +139,32 @@ pub struct PredictionOutput {
 /// diagnostic `ferx check` reports for the same refusal — its `code()`, `block()` and
 /// `suggestion()` — or none where `ferx check` has no code for it (#1746).
 pub fn predict_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Result<PredictionOutput, EngineError> {
+    // Start the process-global SS-equilibration non-convergence sink clean, then drain it into
+    // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
+    // the clear, a note left by an earlier non-draining caller would be reported as this pass's.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+    let out = predict_diag_undrained(model, population, params)?;
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(out.warnings);
+    Ok(PredictionOutput {
+        results: out.results,
+        warnings,
+    })
+}
+
+/// [`predict_diag`] without touching the process-global SS non-convergence sink: the same rows,
+/// the same `Err`s and the same non-fit bundle, but no clear on entry and no take on exit, so the
+/// SS note this pass writes stays in the sink for the enclosing operation to drain.
+///
+/// For a caller that runs *inside* another entry point's clear→take window. A draining call there
+/// would wipe notes the enclosing run already wrote: `suggest_start::sweep` runs inside each
+/// start of a multi-start `fit()`, whose starts run concurrently, so one start's sweep would
+/// delete a note another start's objective passes had written (#1652 review r1 #1).
+pub(crate) fn predict_diag_undrained(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,

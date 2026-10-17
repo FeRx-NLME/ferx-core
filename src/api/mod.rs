@@ -105,6 +105,7 @@ pub(crate) use postfit::{
 };
 #[cfg(test)]
 pub(crate) use postfit::{compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ};
+pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
@@ -378,6 +379,11 @@ mod ode_solver_options_tests;
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
+
+// #1605: a zero ω / κ draws exactly zero in every simulation consumer.
+#[cfg(test)]
+#[path = "tests/sim_zero_omega_tests.rs"]
+mod sim_zero_omega_tests;
 
 // #1853: an ODE-accumulated hazard integrates one `TIME = 0` `$PK` snapshot, so a
 // `TIME`-dependent disposition / `init()` is refused — the `TIME` axis of #741's freeze.

@@ -983,9 +983,14 @@ fn emit_subject_rows<R: rand::Rng>(
         // drawn once per group of its own level: one study κ shared by every arm of
         // the study. The caller built `kappa_draw` per subject (`KappaDraw::of`, which
         // refuses a nested subject without cells), so it is present for every κ model.
+        // The factor is the declared Ω_IOV's, a zero κ exactly 0 (#1605).
+        let kappa_factor = omega_iov.sim_draw_factor(
+            model.default_params.omega_iov.as_ref(),
+            &model.default_params.kappa_fixed,
+        );
         let kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
-            .draw(&omega_iov.chol, normal, rng);
+            .draw(&kappa_factor, normal, rng);
         pk::predict_iov(
             model,
             subject,
@@ -1332,6 +1337,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
+    // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`.
+    let eta_factor = params.omega.sim_draw_factor(
+        Some(&model.default_params.omega),
+        &model.default_params.omega_fixed,
+    );
 
     // How each subject's κ is drawn, built once per subject rather than once per
     // replicate: one κ per occasion group, or per group of each level (#1082 PR4).
@@ -1358,7 +1368,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
                         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        &params.omega.chol * DVector::from_column_slice(&z)
+                        &*eta_factor * DVector::from_column_slice(&z)
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1395,7 +1405,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
-                    let eta = &params.omega.chol * z_vec;
+                    let eta = &*eta_factor * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
