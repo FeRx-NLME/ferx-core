@@ -317,11 +317,13 @@ let (mut population, _) = read_population_for(
     opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
 )?;
 
-// The binders return an `EngineError` (#1773); its `to_string()` is the message.
+// The binders and `fit` return an `EngineError` (#1773, #1772); its `to_string()` is
+// the message.
 bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
 bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
-let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
+let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+    .map_err(|e| e.to_string())?;
 ```
 
 ### A model or population left unbound
