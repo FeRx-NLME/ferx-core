@@ -6003,12 +6003,25 @@ fn residual_correlation_grouping(
     };
     let level_named = |name: &str| levels.levels.iter().find(|l| l.name == name);
     if serial.by.len() > 1 {
-        if let Some(level) = serial.by.iter().find_map(|c| level_named(c)) {
+        // The innermost level the list names: its key path already holds the outer ones,
+        // so `by (STUDY, ARM)` means `by ARM`, not `by STUDY`.
+        let named: Vec<usize> = serial
+            .by
+            .iter()
+            .filter_map(|c| levels.levels.iter().position(|l| l.name == *c))
+            .collect();
+        if let Some(&deepest) = named.iter().max() {
+            let names = named
+                .iter()
+                .map(|&l| format!("`{}`", levels.levels[l].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let level = if named.len() > 1 { "levels" } else { "level" };
             return vec![err(format!(
-                "`{line}` names the level `{name}` in a list of columns. A level groups rows \
-                 by its whole key path, so it does not combine with other columns. Write \
-                 `by {name}` alone.",
-                name = level.name
+                "`{line}` names the {level} {names} in a list of columns. A level groups rows \
+                 by its whole key path, its parent levels included, so it does not combine \
+                 with other columns. Write `by {name}` alone.",
+                name = levels.levels[deepest].name
             ))];
         }
     }
@@ -6180,11 +6193,13 @@ fn residual_correlation_confounded(
         "E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA",
         format!(
             "`{line}` correlates the rows in exactly the groups of {grouping}, where the \
-             kappa {kappas} is drawn. A kappa gives every row of a group one shared random effect, which \
+             {kappa_word} {kappas} {is_are} drawn. A kappa gives every row of a group one shared random effect, which \
              is the correlation `cs` estimates, so ρ and the kappa variance are not identified \
              together: the same covariance for an additive kappa, nearly the same for a \
              multiplicative one. Use `ar1` or `car1`, whose correlation decays with the lag, \
              or drop the kappa.",
+            kappa_word = if kappas.len() > 1 { "kappas" } else { "kappa" },
+            is_are = if kappas.len() > 1 { "are" } else { "is" },
             kappas = kappas.join(", ")
         ),
     )

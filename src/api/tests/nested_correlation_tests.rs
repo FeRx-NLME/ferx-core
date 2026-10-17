@@ -599,27 +599,44 @@ fn ambiguous_groupings_are_refused_and_the_rest_accepted() {
         let (m, pop, _) = load(src);
         check_model_data(&m, &pop)
     };
-    let cells: Vec<(&str, String, Option<&str>)> = vec![
+    // Each refused cell lists every sentence of its message, so cutting any one sentence
+    // reddens that cell (AGENTS.md: a message is code).
+    let cells: Vec<(&str, String, &[&str])> = vec![
         (
             "a level in a tuple",
             with_corr("ar1", 0.3, "STUDY, ARM"),
-            Some("names the level `STUDY` in a list of columns"),
+            &[
+                "`correlation ar1(RHO) by STUDY, ARM` names the levels `STUDY`, `ARM` in a list \
+                 of columns.",
+                "A level groups rows by its whole key path, its parent levels included, so it \
+                 does not combine with other columns.",
+                "Write `by ARM` alone.",
+            ],
         ),
         (
             "a nested level's column under another name",
             renamed("ARM"),
-            Some("`ARM` is the column of the level `AR`, which is nested in `ST`"),
+            &[
+                "`correlation ar1(RHO) by ARM`: `ARM` is the column of the level `AR`, which is \
+                 nested in `ST`.",
+                "As a column, `ARM` groups rows by its value within ID, so rows with the same \
+                 value in two groups of `ST` share one block, while the level keeps them apart.",
+                "Write `by AR` to group by the level.",
+            ],
         ),
         (
             "a level name that is also another data column",
             renamed("ARMID")
                 .replace("level AR by ARM in ST", "level ARMID by ARM in ST")
                 .replace("at AR ", "at ARMID "),
-            Some(
-                "`ARMID` is the level `ARMID`, grouped by the column `ARM`, and also a data column",
-            ),
+            &[
+                "`correlation ar1(RHO) by ARMID`: `ARMID` is the level `ARMID`, grouped by the \
+                 column `ARM`, and also a data column of its own, so `by ARMID` could mean \
+                 either grouping.",
+                "Rename the data column or the level.",
+            ],
         ),
-        ("the level by its name", renamed("AR"), None),
+        ("the level by its name", renamed("AR"), &[]),
         // `cs`, since `ar1` over a study ties its arms' visit times; no κ at the study.
         (
             "a level in ID by its column",
@@ -628,33 +645,144 @@ fn ambiguous_groupings_are_refused_and_the_rest_accepted() {
                 .replace("theta RHO(0.3, -0.9, 0.9)", "theta RHO(0.3, -0.05, 0.9)")
                 .replace("  kappa K_ST ~ 0.0904362 at ST\n", "")
                 .replace("ETA_SP + K_ST + K_ARM", "ETA_SP + K_ARM"),
-            None,
+            &[],
         ),
         (
             "a column no level reads",
             with_corr("ar1", 0.3, "ARMID"),
-            None,
+            &[],
         ),
     ];
-    for (label, src, want) in &cells {
+    for (label, src, sentences) in &cells {
         let d = check(src);
         let hits = codes(&d, AMBIGUOUS);
-        match want {
-            Some(text) => {
-                assert_eq!(hits.len(), 1, "{label}: {d:?}");
-                assert!(hits[0].contains(text), "{label}: {}", hits[0]);
-                assert!(
-                    hits[0].contains("Write `by") || hits[0].contains("Rename"),
-                    "{label}"
-                );
-            }
-            None => assert!(
+        if sentences.is_empty() {
+            assert!(
                 d.iter()
                     .all(|x| x.severity != crate::diagnostics::Severity::Error),
                 "{label}: {d:?}"
-            ),
+            );
+            continue;
+        }
+        assert_eq!(hits.len(), 1, "{label}: {d:?}");
+        for sentence in *sentences {
+            assert!(
+                hits[0].contains(sentence),
+                "{label}: missing {sentence:?} in {}",
+                hits[0]
+            );
         }
     }
+}
+
+/// Finding 3 of review round 1 on #2102: gate B on a one-level model whose occasions an
+/// `iov_occasion` rule derives (here `time(5)`). The rule labels the rows only when the
+/// population is prepared, so the check applies it as the fit does: `cs by WIN`, a column
+/// that groups the rows exactly as the derived windows do, is refused, and `ar1` is not.
+/// Mutation: skip applying the rule (the occasions stay as read, empty) → the `cs` cell is
+/// no longer refused.
+#[test]
+fn gate_b_applies_a_derived_occasion_rule() {
+    let src = |kind: &str| {
+        format!(
+            "[parameters]\n  theta TVE0(10.0)\n  theta RHO(0.3, 0.0, 0.9)\n  \
+             omega ETA ~ 0.09\n  kappa K ~ 0.04\n  sigma ADD ~ 0.25\n\
+             [individual_parameters]\n  E0 = TVE0 * exp(ETA + K)\n\
+             [structural_model]\n  y = E0\n[error_model]\n  DV ~ additive(ADD)\n  \
+             correlation {kind}(RHO) by WIN\n[fit_options]\n  iov_occasion = time(5)\n"
+        )
+    };
+    let times = [1.0, 2.0, 4.0, 8.0, 12.0];
+    let win = |t: f64| {
+        std::collections::HashMap::from([("WIN".to_string(), if t < 5.0 { 1.0 } else { 2.0 })])
+    };
+    let pop = Population {
+        subjects: (1..=2)
+            .map(|i| Subject {
+                id: i.to_string(),
+                obs_times: times.to_vec(),
+                observations: vec![10.0; 5],
+                obs_cmts: vec![1; 5],
+                cens: vec![0; 5],
+                covariates: win(1.0),
+                obs_covariates: times.iter().map(|&t| win(t)).collect(),
+                ..Default::default()
+            })
+            .collect(),
+        covariate_names: vec!["WIN".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    for (kind, refused) in [("cs", true), ("ar1", false)] {
+        let parsed = parse_full_model(&src(kind)).expect("parses");
+        let rule = parsed.fit_options.iov_occasion.clone();
+        assert_ne!(rule, IovOccasionRule::Column, "the rule is derived");
+        let d = crate::api::validation::check_model_data_rule(&parsed.model, &pop, &rule);
+        let hits = codes(&d, CONFOUNDED);
+        assert_eq!(!hits.is_empty(), refused, "{kind}: {d:?}");
+        if refused {
+            assert!(
+                hits[0].contains(
+                    "in exactly the groups of the occasion grouping, where the kappa K is drawn."
+                ),
+                "{}",
+                hits[0]
+            );
+        }
+    }
+    // Finding 9: two kappas at the grouping are named in the plural.
+    let two = src("cs")
+        .replace(
+            "  kappa K ~ 0.04\n",
+            "  kappa K ~ 0.04\n  kappa K2 ~ 0.04\n",
+        )
+        .replace(
+            "  theta TVE0(10.0)\n",
+            "  theta TVE0(10.0)\n  theta TVS(1.0)\n",
+        )
+        .replace("  y = E0\n", "  y = E0 * S\n")
+        .replace(
+            "  E0 = TVE0 * exp(ETA + K)\n",
+            "  E0 = TVE0 * exp(ETA + K)\n  S = TVS * exp(K2)\n",
+        );
+    let parsed = parse_full_model(&two).expect("parses");
+    let d = crate::api::validation::check_model_data_rule(
+        &parsed.model,
+        &pop,
+        &parsed.fit_options.iov_occasion,
+    );
+    let hits = codes(&d, CONFOUNDED);
+    assert_eq!(hits.len(), 1, "{d:?}");
+    assert!(
+        hits[0].contains("where the kappas K, K2 are drawn."),
+        "{}",
+        hits[0]
+    );
+}
+
+/// Finding 4 of review round 1 on #2102: a block a level-named `by` defines is named by its
+/// key path in the data checks' messages (`E_RESIDUAL_CORRELATION_TIES` here), since the
+/// level's value alone names a group in every parent. Mutation: drop the level arm of
+/// `residual_block_key` → the message names the bare `ARM=1`.
+#[test]
+fn a_level_block_is_named_by_its_key_path() {
+    let (m, mut pop, _) = load(&with_corr("ar1", 0.3, "ARM"));
+    // Two rows of subject 1's first arm (study 1, arm 1) at one TIME.
+    let s = &mut pop.subjects[0];
+    s.obs_times[1] = s.obs_times[0];
+    if !s.obs_raw_times.is_empty() {
+        s.obs_raw_times[1] = s.obs_raw_times[0];
+    }
+    let d = check_model_data(&m, &pop);
+    let ties = codes(&d, "E_RESIDUAL_CORRELATION_TIES");
+    assert_eq!(ties.len(), 1, "{d:?}");
+    assert!(
+        ties[0].contains("in the block STUDY=1, ARM=1."),
+        "{}",
+        ties[0]
+    );
 }
 
 /// The conditional IOV objective (`conditional_obs_nll_from_preds(.., iov = true)`, the

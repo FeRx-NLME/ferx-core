@@ -34,6 +34,13 @@
 //! | η̂ and κ̂, 4 × 108 values | 1.676e-7 | 1.677e-7 | `2e-6` (11.9× above) |
 //!
 //! At the default `inner_tol` the gap is 1.1e-6 on `ar1_p05`: see [`INNER_TOL`].
+//!
+//! Fed column-keyed grouping (the level key cut to the bare `ARM` label, so arm 1 of
+//! study 1 and arm 1 of study 2 share a block), the anchor dies before it reaches the
+//! bound: the merged arms share their visit times, so `E_RESIDUAL_CORRELATION_TIES`
+//! refuses the `ar1` fit (measured on #2102). Nesting by key is pinned numerically by
+//! `a_level_name_in_by_groups_by_the_level_nested_by_key` (the `by ARM` / `by ARMID`
+//! bit-equality).
 
 use ferx_core::api::read_population_for;
 use ferx_core::parser::model_parser::parse_full_model;
