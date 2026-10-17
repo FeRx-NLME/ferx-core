@@ -4463,6 +4463,7 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
             0,
             0,
             policy,
+            None,
             |_, r| r.terminal_hessian.is_some(),
         );
         assert!(
