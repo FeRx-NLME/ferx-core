@@ -5733,7 +5733,9 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
     // wrong: `[0.0, 0.0, 99.99999999935972, 199.99999999807915]` for doses at 12 and 36 (the
     // value at t=20 should be ~44.93, as the control above shows), and
     // `[0.0, 0.0, 0.0, 99.99999999935972]` for the hold schedule. Since #1539 the rows past
-    // the divergence are `NaN` instead.
+    // the divergence are `NaN` instead, and since #1578 the driver refuses the first decision
+    // (t=12, past `X`'s pole at t=2) because its state is non-finite — under both verifier
+    // settings, and by naming the state, never the dose clock.
     for (schedule, dose_idx) in [
         ("doses at 12 and 36", vec![0, 1]),
         ("a hold at 12 and a dose at 36", vec![1]),
@@ -5753,27 +5755,21 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
                 || dose_at_decisions(dose_idx.clone()),
                 &opts,
             );
-            // #1539: the rows past the divergence are now `NaN`, and the frozen-replay
-            // verifier no longer counts `NaN == NaN` as agreement — so `verify: true` is
-            // refused, by the *verifier* and never by this guard.
-            match (verify, res) {
-                (false, Err(e)) => panic!(
-                    "a divergence in a compartment that never evaluates TAD must not be \
-                     refused by this guard ({schedule}, verify=false): {e}"
+            // #1578: a decision on a diverged state is refused by the driver's state guard,
+            // before the controller and before the verifier — never by the dose-clock guard.
+            match res {
+                Ok(_) => panic!(
+                    "a decision on a diverged state must be refused ({schedule}, \
+                     verify={verify}, #1578)"
                 ),
-                (false, Ok(_)) => {}
-                (true, Ok(_)) => panic!(
-                    "the frozen-replay verifier must not certify a run whose rows are NaN \
-                     because a state diverged ({schedule}, #1539)"
-                ),
-                (true, Err(e)) => {
+                Err(e) => {
                     let e = format!("{e}");
                     assert!(
-                        e.contains("frozen-schedule replay verification failed")
-                            && e.contains("cannot confirm it")
+                        e.contains("decision 0 at t=12: the ODE state is non-finite (")
+                            && e.contains("X)")
                             && !e.contains("has no referent"),
-                        "verify=true must be refused by the replay verifier, not by the dose \
-                         clock guard ({schedule}): {e}"
+                        "must be the #1578 state refusal, not the dose clock guard \
+                         ({schedule}, verify={verify}): {e}"
                     );
                 }
             }
@@ -5844,6 +5840,11 @@ fn divergent_x_model(x_rate: &str) -> CompiledModel {
 /// verifier refuses to certify rows it cannot confirm. The control (`0·X`) agrees with the
 /// closed form, carries no solver warning, and still verifies.
 ///
+/// The decision sits at t = 1, **before** the pole, so the controller sees a finite state and
+/// the divergence reaches only the rows: that is the leg the verifier's `NaN` guard still
+/// owns. A decision past the pole is refused by the driver before any of this runs (#1578);
+/// the last leg pins that.
+///
 /// Engine: the reactive driver (`ode_predictions_adaptive_impl` → `integrate_segment` →
 /// `integrate_dense_g`, `T = f64`) and, under `verify`, the frozen replay
 /// (`ode_predictions_with_extra_breaks`) — callers of one solver, not two references. Mutations
@@ -5852,18 +5853,20 @@ fn divergent_x_model(x_rate: &str) -> CompiledModel {
 /// the diverged clause from the warning.
 #[test]
 fn adaptive_run_with_a_diverged_state_serves_nan_and_does_not_verify() {
-    let obs = vec![1.0, 20.0, 40.0];
+    let obs = vec![0.5, 20.0, 40.0];
     let pop = population(vec![subj("1", obs, vec![])]);
-    let run = |x_rate: &str, verify: bool| {
+    let run_at = |x_rate: &str, verify: bool, decision: f64| {
         let model = divergent_x_model(x_rate);
         let opts = AdaptiveSimulateOptions {
             seed: Some(1),
-            decision_times: vec![12.0],
+            decision_times: vec![decision],
             verify,
             ..Default::default()
         };
         simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
     };
+    // Before the pole at t = 2: the controller sees a finite state, the rows diverge after it.
+    let run = |x_rate: &str, verify: bool| run_at(x_rate, verify, 1.0);
 
     let control = run("0.0", false).expect("the control runs");
     let diverged = run("0.5", false).expect("verify: false returns the rows");
@@ -5882,7 +5885,7 @@ fn adaptive_run_with_a_diverged_state_serves_nan_and_does_not_verify() {
     assert!(d[0].is_finite());
     // The control is the closed form (η on CL has variance 1e-10, so ≤ ~3e-5 relative).
     for (i, t) in [(1, 20.0), (2, 40.0)] {
-        let want = 100.0 * (-0.1f64 * (t - 12.0)).exp();
+        let want = 100.0 * (-0.1f64 * (t - 1.0)).exp();
         assert!(
             c[i].is_finite() && (c[i] - want).abs() <= 1e-3 * want,
             "control {c:?}"
@@ -5930,15 +5933,36 @@ fn adaptive_run_with_a_diverged_state_serves_nan_and_does_not_verify() {
     // The runtime control for #1983: the driver's refusals carry a code, but a replay that
     // disagrees with the run it checks is a runtime failure, not the caller's input — no code.
     assert_eq!(e.code(), None, "{e}");
+
+    // #1578: the same model with the decision past the pole (t = 12) is refused at the
+    // decision, under both verifier settings, naming the diverged state — uncoded, since the
+    // model diverged rather than the caller's input being wrong. The control still runs there.
+    run_at("0.0", true, 12.0).expect("the control verifies with a decision at t=12");
+    for verify in [false, true] {
+        let e = match run_at("0.5", verify, 12.0) {
+            Ok(_) => panic!("a decision on a diverged state must be refused (verify={verify})"),
+            Err(e) => e,
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("decision 0 at t=12: the ODE state is non-finite (") && msg.contains("X)"),
+            "verify={verify}: {msg}"
+        );
+        assert!(!msg.contains("cannot confirm it"), "verify={verify}: {msg}");
+        assert_eq!(e.code(), None, "verify={verify}: {e}");
+    }
 }
 
 /// T6's second cell (#1539, inherited from #1570 review row 1): a pre-dose `[odes]` RHS that
 /// reads `TAD^(-0.5)`, which no anchor a schedule can supply makes finite. #1570 lets it run
 /// unrefused, and it returns the `NaN` rows `predict()` returns too — `[50, NaN, NaN, NaN]`,
 /// measured. Until #1539 `verify: true` returned `Ok` on it, because `NaN == NaN` counted as
-/// agreement. The rows are unchanged here; only the verdict is.
+/// agreement. Since #1578 the first decision (t = 12) already sees the `NaN` state, so the
+/// driver refuses there under both verifier settings, before the verifier runs; the
+/// verifier's own `NaN` leg is pinned by the decision-before-the-pole fixture above.
 ///
-/// Engine: as above. Mutation that reddens it: count `NaN == NaN` as agreement again.
+/// Engine: as above. Mutation that reddens it: delete the driver's state guard (the run then
+/// returns `NaN` rows under `verify: false`).
 #[test]
 fn adaptive_run_with_nan_rows_from_the_rhs_does_not_verify() {
     let model = parse_model_string(&ODE_INIT50_AUTONOMOUS.replace(
@@ -5954,30 +5978,28 @@ fn adaptive_run_with_nan_rows_from_the_rhs_does_not_verify() {
         ..Default::default()
     };
 
-    let res = simulate_adaptive(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        fixed_bolus,
-        &opts(false),
-    )
-    .expect("verify: false runs unrefused");
-    let rows: Vec<f64> = res.trajectories.iter().map(|s| s.ipred).collect();
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0], 50.0, "{rows:?}");
-    assert!(rows[1..].iter().all(|v| v.is_nan()), "{rows:?}");
-
-    match simulate_adaptive(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        fixed_bolus,
-        &opts(true),
-    ) {
-        Ok(_) => panic!("NaN rows must not verify as agreement (#1539)"),
-        Err(e) => assert!(e.to_string().contains("cannot confirm it"), "{e}"),
+    for verify in [false, true] {
+        match simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            fixed_bolus,
+            &opts(verify),
+        ) {
+            Ok(r) => panic!(
+                "a decision on a NaN state must be refused (verify={verify}, #1578); rows {:?}",
+                r.trajectories.iter().map(|s| s.ipred).collect::<Vec<_>>()
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("decision 0 at t=12: the ODE state is non-finite (central)"),
+                    "verify={verify}: {msg}"
+                );
+                assert_eq!(e.code(), None, "verify={verify}: {e}");
+            }
+        }
     }
 }
 
