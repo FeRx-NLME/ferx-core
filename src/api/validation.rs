@@ -8372,13 +8372,20 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // #1082: a `level` declaration beside `iov_column` / `iov_occasion`, or a kappa with
     // no `at` once levels are declared. The parser writes the code as the message's
     // prefix; the diagnostic carries it as its code and keeps the rest as the message.
+    // #1065: the declaration and route halves of a `profile`d θ level block, same shape.
     const MIXED: &str = "E_LEVEL_MIXED_WITH_IOV_COLUMN: ";
-    if let Some(at) = err.find(MIXED) {
-        return Diagnostic::error(
-            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
-            err[at + MIXED.len()..].to_string(),
-        )
-        .with_block("parameters");
+    for prefix in [
+        MIXED,
+        crate::parser::model_parser::PROFILE_SCOPE,
+        crate::parser::model_parser::PROFILE_NOT_LINEAR,
+    ] {
+        if let Some(at) = err.find(prefix) {
+            return Diagnostic::error(
+                prefix.trim_end_matches(": "),
+                err[at + prefix.len()..].to_string(),
+            )
+            .with_block("parameters");
+        }
     }
     if let Some(rest) = err.strip_prefix("Missing [") {
         if let Some(end) = rest.find(']') {

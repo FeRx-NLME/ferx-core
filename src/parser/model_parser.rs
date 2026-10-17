@@ -14876,6 +14876,76 @@ fn split_level_attachment(
     }
 }
 
+/// The declaration half of `E_PROFILE_SCOPE` (#1065): `profile` goes on a θ level
+/// block with no bounds and no `FIX`.
+fn check_profile_declaration(
+    name: &str,
+    is_block: bool,
+    fixed: bool,
+    has_bounds: bool,
+) -> Result<(), String> {
+    let head = format!("{PROFILE_SCOPE}[parameters] theta {name}");
+    if !is_block {
+        return Err(format!(
+            "{head}: `profile` applies only to a θ level block (`theta {name}[...]`), \
+             whose levels are solved for at every step. A single θ is searched by the \
+             optimizer, so remove `profile`."
+        ));
+    }
+    if fixed {
+        return Err(format!(
+            "{head}[...] is both FIX and `profile`. A fixed block has nothing to solve \
+             for, so remove one of the two."
+        ));
+    }
+    if has_bounds {
+        return Err(format!(
+            "{head}[...] has bounds and `profile`. A profiled block is solved without \
+             constraints, so it takes none: write `theta {name}[...](init) profile`."
+        ));
+    }
+    Ok(())
+}
+
+/// Message prefix of an `E_PROFILE_SCOPE` parse error (#1065), which
+/// `api::validation::parse_error_to_diagnostic` reads back as the code.
+pub(crate) const PROFILE_SCOPE: &str = "E_PROFILE_SCOPE: ";
+/// Message prefix of an `E_PROFILE_NOT_LINEAR` parse error (#1065).
+pub(crate) const PROFILE_NOT_LINEAR: &str = "E_PROFILE_NOT_LINEAR: ";
+
+/// Peel a `profile` keyword off a `theta` declaration (#1065), wherever it sits
+/// among the words after the closing `)` — `(…) profile`, `(…) FIX profile`,
+/// `(…) profile FIX` — so the `theta` grammar itself is unchanged. Returns the
+/// line without it and whether it was there. Any other line passes through.
+fn split_profile_modifier(line: &str) -> (String, bool) {
+    if !line
+        .trim_start()
+        .get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case("theta "))
+    {
+        return (line.to_string(), false);
+    }
+    let Some(close) = line.rfind(')') else {
+        return (line.to_string(), false);
+    };
+    let (head, tail) = line.split_at(close + 1);
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    let Some(at) = words.iter().position(|w| w.eq_ignore_ascii_case("profile")) else {
+        return (line.to_string(), false);
+    };
+    let rest: Vec<&str> = words
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != at)
+        .map(|(_, w)| *w)
+        .collect();
+    if rest.is_empty() {
+        (head.to_string(), true)
+    } else {
+        (format!("{head} {}", rest.join(" ")), true)
+    }
+}
+
 /// The structural rules of the `level` declarations and the `at` tails (#1082): the
 /// levels form one chain below `ID`, every `at` names a declared level, and once any
 /// level is declared every kappa carries one.
@@ -16427,6 +16497,8 @@ fn parse_parameters(
         // #1082: `kappa NAME ~ VALUE at LEVEL` — peeled after the weight, which takes
         // everything to its right.
         let (line, weight_expr, at_level) = split_level_attachment(&line, weight_expr);
+        // #1065: `theta NAME[...](init) profile` — peeled like the tails above.
+        let (line, profiled) = split_profile_modifier(&line);
         let line = &line;
         let mut weight_consumed = false;
         if let Some(caps) = level_re.captures(line) {
@@ -16473,9 +16545,18 @@ fn parse_parameters(
                     })
                 })
             };
-            let lower = bound(4, "lower", 1e-9)?;
-            let upper = bound(5, "upper", 1e9)?;
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
+            // #1065: a profiled block's levels are solved for, without constraints, at
+            // every outer step. Its default box is the whole line, so the log-packing a
+            // `lower ≥ 0` box selects (`theta_packs_log`) is never reached.
+            let (default_lower, default_upper) = if profiled {
+                check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
+                (f64::NEG_INFINITY, f64::INFINITY)
+            } else {
+                (1e-9, 1e9)
+            };
+            let lower = bound(4, "lower", default_lower)?;
+            let upper = bound(5, "upper", default_upper)?;
             match block {
                 None => {
                     prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
@@ -16561,6 +16642,7 @@ fn parse_parameters(
                         name: name.clone(),
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
+                        profiled,
                     });
                 }
             }
@@ -20552,6 +20634,9 @@ pub(crate) struct VectorThetaDecl {
     /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
     /// an error and the user supplies the index column.
     pub(crate) index_covariate: Option<String>,
+    /// Declared `profile` (#1065): the levels are solved for at every outer
+    /// evaluation rather than searched by the optimizer.
+    pub(crate) profiled: bool,
 }
 
 thread_local! {

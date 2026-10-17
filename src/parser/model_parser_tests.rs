@@ -28386,6 +28386,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         name: "KM".to_string(),
         spec,
         index_covariate: None,
+        profiled: false,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
         .unwrap()
@@ -33362,4 +33363,185 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             .collect();
         run_g::<D2>(name, lean, full, &seq, tafd_of, |t| D2::constant(t - last));
     }
+}
+
+// ── #1065: `profile` on a θ level block ─────────────────────────────────────
+
+/// An algebraic MBMA model whose placebo block is declared by `decl` and read
+/// as `read` in `BASE`.
+fn profile_model(decl: &str, read: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  {decl}
+  omega ETA_E0 ~ 4.0
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  BASE = TVE0 + {read} + ETA_E0
+
+[structural_model]
+  y = BASE
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+fn profiled_decls(parsed: &ParsedModel) -> Vec<(String, bool)> {
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .map(|d| (d.name.clone(), d.profiled))
+        .collect()
+}
+
+/// Every accepted form parses and marks the block profiled: the column form under
+/// each contrast, the counted form, and any case. An unmarked block is the control.
+#[test]
+fn profile_is_accepted_on_every_level_block_form() {
+    for contrast in [
+        "",
+        ", contrast = none",
+        ", contrast = ref",
+        ", contrast = sum_to_zero_within",
+        ", contrast = sum_to_zero",
+    ] {
+        let text = profile_model(
+            &format!("theta PLACEBO[STUDY, TIME{contrast}](0.0) profile"),
+            "PLACEBO",
+        );
+        let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{contrast}: {e}"));
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{contrast}"
+        );
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0) profile",
+        "theta PLACEBO[3](0.0)   PROFILE",
+    ] {
+        let parsed = parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{decl}"
+        );
+    }
+    let control =
+        parse_full_model(&profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")).unwrap();
+    assert_eq!(profiled_decls(&control), [("PLACEBO".to_string(), false)]);
+}
+
+/// A profiled block's levels are unbounded, so a `lower ≥ 0` default can never
+/// select log-packing; an unprofiled block keeps the `1e-9 … 1e9` default box.
+#[test]
+fn a_profiled_block_is_unbounded_and_never_log_packed() {
+    let p = parse_full_model(&profile_model(
+        "theta PLACEBO[3](0.5) profile",
+        "PLACEBO[STUDY]",
+    ))
+    .unwrap()
+    .model;
+    let u = parse_full_model(&profile_model("theta PLACEBO[3](0.5)", "PLACEBO[STUDY]"))
+        .unwrap()
+        .model;
+    // θ 0 is TVE0; the three levels follow.
+    for l in 1..=3 {
+        assert_eq!(
+            p.default_params.theta_lower[l],
+            f64::NEG_INFINITY,
+            "level {l}"
+        );
+        assert_eq!(p.default_params.theta_upper[l], f64::INFINITY, "level {l}");
+        assert!(!crate::estimation::parameterization::theta_packs_log(
+            p.default_params.theta_lower[l]
+        ));
+        assert_eq!(u.default_params.theta_lower[l], 1e-9, "control level {l}");
+        assert_eq!(u.default_params.theta_upper[l], 1e9, "control level {l}");
+    }
+}
+
+/// The three declaration refusals, each sentence asserted: a single θ, `FIX`
+/// (inside or after the parentheses, `profile` before or after it), and bounds
+/// (lower only, or both). Every message carries the code prefix and the name.
+#[test]
+fn profile_refuses_a_single_theta_fix_and_bounds() {
+    let err = |decl: &str, read: &str| {
+        parse_full_model(&profile_model(decl, read))
+            .err()
+            .expect("refused")
+    };
+    let single = err("theta PLACEBO(0.0) profile", "PLACEBO");
+    for must in [
+        "E_PROFILE_SCOPE: [parameters] theta PLACEBO: `profile` applies only to a θ level \
+         block (`theta PLACEBO[...]`)",
+        "whose levels are solved for at every step.",
+        "A single θ is searched by the optimizer, so remove `profile`.",
+    ] {
+        assert!(single.contains(must), "missing {must:?} in {single}");
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, FIX) profile",
+        "theta PLACEBO[3](0.0) FIX profile",
+        "theta PLACEBO[3](0.0) profile FIX",
+    ] {
+        let fix = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] is both FIX and `profile`.",
+            "A fixed block has nothing to solve for, so remove one of the two.",
+        ] {
+            assert!(fix.contains(must), "{decl}: missing {must:?} in {fix}");
+        }
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, -5.0) profile",
+        "theta PLACEBO[3](0.0, -5.0, 5.0) profile",
+    ] {
+        let bounds = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has bounds and `profile`.",
+            "A profiled block is solved without constraints, so it takes none: write \
+             `theta PLACEBO[...](init) profile`.",
+        ] {
+            assert!(
+                bounds.contains(must),
+                "{decl}: missing {must:?} in {bounds}"
+            );
+        }
+    }
+}
+
+/// `profile` is peeled off a `theta` line only: on any other declaration it is an
+/// unrecognised word, not a silently accepted one.
+#[test]
+fn profile_is_peeled_off_a_theta_line_only() {
+    assert_eq!(
+        split_profile_modifier("omega ETA ~ 0.1 profile"),
+        ("omega ETA ~ 0.1 profile".to_string(), false)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile"),
+        ("theta A[3](0.0)".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile FIX"),
+        ("theta A[3](0.0) FIX".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0)"),
+        ("theta A[3](0.0)".to_string(), false)
+    );
+    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")
+        .replace("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 4.0 profile");
+    assert!(parse_full_model(&text).is_err());
 }
