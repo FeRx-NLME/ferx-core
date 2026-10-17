@@ -771,11 +771,17 @@ pub fn run_model_simulate_with_overrides(
             iov_occasion: Some(parsed.fit_options.iov_occasion.clone()),
         },
     )
-    // `in_context` only for its `Display` prefix: `Display` stays `"simulation failed: {e}"`
-    // byte for byte, which needs the inner error to carry no context of its own (none of
-    // `simulate_with_options_diag`'s does; `in_context` would overwrite one). `context()`
-    // here names the step, not an entry point.
-    .map_err(|e| e.in_context("simulation failed"))?;
+    // The step's prefix goes into the message, `"simulation failed: {e}"` byte for byte,
+    // with the simulation's diagnostic kept for `code()` / `block()`. Not `in_context`:
+    // `context()` names an entry point, and it would overwrite an inner one (#2062 review
+    // 2, F4).
+    .map_err(|e| {
+        let text = format!("simulation failed: {e}");
+        match e.diagnostic() {
+            Some(d) => EngineError::from_diagnostic_keeping_text(d.clone(), text),
+            None => EngineError::uncoded(text),
+        }
+    })?;
 
     // Group the simulation results by subject id once (they are emitted in
     // subject order, but a map keeps the write-back independent of that), then

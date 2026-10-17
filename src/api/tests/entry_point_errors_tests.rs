@@ -579,6 +579,34 @@ fn fit_carries_the_ode_solver_options_code() {
     }
 }
 
+/// #2062 review 2, F4: a coded refusal from `run_model_simulate`'s simulation step keeps
+/// its code, and its `"simulation failed: "` prefix is in the message, not in
+/// `context()`, which names entry points only. Fixture: a `[simulation]` design whose
+/// `GRP` is outside the declared levels, which only the simulation's data checks see
+/// (`E_COV_LEVEL_UNKNOWN`). Mutations: drop the diagnostic (`uncoded(text)` on both arms)
+/// → `None`; go back to `in_context("simulation failed")` → `context()` is `Some`.
+#[test]
+fn run_model_simulate_keeps_the_simulations_code_without_a_context() {
+    let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+    std::fs::write(
+        f.path(),
+        format!(
+            "{GRP_LEVELS_123}\n[simulation]\n  n_subjects = 1\n  dose_amt = 100\n  \
+             dose_cmt = 1\n  seed = 7\n  times = [1, 4]\n  covariate GRP = [4]\n"
+        ),
+    )
+    .unwrap();
+    let err = crate::api::run_model_simulate(f.path().to_str().unwrap())
+        .err()
+        .expect("a design level outside the declared levels is refused");
+    assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{err}");
+    assert_eq!(err.context(), None, "{err}");
+    let text = err.to_string();
+    assert!(text.starts_with("simulation failed: "), "{text}");
+    assert!(text.contains("`GRP` takes [4.0]"), "{text}");
+    assert_eq!(err.message(), text, "the prefix is part of the message");
+}
+
 /// #1772: the file entry points code their reads and binders as `ferx check` does. A
 /// model file that does not exist is `E_MODEL_READ` (`fit_from_files`, `prepare_run`,
 /// `run_model_simulate`); a dataset missing a covariate the model reads is

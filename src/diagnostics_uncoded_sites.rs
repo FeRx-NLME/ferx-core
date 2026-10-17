@@ -84,10 +84,12 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/api/run.rs",
         "run_model_simulate_with_overrides",
-        6,
+        7,
         "[simulation] design refusals with no code yet: no [simulation] block, a TTE endpoint \
          without horizon (wider than E_SIMULATE_HORIZON's row), no times for a continuous or \
-         binary endpoint, nothing to observe, a design missing a referenced covariate (#1788)",
+         binary endpoint, nothing to observe, a design missing a referenced covariate (#1788); \
+         the simulation step's own uncoded failures (e.g. a non-finite posthoc EBE) under the \
+         `simulation failed: ` prefix, whose coded ones keep their code",
     ),
     (
         "src/api/fit.rs",
