@@ -732,6 +732,34 @@ fn gate_b_applies_a_derived_occasion_rule() {
             );
         }
     }
+    // The warning half on the same derived rule: subject 2's `WIN` no longer follows the
+    // windows, so 1 of 2 subjects matches. `fit()` must hand the warnings walk its own
+    // `iov_occasion` — given `column`, the occasions stay empty and nothing matches.
+    let mut partial = pop.clone();
+    for c in partial.subjects[1].obs_covariates.iter_mut() {
+        c.insert("WIN".to_string(), 1.0);
+    }
+    let parsed = parse_full_model(&src("cs")).unwrap();
+    let r = crate::api::fit(
+        &parsed.model,
+        &partial,
+        &parsed.model.default_params,
+        &FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..parsed.fit_options.clone()
+        },
+    )
+    .expect("a partial match fits");
+    assert!(
+        r.warnings.iter().any(|w| w.contains(
+            "in 1 of 2 subjects the blocks are exactly the groups of the \
+                                 occasion grouping"
+        )),
+        "{:?}",
+        r.warnings
+    );
+
     // Finding 9: two kappas at the grouping are named in the plural.
     let two = src("cs")
         .replace(
@@ -890,4 +918,75 @@ fn the_reported_cwres_whiten_by_the_dense_r_tilde() {
         gap > 0.05,
         "a subject's CWRES are the diagonal-R ones: {gap}"
     );
+}
+
+/// Gate B's warning half, every side in one test. `cs by STUDY` next to a kappa only at
+/// `ARM` matches in exactly the subjects whose studies each hold one arm. On exact3 none
+/// do, so nothing is said. Relabel three sponsors' arms to one per study and it matches in
+/// 3 of 12: `W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`, not the refusal, also in
+/// the fit's warnings. Relabel all twelve and it is the refusal, without the warning.
+///
+/// Mutations: the warning deleted, or raised beside the refusal, or counted over every
+/// subject instead of the matching ones; each reddens its own cell. Every sentence of the
+/// message is asserted.
+#[test]
+fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
+    const WARN: &str = "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA";
+    let src = with_corr("cs", 0.3, "STUDY")
+        .replace("  kappa K_ST ~ 0.0904362 at STUDY\n", "")
+        .replace("ETA_SP + K_ST + K_ARM", "ETA_SP + K_ARM");
+    let (m, pop, opts) = load(&src);
+    // One arm per study in the first `n` sponsors.
+    let single_armed = |n: usize| {
+        let mut p = pop.clone();
+        for s in p.subjects.iter_mut().take(n) {
+            for c in s.obs_covariates.iter_mut() {
+                c.insert("ARM".to_string(), 1.0);
+                c.insert("NARM".to_string(), 50.0);
+            }
+            s.covariates.insert("ARM".to_string(), 1.0);
+        }
+        p
+    };
+    let at = |p: &Population| {
+        let errors = codes(&check_model_data(&m, p), CONFOUNDED);
+        let warns = codes(
+            &crate::api::validation::check_model_data_warnings(&m, p, &m.default_params),
+            WARN,
+        );
+        (errors, warns)
+    };
+
+    let (e, w) = at(&pop);
+    assert!(
+        e.is_empty() && w.is_empty(),
+        "no sponsor matches: {e:?} {w:?}"
+    );
+
+    let partial = single_armed(3);
+    let (e, w) = at(&partial);
+    assert!(e.is_empty(), "3 of 12 is not the refusal: {e:?}");
+    assert_eq!(w.len(), 1, "{w:?}");
+    for sentence in [
+        "`correlation cs(RHO) by STUDY`: in 3 of 12 subjects the blocks are exactly the \
+         groups of the level `ARM`, where the kappa K_ARM is drawn.",
+        "In those subjects `cs` and the kappa are the same covariance, so ρ and the kappa \
+         variance are separated only by the other 9; expect wide standard errors on both.",
+        "If the blocks should differ in every subject, check the `by` column.",
+    ] {
+        assert!(w[0].contains(sentence), "missing {sentence:?} in {}", w[0]);
+    }
+    // The fit says it too.
+    let r = eval(&m, &partial, &opts, EstimationMethod::FoceI);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|x| x.contains("in 3 of 12 subjects the blocks")),
+        "{:?}",
+        r.warnings
+    );
+
+    let (e, w) = at(&single_armed(12));
+    assert_eq!(e.len(), 1, "12 of 12 is the refusal");
+    assert!(w.is_empty(), "the refusal is not also a warning: {w:?}");
 }

@@ -158,6 +158,15 @@ form. The blocks are compared as partitions in every subject, so `cs by ARMID`
 next to `kappa … at ARM` is caught too. `ar1` and `car1` are never refused, and
 neither is `cs` over a grouping no kappa is at.
 
+When the blocks match a kappa-carrying level's groups in **some** subjects but
+not all, the model is identified, from the subjects where they differ, and fits.
+ferx says how many matched, with
+`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`, since ρ and the kappa variance
+are then separated by the other subjects alone. `cs by STUDY` next to a kappa at
+`ARM` is the usual case: the two coincide in every subject whose studies each
+have one arm. A `by` column with a typo that splits one group would otherwise
+switch the refusal off without a word.
+
 **Validation.** ferx scores NONMEM's own `exact3` optimum
 (`nonmem_anchor/nested_levels_3_ar1/`, sponsor → study → arm, `ARM` repeating
 across studies) with `ar1` at ρ = 0.5 and −0.4, `car1` at 0.6 and a ρ = 0

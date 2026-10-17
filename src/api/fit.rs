@@ -1596,7 +1596,12 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, population, init_params) {
+    for d in crate::api::validation::check_model_data_warnings_rule(
+        model,
+        population,
+        init_params,
+        &options.iov_occasion,
+    ) {
         accumulated_warnings.push(d.message);
     }
     // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):

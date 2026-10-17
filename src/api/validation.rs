@@ -6082,8 +6082,119 @@ fn residual_correlation_confounded(
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
-    let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let Some(hit) = kappa_partition_matches(model, population, iov_rule)
+        .into_iter()
+        .find(PartitionMatch::everywhere)
     else {
+        return Vec::new();
+    };
+    vec![Diagnostic::error(
+        "E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA",
+        format!(
+            "`{line}` correlates the rows in exactly the groups of {grouping}, where the \
+             {kappas_drawn}. A kappa gives every row of a group one shared random effect, \
+             which is the correlation `cs` estimates, so ρ and the kappa variance are not \
+             identified together: the same covariance for an additive kappa, nearly the same \
+             for a multiplicative one. Use `ar1` or `car1`, whose correlation decays with the \
+             lag, or drop the kappa.",
+            grouping = hit.grouping,
+            kappas_drawn = hit.kappas_drawn(),
+        ),
+    )
+    .with_block("error_model")]
+}
+
+/// `W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA` (#1082 PR5): the warning half of
+/// [`residual_correlation_confounded`]. The `cs` blocks coincide with a kappa-carrying
+/// level's groups in **some** subjects but not all. Those subjects carry the same
+/// covariance twice; the rest still separate ρ from the kappa variance, so the model is
+/// identified and fits — possibly weakly, which the covariance step's standard errors
+/// show. Said, not refused: `cs by STUDY` beside a kappa at `ARM` matches in exactly the
+/// subjects whose studies each have one arm, a common MBMA design. And a typo in a `by`
+/// column that splits one group would otherwise switch the refusal off in silence. Not
+/// raised when the refusal fires (every subject matches some grouping).
+fn residual_correlation_partly_confounded(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let matches = kappa_partition_matches(model, population, iov_rule);
+    if matches.iter().any(PartitionMatch::everywhere) {
+        return Vec::new();
+    }
+    matches
+        .into_iter()
+        .filter(|m| m.matched > 0)
+        .map(|m| {
+            Diagnostic::warning(
+                "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA",
+                &format!(
+                    "`{line}`: in {matched} of {observed} subjects the blocks are exactly the \
+                     groups of {grouping}, where the {kappas_drawn}. In those subjects `cs` and \
+                     the kappa are the same covariance, so ρ and the kappa variance are \
+                     separated only by the other {rest}; expect wide standard errors on both. \
+                     If the blocks should differ in every subject, check the `by` column.",
+                    matched = m.matched,
+                    observed = m.observed,
+                    grouping = m.grouping,
+                    kappas_drawn = m.kappas_drawn(),
+                    rest = m.observed - m.matched,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// One kappa-carrying grouping, and in how many subjects a `cs` line's blocks are exactly
+/// its groups.
+struct PartitionMatch {
+    /// "the level `ARM`", or "the occasion grouping" on a one-level model.
+    grouping: String,
+    kappas: Vec<String>,
+    /// Subjects with an observation whose blocks partition the rows as the groups do.
+    matched: usize,
+    /// Subjects with an observation.
+    observed: usize,
+}
+
+impl PartitionMatch {
+    /// The refusal's case: the partitions agree in every subject (and there is one).
+    fn everywhere(&self) -> bool {
+        self.observed > 0 && self.matched == self.observed
+    }
+
+    /// "kappa K is drawn" / "kappas K, K2 are drawn".
+    fn kappas_drawn(&self) -> String {
+        let (word, verb) = if self.kappas.len() > 1 {
+            ("kappas", "are")
+        } else {
+            ("kappa", "is")
+        };
+        format!("{word} {} {verb} drawn", self.kappas.join(", "))
+    }
+}
+
+/// The one partition count both halves of gate B read (#1082 PR5, decision
+/// 6238324099): for a `cs` line on a model with kappa, per kappa-carrying grouping —
+/// each nested level with a kappa, or the occasions of a one-level model, with a derived
+/// `iov_occasion` rule applied as the fit applies it — the number of subjects whose `cs`
+/// blocks group the observation rows exactly as that grouping's groups do (a row in no
+/// block is a group of its own). Empty for `ar1`, `car1` and models without kappa.
+///
+/// On partitions, not names, so `cs by ARMID`, a column numbering the arms across the
+/// whole file, matches a kappa at `ARM`.
+fn kappa_partition_matches(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<PartitionMatch> {
+    let Some(serial) = &model.residual_serial else {
         return Vec::new();
     };
     if serial.kind != crate::types::ResidualSerialKind::Cs || model.n_kappa == 0 {
@@ -6118,19 +6229,23 @@ fn residual_correlation_confounded(
                 .collect(),
         )
     };
-    // Whether `groups` partitions the observation rows of every subject with one exactly
-    // as the `cs` blocks do.
-    let same_partition = |pop: &Population, groups: &dyn Fn(&Subject) -> Vec<usize>| {
-        let mut observed = pop.subjects.iter().filter(|s| !s.obs_times.is_empty());
-        let first = observed.next();
-        first.is_some()
-            && first
-                .into_iter()
-                .chain(observed)
-                .all(|s| groups(s) == blocks(s))
+    let count = |pop: &Population,
+                 grouping: String,
+                 kappas: Vec<String>,
+                 groups: &dyn Fn(&Subject) -> Vec<usize>| {
+        let observed: Vec<&Subject> = pop
+            .subjects
+            .iter()
+            .filter(|s| !s.obs_times.is_empty())
+            .collect();
+        PartitionMatch {
+            grouping,
+            kappas,
+            matched: observed.iter().filter(|s| groups(s) == blocks(s)).count(),
+            observed: observed.len(),
+        }
     };
-    // The kappa-carrying groupings: each nested level with a kappa, or the occasions.
-    let mut hit: Option<(String, Vec<String>)> = None;
+    let mut out = Vec::new();
     if let Some(levels) = model.nested_levels() {
         for (l, level) in levels.levels.iter().enumerate() {
             let kappas: Vec<String> = model
@@ -6155,10 +6270,12 @@ fn residual_correlation_confounded(
                 }
                 canonical(class)
             };
-            if same_partition(population, &groups) {
-                hit = Some((format!("the level `{}`", level.name), kappas));
-                break;
-            }
+            out.push(count(
+                population,
+                format!("the level `{}`", level.name),
+                kappas,
+                &groups,
+            ));
         }
     } else {
         // The occasions the fit will integrate over: a derived rule labels them only when
@@ -6179,31 +6296,14 @@ fn residual_correlation_confounded(
                     .collect(),
             )
         };
-        if same_partition(pop, &groups) {
-            hit = Some((
-                "the occasion grouping".to_string(),
-                model.kappa_names.clone(),
-            ));
-        }
+        out.push(count(
+            pop,
+            "the occasion grouping".to_string(),
+            model.kappa_names.clone(),
+            &groups,
+        ));
     }
-    let Some((grouping, kappas)) = hit else {
-        return Vec::new();
-    };
-    vec![Diagnostic::error(
-        "E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA",
-        format!(
-            "`{line}` correlates the rows in exactly the groups of {grouping}, where the \
-             {kappa_word} {kappas} {is_are} drawn. A kappa gives every row of a group one shared random effect, which \
-             is the correlation `cs` estimates, so ρ and the kappa variance are not identified \
-             together: the same covariance for an additive kappa, nearly the same for a \
-             multiplicative one. Use `ar1` or `car1`, whose correlation decays with the lag, \
-             or drop the kappa.",
-            kappa_word = if kappas.len() > 1 { "kappas" } else { "kappa" },
-            is_are = if kappas.len() > 1 { "are" } else { "is" },
-            kappas = kappas.join(", ")
-        ),
-    )
-    .with_block("error_model")]
+    out
 }
 
 /// What `residual_correlation_range` checks ρ's range on.
@@ -7614,12 +7714,28 @@ pub fn check_model_data_warnings(
     population: &Population,
     init_params: &ModelParameters,
 ) -> Vec<Diagnostic> {
+    check_model_data_warnings_rule(model, population, init_params, &IovOccasionRule::Column)
+}
+
+/// [`check_model_data_warnings`] aware of the model-side IOV occasion rule, which the one
+/// warning on derived occasions needs (`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`,
+/// #1082 PR5): `fit()` and `ferx check` pass the fit's `iov_occasion`, as they do to
+/// [`check_model_data_rule`].
+pub(crate) fn check_model_data_warnings_rule(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
     diags.extend(residual_correlation_inert(model, population));
+    diags.extend(residual_correlation_partly_confounded(
+        model, population, iov_rule,
+    ));
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
@@ -9036,10 +9152,11 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                         &parsed.fit_options.iov_occasion,
                     ));
                     let init_params = parsed.model.default_params.clone();
-                    diags.extend(check_model_data_warnings(
+                    diags.extend(check_model_data_warnings_rule(
                         &parsed.model,
                         &population,
                         &init_params,
+                        &parsed.fit_options.iov_occasion,
                     ));
                     // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
                     // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /

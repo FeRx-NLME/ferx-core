@@ -116,6 +116,7 @@
 //! | `E_NESTED_LEVEL_METHOD_UNSUPPORTED` | a nested model fitted with a stage other than `foce` / `focei` at `n_agq = 1`, or with a `[mixture]` / FREM (#1082). Block `fit_options` |
 //! | `E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS` | a residual `correlation … by` line on a nested model whose grouping a level and a data column would read two ways: a level in a list of columns, a level name that is also a different column, or a nested level's column under another name (#1082 PR5). Raised by `fit()`, `ferx check --data` and `simulate()`. Block `error_model` |
 //! | `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA` | a `correlation cs(…)` line whose blocks partition the rows exactly as a kappa-carrying level's groups (nested, or the occasions of one level): the kappa is the same covariance (#1082 PR5). Raised by `fit()` and `ferx check --data`. Block `error_model` |
+//! | `W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA` | the same partitions agree in some subjects but not all: identified from the others, so it fits, with the count said (#1082 PR5). Raised by `fit()` and `ferx check --data` |
 //! | `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED` | a nested model reached an adaptive-dosing entry point, whose kappa stream draws one kappa per occasion (#1082); `simulate*` draws per level. Block `parameters`. Never by `ferx check` |
 
 use serde::Serialize;
