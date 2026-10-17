@@ -275,17 +275,19 @@ Carried, in this order:
    you use it through.
 5. **The ODE-solver diagnostics** of the pass that just ran.
 
-Ahead of the bundle, `predict_diag()`, both `simulate_*_diag()` forms and
-`simulate_adaptive()` also carry the **steady-state non-convergence note** of
-the pass that just ran: the uncoded message beginning "Steady-state (SS=1)
-equilibration…", which `fit()` reports too. It fires when an `SS=1` dose on a
-nonlinear `[odes]` model reaches the equilibration cycle cap short of steady
-state, so the returned trough is unreliable or biased low. Before
+Ahead of the bundle, `predict_diag()`, both `simulate_*_diag()` forms and the
+adaptive driver (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) also
+carry the **steady-state non-convergence note** of the pass that just ran: the
+uncoded message beginning "Steady-state (SS=1) equilibration…", which `fit()`
+reports too. It fires when an `SS=1` dose on a nonlinear `[odes]` model reaches
+the equilibration cycle cap short of steady state, so the returned trough is
+unreliable or biased low. Before
 [#1652](https://github.com/FeRx-NLME/ferx-core/issues/1652), `predict_diag()` and
-`simulate_adaptive()` ran the same capped equilibration and said nothing. Each
-of these calls reports only its own pass: a note left by an earlier call is
-cleared on entry. The thin wrappers in the table above discard it along with
-everything else.
+the adaptive driver ran the same capped equilibration and said nothing. Each of
+these calls reports only its own pass: a note left by an earlier call is cleared
+on entry. The thin wrappers (`predict()`, `simulate()`, `simulate_with_seed()`,
+`simulate_with_options()`, `simulate_with_uncertainty()`; see
+[the entry-point table](#entry-points)) discard it along with everything else.
 
 Not carried, and the reason is structural rather than editorial:
 
