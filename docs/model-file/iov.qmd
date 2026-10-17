@@ -526,6 +526,17 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 
 `simulate()` is occasion-aware for a `kappa` model: it draws one independent κ ~ N(0, Ω~IOV~) per occasion group, so a VPC from an IOV model carries the inter-occasion spread the fit estimated (drawing a single κ for the whole subject would silently under-disperse it).
 
+The occasion groups come from the population's occasion labels. A model whose occasions are derived by `iov_occasion = dose` or `iov_occasion = time(...)` rather than read from an `iov_column` has no labels in the data, so each simulate entry point has to apply the rule itself, as `fit()` does (#1955):
+
+| Entry point | Rule applied |
+|---|---|
+| `simulate_with_options()`, `simulate_with_options_diag()` | `SimulateOptions::iov_occasion`. Applied before the propensity posthoc pass too, so a matched simulation estimates η̂ with κ |
+| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | `FitResult::iov_occasion`, the rule the fit ran under |
+| `ferx --simulate` | the model file's own `[fit_options] iov_occasion` |
+| `simulate()`, `simulate_with_seed()` | none |
+
+A subject that still carries no occasion label is simulated at κ = 0, with no inter-occasion variability. That is the intended reading of a population with no occasions (NONMEM `$SIM` treats `OCC = 0` as `KAPPA = 0`), so it is not an error. The `_diag` forms report it as one `W_IOV_NO_OCCASIONS` warning, which counts the subjects affected. `simulate()` and `simulate_with_seed()` return no warnings, so on a rule-derived model they simulate at κ = 0 silently. Use `simulate_with_options_diag()` with the rule instead. `ferx --simulate` never gets that far: its `[simulation]` design has no occasion column, so without an `iov_occasion` rule it is refused with `E_IOV_MISSING_OCC` before anything is simulated (see *`--simulate`* above). With a rule, the returned population carries the derived labels, so the sdtab writes `OCC`.
+
 That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's own parameters (`model.default_params`) always carry it, but a caller that **rebuilds** parameters from a fit must thread the fitted IOV covariance through as well — `estimation::uncertainty_samples::fitted_params_from_result()` does this and is the supported way to go from a `FitResult` to a simulate-ready `ModelParameters`; it refuses (`E_PARAM_SHAPE`) a fit whose `omega_iov` does not match the model's `kappa`: missing on a model with `kappa` (rather than substituting the model's initial Ω~IOV~), present on a model without, or mis-sized (issue #1789), and a fit whose Ω, σ or Ω~IOV~ is mis-sized or not square (issue #1833). Parameters with a missing `omega_iov` are rejected: every `simulate*` entry point returns an `Err` naming the omission rather than silently emitting occasion-free draws (issue #1019).
 
 ## Limitations

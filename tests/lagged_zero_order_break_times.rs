@@ -578,6 +578,7 @@ fn simulated_event_times_see_the_lagged_zero_order_route() {
         horizon: Some(24.0),
         seed: Some(42),
         match_method: None,
+        iov_occasion: None,
     };
     let draw = |beta: &str| -> Vec<f64> {
         let model =

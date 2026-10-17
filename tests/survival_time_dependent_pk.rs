@@ -203,6 +203,7 @@ fn simulate_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
         horizon: Some(30.0),
         seed: Some(1853),
         match_method: None,
+        iov_occasion: None,
     };
     let err = simulate_with_options(&m, &population(&m), &m.default_params, 1, &opts)
         .expect_err("simulate must refuse");
@@ -300,6 +301,7 @@ fn the_time_free_control_is_accepted_by_every_entry_point() {
         horizon: Some(30.0),
         seed: Some(1853),
         match_method: None,
+        iov_occasion: None,
     };
     let sim = simulate_with_options(&m, &pop, &m.default_params, 1, &opts)
         .expect("the control must simulate");

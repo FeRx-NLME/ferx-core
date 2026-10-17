@@ -976,6 +976,7 @@ fn simulate_propensity_on_analytical_model_with_modeled_dose_errs() {
         seed: Some(1),
         match_method: Some(ferx_core::MatchMethod::Optimal),
         horizon: None,
+        iov_occasion: None,
     };
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("an unbacked RATE=-2 dose must be refused before the EBE pass");
