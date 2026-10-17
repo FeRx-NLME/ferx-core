@@ -589,12 +589,13 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// operation per process at a time (the CLI / ferx-r usage): each draining entrypoint
 /// [`clear_ss_nonconvergence_warnings`] on entry and [`take_ss_nonconvergence_warnings`] on exit to
 /// bracket its own run; genuinely concurrent in-process operations would share the sink. A
-/// draining call *nested* inside another's window clears the outer run's notes, so none may run
-/// after the outer run has written one. The one nested caller today is `suggest_start::sweep`,
-/// which calls `predict()` inside `fit()` (via `inits_from_nca`) after `fit()`'s clear and before
-/// any objective pass: it removes only the sweep's own grid-point notes, which are not about the
-/// fit's estimate. Writers that do not drain (e.g. the public `pk::compute_predictions_with_states`)
-/// leave their note for the next draining entrypoint, whose clear discards it.
+/// draining call *nested* inside another's window clears the outer run's notes, so code that runs
+/// inside an entry point must not call one. `suggest_start::sweep`, which predicts inside `fit()`
+/// (via `inits_from_nca`) — once per start of a multi-start fit, concurrently with the other
+/// starts' objective passes — therefore uses the non-draining `api::predict_diag_undrained`
+/// rather than `predict()` (#1652 review r1 #1). Writers that do not drain (e.g. the public
+/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint,
+/// whose clear discards it.
 fn ss_nonconvergence_sink() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
     static SINK: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
         std::sync::OnceLock::new();
@@ -717,7 +718,11 @@ fn ss_equilibration_tail_warning(
 
 /// Serializes the tests that *read* the process-global SS non-convergence sink
 /// ([`take_ss_nonconvergence_warnings`], #867) so cargo's parallel harness can't have one test
-/// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
+/// drain another's entry mid-read. It does **not** serialize them against the draining `api`
+/// entry points (`fit`, `predict`/`predict_diag`, the `simulate*` family, the adaptive driver),
+/// which clear the sink on entry without taking this guard: a lib test calling one of those can
+/// empty the sink between a reader's write and its take. Known exposure, tracked separately
+/// (#1652 review r1 #2).
 /// Lives here rather than beside any one test module because the sink is now shared by the ODE
 /// (`ode::predictions`) and analytical (`pk::event_driven`) fallbacks, which sit in different
 /// files but the *same* lib-test binary — a per-file guard would not serialize them against

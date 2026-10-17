@@ -147,7 +147,28 @@ pub fn predict_diag(
     // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
     // the clear, a note left by an earlier non-draining caller would be reported as this pass's.
     crate::dosing::clear_ss_nonconvergence_warnings();
+    let out = predict_diag_undrained(model, population, params)?;
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(out.warnings);
+    Ok(PredictionOutput {
+        results: out.results,
+        warnings,
+    })
+}
 
+/// [`predict_diag`] without touching the process-global SS non-convergence sink: the same rows,
+/// the same `Err`s and the same non-fit bundle, but no clear on entry and no take on exit, so the
+/// SS note this pass writes stays in the sink for the enclosing operation to drain.
+///
+/// For a caller that runs *inside* another entry point's clear→take window. A draining call there
+/// would wipe notes the enclosing run already wrote: `suggest_start::sweep` runs inside each
+/// start of a multi-start `fit()`, whose starts run concurrently, so one start's sweep would
+/// delete a note another start's objective passes had written (#1652 review r1 #1).
+pub(crate) fn predict_diag_undrained(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Result<PredictionOutput, EngineError> {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
@@ -293,15 +314,16 @@ pub fn predict_diag(
             None => predict_subjects_serial(),
         }
     };
-    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
-    warnings.extend(super::non_fit_diagnostics(
-        model,
-        population,
-        params,
-        &stats,
-        super::SolverStatsPhase::Predict,
-    ));
-    Ok(PredictionOutput { results, warnings })
+    Ok(PredictionOutput {
+        results,
+        warnings: super::non_fit_diagnostics(
+            model,
+            population,
+            params,
+            &stats,
+            super::SolverStatsPhase::Predict,
+        ),
+    })
 }
 
 /// A single prediction

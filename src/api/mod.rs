@@ -103,6 +103,7 @@ pub(crate) use postfit::{
 };
 #[cfg(test)]
 pub(crate) use postfit::{compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ};
+pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
