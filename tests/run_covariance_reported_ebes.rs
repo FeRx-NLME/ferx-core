@@ -10,8 +10,8 @@
 //!
 //! - **cold reported** (default `inner_maxiter`): the cold solve reproduces the objective, no
 //!   warning is written, and the reported EBEs are the cold ones. Also reloaded from `.fitrx`,
-//!   whose six-decimal EBEs must still be recognised as the cold solve — the claim there is
-//!   bit identity too.
+//!   which stores the EBEs exactly since #1847 — the claim there is bit identity too. A
+//!   bundle written before #1847, at six decimals, is `run_covariance_per_engine.rs`'s.
 //! - **non-cold reported** (`inner_maxiter = 7`): the warm-started trajectory reaches
 //!   warfarin's FOCEI optimum, but seven inner iterations from η = 0 do not, so the cold
 //!   solve scores *worse* and a non-cold candidate is reported. Both covariance methods: the
@@ -30,8 +30,8 @@
 //! different `inner_maxiter` changes the cold solve it compares the reported EBEs against.
 //!
 //! Mutations: return the cold solve unconditionally from `reported_ebe_inputs` → both
-//! `non_cold` rows die; drop `REPORTED_EBE_TOL` to zero → the reload row dies; rebuild `H` at
-//! the cold EBEs instead of the reported ones → the `s` row dies.
+//! `non_cold` rows die; rebuild `H` at the cold EBEs instead of the reported ones → the `s`
+//! row dies.
 //!
 //! Engines: analytic (`Dual2`) inner gradients, asserted per fit through
 //! `gradient_method_inner`; the outer optimizer is the `auto` default.
@@ -147,12 +147,12 @@ fn cold_reported_repeats_inline_covariance_in_memory_and_after_reload() {
         back.subjects
             .iter()
             .zip(&f.fit.subjects)
-            .any(|(b, a)| b.eta != a.eta),
-        "premise: the .fitrx round trip must round the EBEs"
+            .all(|(b, a)| b.eta == a.eta),
+        "the .fitrx round trip must keep the EBEs exactly (#1847)"
     );
     assert!(
         rerun(&f, &back, "cold reported, reloaded") == inline,
-        "cold reported, reloaded: the rounded EBEs must still be taken as the cold solve"
+        "cold reported, reloaded: the reloaded EBEs must still be taken as the cold solve"
     );
 }
 

@@ -82,6 +82,21 @@ source is always available as `loaded.model_source` and can be re-parsed via
 
 Entries are deflate-compressed inside the zip archive.
 
+### Numbers in the CSV entries
+
+Every double in the CSV entries is written as the shortest text that reads back as the
+same `f64` (`0.1`, `0.30000000000000004`, `1e-7`), with an exponent when the value is far
+from one. `NaN` is an empty cell and the infinities are `inf` / `-inf`. A reloaded fit
+therefore holds the EBEs, κ̂ and predictions the saved fit held, bit for bit, which is what
+lets `run_covariance` and `run_sir` repeat the fit's own covariance step and SIR on it
+([#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)).
+
+Bundles written before #1847 hold these doubles at six decimal places. They still load,
+and the values are the rounded ones. `run_covariance` recognises EBEs with that spelling
+and treats them as it always did: when they are within 1e-6 of a cold inner solve, it
+starts from the cold solve. A reader must accept both spellings. ferx-r has written exact
+CSV doubles since ferx-r#415.
+
 ## `manifest.json`
 
 ```json
@@ -394,8 +409,8 @@ other non-finite float.
 
 ```
 ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
-1,0.029777,0.070511,0.438001,-25.745580,11
-2,0.017193,-0.058745,-0.344668,-33.692046,11
+1,0.027974420148319645,0.06614967166052502,0.4822913599410782,-27.117019931625446,11
+2,0.015436836841694453,-0.06290220762098092,-0.2994881644065366,-33.181514844609865,11
 ```
 
 - `ID` — subject identifier as a string (matches `Population.subjects[i].id`).
@@ -425,14 +440,15 @@ Distribution task / saemix's `conddist.saemix`.
 
 ```
 ID,ETA,COND_MEAN,COND_SD,COND_MODE
-1,eta_CL,0.110000,0.050000,0.098000
-1,eta_V,-0.190000,0.060000,-0.175000
+1,eta_CL,0.11,0.05,0.098
+1,eta_V,-0.19,0.06,-0.175
 ```
 
 - `COND_MEAN` / `COND_SD` — mean and SD of the retained MCMC draws for that
   subject/eta.
 - `COND_MODE` — the EBE (same value as `ebes.csv`), included for direct
-  comparison against the conditional mean.
+  comparison against the conditional mean. The loader checks that it reads back as
+  the same value as the `ebes.csv` cell, whatever its spelling.
 - One row per (subject, eta), subject rows contiguous in fit order.
 
 The retained draws themselves (`saem_conddist_keep_samples = true`) and
@@ -445,7 +461,7 @@ pass itself uses) rather than stored redundantly.
 
 ```
 ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
-1,0.500000,5.365300,4.078143,5.351798,0.579358,0.237126,-25.745580,11
+1,0.5,5.3653,3.9165677732979756,5.354088670487155,0.8369821497673978,0.19482332597649954,-27.117019931625446,11
 ```
 
 - `ID` — subject string identifier.
