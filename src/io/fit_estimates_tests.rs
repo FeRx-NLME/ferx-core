@@ -366,3 +366,34 @@ fn every_kind_names_the_keyword_it_is_declared_with() {
     assert_eq!(EstimateKind::Sigma.keyword(), "sigma");
     assert_eq!(EstimateKind::Kappa.keyword(), "kappa");
 }
+
+/// #852. A fit JSON written before `FitResult::ode_linear_exact` existed has no such key —
+/// `[priors] from_fit = "old-fit.json"` reads it through this same
+/// `serde_json::from_str::<FitResult>` — and must load, as `false`. A fit that did run exact
+/// round-trips `true`, so the field is read rather than merely tolerated.
+///
+/// Mutation — drop `#[serde(default)]` on the field: the old-JSON read fails with
+/// "missing field `ode_linear_exact`" and this dies.
+#[test]
+fn json_without_ode_linear_exact_reads_as_false() {
+    let mut fit = fit_with_iov();
+    fit.ode_linear_exact = true;
+    let mut v = fit.to_json_value();
+    let back: FitResult = serde_json::from_str(&v.to_string()).expect("current JSON reads back");
+    assert!(
+        back.ode_linear_exact,
+        "a fit that ran exact must round-trip `true`"
+    );
+    let removed = v
+        .as_object_mut()
+        .expect("a fit serializes to an object")
+        .remove("ode_linear_exact");
+    assert_eq!(
+        removed,
+        Some(serde_json::Value::Bool(true)),
+        "the key must be written"
+    );
+    let old: FitResult = serde_json::from_str(&v.to_string())
+        .unwrap_or_else(|e| panic!("a pre-#852 fit JSON must still load: {e}"));
+    assert!(!old.ode_linear_exact);
+}

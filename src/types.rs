@@ -4152,6 +4152,41 @@ pub struct EndpointPredictionResult {
     pub prediction: Prediction,
 }
 
+/// One `level NAME by COLUMN in PARENT` declaration in `[parameters]` (#1082): the
+/// records of a subject that share a `COLUMN` value inside one group of `PARENT` (`ID`,
+/// or the level declared just before it) form one group of this level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LevelSpec {
+    /// The level's name, which `kappa … at NAME` refers to.
+    pub(crate) name: String,
+    /// The data column whose value labels a record's group.
+    pub(crate) column: String,
+    /// `ID`, or the name of the level this one nests in.
+    pub(crate) parent: String,
+}
+
+/// The variability levels below `ID` of a model that declares more than one (#1082).
+///
+/// The levels form one chain, `levels[0]` in `ID` and each later level in the one before
+/// it, and a group is identified by its key path: `ARM = 1` in study 1 and `ARM = 1` in
+/// study 2 are different groups. Each κ lives at exactly one level and is drawn once per
+/// group of it, and all levels of a subject are integrated jointly in that subject's
+/// marginal.
+///
+/// A model with one level — `iov_column` / `iov_occasion`, or a single `level` line,
+/// which is its explicit spelling — has `None` here and is today's inter-occasion
+/// variability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedLevels {
+    /// The levels, outermost first.
+    pub(crate) levels: Vec<LevelSpec>,
+    /// The level index of each κ, parallel to `CompiledModel::kappa_names`.
+    pub(crate) kappa_level: Vec<usize>,
+    /// Per random effect in `[η…, κ…]` order, the individual parameters whose own
+    /// expression reads it — the `readers` the single-member check compares.
+    pub(crate) readers: Vec<Vec<String>>,
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -5775,6 +5810,19 @@ impl CompiledModel {
         self.kappa_weights.iter().any(|w| w.is_some())
     }
 
+    /// Whether the model declares more than one variability level below `ID` (#1082).
+    #[inline]
+    pub(crate) fn has_nested_levels(&self) -> bool {
+        self.indiv_param_partials.nested_levels.is_some()
+    }
+
+    /// The nested variability levels of a model that declares more than one `level`
+    /// (#1082); `None` for every other model, including one with a single level.
+    #[inline]
+    pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
+        self.indiv_param_partials.nested_levels.as_ref()
+    }
+
     /// Whether an *active* custom residual magnitude depends on `θ`
     /// (see [`RuvMagnitude::theta_dependent`]).
     ///
@@ -7055,6 +7103,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("w_iov_no_occasions") {
+        // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
+        // A simulated subject handled specially, like the arm above; matched on its token
+        // so no prose arm has to stay clear of its wording.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted
@@ -7415,14 +7468,30 @@ pub struct FitResult {
     pub gradient_method_outer: String,
     /// True when the model uses ODE integration; false for analytical PK.
     pub uses_ode_solver: bool,
+    /// True when the `[odes]` system was certified linear and propagated exactly by the matrix
+    /// exponential instead of integrated (#852) — `ode_method = auto` on a qualifying model,
+    /// or `ode_method = linear`. False for an analytical model, a nonlinear system, or a
+    /// linear one whose `ode_method` names an integrator. Also false when the propagator
+    /// declined any segment of the prediction pass at the final estimates
+    /// ([`OdeSolverStats::linear_declined_segments`](crate::ode::OdeSolverStats)), since those
+    /// segments were integrated.
+    ///
+    /// `#[serde(default)]`: a fit JSON written before #852 has no such key, and reads back as
+    /// `false` — the route those fits did run on.
+    #[serde(default)]
+    pub ode_linear_exact: bool,
     /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
     pub uses_sde: bool,
     /// Number of Rayon worker threads used during this fit.
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
     pub nlopt_missing_algorithms: Vec<String>,
-    /// Estimated OFV evaluations for the covariance step (n_params²), set
-    /// when `run_covariance_step = true` and `n_parameters > 30`.
+    /// Estimated OFV evaluations for the covariance step's `R` matrix on the
+    /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
+    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
+    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
+    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
+    /// applies, which evaluates none of them.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -8153,7 +8222,7 @@ pub struct FitOptions {
     /// default. Exists only so the high-dimension routing guard (#1064) can
     /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
     /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
-    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// subject's EBEs at each of `2·n²` objective evaluations, so a *defaulted*
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
@@ -9352,8 +9421,9 @@ pub enum SaemMstepSolver {
     /// Opt-in, and **restricted to the plain Gaussian residual scope** the
     /// expected information has a closed form on: no IOV, no mixture, no M3, no
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
-    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
     ///
     /// It was a **candidate default** in #1449 and did not become one: it is
     /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
@@ -9526,9 +9596,10 @@ pub const BOBYQA_MAX_DIM: usize = 64;
 /// routes to the cross-product (#1064).
 ///
 /// The `R` matrix is a finite-difference Hessian of the objective that
-/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
-/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
-/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+/// reconverges every subject's EBEs at each of `2·n²` objective
+/// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
+/// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`
+/// builds no `R` (#1803) and needs one pass.
 pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method

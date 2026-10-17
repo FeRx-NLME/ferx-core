@@ -1057,6 +1057,9 @@ pub fn print_results(result: &FitResult) {
     } else {
         eprintln!("Estimation method: {}", result.method.label());
     }
+    if result.ode_linear_exact {
+        eprintln!("ODE solution:      exact (linear system, matrix exponential)");
+    }
     eprintln!("Iterations: {}", result.n_iterations);
 
     eprintln!("\n--- Objective Function ---");
@@ -2576,6 +2579,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  covariance_method: {}", m.label()).map_err(|e| e.to_string())?;
     }
     writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
+    // Which ODE path ran (#852): `ode_method` in the settings records what was asked for
+    // (`auto`), not what `auto` resolved to. Emitted only for ODE models, where it means something.
+    if result.uses_ode_solver {
+        writeln!(f, "  ode_linear_exact: {}", result.ode_linear_exact)
+            .map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
     if let Some(n_hmc) = result.saem_n_subjects_hmc {
         let n_mh = result.n_subjects.saturating_sub(n_hmc);
@@ -3667,6 +3676,7 @@ mod tests {
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            ode_linear_exact: false,
             uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: Vec::new(),
@@ -3837,6 +3847,30 @@ mod tests {
             "the condition number must carry the estimator on its own line — it is \
              the figure most often copied out alone:\n{s}"
         );
+    }
+
+    /// #852: the fit YAML says which ODE path ran — both values on an ODE fit, and no key at
+    /// all on an analytical one, where "exact linear: false" would read as "integrated".
+    #[test]
+    fn write_estimates_yaml_records_the_ode_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_for = |uses_ode: bool, exact: bool, name: &str| {
+            let mut r = comprehensive_result();
+            r.uses_ode_solver = uses_ode;
+            r.ode_linear_exact = exact;
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let exact = yaml_for(true, true, "exact.yaml");
+        assert!(exact.contains("  ode_linear_exact: true\n"), "{exact}");
+        let integrated = yaml_for(true, false, "integrated.yaml");
+        assert!(
+            integrated.contains("  ode_linear_exact: false\n"),
+            "{integrated}"
+        );
+        let analytical = yaml_for(false, false, "analytical.yaml");
+        assert!(!analytical.contains("ode_linear_exact"), "{analytical}");
     }
 
     /// #1382: the fit YAML records the estimator, spelled as the `[fit_options]`
@@ -4700,6 +4734,7 @@ mod tests {
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            ode_linear_exact: false,
             uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: Vec::new(),

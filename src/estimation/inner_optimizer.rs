@@ -4,7 +4,7 @@ use crate::stats::likelihood::{
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
-use crate::stats::stacked_layout::{kappa_offset, kappa_range, stacked_width};
+use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
@@ -207,6 +207,9 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
+    if crate::sens::provider::nested_levels_outside_analytic_scope(model) {
+        return "nested variability levels on a closed-form transit/IG model";
+    }
     if analytic_inner_common_bail(model) {
         return "model-level analytic inner fallback";
     }
@@ -218,6 +221,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     }
     if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
+    }
+    // A nested-level subject never given its cells has no compact axes (#1082): every walk
+    // declines it (`StackedLayout::sens_of` is `None`), on every model class.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return "nested-level subject without level cells";
     }
     // #814: attribute against the *effective* model for this subject. A closed-form
     // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
@@ -285,8 +293,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if layout.n_groups() == 0 {
             return "no observation occasions";
         }
-        let n_stacked = layout.n_stacked();
-        let m_dim = eff.n_theta + n_stacked;
+        // The walk's width: the compact axis count under nested levels (the unprepared
+        // case returned above, so `sens_of` only falls back for a model without levels).
+        let n_axes = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
+            .map_or(layout.n_stacked(), |l| l.n_axes());
+        let m_dim = eff.n_theta + n_axes;
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
@@ -375,11 +386,14 @@ fn iov_fd_fallback_warning(
             *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
         }
     }
-    // Mirror the non-IOV contract: only warn for a *mixed* population. An
-    // all-analytic (`n_fd == 0`) population needs no warning, and an all-FD
-    // (`n_fd == n_total`) one is already obvious from the `finite-difference`
-    // banner and the model itself (e.g. `gradient = fd`, LTBS). #590 review.
-    if n_fd == 0 || n_fd == n_total {
+    // Mirror the non-IOV contract, its #926 clause included: warn for a *mixed*
+    // population, and for an all-FD one whose model-level report still claims analytic
+    // (`gradient_method_inner` reads the same `inner_reports_analytic_model`), since
+    // nothing else would correct that label. An all-analytic (`n_fd == 0`) population
+    // needs no warning, and an all-FD one that also *reports* FD (e.g. `gradient = fd`)
+    // is already obvious from the banner and the label (#590 review, #1907).
+    let model_reports_analytic = inner_reports_analytic_model(model);
+    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic) {
         return None;
     }
     let reason_text = reasons
@@ -1622,9 +1636,18 @@ pub(crate) fn find_ebe_cached(
     schedule: Option<&pk::event_driven::EventSchedule>,
     policy: InnerSolvePolicy,
 ) -> EbeResult {
+    #[cfg(test)]
+    EBE_SOLVES_STARTED.with(|n| n.set(n.get() + 1));
     find_ebe_impl(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
     )
+}
+
+// Solves entered through `find_ebe_cached` on this thread, so a test can observe which
+// subjects an inner pass actually solved rather than which it finished (#574 review).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
@@ -1662,6 +1685,23 @@ fn find_ebe_impl(
 ) -> EbeResult {
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // A nested-level subject that was never given its cells (#1082): refused, never
+    // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
+    // from averaging the placeholder into an objective.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1e20,
+            kappas: Vec::new(),
+            hard_reject: true,
+        };
     }
 
     // ── IOV branch ─────────────────────────────────────────────────────────
@@ -2340,6 +2380,16 @@ pub(crate) fn ebe_h_matrices_at(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `(analytic, finite-difference)` gradient steps `find_ebe_iov`'s `agrad` has taken on
+    /// this thread when the analytic inner route is in scope. The FD arm is a silent
+    /// per-iterate fallback — the fit still reports the analytic route — so a test that
+    /// means "the search ran on the analytic gradient" reads this (#2053 review 1).
+    pub(crate) static IOV_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
 /// where bsv_psi = bsv_eta + mu (matches the non-IOV path's mu-referencing
 /// shift). Kappas are zero-centered IOV draws and are not mu-shifted.
@@ -2364,12 +2414,44 @@ fn find_ebe_iov(
 
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
-    let n_flat = stacked_width(n_eta, n_kappa, k_occasions);
+    // #1082: under nested levels the search runs over the compact vector — one κ block
+    // per group of each level — and each candidate is expanded to the per-cell κ vectors
+    // the prediction reads. Without nested levels the compact vector *is* the
+    // per-occasion stack, and every line below reads exactly as before.
+    let nested = crate::stats::nested_levels::NestedLayout::of(model, subject);
+    let n_flat = match &nested {
+        Some(n) => n.n_compact(),
+        None => stacked_width(n_eta, n_kappa, k_occasions),
+    };
+    let to_kappas = |p: &[f64]| -> Vec<Vec<f64>> {
+        match &nested {
+            Some(n) => n.expand(p),
+            None => (0..k_occasions)
+                .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
+                .collect(),
+        }
+    };
 
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
-    let mut x = iov_initial_vector(n_eta, n_flat, &mu, eta_init);
+    // A joint warm start arrives in the per-occasion layout (`η̂` then each cell's κ̂,
+    // as `EbeResult` reports them); under nested levels it is compacted first.
+    let nested_warm: Option<Vec<f64>> = match (&nested, eta_init) {
+        (Some(n), Some(w)) if w.len() == stacked_width(n_eta, n_kappa, k_occasions) => {
+            let cells: Vec<&[f64]> = (0..k_occasions)
+                .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
+                .collect();
+            n.compact(&w[..n_eta], &cells)
+        }
+        (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
+        _ => None,
+    };
+    let warm = match &nested {
+        Some(_) => nested_warm.as_deref(),
+        None => eta_init,
+    };
+    let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -2397,9 +2479,7 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(pi, mi)| pi - mi)
             .collect();
-        let kappas: Vec<Vec<f64>> = (0..k_occasions)
-            .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
-            .collect();
+        let kappas = to_kappas(p);
         individual_nll_iov_frozen(
             model,
             subject,
@@ -2451,6 +2531,11 @@ fn find_ebe_iov(
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
         }
+        if nested.is_some() {
+            // The predicate reads the per-occasion stack the prediction sees.
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
         inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
     };
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
@@ -2470,6 +2555,12 @@ fn find_ebe_iov(
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
         }
+        if nested.is_some() {
+            // The walk reads the per-cell stack the prediction sees, and returns the
+            // gradient over the compact vector `p` lives in (#1082 PR3).
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
         match analytic_eta_nll_gradient_iov_frozen(
             model,
             subject,
@@ -2484,8 +2575,16 @@ fn find_ebe_iov(
             mult.as_deref(),
             frozen,
         ) {
-            Some(g) => g,
-            None => gradient_fd(&obj, p, n_flat),
+            Some(g) => {
+                #[cfg(test)]
+                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                g
+            }
+            None => {
+                #[cfg(test)]
+                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                gradient_fd(&obj, p, n_flat)
+            }
         }
     };
 
@@ -2501,8 +2600,9 @@ fn find_ebe_iov(
             .zip(mu.iter())
             .map(|(p, m)| p - m)
             .collect();
-        let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-            .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+        let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
             .collect();
         // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
         // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
@@ -2582,13 +2682,22 @@ fn find_ebe_iov(
     let mut nm_converged = nm_converged;
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
-        && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, params) > runaway_limit
+        && iov_prior_maha(
+            &x,
+            &mu,
+            n_eta,
+            n_kappa,
+            k_occasions,
+            nested.as_ref(),
+            params,
+        ) > runaway_limit
     {
         let mut seed = vec![0.0; n_flat];
         seed[..n_eta].copy_from_slice(&mu);
         // Certified on stationarity, polish held inside the runaway limit (#1527).
         let (cold, cold_ok) = cert.nelder_mead_recover(&obj, seed, &|p| {
-            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, params) <= runaway_limit
+            iov_prior_maha(p, &mu, n_eta, n_kappa, k_occasions, nested.as_ref(), params)
+                <= runaway_limit
         });
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
@@ -2605,8 +2714,9 @@ fn find_ebe_iov(
         .zip(mu.iter())
         .map(|(p, m)| p - m)
         .collect();
-    let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| DVector::from_column_slice(&x[kappa_range(n_eta, n_kappa, k)]))
+    let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
+        .iter()
+        .map(|k| DVector::from_column_slice(k))
         .collect();
 
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
@@ -3853,8 +3963,16 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    // The walk reads the per-group `stacked_true` and returns the jet over the layout's
+    // axes — the compact vector under nested levels (#1082 PR3), the stack itself otherwise
+    // — so the gradient below is over the vector the EBE search moves.
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    if layout.n_groups() != k_occasions || layout.n_kappa() != n_kappa {
+        return None;
+    }
+    let axes = layout.to_axes(stacked_true)?;
     let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
-    let n_stacked = stacked_width(n_eta, n_kappa, k_occasions);
+    let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),
     // so `v`/`dv_df` carry that factor and the `η_ruv` column gets the variance term
@@ -3916,18 +4034,20 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
     }
-    // Prior: block-diagonal Σ_b⁻¹·stacked. BSV block Ω_bsv⁻¹·η_bsv, each occasion κ
-    // block Ω_iov⁻¹·κ_g (the κ-variance is shared across occasions — SAME).
-    let eta_bsv = DVector::from_column_slice(&stacked_true[..n_eta]);
+    // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
+    // one block per occasion group (the κ-variance shared across occasions, SAME), or under
+    // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
+    let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
     let prior_bsv = &omega_bsv.inv * &eta_bsv;
     for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
         *g += prior_bsv[k];
     }
-    for occ in 0..k_occasions {
-        let base = kappa_offset(n_eta, n_kappa, occ);
-        let kappa_g = DVector::from_column_slice(&stacked_true[base..base + n_kappa]);
-        let prior_kg = &omega_iov.inv * &kappa_g;
-        for c in 0..n_kappa {
+    for (ks, base) in layout.kappa_blocks() {
+        let w = ks.len();
+        let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
+        let inv_l = omega_iov.inv.select_rows(&ks).select_columns(&ks);
+        let prior_kg = &inv_l * &kappa_g;
+        for c in 0..w {
             grad[base + c] += prior_kg[c];
         }
     }
@@ -4686,6 +4806,7 @@ fn iov_prior_maha(
     n_eta: usize,
     n_kappa: usize,
     k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>,
     params: &ModelParameters,
 ) -> f64 {
     let bsv: Vec<f64> = x[..n_eta]
@@ -4695,8 +4816,27 @@ fn iov_prior_maha(
         .collect();
     let mut q = ebe_prior_maha(&bsv, &params.omega);
     if let Some(oi) = params.omega_iov.as_ref() {
-        for k in 0..k_occasions {
-            q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+        match nested {
+            // #1082: one block per group of each level, against that level's Ω_L⁻¹ — the
+            // compact prior's own quadratic form.
+            Some(n) => {
+                for (l, block) in n.blocks(x) {
+                    if !block.iter().all(|v| v.is_finite()) {
+                        return f64::INFINITY;
+                    }
+                    let ks = n.kappas_at(l);
+                    for (a, &ka) in ks.iter().enumerate() {
+                        for (c, &kc) in ks.iter().enumerate() {
+                            q += block[a] * oi.inv[(ka, kc)] * block[c];
+                        }
+                    }
+                }
+            }
+            None => {
+                for k in 0..k_occasions {
+                    q += ebe_prior_maha(&x[kappa_range(n_eta, n_kappa, k)], oi);
+                }
+            }
         }
     }
     q
@@ -4905,6 +5045,7 @@ pub fn run_inner_loop_warm(
         min_obs,
         restarts,
         InnerSolvePolicy::default(),
+        None,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -4950,6 +5091,10 @@ pub(crate) fn run_inner_loop_warm_seeded(
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
         },
+        // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
+        // Gauss–Newton and the trust region, which would carry a placeholder into a
+        // returned result or an accepted state. Those poll at their own boundaries.
+        None,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -4959,7 +5104,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
 /// before the population barrier. The FOCE outer loop uses this to score the
 /// marginal without launching another subject pass. Results retain subject order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn run_inner_loop_warm_map<T: Send>(
+pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -4970,6 +5115,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     min_obs: usize,
     restarts: usize,
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -4990,6 +5136,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         restarts,
         None,
         policy,
+        cancel,
         finish_subject,
     )
 }
@@ -4998,7 +5145,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
 /// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
 /// outer-loop evaluation. See [`find_ebe_cached`].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
+pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -5010,6 +5157,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
     restarts: usize,
     schedules: &[Option<pk::event_driven::EventSchedule>],
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -5030,12 +5178,47 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
         restarts,
         Some(schedules),
         policy,
+        cancel,
         finish_subject,
     )
 }
 
+/// What a subject skipped by a cooperative cancel reports in place of its EBE (#574).
+///
+/// `hard_reject` makes the outer EBE guard reject the trial and `nll = +inf` keeps the
+/// placeholder out of any OFV it might be summed into, so a cancelled pass can never be
+/// accepted as an improvement. The shapes match a real result (η length `n_eta`, an
+/// `n_obs × n_eta` zero H, one κ per occasion) so no consumer indexes out of bounds on the
+/// way out; `fit()` returns `Err("cancelled by user")` before any of it is reported.
+fn cancelled_ebe_placeholder(
+    model: &CompiledModel,
+    subject: &Subject,
+    init: Option<&[f64]>,
+) -> EbeResult {
+    let eta = match init {
+        Some(e) if e.len() == model.n_eta => DVector::from_column_slice(e),
+        _ => DVector::zeros(model.n_eta),
+    };
+    let n_occ = if model.n_kappa > 0 {
+        crate::stats::stacked_layout::group_count(subject)
+    } else {
+        0
+    };
+    EbeResult {
+        eta,
+        h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        terminal_hessian: None,
+        converged: false,
+        used_fallback: false,
+        grad_norm: 0.0,
+        nll: f64::INFINITY,
+        kappas: vec![DVector::zeros(model.n_kappa); n_occ],
+        hard_reject: true,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn run_inner_loop_warm_map_impl<T: Send>(
+fn run_inner_loop_warm_map_impl<T: Send + Default>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -5047,6 +5230,7 @@ fn run_inner_loop_warm_map_impl<T: Send>(
     restarts: usize,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -5063,6 +5247,17 @@ fn run_inner_loop_warm_map_impl<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
+            // Cooperative cancel, polled per subject (#574): one outer evaluation of a
+            // large ODE population is minutes of EBE solves, and the outer loops only
+            // poll between evaluations. A subject that has not started when the flag
+            // flips gets a placeholder instead of a solve, so the pass drains in the
+            // time of the solves already in flight.
+            if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+                return (
+                    cancelled_ebe_placeholder(model, subject, init),
+                    T::default(),
+                );
+            }
             // Both arms route through `find_ebe_cached` so the policy reaches the solve
             // either way; the uncached arm just builds its schedule per call.
             let local_schedule = if schedules.is_none() {

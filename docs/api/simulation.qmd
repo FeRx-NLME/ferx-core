@@ -131,6 +131,7 @@ pub struct SimulateOptions {
     pub seed: Option<u64>,                  // None draws from entropy
     pub match_method: Option<MatchMethod>,  // None disables matching
     pub horizon: Option<f64>,               // TTE administrative censoring time; None = per-record window
+    pub iov_occasion: Option<IovOccasionRule>, // derive IOV occasion labels; None = the data's own
 }
 
 pub enum MatchMethod {
@@ -140,8 +141,18 @@ pub enum MatchMethod {
 }
 ```
 
-With `match_method = None` and `horizon = None` this is identical to
-`simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+With `match_method`, `horizon` and `iov_occasion` all `None` this is identical
+to `simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+
+`iov_occasion = Some(rule)` labels the occasions of a `kappa` model the way
+`fit()` does, for a model whose `[fit_options]` derive them with
+`iov_occasion = dose` or `time(...)` instead of reading an `iov_column`. Pass
+the rule the model was fitted under: `FitResult::iov_occasion`, or the model
+file's `fit_options.iov_occasion`. Without it a population read with no
+occasion column carries no labels, every subject is simulated at κ = 0, and
+`simulate_with_options_diag()` returns a `W_IOV_NO_OCCASIONS` warning. It has
+no effect on a model without `kappa`, and `Some(IovOccasionRule::Column)`
+keeps the data's labels as given. See [IOV: Simulation](../model-file/iov.qmd#simulation).
 
 `horizon = Some(t)` sets an administrative censoring time for **time-to-event**
 endpoints, decoupled from the observed event times: it overrides each TTE
@@ -213,7 +224,12 @@ let fit = fit(&model, &pop, &model.default_params, &opts)?;
 let params = fitted_params_from_result(&fit, &model)?;
 let sims = simulate_with_options(
     &model, &pop, &params, 200,
-    &SimulateOptions { seed: Some(42), match_method: Some(MatchMethod::Optimal) },
+    &SimulateOptions {
+        seed: Some(42),
+        match_method: Some(MatchMethod::Optimal),
+        iov_occasion: fit.iov_occasion.clone(), // the fit's own occasion rule, if any
+        ..Default::default()
+    },
 )?;
 // → 200 replicates; build the pmVPC from `sims` as usual.
 ```

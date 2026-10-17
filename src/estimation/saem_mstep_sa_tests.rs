@@ -642,6 +642,39 @@ fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
     assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
 }
 
+/// #1421: a FREM model is in scope — its covariate rows' score and information
+/// are exact since `obs_dvar_dlogsigma` (see the FD-parity tests in
+/// `fixed_eta_gradient_tests.rs`), so `score_sa` and `mstep_draws` need not
+/// refuse it any more.
+#[test]
+fn numerical_mstep_scope_gap_admits_a_frem_model() {
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TV_WT(70.0, FIX)
+  omega ETA_CL ~ 0.04
+  omega ETA_WT_FREM ~ 100.0
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma EPSCOV ~ 1e-6 FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_predictions = TV_WT/ETA_WT_FREM:100
+  frem_sigma = EPSCOV
+",
+    )
+    .expect("FREM fixture parses");
+    assert!(model.frem_config.is_some(), "the fixture must be FREM");
+    assert_eq!(numerical_mstep_scope_gap(&model, 0, false), None);
+}
+
 // ── stored-draw re-centring ────────────────────────────────────────────────
 
 /// A closed-form mu-reference shift moves `log TVP` and every subject's η

@@ -495,3 +495,41 @@ fn vi_recovers_the_agq_solution_on_warfarin() {
         );
     }
 }
+
+/// #2058: a `.fitrx` bundle of a real VI fit loads back. Under the default
+/// `vi_final_ofv = none` the fit's `ofv` / `aic` / `bic` are `NaN`, which the
+/// bundle writes as `null` and the loader used to refuse (`invalid type: null,
+/// expected f64`); and `FitResult::vi` was dropped on the way through. The
+/// field-by-field round trip is unit-tested in `src/io/fitrx.rs`; this pins it
+/// on what `fit()` actually produces.
+#[test]
+fn vi_fit_round_trips_through_a_fitrx_bundle() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let population = warfarin_data();
+    let model = warfarin_model();
+    let r = run(&model, &population, &vi_opts(5));
+    assert!(
+        r.ofv.is_nan(),
+        "premise: vi_final_ofv = none leaves ofv NaN"
+    );
+    let vi = r.vi.as_ref().expect("premise: a VI fit carries `vi`");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vi.fitrx");
+    save_fit(
+        &r,
+        &population,
+        WARFARIN_SRC,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .unwrap();
+    let l = load_fit(&path).expect("a VI bundle must load").fit;
+
+    assert!(l.ofv.is_nan() && l.aic.is_nan() && l.bic.is_nan());
+    let lv =
+        l.vi.as_ref()
+            .expect("the VI result must survive the round trip");
+    assert_eq!(format!("{lv:?}"), format!("{vi:?}"));
+    assert_eq!(lv.eta_means.len(), population.subjects.len());
+}

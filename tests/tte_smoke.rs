@@ -464,6 +464,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(20.0),
+            iov_occasion: None,
         };
         let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
             .expect("a degenerate hazard still simulates (censored); it does not error");
@@ -507,6 +508,7 @@ mod survival_smoke {
             seed: Some(2),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
             .expect("a degenerate RTTE stream must not abort the whole run");
@@ -975,6 +977,7 @@ mod survival_smoke {
             seed: Some(7),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("RTTE simulation with a horizon must succeed");
@@ -1059,6 +1062,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(60.0),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("left-truncated RTTE simulation must now succeed (#740)");
@@ -1096,6 +1100,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("RTTE simulation with resets must be rejected");
@@ -1147,6 +1152,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("multi-CMT RTTE simulation must be rejected");
@@ -1196,6 +1202,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("RTTE + competing single-TTE simulation must be rejected");
@@ -1608,6 +1615,7 @@ mod survival_smoke {
             seed: Some(99),
             match_method: None,
             horizon: Some(H),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &template, &model.default_params, 1, &opts)
             .expect("simulate with horizon must succeed");
@@ -2018,6 +2026,7 @@ mod survival_smoke {
                 seed: Some(1),
                 match_method: None,
                 horizon: Some(bad),
+                iov_occasion: None,
             };
             let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
                 .expect_err("non-finite / non-positive horizon must error");
@@ -2028,6 +2037,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(10.0),
+            iov_occasion: None,
         };
         assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &ok).is_ok());
     }
@@ -2061,6 +2071,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(3.0), // < entry_time 5.0
+            iov_occasion: None,
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &below)
             .expect_err("horizon below entry_time must error");
@@ -2070,6 +2081,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(8.0),
+            iov_occasion: None,
         };
         assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &above).is_ok());
     }
@@ -2103,6 +2115,7 @@ mod survival_smoke {
             seed: Some(17),
             match_method: None,
             horizon: Some(H),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("ODE-accumulated TTE simulation must succeed");
@@ -2236,6 +2249,7 @@ mod survival_smoke {
             seed: Some(17),
             match_method: None,
             horizon: Some(H),
+            iov_occasion: None,
         };
         let baseline = simulate_with_options(&model, &build_pop(), &model.default_params, 1, &opts)
             .expect("baseline ODE-TTE sim");
@@ -2293,6 +2307,7 @@ mod survival_smoke {
             seed: Some(1),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("ODE-accumulated TTE simulation with resets must error");
@@ -3800,6 +3815,7 @@ mod survival_smoke {
             seed: Some(5),
             match_method: None,
             horizon: Some(30.0),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("ODE-accumulated TTE simulation with a horizon must succeed");

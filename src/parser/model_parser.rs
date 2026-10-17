@@ -4988,6 +4988,30 @@ pub fn parse_full_model_with(
         })
         .collect();
 
+    // #1082: the declared levels. One level is today's IOV and is desugared onto
+    // `iov_column` once `[fit_options]` is read below; more than one is a nested model.
+    let declared_levels = kappa_info.levels.clone();
+    let nested_levels = (declared_levels.len() > 1).then(|| crate::types::NestedLevels {
+        levels: declared_levels.clone(),
+        kappa_level: kappa_info
+            .at
+            .iter()
+            .map(|at| {
+                at.as_ref()
+                    .and_then(|a| {
+                        declared_levels
+                            .iter()
+                            .position(|l| l.name.eq_ignore_ascii_case(a))
+                    })
+                    .expect("check_level_declarations: every kappa names a declared level")
+            })
+            .collect(),
+        readers: (0..n_eta + n_kappa)
+            .map(|k| direct_eta_readers(&indiv_stmts, k))
+            .collect(),
+    });
+    indiv_param_partials.nested_levels = nested_levels;
+
     let model = CompiledModel {
         residual_serial: residual_serial.clone(),
         priors: declared_priors,
@@ -5135,6 +5159,33 @@ pub fn parse_full_model_with(
     let mut model = model;
     if let Some(bloq) = fit_options.bloq_method {
         model.bloq_method = bloq;
+    }
+    // #1082: explicit `level` declarations. They replace `iov_column` / `iov_occasion`
+    // rather than combine with them, so a model states its occasion grouping once.
+    if !declared_levels.is_empty() {
+        if fit_options.iov_column.is_some() || fit_options.iov_occasion != IovOccasionRule::Column {
+            return Err(format!(
+                "E_LEVEL_MIXED_WITH_IOV_COLUMN: [parameters] declares `level {}` and \
+                 [fit_options] also sets {}. A `level` declaration replaces the occasion \
+                 option; remove it from [fit_options].",
+                declared_levels[0].name,
+                if fit_options.iov_column.is_some() {
+                    "`iov_column`"
+                } else {
+                    "`iov_occasion`"
+                }
+            ));
+        }
+        if declared_levels.len() == 1 {
+            // One level in `ID` is today's IOV spelled out: the same occasion column,
+            // read the same way, so the model fits bit-identically to `iov_column`.
+            fit_options.iov_column = Some(declared_levels[0].column.clone());
+        } else {
+            // The level labels are read like covariates and turned into groups when
+            // the population is prepared for the fit.
+            let columns: Vec<String> = declared_levels.iter().map(|l| l.column.clone()).collect();
+            register_referenced_covariates(&mut model.referenced_covariates, columns);
+        }
     }
     // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
     // `[data] path` above, only the raw value is read here;
@@ -5438,6 +5489,17 @@ pub fn parse_full_model_with(
     // arms a fit-scoped override instead (#1212), which merges over whatever is baked here
     // for the fields the caller actually moved. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
+
+    // `ode_method = linear` is an assertion, not a preference (#852): a user who names it is
+    // asking for the exact path, so a model that cannot take it is an error here rather than a
+    // silent fall back to integration (which is what `auto` does, by design).
+    if fit_options.ode_method == crate::ode::OdeMethod::Linear {
+        if let Some(refusal) =
+            crate::ode::predictions::ode_method_linear_refusal(model.ode_spec.as_ref())
+        {
+            return Err(refusal);
+        }
+    }
 
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
@@ -10118,7 +10180,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
                     "fit option `ode_method`: unknown value `{value}` — expected one of \
-                     auto, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
+                     auto, linear, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
                      verner7, ros23, ode23s, rodas5)"
                 )
             })?;
@@ -14202,6 +14264,9 @@ fn build_ode_spec(
         ));
     }
 
+    // Linearity is decided on names, so before the rewrite below turns them into slots (#852).
+    let affine_in_states = ode_linearity::stmts_affine_in_states(&stmts_owned, &state_names_owned);
+
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
     // covariate reference would have been rejected above).
@@ -14400,6 +14465,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
+        affine_in_states,
         init_indiv_reads,
         hoist: rhs_hoist,
         binding,
@@ -14767,6 +14833,107 @@ struct ParsedKappas {
     /// or `None` for an unweighted kappa. Always `None` for a `block_kappa`
     /// member, which the parser rejects a weight on.
     weights: Vec<Option<String>>,
+    /// Parallel to `names_ordered`: the level an `at LEVEL` tail attaches the kappa
+    /// to (#1082), or `None` for a kappa with no tail.
+    at: Vec<Option<String>>,
+    /// The `level NAME by COLUMN in PARENT` declarations (#1082), in order.
+    levels: Vec<crate::types::LevelSpec>,
+}
+
+/// Peel a trailing `at LEVEL` off a `kappa` / `block_kappa` declaration (#1082),
+/// returning the declaration without it and the level name. Only those two forms take
+/// the tail; any other line is returned unchanged.
+///
+/// `weight = <expr>` is peeled first and takes everything to its right, so a tail
+/// written after the weight (`… weight = NARM at ARM`) is found at the end of the
+/// weight expression instead, and peeled from there.
+fn split_level_attachment(
+    line: &str,
+    weight_expr: Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    let lower = line.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("kappa ") || lower.starts_with("block_kappa")) {
+        return (line.to_string(), weight_expr, None);
+    }
+    let re = Regex::new(r"(?i)^(.*\S)\s+at\s+(\w+)\s*$").unwrap();
+    if let Some(w) = &weight_expr {
+        if let Some(c) = re.captures(w) {
+            return (
+                line.to_string(),
+                Some(c[1].trim().to_string()),
+                Some(c[2].to_string()),
+            );
+        }
+    }
+    match re.captures(line) {
+        Some(c) => (c[1].to_string(), weight_expr, Some(c[2].to_string())),
+        None => (line.to_string(), weight_expr, None),
+    }
+}
+
+/// The structural rules of the `level` declarations and the `at` tails (#1082): the
+/// levels form one chain below `ID`, every `at` names a declared level, and once any
+/// level is declared every kappa carries one.
+fn check_level_declarations(kappas: &ParsedKappas) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, l) in kappas.levels.iter().enumerate() {
+        if l.name.eq_ignore_ascii_case("ID") || seen.iter().any(|s| s.eq_ignore_ascii_case(&l.name))
+        {
+            return Err(format!(
+                "[parameters] level {}: the name is already taken (by `ID` or an earlier \
+                 level); give each level its own name",
+                l.name
+            ));
+        }
+        let expected = if i == 0 { "ID" } else { seen[i - 1] };
+        if !l.parent.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "[parameters] level {} by {} in {}: a level nests in `ID` or in the level \
+                 declared just before it, so this one must be `in {expected}`. Levels form \
+                 one chain from the outermost down; two levels inside the same parent \
+                 would be crossed, which is not supported.",
+                l.name, l.column, l.parent
+            ));
+        }
+        seen.push(&l.name);
+    }
+    for (name, at) in kappas.names_ordered.iter().zip(&kappas.at) {
+        match at {
+            Some(level)
+                if !kappas
+                    .levels
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(level)) =>
+            {
+                return Err(if kappas.levels.is_empty() {
+                    format!(
+                        "[parameters] kappa {name} at {level}: no level is declared. Declare \
+                         it first with `level {level} by COLUMN in ID`."
+                    )
+                } else {
+                    format!(
+                        "[parameters] kappa {name} at {level}: `{level}` is not a declared \
+                         level (declared: {}).",
+                        kappas
+                            .levels
+                            .iter()
+                            .map(|l| l.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            }
+            None if !kappas.levels.is_empty() => {
+                return Err(format!(
+                    "E_LEVEL_MIXED_WITH_IOV_COLUMN: [parameters] kappa {name} has no `at LEVEL`, \
+                     but the model declares levels. Once a `level` is declared, every kappa \
+                     says which level it lives at."
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // --- Block extraction ---
@@ -16082,6 +16249,10 @@ fn parse_parameters(
     let mut block_kappas: Vec<BlockKappaSpec> = Vec::new();
     let mut kappa_names_ordered: Vec<String> = Vec::new();
     let mut kappa_weights_ordered: Vec<Option<String>> = Vec::new();
+    // #1082: the `at LEVEL` of each kappa (parallel to `kappa_names_ordered`) and the
+    // `level` declarations themselves.
+    let mut kappa_at_ordered: Vec<Option<String>> = Vec::new();
+    let mut level_decls: Vec<crate::types::LevelSpec> = Vec::new();
     // Per-parameter priors declared with an inline `prior(...)` tail (#254), in
     // declaration order.
     let mut priors: Vec<crate::types::ParameterPrior> = Vec::new();
@@ -16224,6 +16395,9 @@ fn parse_parameters(
     )
     .unwrap();
 
+    // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
+    let level_re = Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap();
+
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
     for source_line in &lines {
@@ -16245,8 +16419,26 @@ fn parse_parameters(
         let (line, prior_decl) = split_prior_modifier(source_line, "parameters")?;
         let (line, weight_expr) =
             split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
+        // #1082: `kappa NAME ~ VALUE at LEVEL` — peeled after the weight, which takes
+        // everything to its right.
+        let (line, weight_expr, at_level) = split_level_attachment(&line, weight_expr);
         let line = &line;
         let mut weight_consumed = false;
+        if let Some(caps) = level_re.captures(line) {
+            if prior_decl.is_some() || weight_expr.is_some() {
+                return Err(format!(
+                    "[parameters] level {}: a level takes no `prior(...)` or `weight =`; a \
+                     weight belongs on each kappa at the level",
+                    &caps[1]
+                ));
+            }
+            level_decls.push(crate::types::LevelSpec {
+                name: caps[1].to_string(),
+                column: caps[2].to_string(),
+                parent: caps[3].to_string(),
+            });
+            continue;
+        }
         // Name the prior attaches to, filled in by whichever declaration arm
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
@@ -16487,6 +16679,7 @@ fn parse_parameters(
             for name in &names {
                 kappa_names_ordered.push(name.clone());
                 kappa_weights_ordered.push(None);
+                kappa_at_ordered.push(at_level.clone());
             }
             let fixed = caps.get(3).is_some();
             // Last, not first: the code promises its repair is sufficient, so it
@@ -16582,6 +16775,7 @@ fn parse_parameters(
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             kappa_names_ordered.push(name.clone());
             kappa_weights_ordered.push(weight_expr.clone());
+            kappa_at_ordered.push(at_level.clone());
             weight_consumed = true;
             prior_target = Some((name.clone(), crate::types::ParameterKind::Kappa));
             kappas.push(KappaSpec {
@@ -16738,6 +16932,16 @@ fn parse_parameters(
         }
     }
 
+    let parsed_kappas = ParsedKappas {
+        diagonal: kappas,
+        block: block_kappas,
+        names_ordered: kappa_names_ordered,
+        weights: kappa_weights_ordered,
+        at: kappa_at_ordered,
+        levels: level_decls,
+    };
+    check_level_declarations(&parsed_kappas)?;
+
     Ok((
         thetas,
         omegas,
@@ -16745,12 +16949,7 @@ fn parse_parameters(
         sigmas,
         block_sigmas,
         eta_names_ordered,
-        ParsedKappas {
-            diagonal: kappas,
-            block: block_kappas,
-            names_ordered: kappa_names_ordered,
-            weights: kappa_weights_ordered,
-        },
+        parsed_kappas,
         vector_thetas,
         level_block_decls,
         unbound_level_blocks,
@@ -27032,6 +27231,10 @@ pub struct OdeRhsProgram {
     /// not, so refusing that window is a per-spelling question, not a
     /// [`Self::pk_reads_model_time`] one.
     pk_reads_tad: bool,
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition —
+    /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
+    /// `ode_linearity::stmts_affine_in_states`.
+    affine_in_states: bool,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -27331,6 +27534,20 @@ impl OdeRhsProgram {
     /// not a default.
     pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
+    }
+
+    /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition — the
+    /// structural half of the linear fast path's eligibility (#852). The other half is
+    /// [`Self::reads_any_model_time`]; `OdeSpec::linear_ineligibility` asks both.
+    pub(crate) fn is_affine_in_states(&self) -> bool {
+        self.affine_in_states
+    }
+
+    /// Any equation reads `TIME`/`T`/`TAFD`/`TAD` — the injected hazard lines included,
+    /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
+    /// the augmented system and a time-dependent hazard line is part of it.
+    pub(crate) fn reads_any_model_time(&self) -> bool {
+        self.uses_time_vars || self.reads_time_builtin
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -28141,36 +28358,72 @@ impl IndivParamProgram {
     /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
     /// individual parameter (declaration order), whose `grad`/`hess` are the exact
     /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
+    ///
+    /// The absolute-axis layout of [`eval_param_duals_cols`](Self::eval_param_duals_cols)
+    /// (`theta_cols = None`).
     pub(crate) fn eval_param_duals<const M: usize>(
         &self,
         theta: &[f64],
         eta: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> Vec<crate::sens::dual2::Dual2<M>> {
+        self.eval_param_duals_cols::<M>(theta, eta, covariates, None, self.n_theta)
+    }
+
+    /// Column-chunked twin of [`eval_param_duals`](Self::eval_param_duals): seed the
+    /// program's θ on a **θ-column chunk's** axes rather than on absolute ones, so a
+    /// program wider than the dual dispatch can be evaluated one chunk at a time (#1907).
+    ///
+    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the chunk
+    /// does not carry enters as a **constant**. That is exact per chunk: forward-mode axes
+    /// never interact, so the chunk that owns a column supplies its derivative, and the
+    /// η block every chunk carries comes out entry for entry the same. `eta_axis_base` is
+    /// the dual axis of `eta[0]` (`cols.len()` for a chunked caller, `n_theta` for an
+    /// absolute one). `theta_cols = None` is the absolute layout `θ_m → m` — the
+    /// pre-chunking behaviour, seed for seed — the same contract as
+    /// `ScaleDerivProgram::eval_scale_dual_cols`.
+    pub(crate) fn eval_param_duals_cols<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        theta_cols: Option<&[usize]>,
+        eta_axis_base: usize,
+    ) -> Vec<crate::sens::dual2::Dual2<M>> {
         use crate::sens::dual2::Dual2;
-        // Only the program's own θ axes (`0..n_theta`, the user-declared thetas) are
-        // seeded. A `theta` slice longer than that carries generated `[covariate_nn]`
-        // weights, which reach the program through `Op::PushNnOutput` and never through
-        // `PushTheta`; seeding them here would put them on the axes `η` and the NN-output
-        // block occupy (`n_theta + k`, see `ModelNnAxisGuard`). For a program whose θ
-        // axis count equals the model's — every non-NN caller — this is the former
-        // `m < M` bound exactly.
+        // θ index → dual axis. Only the program's own θ axes (`0..n_theta`, the
+        // user-declared thetas) are seeded, under either layout. A `theta` slice longer
+        // than that carries generated `[covariate_nn]` weights, which reach the program
+        // through `Op::PushNnOutput` and never through `PushTheta`; seeding them here would
+        // put them on the axes `η` and the NN-output block occupy (`n_theta + k`, see
+        // `ModelNnAxisGuard`). For a program whose θ axis count equals the model's — every
+        // non-NN caller — the absolute layout is the former `m < M` bound exactly.
+        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
+            None => (0..theta.len())
+                .map(|m| (m < self.n_theta).then_some(m))
+                .collect(),
+            Some(_) => vec![None; theta.len()],
+        };
+        if let Some(cols) = theta_cols {
+            for (c, &m) in cols.iter().enumerate() {
+                if m < self.n_theta && m < theta_axis.len() {
+                    theta_axis[m] = Some(c);
+                }
+            }
+        }
         let theta_d: Vec<Dual2<M>> = theta
             .iter()
             .enumerate()
-            .map(|(m, &v)| {
-                if m < self.n_theta && m < M {
-                    Dual2::var(v, m)
-                } else {
-                    Dual2::constant(v)
-                }
+            .map(|(m, &v)| match theta_axis[m] {
+                Some(ax) if ax < M => Dual2::var(v, ax),
+                _ => Dual2::constant(v),
             })
             .collect();
         let eta_d: Vec<Dual2<M>> = eta
             .iter()
             .enumerate()
             .map(|(k, &v)| {
-                let dim = self.n_theta + k;
+                let dim = eta_axis_base + k;
                 if dim < M {
                     Dual2::var(v, dim)
                 } else {
@@ -28604,30 +28857,48 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). For any in-scope
-        // `ExpressionScale` model the provider gate caps `n_theta + n_eta` at
-        // `MAX_SCALE_AXES`, so both `theta` and `eta` fit a stack buffer — build them
-        // there instead of per-call heap `Vec`s (#534 review #4). (`cov_vec` /
-        // bytecode `stack` lengths are not axis-bounded, so they stay on the heap.)
+        // η_k seeds axis k directly (no `n_theta` offset). The non-IOV gate caps
+        // `n_theta + n_eta` at `MAX_SCALE_AXES`, so θ and η fit a stack buffer there —
+        // built on the stack instead of per-call heap `Vec`s (#534 review #4). The IOV
+        // gate carries no such cap: its outer evaluates the scale in θ-column chunks, so
+        // a model past it reaches this inner call with more θ than the buffer holds
+        // (#1907). Those take a heap `Vec` (the fixed-size buffer alone would panic on
+        // the `[..len]` slice). (`cov_vec` / bytecode `stack` lengths are not
+        // axis-bounded, so they stay on the heap.)
         const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
-        debug_assert!(
-            theta.len() <= CAP && eta.len() <= CAP,
-            "scale eval θ/η exceed MAX_SCALE_AXES; caller must be gate-checked"
-        );
-        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
-        for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
-            *d = Dual1::constant(v);
-        }
-        let theta_d = &theta_buf[..theta.len()];
-        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
-        for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
-            *d = if k < N {
+        let seed_eta = |k: usize, v: f64| {
+            if k < N {
                 Dual1::var(v, k)
             } else {
                 Dual1::constant(v)
-            };
-        }
-        let eta_d = &eta_buf[..eta.len()];
+            }
+        };
+        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
+        let theta_heap: Vec<Dual1<N>>;
+        let theta_d: &[Dual1<N>] = if theta.len() <= CAP {
+            for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
+                *d = Dual1::constant(v);
+            }
+            &theta_buf[..theta.len()]
+        } else {
+            theta_heap = theta.iter().map(|&v| Dual1::constant(v)).collect();
+            &theta_heap
+        };
+        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
+        let eta_heap: Vec<Dual1<N>>;
+        let eta_d: &[Dual1<N>] = if eta.len() <= CAP {
+            for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
+                *d = seed_eta(k, v);
+            }
+            &eta_buf[..eta.len()]
+        } else {
+            eta_heap = eta
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| seed_eta(k, v))
+                .collect();
+            &eta_heap
+        };
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
@@ -29390,6 +29661,10 @@ pub struct IndivParamPartials {
     /// hand-built fixtures, which have no statements to measure: the providers
     /// then keep the older rule, "every `eta_param_info` entry is `LogNormal`".
     pub(crate) lognormal_eta_chain: Option<bool>,
+    /// The nested variability levels (#1082), read through
+    /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
+    /// one level, and for hand-built fixtures.
+    pub(crate) nested_levels: Option<crate::types::NestedLevels>,
 }
 
 impl IndivParamPartials {
@@ -29408,6 +29683,7 @@ impl IndivParamPartials {
             data_bindings: DataBindings::default(),
             bound_from_fit: false,
             lognormal_eta_chain: None,
+            nested_levels: None,
         }
     }
 
@@ -29516,6 +29792,7 @@ fn build_indiv_param_partials(
         data_bindings: DataBindings::default(),
         bound_from_fit: false,
         lognormal_eta_chain: None,
+        nested_levels: None,
     }
 }
 
@@ -30754,6 +31031,9 @@ fn parse_if_statement(
         p,
     ))
 }
+
+#[path = "ode_linearity.rs"]
+mod ode_linearity;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

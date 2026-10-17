@@ -638,12 +638,31 @@ fn the_closed_form_certifies_both_engines_and_nonmem() {
 /// this dataset except `TAFD`, whose first dose is at `t = 480` rather than `0`, so it is a
 /// genuinely different RHS and is written out rather than claimed equivalent.
 fn respelled(term: &str) -> CompiledModel {
+    parse_full_model(&respelled_src(term))
+        .expect("respelled model parses")
+        .model
+}
+
+fn respelled_src(term: &str) -> String {
     let src = std::fs::read_to_string(anchor("ss_tabs_fit.ferx")).expect("twin is committed");
     assert!(
         src.contains("0.003*T)"),
         "the fixture no longer spells its term `0.003*T`; this helper is rewriting nothing"
     );
-    parse_full_model(&src.replace("0.003*T)", &format!("{term})")))
+    src.replace("0.003*T)", &format!("{term})"))
+}
+
+/// `respelled(term)` with the integrator named. A respelling that reads no model time is
+/// linear, and `ode_method = auto` would solve it exactly by the matrix exponential (#852),
+/// while its time-reading twin is still integrated — so a comparison between the two would
+/// measure the integrator's error rather than the `TAD` plumbing it exists to check.
+fn respelled_integrated(term: &str) -> CompiledModel {
+    let src = respelled_src(term);
+    assert!(
+        src.contains("[fit_options]\n"),
+        "the fixture has no [fit_options] block"
+    );
+    parse_full_model(&src.replace("[fit_options]\n", "[fit_options]\n  ode_method = rk45\n"))
         .expect("respelled model parses")
         .model
 }
@@ -693,7 +712,11 @@ fn tafd_under_an_unlagged_ss_dose_stays_nan_while_tad_does_not() {
     // Realised worst relative difference, measured: 4.633876e-12. Bound at 1e-10, ~22x
     // headroom, matching the sibling's bound so the pair can be read together.
     let autonomous = ferx_rows(&respelled("0.0*TAD"), &pop, compute_predictions_with_tv);
-    let plain = ferx_rows(&respelled("0.0"), &pop, compute_predictions_with_tv);
+    let plain = ferx_rows(
+        &respelled_integrated("0.0"),
+        &pop,
+        compute_predictions_with_tv,
+    );
     // `worst_rel` asserts `is_finite` on both sides before folding, so a `NaN` fails here
     // rather than being absorbed by `f64::max` — which is the failure this half exists to
     // separate from the `TAFD` rows above.
