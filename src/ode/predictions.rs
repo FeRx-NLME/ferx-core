@@ -5554,8 +5554,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // amount (blamed as a controller action), held silently (`NaN < x` is false),
                 // or dosed on a `0` the `Dv` clamp fabricated from `NaN` — and the run
                 // returned `Ok`. Checked before any monitor, so it also covers a controller
-                // with no monitors that reads `ctx.state` directly. Runtime, uncoded: the
-                // model and its parameter draw diverged, not the caller's input.
+                // with no monitors that reads `ctx.state` directly. The value may come from the
+                // integration or straight from a seed (an `init()` at t=0, or the re-seed of an
+                // EVID=3/4 reset just before this hook), so the message names both sources.
+                // Runtime, uncoded: the model and its parameter draw produced it, not the
+                // caller's input.
                 if u.iter().any(|x| !x.is_finite()) {
                     let names: Vec<&str> = u
                         .iter()
@@ -5565,8 +5568,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         .collect();
                     return Err(AdaptiveDriverError::Runtime(format!(
                         "decision {decision_index} at t={t_start}: the ODE state is non-finite \
-                         ({}), so there is no value to decide on; the [odes] right-hand side \
-                         diverged before this decision. Check the right-hand side and the \
+                         ({}), so there is no value to decide on; an init() expression or the \
+                         [odes] right-hand side produced a non-finite value. Check them and the \
                          parameter values.",
                         names.join(", ")
                     )));
@@ -5618,8 +5621,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         ),
                     };
                     // A finite state (guarded above) that reads out non-finite is a readout
-                    // defect, not a divergence (#1578). Refused here, before the mode split,
-                    // because the `Dv` clamp below would otherwise turn it into a `0`.
+                    // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
+                    // expression that divides by zero, say. The `Dv` clamp below cannot
+                    // fabricate a `0` from it, since only an `ObsCmt` readout clamps and its
+                    // latent is a raw state component the state guard has already checked; this
+                    // guard keeps the controller from being handed the non-finite value itself.
                     if !latent.is_finite() {
                         return Err(AdaptiveDriverError::Runtime(format!(
                             "decision {decision_index} at t={t_start}: monitor '{}' read a \

@@ -14798,24 +14798,36 @@ fn pole_subject() -> Subject {
 
 const POLE_DECISIONS: [f64; 2] = [1.0, 4.0];
 
-/// The state refusal's shape, shared by T2–T4: runtime (uncoded), at decision 1, naming both
-/// states and the divergence, and blaming neither the controller nor a dose amount.
-fn assert_state_refusal(err: &AdaptiveDriverError) {
+/// The state refusal's text, whatever produced the non-finite value: runtime (uncoded), naming
+/// the non-finite states, both possible sources, and blaming neither the controller nor a dose
+/// amount. `at` is the decision's `decision {i} at t={t}` lead, `names` the parenthesised list.
+fn assert_state_refusal_text(err: &AdaptiveDriverError, at: &str, names: &str) {
     let msg = err.to_string();
     assert_eq!(err.kind(), None, "must be uncoded runtime, got {err:?}");
-    assert!(msg.contains("decision 1 at t=4"), "{msg}");
-    assert!(msg.contains("(central, x)"), "{msg}");
+    assert!(
+        msg.starts_with(&format!("{at}: the ODE state is non-finite {names}, ")),
+        "{msg}"
+    );
     assert!(msg.contains("so there is no value to decide on"), "{msg}");
     assert!(
-        msg.contains("the [odes] right-hand side diverged before this decision"),
+        msg.contains(
+            "an init() expression or the [odes] right-hand side produced a non-finite value"
+        ),
         "{msg}"
     );
     assert!(
-        msg.contains("Check the right-hand side and the parameter values."),
+        msg.contains("Check them and the parameter values."),
         "{msg}"
     );
+    // The #1578 review: a seeded state was blamed on the right-hand side, which had not run.
+    assert!(!msg.contains("diverged"), "{msg}");
     assert!(!msg.contains("controller"), "{msg}");
     assert!(!msg.contains("dose amount"), "{msg}");
+}
+
+/// The state refusal on the pole fixture, shared by T2–T4: decision 1, both states.
+fn assert_state_refusal(err: &AdaptiveDriverError) {
+    assert_state_refusal_text(err, "decision 1 at t=4", "(central, x)");
 }
 
 /// T2 (row A1): an `Ipred` monitor and an `amt = 10 / C` controller. Before #1578 this failed
@@ -14925,9 +14937,84 @@ fn adaptive_diverged_state_is_refused_with_no_monitors() {
 /// Engine: the f64 adaptive driver. Mutation that reddens it: delete the latent guard only.
 #[test]
 fn adaptive_non_finite_readout_of_a_finite_state_names_the_monitor() {
-    let ode = pole_ode_spec(OdeReadout::Single(Box::new(
-        |s, _pk, _theta, _eta, _cov| (s[0] - s[0]) / 0.0,
-    )));
+    // Two legs: `0/0 = NaN` and `1/0 = inf`, both from a finite `central`. The `inf` leg is
+    // what kills an `is_nan` guard (#1578 review, finding 3).
+    type Readout = fn(&[f64]) -> f64;
+    let legs: [(&str, Readout); 2] = [
+        ("NaN", |s| (s[0] - s[0]) / 0.0),
+        ("inf", |s| 1.0 / (s[0] - s[0])),
+    ];
+    for (shown, readout) in legs {
+        let ode = pole_ode_spec(OdeReadout::Single(Box::new(
+            move |s, _pk, _theta, _eta, _cov| readout(s),
+        )));
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &[],
+            &[],
+            &pole_subject(),
+            &POLE_DECISIONS,
+            &[MonitorSpec::new("C", 1, ObserveMode::Ipred)],
+            &mut controller,
+            100,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.kind(), None, "{shown}: {err:?}");
+        assert!(msg.contains("decision 0 at t=1"), "{msg}");
+        assert!(
+            msg.contains(&format!("monitor 'C' read a non-finite value ({shown})")),
+            "{msg}"
+        );
+        assert!(msg.contains("from a finite state"), "{msg}");
+        assert!(msg.contains("readout / observe"), "{msg}");
+        assert!(!msg.contains("diverged"), "{msg}");
+        // `x` cannot be probed: "expression" contains it.
+        assert!(!msg.contains("central"), "{msg}");
+    }
+}
+
+/// T7 (#1578 review, findings 1 and 2): a non-finite **seed** is refused at t=0, before any
+/// right-hand side has run, with the same text as an integrated divergence and naming exactly
+/// the non-finite states. The pole fixture NaN-pads every component, so it cannot tell "all
+/// states" from "some", or `NaN` from `inf`; these seeds can.
+///
+/// * `init = [0, NaN]`: only `x`. Kills a guard that scans `u[..1]`.
+/// * `init = [inf, 0]`: only `central`, as `inf`. Kills a last-state-only scan and an
+///   `is_nan` guard.
+/// * the integrated pole (decision 1): both, the same sentences. A message that names one
+///   source only fails one of the two sides.
+///
+/// Engine: the f64 adaptive driver, through `ode.initial_state` (`init_fn`).
+#[test]
+fn adaptive_non_finite_seed_is_refused_naming_only_its_non_finite_states() {
+    for (init, names) in [
+        ([0.0, f64::NAN], "(x)"),
+        ([f64::INFINITY, 0.0], "(central)"),
+    ] {
+        let mut ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+        ode.init_fn = Some(Box::new(move |_pk: &[f64]| init.to_vec()));
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &[],
+            &[],
+            &make_subject(vec![], vec![6.0]),
+            &[0.0, 1.0],
+            &[],
+            &mut controller,
+            100,
+            None,
+        )
+        .unwrap_err();
+        assert_state_refusal_text(&err, "decision 0 at t=0", names);
+    }
+
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
     let err = ode_predictions_adaptive(
         &ode,
@@ -14936,20 +15023,13 @@ fn adaptive_non_finite_readout_of_a_finite_state_names_the_monitor() {
         &[],
         &pole_subject(),
         &POLE_DECISIONS,
-        &[MonitorSpec::new("C", 1, ObserveMode::Ipred)],
+        &[],
         &mut controller,
         100,
         None,
     )
     .unwrap_err();
-    let msg = err.to_string();
-    assert_eq!(err.kind(), None, "{err:?}");
-    assert!(msg.contains("decision 0 at t=1"), "{msg}");
-    assert!(msg.contains("monitor 'C'"), "{msg}");
-    assert!(msg.contains("finite state"), "{msg}");
-    assert!(msg.contains("readout / observe"), "{msg}");
-    assert!(!msg.contains("diverged"), "{msg}");
-    assert!(!msg.contains("central"), "{msg}");
+    assert_state_refusal(&err);
 }
 
 /// T6 twin: a finite state and a controller that itself emits a `NaN` amount stays an
