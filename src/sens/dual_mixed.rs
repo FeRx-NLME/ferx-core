@@ -216,6 +216,26 @@ impl<const NA: usize, const N: usize> DualMixed<NA, N> {
     }
 
     /// `exp(self)`. With `u = e^x`: `u' = u·x'`, `u'' = u·(x'' + x'⊗x')`.
+    /// `φ(self)` for a scalar function with value `v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`:
+    /// `u′ = φ′x′`, `u″ = φ′x″ + φ″x′⊗x′`.
+    pub fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+        let mut grad = [0.0; N];
+        let mut hess = [[0.0; N]; NA];
+        for i in 0..N {
+            grad[i] = d1 * self.grad[i];
+        }
+        for r in 0..NA {
+            for c in 0..N {
+                hess[r][c] = d1 * self.hess[r][c] + d2 * self.grad[r] * self.grad[c];
+            }
+        }
+        DualMixed {
+            value: v,
+            grad,
+            hess,
+        }
+    }
+
     pub fn exp(self) -> Self {
         let v = self.value.exp();
         let mut grad = [0.0; N];

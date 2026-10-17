@@ -96,49 +96,12 @@ pub(crate) enum CovScopeDecline {
     Disabled,
     /// Mixture model — the analytic assembly has no class-marginal term.
     Mixture,
-    /// `method = laplace`, or an AGQ fit anchored on the exact `H`: the second derivative of
-    /// `H` needs fourth-order sensitivities, which nothing computes.
-    ExactHessianAnchor,
-    /// The model itself is outside the analytic sensitivity scope (`ode_analytical_supported`
-    /// / `analytical_supported` / their IOV twins declined).
+    /// No recorder serves the model (`sens::ode_provider::adjoint::recorder_in_scope`).
     ModelOutOfScope,
     /// `gradient = fd` — the user's explicit opt-out from analytic sensitivities.
     GradientFd,
     /// A non-Gaussian data term (`[event_model]` TTE, `[binary_model]`, CTMM).
     NonGaussianEndpoint,
-    /// FREM: covariate pseudo-observation rows are scored with an `EPSCOV²` override the
-    /// Gaussian assembly does not apply.
-    Frem,
-    /// `ErrorSpec::Selected` — endpoints keyed by covariate branch rather than by CMT.
-    SelectedErrorSpec,
-    /// Log-transform-both-sides.
-    LogTransform,
-    /// The IOV shape the covariance assembly cannot serve (κ without the IOV arm, the IOV arm
-    /// without κ, or IOV together with a lagtime).
-    IovShape,
-    /// `[scaling] obs_scale = ...`, i.e. `ScalingSpec::ExpressionScale`. The one clause with a
-    /// one-line rewrite out of it.
-    ExpressionScale,
-    /// A Form-C `analytic_readout`.
-    AnalyticReadout,
-    /// `init(...)` on a closed-form model.
-    AnalyticalInit,
-    /// An η on the residual error.
-    ResidualErrorEta,
-    /// Declared residual correlations.
-    ResidualCorrelations,
-    /// A custom RUV magnitude expression.
-    CustomRuvMagnitude,
-    /// The subject routes to the event-driven walk on a closed-form model.
-    EventWalkSubject,
-    /// The individual-parameter program does not cover the required PK slots.
-    IndivParamProgram,
-    /// Non-interaction FOCE with a prediction-dependent residual variance (#1722): the FOCE
-    /// EBE is then the mode of the frozen-variance objective, whose second-order response
-    /// the analytic assembly does not carry. One predicate,
-    /// [`crate::estimation::sens_cov_hessian::foce_cov_declines_frozen_variance`], is read
-    /// both by the assembly's own bail and by the walk that names it.
-    FoceFrozenResidualVariance,
     /// Every model-level clause passed but the per-subject assembly still bailed (a per-point
     /// provider decline, a non-finite block, an occasion/κ length mismatch, …).
     PerSubjectBail,
@@ -151,26 +114,12 @@ impl CovScopeDecline {
     /// in production enumerates the enum — without it the lib target reports it dead and
     /// `preflight.sh`'s `-Dunused` turns that into a hard error.
     #[cfg(test)]
-    pub(crate) const ALL: [CovScopeDecline; 20] = [
+    pub(crate) const ALL: [CovScopeDecline; 6] = [
         CovScopeDecline::Disabled,
         CovScopeDecline::Mixture,
-        CovScopeDecline::ExactHessianAnchor,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::GradientFd,
         CovScopeDecline::NonGaussianEndpoint,
-        CovScopeDecline::Frem,
-        CovScopeDecline::SelectedErrorSpec,
-        CovScopeDecline::LogTransform,
-        CovScopeDecline::IovShape,
-        CovScopeDecline::ExpressionScale,
-        CovScopeDecline::AnalyticReadout,
-        CovScopeDecline::AnalyticalInit,
-        CovScopeDecline::ResidualErrorEta,
-        CovScopeDecline::ResidualCorrelations,
-        CovScopeDecline::CustomRuvMagnitude,
-        CovScopeDecline::EventWalkSubject,
-        CovScopeDecline::IndivParamProgram,
-        CovScopeDecline::FoceFrozenResidualVariance,
         CovScopeDecline::PerSubjectBail,
     ];
 
@@ -179,38 +128,12 @@ impl CovScopeDecline {
         match self {
             CovScopeDecline::Disabled => "analytic_cov_hessian = false",
             CovScopeDecline::Mixture => "the model is a mixture model",
-            CovScopeDecline::ExactHessianAnchor => {
-                "the fit is anchored on the exact Hessian (method = laplace, or AGQ with that \
-                 anchor), whose second derivative needs fourth-order sensitivities"
-            }
             CovScopeDecline::ModelOutOfScope => {
-                "the model is outside the analytic sensitivity scope"
+                "the model is outside the analytic recorders' scope"
             }
             CovScopeDecline::GradientFd => "gradient = fd",
             CovScopeDecline::NonGaussianEndpoint => {
                 "the model has a non-Gaussian endpoint ([event_model] / [binary_model])"
-            }
-            CovScopeDecline::Frem => "the model is a FREM model",
-            CovScopeDecline::SelectedErrorSpec => {
-                "the error model selects endpoints by covariate branch"
-            }
-            CovScopeDecline::LogTransform => "the model is log-transform-both-sides",
-            CovScopeDecline::IovShape => "the model's IOV structure is outside the assembly",
-            CovScopeDecline::ExpressionScale => "[scaling] obs_scale = ... is in use",
-            CovScopeDecline::AnalyticReadout => "the model declares an analytic readout",
-            CovScopeDecline::AnalyticalInit => "the model declares init(...) compartment amounts",
-            CovScopeDecline::ResidualErrorEta => "the residual error carries a random effect",
-            CovScopeDecline::ResidualCorrelations => "the model declares residual correlations",
-            CovScopeDecline::CustomRuvMagnitude => "the model declares a custom RUV magnitude",
-            CovScopeDecline::EventWalkSubject => {
-                "at least one subject routes to the event-driven walk"
-            }
-            CovScopeDecline::IndivParamProgram => {
-                "the individual-parameter program does not cover the required PK slots"
-            }
-            CovScopeDecline::FoceFrozenResidualVariance => {
-                "the fit is non-interaction FOCE with a prediction-dependent residual variance, \
-                 whose frozen-variance EBE response the analytic assembly does not yet carry"
             }
             CovScopeDecline::PerSubjectBail => {
                 "at least one subject fell outside the analytic assembly"
@@ -230,10 +153,6 @@ impl CovScopeDecline {
     /// promise and gates it on the action clearing every listed clause (#1508 review §3).
     pub(crate) fn remedy(self) -> Option<&'static str> {
         match self {
-            CovScopeDecline::ExpressionScale => Some(
-                "writing the readout as an explicit expression ([scaling] y = central / V) \
-                 instead of obs_scale",
-            ),
             CovScopeDecline::GradientFd => Some("dropping gradient = fd"),
             CovScopeDecline::Disabled => Some("setting analytic_cov_hessian = true"),
             _ => None,

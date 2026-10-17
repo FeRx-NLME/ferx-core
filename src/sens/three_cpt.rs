@@ -87,6 +87,40 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     (alpha, beta, gamma, k21, k31)
 }
 
+/// A three-compartment disposition: the micro parameters the closed forms read directly
+/// and the macro rates ([`macro_rates_three_cpt_g`]), computed once for a parameter set and
+/// shared by every dose and observation evaluated at it. `Q2`/`Q3` enter only through the
+/// rates, so they are not kept.
+#[derive(Clone, Copy)]
+pub(crate) struct ThreeCpt<T> {
+    pub cl: T,
+    pub v1: T,
+    pub v2: T,
+    pub v3: T,
+    pub alpha: T,
+    pub beta: T,
+    pub gamma: T,
+    pub k21: T,
+    pub k31: T,
+}
+
+impl<T: PkNum> ThreeCpt<T> {
+    pub(crate) fn new(cl: T, v1: T, q2: T, v2: T, q3: T, v3: T) -> Self {
+        let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+        Self {
+            cl,
+            v1,
+            v2,
+            v3,
+            alpha,
+            beta,
+            gamma,
+            k21,
+            k31,
+        }
+    }
+}
+
 /// 3-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt} + G·e^{−γt}`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_g<T: PkNum>(
@@ -99,7 +133,14 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
-    three_cpt_iv_bolus_amt_g(T::from_f64(amt), t, cl, v1, q2, v2, q3, v3)
+    three_cpt_iv_bolus_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
+}
+
+/// [`three_cpt_iv_bolus_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_iv_bolus_d<T: PkNum>(amt: f64, t: T, d: &ThreeCpt<T>) -> T {
+    three_cpt_iv_bolus_amt_d(T::from_f64(amt), t, d)
 }
 
 /// As [`three_cpt_iv_bolus_g`] but with a generic amount `amt` (issue #524), so
@@ -116,10 +157,30 @@ pub fn three_cpt_iv_bolus_amt_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
+    three_cpt_iv_bolus_amt_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
+}
+
+/// [`three_cpt_iv_bolus_amt_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -152,13 +213,39 @@ pub fn three_cpt_infusion_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
+    three_cpt_infusion_d(rate, dur, amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
+}
+
+/// [`three_cpt_infusion_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_infusion_d<T: PkNum>(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: T,
+    d: &ThreeCpt<T>,
+) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
-        return three_cpt_iv_bolus_g(amt, t, cl, v1, q2, v2, q3, v3);
+        return three_cpt_iv_bolus_d(amt, t, d);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -205,7 +292,14 @@ pub fn three_cpt_oral_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    three_cpt_oral_amt_g(T::from_f64(amt), t, cl, v1, q2, v2, q3, v3, ka, f_bio)
+    three_cpt_oral_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio)
+}
+
+/// [`three_cpt_oral_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_oral_d<T: PkNum>(amt: f64, t: T, d: &ThreeCpt<T>, ka: T, f_bio: T) -> T {
+    three_cpt_oral_amt_d(T::from_f64(amt), t, d, ka, f_bio)
 }
 
 /// As [`three_cpt_oral_g`] but with a generic amount `amt` (issue #524); the
@@ -223,6 +317,26 @@ pub fn three_cpt_oral_amt_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
+    three_cpt_oral_amt_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio)
+}
+
+/// [`three_cpt_oral_amt_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: T, f_bio: T) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
@@ -232,7 +346,7 @@ pub fn three_cpt_oral_amt_g<T: PkNum>(
     {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -284,6 +398,26 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
+    three_cpt_iv_bolus_ss_d(amt, t, ii, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
+}
+
+/// [`three_cpt_iv_bolus_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &ThreeCpt<T>) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
@@ -293,7 +427,7 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -329,6 +463,40 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
+    three_cpt_oral_ss_d(
+        amt,
+        t,
+        ii,
+        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
+        ka,
+        f_bio,
+    )
+}
+
+/// [`three_cpt_oral_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
+    amt: f64,
+    t: T,
+    ii: f64,
+    d: &ThreeCpt<T>,
+    ka: T,
+    f_bio: T,
+) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
@@ -339,7 +507,7 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -392,6 +560,40 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
+    three_cpt_infusion_ss_d(
+        rate,
+        dur,
+        amt,
+        t,
+        ii,
+        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
+    )
+}
+
+/// [`three_cpt_infusion_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: T,
+    ii: f64,
+    d: &ThreeCpt<T>,
+) -> T {
+    let ThreeCpt {
+        cl,
+        v1,
+        v2,
+        v3,
+        alpha,
+        beta,
+        gamma,
+        k21,
+        k31,
+        ..
+    } = *d;
+
     if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
@@ -402,9 +604,9 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
-        return three_cpt_iv_bolus_ss_g(amt, t, ii, cl, v1, q2, v2, q3, v3);
+        return three_cpt_iv_bolus_ss_d(amt, t, ii, d);
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
@@ -485,46 +687,44 @@ pub fn three_cpt_conc_g<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
+    three_cpt_conc_d(
+        dose,
+        t,
+        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
+        ka,
+        f_bio,
+        oral,
+    )
+}
+
+/// [`three_cpt_conc_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_cpt_conc_d<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    d: &ThreeCpt<T>,
+    ka: T,
+    f_bio: T,
+    oral: bool,
+) -> T {
     // `F` rule mirrors production `route_f_scale` (#327): oral-depot bolus bakes
     // `F` in; IV bolus and every infusion are linear in dose → post-multiply.
     let oral_bolus = oral && !dose.is_infusion();
     let raw = if dose.ss && dose.ii > 0.0 {
         if dose.is_infusion() {
-            three_cpt_infusion_ss_g(
-                dose.rate,
-                dose.duration,
-                dose.amt,
-                t,
-                dose.ii,
-                cl,
-                v1,
-                q2,
-                v2,
-                q3,
-                v3,
-            )
+            three_cpt_infusion_ss_d(dose.rate, dose.duration, dose.amt, t, dose.ii, d)
         } else if oral {
-            three_cpt_oral_ss_g(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3, ka, f_bio)
+            three_cpt_oral_ss_d(dose.amt, t, dose.ii, d, ka, f_bio)
         } else {
-            three_cpt_iv_bolus_ss_g(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3)
+            three_cpt_iv_bolus_ss_d(dose.amt, t, dose.ii, d)
         }
     } else if dose.is_infusion() {
-        three_cpt_infusion_g(
-            dose.rate,
-            dose.duration,
-            dose.amt,
-            t,
-            cl,
-            v1,
-            q2,
-            v2,
-            q3,
-            v3,
-        )
+        three_cpt_infusion_d(dose.rate, dose.duration, dose.amt, t, d)
     } else if oral {
-        three_cpt_oral_g(dose.amt, t, cl, v1, q2, v2, q3, v3, ka, f_bio)
+        three_cpt_oral_d(dose.amt, t, d, ka, f_bio)
     } else {
-        three_cpt_iv_bolus_g(dose.amt, t, cl, v1, q2, v2, q3, v3)
+        three_cpt_iv_bolus_d(dose.amt, t, d)
     };
     if oral_bolus {
         raw

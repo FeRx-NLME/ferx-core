@@ -77,7 +77,9 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg ends after 44 evaluations at a point whose cold
-/// re-solve scores −74.973431, below what the optimizer saw there; the run is restarted
+/// re-solve scores ≈ −74.97 (−74.973431 before #486; the adjoint's gradient rounds
+/// differently, so the 44-evaluation trajectory lands a hair elsewhere — the trap and the
+/// restart are unchanged), below what the optimizer saw there; the run is restarted
 /// from it — its first inner solve is cold — and reaches −79.1679, 4.2 below the trapped
 /// leg. A refit started from those estimates reproduces −79.168, so this is the optimum
 /// and not another trap.
@@ -99,16 +101,27 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
             )
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
+    // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
+    // with any rounding-level change to the gradient (−74.973431 on the pre-#486 forward
+    // provider, −74.966692 and −74.966703 on successive adjoint builds), while the basin it
+    // identifies sits 4.2 above the optimum (−79.1679) — 200× the band.
+    let cold = notice
+        .message
+        .split("cold OFV = ")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        notice.message.contains("cold OFV = -74.973431"),
-        "the notice names the trapped leg's cold objective: {}",
+        (cold + 74.97).abs() < 0.02,
+        "the notice names the trapped leg's cold objective (≈ −74.97): {}",
         notice.message
     );
 
     assert!(
         result.ofv < -79.1,
         "expected the restart to reach the optimum (−79.1679); the trapped leg's cold \
-         objective is −74.9734. Got {}",
+         objective is ≈ −74.97. Got {}",
         result.ofv
     );
     assert!(
@@ -163,8 +176,10 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        (best - cold - 7.9121).abs() < 1e-3,
-        "measured gap 7.9121 (best-seen −67.0614, cold −74.9734): got {best} vs {cold}"
+        // Measured 7.9048 on the #486 adjoint gradient, 7.9121 on the forward provider's —
+        // the same trapped basin; a band, since the sixth decimal follows the rounding.
+        (best - cold - 7.91).abs() < 0.02,
+        "measured gap ≈ 7.91 (best-seen ≈ −67.06, cold ≈ −74.97): got {best} vs {cold}"
     );
     assert!(
         !result.converged,

@@ -5910,26 +5910,6 @@ pub fn parse_full_model_with(
         model.scaling = scaling;
     }
 
-    // A compartment-free model past the analytic axis cap (#811) routes to finite
-    // differences. That is correct, just slower — but silently slower: nothing else
-    // tells the user, and "my fit got sluggish when I added a covariate effect" is
-    // not a debuggable symptom. Name both numbers so the cause is visible, and say
-    // which direction to move.
-    if is_algebraic {
-        let axes = model.n_theta + model.n_eta + model.n_kappa;
-        let cap = crate::sens::algebraic::MAX_ALGEBRAIC_AXES;
-        if axes > cap {
-            model.parse_warnings.push(format!(
-                "[structural_model]: this model estimates {axes} parameters (theta + eta{}), \
-                 past the {cap}-axis cap of the analytic gradient path, so it falls back to \
-                 finite differences. The fit is correct, only slower. Reduce the number of \
-                 simultaneously estimated parameters, or FIX the ones you are not estimating. \
-                 See issue #811.",
-                if model.n_kappa > 0 { " + kappa" } else { "" },
-            ));
-        }
-    }
-
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
@@ -12241,7 +12221,10 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
     // Detect the `ode_template NAME(params)` line (and reject mixing it with a
     // `pk`/`ode(...)` disposition) in a scope that releases the immutable borrow
     // before the block rewrites below.
-    let tmpl_re = Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap();
+    static TMPL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap()
+    });
+    let tmpl_re = &*TMPL_RE;
     let (model_name, params_str) = {
         let struct_lines = match extracted.unnamed.get("structural_model") {
             Some(l) => l,
@@ -12689,9 +12672,13 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
 fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     // ode(obs_cmt=central, states=[depot, central])   — classic form
     // ode(states=[depot, central])                    — Form C: requires [scaling] y = ...
-    let with_obs =
-        Regex::new(r"ode\(\s*obs_cmt\s*=\s*(\w+)\s*,\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
-    let without_obs = Regex::new(r"ode\(\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
+    static WITH_OBS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"ode\(\s*obs_cmt\s*=\s*(\w+)\s*,\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap()
+    });
+    let with_obs = &*WITH_OBS_RE;
+    static WITHOUT_OBS_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"ode\(\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap());
+    let without_obs = &*WITHOUT_OBS_RE;
     for line in lines {
         if let Some(caps) = with_obs.captures(line) {
             let obs_cmt = caps[1].to_string();
@@ -14624,6 +14611,71 @@ fn build_ode_spec(
             (*state_idx, params)
         })
         .collect();
+    // Each `init(state) = …` compiled to the readout's evaluator, so a dual walk seeds the
+    // initial state by evaluating the expression itself on its own number type — exact,
+    // where the opaque `init_fn` closure could only be differenced. The layout mirrors
+    // that closure: states (all 0 at the time origin) then individual parameters, every
+    // name under each case the closure binds; `MACHEPS` is its constant; covariates are
+    // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
+    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
+    // comes from the class being evaluated) or a name the layout does not bind.
+    let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
+        .then(|| {
+            let mut var_idx: HashMap<String, usize> = HashMap::new();
+            for (i, n) in state_names.iter().enumerate() {
+                var_idx.insert(n.clone(), i);
+                var_idx.insert(n.to_lowercase(), i);
+            }
+            for (i, n) in indiv_names_owned.iter().enumerate() {
+                for v in [n.clone(), n.to_uppercase(), n.to_lowercase()] {
+                    var_idx.insert(v, state_count + i);
+                }
+            }
+            init_specs
+                .iter()
+                .map(|(state_idx, expr)| {
+                    let mut e = expr.clone();
+                    let mut mixnum = false;
+                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
+                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
+                            *node = Expression::Literal(f64::EPSILON)
+                        }
+                        Expression::MixNum => mixnum = true,
+                        _ => {}
+                    });
+                    resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
+                    let mut unresolved = false;
+                    visit_expr_nodes(&e, &mut |node| {
+                        if matches!(node, Expression::VariableIdx(usize::MAX)) {
+                            unresolved = true;
+                        }
+                    });
+                    if mixnum || unresolved {
+                        return None;
+                    }
+                    let bc = compile_bytecode(&e);
+                    let dual_evaluable = !bc.ops.iter().any(|op| {
+                        matches!(
+                            op,
+                            Op::PushTheta(_)
+                                | Op::PushEta(_)
+                                | Op::PushThetaGather(_)
+                                | Op::PushNnOutput(_, _)
+                        )
+                    });
+                    let prog = OdeOutputProgram {
+                        bc,
+                        n_states: state_count,
+                        n_indiv: indiv_count,
+                        indiv_to_pk: indiv_to_params_slot.clone(),
+                        cov_names: Vec::new(),
+                        dual_evaluable,
+                    };
+                    dual_evaluable.then_some((*state_idx, prog))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
     // Lift the parameter-only subexpressions out of the RK stages. Individual
     // parameters and `MACHEPS` are the slots that stay fixed across the calls of
     // one integration; `build_rhs_hoist` drops any the program itself assigns.
@@ -14660,6 +14712,7 @@ fn build_ode_spec(
         has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         init_indiv_reads,
+        init_program,
         hoist: rhs_hoist,
         binding,
     };
@@ -15471,12 +15524,16 @@ fn strip_line_comment(line: &str) -> &str {
 /// Shared by `parse_model_name` (the preamble reader) and `extract_blocks` (the
 /// in-block guard) so the two cannot disagree on what a declaration looks like.
 fn model_name_declaration(trimmed: &str) -> Option<&str> {
-    let re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
+    static MODEL_NAME_DECLARATION_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap());
+    let re = &*MODEL_NAME_DECLARATION_RE;
     re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
 }
 
 fn parse_model_name(content: &str) -> Result<String, String> {
-    let header_re = Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap();
+    static HEADER_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap());
+    let header_re = &*HEADER_RE;
     let mut name: Option<String> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = strip_line_comment(line).trim();
@@ -15540,7 +15597,9 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
     // Anchor on the whole line so things like `states=[central]` inside an
     // ODE structural definition aren't misread as a block-tag opener.
-    let block_re = Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap();
+    static BLOCK_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
+    let block_re = &*BLOCK_RE;
 
     // current_target: either an unnamed block name, or a (block_type, instance) pair.
     enum BlockTarget {
@@ -16016,16 +16075,21 @@ fn parse_mixture_block(
 ) -> Result<crate::types::MixtureSpec, String> {
     use crate::types::{MixingExpr, MixtureClassOverride, MixtureSpec};
 
-    let nsub_re = Regex::new(r"(?i)^nsub\s*=\s*(\d+)$").unwrap();
-    let mix_re = Regex::new(r"(?i)^(logit|p)\s*\(\s*(\d+)\s*\)\s*=\s*(.+)$").unwrap();
+    static NSUB_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^nsub\s*=\s*(\d+)$").unwrap());
+    let nsub_re = &*NSUB_RE;
+    static MIX_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^(logit|p)\s*\(\s*(\d+)\s*\)\s*=\s*(.+)$").unwrap()
+    });
+    let mix_re = &*MIX_RE;
     // `omega(k) NAME ~ var [FIX] [(sd|var)] [FIX]` — mirrors the base omega/sigma
     // regexes in `parse_parameters`, prefixed with the `(k)` class selector.
-    let ov_re = Regex::new(
-        &format!(
+    static OV_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let ov_re = &*OV_RE;
 
     let mut nsub: Option<usize> = None;
     let mut mixing: Vec<MixingExpr> = Vec::new();
@@ -16557,10 +16621,10 @@ fn parse_parameters(
     // — `PL = PLACEBO[PLA_IDX]` — so declaration and use match. What makes
     // hundreds of levels tractable is that the reference is a *gather*, which
     // occupies a single `PkParams` slot rather than one per level.
-    let theta_re = Regex::new(
-        r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",
-    )
-    .unwrap();
+    static THETA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",).unwrap()
+    });
+    let theta_re = &*THETA_RE;
 
     // omega NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -16582,12 +16646,12 @@ fn parse_parameters(
     // `~ 0.002 (ſd)` with `ferx check` reporting VALID (#1388 review round 3 #3).
     // The grammar and the read-back now agree, and `(ſd)` is an unrecognized
     // line. Every tag group splices the one `SCALE_TAG_GROUP`.
-    let omega_re = Regex::new(
-        &format!(
+    static OMEGA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let omega_re = &*OMEGA_RE;
 
     // block_omega (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     //
@@ -16605,12 +16669,12 @@ fn parse_parameters(
     // (#1388 review round 3 #8). Group 3 is `FIX`; group 5, a `FIX` after the
     // tag, sits *inside* the tag group so both `] FIX (sd)` and `] (sd) FIX`
     // classify while `] FIX FIX` — no tag at all — still matches nothing.
-    let block_omega_re = Regex::new(
-        &format!(
+    static BLOCK_OMEGA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_omega_re = &*BLOCK_OMEGA_RE;
 
     // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
     //
@@ -16618,12 +16682,12 @@ fn parse_parameters(
     // converted to fixed correlations so the existing positive sigma
     // parameterization remains intact.
     // Same group layout as `block_omega_re`, tag in group 4.
-    let block_sigma_re = Regex::new(
-        &format!(
+    static BLOCK_SIGMA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_sigma_re = &*BLOCK_SIGMA_RE;
 
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -16633,30 +16697,30 @@ fn parse_parameters(
     // and likelihood code (which work in SD) need no changes.
     // FIX may appear before or after the scale annotation (same group layout
     // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
-    let sigma_re = Regex::new(
-        &format!(
+    static SIGMA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let sigma_re = &*SIGMA_RE;
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
-    let kappa_re = Regex::new(
-        &format!(
+    static KAPPA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let kappa_re = &*KAPPA_RE;
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     // Same group layout as `block_omega_re`, tag in group 4.
-    let block_kappa_re = Regex::new(
-        &format!(
+    static BLOCK_KAPPA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_kappa_re = &*BLOCK_KAPPA_RE;
 
     // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
     let level_re = Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap();
@@ -18045,7 +18109,9 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
     // read `zpk one_cpt_iv(cl=CL, v=V)` as a valid `one_cpt_iv` declaration
     // (#811). `classify_structural_line` rejects such a line before this runs;
     // the anchor keeps the two from drifting.
-    let pk_re = Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap();
+    static PK_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap());
+    let pk_re = &*PK_RE;
 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
@@ -18569,7 +18635,9 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
                 .to_string(),
         );
     }
-    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap();
+    static LOG_LHS_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap());
+    let log_lhs_re = &*LOG_LHS_RE;
     if log_lhs_re.is_match(body) {
         return Err(
             "[error_model] log-transform-both-sides (`log(DV) ~ …`) is not supported inside a \
@@ -18577,7 +18645,9 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
                 .to_string(),
         );
     }
-    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap();
+    static PARSE_ERROR_ENDPOINT_BODY_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap());
+    let re = &*PARSE_ERROR_ENDPOINT_BODY_RE;
     let caps = re.captures(body).ok_or_else(|| {
         format!(
             "[error_model] expected a single `DV ~ TYPE(...)` statement inside an if/else branch, \
@@ -18894,11 +18964,13 @@ const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
 fn split_correlation_line(
     lines: &[String],
 ) -> Result<(Vec<String>, Option<CorrelationDecl>), String> {
-    let head = Regex::new(r"(?i)^\s*correlation\b").unwrap();
-    let full = Regex::new(
-        r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",
-    )
-    .unwrap();
+    static HEAD_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*correlation\b").unwrap());
+    let head = &*HEAD_RE;
+    static FULL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",).unwrap()
+    });
+    let full = &*FULL_RE;
     let mut rest = Vec::with_capacity(lines.len());
     let mut decl: Option<CorrelationDecl> = None;
     for line in lines {
@@ -19049,18 +19121,27 @@ fn parse_error_model_inner(
     // expressions with their own nested parens — `combined(PROP*(if (TIME>24)
     // T else 1), ADD)` (#484) — survive intact; top-level commas are split out
     // below with `split_top_level_args`.
-    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
+    static PARSE_ERROR_MODEL_INNER_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap());
+    let re = &*PARSE_ERROR_MODEL_INNER_RE;
     // LTBS LHS `log(DV) ~ TYPE(SIGMA)` — captures the logged data column,
     // the error type, and the sigma list.
-    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
-    let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
+    static LOG_LHS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap()
+    });
+    let log_lhs_re = &*LOG_LHS_RE;
+    static CMT_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap());
+    let cmt_re = &*CMT_RE;
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them,
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
     // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
-    let iiv_re = Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap();
+    static IIV_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
+    let iiv_re = &*IIV_RE;
     let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
@@ -21426,39 +21507,6 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// RAII guard supplying `[covariate_nn]` outputs to
-/// [`eval_statements_g`] for the duration of a scope, mirroring
-/// [`ModelTimeGuard`] for the `TIME` built-in.
-///
-/// # Why a thread-local rather than a parameter
-///
-/// `Op::PushNnOutput` needs the network's forward output, which the `f64`
-/// `pk_param_fn` closure already computes once per call from its captured NN
-/// handles. The generic evaluator has no such closure — it is handed a compiled
-/// [`IndivParamProgram`], which carries statements and layout but no network — so
-/// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
-/// slice and pushed **0.0**. An NN output silently read as zero is precisely the
-/// class of defect AGENTS.md's routing rule exists to prevent, and it was reachable
-/// the moment any gate stopped excluding `[covariate_nn]` models from a
-/// program-driven analytic path.
-///
-/// Threading a parameter instead would touch eight recursive call sites in the hot
-/// inner-loop evaluator. `TIME` faced the same choice and resolved it the same way,
-/// so this follows the established seam rather than inventing a second convention.
-///
-/// # What it is *not* for
-///
-/// On its own, the outputs are lifted as **constants** on every dual axis. That is
-/// exact for `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a
-/// way to get `∂/∂θ` for NN weights — those derivatives are zero under this guard
-/// alone, which is why only η-gradient paths may use it bare. The θ-chain for the
-/// weights comes from one of two places: the fixed-η estimators use
-/// [`crate::estimation::nn_theta_gradient`]; the FOCE/FOCEI event-driven walk pairs this
-/// guard with a [`ModelNnAxisGuard`], which seeds each output on a dual axis of its own
-/// so `∂p/∂z` falls out of the program walk and is chained to the weights through the
-/// network's backprop Jacobian (#1300).
-pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
-
 thread_local! {
     /// First dual axis of the `[covariate_nn]` output block for the generic evaluator,
     /// or `None` (the default) to lift outputs as constants. See [`ModelNnAxisGuard`].
@@ -21489,14 +21537,6 @@ fn current_nn_axis_base() -> Option<usize> {
 pub(crate) struct ModelNnAxisGuard(Option<usize>);
 
 impl ModelNnAxisGuard {
-    /// Seed NN outputs on axes `base..base + n_outputs_total` for the current thread,
-    /// restoring the previous setting on drop.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter(base: usize) -> Self {
-        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(Some(base)));
-        ModelNnAxisGuard(prev)
-    }
-
     /// Lift NN outputs as constants again for the guard's scope, restoring the previous
     /// setting on drop. For a value pass that runs *inside* a seeded evaluation over a
     /// jet-free type — the `Dual2<0>` cov-static fold in `eval_cov_static_f64` — where a
@@ -21513,67 +21553,41 @@ impl Drop for ModelNnAxisGuard {
     }
 }
 
-impl ModelNnGuard {
-    /// Install `outputs` for the current thread, restoring the previous value on drop.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
-        let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
-        ModelNnGuard(prev)
-    }
+thread_local! {
+    /// `[covariate_nn]` outputs on a dual number type, set by [`ModelNnDualGuard`].
+    static MODEL_NN_DUAL: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+}
 
-    /// Compute and install every `[covariate_nn]` block's forward output at this
-    /// `(theta, covariates)` point, or `None` when the model has no network (in which
-    /// case the evaluator's empty default is already correct and no guard is needed).
-    ///
-    /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
-    /// gradient path differentiates around is the value the prediction path produced.
-    ///
-    /// A `forward_raw` failure `panic!`s, exactly as `pk_param_fn` does on the same call.
-    /// It zero-fills an absent covariate, so the only ways it can fail are a mis-sized
-    /// weight slice or an input/layer count mismatch — wiring bugs, not runtime conditions.
-    /// Defaulting the block to `vec![]` instead would make `Op::PushNnOutput` read every
-    /// output as `0.0` in a release build, which is the silent-zero defect this guard
-    /// exists to prevent.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter_for(
-        model: &crate::types::CompiledModel,
-        theta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Option<Self> {
-        if model.covariate_nns.is_empty() {
-            return None;
-        }
-        let outputs: Vec<Vec<f64>> = model
-            .covariate_nns
-            .iter()
-            .map(|nn| {
-                let n_w = nn.mapper.mlp().n_weights();
-                let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                nn.mapper.forward_raw(w, covariates).expect(
-                    "NN forward_raw failed in ModelNnGuard::enter_for: this indicates a \
-                     wiring bug (wrong weight slice or input/layer count), not a \
-                     recoverable condition",
-                )
-            })
-            .collect();
-        Some(Self::enter(outputs))
-    }
+/// Output `out_i` of network `nn_i` from a live [`ModelNnDualGuard`] of type `T`.
+#[inline]
+fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
+    MODEL_NN_DUAL.with(|cell| {
+        cell.borrow()
+            .as_ref()?
+            .downcast_ref::<Vec<Vec<T>>>()?
+            .get(nn_i as usize)?
+            .get(out_i as usize)
+            .copied()
+    })
+}
 
-    #[cfg(not(feature = "nn"))]
-    pub(crate) fn enter_for(
-        _model: &crate::types::CompiledModel,
-        _theta: &[f64],
-        _covariates: &HashMap<String, f64>,
-    ) -> Option<Self> {
-        None
+/// RAII guard installing `[covariate_nn]` outputs computed on the evaluator's own number
+/// type — the network evaluated over taped weights — so the generic evaluator reads them
+/// with their derivatives, in place of [`ModelNnGuard`]'s `f64` constants.
+#[cfg(feature = "nn")]
+pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
+
+#[cfg(feature = "nn")]
+impl ModelNnDualGuard {
+    pub(crate) fn enter<T: 'static>(outputs: Vec<Vec<T>>) -> Self {
+        ModelNnDualGuard(MODEL_NN_DUAL.with(|cell| cell.replace(Some(Box::new(outputs)))))
     }
 }
 
-impl Drop for ModelNnGuard {
+#[cfg(feature = "nn")]
+impl Drop for ModelNnDualGuard {
     fn drop(&mut self) {
-        MODEL_NN_OUTPUTS.with(|cell| {
-            *cell.borrow_mut() = std::mem::take(&mut self.0);
-        });
+        MODEL_NN_DUAL.with(|cell| *cell.borrow_mut() = self.0.take());
     }
 }
 
@@ -26705,6 +26719,11 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::PushMixNum => push!(k(current_mixture_class() as f64)),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
+            // Outputs the caller computed on this number type (`ModelNnDualGuard`: the
+            // adjoint's recordings, the network over taped weights) are read as they are.
+            Op::PushNnOutput(nn_i, out_i) if nn_dual_output::<T>(nn_i, out_i).is_some() => {
+                push!(nn_dual_output::<T>(nn_i, out_i).expect("checked by the guard"));
+            }
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
@@ -27936,11 +27955,35 @@ pub struct OdeRhsProgram {
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
     init_indiv_reads: Vec<(usize, Vec<usize>)>,
+    /// Each `init(state) = …` as `(state, program)`, evaluable over any dual type — the
+    /// exact initial state a dual walk seeds (`None`: no init, or one the compiled form
+    /// cannot express). Recorded here for the same reason as `init_indiv_reads`.
+    init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
     binding: RhsBindingPlan,
 }
 
 impl OdeRhsProgram {
+    /// The initial state `init(...)` sets, evaluated over `T` from the PK-parameter
+    /// vector `params` (states other than the seeded ones, and every state at the origin,
+    /// read 0): the exact counterpart of `OdeSpec::init_fn` on a dual walk. `None` when
+    /// the model's inits have no compiled form.
+    pub(crate) fn init_state_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        params: &[T],
+        n_states: usize,
+    ) -> Option<Vec<T>> {
+        let progs = self.init_program.as_ref()?;
+        let zeros = vec![T::from_f64(0.0); n_states];
+        let empty = HashMap::new();
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        let mut out = zeros.clone();
+        for (idx, prog) in progs {
+            out[*idx] = prog.eval_output_g(&zeros, params, &empty, &mut vars, &mut stack);
+        }
+        Some(out)
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
@@ -28726,8 +28769,7 @@ impl CtmmGeneratorProgram {
     }
 
     /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k` (the same axis convention
-    /// [`IndivParamProgram::eval_param_duals`] uses).
+    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
     ///
     /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
     /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
@@ -28955,10 +28997,6 @@ pub struct IndivParamProgram {
 }
 
 impl IndivParamProgram {
-    /// Dual width needed to seed every (θ, η) axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
     /// User-declared θ count the individual parameters reference (the dual seed
     /// dimension of η axis `k` is `n_theta_axis() + k`).
     pub(crate) fn n_theta_axis(&self) -> usize {
@@ -28967,16 +29005,6 @@ impl IndivParamProgram {
     /// η count the individual parameters reference (BSV + IOV kappa).
     pub(crate) fn n_eta_axis(&self) -> usize {
         self.n_eta
-    }
-
-    /// The PK slot each row of [`eval_param_duals`](Self::eval_param_duals) /
-    /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program) corresponds
-    /// to, in the program's own (analytical: alphabetical-by-PK-name; ODE:
-    /// declaration) order. The analytical provider uses this to pair each `∂p/∂·`
-    /// row with the right slot of the 8-slot PK gradient — `pk_var_slots` order is
-    /// NOT `CompiledModel.pk_indices` (declaration) order.
-    pub(crate) fn pk_slots(&self) -> Vec<usize> {
-        self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
     }
 
     /// Borrowing form of [`pk_slots`](Self::pk_slots): the PK-slot list cached at
@@ -29026,107 +29054,42 @@ impl IndivParamProgram {
         &self.pk_var_slots
     }
 
-    /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
-    /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
-    /// individual parameter (declaration order), whose `grad`/`hess` are the exact
-    /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
-    ///
-    /// The absolute-axis layout of [`eval_param_duals_cols`](Self::eval_param_duals_cols)
-    /// (`theta_cols = None`).
-    pub(crate) fn eval_param_duals<const M: usize>(
+    /// Evaluate the individual parameters over any VM number type, from θ and η already
+    /// seeded by the caller (a forward dual's axes, or tape leaves). Returns one value
+    /// per [`pk_var_slots`](Self::pk_var_slots) entry, in that order. The single
+    /// evaluator behind [`eval_param_duals`](Self::eval_param_duals) and the adjoint
+    /// gradient's taped parameters.
+    pub(crate) fn eval_params_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Vec<crate::sens::dual2::Dual2<M>> {
-        self.eval_param_duals_cols::<M>(theta, eta, covariates, None, self.n_theta)
-    }
-
-    /// Column-chunked twin of [`eval_param_duals`](Self::eval_param_duals): seed the
-    /// program's θ on a **θ-column chunk's** axes rather than on absolute ones, so a
-    /// program wider than the dual dispatch can be evaluated one chunk at a time (#1907).
-    ///
-    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the chunk
-    /// does not carry enters as a **constant**. That is exact per chunk: forward-mode axes
-    /// never interact, so the chunk that owns a column supplies its derivative, and the
-    /// η block every chunk carries comes out entry for entry the same. `eta_axis_base` is
-    /// the dual axis of `eta[0]` (`cols.len()` for a chunked caller, `n_theta` for an
-    /// absolute one). `theta_cols = None` is the absolute layout `θ_m → m` — the
-    /// pre-chunking behaviour, seed for seed — the same contract as
-    /// `ScaleDerivProgram::eval_scale_dual_cols`.
-    pub(crate) fn eval_param_duals_cols<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        theta_cols: Option<&[usize]>,
-        eta_axis_base: usize,
-    ) -> Vec<crate::sens::dual2::Dual2<M>> {
-        use crate::sens::dual2::Dual2;
-        // θ index → dual axis. Only the program's own θ axes (`0..n_theta`, the
-        // user-declared thetas) are seeded, under either layout. A `theta` slice longer
-        // than that carries generated `[covariate_nn]` weights, which reach the program
-        // through `Op::PushNnOutput` and never through `PushTheta`; seeding them here would
-        // put them on the axes `η` and the NN-output block occupy (`n_theta + k`, see
-        // `ModelNnAxisGuard`). For a program whose θ axis count equals the model's — every
-        // non-NN caller — the absolute layout is the former `m < M` bound exactly.
-        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
-            None => (0..theta.len())
-                .map(|m| (m < self.n_theta).then_some(m))
-                .collect(),
-            Some(_) => vec![None; theta.len()],
-        };
-        if let Some(cols) = theta_cols {
-            for (c, &m) in cols.iter().enumerate() {
-                if m < self.n_theta && m < theta_axis.len() {
-                    theta_axis[m] = Some(c);
-                }
-            }
-        }
-        let theta_d: Vec<Dual2<M>> = theta
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| match theta_axis[m] {
-                Some(ax) if ax < M => Dual2::var(v, ax),
-                _ => Dual2::constant(v),
-            })
-            .collect();
-        let eta_d: Vec<Dual2<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                let dim = eta_axis_base + k;
-                if dim < M {
-                    Dual2::var(v, dim)
-                } else {
-                    Dual2::constant(v)
-                }
-            })
-            .collect();
+    ) -> Vec<T> {
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
             .map(|n| covariates.get(n).copied().unwrap_or(0.0))
             .collect();
-        let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual2<M>> = Vec::new();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
-        // plain f64, seed them as dual constants (zero gradient/Hessian — exactly
-        // what they carry), and skip their (pow/exp/log heavy) re-derivation in the
-        // Dual2 walk. `skip` empty ⇒ original full-dual path.
+        // plain f64, seed them as constants (zero derivatives — exactly what they
+        // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
+        // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
-            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+            let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
-                    vars[v] = Dual2::constant(static_vals[v]);
+                    vars[v] = T::from_f64(static_vals[v]);
                 }
             }
         }
-        eval_statements_g::<Dual2<M>>(
+        eval_statements_g::<T>(
             &self.stmts,
-            &theta_d,
-            &eta_d,
+            theta,
+            eta,
             &cov_vec,
             &mut vars,
             None,
@@ -29135,7 +29098,7 @@ impl IndivParamProgram {
         );
         self.pk_var_slots
             .iter()
-            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0)))
             .collect()
     }
 
@@ -29225,65 +29188,6 @@ impl IndivParamProgram {
         );
         vars.truncate(self.n_top_level_vars);
         vars
-    }
-
-    /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
-    /// (`η_k → var(·, k)`, θ held constant): the light first-order counterpart of
-    /// [`eval_param_duals`](Self::eval_param_duals) for the inner η-gradient (#410).
-    /// Returns one `Dual1<M>` per individual parameter (declaration order); its
-    /// `grad` is the exact `∂p/∂η`. Avoids the θ-axes and the second-order Hessian
-    /// the `Dual2` path computes. Requires `M ≥ n_eta_axis()`.
-    pub(crate) fn eval_param_eta_grad<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<crate::sens::dual1::Dual1<M>> {
-        use crate::sens::dual1::Dual1;
-        let theta_d: Vec<Dual1<M>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
-        let eta_d: Vec<Dual1<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                if k < M {
-                    Dual1::var(v, k)
-                } else {
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual1<M>> = Vec::new();
-        // Cov-static fold (#485): same as the Dual2 path — cov-static slots are a
-        // fortiori η-independent, so seeding them as Dual1 constants is exact.
-        let skip: &[bool] = &self.cov_static_mask;
-        if !skip.is_empty() {
-            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
-            for (v, &is_static) in skip.iter().enumerate() {
-                if is_static {
-                    vars[v] = Dual1::constant(static_vals[v]);
-                }
-            }
-        }
-        eval_statements_g::<Dual1<M>>(
-            &self.stmts,
-            &theta_d,
-            &eta_d,
-            &cov_vec,
-            &mut vars,
-            None,
-            &mut stack,
-            skip,
-        );
-        self.pk_var_slots
-            .iter()
-            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual1::constant(0.0)))
-            .collect()
     }
 }
 
@@ -29417,10 +29321,6 @@ pub struct ScaleDerivProgram {
 }
 
 impl ScaleDerivProgram {
-    /// Dual width needed to seed every (θ, η) axis.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
     pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
     }
@@ -29432,153 +29332,26 @@ impl ScaleDerivProgram {
         &self.var_to_pk_slot
     }
 
-    /// Evaluate the scale over `Dual2<M>` seeded on (θ, η): `θ_m → var(·, m)`,
-    /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
-    /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
-    /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
-    ///
-    /// The absolute-axis layout of [`eval_scale_dual_cols`](Self::eval_scale_dual_cols)
-    /// (`theta_cols = None`).
-    pub(crate) fn eval_scale_dual<const M: usize>(
+    /// Evaluate the scale over any VM number type, from caller-seeded θ, η and
+    /// individual-parameter values (`var_vals[i]` for var slot `i`, as in
+    /// [`eval_scale_dual`](Self::eval_scale_dual)). The single evaluator behind the
+    /// `Dual2` entry points and the adjoint gradient's taped scale.
+    pub(crate) fn eval_scale_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual2::Dual2<M>],
-    ) -> crate::sens::dual2::Dual2<M> {
-        self.eval_scale_dual_cols::<M>(theta, eta, cov, var_duals, None, self.n_theta)
-    }
-
-    /// Column-chunked twin of [`eval_scale_dual`](Self::eval_scale_dual): seed the
-    /// program's direct θ / η references on a **θ-column chunk's** axes rather than on
-    /// absolute ones.
-    ///
-    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the
-    /// chunk does not carry enters as a **constant**, which is exactly right per chunk —
-    /// forward-mode axes never interact, so the chunk that owns that column supplies its
-    /// derivative. `eta_axis_base` is the dual axis of `eta[0]` (the chunk's stacked
-    /// block starts right after its θ columns, so `cols.len()` for a chunked caller and
-    /// `n_theta` for an absolute one). `theta_cols = None` is the absolute layout
-    /// `θ_m → m`, i.e. the pre-chunking behaviour entry for entry (#1339).
-    pub(crate) fn eval_scale_dual_cols<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual2::Dual2<M>],
-        theta_cols: Option<&[usize]>,
-        eta_axis_base: usize,
-    ) -> crate::sens::dual2::Dual2<M> {
-        use crate::sens::dual2::Dual2;
-        // θ index → dual axis. `None` is the identity; a chunk maps only the columns it
-        // carries and leaves every other θ a constant.
-        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
-            None => (0..theta.len()).map(Some).collect(),
-            Some(_) => vec![None; theta.len()],
-        };
-        if let Some(cols) = theta_cols {
-            for (c, &m) in cols.iter().enumerate() {
-                if m < theta_axis.len() {
-                    theta_axis[m] = Some(c);
-                }
-            }
-        }
-        let theta_d: Vec<Dual2<M>> = theta
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| match theta_axis[m] {
-                Some(ax) if ax < M => Dual2::var(v, ax),
-                _ => Dual2::constant(v),
-            })
-            .collect();
-        let eta_d: Vec<Dual2<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                let dim = eta_axis_base + k;
-                if dim < M {
-                    Dual2::var(v, dim)
-                } else {
-                    Dual2::constant(v)
-                }
-            })
-            .collect();
+        var_vals: &[T],
+    ) -> T {
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        let mut stack: Vec<Dual2<M>> = Vec::new();
-        eval_bytecode_g::<Dual2<M>>(
-            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
-        )
-    }
-
-    /// First-order η-only evaluation: returns `value` and `∂/∂η_k` on axis `k` over
-    /// `Dual1<N>` (`N = n_eta`). θ and individual-param vars enter as constants
-    /// except the seeded η axes, so this drops the θ axes and the `Dual2` Hessian
-    /// that [`eval_scale_dual`](Self::eval_scale_dual) carries. Used by the inner
-    /// init-amount gradient, whose EBE loop consumes only `∂A₀/∂η` (#524 follow-up).
-    pub(crate) fn eval_scale_dual1<const N: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual1::Dual1<N>],
-    ) -> crate::sens::dual1::Dual1<N> {
-        use crate::sens::dual1::Dual1;
-        // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). The ODE inner gate caps
-        // `n_eta`, not `n_theta + n_eta` (#1804), and the IOV outer evaluates the scale
-        // in θ-column chunks (#1907), so either route can reach this call with more θ
-        // or η values than the common stack buffers hold. Those take heap `Vec`s (the
-        // fixed-size buffers alone would panic on the `[..len]` slices); ordinary narrow
-        // models keep the stack fast path from #534. (`cov_vec` / bytecode `stack`
-        // lengths are not axis-bounded, so they stay on the heap.)
-        const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
-        let seed_eta = |k: usize, v: f64| {
-            if k < N {
-                Dual1::var(v, k)
-            } else {
-                Dual1::constant(v)
-            }
-        };
-        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
-        let theta_heap: Vec<Dual1<N>>;
-        let theta_d: &[Dual1<N>] = if theta.len() <= CAP {
-            for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
-                *d = Dual1::constant(v);
-            }
-            &theta_buf[..theta.len()]
-        } else {
-            theta_heap = theta.iter().map(|&v| Dual1::constant(v)).collect();
-            &theta_heap
-        };
-        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
-        let eta_heap: Vec<Dual1<N>>;
-        let eta_d: &[Dual1<N>] = if eta.len() <= CAP {
-            for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
-                *d = seed_eta(k, v);
-            }
-            &eta_buf[..eta.len()]
-        } else {
-            eta_heap = eta
-                .iter()
-                .enumerate()
-                .map(|(k, &v)| seed_eta(k, v))
-                .collect();
-            &eta_heap
-        };
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| cov.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
-        let mut stack: Vec<Dual1<N>> = Vec::new();
-        eval_bytecode_g::<Dual1<N>>(
-            &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+        let mut stack: Vec<T> = Vec::new();
+        eval_bytecode_g::<T>(
+            &self.bc, theta, eta, &cov_vec, var_vals, &empty_nn, &mut stack,
         )
     }
 }
@@ -29597,17 +29370,53 @@ pub struct RuvMagDerivProgram {
     cov_names: Vec<String>,
 }
 
-/// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
-/// (same const-generic-dispatch convention as `MAX_SCALE_AXES` / `MAX_ODE_AXES`,
-/// but set higher — the magnitude program's bytecode evaluator is cheap to
-/// monomorphize, and covering realistic large-θ population models keeps the
-/// magnitude direct-θ channel analytic rather than dropping to FD, #486). A model
-/// with more thetas than this falls back to FD for the magnitude's direct-θ
-/// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
-/// against this constant when a custom magnitude is active.
-pub(crate) const MAX_RUV_MAG_AXES: usize = 32;
-
 impl RuvMagDerivProgram {
+    /// The magnitude (or exponent) at `theta` over any VM number type — `θ` carrying
+    /// whatever derivative structure the caller seeded (tape leaves for the adjoint
+    /// gradient) — with the observation's covariates and raw TIME, as the runtime
+    /// closure evaluates it. `None` on a θ-count mismatch.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        cov: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Option<T> {
+        if theta.len() != self.n_theta {
+            return None;
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| {
+                if n.eq_ignore_ascii_case("TIME") {
+                    time
+                } else {
+                    cov.get(n).copied().unwrap_or(0.0)
+                }
+            })
+            .collect();
+        // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS; slot 2 = TAD (#1182).
+        let prog_vars = [
+            T::from_f64(1.0),
+            T::from_f64(f64::EPSILON),
+            T::from_f64(tad),
+        ];
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<T> = Vec::new();
+        Some(with_model_time(time, || {
+            eval_bytecode_g::<T>(
+                &self.bc,
+                theta,
+                &[],
+                &cov_vec,
+                &prog_vars,
+                &empty_nn,
+                &mut stack,
+            )
+        }))
+    }
+
     /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
     /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
     /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match

@@ -106,7 +106,7 @@ fn ode_fit_converges_to_analytical_estimates_and_se() {
     // this would silently validate the FD fallback instead of #410.
     let ode_model = parse_model_string(ODE_SRC).expect("ODE parses");
     assert!(
-        ferx_core::sens::provider::sens_supported(&ode_model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&ode_model),
         "ODE twin must be armed for the analytic outer gradient (#410)"
     );
 

@@ -291,7 +291,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
 fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
     // Analytical PK model with `gradient = auto` → exact FOCE gradient is
     // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
-    let m = test_helpers::analytical_model(GradientMethod::Auto);
+    let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m, true),
         Optimizer::NloptLbfgs,
@@ -3198,43 +3198,6 @@ mod theta_block_scale_guards {
     }
 
     #[test]
-    fn a_wide_gather_model_bails_out_of_the_analytic_dual_ladder() {
-        // The `Dual2<M>` dispatch runs `1..=MAX_SCALE_AXES` axes. A
-        // several-hundred-θ block is past the table, and the contract there is
-        // a clean decline — the caller then finite-differences that subject —
-        // never a truncation to the first 24 axes, which would be a wrong
-        // gradient nothing else in the tree could contradict.
-        let model = wide_model(400);
-        let prog = model
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .expect("program");
-        let theta = vec![1.0; model.n_theta];
-        let cov = std::collections::HashMap::from([("PLA_IDX".to_string(), 1.0)]);
-        assert!(crate::sens::ode_provider::param_derivatives_at_cov(
-            prog,
-            &model,
-            &cov,
-            &theta,
-            &[0.0]
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn a_narrow_gather_model_stays_in_analytic_sens_scope() {
-        // The gather itself must not knock a model out of scope — `∂f/∂θ_k`
-        // through it is exact under `Dual2` (pinned against finite differences
-        // in `sens::provider::tests::theta_gather_sens`).
-        let model = wide_model(3);
-        assert!(
-            crate::sens::provider::sens_supported(&model),
-            "a gather is analytically differentiable; only the axis count gates dispatch"
-        );
-    }
-
-    #[test]
     fn cov_hessian_threshold_is_above_the_bobyqa_one() {
         // The covariance step is quadratic in n where the optimizer is only
         // linear, but it runs once — so it tolerates more, not less.
@@ -3834,117 +3797,6 @@ fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
     );
     assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
     assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
-}
-
-/// #1899: the structural invariants [`CompiledModel::pk_slot_rows`] has to hold on
-/// every model shape its two consumers meet, asserted as a property rather than
-/// re-derived per call site:
-///
-/// * **one row per slot** — what `seed_dim_from_slots` (last row per slot wins)
-///   needs to be unambiguous, and the whole point of the lookup;
-/// * **every name index in range** — the consumers pair a row with `tv[i]` /
-///   `sel_flat[i * n_eta ..]`, both of length `indiv_param_names.len()`;
-/// * **bounded by the program's own pair list**, which is what
-///   `sens::provider::closed_form_slot_count_supported` caps at the
-///   `const_dispatch!` table width.
-///
-/// Note what is deliberately **not** asserted: `rows.len() <= pk_indices.len()`.
-/// Review r2 #4 found it false — `pk one_cpt_iv(cl=D1, v=V)` alongside `D1 = …`
-/// gives `D1` both a role slot and a modeled-dose slot, three rows for two names
-/// — so the last case below pins that shape and the *real* bound instead. The
-/// consumers never index by row count, only by slot, so the inequality was a
-/// convenience claim rather than a requirement, and asserting a false one would
-/// have been worse than asserting none.
-///
-/// The shapes are the five that put a name somewhere other than a plain `pk(...)`
-/// role: an analytical modeled-duration `D{n}` (a real slot above `PK_IDX_LAGTIME`
-/// that `pk_indices` records as the placeholder), a Form C `y` readout and a Form B
-/// `obs_scale` (spare slots from #650 / #1898), the ODE layout (every name real),
-/// and a name carrying a role *and* a modeled-dose slot.
-#[test]
-fn pk_slot_rows_hold_their_invariants_on_every_slot_source() {
-    let cases: [(&str, &str); 5] = [
-        (
-            "analytical modeled duration",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  \
-             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
-             D1 = TVD1 * exp(ETA_D1)\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "Form C y readout",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVB(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  BASE = TVB\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [scaling]\n  y = central / V + BASE\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "Form B obs_scale",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVS(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  S = TVS\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [scaling]\n  obs_scale = S\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "ODE layout",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KE = CL / V\n\
-             [structural_model]\n  ode(states=[central])\n\
-             [odes]\n  d/dt(central) = -KE * central\n\
-             [scaling]\n  y = central / V\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            // Review r2 #4: `D1` is bound to the `cl` role *and* carries a
-            // modeled-duration slot, so it owns two rows. The exact rows are
-            // asserted in `pk_slot_rows_give_one_name_both_of_its_slots`.
-            "role plus modeled dose on one name",
-            "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
-             [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-    ];
-    for (label, src) in cases {
-        let m = crate::parser::model_parser::parse_model_string(src)
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let rows = m.pk_slot_rows();
-        // The real bound: the rows are a subset of the program's own pair list,
-        // which `closed_form_slot_count_supported` caps for the fallback.
-        let prog_pairs = m
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .expect("a parsed model carries a program")
-            .pk_slots()
-            .len();
-        assert!(
-            rows.len() <= prog_pairs,
-            "{label}: rows must be a subset of the program's pairs: {} vs {prog_pairs}",
-            rows.len()
-        );
-        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
-        let n = slots.len();
-        slots.sort_unstable();
-        slots.dedup();
-        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
-        for &(_, i) in &rows {
-            assert!(
-                i < m.indiv_param_names.len(),
-                "{label}: name index {i} is past {} names",
-                m.indiv_param_names.len()
-            );
-        }
-    }
 }
 
 /// #1899: an analytical **modeled-duration** `D1` owns a real PK slot above

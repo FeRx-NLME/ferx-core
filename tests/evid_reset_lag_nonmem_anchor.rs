@@ -44,8 +44,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
-use ferx_core::sens::provider::subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     predict, read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions, CompiledModel, Population,
@@ -272,13 +271,13 @@ fn via_with_states(model: &CompiledModel) -> Vec<(String, f64, f64)> {
 /// FD-routed subject would make this leg FD-of-f64 and blind to the dual walk.
 fn via_dual(
     model: &CompiledModel,
-    sens: impl Fn(&ferx_core::types::Subject) -> Option<ferx_core::sens::provider::SubjectSens>,
+    sens: impl Fn(&ferx_core::types::Subject) -> Option<Vec<ferx_core::sens::provider::ObsGrad>>,
 ) -> Vec<(String, f64, f64)> {
     let mut out = Vec::new();
     for s in &pop().subjects {
         let r = sens(s)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        out.extend(r.obs.into_iter().map(|o| (s.id.clone(), o.f)));
+        out.extend(r.into_iter().map(|o| (s.id.clone(), o.f)));
     }
     let _ = model;
     with_raw(out)
@@ -359,7 +358,7 @@ fn ode_dual_walk_value_cancels_a_dose_recorded_before_the_reset() {
     let m = ode();
     let eta = vec![0.0; m.n_eta];
     let got = via_dual(&m, |s| {
-        ode_subject_sensitivities(&m, s, &m.default_params.theta, &eta)
+        subject_eta_grad(&m, s, &m.default_params.theta, &eta)
     });
     assert_matches("ODE dual", &got, ODE_BOUND, &[]);
 }
@@ -384,7 +383,7 @@ fn analytic_dual_cancels_a_dose_recorded_before_the_reset() {
     let m = analytic();
     let eta = vec![0.0; m.n_eta];
     let got = via_dual(&m, |s| {
-        subject_sensitivities(&m, s, &m.default_params.theta, &eta)
+        subject_eta_grad(&m, s, &m.default_params.theta, &eta)
     });
     assert_matches("analytic dual", &got, ANALYTIC_BOUND, ANALYTIC_DUAL_SKIP);
 }

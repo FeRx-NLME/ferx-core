@@ -404,7 +404,7 @@ fn review_ties_follow_file_order() {
 
 #[test]
 fn the_analytic_providers_value_follows_file_order() {
-    // The `Dual2` walks carry their own copy of the kind order (`sens/propagate`,
+    // The dual walks carry their own copy of the kind order (`sens/propagate`,
     // `sens/ode_provider`'s `K_PKONLY < K_OBS`). The reader fix reaches them through the
     // same `Subject`, and their *value* must match the closed form. A Dual2-vs-FD parity
     // test cannot see the order, since the FD reference reads the same Subject.
@@ -414,24 +414,18 @@ fn the_analytic_providers_value_follows_file_order() {
     let ode = parse_model_string(ODE_MODEL).unwrap();
     let pk = parse_model_string(PK_MODEL).unwrap();
     for (s, (label, recs)) in pop.subjects.iter().zip(&cs) {
-        let o = crate::sens::ode_provider::ode_subject_sensitivities(
-            &ode,
-            s,
-            &ode.default_params.theta,
-            &[0.0],
-        )
-        .unwrap_or_else(|| panic!("{label}: ODE model in analytic scope"));
-        let f: Vec<f64> = o.obs.iter().map(|x| x.f).collect();
+        let o = crate::sens::provider::subject_eta_grad(&ode, s, &ode.default_params.theta, &[0.0])
+            .unwrap_or_else(|| panic!("{label}: ODE model in analytic scope"));
+        let f: Vec<f64> = o.iter().map(|x| x.f).collect();
         assert_close(
             &format!("ODE provider {label}"),
             &f,
             &ode_reference(recs),
             1e-9,
         );
-        let a =
-            crate::sens::provider::subject_sensitivities(&pk, s, &pk.default_params.theta, &[0.0])
-                .unwrap_or_else(|| panic!("{label}: analytical model in analytic scope"));
-        let f: Vec<f64> = a.obs.iter().map(|x| x.f).collect();
+        let a = crate::sens::provider::subject_eta_grad(&pk, s, &pk.default_params.theta, &[0.0])
+            .unwrap_or_else(|| panic!("{label}: analytical model in analytic scope"));
+        let f: Vec<f64> = a.iter().map(|x| x.f).collect();
         assert_close(
             &format!("analytic provider {label}"),
             &f,

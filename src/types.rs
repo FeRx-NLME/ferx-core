@@ -3317,6 +3317,42 @@ impl RuvMagnitude {
         out
     }
 
+    /// [`eval_obs`](Self::eval_obs) over any VM number type, from the compiled slot
+    /// programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same two-half row
+    /// (multipliers, then exponents when a power form is active), each a function of the
+    /// caller's θ. `None` when an active slot has no compiled program.
+    pub(crate) fn eval_obs_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Option<Vec<T>> {
+        let half = |fns: &[Option<RuvMagFn>],
+                    progs: &[Option<crate::parser::model_parser::RuvMagDerivProgram>]|
+         -> Option<Vec<T>> {
+            (0..self.per_sigma.len())
+                .map(|k| match fns.get(k) {
+                    Some(Some(_)) => {
+                        progs
+                            .get(k)?
+                            .as_ref()?
+                            .eval_g(theta, obs_covariates, time, tad)
+                    }
+                    _ => Some(T::from_f64(1.0)),
+                })
+                .collect()
+        };
+        let mut out = half(&self.per_sigma, &self.per_sigma_deriv)?;
+        if self.has_exponent() {
+            out.extend(half(
+                &self.per_sigma_exponent,
+                &self.per_sigma_exponent_deriv,
+            )?);
+        }
+        Some(out)
+    }
+
     /// Per-sigma `∂(multiplier)/∂θ` vector for one observation (#576/#486). Slot
     /// `k` evaluates its `Dual1` program's gradient; a bare slot (multiplier ≡ 1)
     /// contributes an all-zero row. With a power exponent active the result has
@@ -4984,6 +5020,15 @@ impl GradientMethod {
 }
 
 impl CompiledModel {
+    /// Whether the model carries a `[covariate_nn]` block (always `false` without the
+    /// `nn` feature).
+    pub(crate) fn has_covariate_nn(&self) -> bool {
+        #[cfg(feature = "nn")]
+        return !self.covariate_nns.is_empty();
+        #[cfg(not(feature = "nn"))]
+        return false;
+    }
+
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
     /// This metadata lives behind the existing opaque `indiv_param_partials`
@@ -5750,7 +5795,7 @@ impl CompiledModel {
         self.residual_cov_with(&self.residual_correlations, theta)
     }
 
-    fn residual_cov_with<'a>(
+    pub(crate) fn residual_cov_with<'a>(
         &'a self,
         pairs: &'a [ResidualCorrelation],
         theta: &[f64],

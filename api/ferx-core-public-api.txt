@@ -516,7 +516,6 @@ pub mod ferx_core::estimation::saem
 pub fn ferx_core::estimation::saem::run_saem(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::estimation::outer_optimizer::OuterResult, alloc::string::String>
 pub mod ferx_core::estimation::saem_conddist
 pub fn ferx_core::estimation::saem_conddist::run_conditional_distribution(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, warm_etas: &[nalgebra::base::alias::DVector<f64>], warm_kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], options: &ferx_core::FitOptions) -> ferx_core::CondDist
-pub mod ferx_core::estimation::sens_cov_hessian
 pub mod ferx_core::estimation::sens_outer_gradient
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], interaction: bool) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
@@ -524,16 +523,10 @@ pub fn ferx_core::estimation::sens_outer_gradient::population_eta_dx(model: &fer
 pub fn ferx_core::estimation::sens_outer_gradient::population_gradient_sens(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::population_gradient_sens_foce(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::predict_warm_etas(prev_etas: &[nalgebra::base::alias::DVector<f64>], jacs: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], x_prev: &[f64], x_new: &[f64]) -> alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_eta_dx(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_eta_dx_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], stacked_eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_omega_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, params: &ferx_core::ModelParameters, eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_foce(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], stacked_eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], stacked_eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_sigma_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, params: &ferx_core::ModelParameters, eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_theta_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, params: &ferx_core::ModelParameters, eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::sens_outer_gradient::subject_theta_gradient_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, params: &ferx_core::ModelParameters, stacked_eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub mod ferx_core::estimation::sir
 pub struct ferx_core::estimation::sir::SirResult
 pub ferx_core::estimation::sir::SirResult::ci_kappa: alloc::vec::Vec<(f64, f64)>
@@ -1665,6 +1658,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, _d2: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
@@ -1698,13 +1692,21 @@ pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
+pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
 pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 pub mod ferx_core::sens::dual2
 pub fn ferx_core::sens::dual2::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub type ferx_core::sens::dual2::Dual2<const N: usize> = ferx_core::sens::dual_mixed::DualMixed<N, N>
@@ -1722,6 +1724,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
@@ -1761,13 +1764,21 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64)
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::val(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub mod ferx_core::sens::jet
 pub mod ferx_core::sens::num
@@ -1782,13 +1793,21 @@ pub fn ferx_core::sens::num::PkNum::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::inv_logit(self) -> Self
 pub fn ferx_core::sens::num::PkNum::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::num::PkNum::jets_finite(self) -> bool
+pub fn ferx_core::sens::num::PkNum::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::num::PkNum::ln(self) -> Self
 pub fn ferx_core::sens::num::PkNum::ln_gamma(self) -> Self
 pub fn ferx_core::sens::num::PkNum::logit(self) -> Self
+pub fn ferx_core::sens::num::PkNum::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn ferx_core::sens::num::PkNum::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::num::PkNum::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
+pub fn ferx_core::sens::num::PkNum::tape_mark() -> usize
+pub fn ferx_core::sens::num::PkNum::tape_rollback(_mark: usize)
 pub fn ferx_core::sens::num::PkNum::val(self) -> f64
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::num::PkNum::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl ferx_core::sens::num::PkNum for f64
 pub const f64::SECOND_ORDER: bool
 pub fn f64::abs(self) -> Self
@@ -1800,13 +1819,21 @@ pub fn f64::guard_floor(self, lo: f64) -> Self
 pub fn f64::inv_logit(self) -> Self
 pub fn f64::jet_max_abs(self) -> f64
 pub fn f64::jets_finite(self) -> bool
+pub fn f64::lift2(self, v: f64, _d1: f64, _d2: f64) -> Self
+pub fn f64::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn f64::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn f64::ln(self) -> Self
 pub fn f64::ln_gamma(self) -> Self
 pub fn f64::logit(self) -> Self
+pub fn f64::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn f64::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn f64::pow(self, e: Self) -> Self
 pub fn f64::sqrt(self) -> Self
+pub fn f64::tape_mark() -> usize
+pub fn f64::tape_rollback(_mark: usize)
 pub fn f64::val(self) -> f64
 pub fn f64::var(x: f64, _dim: usize) -> Self
+pub fn f64::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
@@ -1818,13 +1845,21 @@ pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
+pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
 pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
@@ -1836,21 +1871,22 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64)
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::val(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 pub mod ferx_core::sens::ode_provider
-pub const ferx_core::sens::ode_provider::MIXED_NA_CAP: usize
-pub fn ferx_core::sens::ode_provider::ode_analytical_supported(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::ode_provider::ode_iov_supported(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::ode_provider::ode_subject_eta_grad(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<ferx_core::sens::provider::ObsGrad>>
-pub fn ferx_core::sens::ode_provider::ode_subject_eta_grad_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], stacked_eta: &[f64]) -> core::option::Option<alloc::vec::Vec<ferx_core::sens::provider::ObsGrad>>
-pub fn ferx_core::sens::ode_provider::ode_subject_sensitivities(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
-pub fn ferx_core::sens::ode_provider::ode_subject_sensitivities_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], stacked_eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
 pub mod ferx_core::sens::one_cpt
 pub fn ferx_core::sens::one_cpt::iv_bolus_sens(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
 pub fn ferx_core::sens::one_cpt::one_cpt_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v: T, ka: T, f_bio: T, oral: bool) -> T
@@ -1938,37 +1974,10 @@ pub mod ferx_core::sens::provider
 pub struct ferx_core::sens::provider::ObsGrad
 pub ferx_core::sens::provider::ObsGrad::df_deta: alloc::vec::Vec<f64>
 pub ferx_core::sens::provider::ObsGrad::f: f64
-pub struct ferx_core::sens::provider::ObsSens
-pub ferx_core::sens::provider::ObsSens::d2f_deta2: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::d2f_deta_dtheta: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::d2f_dtheta2: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::d3f_deta2_dtheta: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::d3f_deta3: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::d3f_deta_dtheta2: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::df_deta: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::df_dtheta: alloc::vec::Vec<f64>
-pub ferx_core::sens::provider::ObsSens::f: f64
-pub struct ferx_core::sens::provider::SubjectSens
-pub ferx_core::sens::provider::SubjectSens::obs: alloc::vec::Vec<ferx_core::sens::provider::ObsSens>
-pub static ferx_core::sens::provider::PROFILE_ETA_CALLS: core::sync::atomic::AtomicU64
-pub static ferx_core::sens::provider::PROFILE_ETA_NANOS: core::sync::atomic::AtomicU64
-pub static ferx_core::sens::provider::PROFILE_SENS_CALLS: core::sync::atomic::AtomicU64
-pub static ferx_core::sens::provider::PROFILE_SENS_NANOS: core::sync::atomic::AtomicU64
 pub fn ferx_core::sens::provider::analytic_outer_gradient_available(model: &ferx_core::CompiledModel) -> bool
 pub fn ferx_core::sens::provider::analytic_outer_gradient_for_interaction(model: &ferx_core::CompiledModel, interaction: bool) -> bool
-pub fn ferx_core::sens::provider::analytical_supported(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::provider::iov_analytical_supported(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::provider::iov_sens_supported(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::provider::profile_report()
-pub fn ferx_core::sens::provider::sens_supported(model: &ferx_core::CompiledModel) -> bool
 pub fn ferx_core::sens::provider::subject_eta_grad(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<ferx_core::sens::provider::ObsGrad>>
-pub fn ferx_core::sens::provider::subject_eta_grad_tvcov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<ferx_core::sens::provider::ObsGrad>>
 pub fn ferx_core::sens::provider::subject_eta_jacobian(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::sens::provider::subject_sensitivities(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
-pub fn ferx_core::sens::provider::subject_sensitivities_cov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
-pub fn ferx_core::sens::provider::subject_sensitivities_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], stacked_eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
-pub fn ferx_core::sens::provider::subject_sensitivities_tvcov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<ferx_core::sens::provider::SubjectSens>
-pub fn ferx_core::sens::provider::tvcov_analytical_supported(model: &ferx_core::CompiledModel) -> bool
 pub mod ferx_core::sens::three_cpt
 pub fn ferx_core::sens::three_cpt::three_cpt_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T, oral: bool) -> T
 pub fn ferx_core::sens::three_cpt::three_cpt_infusion_g<T: ferx_core::sens::num::PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T) -> T

@@ -11,7 +11,9 @@
 //! silently disabling everything).
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::sens::provider::{sens_supported, subject_sensitivities};
+use ferx_core::sens::provider::{
+    analytic_outer_gradient_available as sens_supported, subject_eta_grad,
+};
 use ferx_core::types::{CompiledModel, DoseEvent, RateMode};
 
 mod common;
@@ -83,7 +85,7 @@ fn declines(model: &CompiledModel, doses: Vec<DoseEvent>) -> bool {
     );
     let theta = &model.default_params.theta;
     let eta = vec![0.0; model.n_eta];
-    subject_sensitivities(model, &s, theta, &eta).is_none()
+    subject_eta_grad(model, &s, theta, &eta).is_none()
 }
 
 #[test]

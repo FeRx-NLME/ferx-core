@@ -55,7 +55,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     predict, read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions, CompiledModel, Population,
@@ -259,9 +259,9 @@ fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> 
     let eta = vec![0.0; model.n_eta];
     let mut out = Vec::new();
     for s in &pop.subjects {
-        let sens = ode_subject_sensitivities(model, s, &model.default_params.theta, &eta)
+        let sens = subject_eta_grad(model, s, &model.default_params.theta, &eta)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        for (t, o) in s.obs_times.iter().zip(sens.obs) {
+        for (t, o) in s.obs_times.iter().zip(sens) {
             out.push((s.id.clone(), *t, o.f));
         }
     }

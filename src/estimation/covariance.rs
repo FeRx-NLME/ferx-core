@@ -795,26 +795,18 @@ fn analytic_cov_declines(
     if is_mixture {
         out.push(CovScopeDecline::Mixture);
     }
-    // Mirrors `analytic_cov_hessian`'s own first bail: an AGQ/Laplace fit anchored on the exact
-    // `H` needs fourth-order sensitivities for `∂²H/∂x²`, which nothing computes.
-    if options.agq_nodes().is_some() && options.hessian_anchor() != HessianAnchor::GaussNewton {
-        out.push(CovScopeDecline::ExactHessianAnchor);
+    // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
+    // the model (a shape no recorder serves, a non-Gaussian endpoint) or the user's
+    // `gradient = fd` opt-out from analytic derivatives.
+    let _ = population;
+    if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
+        out.push(CovScopeDecline::ModelOutOfScope);
     }
-    // Mirrors the FOCE assembly's bail (#1722): `analytic_cov_assembly` takes the FOCE entry
-    // point exactly when there is no quadrature and interaction is off.
-    if options.agq_nodes().is_none()
-        && !options.interaction
-        && crate::estimation::sens_cov_hessian::foce_cov_declines_frozen_variance(model)
-    {
-        out.push(CovScopeDecline::FoceFrozenResidualVariance);
+    if crate::types::GradientMethod::forced_fd(model) {
+        out.push(CovScopeDecline::GradientFd);
     }
-    let iov = model.n_kappa > 0;
-    for subject in &population.subjects {
-        for decline in crate::sens::provider::covariance_scope_declines(model, subject, iov) {
-            if !out.contains(&decline) {
-                out.push(decline);
-            }
-        }
+    if model.has_non_gaussian() {
+        out.push(CovScopeDecline::NonGaussianEndpoint);
     }
     if out.is_empty() {
         out.push(CovScopeDecline::PerSubjectBail);
@@ -891,21 +883,6 @@ pub(super) enum AnalyticCovAssembly {
     Unavailable,
 }
 
-impl AnalyticCovAssembly {
-    /// The complete analytic Hessian, or `None` if *anything* declined.
-    ///
-    /// Test-facing only. Production reads the variants, because collapsing `Partial` into
-    /// `None` here is precisely the all-or-nothing behaviour #1514 removed — a helper that
-    /// made it a one-character change to reintroduce would not survive the next refactor.
-    #[cfg(test)]
-    pub(super) fn full(self) -> Option<DMatrix<f64>> {
-        match self {
-            AnalyticCovAssembly::Full(h) => Some(h),
-            _ => None,
-        }
-    }
-}
-
 /// At or above this fraction of declining subjects, take the whole-population stencil instead
 /// of salvaging (#1514).
 ///
@@ -935,9 +912,6 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    use crate::estimation::sens_cov_hessian::{
-        subject_packed_cov_hessian, subject_packed_cov_hessian_foce,
-    };
     // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
     // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
     // dropping the tail subjects from both the sum and the declined list, i.e. returning a
@@ -946,41 +920,30 @@ pub(super) fn analytic_cov_assembly(
     if eta_hats.len() != population.subjects.len() {
         return AnalyticCovAssembly::Unavailable;
     }
-    // The objective this assembly differentiates is the FOCE/FOCEI marginal. When
-    // `agq_nodes()` is `Some` — `method = laplace` at any node count, or `method = focei`
-    // with `n_agq > 1` — the fit minimised the AGQ marginal instead, under an anchor that
-    // may not even be H̃ (`HessianAnchor::Exact` for Laplace), and with a quadrature
-    // correction this assembly has no term for. `pop_nll_opts` exists precisely so no
-    // production site reports "standard errors for a likelihood it never optimised"; the
-    // analytic path bypasses that helper, so it must repeat its dispatch condition here
-    // (PR #953 review finding 1).
+    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
+    if crate::types::GradientMethod::forced_fd(model) {
+        return AnalyticCovAssembly::Unavailable;
+    }
+    // The objective this assembly differentiates is the one the fit minimised: the
+    // FOCE/FOCEI marginal, or — `agq_nodes()` is `Some` for `method = laplace` at any node
+    // count and `method = focei` with `n_agq > 1` — the quadrature marginal under its own
+    // anchor (`H̃`, or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on
+    // `H` would be "standard errors for a likelihood it never optimised" (PR #953 review
+    // finding 1), so the objective is taken from the same options the fit ran on.
     //
-    // #251 narrows this: `method = focei` with `n_agq > 1` **is** served, by
-    // `agq_cov_hessian`, which differentiates the quadrature marginal itself. The split is on
-    // the *anchor*, not on `agq_nodes()`:
-    //
-    //   * `HessianAnchor::GaussNewton` (FOCEI) — `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ` is built from first
-    //     derivatives of `f`, so `∂²H̃/∂x²` needs third-order sensitivities, which
-    //     `subject_sensitivities_cov` already provides.
-    //   * `HessianAnchor::Exact` (Laplace, at any node count) — `H = ∂²nll/∂b²` already carries
-    //     `∂²f/∂η²`, so its second derivative needs **fourth** order. Nothing computes those, so
-    //     Laplace keeps the FD covariance. Keying this off `agq_nodes()` instead of the anchor
-    //     would report `H̃`-derived SEs for a fit anchored on `H` — the same class of error the
-    //     bail was added for.
-    let agq = if options.agq_nodes().is_some() {
-        if options.hessian_anchor() != HessianAnchor::GaussNewton {
-            return AnalyticCovAssembly::Unavailable;
-        }
-        options.agq_nodes()
-    } else {
-        None
+    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
+    // differentiates every one of these objectives — FOCE (its frozen-variance mode
+    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
+    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian, Objective};
+    let objective = match options.agq_nodes() {
+        Some(n_agq) => Objective::Agq {
+            n_agq,
+            exact: options.hessian_anchor() != HessianAnchor::GaussNewton,
+        },
+        None if options.interaction => Objective::Focei,
+        None => Objective::Foce,
     };
-    // The quadrature rule and parameter unpacking are shared by every subject.
-    let agq = agq.map(|n_agq| {
-        let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
-        let params = crate::estimation::parameterization::unpack_params(x_hat, template);
-        (nodes, weights, params)
-    });
     let n = x_hat.len();
     let per_subject: Vec<Option<DMatrix<f64>>> = population
         .subjects
@@ -1015,21 +978,8 @@ pub(super) fn analytic_cov_assembly(
             if crate::cancel::is_cancelled(&options.cancel) {
                 return None;
             }
-            let h = if let Some((nodes, weights, params)) = &agq {
-                // FOCEI-anchored quadrature (#251). The grid is rebuilt here from the same
-                // Gauss-Hermite rule the objective used, so the Hessian differentiates the grid the
-                // fit actually evaluated — the same reason the proposal jitter is carried.
-                let (grid, pi) = crate::estimation::agq::subject_grid_and_weights(
-                    model, subject, params, &b, nodes, weights,
-                )?;
-                crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian(
-                    model, subject, template, params, &b, &grid, &pi,
-                )
-            } else if options.interaction {
-                subject_packed_cov_hessian(model, subject, template, x_hat, &b)
-            } else {
-                subject_packed_cov_hessian_foce(model, subject, template, x_hat, &b)
-            }?;
+            // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
+            let h = subject_adjoint_cov_hessian(model, subject, template, x_hat, &b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
@@ -1337,14 +1287,6 @@ pub(super) mod reconverge_log {
 
     pub(in crate::estimation) fn record_fd_hessian(initial_eps: f64) {
         FD_HESSIAN_CALLS.lock().unwrap().push(initial_eps);
-    }
-
-    /// Remove and count the `fd_ofv_hessian` calls made with exactly `initial_eps`.
-    pub(in crate::estimation) fn take_fd_hessian(initial_eps: f64) -> usize {
-        let mut calls = FD_HESSIAN_CALLS.lock().unwrap();
-        let before = calls.len();
-        calls.retain(|&e| e != initial_eps);
-        before - calls.len()
     }
 
     /// Remove and return `(subject count, parallel_subjects)` for every call whose first
@@ -2860,108 +2802,6 @@ mod tests {
     };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
-
-    /// #1722: a FOCE fit with a prediction-dependent residual variance declines the analytic
-    /// covariance in `subject_packed_cov_hessian_foce`, and the walk that names the declining
-    /// clause must say so rather than fall through to `PerSubjectBail` ("genuine drift"). Both
-    /// sides of the gate in one test — FOCE + proportional names it; FOCEI + proportional and
-    /// FOCE + additive do not, and neither does a quadrature fit — so a walk clause stuck on
-    /// either branch fails here. And the assembly agrees: every subject declines exactly when
-    /// the clause is named.
-    #[test]
-    fn the_decline_walk_names_the_frozen_variance_foce_bail() {
-        use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{EstimationMethod, FitOptions};
-        // Single-dose warfarin: inside every other analytic-covariance clause (the IOV data's
-        // multi-dose subjects route to the event walk, which would decline FOCEI too).
-        let src = std::fs::read_to_string("examples/warfarin.ferx").expect("model file");
-        let pop = crate::io::datareader::read_nonmem_csv(
-            std::path::Path::new("data/warfarin.csv"),
-            None,
-            None,
-        )
-        .expect("data");
-        let prop = crate::parser::model_parser::parse_model_string(&src).expect("parse");
-        let add = crate::parser::model_parser::parse_model_string(
-            &src.replace("DV ~ proportional(PROP_ERR)", "DV ~ additive(PROP_ERR)"),
-        )
-        .expect("parse");
-        let opts = |method, interaction, n_agq| FitOptions {
-            method,
-            interaction,
-            n_agq,
-            ..FitOptions::default()
-        };
-        for (label, model, o, named) in [
-            (
-                "foce+prop",
-                &prop,
-                opts(EstimationMethod::Foce, false, 1),
-                true,
-            ),
-            (
-                "focei+prop",
-                &prop,
-                opts(EstimationMethod::FoceI, true, 1),
-                false,
-            ),
-            (
-                "foce+add",
-                &add,
-                opts(EstimationMethod::Foce, false, 1),
-                false,
-            ),
-            (
-                "agq+prop",
-                &prop,
-                opts(EstimationMethod::FoceI, true, 3),
-                false,
-            ),
-            // Quadrature with interaction off: the AGQ clause alone keeps it out.
-            (
-                "laplace+prop, interaction off",
-                &prop,
-                opts(EstimationMethod::Laplace, false, 1),
-                false,
-            ),
-        ] {
-            let declines = super::analytic_cov_declines(model, &pop, &o, false);
-            assert_eq!(
-                declines.contains(&CovScopeDecline::FoceFrozenResidualVariance),
-                named,
-                "{label}: {declines:?}"
-            );
-            if named {
-                assert!(
-                    !declines.contains(&CovScopeDecline::PerSubjectBail),
-                    "{label}: the walk must name the clause, not report drift: {declines:?}"
-                );
-            }
-            // The assembly itself: with frozen EBEs it declines every subject. (The quadrature
-            // arm differentiates the grid, not this entry point — walk half only.)
-            if o.agq_nodes().is_some() {
-                continue;
-            }
-            let p = model.default_params.clone();
-            let x = crate::estimation::parameterization::pack_params(&p);
-            let etas: Vec<nalgebra::DVector<f64>> = pop
-                .subjects
-                .iter()
-                .map(|s| {
-                    crate::estimation::inner_optimizer::find_ebe_for_stage(
-                        model, s, &p, 200, 1e-8, None, None, 0, &o,
-                    )
-                    .eta
-                })
-                .collect();
-            let assembly = super::analytic_cov_assembly(model, &pop, &p, &x, &etas, &[], &o);
-            assert_eq!(
-                matches!(assembly, super::AnalyticCovAssembly::Unavailable),
-                named,
-                "{label}: the assembly declines iff the walk names the clause ({declines:?})"
-            );
-        }
-    }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
 

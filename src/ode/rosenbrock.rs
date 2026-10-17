@@ -764,6 +764,8 @@ pub(crate) struct RosStepper<T> {
     /// which is the only event that moves `(u, t)`. A *rejected* attempt changes `dt` alone,
     /// so the retry reuses them and pays for the factorization only.
     jac_valid: bool,
+    /// Tape mark taken after the (retry-reused) Jacobian.
+    mark: usize,
 }
 
 impl<T: PkNum> RosStepper<T> {
@@ -782,6 +784,7 @@ impl<T: PkNum> RosStepper<T> {
             method,
             usable: false,
             jac_valid: false,
+            mark: 0,
         }
     }
 
@@ -813,6 +816,7 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
             self.ws.refresh_jacobian(rhs, u, params, t);
             self.jac_valid = true;
         }
+        self.mark = T::tape_mark();
         if self.ws.factor_w(dt, gamma).is_err() {
             // Singular `W`: no stage could be solved, so there is no `u_new` to score or to
             // force-accept. The driver shrinks `dt`, or gives up at `min_dt`.
@@ -855,6 +859,11 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
     fn on_accept(&mut self) {
         // `(u, t)` has moved, so the cached `f0` / `J` / `f_t` describe the previous step.
         self.jac_valid = false;
+    }
+
+    fn on_reject(&mut self) {
+        // `f0`, `J`, `f_t` predate the mark and are reused by the retry.
+        T::tape_rollback(self.mark);
     }
 
     fn err_exp(&self) -> f64 {

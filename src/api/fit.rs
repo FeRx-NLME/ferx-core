@@ -439,7 +439,7 @@ pub(crate) fn nn_regularization_unapplied_warning(
     .filter(|(_, l)| *l > 0.0)
     .map(|(k, _)| k)
     .collect();
-    if set.is_empty() || !model_has_covariate_nn(model) {
+    if set.is_empty() || !model.has_covariate_nn() {
         return None;
     }
     let last = *chain.last()?;
@@ -455,16 +455,6 @@ pub(crate) fn nn_regularization_unapplied_warning(
         if set.len() == 1 { "is" } else { "are" },
         last.label(),
     ))
-}
-
-#[cfg(feature = "nn")]
-fn model_has_covariate_nn(model: &CompiledModel) -> bool {
-    !model.covariate_nns.is_empty()
-}
-
-#[cfg(not(feature = "nn"))]
-fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
-    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.

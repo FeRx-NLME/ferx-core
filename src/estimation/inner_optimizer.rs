@@ -186,12 +186,7 @@ fn iov_inner_subject_route(
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
-    // The **η-only** predicate (#1015): this route asks for `deta` and nothing else, so a
-    // program whose θ-axis count does not match `model.n_theta` (every `[covariate_nn]`
-    // model) is still exactly served. Must stay the same predicate `analytic_iov_inner` and
-    // `inner_reports_analytic_model` use, or the reported route drifts from the taken one.
-    if !crate::sens::provider::iov_sens_eta_supported(model)
-        || model.default_params.omega_iov.is_none()
+    if model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
         || subject_has_survival_records(subject)
         || iov_inner_residual_correlation(model, subject)
@@ -199,9 +194,8 @@ fn iov_inner_subject_route(
         return None;
     }
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
-    let n_flat = stacked_width(model.n_eta, model.n_kappa, k_occasions);
-    let stacked = vec![0.0; n_flat];
-    crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
+    let stacked = vec![0.0; stacked_width(model.n_eta, model.n_kappa, k_occasions)];
+    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, &stacked)
 }
 
 /// Whether an IOV subject's residuals are correlated across rows by a `correlation … by`
@@ -226,7 +220,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
-    if crate::sens::provider::nested_levels_outside_analytic_scope(model) {
+    if crate::sens::ode_provider::adjoint::nested_levels_outside_scope(model) {
         return "nested variability levels on a closed-form transit/IG model";
     }
     if analytic_inner_common_bail(model) {
@@ -241,93 +235,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if iov_inner_residual_correlation(model, subject) {
         return "residual correlation";
     }
-    if !crate::sens::provider::iov_sens_eta_supported(model) {
+    if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
     }
-    // A nested-level subject never given its cells has no compact axes (#1082): every walk
-    // declines it (`StackedLayout::sens_of` is `None`), on every model class.
-    if crate::stats::nested_levels::unprepared(model, subject) {
-        return "nested-level subject without level cells";
-    }
-    // #814: attribute against the *effective* model for this subject. A closed-form
-    // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
-    // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
-    // analytic primary's own `ode_spec` is `None` — the same reroute `is_ode_iov` and
-    // `inner_stall_enabled` already track. `effective_for` returns `self` for a genuine ODE
-    // model and for every non-rerouted subject, so this is unchanged for them. A subject the
-    // absorption walk serves (#1560) is never here: the walk takes only subjects whose
-    // gradient it can serve analytically (`walk_eligible`), so an FD subject of such a model
-    // is one the twin served — which is what `effective_for` names.
-    let eff = model.effective_for(subject);
-    if eff.ode_spec.is_some() {
-        // Single scan for the periodic steady-state predicate, mirroring
-        // `ode_iov_subject_supported`'s hoisted `has_ss` so the attribution order and
-        // the gate can't drift.
-        let has_ss = subject.has_periodic_ss_dose();
-        // Modeled-`RATE`/duration doses are analytic under IOV since #486 (the per-occasion
-        // modeled-window jet rides the rate-off saltation) — including combined with
-        // steady-state (#486: `equilibrate_ss_state_g` now threads the same jet into its
-        // per-cycle active/quiet split), EXCEPT when a `D{cmt}`/`R{cmt}` slot is absent —
-        // mirror `ode_iov_subject_supported`'s screen so this attribution can't drift.
-        if !subject.all_doses_fixed() {
-            let attr_map = eff.active_dose_attr_map();
-            let all_slots_present = subject.doses.iter().all(|d| {
-                matches!(d.rate_mode, crate::types::RateMode::Fixed)
-                    || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some()
-            });
-            if !all_slots_present {
-                return "modeled RATE/DURATION dose with missing D/R slot";
-            }
-        }
-        // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
-        // (they are checked *before* the occasion/axis gates below, so omitting
-        // them would misattribute an SS bail to a later reason). #590 review. A
-        // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
-        // with an estimated lagtime, are both analytic now (#486).
-        // `reads_model_time`, mirroring `ode_iov_subject_supported` exactly: asking the
-        // bare `uses_time_vars` here would misattribute a bare-`TIME` SS bail to a later
-        // reason once that gate declines it (#1124).
-        if has_ss
-            && eff
-                .ode_spec
-                .as_ref()
-                .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| p.reads_model_time())
-        {
-            return "steady-state dose + time-dependent ODE RHS";
-        }
-        // Infusion into a built-in absorption compartment (#719 gap 2) declines to FD under IOV
-        // (the dual walk's `+rate` would double-count the mass the convolved `R_in_inf` already
-        // delivers). `ode_iov_subject_supported` checks this *before* its SS-absorption bail, so
-        // naming it here keeps the attribution from drifting to the generic catch-all below.
-        if crate::sens::ode_provider::has_infusion_into_input_rate(eff, subject) {
-            return "infusion into built-in absorption compartment";
-        }
-        // #835: a steady-state dose into a built-in absorption compartment is analytic for the
-        // smooth density kernels (transit/igd/weibull/first_order) — the dual fixed point carries
-        // its κ-coupled sensitivity. Only SS into a `zero_order` window and SS + an absorption
-        // lagtime stay on FD; mirror `ode_iov_subject_supported`'s flipped bail via the shared
-        // `CompiledModel::ss_absorption_out_of_scope` so this attribution can't drift.
-        if eff.ss_absorption_out_of_scope(subject) {
-            return "steady-state dose + built-in absorption forcing";
-        }
-        // The walk's layout: its width is the compact axis count under nested levels. A
-        // subject `sens_of` declines is the unprepared one, already named above.
-        let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
-        else {
-            return "nested-level subject without level cells";
-        };
-        if layout.n_groups() == 0 {
-            return "no observation occasions";
-        }
-        let m_dim = eff.n_theta + layout.n_axes();
-        if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
-            return "ODE IOV stacked axis cap";
-        }
-    }
     // Reached only for an FD subject (the caller invokes this after
-    // `iov_inner_subject_route(..).is_none()`), so this is the catch-all for any
-    // provider bail not enumerated above — never the analytic case.
+    // `iov_inner_subject_route(..).is_none()`): a shape no recorder serves.
     "subject outside IOV analytic scope"
 }
 
@@ -362,7 +274,9 @@ pub(crate) fn fd_fallback_warning(
     let n_fd = population
         .subjects
         .iter()
-        .filter(|s| crate::sens::provider::subject_eta_grad(model, s, theta, &zeros).is_none())
+        .filter(|s| {
+            crate::sens::ode_provider::adjoint::exact_obs_grads(model, s, theta, &zeros).is_none()
+        })
         .count();
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
@@ -602,14 +516,10 @@ fn analytic_inner_seed_hessian(
     }
     if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
-        if let Some(sens) = crate::sens::provider::subject_eta_grad_with_schedule(
-            model,
-            subject,
-            &params.theta,
-            eta,
-            schedule,
-            hint,
-        ) {
+        let _ = (schedule, hint);
+        if let Some(sens) =
+            crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, &params.theta, eta)
+        {
             let mut htilde = params.omega.inv.clone();
             let mut gradient = vec![0.0; model.n_eta];
             let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
@@ -664,13 +574,8 @@ fn analytic_inner_seed_hessian(
                     )
                     .1
                 } else {
-                    crate::estimation::sens_outer_gradient::err_terms(
-                        r,
-                        d,
-                        d2,
-                        subject.observations[j] - obs.f,
-                    )
-                    .p
+                    // The Gauss–Newton weight `p = 1/R + ½(d/R)²` (FOCEI's `H̃` row scalar).
+                    1.0 / r + 0.5 * (d / r) * (d / r)
                 };
                 if !p.is_finite() {
                     valid = false;
@@ -695,31 +600,15 @@ fn analytic_inner_seed_hessian(
             }
         }
     }
-    // The full-provider seed is a metric only (no fused gradient), valid under a frozen
-    // variance for the reason given at `frozen_var_preds` above.
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
-    crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        model.n_eta,
-        &params.omega.inv,
-        eta,
-        model.residual_error_eta,
-    )
-    .map(|core| {
-        if exact {
-            // Laplace's integration correction is defined by the exact
-            // conditional Hessian. Use that same curvature for its BFGS seed;
-            // `init_h_inv` accepts it only when Cholesky proves it SPD.
-            (core.h_inner, None)
-        } else {
-            // nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
-            // Gauss-Newton/Almquist curvature is the FO-family metric.
-            (core.htilde, None)
-        }
-    })
+    // The full seed is a metric only (no fused gradient), valid under a frozen variance for
+    // the reason given at `frozen_var_preds` above: the unified recording's exact Hessian
+    // (Laplace) or `H̃`.
+    let unified = if exact {
+        crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, eta)
+    } else {
+        crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, eta)
+    };
+    unified.map(|h| (h, None))
 }
 
 /// Terminal `(∂f/∂η Jacobian, exact conditional η-Hessian)` at the converged EBE, from one
@@ -744,28 +633,17 @@ pub(crate) fn analytic_terminal_work(
     if !crate::estimation::agq::analytic_score_supported(model) {
         return None;
     }
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
-    let core = crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        model.n_eta,
-        &params.omega.inv,
-        eta,
-        model.residual_error_eta,
-    )?;
-    let mut jac = DMatrix::zeros(subject.obs_times.len(), model.n_eta);
-    if sens.obs.len() != jac.nrows() {
+    // `∂f/∂η` and the exact Hessian from one tape-free recording each.
+    use crate::sens::ode_provider::adjoint::{exact_eta_jacobian, exact_inner_hessian};
+    let (mut jac, h) = (
+        exact_eta_jacobian(model, subject, &params.theta, eta)?,
+        exact_inner_hessian(model, subject, params, eta)?,
+    );
+    if jac.nrows() != subject.obs_times.len() {
         return None;
     }
-    for (row, obs) in sens.obs.iter().enumerate() {
-        for col in 0..model.n_eta {
-            jac[(row, col)] = obs.df_deta[col];
-        }
-    }
     overwrite_frem_pseudo_obs_rows(&mut jac, model, subject, model.n_eta);
-    Some((jac, core.h_inner))
+    Some((jac, h))
 }
 
 /// `FERX_NO_TERMINAL_HESSIAN_REUSE=1` — internal A/B switch that keeps Laplace/AGQ
@@ -1978,8 +1856,13 @@ fn find_ebe_solve(
         if let Some(g) = fused_first_gradient.borrow_mut().take() {
             return g;
         }
+        let exact = || {
+            crate::sens::ode_provider::adjoint::exact_inner_gradient(
+                model, subject, params, e, frozen,
+            )
+        };
         if !use_analytic {
-            return gradient_fd(&obj, e, n_eta);
+            return exact().unwrap_or_else(|| gradient_fd(&obj, e, n_eta));
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -2008,6 +1891,10 @@ fn find_ebe_solve(
                 g
             }
             None => {
+                if let Some(g) = exact() {
+                    GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
+                    return g;
+                }
                 let g = gradient_fd(&obj, e, n_eta);
                 GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                 if profile {
@@ -2364,8 +2251,14 @@ fn ebe_h_matrix(
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
         match captured_jac {
             Some(jac) => Some(jac),
-            None => crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, eta)
-                .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j)),
+            None => crate::sens::ode_provider::adjoint::exact_obs_grads(
+                model,
+                subject,
+                &params.theta,
+                eta,
+            )
+            .filter(|rows| rows.len() == subject.obs_times.len())
+            .map(|rows| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k])),
         }
         .filter(|j| j.iter().all(|v| v.is_finite()))
     } else {
@@ -2381,13 +2274,26 @@ fn ebe_h_matrix(
     // directly undercut the speed premise (PR #381 review finding #10).
     match analytic_jac {
         Some(j) => j,
-        None => {
-            // FD Jacobian fallback for models the analytic provider doesn't cover.
-            let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
-            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-            j
-        }
+        // The exact Jacobian from the adjoint's recording (every engine it serves).
+        None => match crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+            model,
+            subject,
+            &params.theta,
+            eta,
+        ) {
+            Some(mut j) => {
+                overwrite_frem_pseudo_obs_rows(&mut j, model, subject, n_eta);
+                j
+            }
+            None => {
+                // FD Jacobian fallback for models no exact provider covers.
+                let t0 = std::time::Instant::now();
+                let j =
+                    compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
+                GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+                j
+            }
+        },
     }
 }
 
@@ -2416,15 +2322,7 @@ pub(crate) fn ebe_h_matrices_at(
         .map(|(i, subject)| {
             // The same branch `find_ebe_impl` takes.
             if model.n_kappa > 0 && !subject.occasions.is_empty() {
-                let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject);
-                iov_ebe_h_matrix(
-                    model,
-                    subject,
-                    params,
-                    layout.as_ref(),
-                    etas[i].as_slice(),
-                    &kappas[i],
-                )
+                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
             } else {
                 let schedule = cacheable_schedule(model, subject);
                 ebe_h_matrix(
@@ -2618,11 +2516,38 @@ fn find_ebe_iov(
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
+    // The recording's exact stacked gradient, at η_true (identical in psi-space).
+    let exact = |p: &[f64]| {
+        let mut stacked_true = p.to_vec();
+        for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+            *st = p[k] - mu[k];
+        }
+        if nested.is_some() {
+            // The recording reads the per-cell stack, and returns the gradient over the
+            // compact vector `p` lives in (#1082).
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
+        crate::sens::ode_provider::adjoint::exact_inner_gradient(
+            model,
+            subject,
+            params,
+            &stacked_true,
+            frozen,
+        )
+    };
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
-            #[cfg(test)]
-            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-            return gradient_fd(&obj, p, n_flat);
+            // The kernel's exact gradient where it serves the subject; it declines a
+            // dense IOV residual (#1082 PR5), whose search runs on central differences.
+            return match exact(p) {
+                Some(g) => g,
+                None => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, p, n_flat)
+                }
+            };
         }
         let Some(layout) = &layout else {
             // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
@@ -2660,11 +2585,18 @@ fn find_ebe_iov(
                 IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 g
             }
-            None => {
-                #[cfg(test)]
-                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                gradient_fd(&obj, p, n_flat)
-            }
+            None => match exact(p) {
+                Some(g) => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
+                None => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, p, n_flat)
+                }
+            },
         }
     };
 
@@ -2790,15 +2722,7 @@ fn find_ebe_iov(
         .map(|k| DVector::from_column_slice(k))
         .collect();
 
-    // The search's own layout (#2037 review 1).
-    let h_matrix = iov_ebe_h_matrix(
-        model,
-        subject,
-        params,
-        layout.as_ref(),
-        &bsv_eta,
-        &kappas_vec,
-    );
+    let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -2820,67 +2744,44 @@ fn analytic_iov_inner_supported(
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
-    crate::sens::provider::iov_sens_eta_supported(model)
+    crate::sens::ode_provider::adjoint::model_in_scope(model)
         && params.omega_iov.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject)
 }
 
 /// The `H` matrix an IOV EBE solve reports at `(bsv_eta, kappas)`: BSV columns only
-/// (`∂f/∂η_bsv` with κ fixed at the EBE). The BSV block of the analytic stacked-η Jacobian
-/// is exactly this, so reuse the provider when it serves this subject; else the FD
-/// Jacobian. Like [`ebe_h_matrix`], a function of the EBE alone (#2026).
-///
-/// `layout` is the subject's `StackedLayout::sens_of`: the EBE search passes its own
-/// (#2037), and a caller with none builds it.
+/// (`∂f/∂η_bsv` with κ fixed at the EBE) — the BSV block of the exact stacked
+/// η-Jacobian from the adjoint's recording, else the FD Jacobian. Like
+/// [`ebe_h_matrix`], a function of the EBE alone (#2026).
 fn iov_ebe_h_matrix(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
     bsv_eta: &[f64],
     kappas: &[DVector<f64>],
 ) -> DMatrix<f64> {
     let n_eta = model.n_eta;
-    let analytic = if analytic_iov_inner_supported(model, subject, params) {
-        let mut stacked_hat = bsv_eta.to_vec();
-        for k in kappas {
-            stacked_hat.extend(k.iter().copied());
-        }
-        // `None` is the unprepared subject, which no walk serves.
-        layout.and_then(|l| {
-            crate::sens::provider::subject_eta_grad_iov_in(
-                model,
-                subject,
-                l,
-                &params.theta,
-                &stacked_hat,
-            )
-        })
-    } else {
-        None
-    };
-    match analytic {
-        // Require one sensitivity row per observation — the indexed writes below would
-        // otherwise panic and abort the fit. The provider's scope gates hold this
-        // invariant today; guard it so a future mismatch degrades to FD instead of
-        // crashing, mirroring the outer `subject_packed_gradient_foce_iov` check (#466
-        // review round 4 #7).
-        Some(sens) if sens.len() == subject.obs_times.len() => {
-            let n_obs = subject.obs_times.len();
-            let mut h = DMatrix::zeros(n_obs, n_eta);
-            for (j, obs) in sens.iter().enumerate() {
-                for k in 0..n_eta {
-                    h[(j, k)] = obs.df_deta[k];
-                }
-            }
-            // Match the FD path: FREM covariate pseudo-obs rows carry the exact {0,1}
-            // Jacobian, which the provider's PK-prediction sensitivity does not emit
-            // (#466 review #9).
+    let mut stacked_hat = bsv_eta.to_vec();
+    for k in kappas {
+        stacked_hat.extend(k.iter().copied());
+    }
+    let n_obs = subject.obs_times.len();
+    match crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        model,
+        subject,
+        &params.theta,
+        &stacked_hat,
+    )
+    .filter(|j| j.nrows() == n_obs && j.ncols() >= n_eta)
+    {
+        Some(j) => {
+            let mut h = j.columns(0, n_eta).into_owned();
+            // FREM covariate pseudo-obs rows carry the exact {0,1} Jacobian (#466 review #9).
             overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
             h
         }
-        _ => {
+        None => {
             let kappas_slices: Vec<Vec<f64>> =
                 kappas.iter().map(|k| k.as_slice().to_vec()).collect();
             compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
@@ -2953,7 +2854,7 @@ fn compute_jacobian_fd_iov(
 /// both the FD and the analytic IOV H-matrix so the analytic branch does not silently drop
 /// the correction the FD path performs (#466 review #9). No-op when the model isn't FREM
 /// or the subject carries no pseudo-obs rows.
-fn overwrite_frem_pseudo_obs_rows(
+pub(crate) fn overwrite_frem_pseudo_obs_rows(
     h: &mut DMatrix<f64>,
     model: &CompiledModel,
     subject: &Subject,
@@ -3333,38 +3234,23 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
         return false;
     }
-    crate::sens::provider::analytical_supported(model)
+    // The unified recorder's scope, or an endpoint-only model (no structural model, no
+    // compartments), whose inner gradient is the prior plus the exactly-served endpoint term.
+    crate::sens::ode_provider::adjoint::recorder_in_scope(model)
+        || (model.ode_spec.is_none()
+            && !model.is_algebraic()
+            && model.pk_indices.is_empty()
+            && model.has_non_gaussian())
 }
 
 /// Whether the inner (per-subject EBE) loop reports an **analytic** gradient at the model
-/// level — the union of the three in-scope routes, each gated by the shared escape hatches:
-///   - **closed-form / CTMM** — [`analytic_inner_grad_supported_model`];
-///   - **ODE non-IOV** — the light `Dual1` walk
-///     ([`ode_inner_grad_supported_model`](crate::sens::provider::ode_inner_grad_supported_model)),
-///     which the closed-form predicate misses (ODE models have no `tv_fn`). The live ODE
-///     branch of [`analytic_inner_grad_supported`] now *delegates* to
-///     `analytic_inner_common_bail` rather than re-listing it, so the two cannot drift;
-///   - **IOV** — the stacked-η walk
-///     ([`iov_sens_eta_supported`](crate::sens::provider::iov_sens_eta_supported) + `omega_iov`)
-///     — the η-only predicate, matching what the inner route actually gates on.
-///
-/// **Single source of truth** for both `build_info::gradient_method_inner` (the reported
-/// method) and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted
-/// `gradient_method_inner` label and the reconciling FD-fallback warning cannot drift as the
-/// analytic scope grows — the coupling PR #381 review #9 relies on, extended to the ODE route
-/// (#378 task B / #926). This is **best-case, model-level**: a per-subject FD fallback is
-/// caught separately by `fd_fallback_warning` (mixed populations) and, for an all-FD in-scope
-/// population, by that same warning *because* this predicate reports analytic.
+/// level: [`analytic_inner_grad_supported_model`], the unified recorder's scope behind the
+/// shared escape hatches. **Single source of truth** for `build_info::gradient_method_inner`
+/// and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted label and the
+/// reconciling warning cannot drift. Best-case and model-level: a per-subject FD fallback is
+/// reported by `fd_fallback_warning`.
 pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
     analytic_inner_grad_supported_model(model)
-        // Compartment-free (#811): served by neither the closed-form predicate (which
-        // declines the placeholder `pk_model` outright) nor the ODE one (no `ode_spec`).
-        || (crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model))
-        || (crate::sens::provider::ode_inner_grad_supported_model(model)
-            && !analytic_inner_common_bail(model))
-        || (crate::sens::provider::iov_sens_eta_supported(model)
-            && model.default_params.omega_iov.is_some()
-            && !analytic_inner_common_bail(model))
 }
 
 /// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its
@@ -3421,73 +3307,10 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if subject.obs_times.is_empty() {
         return !analytic_inner_common_bail(model);
     }
-    // Compartment-free (#811): its own provider, with a model-level scope and no
-    // per-subject exclusions — there are no doses, no resets and no absorption for a
-    // subject to carry that could put it out of scope, and time-varying covariates
-    // are served (the readout is re-seeded per observation, exactly as production
-    // re-evaluates it). Placed before the ODE and closed-form branches, which would
-    // both misread the placeholder `pk_model`.
-    if model.is_algebraic() {
-        return crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model);
-    }
-    // ODE models use the light `Dual1` inner provider (#410) with their own
-    // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
-    // plus the model-level exclusions the analytical path applies in
-    // `analytic_inner_grad_supported_model` still hold here:
-    //   - IIV on residual error (#409/#474): the residual-variance scaling
-    //     `exp(2·η_ruv)` and the `η_ruv` variance column live in the shared
-    //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
-    //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
-    //     keeps FD (the censored residual-eta second derivatives are not assembled).
-    //   - LTBS: the ODE `Dual1` walk shares `solve_ode_g` with the objective, so the
-    //     analytic-EBE *is* the objective's own minimum — the gradient matches FD of
-    //     `individual_nll` and the analytic/FD EBEs agree to integrator tolerance,
-    //     leaving the covariance Hessian clean. Validated by
-    //     `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd` (#474). The
-    //     closed-form inner now serves LTBS too: its provider closed forms agree with
-    //     `compute_predictions` only to ~1e-9, which the `g = ln(f)` wrap amplifies into
-    //     the covariance Hessian, so it relies on the covariance step reconverging at the
-    //     tighter `cov_inner_tol` rather than on shared code (see
-    //     `FitOptions::effective_cov_inner_tol`).
-    if model.ode_spec.is_some() {
-        // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
-        // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
-        // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
-        // magnitude-×-`block_sigma` cases revert here — which is now exactly
-        // `analytic_inner_common_bail`, so delegate instead of re-listing it.
-        //
-        // The hand-inlined copy that used to live here was justified by the shared bail
-        // being a strict superset: it also carried `log_transform && n_kappa > 0`, which
-        // the ODE branch had to skip. #486 deleted that clause, so the two lists coincide;
-        // keeping both would mean the next escape hatch added to the documented single
-        // source of truth silently would not apply to ODE inner subjects, which would then
-        // keep claiming an analytic inner the provider declines — the inner/outer route
-        // split this whole change set exists to close (PR #950 review #8).
-        if analytic_inner_common_bail(model) {
-            return false;
-        }
-        return crate::sens::provider::ode_inner_grad_supported(model, subject);
-    }
-    if !analytic_inner_grad_supported_model(model) {
-        return false;
-    }
-    // TV-cov / oral-infusion subjects now get the light event-driven inner gradient
-    // (`subject_eta_grad_tvcov`, #447); trust the provider's `None` for the residual
-    // out-of-scope cases (it matches the outer TV-cov scope). Other subjects keep the
-    // static superposition inner. (The survival guard is hoisted to the top of this
-    // function, so it covers this path too.)
-    //
-    // A `TIME`-built-in structural parameter routes through the same per-event walk
-    // (#486), so it must consult `tvcov_analytical_supported` too — otherwise a TIME
-    // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
-    // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
-    // inner route from the outer. LTBS now takes the analytic inner gradient on the
-    // event-driven walk too (`subject_eta_grad_tvcov` applies the `ln f` jet LAST), so
-    // no `!log_transform` carve-out is needed here.
-    if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
-        return crate::sens::provider::tvcov_analytical_supported(model);
-    }
-    true
+    // The unified recorder (`adjoint::exact_obs_grads`) serves every engine in its scope; a
+    // subject it declines falls back per point.
+    crate::sens::ode_provider::adjoint::recorder_in_scope(model)
+        && !analytic_inner_common_bail(model)
 }
 
 /// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`
@@ -3736,15 +3559,16 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
-    let hint = std::mem::take(obs_grad_recycle);
-    let sens = crate::sens::provider::subject_eta_grad_with_schedule(
-        model,
-        subject,
-        theta,
-        eta,
-        cached_schedule,
-        hint,
-    )?;
+    // The recorder fills the caller's buffer in place (one per subject, reused across
+    // iterations), handed back below on every exit.
+    let _ = cached_schedule;
+    let mut sens = std::mem::take(obs_grad_recycle);
+    if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model, subject, theta, eta, &mut sens,
+    ) {
+        *obs_grad_recycle = sens;
+        return None;
+    }
     // Fold the non-Gaussian block into whichever Gaussian branch runs below.
     #[cfg(feature = "markov")]
     let add_nongaussian = |mut g: Vec<f64>| -> Vec<f64> {
@@ -4054,18 +3878,13 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
-    // The walk reads the per-group `stacked_true` and returns the jet over the layout's
-    // axes — the compact vector under nested levels (#1082 PR3), the stack itself otherwise
-    // — so the gradient below is over the vector the EBE search moves.
+    // The recording reads the per-cell `stacked_true` and returns the jet over the
+    // layout's axes — the compact vector under nested levels (#1082), the stack itself
+    // otherwise — so the gradient below is over the vector the EBE search moves.
     let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens = crate::sens::provider::subject_eta_grad_iov_in(
-        model,
-        subject,
-        layout,
-        theta,
-        stacked_true,
-    )?;
+    let sens =
+        crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, stacked_true)?;
     let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),

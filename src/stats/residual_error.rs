@@ -264,30 +264,12 @@ impl ErrorSpec {
         correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
-        let loadings = self.scaled_loadings(cmt, f_pred, sigma.len(), mult);
-        if loadings.is_empty() {
-            return f64::NAN;
-        }
-        let mut v = 0.0;
-        for l in &loadings {
-            let Some(&s) = sigma.get(l.idx) else {
-                return f64::NAN;
-            };
-            let c = l.c;
-            v += c * c * s * s;
-        }
-        for corr in correlations {
-            let ci = loadings.iter().find(|l| l.idx == corr.sigma_i).map(|l| l.c);
-            let cj = loadings.iter().find(|l| l.idx == corr.sigma_j).map(|l| l.c);
-            let (Some(ci), Some(cj)) = (ci, cj) else {
-                continue;
-            };
-            let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-                return f64::NAN;
-            };
-            v += 2.0 * ci * cj * corr.rho * si * sj;
-        }
-        v.max(MIN_VARIANCE)
+        let loadings: Vec<(usize, f64)> = self
+            .scaled_loadings(cmt, f_pred, sigma.len(), mult)
+            .into_iter()
+            .map(|l| (l.idx, l.c))
+            .collect();
+        loadings_variance_g(&loadings, sigma, correlations, |k| correlations[k].rho)
     }
 
     /// The magnitude-scaled loading of every sigma slot this observation loads
@@ -952,14 +934,153 @@ fn same_residual_block(
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
 
-fn cross_observation_covariance(
-    load_j: &[(usize, f64)],
-    load_k: &[(usize, f64)],
-    sigma_values: &[f64],
+/// One observation's residual variance from its σ-loadings `(idx, c)`:
+/// `Σ c²σ² + 2Σ_ρ c_i c_j ρ σ_i σ_j`, floored at `MIN_VARIANCE`. Loadings, σ and ρ may
+/// all be dual or tape values (`rho(k)` is correlation `k`'s ρ). The single formula
+/// behind [`ErrorSpec::variance_at_scaled`] (instantiated at `f64`) and the adjoint's
+/// generic `R` ([`r_matrix_g`]).
+pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
+    loadings: &[(usize, T)],
+    sigma: &[T],
     correlations: &[ResidualCorrelation],
-) -> f64 {
-    let mut cov = 0.0;
-    for corr in correlations {
+    rho: impl Fn(usize) -> T,
+) -> T {
+    if loadings.is_empty() {
+        return T::from_f64(f64::NAN);
+    }
+    let mut v = T::from_f64(0.0);
+    for &(idx, c) in loadings {
+        let Some(&s) = sigma.get(idx) else {
+            return T::from_f64(f64::NAN);
+        };
+        v = v + c * c * s * s;
+    }
+    for (k, corr) in correlations.iter().enumerate() {
+        let ci = loadings.iter().find(|l| l.0 == corr.sigma_i).map(|l| l.1);
+        let cj = loadings.iter().find(|l| l.0 == corr.sigma_j).map(|l| l.1);
+        let (Some(ci), Some(cj)) = (ci, cj) else {
+            continue;
+        };
+        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+            return T::from_f64(f64::NAN);
+        };
+        v = v + T::from_f64(2.0) * ci * cj * rho(k) * si * sj;
+    }
+    v.guard_floor(MIN_VARIANCE)
+}
+
+/// `(V, ∂V/∂f, ∂²V/∂f²)` of one row *with* its `block_sigma` correlations: the shared
+/// loadings formula ([`loadings_variance_g`]) over a second-order dual in `f`. The
+/// row-wise FOCEI objective uses it for a correlated model whose subject has censored or
+/// FREM rows, so it scores the same correlated variance the inner objective does.
+pub(crate) fn residual_rd2_corr(
+    error_spec: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[f64]>,
+) -> (f64, f64, f64) {
+    use crate::sens::dual2::Dual2;
+    use crate::sens::num::PkNum;
+    let fd = <Dual2<1> as PkNum>::var(f, 0);
+    let loads: Vec<(usize, Dual2<1>)> = error_spec
+        .scaled_loadings(cmt, f, sigma.len(), mult.unwrap_or(&[]))
+        .into_iter()
+        .map(|l| (l.idx, fd.lift2(l.c, l.c1, l.c2)))
+        .collect();
+    let sig: Vec<Dual2<1>> = sigma.iter().map(|&x| Dual2::<1>::constant(x)).collect();
+    let v = loadings_variance_g(&loads, &sig, correlations, |k| {
+        Dual2::<1>::constant(correlations[k].rho)
+    });
+    (v.value, v.grad[0], v.hess[0][0])
+}
+
+/// The residual covariance `R(f)` over a generic numeric type: the diagonal, the
+/// `block_sigma` cross-observation pairs and the serial `correlation` terms. Built from
+/// the same formulas as [`compute_r_matrix_with_correlations_scaled_cov`]
+/// (`loadings_variance_g`, `cross_observation_covariance`, `same_slot_covariance`, and
+/// the `serial_pairs_jet` coefficients), with the pair structure taken from the value
+/// loadings.
+///
+/// `loadings(j)` gives row `j`'s σ loadings as generic values of its prediction (and of
+/// any residual-magnitude parameters), and `σ`, the `block_sigma` ρ's (`rho(k)` for
+/// correlation `k`) and the serial ρ are generic too, so on the adjoint's tape `R`
+/// carries exact derivatives in `f` and in every residual parameter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
+    loadings: impl Fn(usize) -> Vec<(usize, T)>,
+    n: usize,
+    subject: &Subject,
+    sigma: &[T],
+    cov: ResidualCov<'_>,
+    rho: impl Fn(usize) -> T,
+    serial_rho: Option<T>,
+) -> Vec<Vec<T>> {
+    let lt: Vec<Vec<(usize, T)>> = (0..n).map(&loadings).collect();
+    let mut r = vec![vec![T::from_f64(0.0); n]; n];
+    for j in 0..n {
+        r[j][j] = loadings_variance_g(&lt[j], sigma, cov.pairs, &rho);
+    }
+    if !cov.is_dense() {
+        return r;
+    }
+    let lf: Vec<Vec<(usize, f64)>> = lt
+        .iter()
+        .map(|l| l.iter().map(|&(i, c)| (i, c.val())).collect())
+        .collect();
+    let sigma_v: Vec<f64> = sigma.iter().map(|x| x.val()).collect();
+    for (j, k, _) in match_partners(
+        &lf,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        &sigma_v,
+        cov.pairs,
+    ) {
+        let c = cross_observation_covariance(&lt[j], &lt[k], sigma, cov.pairs, &rho);
+        r[j][k] = c;
+        r[k][j] = c;
+    }
+    if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
+        match serial_pairs_jet(
+            serial,
+            &subject.obs_rgroup,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            n,
+        ) {
+            Some(pairs) => {
+                for (j, k, [c, dc, d2c]) in pairs {
+                    // C_jk(ρ) with both ρ-derivatives, so the serial ρ is differentiated
+                    // exactly to the second order the R-matrix reads.
+                    let v = rho_t.lift2(c, dc, d2c) * same_slot_covariance(&lt[j], &lt[k], sigma);
+                    r[j][k] = r[j][k] + v;
+                    r[k][j] = r[k][j] + v;
+                }
+            }
+            None => {
+                for rowv in r.iter_mut() {
+                    for x in rowv.iter_mut() {
+                        *x = T::from_f64(f64::NAN);
+                    }
+                }
+            }
+        }
+    }
+    r
+}
+
+fn cross_observation_covariance<T: crate::sens::num::PkNum>(
+    load_j: &[(usize, T)],
+    load_k: &[(usize, T)],
+    sigma_values: &[T],
+    correlations: &[ResidualCorrelation],
+    rho: impl Fn(usize) -> T,
+) -> T {
+    let mut cov = T::from_f64(0.0);
+    for (ck, corr) in correlations.iter().enumerate() {
         let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
         let j_has_j = load_j.iter().any(|(idx, _)| *idx == corr.sigma_j);
         let k_has_i = load_k.iter().any(|(idx, _)| *idx == corr.sigma_i);
@@ -968,12 +1089,12 @@ fn cross_observation_covariance(
             continue;
         }
         let Some(&si) = sigma_values.get(corr.sigma_i) else {
-            return f64::NAN;
+            return T::from_f64(f64::NAN);
         };
         let Some(&sj) = sigma_values.get(corr.sigma_j) else {
-            return f64::NAN;
+            return T::from_f64(f64::NAN);
         };
-        let cov_ij = corr.rho * si * sj;
+        let cov_ij = rho(ck) * si * sj;
         let ci_j = load_j
             .iter()
             .find(|(idx, _)| *idx == corr.sigma_i)
@@ -983,7 +1104,7 @@ fn cross_observation_covariance(
             .find(|(idx, _)| *idx == corr.sigma_j)
             .map(|(_, coeff)| *coeff);
         if let (Some(ci), Some(cj)) = (ci_j, cj_k) {
-            cov += ci * cj * cov_ij;
+            cov = cov + ci * cj * cov_ij;
         }
 
         let cj_j = load_j
@@ -995,7 +1116,7 @@ fn cross_observation_covariance(
             .find(|(idx, _)| *idx == corr.sigma_i)
             .map(|(_, coeff)| *coeff);
         if let (Some(cj), Some(ci)) = (cj_j, ci_k) {
-            cov += cj * ci * cov_ij;
+            cov = cov + cj * ci * cov_ij;
         }
     }
     cov
@@ -1094,6 +1215,7 @@ fn match_partners(
                 &loadings[k],
                 sigma_values,
                 correlations,
+                |c| correlations[c].rho,
             );
             pairs.push((j, k, cov));
             let explicit = obs_l2.get(j).copied().unwrap_or(0) != 0
@@ -1244,21 +1366,28 @@ fn serial_pairs(
     obs_raw_times: &[f64],
     n: usize,
 ) -> Option<Vec<(usize, usize, f64)>> {
-    serial_pairs_coef(serial, obs_rgroup, obs_times, obs_raw_times, n, false)
+    Some(
+        serial_pairs_jet(serial, obs_rgroup, obs_times, obs_raw_times, n)?
+            .into_iter()
+            .filter(|&(_, _, c)| c[0] != 0.0)
+            .map(|(j, k, c)| (j, k, c[0]))
+            .collect(),
+    )
 }
 
-/// [`serial_pairs`] with `deriv = true` returning `∂C_jk/∂ρ` in place of `C_jk` (#1960):
-/// `1` under `cs`, `n·ρ^(n−1)` under `ar1` (`n = |p_j − p_k| ≥ 1`) and `Δ·ρ^(Δ−1)` under
-/// `car1` (`Δ = |t_j − t_k|`). The same row pairing, so the derivative of `R` cannot
-/// pair rows `R` does not. A zero derivative is left out like a zero `C_jk`.
-fn serial_pairs_coef(
+/// Each serial pair's coefficient `C_jk(ρ)` with its first and second ρ-derivatives
+/// (`[C, ∂C/∂ρ, ∂²C/∂ρ²]`): `[ρ, 1, 0]` under `cs`, `[ρⁿ, n·ρⁿ⁻¹, n(n−1)·ρⁿ⁻²]` under `ar1`
+/// (`n = |p_j − p_k| ≥ 1`) and the same in `Δ = |t_j − t_k|` under `car1` (#1960). All three
+/// come from one pass over one pairing, so a derivative can never be paired with another
+/// pair's value, and a pair is kept when any of the three is non-zero — at `ρ = 0` the
+/// value vanishes but its derivative does not.
+fn serial_pairs_jet(
     serial: SerialCov,
     obs_rgroup: &[u32],
     obs_times: &[f64],
     obs_raw_times: &[f64],
     n: usize,
-    deriv: bool,
-) -> Option<Vec<(usize, usize, f64)>> {
+) -> Option<Vec<(usize, usize, [f64; 3])>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1296,25 +1425,33 @@ fn serial_pairs_coef(
             if obs_rgroup[k] != g {
                 continue;
             }
-            let c = match (serial.kind, deriv) {
-                (crate::types::ResidualSerialKind::Cs, false) => serial.rho,
-                (crate::types::ResidualSerialKind::Cs, true) => 1.0,
-                (crate::types::ResidualSerialKind::Ar1, false) => {
-                    serial.rho.powi(pos[j].abs_diff(pos[k]) as i32)
-                }
-                (crate::types::ResidualSerialKind::Ar1, true) => {
-                    let lag = pos[j].abs_diff(pos[k]) as i32;
-                    lag as f64 * serial.rho.powi(lag - 1)
-                }
-                (crate::types::ResidualSerialKind::Car1, false) => {
-                    serial.rho.powf((time(j) - time(k)).abs())
-                }
-                (crate::types::ResidualSerialKind::Car1, true) => {
-                    let dt = (time(j) - time(k)).abs();
-                    dt * serial.rho.powf(dt - 1.0)
-                }
+            let rho = serial.rho;
+            // `ρᵉ` and its two ρ-derivatives, each term written so a zero coefficient
+            // (`e = 1` in the second) never multiplies a pole at `ρ = 0`.
+            let power = |e: f64| {
+                let d1 = if e == 0.0 { 0.0 } else { e * rho.powf(e - 1.0) };
+                let d2 = if e == 0.0 || e == 1.0 {
+                    0.0
+                } else {
+                    e * (e - 1.0) * rho.powf(e - 2.0)
+                };
+                [rho.powf(e), d1, d2]
             };
-            if c != 0.0 {
+            let c = match serial.kind {
+                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0],
+                crate::types::ResidualSerialKind::Ar1 => {
+                    let lag = pos[j].abs_diff(pos[k]) as i32;
+                    let d1 = lag as f64 * rho.powi(lag - 1);
+                    let d2 = if lag < 2 {
+                        0.0
+                    } else {
+                        (lag * (lag - 1)) as f64 * rho.powi(lag - 2)
+                    };
+                    [rho.powi(lag), d1, d2]
+                }
+                crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
+            };
+            if c.iter().any(|&x| x != 0.0) {
                 out.push((j, k, c));
             }
         }
@@ -1326,16 +1463,19 @@ fn serial_pairs_coef(
 /// covariance a `correlation` line scales by `C_jk` (#1081). Bilinear in the two
 /// loadings, so the derivative builders pass slope (or curvature) loadings for
 /// one side, exactly as they do for [`cross_observation_covariance`].
-fn same_slot_covariance(
-    load_a: &[(usize, f64)],
-    load_b: &[(usize, f64)],
-    sigma_values: &[f64],
-) -> f64 {
-    let mut cov = 0.0;
+fn same_slot_covariance<T: crate::sens::num::PkNum>(
+    load_a: &[(usize, T)],
+    load_b: &[(usize, T)],
+    sigma_values: &[T],
+) -> T {
+    let mut cov = T::from_f64(0.0);
     for &(idx, a) in load_a {
         if let Some(&(_, b)) = load_b.iter().find(|(i, _)| *i == idx) {
-            let sg = sigma_values.get(idx).copied().unwrap_or(f64::NAN);
-            cov += a * b * sg * sg;
+            let sg = sigma_values
+                .get(idx)
+                .copied()
+                .unwrap_or(T::from_f64(f64::NAN));
+            cov = cov + a * b * sg * sg;
         }
     }
     cov
@@ -1367,61 +1507,6 @@ fn fill_serial_covariances(
         r[(j, k)] += v;
         r[(k, j)] += v;
     }
-}
-
-/// Does this subject's residual covariance `R` couple two different observation rows?
-///
-/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
-/// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
-/// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
-/// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found
-/// by the same function, so the predicate cannot disagree with the `R` the objective uses.
-///
-/// The answer depends on the **data and the correlation structure only**, never on `f` or
-/// θ: pairing is decided by the rows' residual block and by which sigma slots they occupy
-/// ([`loadings_share_correlation`]), and slot presence does not depend on the prediction —
-/// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
-/// off-diagonal `R` at every parameter point of a fit (#1536).
-pub(crate) fn has_cross_observation_residual(
-    error_spec: &ErrorSpec,
-    subject: &Subject,
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-) -> bool {
-    if !cov.is_dense() {
-        return false;
-    }
-    let loadings: Vec<Vec<(usize, f64)>> = error_spec
-        .obs_keys(subject)
-        .iter()
-        .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
-        .collect();
-    // A `correlation` line couples any two rows of one block (#1081). Value-free
-    // like the `block_sigma` arm below: `ρ` does not enter, so a fit whose `ρ`
-    // starts at 0 still routes the subject the way it will need at `ρ ≠ 0`. A
-    // population without its residual blocks answers `true` too — its `R` is NaN.
-    if cov.serial.is_some() {
-        let g = &subject.obs_rgroup;
-        if g.len() != loadings.len() {
-            return !loadings.is_empty();
-        }
-        let mut seen = std::collections::HashSet::new();
-        for (j, &k) in g.iter().enumerate() {
-            if k != 0 && !loadings[j].is_empty() && !seen.insert(k) {
-                return true;
-            }
-        }
-    }
-    !match_partners(
-        &loadings,
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        &subject.obs_l2,
-        sigma_values,
-        cov.pairs,
-    )
-    .is_empty()
 }
 
 /// Build the subject-level residual covariance matrix `R`.
@@ -1768,53 +1853,6 @@ pub(crate) fn compute_dr_df_matrices_cov(
     out
 }
 
-/// The `∂R/∂f_m` family of [`compute_dr_df_matrices_cov`] in **column form**: an `n×n`
-/// matrix `Dc` with `Dc[(k, m)] = ∂R_km/∂f_m` (#1960).
-///
-/// `∂R/∂f_m` is nonzero only in row and column `m` (each entry of `R` depends on the two
-/// predictions it couples), so its column `m` determines the whole matrix:
-/// `∂R/∂f_m = Dc[:,m] e_mᵀ + e_m Dc[:,m]ᵀ − Dc[(m,m)] e_m e_mᵀ`. The dense family is `n`
-/// matrices of `n×n`; this is one, filled by the same visitor, so the two cannot differ.
-/// NaN throughout where the dense builder fills NaN.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_dr_df_columns_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
-) -> DMatrix<f64> {
-    let n = ipreds.len();
-    let mut dc = DMatrix::<f64>::zeros(n, n);
-    let ok = visit_dr_df_cov(
-        error_spec,
-        ipreds,
-        obs_cmts,
-        obs_times,
-        obs_raw_times,
-        occasions,
-        obs_l2,
-        obs_rgroup,
-        sigma_values,
-        cov,
-        mult,
-        &mut |m, i, j, v| {
-            let other = if i == m { j } else { i };
-            dc[(other, m)] += v;
-        },
-    );
-    if !ok {
-        dc.fill(f64::NAN);
-    }
-    dc
-}
-
 /// Every nonzero entry of the `∂R/∂f_m` family, as `sink(m, i, j, v)`: add `v` at
 /// `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂R/∂f_m`. One of `i`, `j` is always `m`.
 /// Returns `false` when the residual blocks of a `correlation` line are missing (the
@@ -1873,9 +1911,15 @@ fn visit_dr_df_cov(
     // Each row picks up one cross term per partner (all-to-all within an L2
     // group), so `dr[j]` and `dr[k]` carry independent slopes.
     for &(j, k, _) in &pairs {
-        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
+        let djk =
+            cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
         sink(j, j, k, djk);
-        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
+        let dkj =
+            cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
         sink(k, k, j, dkj);
     }
     // A `correlation` line's `R_jk = C_jk · Σ_s c_j c_k σ²` (#1081), bilinear in
@@ -2111,101 +2155,6 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
     out
 }
 
-/// The `∂²R/∂f_a∂f_b` tensor of [`compute_d2r_df2_matrices_cov`] in **compact form**
-/// `(X, Y)` (#1960), two `n×n` matrices instead of `n²` of them:
-///
-/// * `X[(a, b)] = ∂²R_ab/∂f_a∂f_b` for `a ≠ b` — the only entry of `∂²R/∂f_a∂f_b`
-///   (each entry of `R` depends on the two predictions it couples), at `(a,b)`/`(b,a)`;
-/// * `Y[(k, a)] = ∂²R_ka/∂f_a²` — column `a` of `∂²R/∂f_a²`, which is nonzero only in
-///   row and column `a` (the diagonal curvature, plus a `power(...)` slot's own-row
-///   curvature on a `correlation` line). `X`'s diagonal is unused (zero).
-///
-/// Filled by the visitor the dense builder uses, so the two cannot differ.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_d2r_df2_compact_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
-) -> (DMatrix<f64>, DMatrix<f64>) {
-    let n = ipreds.len();
-    let mut x = DMatrix::<f64>::zeros(n, n);
-    let mut y = DMatrix::<f64>::zeros(n, n);
-    let ok = visit_d2r_df2_cov(
-        error_spec,
-        ipreds,
-        obs_cmts,
-        obs_times,
-        obs_raw_times,
-        occasions,
-        obs_l2,
-        obs_rgroup,
-        sigma_values,
-        cov,
-        mult,
-        &mut |a, b, i, j, v| {
-            if a != b {
-                x[(a, b)] += v;
-            } else {
-                let other = if i == a { j } else { i };
-                y[(other, a)] += v;
-            }
-        },
-    );
-    if !ok {
-        x.fill(f64::NAN);
-        y.fill(f64::NAN);
-    }
-    (x, y)
-}
-
-/// `(∂R/∂ρ, ∂Dc/∂ρ)` for the `ρ` of a `correlation <kind>(RHO) by COL` line at fixed
-/// predictions (#1960), `Dc` in the column form of [`compute_dr_df_columns_cov`].
-///
-/// `ρ` enters `R` only through `C_jk` in `R_jk = C_jk · Σ_s c_j c_k σ²`, so both
-/// derivatives are the serial terms of the builders with `C_jk` replaced by `∂C_jk/∂ρ`
-/// ([`serial_pairs_coef`]); the diagonal never depends on `ρ`. `None` without a
-/// `correlation` line, without residual blocks, or where `∂C_jk/∂ρ` is not finite (a
-/// `car1` gap below one time unit at `ρ = 0`), for the caller to decline.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn serial_rho_derivatives(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
-) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
-    let serial = cov.serial?;
-    let n = ipreds.len();
-    let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
-    let spairs = serial_pairs_coef(serial, obs_rgroup, obs_times, obs_raw_times, n, true)?;
-    let mut dr = DMatrix::<f64>::zeros(n, n);
-    let mut ddc = DMatrix::<f64>::zeros(n, n);
-    for (j, k, dc) in spairs {
-        if !dc.is_finite() {
-            return None;
-        }
-        let v = dc * same_slot_covariance(&vload[j], &vload[k], sigma_values);
-        dr[(j, k)] += v;
-        dr[(k, j)] += v;
-        // Column `j` of `∂R/∂f_j` at row `k` is `C_jk · cov(slope_j, value_k)`.
-        ddc[(k, j)] += dc * same_slot_covariance(&sload[j], &vload[k], sigma_values);
-        ddc[(j, k)] += dc * same_slot_covariance(&sload[k], &vload[j], sigma_values);
-    }
-    Some((dr, ddc))
-}
-
 /// Every nonzero entry of the `∂²R/∂f_a∂f_b` tensor, as `sink(a, b, i, j, v)`: add `v`
 /// at `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂²R/∂f_a∂f_b`. For `a ≠ b`, `{i, j} =
 /// {a, b}`; for `a = b`, one of `i`, `j` is `a`. Returns `false` when a `correlation`
@@ -2268,7 +2217,10 @@ fn visit_d2r_df2_cov(
     }
     // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
     for &(j, k, _) in &pairs {
-        let d = cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations);
+        let d =
+            cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
         if d != 0.0 {
             sink(j, k, j, k, d);
             sink(k, j, j, k, d);
@@ -2331,111 +2283,6 @@ fn diag_self_second_deriv(
         }
     }
     d
-}
-
-/// Direct-θ derivatives of a magnitude-scaled residual variance at prediction
-/// `f` (#484/#576/#486, and the `power(...)` exponent of #1182).
-///
-/// A custom / time-varying σ magnitude `mult(θ)` makes the per-observation
-/// variance `R_j = Σ_s (c_s·σ_s)²`, `c_s = coeff_s(f)·m_s`, depend on θ
-/// **directly** (not only through `f`); a `power(...)` exponent `p(θ)` does the
-/// same through `c_s = m_s·sign(f)|f|^{p}`. Returns `dr_dtheta`, the θ-gradient
-/// of `R_j` (length `n_theta`), and when `dd_dtheta` is `Some` also accumulates
-/// into it the θ-gradient of `d_j = ∂R_j/∂f = Σ 2 c_s c_s' σ_s²`:
-///
-/// ```text
-///   ∂R/∂θ = Σ_s 2 c_s σ_s² ∂c_s/∂θ
-///   ∂d/∂θ = Σ_s 2 σ_s² (∂c_s/∂θ · c_s' + c_s · ∂c_s'/∂θ)
-///   plain slot:  ∂c/∂θ = coeff·∂m/∂θ,            ∂c'/∂θ = slope·∂m/∂θ
-///   power slot:  ∂c/∂θ = g·∂m/∂θ + m·g·ln|f|·∂p/∂θ
-///                ∂c'/∂θ = g'·∂m/∂θ + m·|f|^{p−1}(1 + p·ln|f|)·∂p/∂θ
-/// ```
-///
-/// with `g = sign(f)|f|^p`, `g' = p|f|^{p−1}`. The plain-slot arms are written
-/// as the bilinear `2·coeff²·m·σ²·∂m/∂θ` and `4·coeff·coeff'·m·σ²·∂m/∂θ` they
-/// were before #1182, so a model without a power form is unchanged bit for
-/// bit. `ruv_scale` folds the `iiv_on_ruv` `exp(2·η_ruv)` link (`1.0` on the
-/// FOCE / non-`ruv` path). `mult_row` is the observation's magnitude row and
-/// `mult_grad_row` its per-`(slot, θ)` gradient, both in
-/// [`crate::types::RuvMagnitude::eval_obs`]'s layout, so a power slot's
-/// `∂p/∂θ` is `mult_grad_row[n_sigma + s]`. Diagonal-`R` only (`block_sigma`
-/// correlations force FD upstream). A power slot whose scaled variance sits on
-/// the `MIN_VARIANCE` floor contributes nothing, matching
-/// [`ErrorSpec::dvar_df_scaled`]'s gate — the objective is locally constant
-/// there.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn magnitude_dvar_dtheta(
-    error_spec: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    mult_row: &[f64],
-    mult_grad_row: &[Vec<f64>],
-    n_theta: usize,
-    ruv_scale: f64,
-    mut dd_dtheta: Option<&mut Vec<f64>>,
-) -> Vec<f64> {
-    let n_sigma = sigma.len();
-    let loadings = error_spec.sigma_loadings(cmt, f, n_sigma);
-    let slopes = error_spec.sigma_loading_slopes(cmt, n_sigma);
-    let slope_of = |idx: usize| -> f64 {
-        slopes
-            .iter()
-            .find(|&&(i, _)| i == idx)
-            .map(|&(_, s)| s)
-            .unwrap_or(0.0)
-    };
-    let floored = || error_spec.variance_at_scaled(cmt, f, sigma, &[], mult_row) <= MIN_VARIANCE;
-    let mut dr_dtheta = vec![0.0f64; n_theta];
-    for &(idx, coeff) in &loadings {
-        let sg = sigma.get(idx).copied().unwrap_or(0.0);
-        let mv = mult_row.get(idx).copied().unwrap_or(1.0);
-        let Some(dmi) = mult_grad_row.get(idx) else {
-            continue;
-        };
-        let slope = slope_of(idx);
-        let exponent = (slope != 0.0)
-            .then(|| slot_exponent(mult_row, n_sigma, idx))
-            .flatten();
-        match exponent {
-            None => {
-                let coeff_p = if dd_dtheta.is_some() { slope } else { 0.0 };
-                for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
-                    let dmdt = dmdt_raw * ruv_scale;
-                    dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
-                    if let Some(dd) = dd_dtheta.as_deref_mut() {
-                        dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
-                    }
-                }
-            }
-            Some(p) => {
-                if floored() {
-                    continue;
-                }
-                let (g, g1, _) = power_loading(f, p);
-                let a = f.abs();
-                let (ln_a, ap1) = if a > 0.0 {
-                    (a.ln(), a.powf(p - 1.0))
-                } else {
-                    (0.0, 0.0)
-                };
-                let c = mv * g;
-                let c1 = mv * g1;
-                let dp = mult_grad_row.get(n_sigma + idx);
-                for tm in 0..n_theta {
-                    let dm = dmi.get(tm).copied().unwrap_or(0.0) * ruv_scale;
-                    let dpt = dp.and_then(|v| v.get(tm)).copied().unwrap_or(0.0) * ruv_scale;
-                    let dc = g * dm + mv * g * ln_a * dpt;
-                    dr_dtheta[tm] += 2.0 * c * sg * sg * dc;
-                    if let Some(dd) = dd_dtheta.as_deref_mut() {
-                        let dc1 = g1 * dm + mv * ap1 * (1.0 + p * ln_a) * dpt;
-                        dd[tm] += 2.0 * sg * sg * (dc * c1 + c * dc1);
-                    }
-                }
-            }
-        }
-    }
-    dr_dtheta
 }
 
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
@@ -2828,148 +2675,10 @@ mod tests {
         }
     }
 
-    /// The direct-θ channel under an exponent: `∂R/∂θ` and `∂d/∂θ` against
-    /// FD in θ, where θ = (m, p) enters the row as `[m, p]`, for a plain
-    /// multiplier alone (the pre-#1182 arm) and with an exponent.
-    #[test]
-    fn magnitude_dvar_dtheta_matches_fd_in_the_multiplier_and_the_exponent() {
-        let spec = ErrorSpec::Single(ErrorModel::Proportional);
-        let sigma = [0.2];
-        let f = 3.0;
-        let ruv_scale = 1.7;
-        // θ = [m, p]; row(θ) = [m, p], so ∂row/∂θ is the identity.
-        let row_of = |th: &[f64]| vec![th[0], th[1]];
-        let grad_rows = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        for theta in [[1.3, 1.4], [0.8, 0.6], [1.0, 1.0]] {
-            let row = row_of(&theta);
-            let mut dd = vec![0.0; 2];
-            let dr = magnitude_dvar_dtheta(
-                &spec,
-                0,
-                f,
-                &sigma,
-                &row,
-                &grad_rows,
-                2,
-                ruv_scale,
-                Some(&mut dd),
-            );
-            for t in 0..2 {
-                let h = 1e-6;
-                let at = |d: f64| {
-                    let mut th = theta;
-                    th[t] += d;
-                    let r = row_of(&th);
-                    (
-                        ruv_scale * spec.variance_at_scaled(0, f, &sigma, &[], &r),
-                        ruv_scale * spec.dvar_df_scaled(0, f, &sigma, &r),
-                    )
-                };
-                let (rp, dp) = at(h);
-                let (rm, dm) = at(-h);
-                assert_relative_eq!(
-                    dr[t],
-                    (rp - rm) / (2.0 * h),
-                    max_relative = 1e-5,
-                    epsilon = 1e-9
-                );
-                assert_relative_eq!(
-                    dd[t],
-                    (dp - dm) / (2.0 * h),
-                    max_relative = 1e-5,
-                    epsilon = 1e-9
-                );
-            }
-        }
-    }
-
     #[test]
     fn test_additive_variance() {
         let v = residual_variance(ErrorModel::Additive, 10.0, &[0.5]);
         assert_relative_eq!(v, 0.25, epsilon = 1e-12);
-    }
-
-    /// #847: `dvar_drho`'s closed forms must equal central differences of the
-    /// production `R` and `∂R/∂f` builders in ρ. Those two are what the objective
-    /// and the outer gradient consume, so agreeing with them is the whole
-    /// contract — a hand-derived formula that drifts from either is the bug this
-    /// pins.
-    #[test]
-    fn dvar_drho_matches_fd_of_the_production_builders() {
-        let es = ErrorSpec::Single(ErrorModel::Combined);
-        let sigma = [0.3_f64, 1.4];
-        let f = 7.5_f64;
-        let rho = 0.42_f64;
-        let corr_at = |r: f64| {
-            vec![ResidualCorrelation {
-                sigma_i: 0,
-                sigma_j: 1,
-                rho: r,
-            }]
-        };
-        // `∂R/∂f` comes from the same helper `compute_dr_df_matrices` puts on the
-        // diagonal, so this differentiates exactly what production reads.
-        let d_at = |r: f64| {
-            diag_self_deriv(
-                &es.sigma_loadings(0, f, sigma.len()),
-                &es.sigma_loading_slopes(0, sigma.len()),
-                &sigma,
-                &corr_at(r),
-            )
-        };
-        let h = 1e-6;
-        let fd_r = (es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho + h))
-            - es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho - h)))
-            / (2.0 * h);
-        let fd_d = (d_at(rho + h) - d_at(rho - h)) / (2.0 * h);
-
-        let mut out = [(0.0, 0.0)];
-        dvar_drho(&es, 0, f, &sigma, &corr_at(rho), &mut out);
-        assert_relative_eq!(out[0].0, fd_r, max_relative = 1e-8);
-        assert_relative_eq!(out[0].1, fd_d, max_relative = 1e-8);
-        // Combined error: R = (fσ_p)² + σ_a² + 2ρ·f·σ_p·σ_a, so the hand value is
-        // 2·f·σ_p·σ_a — pinned so an FD-only check can't hide a shared mistake.
-        assert_relative_eq!(out[0].0, 2.0 * f * sigma[0] * sigma[1], epsilon = 1e-12);
-        assert_relative_eq!(out[0].1, 2.0 * sigma[0] * sigma[1], epsilon = 1e-12);
-    }
-
-    /// The `MIN_VARIANCE` clamp is asymmetric on purpose: `variance_at_scaled`
-    /// floors `R` while `diag_self_deriv` leaves `d` unfloored, so a clamped row
-    /// must report `∂R/∂ρ = 0` and keep its `∂d/∂ρ`. Claiming a live `∂R/∂ρ` on a
-    /// row whose variance the objective has pinned is the #958 failure mode, on
-    /// the correlation axis (#847).
-    #[test]
-    fn dvar_drho_zeroes_the_variance_term_at_the_floor() {
-        // `Combined` loads both slots, so the correlation has a partner; driving
-        // both sigmas to zero puts the row on the floor.
-        let es = ErrorSpec::Single(ErrorModel::Combined);
-        let sigma = [0.0_f64, 0.0];
-        let corr = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
-        assert!(es.variance_at_with_correlations(0, 5.0, &sigma, &corr) <= MIN_VARIANCE);
-        let mut out = [(0.0, 0.0)];
-        dvar_drho(&es, 0, 5.0, &sigma, &corr, &mut out);
-        assert_eq!(out[0].0, 0.0);
-    }
-
-    /// A correlation whose two sigma slots are not both loaded by an observation
-    /// contributes nothing to that observation's variance, so both derivatives
-    /// are zero — the same `continue` `variance_at_scaled` takes (#847).
-    #[test]
-    fn dvar_drho_is_zero_when_a_slot_is_not_loaded() {
-        // `Additive` loads slot 0 only, so a (0, 1) correlation has no partner.
-        let es = ErrorSpec::Single(ErrorModel::Additive);
-        let corr = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
-        let mut out = [(1.0, 1.0)];
-        dvar_drho(&es, 0, 3.0, &[0.4, 0.9], &corr, &mut out);
-        assert_eq!(out[0], (0.0, 0.0));
     }
 
     #[test]
@@ -3138,74 +2847,6 @@ mod tests {
         assert_relative_eq!(r(moved), paired, epsilon = 1e-12);
         // Two periods after an EVID=4 reset: written 2 and 2, engine 2 and 27.
         assert_eq!(r([2.0, 27.0]), 0.0);
-    }
-
-    /// #1959 through the production entry points (#1964 review, finding 1): a
-    /// free/total pair under a `block_sigma`, read from a file in which an `MDV=1` row
-    /// listed after the pair moves the total a ULP below `TIME = 2` (#1810). The
-    /// subject still has a cross-observation residual (`has_cross_observation_residual`,
-    /// which picks the dense path for FOCE, the gradients and simulate), and the dense
-    /// `R` that FOCE builds (`r_matrix_maybe_scaled`) carries the pair's covariance
-    /// bit-for-bit as on the same file without the `MDV=1` row. The straddle is asserted.
-    ///
-    /// Mutation — the pairing key back on `obs_times` bits (`same_residual_block`): the
-    /// moved subject has no cross-observation residual and `R[0,1]` is 0.
-    #[test]
-    fn a_reader_moved_pair_keeps_its_covariance_on_the_production_path() {
-        use std::io::Write as _;
-        let text = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  \
-                    omega ETA_CL ~ 0.09\n  block_sigma (S_TOT, S_UNB) = [0.04, 0.02, 0.04]\n\
-                    [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
-                    [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
-                    if (FREE == 0) {\n    DV ~ proportional(S_TOT)\n  } else {\n    \
-                    DV ~ proportional(S_UNB)\n  }\n[covariates]\n  FREE categorical\n";
-        let model = crate::parser::model_parser::parse_full_model(text)
-            .expect("parse")
-            .model;
-        assert!(!model.residual_correlations.is_empty());
-        let read = |mdv_row: bool| {
-            let mut csv = String::from(
-                "ID,TIME,DV,EVID,AMT,CMT,MDV,FREE\n1,0,.,1,100,1,1,0\n\
-                 1,2,8.0,0,.,1,0,0\n1,2,4.0,0,.,1,0,1\n",
-            );
-            if mdv_row {
-                csv.push_str("1,2,.,0,.,1,1,0\n");
-            }
-            csv.push_str("1,4,6.0,0,.,1,0,0\n");
-            let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
-            f.write_all(csv.as_bytes()).unwrap();
-            let path = f.path().to_str().unwrap().to_string();
-            crate::api::read_population_for(&model, &None, &path, None, None, None, &[])
-                .expect("reads")
-                .0
-                .subjects
-                .remove(0)
-        };
-        let sigma = &model.default_params.sigma.values;
-        let cov = ResidualCov::block_sigma(&model.residual_correlations);
-        let r01 = |s: &Subject| {
-            assert!(
-                has_cross_observation_residual(&model.error_spec, s, sigma, cov),
-                "{:?}",
-                s.obs_times
-            );
-            let keys = model.error_spec.obs_keys(s);
-            r_matrix_maybe_scaled(
-                &model.error_spec,
-                &[8.0, 4.0, 6.0],
-                &keys,
-                s,
-                sigma,
-                cov,
-                None,
-            )[(0, 1)]
-        };
-        let (still, moved) = (read(false), read(true));
-        assert_eq!(still.obs_times, vec![2.0, 2.0, 4.0]);
-        assert_eq!(moved.obs_times[0], 2.0f64.next_down(), "the straddle");
-        let want = r01(&still);
-        assert!(want.is_finite() && want > 0.0, "{want}");
-        assert_eq!(r01(&moved).to_bits(), want.to_bits());
     }
 
     // #827: two physical samples at the SAME subject time (replicate assays,
@@ -4379,65 +4020,6 @@ pub(crate) fn residual_rd(
             es.dvar_df_scaled(cmt, f, sigma, m),
         ),
         None => (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma)),
-    }
-}
-
-/// Closed-form `(∂R_jj/∂ρ_k, ∂d_j/∂ρ_k)` for every `block_sigma` off-diagonal
-/// `k` at one observation (#847), where `d_j = ∂R_jj/∂f_j`.
-///
-/// The within-observation part of the residual variance is
-/// `R_jj = Σ_s (c_s σ_s)² + Σ_k 2 ρ_k c_{i_k} c_{j_k} σ_{i_k} σ_{j_k}`
-/// (see [`ErrorSpec::variance_at_scaled`]), and every loading coefficient `c_s`
-/// is affine in `f`, so
-///
-/// ```text
-///   ∂R_jj/∂ρ_k = 2 σ_i σ_j c_i c_j
-///   ∂d_j /∂ρ_k = 2 σ_i σ_j (c_i' c_j + c_i c_j')
-/// ```
-///
-/// with `c'` the slope loading. The `∂d/∂ρ` form is exactly the ρ-derivative of
-/// `diag_self_deriv`'s cross term, so the two can only agree.
-///
-/// **The floor is asymmetric, deliberately.** `variance_at_scaled` clamps `R` at
-/// `MIN_VARIANCE` while `diag_self_deriv` computes `d` unclamped, so a clamped
-/// row has `∂R/∂ρ = 0` but keeps its `∂d/∂ρ`. Mirroring that here is what stops
-/// the analytic gradient from claiming a live `∂R/∂ρ` on a row whose variance the
-/// objective has already pinned to the floor — the #958 failure mode, on the
-/// correlation axis.
-///
-/// A correlation whose two sigma slots are not both loaded by this observation
-/// contributes nothing to its variance, and so returns `(0, 0)`.
-pub(crate) fn dvar_drho(
-    es: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    correlations: &[ResidualCorrelation],
-    out: &mut [(f64, f64)],
-) {
-    debug_assert_eq!(out.len(), correlations.len());
-    let loadings = es.sigma_loadings(cmt, f, sigma.len());
-    let slopes = es.sigma_loading_slopes(cmt, sigma.len());
-    let coeff = |ld: &[(usize, f64)], slot: usize| -> Option<f64> {
-        ld.iter().find(|(i, _)| *i == slot).map(|(_, c)| *c)
-    };
-    let floored = es.variance_at_with_correlations(cmt, f, sigma, correlations) <= MIN_VARIANCE;
-    for (k, corr) in correlations.iter().enumerate() {
-        out[k] = (0.0, 0.0);
-        let (Some(ci), Some(cj)) = (
-            coeff(&loadings, corr.sigma_i),
-            coeff(&loadings, corr.sigma_j),
-        ) else {
-            continue;
-        };
-        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-            continue;
-        };
-        let di = coeff(&slopes, corr.sigma_i).unwrap_or(0.0);
-        let dj = coeff(&slopes, corr.sigma_j).unwrap_or(0.0);
-        let ss = si * sj;
-        let dr = if floored { 0.0 } else { 2.0 * ss * ci * cj };
-        out[k] = (dr, 2.0 * ss * (di * cj + ci * dj));
     }
 }
 

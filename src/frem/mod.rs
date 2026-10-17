@@ -484,7 +484,10 @@ pub fn generate_frem_model(
     // estimate when one is supplied (issue #239) so a subsequent fit of the
     // FREM model warm-starts from converged PK parameters instead of the
     // original declared inits.
-    let theta_init_re = Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap();
+    static THETA_INIT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap()
+    });
+    let theta_init_re = &*THETA_INIT_RE;
     if let Some(params_lines) = blocks.get("parameters") {
         for line in params_lines {
             let trimmed = line.trim();

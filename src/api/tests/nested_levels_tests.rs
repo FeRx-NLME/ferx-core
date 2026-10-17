@@ -918,17 +918,12 @@ fn a_nested_model_reports_the_analytic_walks_unless_it_runs_on_a_transit_twin() 
     ] {
         assert_eq!(m.has_nested_levels(), nested_levels, "{label}");
         assert_eq!(
-            crate::sens::provider::nested_levels_outside_analytic_scope(m),
+            crate::sens::ode_provider::adjoint::nested_levels_outside_scope(m),
             !analytic,
             "{label}"
         );
         assert_eq!(
-            crate::sens::provider::iov_sens_supported(m),
-            analytic,
-            "{label}"
-        );
-        assert_eq!(
-            crate::sens::provider::iov_sens_eta_supported(m),
+            crate::sens::ode_provider::adjoint::recorder_in_scope(m),
             analytic,
             "{label}"
         );
