@@ -28857,14 +28857,13 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). The non-IOV gate caps
-        // `n_theta + n_eta` at `MAX_SCALE_AXES`, so θ and η fit a stack buffer there —
-        // built on the stack instead of per-call heap `Vec`s (#534 review #4). The IOV
-        // gate carries no such cap: its outer evaluates the scale in θ-column chunks, so
-        // a model past it reaches this inner call with more θ than the buffer holds
-        // (#1907). Those take a heap `Vec` (the fixed-size buffer alone would panic on
-        // the `[..len]` slice). (`cov_vec` / bytecode `stack` lengths are not
-        // axis-bounded, so they stay on the heap.)
+        // η_k seeds axis k directly (no `n_theta` offset). The ODE inner gate caps
+        // `n_eta`, not `n_theta + n_eta` (#1804), and the IOV outer evaluates the scale
+        // in θ-column chunks (#1907), so either route can reach this call with more θ
+        // or η values than the common stack buffers hold. Those take heap `Vec`s (the
+        // fixed-size buffers alone would panic on the `[..len]` slices); ordinary narrow
+        // models keep the stack fast path from #534. (`cov_vec` / bytecode `stack`
+        // lengths are not axis-bounded, so they stay on the heap.)
         const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
         let seed_eta = |k: usize, v: f64| {
             if k < N {

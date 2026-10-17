@@ -62,11 +62,12 @@ use crate::types::{CompiledModel, Subject};
 
 /// Widest `(θ, η)` axis count the dispatch ladders below instantiate.
 ///
-/// Shares [`MAX_ODE_AXES`] rather than picking its own number: the inner walk's
-/// `∂p/∂η` comes from `param_derivatives_at_cov`, whose own dispatch table is
-/// bounded by that constant, so a model admitted here but wider than that would
-/// take an analytic outer gradient against an FD inner — the scope split the ODE
-/// provider forbids for the same reason.
+/// Shares [`MAX_ODE_AXES`] rather than picking its own number: the outer walk's
+/// `∂p/∂(θ, η)` comes from [`seed_pk_dual2`], whose program evaluation is dispatched
+/// up to that constant. One bound gates both loops here. The inner walk's
+/// [`seed_pk_dual1`] has seeded η alone since #1804, so for the inner this bound is
+/// conservative: a compartment-free model past it takes FD on both loops, where the
+/// ODE provider now keeps the inner analytic (`OdeGradScope`).
 ///
 /// It is a **separate constant on purpose**, initialised to `MAX_ODE_AXES` rather
 /// than spelled as it: the coupling is a real constraint today, but it is one

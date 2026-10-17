@@ -1078,22 +1078,37 @@ pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interactio
 /// either the static superposition walk ([`ode_subject_supported`]) or the
 /// event-driven TV-cov walk ([`ode_tvcov_supported`]). Both are wired in
 /// [`ode_subject_eta_grad`], so the inner EBE loop takes the analytic η-gradient
-/// for TV-cov subjects too, matching the outer scope rather than splitting to an
-/// FD inner (#410; #449 review — the TV-cov inner gate was previously missing).
+/// for TV-cov subjects too, rather than splitting to an FD inner (#410; #449 review —
+/// the TV-cov inner gate was previously missing).
+///
+/// Both gates are asked in the **inner** scope (`OdeGradScope::Inner`, #1804): the walks
+/// behind [`ode_subject_eta_grad`] seed η alone, so `n_theta` does not bound them. Every
+/// subject the outer gradient serves is served here; past `MAX_ODE_AXES` total axes the
+/// reverse is not true, and the outer goes FD while this stays analytic.
 ///
 /// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported
 /// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
 /// [`ode_subject_eta_grad`]: crate::sens::ode_provider::ode_subject_eta_grad
 pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    use crate::sens::ode_provider::OdeGradScope;
     ODE_SENS_ENABLED
-        && (crate::sens::ode_provider::ode_subject_supported(model, subject)
-            || crate::sens::ode_provider::ode_tvcov_supported(model, subject))
+        && (crate::sens::ode_provider::ode_subject_supported_in(
+            model,
+            subject,
+            OdeGradScope::Inner,
+        ) || crate::sens::ode_provider::ode_tvcov_supported_in(
+            model,
+            subject,
+            OdeGradScope::Inner,
+        ))
 }
 
 /// Model-level umbrella for [`ode_inner_grad_supported`]: whether the light `Dual1`
 /// ODE inner η-gradient can serve the *best-case* subject of this model. Both
 /// per-subject gates ([`ode_subject_supported`], [`ode_tvcov_supported`]) require
-/// [`ode_analytical_supported`] as their subject-independent core, so a servable
+/// [`ode_analytical_supported`] as their subject-independent core — all three asked in
+/// the inner scope here (`ode_analytical_supported_in(model, OdeGradScope::Inner)`,
+/// #1804), the scope [`ode_inner_grad_supported`] uses — so a servable
 /// subject always exists when this holds — a plain-bolus, fixed-dose, no-TV-cov
 /// subject takes the static walk, and a lagtime / TV-cov / SS / modeled-dose subject
 /// routes to the event-driven walk. **Non-IOV only:** `ode_analytical_supported`
@@ -1116,7 +1131,11 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
 /// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
 /// [`ode_iov_supported`]: crate::sens::ode_provider::ode_iov_supported
 pub(crate) fn ode_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model)
+    ODE_SENS_ENABLED
+        && crate::sens::ode_provider::ode_analytical_supported_in(
+            model,
+            crate::sens::ode_provider::OdeGradScope::Inner,
+        )
 }
 
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
@@ -4983,8 +5002,10 @@ fn subject_eta_grad_impl(
         return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
     }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
-    // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
-    // scope the outer provider uses, so inner and outer stay on the same route.
+    // switch. Out-of-scope ODE subjects decline (→ FD inner). The inner scope bounds
+    // `n_eta` where the outer bounds `n_theta + n_eta` (#1804), so an analytic outer
+    // implies an analytic inner, but not the reverse: past the axis cap the inner
+    // stays analytic while the outer goes FD.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             // Closed-form modified-release fast path (#860 Phase A6): a *static*

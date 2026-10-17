@@ -12937,6 +12937,466 @@ fn ode_wider_than_static_walk_iov_matches_predict_iov() {
     );
 }
 
+// ---- #1804: the inner η-gradient is bounded on n_eta, not on n_theta + n_eta ----
+
+/// The #1661 model (`wide`: 13 individual parameters, every subject on the event-driven
+/// walk) or its 12-parameter twin (static walk for a subject without triggers), with
+/// `n_pad` FIX θ at 0 multiplying CL by `exp(P1 + … + Pn) = 1`. The likelihood is the
+/// same at every `n_pad`; only `n_theta = 8 + n_pad` moves, and `n_eta = 3` stays put.
+fn padded_ode_model(n_pad: usize, wide: bool) -> CompiledModel {
+    let pads: String = (1..=n_pad)
+        .map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n"))
+        .collect();
+    let factor = if n_pad == 0 {
+        String::new()
+    } else {
+        let sum: Vec<String> = (1..=n_pad).map(|i| format!("P{i}")).collect();
+        format!(" * exp({})", sum.join(" + "))
+    };
+    let src = WIDE_ODE_TEMPLATE
+        .replace("  omega ETA_CL", &format!("{pads}  omega ETA_CL"))
+        .replace(
+            "exp(ETA_CL __KAPPA_TERM__)",
+            &format!("exp(ETA_CL){factor}"),
+        )
+        .replace("__IMAX_DECL__", if wide { "IMAX = 0.8" } else { "" })
+        .replace("__IMAX__", if wide { "IMAX" } else { "0.8" })
+        .replace("__KAPPA__", "")
+        .replace("__IOV_OPT__", "");
+    let model = parse_model_string(&src).expect("parse #1804 padded fixture");
+    assert_eq!(model.n_theta, WIDE_THETA.len() + n_pad);
+    assert_eq!(model.n_eta, WIDE_ETA.len());
+    model
+}
+
+fn padded_theta(n_pad: usize) -> Vec<f64> {
+    let mut theta = WIDE_THETA.to_vec();
+    theta.resize(WIDE_THETA.len() + n_pad, 0.0);
+    theta
+}
+
+/// [`wide_ode_subject`] with the weight on CL stepping between the two doses: an
+/// event-walk subject on either model.
+fn wide_ode_tvcov_subject() -> Subject {
+    let mut subject = wide_ode_subject();
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(62.0), wt(80.0)];
+    subject.obs_covariates = vec![wt(62.0), wt(62.0), wt(62.0), wt(80.0), wt(80.0), wt(80.0)];
+    assert!(subject.has_tv_covariates());
+    subject
+}
+
+/// Pads putting the fixture at exactly the cap, one past it, and twice it.
+const PAD_AT_CAP: usize = 13;
+const PAD_PAST_CAP: usize = 14;
+const PAD_TWICE_CAP: usize = 37;
+/// The widths of the `Outer ⇒ Inner` sweep: 11, 12, 23, 24, 25, 26 and 41 axes, i.e. two on
+/// each side of the cap and the two ends.
+const SWEEP_PADS: [usize; 7] = [
+    0,
+    1,
+    PAD_AT_CAP - 1,
+    PAD_AT_CAP,
+    PAD_PAST_CAP,
+    PAD_PAST_CAP + 1,
+    30,
+];
+/// The widths at which the sweep also runs the outer provider: 11, 23, 24, 25 and 41 axes.
+const OUTER_PROBE_PADS: [usize; 5] = [0, PAD_AT_CAP - 1, PAD_AT_CAP, PAD_PAST_CAP, 30];
+
+/// The gate straddle. At 24 axes both scopes serve both walks; at 25 and 48 the outer
+/// declines and the inner still serves, on the static walk (narrow model, no trigger)
+/// and the event-driven one (TV-cov subject, and every subject of the wide model). Each
+/// half is asserted on the same model, so forcing either scope to the other's answer
+/// reddens it.
+#[test]
+fn ode_inner_scope_is_bounded_on_eta_not_theta_plus_eta() {
+    use crate::sens::provider::{
+        analytic_outer_gradient_available, ode_inner_grad_supported, ode_inner_grad_supported_model,
+    };
+    let plain = wide_ode_subject();
+    let tvcov = wide_ode_tvcov_subject();
+    for (n_pad, axes) in [(PAD_AT_CAP, 24), (PAD_PAST_CAP, 25), (PAD_TWICE_CAP, 48)] {
+        let past = axes > MAX_ODE_AXES;
+        for wide in [false, true] {
+            let m = padded_ode_model(n_pad, wide);
+            let tag = format!("{axes} axes, wide = {wide}");
+            assert_eq!(m.n_theta + m.n_eta, axes, "{tag}: fixture width");
+            assert_eq!(
+                ode_analytical_supported(&m),
+                !past,
+                "{tag}: outer model gate"
+            );
+            assert_eq!(
+                analytic_outer_gradient_available(&m),
+                !past,
+                "{tag}: outer gradient report"
+            );
+            assert!(
+                ode_analytical_supported_in(&m, OdeGradScope::Inner),
+                "{tag}: #1804 the inner model gate must not count θ"
+            );
+            assert!(ode_inner_grad_supported_model(&m), "{tag}: inner report");
+
+            // Which walk serves the plain subject depends on the model's width only.
+            let (static_walk, event_walk) = (!wide, wide);
+            for scope in [OdeGradScope::Outer, OdeGradScope::Inner] {
+                let want = scope == OdeGradScope::Inner || !past;
+                assert_eq!(
+                    ode_subject_supported_in(&m, &plain, scope),
+                    want && static_walk,
+                    "{tag}, {scope:?}: static walk, plain subject"
+                );
+                assert_eq!(
+                    ode_tvcov_supported_in(&m, &plain, scope),
+                    want && event_walk,
+                    "{tag}, {scope:?}: event walk, plain subject"
+                );
+                assert!(
+                    !ode_subject_supported_in(&m, &tvcov, scope),
+                    "{tag}, {scope:?}: a TV-cov subject never takes the static walk"
+                );
+                assert_eq!(
+                    ode_tvcov_supported_in(&m, &tvcov, scope),
+                    want,
+                    "{tag}, {scope:?}: event walk, TV-cov subject"
+                );
+            }
+            assert!(ode_inner_grad_supported(&m, &plain), "{tag}: plain inner");
+            assert!(ode_inner_grad_supported(&m, &tvcov), "{tag}: TV-cov inner");
+        }
+    }
+}
+
+/// `Outer ⇒ Inner` across 11 to 41 axes, on both walks: no subject the outer gradient
+/// serves may fall to an FD inner. Also that the provider agrees with its gate in each
+/// scope, so a dispatch table narrower than the gate (a silent `_ => None`) fails here
+/// rather than as an unexplained FD fallback in a fit.
+///
+/// The gates are a threshold on the axis count, so the sweep takes `SWEEP_PADS`, two widths
+/// on each side of the cap plus the ends, not every width: in a debug build (macOS arm64)
+/// all 31 cost 34 s, 11 s of it compiling the 62 models. The outer provider runs a
+/// `Dual2<θ+η>` walk and is probed at `OUTER_PROBE_PADS` only.
+#[test]
+fn ode_outer_scope_implies_inner_scope_across_the_cap() {
+    on_fit_stack(ode_outer_scope_implies_inner_scope_body);
+}
+
+/// Runs `body` on a thread with the fit's worker stack. The outer `Dual2<24>` event walk at
+/// the cap overflows the 2 MiB default test-thread stack in a debug build; production fits
+/// run on `FIT_RAYON_STACK_SIZE` for that reason (as in
+/// `ode_iov_bucketed_dispatch_is_bit_identical_to_the_exact_width`).
+fn on_fit_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
+        .spawn(body)
+        .expect("spawn wide-stack test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn ode_outer_scope_implies_inner_scope_body() {
+    let subjects = [wide_ode_subject(), wide_ode_tvcov_subject()];
+    for n_pad in SWEEP_PADS {
+        let theta = padded_theta(n_pad);
+        for wide in [false, true] {
+            let m = padded_ode_model(n_pad, wide);
+            for (s, subject) in subjects.iter().enumerate() {
+                let tag = format!("{} axes, wide = {wide}, subject {s}", m.n_theta + m.n_eta);
+                let outer = ode_subject_supported(&m, subject) || ode_tvcov_supported(&m, subject);
+                let inner = crate::sens::provider::ode_inner_grad_supported(&m, subject);
+                assert!(!outer || inner, "{tag}: outer analytic over an FD inner");
+                if OUTER_PROBE_PADS.contains(&n_pad) {
+                    assert_eq!(
+                        ode_subject_sensitivities(&m, subject, &theta, &WIDE_ETA).is_some(),
+                        outer,
+                        "{tag}: outer provider vs its gate"
+                    );
+                }
+                assert_eq!(
+                    ode_subject_eta_grad(&m, subject, &theta, &WIDE_ETA).is_some(),
+                    inner,
+                    "{tag}: inner provider vs its gate"
+                );
+            }
+        }
+    }
+}
+
+/// The inner η-gradient past the cap is exact. On every (walk, subject) cell:
+///
+/// * at 24 axes the light inner equals the outer `Dual2` η-block, which still reads `∂p/∂η`
+///   through `param_derivatives_at_cov` — the old seeder against the new one, end to end;
+/// * at 25 and 48 axes it equals the 24-axis gradient (the padding θ are FIX with no
+///   effect), where before #1804 it was `None`;
+/// * at 25 axes it matches central FD of the production predictor.
+#[test]
+fn ode_inner_eta_grad_past_axis_cap_matches_twin_and_production() {
+    on_fit_stack(ode_inner_eta_grad_past_axis_cap_body);
+}
+
+fn ode_inner_eta_grad_past_axis_cap_body() {
+    let subjects = [
+        ("plain", wide_ode_subject()),
+        ("TV-cov", wide_ode_tvcov_subject()),
+    ];
+    for wide in [false, true] {
+        let at_cap = padded_ode_model(PAD_AT_CAP, wide);
+        for (name, subject) in &subjects {
+            let tag = format!("wide = {wide}, {name} subject");
+            let theta_at = padded_theta(PAD_AT_CAP);
+            check_inner_outer_eta_parity(&at_cap, subject, &theta_at, &WIDE_ETA);
+            let reference =
+                ode_subject_eta_grad(&at_cap, subject, &theta_at, &WIDE_ETA).expect("24 axes");
+            assert_overflow_row_is_live(reference.iter().map(|o| o.df_deta[2]));
+
+            for n_pad in [PAD_PAST_CAP, PAD_TWICE_CAP] {
+                let m = padded_ode_model(n_pad, wide);
+                let theta = padded_theta(n_pad);
+                let tag = format!("{tag}, {} axes", m.n_theta + m.n_eta);
+                assert!(
+                    ode_subject_sensitivities(&m, subject, &theta, &WIDE_ETA).is_none(),
+                    "{tag}: the outer is FD past the cap"
+                );
+                let got = ode_subject_eta_grad(&m, subject, &theta, &WIDE_ETA)
+                    .unwrap_or_else(|| panic!("{tag}: #1804 the inner must stay analytic"));
+                // Bit-identical, measured: the inner never seeds a θ axis, so the padding θ
+                // cannot enter its arithmetic at all.
+                assert_eq!(got.len(), reference.len());
+                for (a, b) in got.iter().zip(&reference) {
+                    assert!(a.f.is_finite() && b.f.is_finite(), "{tag}: non-finite f");
+                    assert_eq!(a.f, b.f, "{tag}: f");
+                    for k in 0..m.n_eta {
+                        assert!(a.df_deta[k].is_finite(), "{tag}: non-finite ∂f/∂η{k}");
+                        assert_eq!(a.df_deta[k], b.df_deta[k], "{tag}: ∂f/∂η{k}");
+                    }
+                }
+            }
+
+            let m = padded_ode_model(PAD_PAST_CAP, wide);
+            let theta = padded_theta(PAD_PAST_CAP);
+            let got = ode_subject_eta_grad(&m, subject, &theta, &WIDE_ETA).expect("25 axes");
+            let pred = |e: &[f64], j: usize| compute_predictions_with_tv(&m, subject, &theta, e)[j];
+            // Measured worst over the 4 cells' 72 (row, η) pairs (macOS arm64): `f` vs the
+            // production predictor rel 6.1e-13, `∂f/∂η` vs central FD rel 2.4e-7 (the FD
+            // of the adaptive solve). Bounds at about 15× and 8× those.
+            let he = 1e-6;
+            for (j, o) in got.iter().enumerate() {
+                approx::assert_relative_eq!(
+                    o.f,
+                    pred(&WIDE_ETA, j),
+                    max_relative = 1e-11,
+                    epsilon = 1e-14
+                );
+                for k in 0..m.n_eta {
+                    let mut ep = WIDE_ETA.to_vec();
+                    ep[k] += he;
+                    let mut em = WIDE_ETA.to_vec();
+                    em[k] -= he;
+                    let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        o.df_deta[k],
+                        fd,
+                        max_relative = 2e-6,
+                        epsilon = 1e-14
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`seed_pk_dual1`] (η-only `Dual1` program evaluation since #1804) against the η-block
+/// of the `Dual2<θ + η>` [`param_derivatives_at_cov`] it replaced, slot by slot, at
+/// `n_eta` = 1, 8 and 22 (22 + 2 θ = 24, the widest the old path evaluates). Each η enters
+/// CL with a distinct coefficient and V through a distinct product, so a seeder that
+/// permuted, dropped or shifted an axis disagrees on some slot.
+#[test]
+fn seed_pk_dual1_matches_the_dual2_eta_block() {
+    fn src(n_eta: usize) -> String {
+        let omegas: String = (1..=n_eta)
+            .map(|k| format!("  omega E{k} ~ 0.1\n"))
+            .collect();
+        let lin: Vec<String> = (1..=n_eta)
+            .map(|k| format!("{:.1} * E{k}", 0.1 * k as f64))
+            .collect();
+        let quad: Vec<String> = (1..=n_eta).map(|k| format!("E{k} * E{k} / {k}")).collect();
+        format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(12.0, 1.0, 500.0)\n{omegas}\
+             \x20 sigma PROP_ERR ~ 0.02 (sd)\n[individual_parameters]\n  CL = TVCL * exp({})\n  \
+             V = TVV * exp({})\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+             [odes]\n  d/dt(central) = -(CL/V) * central\n[error_model]\n  \
+             DV ~ proportional(PROP_ERR)\n",
+            lin.join(" + "),
+            quad.join(" + ")
+        )
+    }
+    fn check<const N: usize>() {
+        let m = parse_model_string(&src(N)).expect("parse seeder fixture");
+        assert_eq!((m.n_theta, m.n_eta), (2, N));
+        let prog = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.indiv_param_program.as_ref())
+            .expect("program");
+        let theta = [4.0, 12.0];
+        let eta: Vec<f64> = (0..N)
+            .map(|k| 0.05 * (k as f64 + 1.0) * if k % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let cov = HashMap::new();
+        let old = param_derivatives_at_cov(prog, &m, &cov, &theta, &eta).expect("old path");
+        let new = seed_pk_dual1::<N>(&m, prog, &theta, &eta, &cov, 0.0).expect("new path");
+        let mut live = 0usize;
+        for (i, &slot) in m.pk_indices.iter().enumerate() {
+            for k in 0..N {
+                let (a, b) = (new[slot].grad[k], old.dp_deta[i][k]);
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "n_eta {N}: slot {slot} axis {k}"
+                );
+                // Measured bit-identical at all three widths: both duals' first-order product
+                // rule is the same arithmetic. The bound is a few ULP, room for a
+                // reassociation in either dual, not for a wrong axis.
+                approx::assert_relative_eq!(a, b, max_relative = 1e-14, epsilon = 1e-15);
+                if b != 0.0 {
+                    live += 1;
+                }
+            }
+        }
+        // Every η is live in both CL and V.
+        assert_eq!(live, 2 * N, "n_eta {N}: live entries");
+    }
+    check::<1>();
+    check::<8>();
+    check::<22>();
+}
+
+/// An η-dependent `ExpressionScale` is admitted by the inner scope past the cap, and its
+/// quotient is applied: the 25- and 27-axis inner gradients match FD of the production
+/// predictor (which divides by the scale) and the 24-axis twin. The latter carries 25 θ,
+/// past `eval_scale_dual1`'s stack-buffer width; before the heap fallback it panicked even
+/// though θ are constants on this η-only path. The scale admissibility is a separate width
+/// check from the model's own, so it needs its own straddle.
+#[test]
+fn ode_expression_scale_inner_scope_past_axis_cap() {
+    let padded = |n_pad: usize| -> CompiledModel {
+        let pads: String = (1..=n_pad)
+            .map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n"))
+            .collect();
+        let sum: Vec<String> = (1..=n_pad).map(|i| format!("P{i}")).collect();
+        let src = TWOCPT_ODE_EXPRSCALE
+            .replace("  omega ETA_CL", &format!("{pads}  omega ETA_CL"))
+            .replace(
+                "CL = TVCL * exp(ETA_CL)",
+                &format!("CL = TVCL * exp(ETA_CL) * exp({})", sum.join(" + ")),
+            );
+        parse_model_string(&src).expect("parse padded ExpressionScale")
+    };
+    let theta = |n_pad: usize| -> Vec<f64> {
+        let mut t = vec![4.0, 12.0, 2.0, 25.0];
+        t.resize(4 + n_pad, 0.0);
+        t
+    };
+    let eta = [0.12, -0.08];
+    let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+
+    let at_cap = padded(18);
+    assert_eq!(at_cap.n_theta + at_cap.n_eta, MAX_ODE_AXES);
+    let reference = ode_subject_eta_grad(&at_cap, &subject, &theta(18), &eta).expect("24 axes");
+    for n_pad in [19, 21] {
+        let past = padded(n_pad);
+        let axes = past.n_theta + past.n_eta;
+        let tag = format!("{axes} axes ({} θ)", past.n_theta);
+        assert!(axes > MAX_ODE_AXES, "{tag}: past the outer cap");
+        if n_pad == 21 {
+            assert!(
+                past.n_theta > crate::sens::provider::MAX_SCALE_AXES,
+                "{tag}: regression must cross the scale evaluator's θ buffer"
+            );
+        }
+        let ScalingSpec::ExpressionScale { deriv: Some(p), .. } = &past.scaling else {
+            panic!("{tag}: fixture must carry a differentiable scale program");
+        };
+        assert!(!expression_scale_axes_admissible(
+            p,
+            &past,
+            OdeGradScope::Outer
+        ));
+        assert!(expression_scale_axes_admissible(
+            p,
+            &past,
+            OdeGradScope::Inner
+        ));
+        assert!(!ode_analytical_supported(&past));
+        assert!(ode_analytical_supported_in(&past, OdeGradScope::Inner));
+
+        let th = theta(n_pad);
+        let got = ode_subject_eta_grad(&past, &subject, &th, &eta)
+            .unwrap_or_else(|| panic!("{tag}: inner gradient"));
+        let pred = |e: &[f64], j: usize| compute_predictions_with_tv(&past, &subject, &th, e)[j];
+        // Measured (macOS arm64): both twins bit-identical to the 24-axis reference;
+        // `f` vs the production predictor rel 1.8e-16; `∂f/∂η` vs central FD rel 1.9e-9
+        // over each case's 14 (row, η) pairs. FD bound at about 10× that.
+        let he = 1e-6;
+        assert_eq!(got.len(), reference.len());
+        for (j, (o, r)) in got.iter().zip(&reference).enumerate() {
+            assert!(o.f.is_finite(), "{tag}, row {j}: non-finite f");
+            assert_eq!(o.f, r.f, "{tag}, row {j}: f");
+            approx::assert_relative_eq!(o.f, pred(&eta, j), max_relative = 1e-14, epsilon = 1e-16);
+            for k in 0..past.n_eta {
+                assert!(
+                    o.df_deta[k].is_finite(),
+                    "{tag}, row {j}: non-finite ∂f/∂η{k}"
+                );
+                assert_eq!(o.df_deta[k], r.df_deta[k], "{tag}, row {j}: ∂f/∂η{k}");
+                let mut ep = eta.to_vec();
+                ep[k] += he;
+                let mut em = eta.to_vec();
+                em[k] -= he;
+                let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+                approx::assert_relative_eq!(o.df_deta[k], fd, max_relative = 2e-8, epsilon = 1e-16);
+            }
+        }
+    }
+}
+
+/// What the fit reports follows the split route past the cap: the inner label and the
+/// per-subject inner route say analytic, the outer says it is not. Before #1804 all three
+/// said FD.
+#[test]
+fn ode_past_axis_cap_reports_analytic_inner_fd_outer() {
+    use crate::build_info::{
+        gradient_method_inner, gradient_method_outer, GradientMethodKind, BUILD_INFO,
+    };
+    use crate::estimation::inner_optimizer::{resolve_gradient_method, InnerGradientMethod};
+    use crate::types::{EstimationMethod, Optimizer};
+    let subjects = [wide_ode_subject(), wide_ode_tvcov_subject()];
+    for (n_pad, past) in [(PAD_AT_CAP, false), (PAD_PAST_CAP, true)] {
+        for wide in [false, true] {
+            let m = padded_ode_model(n_pad, wide);
+            let tag = format!("{} axes, wide = {wide}", m.n_theta + m.n_eta);
+            assert_eq!(
+                gradient_method_inner(&BUILD_INFO, &m),
+                GradientMethodKind::Analytic,
+                "{tag}: inner label"
+            );
+            assert_eq!(
+                gradient_method_outer(&BUILD_INFO, EstimationMethod::FoceI, Optimizer::Auto, &m)
+                    == GradientMethodKind::Analytic,
+                !past,
+                "{tag}: outer label"
+            );
+            for subject in &subjects {
+                assert_eq!(
+                    resolve_gradient_method(&m, subject),
+                    InnerGradientMethod::Analytic,
+                    "{tag}: inner route"
+                );
+            }
+        }
+    }
+}
+
 /// A model with no θ and no η (σ-only: every individual parameter a constant) has nothing
 /// to seed either ODE walk with, so the provider returns `None` for every subject at any
 /// width. It must not be reported analytic, or `optimizer = auto` would pick a gradient
