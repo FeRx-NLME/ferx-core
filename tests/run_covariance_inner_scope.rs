@@ -14,7 +14,7 @@
 //! opens (score under `FitOptions::default()`'s inner settings) → T4 (i) dies here, and the
 //! `inner_optimizer` row and T10 in `run_covariance_scoring_record.rs` (measured on #1847;
 //! before #1847 it was T4 (ii) and T5, which since then start from the fit's own EBEs, where
-//! the default dense BFGS and L-BFGS reconverge to the same bits); write a fit's inner
+//! the default dense BFGS and L-BFGS reconverge to the same bits, see T4); write a fit's inner
 //! settings to a process global again → T4 (iii) dies.
 
 use ferx_core::{fit, prepare_run, run_covariance, FitOptions, FitResult, InnerOptimizer};
@@ -109,8 +109,11 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
     );
     // The premise uses the solver the leak would bring in. Since #1847 the step starts from
     // the fit's own EBEs, and from there dense BFGS (`Auto` on warfarin) and L-BFGS reconverge
-    // every FD point to the same bits, so only a materially different solver can move the
-    // covariance. Before #1847 `Auto` did, through the cold solve it started from. A
+    // to the same bits. On this fixture's analytic-Hessian route the step reconverges once, at
+    // the centre: 8 of 10 warm starts already meet the tolerance, and the other 2 move by
+    // ≤1.9e-9 with identical steps under both solvers (measured on #2092). So only a
+    // materially different solver can move the covariance. Before #1847 `Auto` did, through
+    // the cold solve it started from. A
     // non-default caller value is scored as given, so the record stays.
     let nelder_mead = FitOptions {
         inner_optimizer: InnerOptimizer::NelderMead,

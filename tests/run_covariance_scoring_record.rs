@@ -164,8 +164,9 @@ fn failing_inner() -> FitOptions {
 }
 
 // Nelder–Mead, not L-BFGS: since #1847 the step starts from the fit's own EBEs, and from
-// there dense BFGS (the default on warfarin) and L-BFGS reconverge every FD point to the same
-// bits, so an L-BFGS fit's premise fails.
+// there dense BFGS (the default on warfarin) and L-BFGS reconverge to the same bits (the one
+// reconvergence at the centre, on the analytic-Hessian route; see
+// `run_covariance_inner_scope.rs`), so an L-BFGS fit's premise fails.
 field_row!(
     inner_optimizer,
     WARFARIN,
