@@ -1365,7 +1365,8 @@ fn write_ebes_kappa_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxE
 /// the level per subject. `GROUP` is the group's 1-based position in its subject's list
 /// (first-record order); the label columns name it, outermost level first. A label is
 /// written in full (shortest round-trip form), since it identifies the group and must
-/// reload to the same bits; a κ̂ at the 6 decimals of `ebes_kappa.csv`, NaN as empty.
+/// reload to the same bits; a κ̂ exactly too, as every bundle double is (`fmt_f64`, #1847),
+/// NaN as empty.
 fn write_level_kappa_csv<W: Write>(
     w: &mut W,
     r: &FitResult,
@@ -1578,10 +1579,20 @@ fn write_predictions_csv<W: Write>(
     Ok(())
 }
 
+/// The bundle's CSV float: the shortest text that reads back as the same `f64`, so a
+/// reloaded fit holds the bits the saved one held (#1631, #1847). `NaN` is an empty cell
+/// and `±inf` is `inf` / `-inf`, as before. `{:?}` rather than `{}` so a value far from
+/// one takes an exponent (`1e-7`, `1e20`) instead of a run of zeros; both round-trip.
+///
+/// Bundles written before this read back unchanged: six-decimal text parses to the value
+/// it always did. Those EBEs are not the in-memory ones, and `run_covariance` tells them
+/// apart by that spelling (`written_at_six_decimals`).
 fn fmt_f64(v: f64) -> String {
-    // Shared CSV float formatter (NaN → empty, else 6 dp). See
-    // `io::output::fmt_num` for the single source of truth.
-    crate::io::output::fmt_num(v)
+    if v.is_nan() {
+        String::new()
+    } else {
+        format!("{v:?}")
+    }
 }
 
 fn csv_escape(s: &str) -> String {
@@ -2275,10 +2286,16 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         // COND_MODE is the conditional mode = the EBE already carried on
         // `fit.subjects[si].eta` (loaded from ebes.csv). It isn't re-stored, but
         // we validate it agrees with that EBE so a mismatched or hand-edited
-        // bundle fails fast rather than passing off inconsistent data. Both are
-        // produced by the same `fmt_f64`, so a consistent bundle matches exactly.
-        let expected_mode = fmt_f64(fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN));
-        if fields[4] != expected_mode {
+        // bundle fails fast rather than passing off inconsistent data. Compared as
+        // the value both cells read back as, not as text: a consistent bundle
+        // writes both with one formatter, but which one depends on its writer
+        // (six decimals before #1847, the shortest round-trip text after, R's
+        // own shortest spelling in ferx-r). `+0` and `-0` agree, as in `run_covariance`'s
+        // EBE comparison, and two `NaN`s do.
+        let ebe = fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN);
+        let mode = parse_or_nan(&fields[4])?;
+        if mode != ebe && !(mode.is_nan() && ebe.is_nan()) {
+            let expected_mode = fmt_f64(ebe);
             return Err(FitrxError::Corrupt(format!(
                 "conddist.csv: COND_MODE {:?} for ID {:?} ETA {:?} disagrees with EBE {:?}",
                 fields[4], fields[0], fields[1], expected_mode
@@ -3723,6 +3740,175 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[0].len(), 2);
         assert!((loaded.fit.ebe_kappas[0][0][0] - 0.01).abs() < 1e-9);
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
+    }
+
+    /// Doubles no six-decimal text can hold: a sum with no short decimal, a value smaller
+    /// than the last place, one with eleven significant digits, π, and one far above one.
+    const AWKWARD: [f64; 5] = [
+        0.1 + 0.2,
+        3e-7,
+        -1.234_567_891_23e-5,
+        std::f64::consts::PI,
+        1e20,
+    ];
+
+    /// #1847 / #1631: every CSV double in a bundle reads back as the bits it was written
+    /// from — the EBEs, κ̂, the per-subject objective, the predictions and the conditional
+    /// distribution — so a reloaded fit holds the in-memory EBEs `run_covariance` compares
+    /// against the cold solve. Mutation: `fmt_f64` back to six decimals → dies on the first
+    /// EBE; `{}` instead of `{:?}` → still green (both round-trip), which is why the
+    /// spelling is pinned separately in `fmt_f64_is_shortest_round_trip_text`.
+    #[test]
+    fn roundtrip_csv_doubles_bit_for_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.fitrx");
+        let mut r = minimal_fit_result();
+        for (i, s) in r.subjects.iter_mut().enumerate() {
+            s.eta = DVector::from_vec(vec![AWKWARD[i], AWKWARD[i + 2]]);
+            s.ofv_contribution = AWKWARD[i + 3];
+            for (j, y) in s.ipred.iter_mut().enumerate() {
+                *y = AWKWARD[(i + j) % AWKWARD.len()];
+            }
+        }
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[0.05]));
+        r.kappa_names = vec!["kappa_CL".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        r.ebe_kappas = vec![
+            vec![
+                DVector::from_vec(vec![AWKWARD[0]]),
+                DVector::from_vec(vec![AWKWARD[1]]),
+            ],
+            vec![DVector::from_vec(vec![AWKWARD[2]])],
+        ];
+        r.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![AWKWARD[3], AWKWARD[1]], vec![AWKWARD[2], AWKWARD[0]]],
+            cond_sd: vec![vec![AWKWARD[1], AWKWARD[3]], vec![AWKWARD[4], AWKWARD[2]]],
+            samples: vec![Vec::new(), Vec::new()],
+            shrinkage: vec![0.2, 0.3],
+            nsamp: 500,
+            burnin: 100,
+        });
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let l = load_fit(&path).unwrap().fit;
+
+        let bits = |xs: &mut dyn Iterator<Item = f64>| xs.map(f64::to_bits).collect::<Vec<_>>();
+        for (a, b) in l.subjects.iter().zip(&r.subjects) {
+            assert_eq!(
+                bits(&mut a.eta.iter().copied()),
+                bits(&mut b.eta.iter().copied()),
+                "eta"
+            );
+            assert_eq!(
+                a.ofv_contribution.to_bits(),
+                b.ofv_contribution.to_bits(),
+                "ofv"
+            );
+            assert!(!a.ipred.is_empty(), "premise: predictions are read back");
+            assert_eq!(
+                bits(&mut a.ipred.iter().copied()),
+                bits(&mut b.ipred.iter().copied()),
+                "ipred"
+            );
+        }
+        let kappas = |f: &FitResult| {
+            bits(
+                &mut f
+                    .ebe_kappas
+                    .iter()
+                    .flatten()
+                    .flat_map(|k| k.iter().copied()),
+            )
+        };
+        assert_eq!(kappas(&l), kappas(&r), "kappa");
+        let (lc, rc) = (l.cond_dist.unwrap(), r.cond_dist.unwrap());
+        assert_eq!(
+            bits(&mut lc.cond_mean.iter().flatten().copied()),
+            bits(&mut rc.cond_mean.iter().flatten().copied()),
+            "cond_mean"
+        );
+        assert_eq!(
+            bits(&mut lc.cond_sd.iter().flatten().copied()),
+            bits(&mut rc.cond_sd.iter().flatten().copied()),
+            "cond_sd"
+        );
+    }
+
+    /// The spelling: shortest round-trip text, an exponent far from one, the empty cell for
+    /// `NaN` and the `inf` tokens kept. Mutation: `{}` → the `1e-7` / `1e20` rows die;
+    /// six decimals → every finite row dies; drop the `NaN` arm → the empty-cell row dies.
+    #[test]
+    fn fmt_f64_is_shortest_round_trip_text() {
+        assert_eq!(fmt_f64(0.1), "0.1");
+        assert_eq!(fmt_f64(1.0), "1.0");
+        assert_eq!(fmt_f64(1e-7), "1e-7");
+        assert_eq!(fmt_f64(1e20), "1e20");
+        assert_eq!(fmt_f64(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(fmt_f64(f64::NAN), "");
+        assert_eq!(fmt_f64(f64::INFINITY), "inf");
+        assert_eq!(fmt_f64(f64::NEG_INFINITY), "-inf");
+        for x in AWKWARD {
+            assert_eq!(fmt_f64(x).parse::<f64>().unwrap().to_bits(), x.to_bits());
+        }
+    }
+
+    /// COND_MODE is checked against the EBE by value: a bundle written before #1847 (six
+    /// decimals), one written now (shortest text) and one in another writer's spelling all
+    /// load, while a mode one ULP off the EBE is still refused. Mutation: compare the text
+    /// with `fmt_f64` (the pre-#1847 check) → the six-decimal and `1e-1` rows die.
+    #[test]
+    fn parse_conddist_csv_compares_cond_mode_by_value() {
+        let fit = minimal_fit_result();
+        for (mode_cl, mode_v) in [("0.100000", "0.200000"), ("0.1", "0.2"), ("1e-1", "2.0e-1")] {
+            let csv = format!(
+                "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+                 S1,eta_CL,0.11,0.05,{mode_cl}\nS1,eta_V,-0.19,0.06,{mode_v}\n\
+                 S2,eta_CL,0.29,0.07,{mode_cl}\nS2,eta_V,0.41,0.08,{mode_v}\n"
+            );
+            parse_conddist_csv(&csv, &fit)
+                .unwrap_or_else(|e| panic!("COND_MODE spelled {mode_cl:?}: {e:?}"));
+        }
+        let off = format!("{:?}", 0.1_f64.next_up());
+        let csv = format!(
+            "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+             S1,eta_CL,0.11,0.05,{off}\nS1,eta_V,-0.19,0.06,0.2\n\
+             S2,eta_CL,0.29,0.07,0.1\nS2,eta_V,0.41,0.08,0.2\n"
+        );
+        let err = parse_conddist_csv(&csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("COND_MODE")),
+            "one ULP off: expected COND_MODE mismatch, got {err:?}"
+        );
+    }
+
+    /// #2092 review Q1: a `conddist.csv` that ferx-r's `ferx_save_fit` writes loads. R
+    /// spells each double as the shortest of `%.15g` / `%.16g` / `%.17g` that reads back,
+    /// so a value is full precision and an exponent has two digits; the cells below are R's
+    /// own output for these doubles (`Rscript`, `.fitrx_double_text`'s rule). Before #1847
+    /// the check compared that text with the EBE at six decimals, so every R bundle whose
+    /// EBEs were not six-decimal numbers was refused as corrupt. The second CSV is R's `-0`
+    /// against an EBE of `+0`, which agree (review nit). Mutations: compare the text with
+    /// `fmt_f64` → the R-spelling half dies (`e-07` vs `e-7`); compare bits → the `-0` half
+    /// dies; the pre-#1847 six-decimal text compare → the R-spelling half dies.
+    #[test]
+    fn parse_conddist_csv_accepts_r_written_spelling() {
+        let mut fit = minimal_fit_result();
+        fit.subjects[0].eta = DVector::from_vec(vec![0.027974420148319645, 1.2345678901234568e-7]);
+        fit.subjects[1].eta = DVector::from_vec(vec![-0.06290220762098092, 0.0]);
+        let csv = |s2_v: &str| {
+            format!(
+                "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+                 S1,eta_CL,0.11,0.05,0.027974420148319645\n\
+                 S1,eta_V,-0.19,0.06,1.2345678901234568e-07\n\
+                 S2,eta_CL,0.29,0.07,-0.06290220762098092\n\
+                 S2,eta_V,0.41,0.08,{s2_v}\n"
+            )
+        };
+        parse_conddist_csv(&csv("0"), &fit)
+            .unwrap_or_else(|e| panic!("R's full-precision spelling: {e:?}"));
+        parse_conddist_csv(&csv("-0"), &fit)
+            .unwrap_or_else(|e| panic!("R's -0 against an EBE of +0: {e:?}"));
     }
 
     /// #1705: a SIR fit's kappa intervals survive the bundle, per kappa and in
