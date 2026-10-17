@@ -533,12 +533,14 @@ pub fn generate_frem_model(
     // The `iiv_on_ruv` eta scales the residual, not a structural parameter, so
     // covariates do not explain it: NONMEM / PsN FREM keep it in its own
     // diagonal $OMEGA outside the covariate block (#904). Emit it standalone
-    // when the base model leaves it uncorrelated with every other eta; one the
-    // base correlates with a PK eta stays in the block to keep that covariance,
-    // but starts with zero covariate cross-terms.
+    // when the base model declares no covariance between it and another eta;
+    // one the base puts in a block with a PK eta stays in the block to keep that
+    // covariance free, but starts with zero covariate cross-terms. The test is
+    // structural (`free_mask`), not numeric: a block entry declared or fitted as
+    // exactly 0.0 is still an estimable covariance.
     let ruv_eta = base_model.residual_error_eta.filter(|&k| k < n_base);
-    let standalone_ruv =
-        ruv_eta.filter(|&k| (0..n_base).all(|j| j == k || base_omega[k][j] == 0.0));
+    let free = &base_model.default_params.omega.free_mask;
+    let standalone_ruv = ruv_eta.filter(|&k| (0..n_base).all(|j| j == k || !free[(k, j)]));
     if let Some(k) = standalone_ruv {
         let fix = if base_model
             .default_params
@@ -1903,10 +1905,13 @@ mod tests {
         // were modelled as explaining residual-error IIV. NONMEM / PsN FREM keep
         // it in its own $OMEGA. ETA_RUV is declared *between* two PK etas so a
         // wrong index map in the block rebuild shows up on ETA_V.
+        // The fit carries a nonzero ETA_CL × ETA_RUV covariance the diagonal
+        // base never declared: structure comes from the base, so ETA_RUV still
+        // leaves the block.
         let fit_init = FremFitInit {
             theta: Vec::new(),
             eta_names: vec!["ETA_CL".into(), "ETA_RUV".into()],
-            omega: DMatrix::from_row_slice(2, 2, &[0.11, 0.0, 0.0, 0.25]),
+            omega: DMatrix::from_row_slice(2, 2, &[0.11, 0.02, 0.02, 0.25]),
         };
         let (text, m) = frem_convert_and_parse(IIV_ON_RUV_BASE, Some(&fit_init));
 
@@ -1978,6 +1983,33 @@ mod tests {
             let c = eta_index(&m, cov);
             assert_eq!(om[(ruv, c)], 0.0, "ETA_RUV × {cov} is not zero:\n{text}");
             assert!(om[(cl, c)] > 0.0, "ETA_CL × {cov} lost its cross-term");
+        }
+
+        // The block membership is structural: a covariance declared as exactly
+        // 0.0 inside the block, or fitted to exactly 0.0, is still a free
+        // parameter and must stay estimable in the FREM block.
+        let zero_init = base.replace("[0.09, 0.01, 0.30]", "[0.09, 0.0, 0.30]");
+        assert!(zero_init.contains("[0.09, 0.0, 0.30]"));
+        let zero_fit = FremFitInit {
+            theta: Vec::new(),
+            eta_names: vec!["ETA_CL".into(), "ETA_RUV".into()],
+            omega: DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.30]),
+        };
+        for (label, b, fi) in [
+            ("declared 0.0", zero_init.as_str(), None),
+            ("fitted 0.0", base.as_str(), Some(&zero_fit)),
+        ] {
+            let (text, m) = frem_convert_and_parse(b, fi);
+            let block_line = text.lines().find(|l| l.contains("block_omega")).unwrap();
+            assert!(
+                block_line.contains("ETA_RUV"),
+                "{label}: ETA_RUV left the block, dropping a free covariance:\n{text}"
+            );
+            let (cl, ruv) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_RUV"));
+            assert!(
+                m.default_params.omega.free_mask[(cl, ruv)],
+                "{label}: ETA_CL × ETA_RUV is no longer a free covariance:\n{text}"
+            );
         }
     }
 

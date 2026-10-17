@@ -162,8 +162,10 @@ covariates do not explain it. `prepare_frem()` therefore emits it as its own dia
 This is the structure NONMEM / PsN FREM use (a separate `$OMEGA` for the IIV-on-RUV
 eta). Before [#904](https://github.com/FeRx-NLME/ferx-core/issues/904) the generator
 put it inside the block, with a nonzero starting covariance to every covariate eta. If
-the base model correlates it with a PK eta (`block_omega (ETA_CL, ETA_RUV)`), it stays
-in the block so that covariance is kept, but it starts with no covariate cross-terms.
+the base model declares it in a block with a PK eta (`block_omega (ETA_CL, ETA_RUV)`),
+it stays in the block so that covariance stays estimable, but it starts with no
+covariate cross-terms. That rule follows the declaration, not the number: a block
+covariance initialised (or fitted) at exactly 0 still keeps the eta in the block.
 
 On the 475-subject, 8-covariate workshop reprex of #904, the old layout is a superset
 model. It has 11 extra covariances, which estimate to small values (|ρ| ≤ 0.22). Under
