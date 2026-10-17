@@ -358,6 +358,38 @@ the same length, falls back to the stored estimates; a `[mixture]` fit with an
 override is then refused, since its override value lives only in this vector.
 The format version did not change.
 
+### `vi`
+
+The variational-inference result of a `method = vi` fit
+([#2058](https://github.com/FeRx-NLME/ferx-core/issues/2058)), in the layout of the
+`vi:` section of the fit YAML:
+
+```json
+"vi": {
+  "neg_two_elbo": -12.5, "data_term": 3.25, "kl_term": 0.125,
+  "family": "full_rank", "n_iterations": 300, "n_mc_samples": 4,
+  "kl": "analytic", "n_kl_fallback_subjects": 0, "converged": true,
+  "n_fd_subjects": 0, "elbo_tightness_ratio": 1.02,
+  "elbo_trace": [/* per-iteration -2·ELBO */],
+  "eta_names": ["ETA_CL", "ETA_V"],
+  "eta_posterior": [
+    { "id": "1", "mean": [0.1, -0.2], "cov": [[0.05, 0.01], [0.01, 0.04]] }
+  ]
+}
+```
+
+`superseded_by` is written only when a later stage re-estimated the parameters,
+`objective_trace` only when covariate-NN regularization made it differ from
+`elbo_trace`, and an `eta_posterior` entry's `kappa_means` (one row per occasion) only
+for a model with IOV. Entries are in `ebes.csv` row order, and each `id` must name the
+subject on that row; a bundle where they disagree is refused as corrupt. The block is
+absent for every other method and on a bundle saved before #2058, both of which load
+`vi` as `None`. The format version did not change.
+
+A VI fit under the default `vi_final_ofv = none` has no likelihood, so its `ofv`, `aic`
+and `bic` (and, for a fit with priors, `ofv_data`) are `NaN`, written as `null` like any
+other non-finite float.
+
 ## `ebes.csv`
 
 ```

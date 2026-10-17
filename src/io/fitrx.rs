@@ -85,6 +85,9 @@ struct FitWire {
     method: String,
     method_chain: Vec<String>,
     converged: bool,
+    /// `NaN` for a VI fit under the default `vi_final_ofv = none` (#2058), and so
+    /// `aic` / `bic` with it; written as `null`, read back as `NaN`.
+    #[serde(with = "crate::io::serde_nan::scalar")]
     ofv: f64,
     /// Parameter-prior split (#254). `Option` so an artifact written before the
     /// split still loads: `None` means "this file predates priors", and the
@@ -95,13 +98,26 @@ struct FitWire {
     /// total — and reconstructing `ofv_data` from it on load would relabel the
     /// penalized objective as the data likelihood, drop every prior row, and
     /// break the `aic == ofv_data + 2k` invariant that `aic` was computed under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// The key's presence carries `Some`, so a present `null` is a `Some(NaN)` — a
+    /// priored VI fit's `ofv_data` — rather than "predates priors" (#2058).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_present"
+    )]
     ofv_data: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_present"
+    )]
     ofv_prior: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prior_summary: Vec<crate::types::PriorSummary>,
+    #[serde(with = "crate::io::serde_nan::scalar")]
     aic: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
     bic: f64,
     n_obs: usize,
     n_subjects: usize,
@@ -279,6 +295,166 @@ struct FitWire {
         with = "crate::io::serde_nan::opt_vec"
     )]
     packed_estimate: Option<Vec<f64>>,
+    /// The variational-inference result (#2058), in the layout of the YAML
+    /// writer's `vi:` section. Absent for every other method and on bundles saved
+    /// before the field existed; both load as `None`. Additive: no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vi: Option<ViWire>,
+}
+
+/// Wire form of [`ViResult`]: its fields in the order and under the names the
+/// YAML writer's `vi:` section uses, with the per-subject posteriors gathered into
+/// `eta_posterior` entries keyed by subject ID. Every float goes through
+/// `serde_nan`, since the ELBO of a diverged run is `NaN`.
+#[derive(Serialize, Deserialize)]
+struct ViWire {
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    neg_two_elbo: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    data_term: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    kl_term: f64,
+    family: String,
+    n_iterations: usize,
+    n_mc_samples: usize,
+    kl: String,
+    n_kl_fallback_subjects: usize,
+    converged: bool,
+    n_fd_subjects: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    elbo_tightness_ratio: f64,
+    #[serde(with = "crate::io::serde_nan::vec")]
+    elbo_trace: Vec<f64>,
+    /// Empty is `ViResult::objective_trace`'s "identical to `elbo_trace`"
+    /// sentinel, so the key is omitted then, as in the YAML.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::io::serde_nan::vec"
+    )]
+    objective_trace: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eta_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eta_posterior: Vec<ViPosteriorWire>,
+}
+
+/// One subject's variational posterior. `cov` and `kappa_means` are `None` when
+/// `ViResult` has no entry for the subject (rather than an empty one), so an
+/// absent key and an empty list each round-trip as themselves.
+#[derive(Serialize, Deserialize)]
+struct ViPosteriorWire {
+    id: String,
+    #[serde(with = "crate::io::serde_nan::vec")]
+    mean: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov: Option<NanRows>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kappa_means: Option<NanRows>,
+}
+
+/// A row-major `Vec<Vec<f64>>` with non-finite cells as `null`, usable inside an
+/// `Option` (which a `#[serde(with)]` adapter cannot reach).
+#[derive(Serialize, Deserialize)]
+struct NanRows(#[serde(with = "crate::io::serde_nan::vec_vec")] Vec<Vec<f64>>);
+
+impl ViWire {
+    fn from_result(v: &ViResult, r: &FitResult) -> Self {
+        let eta_posterior = v
+            .eta_means
+            .iter()
+            .enumerate()
+            .map(|(i, mean)| ViPosteriorWire {
+                // The YAML writer's fallback for a mean with no subject row.
+                id: r
+                    .subjects
+                    .get(i)
+                    .map_or_else(|| "unknown".to_string(), |s| s.id.clone()),
+                mean: mean.clone(),
+                cov: v.eta_covs.get(i).cloned().map(NanRows),
+                kappa_means: v.kappa_means.get(i).cloned().map(NanRows),
+            })
+            .collect();
+        ViWire {
+            neg_two_elbo: v.neg_two_elbo,
+            data_term: v.data_term,
+            kl_term: v.kl_term,
+            family: v.family.clone(),
+            n_iterations: v.n_iterations,
+            n_mc_samples: v.n_mc_samples,
+            kl: v.kl.clone(),
+            n_kl_fallback_subjects: v.n_kl_fallback_subjects,
+            converged: v.converged,
+            n_fd_subjects: v.n_fd_subjects,
+            superseded_by: v.superseded_by.clone(),
+            elbo_tightness_ratio: v.elbo_tightness_ratio,
+            elbo_trace: v.elbo_trace.clone(),
+            objective_trace: v.objective_trace.clone(),
+            eta_names: if v.eta_means.is_empty() {
+                Vec::new()
+            } else {
+                r.eta_names.clone()
+            },
+            eta_posterior,
+        }
+    }
+
+    /// Back to a [`ViResult`]. An entry's `id` must name the subject at its
+    /// position in `ebes.csv`: the posteriors are stored by position, so a bundle
+    /// whose subjects were reordered or edited would otherwise attach one
+    /// subject's posterior to another.
+    fn into_result(self, subjects: &[SubjectResult]) -> Result<ViResult, FitrxError> {
+        for (i, p) in self.eta_posterior.iter().enumerate() {
+            if let Some(s) = subjects.get(i) {
+                if p.id != s.id {
+                    return Err(FitrxError::Corrupt(format!(
+                        "vi.eta_posterior[{i}] is subject {:?}, but ebes.csv row {} is {:?}",
+                        p.id,
+                        i + 1,
+                        s.id
+                    )));
+                }
+            }
+        }
+        // `None` everywhere means `ViResult` carried no list at all; otherwise a
+        // missing entry is a subject the list stopped short of. Positions are kept
+        // either way, so only a list that ends early can be written back shorter.
+        let rows = |pick: fn(&ViPosteriorWire) -> Option<&NanRows>| -> Vec<Vec<Vec<f64>>> {
+            let n = self
+                .eta_posterior
+                .iter()
+                .rposition(|p| pick(p).is_some())
+                .map_or(0, |last| last + 1);
+            self.eta_posterior[..n]
+                .iter()
+                .map(|p| pick(p).map(|r| r.0.clone()).unwrap_or_default())
+                .collect()
+        };
+        let eta_covs = rows(|p| p.cov.as_ref());
+        let kappa_means = rows(|p| p.kappa_means.as_ref());
+        Ok(ViResult {
+            neg_two_elbo: self.neg_two_elbo,
+            data_term: self.data_term,
+            kl_term: self.kl_term,
+            n_iterations: self.n_iterations,
+            converged: self.converged,
+            family: self.family,
+            n_mc_samples: self.n_mc_samples,
+            kl: self.kl,
+            n_kl_fallback_subjects: self.n_kl_fallback_subjects,
+            elbo_trace: self.elbo_trace,
+            objective_trace: self.objective_trace,
+            eta_means: self.eta_posterior.into_iter().map(|p| p.mean).collect(),
+            kappa_means,
+            eta_covs,
+            n_fd_subjects: self.n_fd_subjects,
+            elbo_tightness_ratio: self.elbo_tightness_ratio,
+            superseded_by: self.superseded_by,
+        })
+    }
 }
 
 /// Wire form of [`DataBindings`]: the same fields, keyed by `BTreeMap` so
@@ -1055,6 +1231,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         population_fingerprint: r.population_fingerprint.clone(),
         iov_occasion: r.iov_occasion.clone(),
         packed_estimate: r.packed_estimate.clone(),
+        vi: r.vi.as_ref().map(|v| ViWire::from_result(v, r)),
     }
 }
 
@@ -2166,6 +2343,7 @@ fn wire_to_fit_result(
     ebe_kappas: Vec<Vec<DVector<f64>>>,
 ) -> Result<FitResult, FitrxError> {
     validate_parallel_lengths(&w)?;
+    let vi = w.vi.take().map(|v| v.into_result(&subjects)).transpose()?;
     let method = method_from_str(&w.method)?;
     let method_chain: Vec<EstimationMethod> = w
         .method_chain
@@ -2394,9 +2572,7 @@ fn wire_to_fit_result(
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
-        // .fitrx v1 does not serialise the variational posteriors; re-run
-        // `method = vi` if the consumer needs them.
-        vi: None,
+        vi,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -4984,6 +5160,149 @@ mod tests {
                 ),
                 other => panic!("{block}: expected Corrupt, got {:?}", other.map(|_| ())),
             }
+        }
+    }
+
+    /// A `method = vi` fit as `vi_final_ofv = none` leaves it (#2058): `ofv`, `aic`,
+    /// `bic` and a priored fit's `ofv_data` are `NaN`, and `vi` carries every field —
+    /// a `NaN` tightness ratio and trace point, a penalized `objective_trace`, a
+    /// `superseded_by` label and per-occasion κ means — so a dropped key shows.
+    fn vi_fit_with_nan_ofv() -> FitResult {
+        let mut r = minimal_fit_result();
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.ofv = f64::NAN;
+        r.ofv_data = f64::NAN;
+        r.ofv_prior = 1.5;
+        r.aic = f64::NAN;
+        r.bic = f64::NAN;
+        r.prior_summary = vec![crate::types::PriorSummary {
+            name: "CL".into(),
+            prior_value: 1.0,
+            estimate: 1.0,
+            shift_in_prior_sds: 0.0,
+            penalty: 1.5,
+            family: "lognormal".into(),
+            prior_lower_95: 0.5,
+            prior_upper_95: 2.0,
+        }];
+        r.vi = Some(ViResult {
+            neg_two_elbo: -12.5,
+            data_term: 3.25,
+            kl_term: 0.125,
+            n_iterations: 3,
+            converged: false,
+            family: "full_rank".into(),
+            n_mc_samples: 4,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 1,
+            elbo_trace: vec![1.0, f64::NAN, -12.5],
+            objective_trace: vec![2.0, 1.5, -12.0],
+            eta_means: vec![vec![0.1, -0.2], vec![0.3, 0.4]],
+            kappa_means: vec![vec![vec![0.01], vec![-0.02]], vec![]],
+            eta_covs: vec![
+                vec![vec![0.5, 0.1], vec![0.1, 0.25]],
+                vec![vec![0.4, 0.0], vec![0.0, 0.2]],
+            ],
+            n_fd_subjects: 2,
+            elbo_tightness_ratio: f64::NAN,
+            superseded_by: Some("focei".into()),
+        });
+        r
+    }
+
+    /// #2058: a VI fit's `NaN` OFV / AIC / BIC used to make `fit.json` unloadable
+    /// (`invalid type: null, expected f64`), and its `vi` result was dropped on every
+    /// round trip. Both survive now: the four objectives come back `NaN` and `vi` comes
+    /// back identical. `Debug` is the comparison because `ViResult` has no
+    /// `PartialEq` and prints `NaN` as itself, where `==` would fail on it.
+    /// Mutations: drop `scalar` from any of `ofv` / `aic` / `bic` (load fails);
+    /// `vi: None` on either side; drop any one `ViWire` field.
+    #[test]
+    fn vi_fit_with_nan_ofv_round_trips_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vi.fitrx");
+        let r = vi_fit_with_nan_ofv();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).expect("a NaN-OFV VI bundle must load").fit;
+        assert_eq!(l.method, EstimationMethod::Vi);
+        for (name, v) in [
+            ("ofv", l.ofv),
+            ("ofv_data", l.ofv_data),
+            ("aic", l.aic),
+            ("bic", l.bic),
+        ] {
+            assert!(v.is_nan(), "{name} must come back NaN, got {v}");
+        }
+        assert_eq!(l.ofv_prior, 1.5);
+        assert_eq!(
+            format!("{:?}", l.vi),
+            format!("{:?}", r.vi),
+            "the VI result must survive the round trip"
+        );
+
+        // The wire encoding the loaders on both sides agree on: `null`, not a
+        // missing key and not a string.
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        for key in ["ofv", "ofv_data", "aic", "bic"] {
+            assert!(wire[key].is_null(), "{key} must be written as null");
+        }
+        assert_eq!(wire["vi"]["eta_posterior"][1]["id"], "S2");
+        assert_eq!(
+            wire["vi"]["eta_names"],
+            serde_json::json!(["eta_CL", "eta_V"])
+        );
+    }
+
+    /// A VI result with no per-subject covariances and no κ (a model without IOV)
+    /// keeps both lists empty rather than gaining one empty entry per subject — the
+    /// per-entry `None` is what tells "no list" from "an empty list for this subject".
+    /// And a fit with no `vi` writes no key, so every non-VI bundle is unchanged.
+    #[test]
+    fn vi_without_covs_or_kappas_round_trips_and_non_vi_writes_no_key() {
+        let mut r = vi_fit_with_nan_ofv();
+        let vi = r.vi.as_mut().unwrap();
+        vi.eta_covs.clear();
+        vi.kappa_means.clear();
+        vi.objective_trace.clear();
+        vi.superseded_by = None;
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        for key in ["cov", "kappa_means"] {
+            assert!(wire["vi"]["eta_posterior"][0].get(key).is_none(), "{key}");
+        }
+        assert!(wire["vi"].get("objective_trace").is_none());
+        let back: FitWire = serde_json::from_value(wire).unwrap();
+        let l = wire_to_fit_result(back, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(format!("{:?}", l.vi), format!("{:?}", r.vi));
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("vi").is_none(),
+            "a non-VI fit must not write `vi`"
+        );
+        let back: FitWire = serde_json::from_value(plain).unwrap();
+        let l = wire_to_fit_result(back, minimal_fit_result().subjects, Vec::new()).unwrap();
+        assert!(l.vi.is_none());
+    }
+
+    /// The posteriors are stored by position, so an entry whose `id` names another
+    /// subject than its `ebes.csv` row would attach one subject's posterior to
+    /// another: `Corrupt`, naming both. The unedited bundle loading in the test
+    /// above is the accept side of the same gate.
+    #[test]
+    fn vi_posterior_id_disagreeing_with_ebes_is_corrupt() {
+        let r = vi_fit_with_nan_ofv();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        value["vi"]["eta_posterior"][1]["id"] = "S9".into();
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        match wire_to_fit_result(wire, r.subjects.clone(), Vec::new()) {
+            Err(FitrxError::Corrupt(msg)) => assert_eq!(
+                msg,
+                "vi.eta_posterior[1] is subject \"S9\", but ebes.csv row 2 is \"S2\""
+            ),
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
         }
     }
 }
