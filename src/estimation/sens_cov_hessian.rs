@@ -5801,10 +5801,10 @@ mod tests {
     /// that produced them (#1516 review §1).
     ///
     /// Under `covariance_method = s` the returned covariance is `S⁻¹` from the score
-    /// cross-product alone and `R` is discarded — hybrid or not — so nothing about the salvage
-    /// route reaches the reported standard errors, and the note's closing claim ("only the
-    /// named subjects' terms use a different estimator") would be a statement about a matrix
-    /// this step threw away. `rsr` is the other side of that gate and must keep the note: it
+    /// cross-product alone and no `R` is built at all (#1803) — hybrid or not — so nothing
+    /// about the salvage route reaches the reported standard errors, and the note's closing
+    /// claim ("only the named subjects' terms use a different estimator") would be a statement
+    /// about a matrix this step never assembled. `rsr` is the other side of that gate and must keep the note: it
     /// returns `R⁻¹ S R⁻¹`, so the salvaged terms are in the numbers. Asserted in one test, so
     /// a gate stuck on either branch reddens rather than passing half.
     #[test]

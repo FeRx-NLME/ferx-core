@@ -101,6 +101,7 @@ fn main() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&model, &template, &model.default_params, 1, &opts)
         .expect("ferx RTTE simulation must succeed");
@@ -187,6 +188,7 @@ fn main() {
             seed: Some(seed),
             match_method: None,
             horizon: Some(horizon),
+            iov_occasion: None,
         };
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts).unwrap();
         let mut by = BTreeMap::<String, usize>::new();

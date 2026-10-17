@@ -39,6 +39,12 @@ use std::time::Instant;
 /// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
+/// An IOV model's occasions are read from `population` as given: this entry point takes
+/// no `iov_occasion` rule, and a subject with no occasion labels is simulated at κ = 0
+/// without a warning. For a model fitted under `iov_occasion = dose | time(...)`, use
+/// [`simulate_with_options_diag`] with [`SimulateOptions::iov_occasion`], which also
+/// reports `W_IOV_NO_OCCASIONS` (#1955).
+///
 /// # Errors
 ///
 /// On a model/data precondition failure — a dose the model cannot route or honour, an
@@ -57,6 +63,8 @@ pub fn simulate(
 }
 
 /// Simulate with a fixed seed for reproducibility.
+///
+/// Takes no `iov_occasion` rule and returns no warnings, as [`simulate`] (#1955).
 ///
 /// # Errors
 ///
@@ -96,6 +104,17 @@ pub struct SimulateOptions {
     /// rather than drawing unbounded — the decoupled horizon a competing-risks VPC
     /// needs. `None` keeps the per-record window. No effect on Gaussian endpoints.
     pub horizon: Option<f64>,
+    /// The model-side IOV occasion rule (`iov_occasion = dose | time(...)` in
+    /// `[fit_options]`, #1955). For a model that declares κ, a `PerDose` or `TimeWindows`
+    /// rule re-derives every subject's occasion labels from its own timeline before
+    /// anything else runs, the propensity branch's posthoc pass included, exactly as
+    /// `fit()` derives them. One κ is then drawn per derived occasion.
+    ///
+    /// `None` and `Some(IovOccasionRule::Column)` keep the population's labels as given.
+    /// A subject with none is simulated at κ = 0, which the `_diag` form reports as
+    /// `W_IOV_NO_OCCASIONS`. Pass the rule the model was fitted under:
+    /// [`FitResult::iov_occasion`], or the model file's `[fit_options] iov_occasion`.
+    pub iov_occasion: Option<IovOccasionRule>,
 }
 
 /// What a `simulate*` entry point lets its caller supply as the TTE administrative
@@ -342,6 +361,9 @@ pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
 ) -> Result<(), EngineError> {
+    if model.has_nested_levels() {
+        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+    }
     if model.n_kappa > 0 && params.omega_iov.is_none() {
         // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
         // message stays #1019's, which names the remedy a rebuilt parameter set needs.
@@ -399,7 +421,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
                 .join(", ")
         ));
     }
-    first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
+    Err(super::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for
@@ -599,12 +621,14 @@ pub fn simulate_with_options(
 /// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
 /// only the rows.
 ///
-/// Four sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// Five sources feed `warnings`, in this order: per-subject simulation diagnostics (a
 /// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
 /// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their
 /// observations whose sampled η entered a twin-less transit / IG closed form's flip-flop
 /// regime, so their entire dose-driven concentration was clamped to zero (#1823), capped
-/// steady-state equilibrations (#867), and — new in #1280 / #1304 — the shared non-fit
+/// steady-state equilibrations (#867), `W_IOV_NO_OCCASIONS` for an IOV model handed
+/// subjects with no occasion labels after `opts.iov_occasion` is applied (#1955), and —
+/// new in #1280 / #1304 — the shared non-fit
 /// diagnostics bundle (parse warnings, data-reader warnings, the model/data checks,
 /// experimental-feature notices, and this pass's ODE-solver diagnostics). Before it, a model
 /// `fit()` refuses to stay quiet about served the same rows here with nothing attached.
@@ -623,6 +647,19 @@ pub fn simulate_with_options_diag(
     // `warnings` at each return (#867): a capped nonlinear pulse-train can silently under-report
     // the SS trough, biasing simulated concentrations low.
     crate::dosing::clear_ss_nonconvergence_warnings();
+
+    // A model-side occasion rule's labels come first (#1955), so every step below sees
+    // them: the checks, the propensity branch's posthoc pass, and the κ draw.
+    let derived = with_derived_occasions(model, population, opts.iov_occasion.as_ref());
+    let population: &Population = &derived;
+    let iov_warning = no_occasion_warning(
+        params.omega_iov.is_some(),
+        population,
+        "no kappa was drawn for them: they were simulated",
+        "Label the occasions in the data (`iov_column` in [fit_options]), or derive them with \
+         `iov_occasion = dose | time(...)`; `simulate_with_options` takes the rule as \
+         `SimulateOptions::iov_occasion`.",
+    );
 
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
     // via the augmented-ODE root-finder (Slice 2.2). Validate its preventable
@@ -727,6 +764,7 @@ pub fn simulate_with_options_diag(
             let results = results?;
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+            warnings.extend(iov_warning);
             warnings.extend(super::non_fit_diagnostics(
                 model,
                 population,
@@ -794,12 +832,11 @@ pub fn simulate_with_options_diag(
         .enumerate()
         .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
     {
-        return Err(format!(
+        return Err(EngineError::uncoded(format!(
             "propensity-score matching: the posthoc eta for subject '{}' is \
              non-finite (its EBE did not converge); cannot match",
             population.subjects[i].id
-        )
-        .into());
+        )));
     }
 
     let omega_inv = &params.omega.inv;
@@ -826,6 +863,7 @@ pub fn simulate_with_options_diag(
     let results = results?;
     warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    warnings.extend(iov_warning);
     warnings.extend(super::non_fit_diagnostics(
         model,
         population,
@@ -918,10 +956,14 @@ fn emit_subject_rows<R: rand::Rng>(
         // the subject carries no occasion labels, in which case `predict_iov`
         // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
         let n_groups = crate::stats::stacked_layout::group_count(subject);
+        let kappa_factor = omega_iov.sim_draw_factor(
+            model.default_params.omega_iov.as_ref(),
+            &model.default_params.kappa_fixed,
+        );
         let kappas: Vec<Vec<f64>> = (0..n_groups)
             .map(|_| {
                 let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
-                (&omega_iov.chol * DVector::from_column_slice(&z))
+                (&*kappa_factor * DVector::from_column_slice(&z))
                     .iter()
                     .copied()
                     .collect()
@@ -1267,6 +1309,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
+    // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`.
+    let eta_factor = params.omega.sim_draw_factor(
+        Some(&model.default_params.omega),
+        &model.default_params.omega_fixed,
+    );
 
     let mut results = Vec::new();
 
@@ -1281,7 +1328,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
                         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        &params.omega.chol * DVector::from_column_slice(&z)
+                        &*eta_factor * DVector::from_column_slice(&z)
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1317,7 +1364,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
-                    let eta = &params.omega.chol * z_vec;
+                    let eta = &*eta_factor * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
@@ -1374,6 +1421,10 @@ pub struct SimulateUncertaintyOptions {
 /// n_obs`. Each `SimulationResult` carries the originating `draw` and `sim`
 /// indices so downstream code can compute per-time uncertainty bands.
 ///
+/// For an IOV model, a fit under a derived `iov_occasion = dose | time(...)` rule
+/// ([`FitResult::iov_occasion`]) has the population's occasion labels re-derived with that
+/// rule first, as `fit()` derived them, so κ is drawn per occasion (#1955).
+///
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
 pub fn simulate_with_uncertainty(
@@ -1395,7 +1446,9 @@ pub fn simulate_with_uncertainty(
 /// `W_SIMULATED_FLIP_FLOP` count of the eligible individuals *inside* the draws that ran
 /// whose own sampled η landed there (#1823 — the skip is decided at each draw's η = 0 θ, so
 /// both can fire on one run), capped steady-state
-/// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
+/// equilibrations (#867), `W_IOV_NO_OCCASIONS` for an IOV model handed subjects with no
+/// occasion labels after the fit's [`FitResult::iov_occasion`] is applied (#1955), and the
+/// shared non-fit diagnostics bundle — parse warnings, the
 /// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
 /// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
 /// collected over every draw. `postfit::non_fit_diagnostics` documents what that bundle
@@ -1419,6 +1472,19 @@ pub fn simulate_with_uncertainty_diag(
     // Start the SS-equilibration non-convergence sink clean, as `simulate_with_options_diag`
     // does, so this run's `warnings` carry only its own capped equilibrations (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();
+
+    // The occasions the fit derived (#1955): `FitResult::iov_occasion` is the rule it ran
+    // under (#1783), applied before anything reads the population.
+    let derived = with_derived_occasions(model, population, fit_result.iov_occasion.as_ref());
+    let population: &Population = &derived;
+    let iov_warning = no_occasion_warning(
+        fit_result.omega_iov.is_some(),
+        population,
+        "no kappa was drawn for them: they were simulated",
+        "Label the occasions in the data (`iov_column` in [fit_options]), or derive them with \
+         `iov_occasion = dose | time(...)`; `simulate_with_uncertainty` applies the rule the \
+         fit ran under, `FitResult::iov_occasion`.",
+    );
 
     // The fit's θ against this model's layout (#1614), before anything is drawn around
     // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
@@ -1457,7 +1523,8 @@ pub fn simulate_with_uncertainty_diag(
         population,
         &template.theta,
     ))?;
-    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
+    // The sampler's input refusals carry their codes (#2044).
+    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples_coded(
         fit_result,
         &template,
         opts.n_uncertainty_draws,
@@ -1489,6 +1556,7 @@ pub fn simulate_with_uncertainty_diag(
     });
     looped?;
     sim_warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    sim_warnings.extend(iov_warning);
     sim_warnings.extend(super::non_fit_diagnostics(
         model,
         population,

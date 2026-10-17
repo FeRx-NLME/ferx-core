@@ -2079,6 +2079,25 @@ pub struct OmegaMatrix {
     /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
     /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
     pub(crate) block_declared: Vec<bool>,
+    /// The factor a **simulation** draws η from, when it differs from `chol`
+    /// (#1605). `None` means "draw from `chol`", which is every positive-definite
+    /// input.
+    ///
+    /// `Some` only when the input matrix had **structural zeros** — an η whose
+    /// diagonal is exactly `0` and whose whole row and column are exactly `0`
+    /// (`omega ETA ~ 0.0`, with or without `FIX`). The constructor regularises
+    /// such a matrix by `+ 1e-8·I` so that `matrix`, `chol`, `inv` and `log_det`
+    /// stay finite for the fit; that regularisation would draw the zero η with
+    /// sd `1e-4` and add `1e-8` to every other η's variance too. This factor is
+    /// built from the *input* instead: the non-zero sub-block factored on its
+    /// own, the zero rows and columns left at exactly `0`. A genuinely indefinite
+    /// input has no such split and stays `None`, drawing from `chol` as before.
+    ///
+    /// Read it through [`OmegaMatrix::sim_draw_factor`], never directly: that is
+    /// where a zero carried by a fit's `1e-8` (which has no `sim_chol`) is
+    /// recovered from the declaration. `pub(crate)` for the same reason as
+    /// `block_declared`.
+    pub(crate) sim_chol: Option<DMatrix<f64>>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -2101,9 +2120,11 @@ impl OmegaMatrix {
         // all describe the *same* matrix downstream — otherwise the
         // FOCE inner loop's eta_prior (read from `matrix`) would be
         // inconsistent with the cached `inv` (computed from `m_reg`).
-        let (matrix, chol, inv) = match m.clone().cholesky() {
-            Some(c) => (m, c.l(), c.inverse()),
+        let (matrix, chol, inv, sim_chol) = match m.clone().cholesky() {
+            Some(c) => (m, c.l(), c.inverse(), None),
             None => {
+                // Taken from `m`, before the regularisation below touches it (#1605).
+                let sim_chol = structural_zero_factor(&m);
                 let eig = m.clone().symmetric_eigen();
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
@@ -2112,7 +2133,7 @@ impl OmegaMatrix {
                     .clone()
                     .cholesky()
                     .expect("Regularized matrix must be PD");
-                (m_reg, c.l(), c.inverse())
+                (m_reg, c.l(), c.inverse(), sim_chol)
             }
         };
         // log|Ω| = 2·Σᵢ log(L_ii). Negative or zero diagonals shouldn't
@@ -2136,6 +2157,7 @@ impl OmegaMatrix {
             diagonal,
             free_mask,
             block_declared: vec![false; n],
+            sim_chol,
             inv,
             log_det,
         }
@@ -2226,6 +2248,9 @@ impl OmegaMatrix {
             diagonal,
             free_mask,
             block_declared: vec![false; n],
+            // A factor has no exact zero to preserve: a FIX-0 η reaches here as
+            // `L_ii = 1e-4`, and `sim_draw_factor` recovers it from the declaration.
+            sim_chol: None,
             inv,
             log_det,
         }
@@ -2234,6 +2259,112 @@ impl OmegaMatrix {
     pub fn dim(&self) -> usize {
         self.matrix.nrows()
     }
+
+    /// Per η: is it a structural zero of the matrix this was built from — a
+    /// declared `~ 0.0`, diagonal and whole row/column exactly `0` (#1605)?
+    /// All-`false` for a positive-definite input and for one built from a factor.
+    pub(crate) fn structural_zeros(&self) -> Vec<bool> {
+        let n = self.dim();
+        match &self.sim_chol {
+            Some(l) => (0..n).map(|i| l.row(i).iter().all(|&x| x == 0.0)).collect(),
+            None => vec![false; n],
+        }
+    }
+
+    /// The factor a simulation draws `η = L·z` from (#1605). Every draw site —
+    /// `simulate`, `simulate_adaptive` and its verifier, the NPDE reference — goes
+    /// through here, for η and κ alike, and still draws the full `z` vector, so the
+    /// RNG stream is the same whichever factor comes back.
+    ///
+    /// `self` is the Ω being simulated from; `declared` / `declared_fixed` are the
+    /// model's own declaration (`model.default_params`). A structural-zero η draws
+    /// exactly `0` and every other η draws from its own variance, without the
+    /// `1e-8` the constructor adds to keep the fit finite:
+    ///
+    /// - `self` carries its own zeros (`sim_chol`): the declared Ω simulated
+    ///   directly, `FIX` or not.
+    /// - `self` came from a fit, whose Ω holds the regularised `1e-8` rather than
+    ///   the zero: an η is recovered as a zero when the declaration fixes it **and**
+    ///   declares it `0` **and** `self` still holds it at the regularisation floor.
+    ///   A `FIX` value never moves, so the declaration is the truth; the floor check
+    ///   keeps a caller who supplies a real variance for that η from losing it.
+    /// - Otherwise `chol`, borrowed, exactly as before.
+    pub(crate) fn sim_draw_factor<'a>(
+        &'a self,
+        declared: Option<&OmegaMatrix>,
+        declared_fixed: &[bool],
+    ) -> std::borrow::Cow<'a, DMatrix<f64>> {
+        use std::borrow::Cow;
+        if let Some(l) = &self.sim_chol {
+            return Cow::Borrowed(l);
+        }
+        let n = self.dim();
+        let zeros: Vec<bool> = match declared.filter(|d| d.dim() == n) {
+            Some(d) => d
+                .structural_zeros()
+                .iter()
+                .enumerate()
+                .map(|(i, &z)| {
+                    z && declared_fixed.get(i).copied().unwrap_or(false)
+                        && self.matrix[(i, i)] <= SIM_ZERO_RECOVERY_CEILING
+                })
+                .collect(),
+            None => vec![false; n],
+        };
+        if !zeros.iter().any(|&z| z) {
+            return Cow::Borrowed(&self.chol);
+        }
+        match factor_with_zeros(&self.matrix, &zeros) {
+            Some(l) => Cow::Owned(l),
+            None => Cow::Borrowed(&self.chol),
+        }
+    }
+}
+
+/// The largest diagonal a fit-carried Ω may hold on a `FIX`-ed declared zero and
+/// still be read back as that zero by [`OmegaMatrix::sim_draw_factor`] (#1605).
+/// A fit holds such an η at the constructor's `1e-8` floor, reached as
+/// `exp(ln 1e-4)²`, which lands 10 ULP above `1e-8` (measured through the
+/// parameterisation round trip; `a_fit_carried_fix_zero_is_recovered_from_the_declaration`
+/// bounds it). Twice the floor clears that by ~1e-8 and stays far below any variance a
+/// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
+const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
+
+/// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
+/// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
+/// `0`) and the rest factors on its own; `None` otherwise (#1605).
+fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
+    let n = m.nrows();
+    let zeros: Vec<bool> = (0..n)
+        .map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0))
+        .collect();
+    if !zeros.iter().any(|&z| z) {
+        return None;
+    }
+    factor_with_zeros(m, &zeros)
+}
+
+/// Lower Cholesky factor of `m` with the `zeros` rows and columns dropped,
+/// scattered back to `n × n` with those rows and columns exactly `0`. `None` when
+/// the remaining block is not positive definite. Off-diagonal entries between a
+/// zero and a non-zero η are ignored: on a declared zero they are `0` by
+/// definition, and on a fit-carried one they are the regularisation's residue.
+fn factor_with_zeros(m: &DMatrix<f64>, zeros: &[bool]) -> Option<DMatrix<f64>> {
+    let n = m.nrows();
+    let keep: Vec<usize> = (0..n).filter(|&i| !zeros[i]).collect();
+    let k = keep.len();
+    let mut l = DMatrix::zeros(n, n);
+    if k == 0 {
+        return Some(l);
+    }
+    let sub = DMatrix::from_fn(k, k, |a, b| m[(keep[a], keep[b])]);
+    let sub_l = sub.cholesky()?.l();
+    for (a, &i) in keep.iter().enumerate() {
+        for (b, &j) in keep.iter().enumerate() {
+            l[(i, j)] = sub_l[(a, b)];
+        }
+    }
+    Some(l)
 }
 
 /// Residual error parameters (Sigma)
@@ -4152,6 +4283,41 @@ pub struct EndpointPredictionResult {
     pub prediction: Prediction,
 }
 
+/// One `level NAME by COLUMN in PARENT` declaration in `[parameters]` (#1082): the
+/// records of a subject that share a `COLUMN` value inside one group of `PARENT` (`ID`,
+/// or the level declared just before it) form one group of this level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LevelSpec {
+    /// The level's name, which `kappa … at NAME` refers to.
+    pub(crate) name: String,
+    /// The data column whose value labels a record's group.
+    pub(crate) column: String,
+    /// `ID`, or the name of the level this one nests in.
+    pub(crate) parent: String,
+}
+
+/// The variability levels below `ID` of a model that declares more than one (#1082).
+///
+/// The levels form one chain, `levels[0]` in `ID` and each later level in the one before
+/// it, and a group is identified by its key path: `ARM = 1` in study 1 and `ARM = 1` in
+/// study 2 are different groups. Each κ lives at exactly one level and is drawn once per
+/// group of it, and all levels of a subject are integrated jointly in that subject's
+/// marginal.
+///
+/// A model with one level — `iov_column` / `iov_occasion`, or a single `level` line,
+/// which is its explicit spelling — has `None` here and is today's inter-occasion
+/// variability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedLevels {
+    /// The levels, outermost first.
+    pub(crate) levels: Vec<LevelSpec>,
+    /// The level index of each κ, parallel to `CompiledModel::kappa_names`.
+    pub(crate) kappa_level: Vec<usize>,
+    /// Per random effect in `[η…, κ…]` order, the individual parameters whose own
+    /// expression reads it — the `readers` the single-member check compares.
+    pub(crate) readers: Vec<Vec<String>>,
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -5775,6 +5941,19 @@ impl CompiledModel {
         self.kappa_weights.iter().any(|w| w.is_some())
     }
 
+    /// Whether the model declares more than one variability level below `ID` (#1082).
+    #[inline]
+    pub(crate) fn has_nested_levels(&self) -> bool {
+        self.indiv_param_partials.nested_levels.is_some()
+    }
+
+    /// The nested variability levels of a model that declares more than one `level`
+    /// (#1082); `None` for every other model, including one with a single level.
+    #[inline]
+    pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
+        self.indiv_param_partials.nested_levels.as_ref()
+    }
+
     /// Whether an *active* custom residual magnitude depends on `θ`
     /// (see [`RuvMagnitude::theta_dependent`]).
     ///
@@ -7055,6 +7234,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("w_iov_no_occasions") {
+        // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
+        // A simulated subject handled specially, like the arm above; matched on its token
+        // so no prose arm has to stay clear of its wording.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted
@@ -7415,14 +7599,30 @@ pub struct FitResult {
     pub gradient_method_outer: String,
     /// True when the model uses ODE integration; false for analytical PK.
     pub uses_ode_solver: bool,
+    /// True when the `[odes]` system was certified linear and propagated exactly by the matrix
+    /// exponential instead of integrated (#852) — `ode_method = auto` on a qualifying model,
+    /// or `ode_method = linear`. False for an analytical model, a nonlinear system, or a
+    /// linear one whose `ode_method` names an integrator. Also false when the propagator
+    /// declined any segment of the prediction pass at the final estimates
+    /// ([`OdeSolverStats::linear_declined_segments`](crate::ode::OdeSolverStats)), since those
+    /// segments were integrated.
+    ///
+    /// `#[serde(default)]`: a fit JSON written before #852 has no such key, and reads back as
+    /// `false` — the route those fits did run on.
+    #[serde(default)]
+    pub ode_linear_exact: bool,
     /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
     pub uses_sde: bool,
     /// Number of Rayon worker threads used during this fit.
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
     pub nlopt_missing_algorithms: Vec<String>,
-    /// Estimated OFV evaluations for the covariance step (n_params²), set
-    /// when `run_covariance_step = true` and `n_parameters > 30`.
+    /// Estimated OFV evaluations for the covariance step's `R` matrix on the
+    /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
+    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
+    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
+    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
+    /// applies, which evaluates none of them.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -8154,7 +8354,7 @@ pub struct FitOptions {
     /// default. Exists only so the high-dimension routing guard (#1064) can
     /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
     /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
-    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// subject's EBEs at each of `2·n²` objective evaluations, so a *defaulted*
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
@@ -9353,8 +9553,9 @@ pub enum SaemMstepSolver {
     /// Opt-in, and **restricted to the plain Gaussian residual scope** the
     /// expected information has a closed form on: no IOV, no mixture, no M3, no
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
-    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
-    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
     ///
     /// It was a **candidate default** in #1449 and did not become one: it is
     /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
@@ -9527,9 +9728,10 @@ pub const BOBYQA_MAX_DIM: usize = 64;
 /// routes to the cross-product (#1064).
 ///
 /// The `R` matrix is a finite-difference Hessian of the objective that
-/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
-/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
-/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+/// reconverges every subject's EBEs at each of `2·n²` objective
+/// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
+/// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`
+/// builds no `R` (#1803) and needs one pass.
 pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method

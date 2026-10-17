@@ -951,6 +951,7 @@ fn run_inner_loop_and_nll(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
+    cancel: Option<&crate::cancel::CancelFlag>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -959,7 +960,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, mu_k, None, schedules,
+        model, population, params, options, prev_etas, mu_k, None, schedules, cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1005,6 +1006,10 @@ fn run_inner_loop_and_nll_prepared(
     mu_k: Option<&[f64]>,
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
+    // Polled per subject (#574). Only a caller whose guard keeps a hard-rejected pass
+    // out of every accepted state passes `Some`: the NLopt objective and the global
+    // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
+    cancel: Option<&crate::cancel::CancelFlag>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -1038,6 +1043,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_restarts,
                 cache,
                 policy,
+                cancel,
                 take_terminal_work,
             ),
             None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
@@ -1051,9 +1057,23 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 policy,
+                cancel,
                 take_terminal_work,
             ),
         };
+        // A cancel observed during the pass left placeholders, not modes: do not run
+        // the quadrature on them (#574).
+        if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+            return (
+                etas,
+                h_matrices,
+                stats,
+                kappas,
+                f64::INFINITY,
+                None,
+                Vec::new(),
+            );
+        }
         let n_nodes = options.agq_nodes().expect("AGQ branch");
         let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
             Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
@@ -1132,6 +1152,7 @@ fn run_inner_loop_and_nll_prepared(
             options.inner_restarts,
             cache,
             policy,
+            cancel,
             finish_subject,
         )
     } else {
@@ -1146,10 +1167,16 @@ fn run_inner_loop_and_nll_prepared(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             policy,
+            cancel,
             finish_subject,
         )
     };
-    let nll = contributions.iter().sum();
+    // A cancelled pass sums placeholder contributions (#574); never report it as an OFV.
+    let nll = if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled) {
+        f64::INFINITY
+    } else {
+        contributions.iter().sum()
+    };
     (etas, h_matrices, stats, kappas, nll, None, contributions)
 }
 
@@ -1588,6 +1615,7 @@ fn run_global_presearch(
             Some(&cached_zero),
             Some(&mu_k),
             Some(&schedule_cache),
+            options.cancel.as_ref(),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1627,6 +1655,7 @@ fn run_global_presearch(
             Some(&state.cached_etas),
             Some(&mu_k),
             Some(&schedule_cache),
+            options.cancel.as_ref(),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -3548,10 +3577,21 @@ fn optimize_nlopt_once(
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
                     Some(&schedule_cache),
+                    options.cancel.as_ref(),
                 );
             contribs = nll_i.iter().map(|v| 2.0 * v).collect();
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
+        // The pass above polls the flag per subject (#574), so a cancel that lands inside
+        // it comes back here as placeholders. Leave the way the entry check does, before
+        // the guard accounting, the state caches, the trace and any gradient pass see the
+        // evaluation.
+        if crate::cancel::is_cancelled(&options.cancel) {
+            if let Some(g) = grad {
+                g.fill(0.0);
+            }
+            return 1e20;
+        }
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         // When a gradient is wanted the penalty gradient comes out of the same
         // pass (one network evaluation per curvature node) and is spliced into
@@ -4806,6 +4846,7 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             None,
+            None, // the built-in BFGS loop polls between iterations (#574)
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(x);
@@ -4841,6 +4882,7 @@ fn optimize_bfgs(
             Some(&mu_k),
             None,
             None,
+            None, // the built-in BFGS loop polls between iterations (#574)
         );
         let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
         let ofv = 2.0 * nll;

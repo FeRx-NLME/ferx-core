@@ -70,7 +70,12 @@ fn bits(fit: &FitResult, what: &str) -> Vec<u64> {
 struct Fixture(&'static str, &'static str);
 
 const WARFARIN: Fixture = Fixture("examples/warfarin.ferx", "data/warfarin.csv");
-const WARFARIN_ODE: Fixture = Fixture("examples/warfarin_ode.ferx", "data/warfarin.csv");
+/// Integrated, not solved exactly: the rows below observe the integrator's settings, which a
+/// linear `[odes]` model no longer reads (#852). See the fixture's header.
+const WARFARIN_ODE: Fixture = Fixture(
+    "tests/fixtures/warfarin_ode_integrated.ferx",
+    "data/warfarin.csv",
+);
 const WARFARIN_IOV: Fixture = Fixture("examples/warfarin_iov.ferx", "data/warfarin_iov.csv");
 
 struct Fitted {

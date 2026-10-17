@@ -155,6 +155,9 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
 
 /// T8. `run_sir_core` refuses parameters whose mixture shape disagrees with the model —
 /// both directions — with an `Err`, not the `mixture_ofv` panic the scorer would hit.
+/// #2044: as `E_PARAM_SHAPE` (no block) on the coded core, the `String` core's text
+/// being its `to_string()`. Each whole text is pinned, so deleting a sentence reddens
+/// its direction; either site back on `EngineError::uncoded` reddens its `code()`.
 #[test]
 fn run_sir_core_refuses_mixture_params_mismatch() {
     let (model, pop) = mixture_inputs();
@@ -167,11 +170,19 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
 
     let mut flat = model.default_params.clone();
     flat.mixture = None;
-    let e = run_sir_core(&model, &pop, &flat, &etas, &cov, 0.0, &opts)
-        .expect_err("a [mixture] model with one-class parameters must be refused");
-    assert!(
-        e.contains("the model declares [mixture] but the parameters carry no per-class"),
-        "{e}"
+    let coded = |m: &CompiledModel, p: &ModelParameters| {
+        let e = run_sir_core_coded(m, &pop, p, &etas, &cov, 0.0, &opts).expect_err("refused");
+        let s = run_sir_core(m, &pop, p, &etas, &cov, 0.0, &opts).expect_err("refused");
+        assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "{e}");
+        assert_eq!(e.block(), None, "{e}");
+        assert_eq!(e.to_string(), s);
+        s
+    };
+    assert_eq!(
+        coded(&model, &flat),
+        "run_sir_core: the model declares [mixture] but the parameters carry \
+         no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
+         fitted_params_from_result or pass the fit's own parameters."
     );
 
     // The same model without its `[mixture]` block.
@@ -188,7 +199,85 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
     )
     .expect("non-mixture variant must parse");
     assert!(plain.mixture.is_none(), "fixture premise: no [mixture]");
-    let e = run_sir_core(&plain, &pop, &model.default_params, &etas, &cov, 0.0, &opts)
-        .expect_err("per-class parameters on a non-mixture model must be refused");
-    assert!(e.contains("the model declares no [mixture]"), "{e}");
+    assert_eq!(
+        coded(&plain, &model.default_params),
+        "run_sir_core: the parameters carry per-class Ω/Σ \
+         (ModelParameters::mixture) but the model declares no [mixture]."
+    );
+}
+
+/// #1774: `fitted_params_from_result`'s three `[mixture]` override refusals carry a
+/// code, shared by every entry point that rebuilds a fit's parameters (`run_sir`,
+/// `run_covariance`, `simulate_with_uncertainty`). Override values the fit does not
+/// store are `E_FIT_INPUT_MISSING`; a packed estimate of another layout, or one that
+/// no longer reproduces the reported estimates, is `E_FIT_INPUT_MODEL`. Each text is
+/// pinned whole; `run_sir` carries the same refusal with its context.
+///
+/// Mutations — any arm back on a bare `String`, or `fit_input_missing` /
+/// `fit_input_model` swapped: that row's code; a sentence deleted: its text.
+#[test]
+fn mixture_override_refusals_carry_their_codes() {
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let n = fit
+        .packed_estimate
+        .as_ref()
+        .expect("packed-space fit")
+        .len();
+
+    let mut absent = fit.clone();
+    absent.packed_estimate = None;
+    let mut short = fit.clone();
+    short.packed_estimate.as_mut().unwrap().pop();
+    let mut stale = fit.clone();
+    stale.theta[0] *= 1.01;
+    let missing = "this [mixture] fit estimates the per-class override(s) omega(2) ETA_CL, \
+                   and a FitResult does not store their fitted values. They are carried by \
+                   the result of a FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a \
+                   .fitrx bundle save_fit wrote from one; a fit built in R, a .fitrx bundle \
+                   saved before #1815 or written by ferx-r, or a fit estimated by SAEM, IMP or \
+                   Bayes lacks them (#1765).";
+    let layout = format!(
+        "the fit's packed estimate has {} coordinates but this model's parameter layout has \
+         {n}, so the [mixture] override values cannot be read from it. Supply the model the \
+         fit was estimated with.",
+        n - 1
+    );
+    let changed = "the fit's packed estimate does not reproduce its reported estimates \
+                   (theta / Omega / Sigma / Omega_IOV / residual correlations), so the \
+                   [mixture] override values it carries cannot be trusted: the estimates or \
+                   the packed estimate were changed after the fit, or this is not the model \
+                   the fit was estimated with.";
+    let mut bad = Vec::new();
+    for (what, f, code, text) in [
+        (
+            "absent",
+            &absent,
+            "E_FIT_INPUT_MISSING",
+            missing.to_string(),
+        ),
+        ("another layout", &short, "E_FIT_INPUT_MODEL", layout),
+        ("stale", &stale, "E_FIT_INPUT_MODEL", changed.to_string()),
+    ] {
+        let e = fitted_params_from_result(f, &model).expect_err(what);
+        let got = (e.code(), e.block(), e.context(), e.to_string());
+        if got != (Some(code), None, None, text.clone()) {
+            bad.push(format!("{what}: {got:?}"));
+        }
+        let e = crate::run_sir(f, Some(&model), Some(&pop), &FitOptions::default())
+            .map(|_| ())
+            .expect_err(what);
+        let got = (e.code(), e.context(), e.to_string());
+        if got != (Some(code), Some("run_sir"), format!("run_sir: {text}")) {
+            bad.push(format!("run_sir/{what}: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

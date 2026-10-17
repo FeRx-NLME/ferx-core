@@ -243,6 +243,25 @@ pub enum OdeMethod {
     /// model that is stiff stops being stability-limited without anyone having to notice.
     #[default]
     Auto,
+    /// Exact propagation of a **linear time-invariant** right-hand side by the matrix
+    /// exponential — no stepping, no tolerance, no stability limit (#852; NONMEM's ADVAN5).
+    /// The propagator lives in `crate::ode::linear`.
+    ///
+    /// Not a stepper: each segment's `du/dt = A·u + b` is read off the RHS and advanced as
+    /// `exp([[A, b], [0, 0]]·h)`, exact to roundoff. A model gets it in one of two ways — the
+    /// parser selects it for [`Auto`](OdeMethod::Auto) when its `[odes]` block is
+    /// *structurally* affine in the states, reads no model time and carries no absorption
+    /// forcing; or the user names `ode_method = linear`, which asserts that and is refused on
+    /// a model that is not (a parse error from the model file, `E_ODE_METHOD_LINEAR` from a
+    /// caller's `FitOptions`). Any named integrator opts a linear model out.
+    ///
+    /// Only a parser-certified spec takes the exact path. The public `solve_ode*` functions
+    /// take an arbitrary closure and integrate `Linear` as `Auto`: the propagator's runtime
+    /// self-check samples finitely many points, so it cannot certify a closure. A certified
+    /// segment it still declines (an overflowing exponential, say) is integrated as `Auto`
+    /// would integrate it and counted in
+    /// [`OdeSolverStats::linear_declined_segments`].
+    Linear,
 }
 
 impl OdeMethod {
@@ -266,6 +285,7 @@ impl OdeMethod {
             "rodas5p" | "rodas5" => Some(OdeMethod::Rodas5P),
             "vern7" | "verner7" => Some(OdeMethod::Vern7),
             "auto" => Some(OdeMethod::Auto),
+            "linear" => Some(OdeMethod::Linear),
             _ => None,
         }
     }
@@ -279,6 +299,7 @@ impl OdeMethod {
             OdeMethod::Rodas5P => "rodas5p",
             OdeMethod::Vern7 => "vern7",
             OdeMethod::Auto => "auto",
+            OdeMethod::Linear => "linear",
         }
     }
 }
@@ -338,6 +359,25 @@ pub struct OdeSolverOptions {
     /// rather than restarting or re-solving. Setting this to `false` restores the pre-#1080
     /// Part C behaviour — one method per segment, chosen at its start.
     pub auto_switch: bool,
+}
+
+impl OdeSolverOptions {
+    /// These options as a *stepping* driver should read them: [`OdeMethod::Linear`] becomes
+    /// [`OdeMethod::Auto`], everything else is unchanged.
+    ///
+    /// `Linear` names an exact propagator, not a stepper, so wherever a segment has to be
+    /// integrated after all — the exact path declined it, or a driver (the threshold search)
+    /// has no exact counterpart — it is integrated exactly as the default would integrate it,
+    /// stiffness probe and escalation guard included.
+    pub(crate) fn for_integration(&self) -> Self {
+        match self.method {
+            OdeMethod::Linear => Self {
+                method: OdeMethod::Auto,
+                ..*self
+            },
+            _ => *self,
+        }
+    }
 }
 
 impl Default for OdeSolverOptions {
@@ -769,6 +809,16 @@ pub struct OdeSolverStats {
     /// parameter values. Like the other step counters it is a floor:
     /// [`solve_ode_until_threshold`] takes no stats.
     pub diverged_segments: usize,
+    /// Segments of a model on the exact linear path ([`OdeMethod::Linear`], #852) that the
+    /// matrix-exponential propagator **declined** and that were integrated instead — its
+    /// self-check found the right-hand side not affine at a checked state, the exponential
+    /// overflowed, or the Padé denominator was singular.
+    ///
+    /// Zero on every model off that path, and on every certified-linear fit measured so far.
+    /// Non-zero means `ode_linear_exact` in the fit output is `false` even though the model was
+    /// routed to the exact path: some of its predictions carry integrator error. A zero-length
+    /// segment is not counted — it is returned unchanged by either route.
+    pub linear_declined_segments: usize,
 }
 
 impl OdeSolverStats {
@@ -811,6 +861,7 @@ impl OdeSolverStats {
             discarded_unfinished_segments,
             abandoned_non_finite_timeline,
             diverged_segments,
+            linear_declined_segments,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -828,6 +879,7 @@ impl OdeSolverStats {
         self.discarded_unfinished_segments += discarded_unfinished_segments;
         self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
         self.diverged_segments += diverged_segments;
+        self.linear_declined_segments += linear_declined_segments;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -933,6 +985,10 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
         // the explicit default keeps such a caller integrating (correctly, if slowly on a
         // stiff system) rather than panicking inside a fit's worker thread.
         OdeMethod::Auto => Box::new(Rk45Stepper::new(n)),
+        // `Linear` is not a stepper either: `integrate_resolved_g_inner` serves it exactly and
+        // integrates a declined segment as `Auto`, so only a caller building a stepper straight
+        // from the options lands here. Same reasoning as the `Auto` arm.
+        OdeMethod::Linear => Box::new(Rk45Stepper::new(n)),
     }
 }
 
@@ -1457,6 +1513,13 @@ fn integrate_dense_g<T: PkNum>(
 
 /// Integrate an ODE system from `t_start` to `t_end`, returning the state at each `saveat`
 /// time. Uses whichever stepper [`OdeSolverOptions::method`] selects.
+///
+/// [`OdeMethod::Linear`] is integrated as [`OdeMethod::Auto`] here, as on every public
+/// `solve_ode*` entry point: `rhs` is an arbitrary closure no parser has certified, and the
+/// exact propagator's runtime self-check samples finitely many points, so it cannot tell a
+/// right-hand side that is affine from one that only agrees with an affine map where it looks
+/// (a generator that varies in time between its sample points, say). The exact path is taken
+/// only for a model whose `[odes]` block the parser certified (#852).
 pub fn solve_ode(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u0: &[f64],
@@ -1466,6 +1529,21 @@ pub fn solve_ode(
     opts: &OdeSolverOptions,
 ) -> Vec<SolPoint> {
     solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode`] for a caller holding options from
+/// [`OdeSpec::effective_solver_opts`](crate::ode::predictions::OdeSpec) on the RHS that spec
+/// built — the one place [`OdeMethod::Linear`] is honoured, because only there did the parser
+/// certify the system linear.
+pub(crate) fn solve_ode_certified(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPoint> {
+    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, None).0
 }
 
 /// [`solve_ode`] with optional adaptive-step instrumentation.
@@ -1481,6 +1559,8 @@ pub fn solve_ode_with_stats(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
+    // Uncertified closure: never the exact path (see `solve_ode`).
+    let opts = &opts.for_integration();
     solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
 }
 
@@ -1585,6 +1665,9 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
+    // The crossing search bisects a step's continuous extension and has no exact counterpart,
+    // so a linear model's search is stepped exactly as the default's is.
+    let opts = &opts.for_integration();
     // The explicit re-solve pins its method, which also takes mid-segment switching off it:
     // a fallback that could escalate again would be the escalation it is undoing.
     let pinned_explicit = OdeSolverOptions {
@@ -1930,6 +2013,32 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
     solve_ode_g_with_stats(rhs, u0, t_span, params, saveat, opts, None)
 }
 
+/// [`solve_ode_g`] for a certified spec's options — the generic twin of
+/// [`solve_ode_certified`], and like it the only `solve_ode_g*` route that honours
+/// [`OdeMethod::Linear`].
+pub(crate) fn solve_ode_g_certified<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPointG<T>> {
+    let mut auto_state = OdeAutoSwitchState::default();
+    integrate_resolved_g(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        &[],
+        opts,
+        None,
+        &mut auto_state,
+    )
+    .0
+}
+
 /// [`solve_ode_g`] with optional adaptive-step instrumentation.
 pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
@@ -1981,7 +2090,8 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
         params,
         saveat,
         interp_at,
-        opts,
+        // Uncertified closure: never the exact path (see `solve_ode`).
+        &opts.for_integration(),
         stats,
         &mut auto_state,
     )
@@ -2159,6 +2269,33 @@ fn integrate_resolved_g_inner<T: PkNum>(
     mut stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    // A certified-linear model's segment is propagated exactly (#852). Every integration entry
+    // point funnels through here, so the dense segments, the steady-state run-in cycles and the
+    // `Dual1`/`Dual2` sensitivity solves all take the same exact path without being threaded
+    // individually. A segment it declines is integrated as `Auto` would integrate it.
+    if opts.method == OdeMethod::Linear {
+        if (t_span.1 - t_span.0).abs() >= 1e-15 {
+            if let Some(out) =
+                super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
+            {
+                return out;
+            }
+            if let Some(s) = stats.as_deref_mut() {
+                s.linear_declined_segments += 1;
+            }
+        }
+        return integrate_resolved_g_inner(
+            rhs,
+            u0,
+            t_span,
+            params,
+            saveat,
+            interp_at,
+            &opts.for_integration(),
+            stats,
+            auto_state,
+        );
+    }
     // A zero-length span returns `u0` at every requested time without stepping, so there is
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
     // wherever two events share a time.

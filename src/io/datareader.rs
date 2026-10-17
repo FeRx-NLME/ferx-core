@@ -531,6 +531,12 @@ pub(crate) struct ObsRouting {
     /// placeholder that no `state_codes` lookup can map back to a generator
     /// index (#957 review).
     pub design_states: HashMap<usize, usize>,
+    /// Covariate columns a missing cell is **not** carried forward in (#1082): the row's
+    /// snapshot holds `NaN` there instead of the previous record's value. The level
+    /// columns of a nested-level model, whose value names the record's group, so a blank
+    /// cell must be seen as missing rather than silently joining the group before it.
+    /// Empty for every other model, which keeps the ordinary carry-forward.
+    pub no_carry_forward: HashSet<String>,
 }
 
 impl ObsRouting {
@@ -553,6 +559,13 @@ impl ObsRouting {
     /// value the endpoint can decode. CMTs left out keep the `0` default.
     pub(crate) fn with_design_states(mut self, codes: HashMap<usize, usize>) -> Self {
         self.design_states = codes;
+        self
+    }
+
+    /// Name the covariate columns whose missing cells read as `NaN` rather than being
+    /// carried forward (builder form; see [`ObsRouting::no_carry_forward`]).
+    pub(crate) fn with_no_carry_forward(mut self, columns: HashSet<String>) -> Self {
+        self.no_carry_forward = columns;
         self
     }
 
@@ -2503,7 +2516,16 @@ fn parse_subject(
                 }
             }
         }
-        if is_tv {
+        // A column that must not carry forward (#1082) needs per-record snapshots as
+        // soon as one of its cells is missing while another holds a value, or the
+        // missing record would read the subject-static value.
+        let gapped = || {
+            first_val.is_some()
+                && rows
+                    .iter()
+                    .any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
+        };
+        if is_tv || (routing.no_carry_forward.contains(name) && gapped()) {
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
@@ -2562,12 +2584,19 @@ fn parse_subject(
         // with this record's covariate values" semantics.
         if any_tv {
             for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
-                if let Some(s) = row.get(*idx) {
-                    if let Ok(v) = s.parse::<f64>() {
-                        if v.is_finite() {
-                            locf_state.insert((*name).to_string(), v);
-                        }
+                let value = row
+                    .get(*idx)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite());
+                match value {
+                    Some(v) => {
+                        locf_state.insert((*name).to_string(), v);
                     }
+                    // #1082: a level label is not carried forward.
+                    None if routing.no_carry_forward.contains(*name) => {
+                        locf_state.insert((*name).to_string(), f64::NAN);
+                    }
+                    None => {}
                 }
             }
         }
@@ -3428,6 +3457,8 @@ fn parse_subject(
     // The remedy is #614's: the first record moves one ULP below the tie, so every
     // engine reaches it first. Only the first record needs moving, since the later
     // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
+    // That leaves two observations one ULP apart whenever the tie holds more than one,
+    // which the ODE engines must save as two points (`ode::predictions::segment_saveat`).
     // One ULP is always enough, too: the #614 pass below moves only observations, and an
     // observation sorts last among the kinds, so a pk-only row sharing its ULP still
     // goes first.

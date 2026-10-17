@@ -19,21 +19,23 @@
 //!
 //! | code | meaning |
 //! |------|---------|
-//! | `E_PARSE`                 | the model file failed to parse |
+//! | `E_PARSE`                 | the model file failed to parse; on block `data_selection`, a `[data_selection]` clause that does not compile into a row filter, which `run_sir` / `run_covariance` reach from recorded reader settings edited after the fit (#1774) |
 //! | `E_MISSING_BLOCK`         | a required `[block]` is absent |
 //! | `E_UNKNOWN_BLOCK`         | a `[block]` header is not a recognised block name |
 //! | `E_DEPRECATED_BLOCK`      | a `[block]` that was ferx syntax and is no longer read |
 //! | `E_BLOCK_INSTANCE_NAME`   | a `[block NAME]` instance name is present where none is taken, or missing where one is required |
 //! | `E_BLOCK_FEATURE_DISABLED`| a `[block]` needs a cargo feature this binary was not built with |
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |
-//! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data |
+//! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data; on block `covariates`, the strict reader found a declared covariate column missing, whether `ferx check --data` read the file or `run_sir` / `run_covariance` re-read `fit.data_path` (#1774) |
+//! | `E_COVARIATE_NOT_NUMERIC` | the strict reader found a declared covariate column holding a value that is not a number. Block `covariates`. Raised by `ferx check --data` and by the `run_sir` / `run_covariance` re-read of `fit.data_path` (#1774), through one classifier |
+//! | `E_ODE_METHOD_LINEAR`     | `ode_method = linear` on a model that cannot take the exact linear path |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
 //! | `W_PER_CMT_UNMATCHED`     | the other direction of the two above: a **declared** per-CMT entry — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, or a `y[CMT=N]` readout on either engine — that no observation is recorded on, so the entry is inert. A warning rather than an error because nothing goes `NaN`, and one code for all three channels, with the channel named in the message. Names `[data_selection]` as a candidate cause only for the dead compartments a clause actually emptied. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead (#1405) |
 //! | `E_ENDPOINT_UNROUTED`     | a CMT declared as a non-Gaussian endpoint carries Gaussian observations — the population was read without the model's endpoint routing (#1199) |
 //! | `E_ENDPOINT_NO_RECORDS`   | a declared non-Gaussian endpoint has no row routed to it (typically a missing `CMT` column) |
 //! | `E_NO_SCORED_OBSERVATIONS` | the population has no record the likelihood scores — no Gaussian observation and no endpoint record on any subject — so the data contribute nothing to the objective. One population-level finding, last in `check_model_data_rule` so the specific data codes win `fit()`'s first error; the message names `[data_selection]` when it removed observation rows, and otherwise says what makes a row scored (#1491) |
-//! | `E_DATA`                  | the `--data` file could not be read or parsed |
+//! | `E_DATA`                  | the `--data` file could not be read or parsed. Also raised by `run_sir` / `run_covariance` when the re-read of `fit.data_path` fails for any other reason than a covariate column (#1774), through the same classifier; there the message is the reader's own, without `ferx check`'s `Failed to read data file` lead |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |
 //! | `W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT` | `gradient = fd` with `optimizer` left at `auto` on a model whose analytic gradient *is* in scope: `auto` follows the gradient, so the one line moved the optimizer too (#1381) |
@@ -79,16 +81,23 @@
 //! | `W_CMT_DEFAULTED`         | dose / observation rows assigned compartment 1 because the dataset has no `CMT` column, or the cell is missing or unparseable; reported when `CMT` selects something — more than one compartment a dose can reach (multi-state `[odes]`, or an analytical model whose `CMT=2` is a real target), a per-CMT scaling / error model / readout on either engine, an endpoint the row routes to, or a `[data_selection]` clause comparing `CMT` (the scope is the `CmtConsumer` enumeration in `api::validation`) |
 //! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |
 //! | `W_COVSTAT_UNBOUND`       | the same, reported without a `--data` file — the model is fine, it just cannot be built until a dataset is supplied |
-//! | `E_COVARIATE_STATS_BINDING` | a `[covariate_model]` statistic could not be bound, either on the data (a `levels = auto` relation whose data carry one level, which leaves nothing to estimate, or a covariate with no non-missing value) or from a fit (statistics that lack a covariate a symbolic relation reads, carry one no relation reads, or a fit that recorded none on a model with no level block). `ferx check --data` reports the first kind; `bind_covariate_stats`, `bind_from_fit` and `layout_from_fit` return both, and `run_sir` / `run_covariance` return the second, since they call the from-fit binder. Block `covariate_model`; the message is the binder's own (#1739, #1773) |
+//! | `E_COVARIATE_STATS_BINDING` | a `[covariate_model]` statistic could not be bound, either on the data (a `levels = auto` relation whose data carry one level, which leaves nothing to estimate, or a covariate with no non-missing value) or from a fit (statistics that lack a covariate a symbolic relation reads, carry one no relation reads, or a fit that recorded none on a model with no level block). `ferx check --data` reports the first kind; `bind_covariate_stats`, `bind_from_fit` and `layout_from_fit` return both, and `run_sir` / `run_covariance` return the second, since they call the from-fit binder, and the first kind's no-value refusal when they check a supplied model's statistics against the population of a fit that recorded none (#1729, #1774). Block `covariate_model`; the message is the binder's own (#1739, #1773) |
 //! | `E_THETA_LEVEL_BINDING`   | a `[parameters]` level block (`theta NAME[COL, ...]`) could not be bound, either to the data's own levels (a level column missing or non-finite, no observation rows, a contrast the data cannot carry) or to a fit's level layout (a data level the fit estimated no θ for, level bindings that do not match the model's blocks, or a fit that recorded none). `ferx check --data` reports the first kind; the binders (`bind_theta_levels`, `bind_from_fit`, `layout_from_fit`, `bind_theta_levels_from_fit`) return both, and so do `run_sir` / `run_covariance`, which call them. A fit with no bindings, on a model with a level block and a symbolic statistic, is this code. Block `parameters` (#1773) |
 //! | `E_THETA_LEVELS_DATA_UNBOUND` | a model whose `theta NAME[...]` block is bound was handed a population never bound for it, so no record carries an index into the block's levels: the usual "fit, then predict or simulate new data" without binding the new data. Raised by `fit()`, `predict` / `predict_diag`, the `simulate*` and adaptive entry points and `compute_npde_npd`. The binder named is `bind_from_fit` on the paths that run a θ already laid out, and `bind_theta_levels` on a fresh parse for `fit()`; the engine-internal index column is never named (#1647). Also raised by `predict_survival` / `predict_categorical` (#1763). A population only some of whose subjects carry the index gets "`k` of `n` subjects" and the first such ID instead of "never bound" (#1762) |
 //! | `E_THETA_LEVELS_DATA_MISMATCH` | a population that carries a bound block's index was bound for other levels than the model's (#1762): a record's index is not the position, in the model's level table, of the label its own level columns spell — a population bound on its own for another dataset's studies or times, or a subset of the model's levels with its own count. Every unseen label is listed; or the first misindexed record (subject, time, label, both indices) is named, with the same binder as `E_THETA_LEVELS_DATA_UNBOUND`; or an index without its level column is named, since its level cannot be checked. Raised by the same entry points. Refused, never re-indexed |
-//! | `E_MODEL_READ`            | the model file could not be read: it does not exist, cannot be opened, or is not UTF-8. Raised by `ferx check` before any parse; the message names the path and the operating system's reason. No block, since no block is at fault. The file is read once per check, and that one read is parsed and bound to the data, so a file moved or edited while the check runs is not read again (#1743, #1752) |
+//! | `E_MODEL_READ`            | the model file could not be read: it does not exist, cannot be opened, or is not UTF-8. Raised by `ferx check` before any parse; the message names the path and the operating system's reason. No block, since no block is at fault. The file is read once per check, and that one read is parsed and bound to the data, so a file moved or edited while the check runs is not read again (#1743, #1752). `run_sir` / `run_covariance` raise it too when they re-read `fit.model_path`, through the same classifier, and there a file edited since the fit is `E_FIT_INPUT_CHANGED` (#1774) |
 //! | `E_COV_LEVEL_UNKNOWN`     | the data carry a value of a categorical `[covariate_model]` covariate that is not one of the relation's levels, which the generated factor would model as the reference. Raised by `fit()`, `ferx check`, the `simulate*` and adaptive entry points, `predict` / `predict_diag` / `predict_survival` / `predict_categorical`, `compute_npde_npd`, and `run_sir` / `run_covariance` (#1111, #1740); not by the per-method estimators `fit()` dispatches to, which rely on its check |
-//! | `E_THETA_LENGTH`          | an entry point taking a parameter vector was handed a θ whose length is not the model's; refused rather than read by position (a short vector read `0.0` past its end). Raised by the `simulate*` and adaptive entry points (#1614), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and `compute_npde_npd` (#1615); never by `ferx check`, which has no parameter vector. On a level-block model the message says the θ count is set by the bound data, so a fit's θ fits only a design bound against that fit's level bindings (#1614); it names no function, since the R wrapper reaches it too (#1623). `fit()` refuses its initial parameters with the same message (#1764) |
-//! | `E_PARAM_SHAPE`           | an entry point was handed an Ω, σ or Ω_IOV whose dimension is not the model's, an Ω_IOV on a model with no κ, or none on a model with κ; refused rather than read by position (a mis-sized block panicked; a long σ or a missing Ω_IOV was silently ignored). Raised by `fit()` (as its message), the `simulate*` and adaptive entry points, `simulate_with_uncertainty` and `compute_npde_npd`, and — for σ and Ω_IOV — `run_sir` / `run_covariance` (#1764); for Ω_IOV alone, `fitted_params_from_result` (#1789). Not by `predict*`, which read none of the three; on `simulate*` a missing Ω_IOV keeps its own message (#1019) under this code (#1774), and `compute_npde_npd` falls back to κ = 0 for one, as documented there |
+//! | `E_THETA_LENGTH`          | an entry point taking a parameter vector was handed a θ whose length is not the model's; refused rather than read by position (a short vector read `0.0` past its end). Raised by the `simulate*` and adaptive entry points (#1614), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and `compute_npde_npd` (#1615); never by `ferx check`, which has no parameter vector. On a level-block model the message says the θ count is set by the bound data, so a fit's θ fits only a design bound against that fit's level bindings (#1614); it names no function, since the R wrapper reaches it too (#1623). `fit()` refuses its initial parameters with the same message (#1764); and `run_sir` / `run_covariance` refuse a fit whose θ is not the length of the model they run on, with their own message (#1774) |
+//! | `E_PARAM_SHAPE`           | an entry point was handed an Ω, σ or Ω_IOV whose dimension is not the model's, an Ω_IOV on a model with no κ, or none on a model with κ; refused rather than read by position (a mis-sized block panicked; a long σ or a missing Ω_IOV was silently ignored). Raised by `fit()` (as its message), the `simulate*` and adaptive entry points, `simulate_with_uncertainty` and `compute_npde_npd`, and — for σ and Ω_IOV — `run_sir` / `run_covariance` (#1764); for Ω_IOV alone, `fitted_params_from_result` (#1789); and inside the SIR core for per-class Ω/Σ present on parameters for a model with no `[mixture]`, or absent on one with it (#2044), which no public entry point reaches with a code: `run_sir` builds the parameters from the fit, so their per-class Ω/Σ follow the model, and `run_sir_core` returns the text as a `String`. Not by `predict*`, which read none of the three; on `simulate*` a missing Ω_IOV keeps its own message (#1019) under this code (#1774), and `compute_npde_npd` falls back to κ = 0 for one, as documented there |
 //! | `E_POPULATION_MISMATCH`   | a population handed to, or re-read by, a post-hoc step is not the one the fit was given (#1685): another subject list, other covariate columns, or a subject whose records, doses or covariate values differ. Raised by `run_sir` / `run_covariance` and `PopulationFingerprint::verify` (#1813, #1814), from one builder, so the three give the same message and suggestion. The message names what differs and how the population was obtained, never a cause the comparison cannot establish; the suggestion is the remedy. Never by `ferx check`, which has no fit. Pre-empted by `E_ENDPOINT_UNROUTED` and `E_THETA_LEVELS_DATA_UNBOUND`, whose fix is a reader or a binder |
 //! | `E_FIT_SUBJECTS_MISMATCH` | the population matches the fit's fingerprint, so it is the one the fit was given, but the fit's per-subject results (`fit.subjects`), which `run_sir` / `run_covariance` read by position, are another count or another order. Reachable when a front end rebuilds a fit from separate fields (ferx-r's fit skeleton); a `fit()` result carries both lists from one population. Without a current fingerprint the same mismatch is `E_POPULATION_MISMATCH`, since nothing says which side is wrong (#1868) |
+//! | `E_FIT_INPUT_MISSING`     | a post-hoc step on a fit (`run_sir`, `run_covariance`) needs an input that neither the caller passed nor the fit records: `fit.model_path` with no model passed, `fit.data_path` with no population passed, SIR's `fit.covariance_matrix`, the population of an IOV model passed as `model = Some` to a fit with no recorded reader settings, the IOV occasion rule of a fit saved before #1783 whose population carries no occasion labels, or the fitted values of a `[mixture]` fit's per-class overrides, which a `FitResult` stores only in `packed_estimate` (#1765; `simulate_with_uncertainty` raises this one too). `simulate_with_uncertainty` also raises it for the covariance matrix or SIR resamples it draws from, absent or empty (#2044). No block. Never by `ferx check`, which has no fit (#1774) |
+//! | `E_FIT_INPUT_CHANGED`     | a file a post-hoc step re-reads, `fit.model_path` or `fit.data_path`, no longer has the SHA-256 the fit recorded. No block. Raised by `run_sir` / `run_covariance` (#1774); never by `ferx check`, which compares no hash |
+//! | `E_FIT_INPUT_MODEL`       | the model a post-hoc step would run on is not the one the fit was made with: a supplied model bound with other data-derived bindings than `fit.data_bindings`, a supplied model whose covariate statistics the population does not reproduce (on a fit that recorded no bindings, #1729), a model whose η count is not the width of the fit's per-subject η̂, a `[mixture]` fit whose `packed_estimate` has another layout or no longer reproduces its reported estimates (#1815; `simulate_with_uncertainty` raises these too), or a covariance matrix that is not the size of the model's packed parameters (SIR's proposal; and `simulate_with_uncertainty`'s covariance or SIR resamples, #2044). No block. Raised by `run_sir` / `run_covariance` (#1774). Its θ count is `E_THETA_LENGTH`, its Ω / σ / Ω_IOV shape `E_PARAM_SHAPE` |
+//! | `E_SIR_OPTIONS`           | SIR settings the importance resampler cannot run with: `sir_resamples` above `sir_samples`, a `sir_df` that is not a valid Student-t degrees of freedom, or `sir_scale = natural` on a model with `prior(...)` (#1723). No block. Raised by `run_sir` (#1774); `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
+//! | `E_SIR_NOTHING_TO_SAMPLE` | every estimated parameter of the fit is FIX (θ, Ω and σ, and Ω_IOV, `block_sigma` correlations and `[mixture]` overrides where the model has them), so SIR has no free direction to propose in. Block `parameters`. Raised by `run_sir` (#1774); `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
+//! | `E_ODE_SOLVER_OPTIONS`    | ODE solver settings on a hand-built `FitOptions` that no solver can run with: an `ode_reltol` / `ode_abstol` that is not finite and positive, or `ode_max_steps = 0`. No block. Raised by `run_sir` / `run_covariance` through `with_fit_scope` (#2044), and `run_sir_core` returns the same text as a `String`; a model file's `[fit_options]` refuses the same values at parse time as `E_PARSE` |
+//! | `E_LOGIT_THETA_OUT_OF_RANGE` | a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly inside (0, 1), so it has no logit-scale draw; reachable only with a declared upper bound above 1, which the suggestion says to lower. Block `parameters`. Raised by `simulate_with_uncertainty` (asymptotic method) and `run_sir` (#2044). `Display` folds the suggestion in after the message, so `run_sir_core` and `draw_parameter_samples` return that text as a `String`, and `fit()`'s in-fit SIR reports it as a `SIR failed:` warning |
 //! | `E_ENDPOINT_TV_COVARIATE` | a covariate that varies within a subject is read by an endpoint that evaluates it at the baseline: an analytic hazard's own parameters, any covariate under an ODE-accumulated hazard, a `[binary_model]` predictor, a `[markov_model]` intensity (#741). Block is the endpoint's (`event_model` / `binary_model` / `markov_model`). Raised by `fit()`, `ferx check` (since #1774), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and the `simulate*` entry points |
 //! | `E_ENDPOINT_TIME_DEPENDENT_PK` | an ODE-accumulated hazard would integrate a `TIME`-dependent individual parameter (reaching it through the `[odes]` RHS or an `init()` seed) at its TIME=0 value (#1853), or, fail-closed, a hand-built model lacks the compiled programs that decide it. Block `event_model`. A function of the model alone. Raised by `fit()`, `ferx check` (without `--data`, since #1774), `predict` / `predict_diag` / `predict_survival` and the `simulate*` entry points; not `predict_categorical` |
 //! | `E_READOUT_DEPOT_UNSUPPORTED` | an analytic `[scaling] y` readout reads the oral `depot` amount on a subject dose superposition cannot reconstruct it for: an EVID=3/4 reset (#650) or a dose into a non-default compartment (#375). Block `scaling`. Raised by `fit()`, `ferx check` (since #1774) and `predict` / `predict_diag` |
@@ -96,9 +105,17 @@
 //! | `E_TTE_NOT_SIMULATABLE`   | a TTE endpoint the event-time simulator cannot draw for this population: two repeated-event streams on a subject, a repeated-event cause beside a single-event one, a reset under a repeated-event or ODE-accumulated hazard, left truncation under an ODE-accumulated hazard; or a repeated-event or ODE-accumulated TTE endpoint on `simulate_with_uncertainty`, which needs a horizon and takes none. Block `event_model`. Raised by the `simulate*` entry points (#1774) |
 //! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check still returns a `String` (#1772) |
 //! | `E_PROPENSITY_INPUT`      | propensity-score matching was requested on a population it cannot compute posthoc etas from: empty, a subject with no observations, a non-finite `DV`. Raised by `simulate_with_options*` (#1774) |
-//! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), or an `auc_target` on a time-varying-covariate, IOV or reset subject. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
-//! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite or not strictly increasing), or `decision_times` / `monitors` set beside a spec that owns them. Raised by the adaptive entry points (#1774) |
-//! | `E_ADAPTIVE_SPEC`         | an `[adaptive_dosing]` spec that does not compile against the model: a parser invariant (on a spec built in code), `assay_cmt` out of range, an `observe` that does not compile. Block `adaptive_dosing`. Raised by `simulate_adaptive_from_spec`, whose context it carries (#1774). An `observe` covariate absent from the data is `E_MISSING_COVARIATE` there, block `adaptive_dosing` |
+//! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), an `auc_target` on a time-varying-covariate, IOV or reset subject, or a base regimen × EVID=3/4 reset under a time-varying covariate or IOV (before any subject runs). Once the driver runs (#1983): a base dose under a time-varying covariate or IOV that is not a plain bolus / infusion, a non-finite break time, a `TAD` / `TAFD` read before any dose. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
+//! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite, not strictly increasing, or past `max_decisions`), a monitor compartment out of range, a `Dv` monitor on a compartment no `[error_model]` covers, or `decision_times` / `monitors` set beside a spec that owns them — all before any subject runs. Once the driver runs (#1983): two of a subject's times within 1e-15 of each other but not equal. Raised by the adaptive entry points (#1774) |
+//! | `E_ADAPTIVE_CONTROLLER_ACTION` | a controller action the driver refuses: a dose into compartment 0 or past the states, a negative or non-finite amount, a rate that is not positive and finite, a compartment fed by an input-rate function or carrying a lag, a `Stop` with actions after it. The controller is the caller's code, so an input refusal; only a simulation reaches it. Raised by `simulate_adaptive` (#1983); on `simulate_adaptive_from_spec`, whose controller is the spec's `route`, the same refusal is `E_ADAPTIVE_SPEC` |
+//! | `E_ADAPTIVE_SPEC`         | an `[adaptive_dosing]` spec that does not compile against the model: a parser invariant (on a spec built in code), `assay_cmt` out of range or with no `[error_model]` (#1983), a `route` compartment out of range or fed by an input-rate function, or — once the driver runs — a `route` dose it refuses (a lagged compartment) (#1983), an `observe` that does not compile. Block `adaptive_dosing`. Raised by `simulate_adaptive_from_spec`, whose context it carries (#1774). An `observe` covariate absent from the data is `E_MISSING_COVARIATE` there, block `adaptive_dosing` |
+//! | `E_LEVEL_MIXED_WITH_IOV_COLUMN` | a `level` declaration beside `iov_column` / `iov_occasion`, or a `kappa` with no `at LEVEL` once levels are declared (#1082). Block `parameters`; raised at parse time, so a parse error's message carries the code |
+//! | `E_LEVEL_MISSING_LABEL`   | a record with no value in a level column of a nested model (#1082). Block `parameters`. Raised by `fit()` and `ferx check --data` |
+//! | `E_LEVEL_SINGLE_MEMBER`   | a level with at most one group in every parent group whose kappa reads the same parameters as a random effect of the parent level (#1082). Block `parameters` |
+//! | `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED` | a `theta NAME[COL, …]` level block nested in the groups of a kappa-carrying level of a nested model, which the binder cannot yet certify (#1082). Block `parameters` |
+//! | `E_NESTED_LEVEL_METHOD_UNSUPPORTED` | a nested model fitted with a stage other than `foce` / `focei` at `n_agq = 1`, or with a `[mixture]` / FREM (#1082). Block `fit_options` |
+//! | `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED` | a residual `correlation … by` line on a nested model (#1082). Block `error_model` |
+//! | `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED` | a nested model reached a `simulate*` or adaptive entry point, which draw one kappa per occasion (#1082). Block `parameters`. Never by `ferx check` |
 
 use serde::Serialize;
 
@@ -259,19 +276,23 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
 /// them, since it has no parameter vector, no fit, no fit's bindings, no simulation
 /// options and no adaptive controller: `E_THETA_LENGTH`, `E_PARAM_SHAPE`, the
 /// binders' `E_THETA_LEVEL_BINDING` / `E_COVARIATE_STATS_BINDING` on a fit's
-/// bindings, `E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, and the
+/// bindings, `E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, the post-hoc
+/// steps' `E_FIT_INPUT_MISSING` / `E_FIT_INPUT_CHANGED` / `E_FIT_INPUT_MODEL` /
+/// `E_SIR_OPTIONS` / `E_SIR_NOTHING_TO_SAMPLE` / `E_ODE_SOLVER_OPTIONS`, the
+/// uncertainty draws' `E_LOGIT_THETA_OUT_OF_RANGE` (#2044), and the
 /// predict / simulate / adaptive codes of #1774 (`E_CTMM_UNSUPPORTED`,
 /// `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON`, `E_PROPENSITY_INPUT`,
-/// `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`).
+/// `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`,
+/// `E_ADAPTIVE_CONTROLLER_ACTION`).
 /// A failure with no code carries none ([`diagnostic`](Self::diagnostic) is `None`).
 ///
 /// `Display` is the historical `String` error byte for byte: the message, preceded
 /// by `"{context}: "` when the refusal names its entry point (`run_sir`,
 /// `run_covariance`). `.to_string()` therefore recovers the pre-#1746 `Err`.
 ///
-/// Three refusals also fold their suggestion in after the message: `predict`'s
-/// unbound `theta NAME[...]` block, `E_POPULATION_MISMATCH` and
-/// `E_FIT_SUBJECTS_MISMATCH`. There `Display`
+/// Four refusals also fold their suggestion in after the message: `predict`'s
+/// unbound `theta NAME[...]` block, `E_POPULATION_MISMATCH`,
+/// `E_FIT_SUBJECTS_MISMATCH` and `E_LOGIT_THETA_OUT_OF_RANGE`. There `Display`
 /// appends it, while
 /// [`message`](Self::message) stays the bare message and the suggestion is only in
 /// [`suggestion`](Self::suggestion). So a renderer shows either `to_string()` alone,
@@ -303,6 +324,23 @@ impl EngineError {
         EngineError {
             suggestion_in_display: true,
             ..EngineError::from_diagnostic(d)
+        }
+    }
+
+    /// An error with no diagnostic: [`code`](Self::code) is `None`.
+    ///
+    /// Right only for a failure `ferx check` has no code for: a runtime, IO or
+    /// internal failure, or a refusal no code exists for yet. A refusal some
+    /// helper already codes goes through that helper's [`Diagnostic`] instead.
+    /// There is deliberately no `From<String>` (#1775): a `?` on a `String`
+    /// helper would otherwise drop a code silently. Every call site is listed in
+    /// `UNCODED_SITES` (the test module below) with its reason.
+    pub(crate) fn uncoded(message: impl Into<String>) -> Self {
+        EngineError {
+            diagnostic: None,
+            message: message.into(),
+            context: None,
+            suggestion_in_display: false,
         }
     }
 
@@ -364,25 +402,6 @@ impl std::fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<String> for EngineError {
-    fn from(message: String) -> Self {
-        EngineError {
-            diagnostic: None,
-            message,
-            context: None,
-            suggestion_in_display: false,
-        }
-    }
-}
-
-/// A failure with no diagnostic: [`EngineError::diagnostic`] is `None`.
-impl From<&str> for EngineError {
-    fn from(message: &str) -> Self {
-        message.to_string().into()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -447,7 +466,7 @@ mod tests {
         assert_eq!(err.context(), None);
         assert_eq!(err.to_string(), "second is the error");
 
-        let plain = EngineError::from("no diagnostic here".to_string());
+        let plain = EngineError::uncoded("no diagnostic here");
         assert!(plain.diagnostic().is_none());
         assert_eq!(plain.code(), None);
         assert_eq!(plain.to_string(), "no diagnostic here");
@@ -498,3 +517,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "diagnostics_uncoded_sites.rs"]
+mod uncoded_sites;

@@ -1715,7 +1715,7 @@ fn adaptive_tv_break_collision_within_tolerance_is_rejected() {
     )
     .expect_err("a sub-tolerance decision/obs collision must be rejected");
     assert!(
-        err.contains("bit-identical"),
+        err.to_string().contains("bit-identical"),
         "error should cite the collision: {err}"
     );
 }
@@ -2580,9 +2580,11 @@ fn adaptive_dv_without_assay_capability_errors() {
     )
     .unwrap_err();
     assert!(
-        err.contains("DV") && err.contains("capability"),
+        err.to_string().contains("DV") && err.to_string().contains("capability"),
         "got: {err}"
     );
+    // An internal invariant (production always supplies the assay), so no code (#1983).
+    assert_eq!(err.kind(), None, "got: {err:?}");
 }
 
 #[test]
@@ -2611,7 +2613,10 @@ fn adaptive_dv_no_error_model_errors() {
         Some(&assay),
     )
     .unwrap_err();
-    assert!(err.contains("error_model"), "got: {err}");
+    assert!(err.to_string().contains("error_model"), "got: {err}");
+    // The entry points refuse this before any subject runs (#1983), so in the driver it is
+    // an internal invariant and carries no code.
+    assert_eq!(err.kind(), None, "got: {err:?}");
 }
 
 #[test]
@@ -3156,27 +3161,8 @@ fn adaptive_base_regimen_with_reset_matches_static_ode_driver() {
     }
 }
 
-#[test]
-fn adaptive_max_decisions_runaway_guard() {
-    let ode = one_cpt_ode_spec();
-    let pk = pk_one(1.0, 10.0);
-    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(vec![], vec![1.0]);
-    let err = ode_predictions_adaptive(
-        &ode,
-        &pk.values,
-        &[],
-        &[],
-        &base,
-        &[0.0, 24.0, 48.0],
-        &[],
-        &mut controller,
-        2,
-        None,
-    )
-    .unwrap_err();
-    assert!(err.contains("max_decisions"), "got: {err}");
-}
+// The `max_decisions` runaway guard is refused at the API entry since #1983, before any
+// subject runs: `entry_refusal_codes_tests::adaptive_entry_refusals_simulate_no_subject`.
 
 #[test]
 fn adaptive_rejects_zero_compartment_via_validate() {
@@ -3197,7 +3183,7 @@ fn adaptive_rejects_zero_compartment_via_validate() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("compartment"), "got: {err}");
+    assert!(err.to_string().contains("compartment"), "got: {err}");
 }
 
 #[test]
@@ -3320,32 +3306,11 @@ fn adaptive_rejects_out_of_range_bolus_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
+    assert!(err.to_string().contains("state"), "got: {err}");
 }
 
-#[test]
-fn adaptive_rejects_out_of_range_monitor_compartment() {
-    // A monitor on a compartment beyond the model is a precondition error.
-    let ode = one_cpt_ode_spec();
-    let pk = pk_one(1.0, 10.0);
-    let monitors = [MonitorSpec::new("A", 2, ObserveMode::Ipred)]; // n_states = 1
-    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(vec![], vec![1.0]);
-    let err = ode_predictions_adaptive(
-        &ode,
-        &pk.values,
-        &[],
-        &[],
-        &base,
-        &[0.0],
-        &monitors,
-        &mut controller,
-        100,
-        None,
-    )
-    .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
-}
+// A monitor on a compartment beyond the model is refused at the API entry since #1983,
+// before any subject runs: `entry_refusal_codes_tests::adaptive_entry_refusals_simulate_no_subject`.
 
 #[test]
 fn adaptive_rejects_dosing_into_input_rate_compartment() {
@@ -3376,7 +3341,7 @@ fn adaptive_rejects_dosing_into_input_rate_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("input-rate"), "got: {err}");
+    assert!(err.to_string().contains("input-rate"), "got: {err}");
 }
 
 #[test]
@@ -3401,7 +3366,7 @@ fn adaptive_rejects_lagged_dose_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("lag time"), "got: {err}");
+    assert!(err.to_string().contains("lag time"), "got: {err}");
 }
 
 // ----- S1.3b reactive infusions (#391) ------------------------------
@@ -3820,7 +3785,7 @@ fn adaptive_rejects_nonpositive_infusion_rate() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("rate"), "got: {err}");
+    assert!(err.to_string().contains("rate"), "got: {err}");
 }
 
 #[test]
@@ -3848,7 +3813,7 @@ fn adaptive_rejects_out_of_range_infusion_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("state"), "got: {err}");
+    assert!(err.to_string().contains("state"), "got: {err}");
 }
 
 #[test]
@@ -3883,7 +3848,7 @@ fn adaptive_rejects_infusion_into_input_rate_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("input-rate"), "got: {err}");
+    assert!(err.to_string().contains("input-rate"), "got: {err}");
 }
 
 #[test]
@@ -3912,7 +3877,7 @@ fn adaptive_rejects_lagged_infusion_compartment() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("lag time"), "got: {err}");
+    assert!(err.to_string().contains("lag time"), "got: {err}");
 }
 
 // ----- S1.4a decision log (#391) ------------------------------------
@@ -4204,7 +4169,10 @@ fn adaptive_driver_rejects_malformed_or_post_stop_actions() {
             None,
         )
         .expect_err("malformed / post-stop action list is rejected");
-        assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        assert!(
+            err.to_string().contains(needle),
+            "expected {needle:?}, got: {err}"
+        );
     }
 }
 
@@ -7016,7 +6984,9 @@ fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: u
     let mut u = vec![0.0; ode.n_states];
     for _ in 0..max_cycles {
         u[cmt] += dose.amt;
-        if let Some(last) = solve_ode(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last() {
+        if let Some(last) =
+            solve_ode_certified(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last()
+        {
             u.copy_from_slice(&last.u);
         }
     }
@@ -8145,7 +8115,7 @@ fn explicit_ss_run_in(
     for m in 0..max_cycles {
         let prev = u.clone();
         let seg = (m as f64 * dose.ii, (m + 1) as f64 * dose.ii);
-        let sol = solve_ode(&train, &u, seg, pk, &[seg.1], &eq_opts);
+        let sol = solve_ode_certified(&train, &u, seg, pk, &[seg.1], &eq_opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -12678,7 +12648,7 @@ fn the_adaptive_driver_records_an_abandoned_walk() {
     let (stats, out) = run_at(f64::NAN, &mut decide);
     let err = out.expect_err("a NaN dose time must be the driver's typed error");
     assert!(
-        err.contains("cannot be ordered"),
+        err.to_string().contains("cannot be ordered"),
         "the driver must reject it for the timeline, not for something else: {err}"
     );
     assert_eq!(
@@ -14703,4 +14673,88 @@ fn a_dose_recorded_before_an_evid3_reset_is_cancelled_on_every_ode_engine() {
         }
     }
     println!("#1587 every ODE engine: worst |f| after the reset {worst:.3e}");
+}
+
+/// **A co-timed pair the reader split one ULP apart is read on every ODE engine** (the
+/// reader's #614 and #1810 passes). The first of two records at one `TIME` moves to `t⁻`
+/// when something the engines order ahead of it follows it there: an EVID=2 row (#1810) or
+/// a dose (#614). Every segment `saveat` deduped at `1e-15`, which merges `[4⁻, 4]`, while
+/// the solve's points are matched back to records by exact bits, so the record at `4` was
+/// never written and kept a `NaN` prediction unless a break at `4` read it instead. Two
+/// cells have no such break: an EVID=2 row (which these engines do not break on) and a
+/// lagged dose (whose break is its arrival, `4.5`).
+///
+/// Oracle: the same subject with the pair as the reader writes it when nothing moves it
+/// apart — `[4, 4]` for two observations with no EVID=2 row, `[4⁻, 4⁻]` for two observations
+/// listed before the dose. The pair reads residual drug from the dose at `0`, and in the
+/// lagged cell the dose at `4` has not yet arrived, so both records read the same state.
+/// Measured on macOS arm64: worst relative difference 3.2e-16 across the six engines and
+/// both cells. Bound `1e-12`.
+///
+/// Mutation: dedup `segment_saveat` at `1e-15` again and the record at `4` reads `NaN` in
+/// both cells on `ode_predictions`, `ode_predictions_with_states`, `ode_dense_solve_states`
+/// and `ode_predictions_adaptive`. The two event-driven engines stay green, since they walk
+/// records rather than a `saveat`. The EKF is asserted in `ode/ekf.rs`
+/// (`ekf_reader_split_tie_is_one_instant`).
+#[test]
+fn a_reader_split_tie_is_read_on_every_ode_engine() {
+    let t = 4.0f64;
+    assert!(
+        t - t.next_down() < 1e-15,
+        "the pair must be close enough for the old 1e-15 dedup to merge it"
+    );
+    let lag_slot = 20usize;
+    let ode = depot_central_lag_spec(lag_slot);
+    let depot = |time: f64, amt: f64| DoseEvent::new(time, amt, 1, 0.0, false, 0.0);
+    // (label, lag, doses, split observation times, oracle observation times)
+    let cells = [
+        (
+            "obs, EVID=2, obs (#1810)",
+            0.0,
+            vec![depot(0.0, 100.0)],
+            vec![t.next_down(), t, 8.0],
+            vec![t, t, 8.0],
+        ),
+        (
+            "obs, lagged dose, obs (#614)",
+            0.5,
+            vec![depot(0.0, 100.0), depot(t, 50.0)],
+            vec![t.next_down(), t, 8.0],
+            vec![t.next_down(), t.next_down(), 8.0],
+        ),
+    ];
+    let mut worst = 0.0_f64;
+    // Every failing (cell, engine, record), so a regression names each engine it reaches.
+    let mut bad: Vec<String> = Vec::new();
+    for (label, lag, doses, split, oracle) in cells {
+        let mut pk = pk_one(2.0, 20.0);
+        pk.values[4] = 0.15;
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        pk.values[lag_slot] = lag;
+        let got = ss_tie_engines(&ode, &pk, &make_subject(doses.clone(), split));
+        let want = ss_tie_engines(&ode, &pk, &make_subject(doses, oracle));
+        assert_eq!(got.len(), 6, "{label}: engines");
+        for ((engine, g), (_, w)) in got.iter().zip(&want) {
+            for j in 0..3 {
+                // Finite first: a `NaN` fails every comparison below, but `f64::max` would
+                // drop it from `worst`.
+                assert!(
+                    w[j].is_finite() && w[j] > 1.0,
+                    "{label}, {engine}, record {j}: the oracle reads {}",
+                    w[j]
+                );
+                let rel = (g[j] - w[j]).abs() / w[j];
+                if !(rel < 1e-12) {
+                    bad.push(format!(
+                        "{label}, {engine}, record {j}: {} vs {} with the pair unsplit",
+                        g[j], w[j]
+                    ));
+                    continue;
+                }
+                worst = worst.max(rel);
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    println!("reader-split tie, every ODE engine: worst relative difference {worst:.3e}");
 }
