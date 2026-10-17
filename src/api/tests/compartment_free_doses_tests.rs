@@ -322,7 +322,8 @@ fn readout_tad_is_a_data_column_refused_when_absent_and_read_when_present() {
         .to_string();
     let fit_err = crate::api::fit(&model, &without, params, &eval_only)
         .err()
-        .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0");
+        .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0")
+        .to_string();
     for (entry, err) in [("predict", &predict_err), ("fit", &fit_err)] {
         assert!(
             err.to_string().contains("TAD") && err.to_string().contains("not found in data"),

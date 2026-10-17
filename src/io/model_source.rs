@@ -43,6 +43,13 @@ pub(crate) enum ModelSourceError {
 }
 
 impl ModelSourceError {
+    /// The read's own text, before any classifier rewords it.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Read(m) | Self::Hash(m) | Self::Parse(m) => m,
+        }
+    }
+
     pub(crate) fn into_message(self) -> String {
         match self {
             Self::Read(m) | Self::Hash(m) | Self::Parse(m) => m,

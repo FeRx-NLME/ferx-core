@@ -306,7 +306,8 @@ fn fit_routing_rejects_invalid_programmatic_ode_options() {
     ] {
         let err = install_on_fit_pool(&options, || panic!("invalid options reached the fit"))
             .expect_err("invalid Rust API options");
-        assert!(err.contains(field), "{err}");
+        assert_eq!(err.code(), Some("E_ODE_SOLVER_OPTIONS"), "{err}");
+        assert!(err.to_string().contains(field), "{err}");
     }
 }
 
@@ -495,7 +496,9 @@ fn a_fit_whose_every_start_is_refused_says_why() {
     );
     let mut opts = short_fit_opts();
     opts.n_starts = 2;
-    let err = fit(&model, &pop, &params, &opts).expect_err("every start is refused");
+    let err = fit(&model, &pop, &params, &opts)
+        .expect_err("every start is refused")
+        .to_string();
     assert!(
         err.starts_with("All multi-start fits failed: start 0:"),
         "{err}"

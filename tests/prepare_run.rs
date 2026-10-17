@@ -87,7 +87,7 @@ fn a_missing_model_or_dataset_is_an_error() {
 fn a_model_without_a_data_block_needs_an_explicit_dataset() {
     // warfarin.ferx has no `[data]` block, so `None` has nothing to fall back
     // on and must say so rather than reading an empty population.
-    let err = error_of(prepare_run(MODEL, None));
+    let err = error_of(prepare_run(MODEL, None).map_err(|e| e.to_string()));
     assert!(
         err.contains("no dataset specified"),
         "expected the missing-dataset message, got: {err}"

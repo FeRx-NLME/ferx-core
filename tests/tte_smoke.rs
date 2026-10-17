@@ -404,7 +404,8 @@ mod survival_smoke {
         let (model, pop) = tv_cov_hazard_model_and_pop();
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("a time-varying covariate on the hazard must be rejected by fit()");
+            .expect_err("a time-varying covariate on the hazard must be rejected by fit()")
+            .to_string();
         assert!(err.contains("#741"), "error must cite the issue: {err}");
         assert!(err.contains("CRCL"), "error must name the covariate: {err}");
     }
@@ -603,7 +604,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("out-of-order RTTE records must be rejected");
+            .expect_err("out-of-order RTTE records must be rejected")
+            .to_string();
         assert!(
             err.contains("out of time order") && err.contains("CMT=2"),
             "error should flag the unsorted RTTE rows, got: {err}"
@@ -676,7 +678,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("interval-censored RTTE record must be rejected");
+            .expect_err("interval-censored RTTE record must be rejected")
+            .to_string();
         assert!(
             err.contains("interval-censored") && err.contains("CMT=2"),
             "error should flag interval censoring as unsupported for RTTE, got: {err}"
@@ -706,7 +709,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("non-finite RTTE TIME must be rejected");
+            .expect_err("non-finite RTTE TIME must be rejected")
+            .to_string();
         assert!(
             err.contains("non-finite TIME") && err.contains("CMT=2"),
             "error should flag the non-finite time, got: {err}"
@@ -738,7 +742,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("entry_time after TIME must be rejected");
+            .expect_err("entry_time after TIME must be rejected")
+            .to_string();
         assert!(
             err.contains("entry_time") && err.contains("CMT=2"),
             "error should flag the entry-after-time record, got: {err}"
@@ -799,7 +804,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("mid-stream censor under clock=reset must be rejected");
+            .expect_err("mid-stream censor under clock=reset must be rejected")
+            .to_string();
         assert!(
             err.contains("right-censored") && err.contains("CMT=2"),
             "error should flag the mid-stream censor, got: {err}"
@@ -852,7 +858,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("tied event times under clock=reset must be rejected");
+            .expect_err("tied event times under clock=reset must be rejected")
+            .to_string();
         assert!(
             err.contains("same TIME") && err.contains("CMT=2"),
             "error should flag the zero-gap tied events, got: {err}"
@@ -902,7 +909,8 @@ mod survival_smoke {
         ];
         let opts = FitOptions::default();
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("entry_time after TIME under clock=reset must be rejected");
+            .expect_err("entry_time after TIME under clock=reset must be rejected")
+            .to_string();
         assert!(
             err.contains("entry_time") && err.contains("CMT=2"),
             "error should flag the entry-after-time record on the reset endpoint, got: {err}"
@@ -1891,7 +1899,8 @@ mod survival_smoke {
         std::fs::write(&path, model_src).expect("write model");
 
         let err = ferx_core::run_model_simulate(path.to_str().unwrap())
-            .expect_err("a TTE [simulation] without a horizon must error");
+            .expect_err("a TTE [simulation] without a horizon must error")
+            .to_string();
         assert!(
             err.contains("horizon") && err.contains("TTE"),
             "error must name the missing horizon: {err}"
@@ -2004,7 +2013,8 @@ mod survival_smoke {
         std::fs::write(&path, model_src).expect("write model");
 
         let err = ferx_core::run_model_simulate(path.to_str().unwrap())
-            .expect_err("a joint PK+TTE model with horizon but no times must error");
+            .expect_err("a joint PK+TTE model with horizon but no times must error")
+            .to_string();
         assert!(
             err.contains("times") && err.contains("continuous"),
             "error must point at the missing continuous `times`: {err}"

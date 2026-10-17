@@ -97,6 +97,61 @@ fn code_in(diags: &[crate::diagnostics::Diagnostic], code: &str) -> Option<Strin
         .map(|d| d.message.clone())
 }
 
+/// #2062 review B1: a model file that does not parse keeps its exact text on the file
+/// entry points, while carrying the parse's code. `parse_error_to_diagnostic` rewrites
+/// the message for two kinds of parse error, so both are cells here: a misspelt block
+/// header (`locate()` strips ` (line N)`) and a level declared beside `iov_column`
+/// (the `E_…:` prefix is stripped). Either one alone would leave the other free to
+/// drift. Mutation: build the error from the diagnostic's message
+/// (`EngineError::from_diagnostic`) in `read_model_source` → both cells redden on the
+/// text.
+#[test]
+fn a_model_file_that_does_not_parse_keeps_its_text_and_carries_its_code() {
+    let cells = [
+        (
+            "misspelt block",
+            format!("{}\n[fit_optoins]\n  maxiter = 1\n", src()),
+            "E_UNKNOWN_BLOCK",
+        ),
+        (
+            "level beside iov_column",
+            src_with(
+                "",
+                "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
+                "[fit_options]\n  iov_column = OCC\n",
+            ),
+            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+        ),
+    ];
+    for (label, text, code) in cells {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), &text).unwrap();
+        let p = f.path().to_str().unwrap();
+        let old = crate::io::model_source::ModelSource::read(p)
+            .err()
+            .expect("the file does not parse");
+        let errs = [
+            (
+                "prepare_run",
+                crate::api::prepare_run(p, Some("data/warfarin.csv")).err(),
+            ),
+            (
+                "fit_from_files",
+                crate::api::fit_from_files(p, Some("data/warfarin.csv"), None, None).err(),
+            ),
+            (
+                "run_model_simulate",
+                crate::api::run_model_simulate(p).err(),
+            ),
+        ];
+        for (entry, e) in errs {
+            let e = e.unwrap_or_else(|| panic!("{label} via {entry}: accepted"));
+            assert_eq!(e.to_string(), old, "{label} via {entry}: text");
+            assert_eq!(e.code(), Some(code), "{label} via {entry}: code");
+        }
+    }
+}
+
 // ── grammar ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -599,7 +654,8 @@ fn fit_refuses_a_nested_model_under_saem_with_its_code() {
     };
     let err = crate::api::fit(&m, &full_design(), &m.default_params, &opts)
         .err()
-        .expect("refused");
+        .expect("refused")
+        .to_string();
     assert!(
         err.contains("method = saem is not yet supported on a model with nested levels"),
         "{err}"
@@ -856,7 +912,8 @@ fn a_fit_time_occasion_rule_is_refused_on_a_nested_model() {
         );
         let err = crate::api::fit(&m, &full_design(), &m.default_params, &with(rule))
             .err()
-            .expect("fit refuses it");
+            .expect("fit refuses it")
+            .to_string();
         assert!(err.contains("the fit options set `iov_occasion`"), "{err}");
     }
     // A one-level model keeps the rule.

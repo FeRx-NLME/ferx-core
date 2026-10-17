@@ -453,6 +453,21 @@ pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceErr
     }
 }
 
+/// A failed model-file read as an entry point's `Err`: [`model_source_diagnostic`]'s
+/// code, block and line, with the read's own text as the message. The diagnostic
+/// rewords some parse errors for `ferx check`, which shows `block:line` beside them (it
+/// strips ` (line N)` and an `E_…:` prefix); an entry point prints only `Display`, so
+/// it keeps the text `ModelSource::read` returns, byte for byte (#2062 review B1).
+pub(crate) fn model_source_refusal(
+    e: crate::io::model_source::ModelSourceError,
+) -> crate::diagnostics::EngineError {
+    let message = e.message().to_string();
+    crate::diagnostics::EngineError::from_diagnostic_keeping_text(
+        model_source_diagnostic(e),
+        message,
+    )
+}
+
 /// The `[data_selection]` filter `ferx check`'s data read applies, compiled from
 /// the model file's own clauses by the **fit's** builder
 /// ([`crate::api::run::build_selection_filter`]) rather than a second spelling of
@@ -983,6 +998,31 @@ pub(crate) fn check_unbound_theta_levels(
     model: &CompiledModel,
     entry: UnboundLevelsEntry,
 ) -> Vec<Diagnostic> {
+    let unbound = model.theta_blocks().unbound_level_blocks();
+    // `fit()`'s refusal names every unbound block in one message, with the way out
+    // in the message itself (its historical text, #1772), so it is one diagnostic.
+    if entry == UnboundLevelsEntry::Fit {
+        return unbound
+            .first()
+            .map(|first| {
+                Diagnostic::error(
+                    "E_THETA_LEVELS_UNBOUND",
+                    format!(
+                        "`theta {}[...]` was never bound to data, so it has no levels. Call \
+                         `bind_theta_levels(&mut parsed, &model_text, &mut population)` after \
+                         reading the population (`read_population_for`) and before `fit`. \
+                         `prepare_run` and the file entry points (`fit_from_files`, \
+                         `run_model_with_data`, the CLI) bind for you. Or declare the block \
+                         explicitly as `theta {}[N](...)` and index it with your own column.",
+                        unbound.join("`, `theta "),
+                        first,
+                    ),
+                )
+                .with_block("parameters")
+            })
+            .into_iter()
+            .collect();
+    }
     model
         .theta_blocks()
         .unbound_level_blocks()
@@ -1014,6 +1054,7 @@ pub(crate) fn check_unbound_theta_levels(
                      declare the block explicitly as `theta {name}[N](...)` and index it \
                      with your own column"
                 ),
+                UnboundLevelsEntry::Fit => unreachable!("`fit()`'s diagnostic is returned above"),
             };
             Diagnostic::error(
                 "E_THETA_LEVELS_UNBOUND",
@@ -1055,6 +1096,9 @@ pub(crate) enum UnboundLevelsEntry {
     /// `predict_diag` (#1644), `predict_survival`, `predict_categorical`,
     /// `compute_npde_npd` (#1763) — carrying the name the suggestion gives it.
     Predict(&'static str),
+    /// `fit()` (#1772): one diagnostic naming every unbound block, the advice in its
+    /// message and no suggestion.
+    Fit,
 }
 
 /// Every `NAME[COLUMN]` gather index the data carries must be an integer level

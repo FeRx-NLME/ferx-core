@@ -988,6 +988,121 @@ fn temp_cov_csv(name: &str, values: &[Option<f64>]) -> tempfile::NamedTempFile {
     f
 }
 
+/// #1772: the file entry points carry each binder's code. Before #1772 they returned
+/// `String` and dropped it (`// #1772 removes`). The two cells of
+/// `each_binding_failure_of_the_check_carries_its_own_code`, written to files:
+///
+/// - a level block on `GRP` with `GRP` = 1, 2 (one subject per level) →
+///   `E_THETA_LEVEL_BINDING` on `parameters`;
+/// - a `levels = auto` relation with `GRP` = 2 on every subject, nothing to estimate →
+///   `E_COVARIATE_STATS_BINDING` on `covariate_model`.
+///
+/// Each cell goes through `prepare_run`, `fit_from_files` and `run_model_with_data`,
+/// whose `to_string()` is the binder's own message, and through `run_model_simulate`
+/// with the same `GRP` values as its `[simulation]` design.
+///
+/// Mutations: drop either binder's code with `.map_err(|e|
+/// EngineError::uncoded(e.to_string()))` at any of its six call sites
+/// (`prepare_run_with_inits`, `fit_from_files`, `run_model_simulate_with_overrides`) →
+/// that cell's code is `None` on the entry points through it, and the row names the
+/// entry (#2062 review: M4–M8).
+#[test]
+fn file_entry_points_carry_each_binders_code() {
+    use crate::diagnostics::EngineError;
+    let level_text = grp_auto()
+        .replace(
+            "  theta TVV(40.0, 1.0, 500.0)",
+            "  theta TVV(40.0, 1.0, 500.0)\n  theta PLACEBO[GRP](0.5, -5.0, 5.0)",
+        )
+        .replace("V  = TVV", "V  = TVV * exp(PLACEBO)");
+    let cells: [(&str, String, Vec<Option<f64>>, &str, &str); 2] = [
+        (
+            "level block",
+            level_text,
+            vec![Some(1.0), Some(2.0)],
+            "E_THETA_LEVEL_BINDING",
+            "parameters",
+        ),
+        (
+            "covariate statistic",
+            grp_auto(),
+            vec![Some(2.0); 4],
+            "E_COVARIATE_STATS_BINDING",
+            "covariate_model",
+        ),
+    ];
+    for (label, text, values, code, block) in cells {
+        let m = temp_model(&text);
+        let d = temp_cov_csv("GRP", &values);
+        let (mp, dp) = (
+            m.path().to_str().expect("utf-8 temp path"),
+            d.path().to_str().expect("utf-8 temp path"),
+        );
+        // The binder's own diagnostic on the same file and data: the reference text.
+        let report = crate::api::validate_model_file(mp, Some(dp));
+        let want = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.ends_with("_BINDING"))
+            .unwrap_or_else(|| panic!("{label}: check binds: {:?}", report.diagnostics));
+        assert_eq!(
+            want.code, code,
+            "{label}: the fixture trips the intended half"
+        );
+        let errs: [(&str, EngineError); 3] = [
+            (
+                "prepare_run",
+                crate::api::prepare_run(mp, Some(dp))
+                    .err()
+                    .expect("prepare_run refuses"),
+            ),
+            (
+                "fit_from_files",
+                crate::api::fit_from_files(mp, Some(dp), None, None)
+                    .expect_err("fit_from_files refuses"),
+            ),
+            (
+                "run_model_with_data",
+                crate::api::run_model_with_data(mp, Some(dp))
+                    .err()
+                    .expect("run_model_with_data refuses"),
+            ),
+        ];
+        for (entry, e) in &errs {
+            assert_eq!(e.code(), Some(code), "{label} via {entry}: {e}");
+            assert_eq!(e.block(), Some(block), "{label} via {entry}");
+            assert_eq!(e.to_string(), want.message, "{label} via {entry}: text");
+        }
+
+        // `run_model_simulate` binds the same blocks against its `[simulation]` design,
+        // whose `GRP` values are the data's.
+        let grp: Vec<String> = values.iter().map(|v| format!("{}", v.unwrap())).collect();
+        let sim = temp_model(&format!(
+            "{text}\n[simulation]\n  n_subjects = {}\n  dose_amt = 100\n  dose_cmt = 1\n  \
+             seed = 7\n  times = [1, 4, 12]\n  covariate GRP = [{}]\n",
+            values.len(),
+            grp.join(", "),
+        ));
+        let e = crate::api::run_model_simulate(sim.path().to_str().expect("utf-8 temp path"))
+            .err()
+            .expect("run_model_simulate refuses");
+        assert_eq!(e.code(), Some(code), "{label} via run_model_simulate: {e}");
+        assert_eq!(e.block(), Some(block), "{label} via run_model_simulate");
+        // The design reaches a different cell of the same binder than the data do (for
+        // the level block, `sum_to_zero`'s zero-init rule), so the text is pinned only to
+        // name what is at fault.
+        let names = if code == "E_THETA_LEVEL_BINDING" {
+            "theta PLACEBO["
+        } else {
+            "GRP"
+        };
+        assert!(
+            e.to_string().contains(names),
+            "{label} via run_model_simulate: {e}"
+        );
+    }
+}
+
 /// #1739 T9. A `[covariate_model]` statistic the data cannot bind is reported as
 /// `E_COVARIATE_STATS_BINDING` on block `covariate_model` — not as the level-block
 /// code `E_THETA_LEVEL_BINDING` on `parameters`, which sent the reader to the wrong

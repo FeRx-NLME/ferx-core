@@ -96,14 +96,14 @@
 //! | `E_FIT_INPUT_MODEL`       | the model a post-hoc step would run on is not the one the fit was made with: a supplied model bound with other data-derived bindings than `fit.data_bindings`, a supplied model whose covariate statistics the population does not reproduce (on a fit that recorded no bindings, #1729), a model whose η count is not the width of the fit's per-subject η̂, a `[mixture]` fit whose `packed_estimate` has another layout or no longer reproduces its reported estimates (#1815; `simulate_with_uncertainty` raises these too), or a covariance matrix that is not the size of the model's packed parameters (SIR's proposal; and `simulate_with_uncertainty`'s covariance or SIR resamples, #2044). No block. Raised by `run_sir` / `run_covariance` (#1774). Its θ count is `E_THETA_LENGTH`, its Ω / σ / Ω_IOV shape `E_PARAM_SHAPE` |
 //! | `E_SIR_OPTIONS`           | SIR settings the importance resampler cannot run with: `sir_resamples` above `sir_samples`, a `sir_df` that is not a valid Student-t degrees of freedom, or `sir_scale = natural` on a model with `prior(...)` (#1723). No block. Raised by `run_sir` (#1774); `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
 //! | `E_SIR_NOTHING_TO_SAMPLE` | every estimated parameter of the fit is FIX (θ, Ω and σ, and Ω_IOV, `block_sigma` correlations and `[mixture]` overrides where the model has them), so SIR has no free direction to propose in. Block `parameters`. Raised by `run_sir` (#1774); `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
-//! | `E_ODE_SOLVER_OPTIONS`    | ODE solver settings on a hand-built `FitOptions` that no solver can run with: an `ode_reltol` / `ode_abstol` that is not finite and positive, or `ode_max_steps = 0`. No block. Raised by `run_sir` / `run_covariance` through `with_fit_scope` (#2044), and `run_sir_core` returns the same text as a `String`; a model file's `[fit_options]` refuses the same values at parse time as `E_PARSE` |
+//! | `E_ODE_SOLVER_OPTIONS`    | ODE solver settings on a hand-built `FitOptions` that no solver can run with: an `ode_reltol` / `ode_abstol` that is not finite and positive, or `ode_max_steps = 0`. No block. Raised by `run_sir` / `run_covariance` through `with_fit_scope` (#2044) and by `fit()` through `install_on_fit_pool` (#1772), and `run_sir_core` returns the same text as a `String`; a model file's `[fit_options]` refuses the same values at parse time as `E_PARSE` |
 //! | `E_LOGIT_THETA_OUT_OF_RANGE` | a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly inside (0, 1), so it has no logit-scale draw; reachable only with a declared upper bound above 1, which the suggestion says to lower. Block `parameters`. Raised by `simulate_with_uncertainty` (asymptotic method) and `run_sir` (#2044). `Display` folds the suggestion in after the message, so `run_sir_core` and `draw_parameter_samples` return that text as a `String`, and `fit()`'s in-fit SIR reports it as a `SIR failed:` warning |
 //! | `E_ENDPOINT_TV_COVARIATE` | a covariate that varies within a subject is read by an endpoint that evaluates it at the baseline: an analytic hazard's own parameters, any covariate under an ODE-accumulated hazard, a `[binary_model]` predictor, a `[markov_model]` intensity (#741). Block is the endpoint's (`event_model` / `binary_model` / `markov_model`). Raised by `fit()`, `ferx check` (since #1774), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and the `simulate*` entry points |
 //! | `E_ENDPOINT_TIME_DEPENDENT_PK` | an ODE-accumulated hazard would integrate a `TIME`-dependent individual parameter (reaching it through the `[odes]` RHS or an `init()` seed) at its TIME=0 value (#1853), or, fail-closed, a hand-built model lacks the compiled programs that decide it. Block `event_model`. A function of the model alone. Raised by `fit()`, `ferx check` (without `--data`, since #1774), `predict` / `predict_diag` / `predict_survival` and the `simulate*` entry points; not `predict_categorical` |
 //! | `E_READOUT_DEPOT_UNSUPPORTED` | an analytic `[scaling] y` readout reads the oral `depot` amount on a subject dose superposition cannot reconstruct it for: an EVID=3/4 reset (#650) or a dose into a non-default compartment (#375). Block `scaling`. Raised by `fit()`, `ferx check` (since #1774) and `predict` / `predict_diag` |
 //! | `E_CTMM_UNSUPPORTED`      | a `[markov_model]` endpoint reached `predict` / `predict_diag` with no continuous observation, or a `simulate*` entry point; neither has an occupancy path (#759, #820). Block `markov_model`. Never by `ferx check` or `fit()`, which supports CTMM (#1774) |
 //! | `E_TTE_NOT_SIMULATABLE`   | a TTE endpoint the event-time simulator cannot draw for this population: two repeated-event streams on a subject, a repeated-event cause beside a single-event one, a reset under a repeated-event or ODE-accumulated hazard, left truncation under an ODE-accumulated hazard; or a repeated-event or ODE-accumulated TTE endpoint on `simulate_with_uncertainty`, which needs a horizon and takes none. Block `event_model`. Raised by the `simulate*` entry points (#1774) |
-//! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check still returns a `String` (#1772) |
+//! | `E_SIMULATE_HORIZON`      | the simulation horizon is missing where a repeated-event or ODE-accumulated TTE endpoint needs one (on an entry point that takes one; `simulate_with_uncertainty` gives `E_TTE_NOT_SIMULATABLE` instead), is not finite and positive, or lies below a subject's entry time. Raised by the `simulate*` entry points (#1774); `run_model_simulate`'s `[simulation]` check has no code yet (#1788) |
 //! | `E_PROPENSITY_INPUT`      | propensity-score matching was requested on a population it cannot compute posthoc etas from: empty, a subject with no observations, a non-finite `DV`. Raised by `simulate_with_options*` (#1774) |
 //! | `E_ADAPTIVE_UNSUPPORTED`  | a model the adaptive driver cannot simulate faithfully (no `[odes]`, an SDE, a covariate-selected `[error_model]`, a residual `correlation` line), an `auc_target` on a time-varying-covariate, IOV or reset subject, or a base regimen × EVID=3/4 reset under a time-varying covariate or IOV (before any subject runs). Once the driver runs (#1983): a base dose under a time-varying covariate or IOV that is not a plain bolus / infusion, a non-finite break time, a `TAD` / `TAFD` read before any dose. Block when one is at fault. Raised by `simulate_adaptive` / `simulate_adaptive_from_spec` (#1774) |
 //! | `E_ADAPTIVE_OPTIONS`      | `AdaptiveSimulateOptions` with no usable schedule (`decision_times` empty, not finite, not strictly increasing, or past `max_decisions`), a monitor compartment out of range, a `Dv` monitor on a compartment no `[error_model]` covers, or `decision_times` / `monitors` set beside a spec that owns them — all before any subject runs. Once the driver runs (#1983): two of a subject's times within 1e-15 of each other but not equal. Raised by the adaptive entry points (#1774) |
@@ -266,9 +266,11 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
     }
 }
 
-/// The error a non-`fit` entry point (`predict*`, `simulate*`, `compute_npde_npd`,
-/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca`) returns when it
-/// refuses its input (#1746).
+/// The error an entry point (`predict*`, `simulate*`, `compute_npde_npd`,
+/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca` since #1746; [`crate::fit`]
+/// and the file entry points built on it — [`crate::fit_from_files`],
+/// [`crate::prepare_run`], [`crate::run_model_with_data`], [`crate::run_model_simulate`]
+/// and their variants — since #1772) returns when it refuses its input or fails.
 ///
 /// When `ferx check` reports the same refusal with a code, the error carries that
 /// [`Diagnostic`] — so a caller matches on [`code`](Self::code) instead of parsing
@@ -314,6 +316,17 @@ impl EngineError {
             diagnostic: Some(d),
             context: None,
             suggestion_in_display: false,
+        }
+    }
+
+    /// An error carrying `d` for its code, block and line, whose message is `message`
+    /// rather than `d.message`: for a refusal whose historical text the diagnostic
+    /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
+    /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
+    pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
+        EngineError {
+            message,
+            ..EngineError::from_diagnostic(d)
         }
     }
 

@@ -214,7 +214,8 @@ fn imp_estimator_rejects_iov_models() {
 
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("estimating imp on an IOV model must be rejected (v1)");
+        .expect("estimating imp on an IOV model must be rejected (v1)")
+        .to_string();
     assert!(
         err.to_lowercase().contains("inter-occasion") || err.contains("IOV"),
         "expected IOV-not-supported error, got: {err}"
@@ -231,7 +232,8 @@ fn imp_estimator_rejects_invalid_proposal_df() {
     opts.imp_proposal_df = 0.0;
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("imp_proposal_df = 0 must be rejected");
+        .expect("imp_proposal_df = 0 must be rejected")
+        .to_string();
     assert!(
         err.contains("proposal_df"),
         "expected proposal_df error, got: {err}"

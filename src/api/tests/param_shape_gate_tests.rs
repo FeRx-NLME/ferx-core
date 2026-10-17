@@ -254,7 +254,8 @@ fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
         for cell in shape_cells(&model.default_params) {
             let p = &cell.params;
             let e = fit(&model, &pop, p, &short_fit()).expect_err("fit");
-            assert_eq!(e, cell.message, "fit, {}", cell.label);
+            assert_eq!(e.to_string(), cell.message, "fit, {}", cell.label);
+            assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "fit, {}", cell.label);
             let npde = crate::stats::npde::compute_npde_npd(&model, &pop, p, 20, Some(4), None);
             if cell.label == "Ω_IOV absent" {
                 // Documented κ = 0 fallback (#1019), pinned numerically in `stats::npde`.
@@ -321,8 +322,9 @@ fn fit_refuses_initial_theta_of_the_wrong_length() {
     for n in [1usize, 3] {
         let p = super::theta_length_gate_tests::with_theta_len(&model.default_params, n);
         let e = fit(&model, &pop, &p, &short_fit()).expect_err("fit");
+        assert_eq!(e.code(), Some("E_THETA_LENGTH"));
         assert_eq!(
-            e,
+            e.to_string(),
             format!(
                 "the supplied theta has {n} values but this model has 2; the model reads \
                  theta by position, so these values would be read against the wrong parameters"

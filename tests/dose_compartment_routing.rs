@@ -135,7 +135,8 @@ fn fit_rejects_an_unroutable_infusion() {
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&unroutable_infusion_csv());
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("an unroutable infusion must be an Err, not a panic");
+        .expect_err("an unroutable infusion must be an Err, not a panic")
+        .to_string();
     assert!(
         err.contains("compartment 0") && err.contains("two_cpt_oral"),
         "error should name the offending compartment and model: {err}"
@@ -537,7 +538,8 @@ fn pure_tte_high_cmt_dose_fit_refuses_the_model_blind_load() {
         ..FitOptions::default()
     };
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("a model-blind load of a TTE model is refused");
+        .expect_err("a model-blind load of a TTE model is refused")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
@@ -666,7 +668,8 @@ fn pure_tte_iov_high_cmt_dose_fit_refuses_the_model_blind_load() {
         ..FitOptions::default()
     };
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("a model-blind IOV load of a TTE model is refused");
+        .expect_err("a model-blind IOV load of a TTE model is refused")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
@@ -764,7 +767,8 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,2,0,1,70\n{obs}"
     ));
     let err = fit(&model, &bad, &model.default_params, &FitOptions::default())
-        .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction");
+        .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction")
+        .to_string();
     assert!(
         err.contains("phantom depot"),
         "the error should explain the phantom depot amount: {err}"
@@ -830,7 +834,8 @@ fn fit_rejects_an_ode_dose_past_the_declared_states() {
     let model = model_of(ODE_TWO_STATE);
     let pop = pop_of(&ode_csv(3));
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("a dose past the declared states must be an Err, not a silent drop");
+        .expect_err("a dose past the declared states must be an Err, not a silent drop")
+        .to_string();
     assert!(
         err.contains("compartment 3") && err.contains("only 2 state(s)"),
         "error should name the compartment and the declared state count: {err}"
