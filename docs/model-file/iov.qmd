@@ -421,10 +421,36 @@ Nested levels (more than one `level`) are estimated with `method = foce` or `foc
 
 - **Gradients are analytic.** The inner and outer gradients come from the same exact sensitivity walks as one-level IOV (compartment-free, closed-form and `[odes]` models), so the fit reports `gradient_method_inner` and `gradient_method_outer` as `analytic (Dual2)` and `optimizer = auto` takes its gradient-based choice. Each kappa's derivative lands on its own group's random effect: an arm's records move the arm kappa of that arm and the study kappa of its study, which every arm of the study shares. Two cases stay on finite differences and say so: a closed-form transit or inverse-Gaussian absorption model (`pk one_cpt_transit`, …), whose IOV subjects run on an ODE twin (`gradient_method_inner` reports `finite differences`, with the reason `nested variability levels on a closed-form transit/IG model`), and the covariance step, which finite-differences the objective.
 - **Other estimators are refused** with `E_NESTED_LEVEL_METHOD_UNSUPPORTED`: SAEM, IMP, IMPMAP, Bayes, VI, Laplace and FOCEI quadrature, GN, a `[mixture]` and FREM. Each is enabled later with its own anchor. A single level is not affected.
-- **Simulation is refused** with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`, on `simulate()` and the adaptive-dosing entry points: the simulator draws one kappa per occasion, and a kappa at an outer level must be drawn once per group.
-- **A residual `correlation … by` line** is refused with `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED`.
+- **Simulation** draws each kappa once per group of its level ([below](#nested-levels-simulation)). The adaptive-dosing entry points are refused with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: their kappa stream draws one kappa per occasion.
+- **A residual `correlation … by` line** is refused with `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED`, in the fit and in simulation.
 - **A `theta NAME[COL, …]` level block** whose levels each lie inside one group of a level that carries a kappa could absorb that kappa. The check that decides whether it does is not yet available for nested levels, so such a model is refused with `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`. A block whose levels cross those groups (`PLACEBO[TIME]`, say) fits as before.
-- **Post-fit output is per occasion cell.** Each distinct combination of labels (one arm of one study) is reported as one occasion: `FitResult.ebe_kappas` holds, per cell, the kappas that cell reads, so a study kappa appears once for each of its arms. Kappa shrinkage and the typical arm size are taken over those cells, not over the groups of each kappa's level. Output per level follows in a later release.
+- **Post-fit output is per level** ([below](#nested-levels-output)).
+
+### Output per level {#nested-levels-output}
+
+A kappa at a level has one estimate per group of that level, so each post-fit quantity is taken over those groups:
+
+| Output | What it holds |
+|---|---|
+| `FitResult.kappa_levels` | each kappa's level, parallel to `kappa_names` (`["STUDY", "ARM"]`) |
+| `FitResult.ebe_kappas_by_level` | per level, outermost first: the level's columns and kappas, and per subject each group's labels (`[1, 2]` = study 1, arm 2) and its estimates, each group once |
+| `FitResult.ebe_kappas` | unchanged: per subject, one vector per **cell** (one arm of one study) with the kappas that cell reads, so a study kappa repeats for each of its arms |
+| `shrinkage_kappa` | per kappa, pooled over the groups of its own level, not the cells. A group counts when a record of it informs the kappa (#1911): a study counts when any of its arms does. `shrinkage_kappa_by_occ` is empty, since an occasion slot would mix studies and arms |
+| `kappa_weight_typical` | the median weight over the groups of the kappa's level: one value per study for a weighted study kappa |
+| the KAPPA rows | the level after the name: `K_ST at STUDY = 0.040000 …`, `K_ST at STUDY [FIX]` when fixed; the rest of the row is unchanged |
+| the fit YAML | a `level:` line in each kappa's `omega_iov:` entry |
+| the sdtab | one column per kappa, named after it, with the estimate of the row's own group: `K_ST` is the study estimate, `K_ARM` the arm estimate |
+| `.fitrx` | one `ebes_kappa_<LEVEL>.csv` per level (`ID,GROUP,<label columns>,<kappas>`), listed in `fit.json`; a bundle written before this release loads with no per-level estimates |
+
+A model with a single level (`iov_column`, or one `level` line) has none of the additions, and its output is as before.
+
+### Simulation {#nested-levels-simulation}
+
+`simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` and the NPDE reference distribution draw each kappa once per group of its level, from that level's block of Ω~IOV~: one study kappa shared by every record of the study, one arm kappa per arm. The groups come from the level columns of the population being simulated, read as `fit()` reads them, so every record needs a numeric label at every level (`E_LEVEL_MISSING_LABEL`). A `[simulation]` design gives each subject one value per covariate, so even with `covariate STUDY = …` lines every subject has a single group at each level; simulate a nested model on a dataset that carries the level columns row by row.
+
+A kappa drawn per level reduces exactly to today's draw. A nested model whose kappas all live at one level simulates the same rows, bit for bit, as a one-level model whose `iov_column` labels that level's groups (`tests/nested_levels_simulate.rs`), and data simulated at the exact3 truth are refitted to the variance components they were drawn from (`tests/nested_levels_round_trip.rs`).
+
+A derived `iov_occasion` rule in `SimulateOptions` is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`, as in `fit()`: the levels define the groups.
 
 ### Validation against NONMEM {#nested-levels-nonmem}
 
@@ -547,7 +573,7 @@ That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's 
 - **Form C output (`[scaling] y = <expr>`) cannot reference `KAPPA_*` directly** under IOV — the `[scaling]` eta scope is between-subject only, so a bare kappa name would resolve to `kappa = 0`. The parser rejects it with a clear error (issue #107); put the occasion dependence in an `[individual_parameters]` entry (e.g. `BASE = TVBASE * exp(KAPPA_B)`, or a structural parameter such as `CL`) and reference *that* in the readout. Such a reference **is** occasion-correct: the readout is evaluated per observation with that observation's occasion κ, on both the ODE and the closed-form engine (fixed in #1079 for the closed-form engine, which previously evaluated the readout's individual parameters at `kappa = 0`). The PK dynamics themselves are always occasion-correct.
 - **Inner-loop and outer gradients come from the exact analytic sensitivity provider** within scope for IOV models — both the analytical 1-/2-/3-compartment models and user-`[odes]` IOV models with a compiled RHS, event-driven dosing, dose-only occasions, and a per-subject stacked axis count up to 96 (see [Inner loop](#inner-loop) and [Outer-loop gradient](#outer-loop-gradient-ebe-re-convergence-for-iov)). Steady-state IOV doses, `iiv_on_ruv`, FREM, an estimated lagtime, and above-cap axis counts still fall back to finite differences (per subject for the outer gradient).
 - The occasion column must hold non-negative whole numbers (`2.0` is occasion 2). A missing, fractional, negative or non-numeric value becomes `OCC = 0` and is counted in one `W_IOV_OCC_MISSING` warning.
-- Kappa EBEs are not yet emitted as columns in the sdtab CSV; access them via `FitResult.ebe_kappas`.
+- Kappa EBEs are not emitted as sdtab columns for a one-level model; access them via `FitResult.ebe_kappas`. A model with nested levels gets one column per kappa ([output per level](#nested-levels-output)).
 
 ## Comparison to NONMEM
 

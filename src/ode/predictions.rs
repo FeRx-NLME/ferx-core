@@ -5549,6 +5549,31 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
         if !stopped {
             if let Some(&decision_index) = decision_index_of.get(&t_start.to_bits()) {
+                // A diverged state has no value to decide on (#1578). Without this guard a
+                // `NaN` state reached the controller, which then failed on its own `NaN`
+                // amount (blamed as a controller action), held silently (`NaN < x` is false),
+                // or dosed on a `0` the `Dv` clamp fabricated from `NaN` — and the run
+                // returned `Ok`. Checked before any monitor, so it also covers a controller
+                // with no monitors that reads `ctx.state` directly. The value may come from the
+                // integration or straight from a seed (an `init()` at t=0, or the re-seed of an
+                // EVID=3/4 reset just before this hook), so the message names both sources.
+                // Runtime, uncoded: the model and its parameter draw produced it, not the
+                // caller's input.
+                if u.iter().any(|x| !x.is_finite()) {
+                    let names: Vec<&str> = u
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| !x.is_finite())
+                        .map(|(k, _)| ode.state_names.get(k).map_or("?", String::as_str))
+                        .collect();
+                    return Err(AdaptiveDriverError::Runtime(format!(
+                        "decision {decision_index} at t={t_start}: the ODE state is non-finite \
+                         ({}), so there is no value to decide on; an init() expression or the \
+                         [odes] right-hand side produced a non-finite value. Check them and the \
+                         parameter values.",
+                        names.join(", ")
+                    )));
+                }
                 // Covariate snapshot in effect at the decision time. On the TV path (#700,
                 // #1148) it is the row of the SAME in-force record `readout_pk` came from, so
                 // an `observe` / `[scaling]` expression that references a time-varying
@@ -5595,6 +5620,20 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             t_start,
                         ),
                     };
+                    // A finite state (guarded above) that reads out non-finite is a readout
+                    // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
+                    // expression that divides by zero, say. The `Dv` clamp below cannot
+                    // fabricate a `0` from it, since only an `ObsCmt` readout clamps and its
+                    // latent is a raw state component the state guard has already checked; this
+                    // guard keeps the controller from being handed the non-finite value itself.
+                    if !latent.is_finite() {
+                        return Err(AdaptiveDriverError::Runtime(format!(
+                            "decision {decision_index} at t={t_start}: monitor '{}' read a \
+                             non-finite value ({latent}) from a finite state. Check its readout \
+                             / observe expression.",
+                            m.name
+                        )));
+                    }
                     // Resolve the monitored signal on its own mode: Ipred is the
                     // latent readout; Dv adds the endpoint's assay residual draw on
                     // the controller-assay substream (#391 S1.5).
@@ -5635,8 +5674,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // `has_residual_error_for_cmt` (the gate behind `resid_var`)
                             // requires `sigma` to cover the model's σ indices, so a `Some`
                             // here is panic-free and structurally finite — no downstream
-                            // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
-                            // diverged IPRED) is whole-sim garbage-in, out of scope here.
+                            // finiteness guard. A diverged state or a non-finite readout never
+                            // gets here: both are refused above (#1578). A NaN/∞ in `sigma` is
+                            // still whole-sim garbage-in, out of scope here.
                             let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
                             let noised = latent + var.sqrt() * eps;
                             // Edge (b): an assay cannot read below zero; clamp the

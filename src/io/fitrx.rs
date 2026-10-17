@@ -795,6 +795,29 @@ struct IovWire {
     /// back to the log-normal CV%.
     #[serde(default)]
     kappa_param_types: Vec<String>,
+    /// Each kappa's level, parallel to `kappa_names`, for a model with nested levels
+    /// (#1082 PR4). Empty otherwise, and then not written, so every other bundle is
+    /// byte-identical; defaulted so a bundle written before #1082 PR4 still reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kappa_levels: Vec<String>,
+    /// The levels whose κ̂ are bundled, one `ebes_kappa_<LEVEL>.csv` each (#1082 PR4),
+    /// outermost first. Empty, and absent from the JSON, for every other model; a nested
+    /// bundle written before #1082 PR4 has none and loads with no per-level κ̂.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    levels: Vec<LevelWire>,
+}
+
+/// One level's entry in [`IovWire::levels`]: the shape of its `ebes_kappa_<LEVEL>.csv`.
+#[derive(Serialize, Deserialize)]
+struct LevelWire {
+    name: String,
+    columns: Vec<String>,
+    kappa_names: Vec<String>,
+}
+
+/// The bundle entry holding level `name`'s κ̂ (#1082 PR4).
+fn level_kappa_entry(name: &str) -> String {
+    format!("ebes_kappa_{name}.csv")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1002,6 +1025,16 @@ pub fn save_fit(
         entries.push("ebes_kappa.csv".into());
     }
 
+    // --- ebes_kappa_<LEVEL>.csv (nested levels, #1082 PR4) -----------------
+    if result.omega_iov.is_some() {
+        for level in &result.ebe_kappas_by_level {
+            let entry = level_kappa_entry(&level.level);
+            zip.start_file(entry.as_str(), zopts)?;
+            write_level_kappa_csv(&mut zip, result, level)?;
+            entries.push(entry);
+        }
+    }
+
     // --- conddist.csv (only when the SAEM conditional-distribution pass ran) ---
     if let Some(cd) = &result.cond_dist {
         zip.start_file("conddist.csv", zopts)?;
@@ -1178,6 +1211,16 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .iter()
                 .map(|&t| eta_param_type_to_str(t).into())
                 .collect(),
+            kappa_levels: r.kappa_levels.clone(),
+            levels: r
+                .ebe_kappas_by_level
+                .iter()
+                .map(|l| LevelWire {
+                    name: l.level.clone(),
+                    columns: l.columns.clone(),
+                    kappa_names: l.kappa_names.clone(),
+                })
+                .collect(),
         }),
         eta_param_info: r
             .eta_param_info
@@ -1316,6 +1359,128 @@ fn write_ebes_kappa_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxE
         }
     }
     Ok(())
+}
+
+/// One level's κ̂ (#1082 PR4): `ID,GROUP,<label columns…>,<kappas…>`, one row per group of
+/// the level per subject. `GROUP` is the group's 1-based position in its subject's list
+/// (first-record order); the label columns name it, outermost level first. A label is
+/// written in full (shortest round-trip form), since it identifies the group and must
+/// reload to the same bits; a κ̂ at the 6 decimals of `ebes_kappa.csv`, NaN as empty.
+fn write_level_kappa_csv<W: Write>(
+    w: &mut W,
+    r: &FitResult,
+    level: &crate::types::LevelKappaEbes,
+) -> Result<(), FitrxError> {
+    let mut header = String::from("ID,GROUP");
+    for c in level.columns.iter().chain(&level.kappa_names) {
+        header.push(',');
+        header.push_str(c);
+    }
+    writeln!(w, "{}", header)?;
+    for (s, groups) in r.subjects.iter().zip(&level.groups) {
+        for (gi, g) in groups.iter().enumerate() {
+            let mut row = csv_escape(&s.id);
+            row.push(',');
+            row.push_str(&(gi + 1).to_string());
+            for &v in &g.labels {
+                row.push(',');
+                row.push_str(&v.to_string());
+            }
+            for &v in &g.kappa {
+                row.push(',');
+                row.push_str(&fmt_f64(v));
+            }
+            writeln!(w, "{}", row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse one `ebes_kappa_<LEVEL>.csv` back into its groups, per subject in
+/// `subject_ids` order. Rows are placed by `GROUP`, which must run 1..n per subject.
+fn parse_level_kappa_csv(
+    csv: &str,
+    level: LevelWire,
+    subject_ids: &[String],
+) -> Result<crate::types::LevelKappaEbes, FitrxError> {
+    let entry = level_kappa_entry(&level.name);
+    let corrupt = |msg: String| FitrxError::Corrupt(format!("{entry}: {msg}"));
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or_else(|| corrupt("empty".into()))?;
+    let cols: Vec<&str> = header.split(',').collect();
+    let n_labels = level.columns.len();
+    let n_kappa = level.kappa_names.len();
+    let expected: Vec<&str> = ["ID", "GROUP"]
+        .into_iter()
+        .chain(level.columns.iter().map(String::as_str))
+        .chain(level.kappa_names.iter().map(String::as_str))
+        .collect();
+    if cols != expected {
+        return Err(corrupt(format!(
+            "header {header:?} does not match fit.json's level (expected {:?})",
+            expected.join(",")
+        )));
+    }
+    let by_id: HashMap<&str, usize> = subject_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let mut staged: Vec<Vec<(usize, crate::types::LevelGroupEbe)>> =
+        vec![Vec::new(); subject_ids.len()];
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = parse_csv_row(line);
+        if fields.len() != cols.len() {
+            return Err(corrupt(format!(
+                "row {} has {} fields, expected {}",
+                i + 1,
+                fields.len(),
+                cols.len()
+            )));
+        }
+        let idx = *by_id
+            .get(fields[0].as_str())
+            .ok_or_else(|| corrupt(format!("unknown ID {:?}", fields[0])))?;
+        let group = fields[1]
+            .parse::<usize>()
+            .ok()
+            .filter(|&g| g > 0)
+            .ok_or_else(|| corrupt(format!("row {}: bad GROUP {:?}", i + 1, fields[1])))?;
+        let num = |f: &String| {
+            f.parse::<f64>()
+                .map_err(|_| corrupt(format!("row {}: bad number {f:?}", i + 1)))
+        };
+        let labels = fields[2..2 + n_labels]
+            .iter()
+            .map(num)
+            .collect::<Result<_, _>>()?;
+        // An empty κ̂ cell is a NaN estimate, as the writer prints it (review r1 #3).
+        let kappa = fields[2 + n_labels..2 + n_labels + n_kappa]
+            .iter()
+            .map(|f| if f.is_empty() { Ok(f64::NAN) } else { num(f) })
+            .collect::<Result<_, _>>()?;
+        staged[idx].push((group, crate::types::LevelGroupEbe { labels, kappa }));
+    }
+    let mut groups = Vec::with_capacity(staged.len());
+    for (idx, mut rows) in staged.into_iter().enumerate() {
+        rows.sort_by_key(|(g, _)| *g);
+        if rows.iter().enumerate().any(|(n, (g, _))| *g != n + 1) {
+            return Err(corrupt(format!(
+                "subject {:?}: GROUP must run 1..n without gaps or repeats",
+                subject_ids[idx]
+            )));
+        }
+        groups.push(rows.into_iter().map(|(_, g)| g).collect());
+    }
+    Ok(crate::types::LevelKappaEbes {
+        level: level.name,
+        columns: level.columns,
+        kappa_names: level.kappa_names,
+        groups,
+    })
 }
 
 fn write_conddist_csv<W: Write>(w: &mut W, r: &FitResult, cd: &CondDist) -> Result<(), FitrxError> {
@@ -1507,7 +1672,29 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         Vec::new()
     };
 
+    // Nested levels (#1082 PR4): one `ebes_kappa_<LEVEL>.csv` per level fit.json names.
+    let mut wire = wire;
+    let level_wires = wire
+        .iov
+        .as_mut()
+        .map(|iov| std::mem::take(&mut iov.levels))
+        .unwrap_or_default();
+    let subject_ids: Vec<String> = subjects.iter().map(|s| s.id.clone()).collect();
+    let mut by_level = Vec::with_capacity(level_wires.len());
+    for level in level_wires {
+        let entry = level_kappa_entry(&level.name);
+        if archive.index_for_name(&entry).is_none() {
+            return Err(FitrxError::Corrupt(format!(
+                "fit.json names level `{}`, but the bundle has no {entry}",
+                level.name
+            )));
+        }
+        let csv = read_text(&mut archive, &entry)?;
+        by_level.push(parse_level_kappa_csv(&csv, level, &subject_ids)?);
+    }
+
     let mut fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    fit.ebe_kappas_by_level = by_level;
     fit.model_text = Some(model_source.clone());
     if let Some(csv) = conddist_csv.as_deref() {
         fit.cond_dist = Some(parse_conddist_csv(csv, &fit)?);
@@ -2329,6 +2516,31 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
                 n_kappa
             ));
         }
+        if !iov.kappa_levels.is_empty() && iov.kappa_levels.len() != n_kappa {
+            return bail(format!(
+                "iov.kappa_levels ({}) does not match iov.kappa_names ({})",
+                iov.kappa_levels.len(),
+                n_kappa
+            ));
+        }
+        // Each bundled level holds kappas `kappa_levels` puts at it (review r1 #11).
+        for level in &iov.levels {
+            for name in &level.kappa_names {
+                let at = iov
+                    .kappa_names
+                    .iter()
+                    .position(|k| k == name)
+                    .and_then(|k| iov.kappa_levels.get(k));
+                if at != Some(&level.name) {
+                    return bail(format!(
+                        "iov.levels names kappa `{name}` at level `{}`, but iov.kappa_levels \
+                         puts it at {}",
+                        level.name,
+                        at.map_or("no level".to_string(), |l| format!("`{l}`"))
+                    ));
+                }
+            }
+        }
         if !iov.kappa_param_types.is_empty() && iov.kappa_param_types.len() != n_kappa {
             return bail(format!(
                 "iov.kappa_param_types ({}) does not match iov.kappa_names ({})",
@@ -2405,6 +2617,7 @@ fn wire_to_fit_result(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         omega_iov_param_corr,
+        kappa_levels,
     ) = match w.iov {
         Some(iov) => {
             // `validate_parallel_lengths` has already ensured that
@@ -2434,6 +2647,7 @@ fn wire_to_fit_result(
                 iov.omega_iov_param_corr
                     .map(|m| m.into_dmatrix())
                     .transpose()?,
+                iov.kappa_levels,
             )
         }
         None => (
@@ -2448,6 +2662,7 @@ fn wire_to_fit_result(
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         ),
     };
 
@@ -2586,6 +2801,9 @@ fn wire_to_fit_result(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         ebe_kappas,
+        kappa_levels,
+        // Filled by `load_fit` from the `ebes_kappa_<LEVEL>.csv` entries.
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
         saem_mh_accept_tail: w.saem_mh_accept_tail,
@@ -4698,6 +4916,190 @@ mod tests {
         match err {
             FitrxError::Corrupt(msg) => assert!(msg.contains("1-based"), "msg = {}", msg),
             other => panic!("expected Corrupt, got {:?}", other),
+        }
+    }
+
+    // ── #1082 PR4: ebes_kappa_<LEVEL>.csv ────────────────────────────────────
+
+    fn arm_level() -> LevelWire {
+        LevelWire {
+            name: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+        }
+    }
+
+    fn corrupt_message(r: Result<crate::types::LevelKappaEbes, FitrxError>) -> String {
+        match r {
+            Err(FitrxError::Corrupt(msg)) => msg,
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Rows are placed by `GROUP`, not by file order.
+    #[test]
+    fn a_level_kappa_csv_places_its_rows_by_group() {
+        let csv = "ID,GROUP,STUDY,ARM,K_ARM\nS1,2,1,2,0.200000\nS1,1,1,1,0.100000\n\
+                   S2,1,2,1,-0.300000\n";
+        let l = parse_level_kappa_csv(csv, arm_level(), &["S1".into(), "S2".into()]).unwrap();
+        assert_eq!(l.level, "ARM");
+        assert_eq!(l.groups[0].len(), 2);
+        assert_eq!(l.groups[0][0].labels, [1.0, 1.0]);
+        assert_eq!(l.groups[0][1].kappa, [0.2]);
+        assert_eq!(l.groups[1][0].kappa, [-0.3]);
+    }
+
+    /// A NaN κ̂ is written as an empty cell and reads back as NaN; a label keeps every
+    /// digit (it names the group, which the sdtab matches by bits).
+    #[test]
+    fn a_level_kappa_csv_round_trips_a_nan_estimate_and_an_exact_label() {
+        let level = crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: vec![vec![
+                crate::types::LevelGroupEbe {
+                    labels: vec![1.0, 0.1234567],
+                    kappa: vec![f64::NAN],
+                },
+                crate::types::LevelGroupEbe {
+                    labels: vec![1.0, 1e-7],
+                    kappa: vec![0.25],
+                },
+            ]],
+        };
+        let mut r = minimal_fit_result();
+        r.subjects.truncate(1);
+        let mut buf = Vec::new();
+        write_level_kappa_csv(&mut buf, &r, &level).unwrap();
+        let csv = String::from_utf8(buf).unwrap();
+        let back = parse_level_kappa_csv(&csv, arm_level(), &[r.subjects[0].id.clone()]).unwrap();
+        let g = &back.groups[0];
+        assert!(g[0].kappa[0].is_nan(), "{csv}");
+        assert_eq!(g[1].kappa, [0.25]);
+        assert_eq!(g[0].labels[1].to_bits(), 0.1234567f64.to_bits(), "{csv}");
+        assert_eq!(g[1].labels[1].to_bits(), 1e-7f64.to_bits(), "{csv}");
+    }
+
+    /// A one-level fit's `fit.json` carries neither new key, so its bundle is the bytes it
+    /// was before #1082 PR4 (review r1 #12).
+    #[test]
+    fn a_one_level_fit_json_has_no_level_keys() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K".into()];
+        r.kappa_fixed = vec![false];
+        let json = serde_json::to_string(&build_fit_wire(&r)).unwrap();
+        assert!(json.contains("\"kappa_names\""), "{json}");
+        assert!(!json.contains("kappa_levels"), "{json}");
+        assert!(!json.contains("\"levels\""), "{json}");
+    }
+
+    #[test]
+    fn a_level_list_must_agree_with_kappa_levels() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K_ARM".into()];
+        r.kappa_fixed = vec![false];
+        r.kappa_levels = vec!["STUDY".into()];
+        r.ebe_kappas_by_level = vec![crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: Vec::new(),
+        }];
+        let msg = validate_parallel_lengths(&build_fit_wire(&r))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("iov.levels names kappa `K_ARM` at level `ARM`, but iov.kappa_levels puts it at `STUDY`"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_level_kappa_csv_must_match_its_level_and_number_its_groups_from_one() {
+        let ids = ["S1".to_string()];
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,ARM,K_ARM\nS1,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("ebes_kappa_ARM.csv: header"), "{msg}");
+        assert!(msg.contains("ID,GROUP,STUDY,ARM,K_ARM"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS1,2,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("GROUP must run 1..n"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS1,0,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("bad GROUP"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS9,1,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("unknown ID"), "{msg}");
+    }
+
+    /// fit.json names each bundled level; a bundle that names one and lacks its CSV is
+    /// corrupt rather than loading with that level silently empty.
+    #[test]
+    fn a_bundle_naming_a_level_without_its_csv_is_corrupt() {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K_ARM".into()];
+        r.kappa_fixed = vec![false];
+        r.kappa_levels = vec!["ARM".into()];
+        let group = |v: f64| crate::types::LevelGroupEbe {
+            labels: vec![1.0, 1.0],
+            kappa: vec![v],
+        };
+        r.ebe_kappas_by_level = vec![crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: r.subjects.iter().map(|_| vec![group(0.25)]).collect(),
+        }];
+        let ids: Vec<&str> = r.subjects.iter().map(|s| s.id.as_str()).collect();
+        let p = dummy_population(&ids, 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let whole = load_fit(&path).unwrap();
+        assert_eq!(whole.fit.kappa_levels, ["ARM"]);
+        assert_eq!(whole.fit.ebe_kappas_by_level, r.ebe_kappas_by_level);
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let patched = dir.path().join("nested-no-level-csv.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            if name == "ebes_kappa_ARM.csv" {
+                continue;
+            }
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&buf).unwrap();
+        }
+        zw.finish().unwrap();
+        match load_fit(&patched) {
+            Err(FitrxError::Corrupt(msg)) => assert!(
+                msg.contains(
+                    "fit.json names level `ARM`, but the bundle has no ebes_kappa_ARM.csv"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
         }
     }
 

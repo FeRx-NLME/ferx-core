@@ -1601,7 +1601,13 @@ impl CmtConsumer {
                 if let Some(ar) = model.analytic_readout.as_ref() {
                     set.extend(per_cmt(&ar.readout));
                 }
-                keys(set, "[scaling] y[CMT=N]", "scaling")
+                // A compartment-free model writes its `y[CMT=N]` entries in
+                // `[structural_model]`; it has no `[scaling]` block (#1827).
+                if model.is_algebraic() {
+                    keys(set, "[structural_model] y[CMT=N]", "structural_model")
+                } else {
+                    keys(set, "[scaling] y[CMT=N]", "scaling")
+                }
             }
             // Already an *error*, not a warning: `E_ENDPOINT_NO_RECORDS` reports a
             // declared endpoint with no row routed to it, so reporting it here would
@@ -1975,23 +1981,15 @@ fn check_iov_occasions(
     .with_block("fit_options")]
 }
 
-/// The data checks of a model with nested levels (#1082), in this order:
-///
-/// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
-///   column. Every record needs its full label path, since its group at each level is
-///   identified by that path.
-/// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
-///   its parent, with a κ that has the same readers as a random effect of the parent
-///   level. That κ is then the parent's random effect by another name, and the two
-///   variances cannot be told apart. A level where some parents have several members
-///   is identified and is not refused.
-/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
-///   levels each lie within one group of a level that carries a κ (the innermost such
-///   level is named). The block could then absorb that κ, and the level-block binder
-///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
-///   block whose levels cross those groups cannot absorb the κ and binds as before.
-fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
-    use crate::stats::nested_levels::{label_path, record_paths, RecordKind};
+/// `E_LEVEL_MISSING_LABEL` (the first rule of [`check_nested_levels`]): the first record
+/// of a nested model with no value in a level column. Shared with the simulate
+/// chokepoint (#1082 PR4), which groups the κ draw by those labels and needs nothing
+/// else `check_nested_levels` asks of a fit.
+pub(crate) fn check_level_labels(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::{record_paths, RecordKind};
     let Some(levels) = model.nested_levels() else {
         return Vec::new();
     };
@@ -2036,6 +2034,33 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
             )
             .with_block("parameters")];
         }
+    }
+    Vec::new()
+}
+
+/// The data checks of a model with nested levels (#1082), in this order:
+///
+/// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
+///   column. Every record needs its full label path, since its group at each level is
+///   identified by that path.
+/// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
+///   its parent, with a κ that has the same readers as a random effect of the parent
+///   level. That κ is then the parent's random effect by another name, and the two
+///   variances cannot be told apart. A level where some parents have several members
+///   is identified and is not refused.
+/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
+///   levels each lie within one group of a level that carries a κ (the innermost such
+///   level is named). The block could then absorb that κ, and the level-block binder
+///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
+///   block whose levels cross those groups cannot absorb the κ and binds as before.
+fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::label_path;
+    let Some(levels) = model.nested_levels() else {
+        return Vec::new();
+    };
+    let missing = check_level_labels(model, population);
+    if !missing.is_empty() {
+        return missing;
     }
 
     // Per level, whether every parent group holds at most one of its groups, on the
@@ -2340,6 +2365,11 @@ pub(crate) fn with_derived_occasions<'a>(
     population: &'a Population,
     rule: Option<&IovOccasionRule>,
 ) -> std::borrow::Cow<'a, Population> {
+    // A nested model's groups are its level cells (#1082 PR4), which no rule regroups:
+    // `fit()` refuses a derived rule on one, and `simulate_with_options_diag` too.
+    if model.has_nested_levels() {
+        return crate::stats::nested_levels::with_level_cells(model, population);
+    }
     match rule {
         Some(rule) if model.n_kappa > 0 && *rule != IovOccasionRule::Column => {
             let mut derived = population.clone();

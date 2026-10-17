@@ -37,6 +37,14 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime: a subject's posthoc EBE is non-finite",
     ),
     (
+        "src/stats/nested_levels.rs",
+        "of",
+        1,
+        "internal only (#1082 PR4): `KappaDraw::of` on a nested subject without its level \
+         cells; every simulate and NPDE entry point assigns them after refusing a record with \
+         no label (`E_LEVEL_MISSING_LABEL`), so only a caller bypassing those reaches it",
+    ),
+    (
         "src/estimation/uncertainty_samples.rs",
         "draw_asymptotic",
         2,
