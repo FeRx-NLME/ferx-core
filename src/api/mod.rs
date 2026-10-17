@@ -377,6 +377,11 @@ mod ode_solver_options_tests;
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
 
+// #1605: a zero ω / κ draws exactly zero in every simulation consumer.
+#[cfg(test)]
+#[path = "tests/sim_zero_omega_tests.rs"]
+mod sim_zero_omega_tests;
+
 // #1853: an ODE-accumulated hazard integrates one `TIME = 0` `$PK` snapshot, so a
 // `TIME`-dependent disposition / `init()` is refused — the `TIME` axis of #741's freeze.
 #[cfg(all(test, feature = "survival"))]

@@ -956,10 +956,14 @@ fn emit_subject_rows<R: rand::Rng>(
         // the subject carries no occasion labels, in which case `predict_iov`
         // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
         let n_groups = crate::stats::stacked_layout::group_count(subject);
+        let kappa_factor = omega_iov.sim_draw_factor(
+            model.default_params.omega_iov.as_ref(),
+            &model.default_params.kappa_fixed,
+        );
         let kappas: Vec<Vec<f64>> = (0..n_groups)
             .map(|_| {
                 let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
-                (&omega_iov.chol * DVector::from_column_slice(&z))
+                (&*kappa_factor * DVector::from_column_slice(&z))
                     .iter()
                     .copied()
                     .collect()
@@ -1305,6 +1309,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
+    // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`.
+    let eta_factor = params.omega.sim_draw_factor(
+        Some(&model.default_params.omega),
+        &model.default_params.omega_fixed,
+    );
 
     let mut results = Vec::new();
 
@@ -1319,7 +1328,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
                         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        &params.omega.chol * DVector::from_column_slice(&z)
+                        &*eta_factor * DVector::from_column_slice(&z)
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1355,7 +1364,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
-                    let eta = &params.omega.chol * z_vec;
+                    let eta = &*eta_factor * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);

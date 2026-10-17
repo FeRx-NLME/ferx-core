@@ -659,6 +659,13 @@ where
     // into an inactive sink on every path a user could take.
     let stats_scope = super::solver_stats_scope(model);
 
+    // η (and κ below) are drawn from the declared Ω, a zero η exactly 0 (#1605). The
+    // verifier's κ re-draw resolves its factor through the same call.
+    let eta_factor = params.omega.sim_draw_factor(
+        Some(&model.default_params.omega),
+        &model.default_params.omega_fixed,
+    );
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for subject in &population.subjects {
@@ -666,7 +673,7 @@ where
             // **baseline** window — the parameters before the first decision, and
             // the reactive driver's fixed eta on a non-IOV run.
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let eta = &params.omega.chol * DVector::from_column_slice(&z);
+            let eta = &*eta_factor * DVector::from_column_slice(&z);
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
@@ -685,6 +692,10 @@ where
                     .omega_iov
                     .as_ref()
                     .expect("omega_iov present when n_kappa > 0");
+                let kappa_factor = omega_iov.sim_draw_factor(
+                    model.default_params.omega_iov.as_ref(),
+                    &model.default_params.kappa_fixed,
+                );
                 let kappa_base =
                     crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
                 let n_occ = decision_times.len();
@@ -698,7 +709,7 @@ where
                     let zk: Vec<f64> = (0..model.n_kappa)
                         .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
                         .collect();
-                    let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+                    let kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
                     let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
                     e.extend(kappa_g.iter().copied());
                     // PK at decision g under occasion g's κ, at the covariate the
@@ -1060,6 +1071,12 @@ pub(crate) fn verify_adaptive_snapshots(
              invariant violation (#748)"
                 .to_string()
         })?;
+        // The build loop's factor (#1605): a re-draw from bare `chol` would disagree
+        // with it on every zero κ and fail the bit-equality below.
+        let kappa_factor = omega_iov.sim_draw_factor(
+            model.default_params.omega_iov.as_ref(),
+            &model.default_params.kappa_fixed,
+        );
         let kappa_base =
             crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
         let n_occ = decision_times.len();
@@ -1082,7 +1099,7 @@ pub(crate) fn verify_adaptive_snapshots(
             let zk: Vec<f64> = (0..model.n_kappa)
                 .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
                 .collect();
-            let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+            let kappa_g = &*kappa_factor * DVector::from_column_slice(&zk);
             let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
             e.extend(kappa_g.iter().copied());
 
