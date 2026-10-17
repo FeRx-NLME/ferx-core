@@ -5711,23 +5711,24 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
     // numbers are right — they are not — and it does not pin agreement with `predict()`,
     // which would lock in the frozen output as if it were correct.
     //
-    // #1570 review, row 2 — the second schedule's first decision is at 18. `X` diverges in
-    // `(0, 2]`, so the window after the observation at 6, `(6, 18]`, starts from the solver's
-    // pad (`X` non-finite, `central` frozen at 0) with the clock still unanchored. At
-    // `494a7af3` such a window was refused — "the segment … integrated to a non-finite state,
-    // and the [odes] RHS reads `TAD`" — pinning `X`'s earlier divergence on the clock; a state
-    // with a non-finite component is no longer probed. That schedule used to hold at 12 and dose
-    // at 36; since #1578 a decision at 12 is refused on its non-finite state before `(12, 36]`
-    // is integrated, so the first decision moved to 18 to keep a padded window running ahead of
-    // the state guard (#1578 review, finding 5). Not 36: `(0, 36]` crosses `TIME > 20`, where
-    // the RHS really does read the unanchored `TAD`, and the dose-clock refusal there is right.
+    // #1570 review, row 2 — the second schedule's first decision is at 18. Observations do not
+    // split the driver's segments (they are read off one), so this leg integrates a single
+    // segment, `(0, 18]`, **from the finite seed**, entirely inside `TIME ≤ 20`: `X` diverges in
+    // it, the model mentions `TAD` only in the branch it never takes, and the state guard refuses
+    // at 18 while the dose clock does not. Not 36: `(0, 36]` crosses `TIME > 20`, where the RHS
+    // really does read the unanchored `TAD`, and the dose-clock refusal there is right (#1578
+    // review, finding 5). That schedule used to hold at 12 and dose at 36, so that `(12, 36]`
+    // started from the solver's pad with the clock unanchored — the shape #1570 row 2 fixed. Since
+    // #1578 the decision at 12 refuses before that window runs, and no test now reaches a window
+    // that *starts* from a pad: that needs a segment break after the divergence and before the
+    // first decision (#2089).
     //
     // Mutation that reddens it: drop the dependence test from `unanchored_dose_clock_error` —
     // refuse whenever the clock is read and unanchored (it was the `resolve_with_finite_clock`
     // conjunct before #1535) — for both schedules. It does **not** kill "probe `u_start`
-    // whatever its components" (drop the all-finite filter in `unanchored_clock_dependence`):
-    // measured surviving at `60cbec31` (the #1578 review) and after #1578 with the second
-    // schedule at 18.
+    // whatever its components" (drop the all-finite filter in `unanchored_clock_dependence`),
+    // which needs the padded-start window above: measured surviving at `60cbec31` (the #1578
+    // review) and after #1578 with the second schedule at 18 (#2089).
     let model =
         parse_model_string(ODE_TAD_PLUS_DIVERGENT_STATE).expect("parse divergent-state model");
     let obs = vec![0.0, 6.0, 20.0, 40.0];
