@@ -550,6 +550,35 @@ fn fit_carries_the_options_check_code() {
     assert_eq!(err.to_string(), want.message);
 }
 
+/// #2062 review 2, F2: ODE solver settings no solver can run with reach `fit()` as
+/// `E_ODE_SOLVER_OPTIONS`, the code `run_sir` / `run_covariance` give them (#2044). The
+/// check runs in `install_on_fit_pool` before any start, so the single-start and the
+/// multi-start installs are both cells. Mutation: map `install_on_fit_pool`'s
+/// `validate()` through `EngineError::uncoded` → `None` on both.
+#[test]
+fn fit_carries_the_ode_solver_options_code() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    for n_starts in [1, 2] {
+        let opts = FitOptions {
+            ode_reltol: -1.0,
+            n_starts,
+            ..FitOptions::default()
+        };
+        let err = fit(&model, &pop, &model.default_params, &opts).expect_err("ode_reltol = -1");
+        assert_eq!(
+            err.code(),
+            Some("E_ODE_SOLVER_OPTIONS"),
+            "n_starts = {n_starts}: {err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("ode_reltol must be finite and positive"),
+            "n_starts = {n_starts}: {err}"
+        );
+    }
+}
+
 /// #1772: the file entry points code their reads and binders as `ferx check` does. A
 /// model file that does not exist is `E_MODEL_READ` (`fit_from_files`, `prepare_run`,
 /// `run_model_simulate`); a dataset missing a covariate the model reads is

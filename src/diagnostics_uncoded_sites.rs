@@ -92,12 +92,19 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/api/fit.rs",
         "fit_unstamped",
-        19,
+        17,
         "fit()-only refusals with no ferx check code yet (#1788): mixture options (4), RTTE \
          records, binary states, CTMM states/times and a Q(t) with no ODE (3), LTBS on a \
          hand-built model (3), iiv_on_ruv (2), the AGQ grid under IOV, a derived iov_occasion \
-         giving one occasion; ODE solver options (FitScope::validate, #2044) at the two pool \
-         installs; runtime: every multi-start failed",
+         giving one occasion; runtime: every multi-start failed (a coded refusal every start \
+         shares is flattened here, #2073)",
+    ),
+    (
+        "src/api/pool.rs",
+        "install_on_fit_pool",
+        3,
+        "runtime: the fit's worker pool could not be built (scoped, shared or leased); its \
+         ODE-option refusal is coded (#2044)",
     ),
     (
         "src/api/fit.rs",

@@ -179,7 +179,7 @@ found:
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
 | the covariance matrix or SIR resamples to draw from (`simulate_with_uncertainty()`): not on the fit, or an empty pool; not the size of the model's packed parameters | `E_FIT_INPUT_MISSING`; `E_FIT_INPUT_MODEL` |
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
-| ODE solver settings on a `FitOptions` built in code (`run_sir()`, `run_covariance()`) | `E_ODE_SOLVER_OPTIONS` |
+| ODE solver settings on a `FitOptions` built in code (`fit()`, `run_sir()`, `run_covariance()`) | `E_ODE_SOLVER_OPTIONS` |
 | a logit-scaled θ estimated outside (0, 1) (`simulate_with_uncertainty()` with the asymptotic method, `run_sir()`) | `E_LOGIT_THETA_OUT_OF_RANGE` |
 | re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 

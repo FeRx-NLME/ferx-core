@@ -306,7 +306,8 @@ fn fit_routing_rejects_invalid_programmatic_ode_options() {
     ] {
         let err = install_on_fit_pool(&options, || panic!("invalid options reached the fit"))
             .expect_err("invalid Rust API options");
-        assert!(err.contains(field), "{err}");
+        assert_eq!(err.code(), Some("E_ODE_SOLVER_OPTIONS"), "{err}");
+        assert!(err.to_string().contains(field), "{err}");
     }
 }
 

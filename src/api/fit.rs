@@ -998,7 +998,7 @@ fn fit_unstamped(
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
         // rather than turning a previously-successful default fit into an `Err`.
-        let res = install_on_fit_pool(options, run).map_err(EngineError::uncoded)?;
+        let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
             // Surface any SS-equilibration non-convergence seen during this (default, single-start)
@@ -1074,7 +1074,7 @@ fn fit_unstamped(
     // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
     // shared big-stack pool; fall back to the ambient pool only if that one-time build failed.
     let results: Vec<(usize, Result<FitResult, EngineError>)> =
-        install_on_fit_pool(options, par_starts).map_err(EngineError::uncoded)?;
+        install_on_fit_pool(options, par_starts)?;
 
     // Pick the best start (see `multistart_prefers` for the ranking). Under
     // covariate-NN regularization every start minimised the *penalized*
