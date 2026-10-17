@@ -77,6 +77,22 @@ pub(crate) fn block_diag_stack(
     m
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Layouts built on this thread — every [`StackedLayout::new`] and
+    /// [`NestedLayout::of`]. The layout depends on the subject alone, so a search that
+    /// rebuilds it per objective or gradient evaluation is invisible in its numbers; tests
+    /// that pin "built once per EBE search" (#2037) read this instead.
+    pub(crate) static LAYOUT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one layout build (test builds only); see `LAYOUT_BUILDS`.
+#[inline]
+pub(crate) fn count_build() {
+    #[cfg(test)]
+    LAYOUT_BUILDS.with(|c| c.set(c.get() + 1));
+}
+
 /// One subject's stacked `[η_bsv, κ…]` layout. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct StackedLayout {
@@ -93,6 +109,7 @@ pub(crate) struct StackedLayout {
 impl StackedLayout {
     /// The layout of `subject` for `n_eta` between-subject and `n_kappa` per-group effects.
     pub(crate) fn new(n_eta: usize, n_kappa: usize, subject: &Subject) -> Self {
+        count_build();
         let groups = crate::stats::likelihood::iov_occasion_groups(subject);
         let occ_to_group = crate::stats::likelihood::iov_occ_to_k(&groups);
         Self {
@@ -202,6 +219,16 @@ impl StackedLayout {
                 .map(|g| ((0..self.n_kappa).collect(), self.kappa_offset(g)))
                 .collect(),
         }
+    }
+
+    /// The compact layout of a model with nested levels, set only by [`Self::sens_of`].
+    pub(crate) fn nested(&self) -> Option<&NestedLayout> {
+        self.nested.as_ref()
+    }
+
+    /// Width of the between-subject block.
+    pub(crate) fn n_eta(&self) -> usize {
+        self.n_eta
     }
 
     /// Width of one κ block.

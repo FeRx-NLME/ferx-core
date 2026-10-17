@@ -252,7 +252,8 @@ above.
 | `RATE=-1` infusion under `F ≠ 1` | both | both | — |
 | SS + non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) | ODE | both | a non-autonomous field breaks the steady-state cycle recurrence |
 | observation / reset / covariate change exactly on a lagged arrival | closed-form | both | the walk resolves one dual position per break time |
-| model wider than the size caps (`θ + η` > 24 ODE / > 32 closed-form event walk) | both | both | too wide to monomorphise |
+| model wider than the ODE size cap (`θ + η` > 24) | ODE | outer | too wide to monomorphise; the inner η-gradient is sized on `η` alone and goes FD only past 24 η (#1804) |
+| model wider than the closed-form event-walk cap (`θ + η` > 32) | closed-form | both | too wide to monomorphise |
 
 A **steady-state dose into a `zero_order` window** and a **steady-state dose combined with an
 absorption lagtime** are not on this list because they are not served at all: both are rejected
@@ -294,6 +295,8 @@ The practical consequence is that at *exactly* such a coincidence an analytic gr
 Two scope limits were also widened (#486). A `[scaling] y = <expr>` **Form-C readout** whose individual parameters spill past the eight structural PK slots (e.g. a sigmoid-Emax readout on a 3-compartment oral model, which exhausts them immediately) is now analytic on the time-varying-covariate walk rather than FD. And the **model-size caps** that decide when a model is too wide to monomorphise the exact gradient were raised: `θ + η` from 16 to 24 on the ODE and output-scaling paths, and from 24 to 32 on the closed-form event walk. The old limit was tighter than it looked — a mid-sized covariate model (5 structural θ + 6 covariate-effect θ + 5 η) sat at exactly 16, so adding one more covariate silently dropped the entire fit to finite differences. Beyond the raised caps the fallback is still FD (correct, just slower).
 
 The number of **individual parameters** is no longer a limit on ODE models (#1661). The cheaper of the two ODE sensitivity walks gives every individual parameter its own derivative direction and stops at 12. Until #1661 that cap declined the whole model, so a model with more than 12 individual parameters ran entirely on finite differences even when only `θ + η` was small. Data-copied PK parameters, constants such as a modeled duration `D1`, and `F` scalings used to start a compartment at baseline all count towards that 12. A model past 12 now takes the event-driven walk instead, sized on `θ + η` (up to 24). That covers every subject the ODE sensitivity provider serves. A modified-release subject that qualifies for the closed-form release-curve fast path still takes that path first, which is analytic too. On a reported 19-parameter PK/PD model with 8 θ and 4 η, the first objective evaluation took 16 s instead of 70 s. The finite-difference inner loop had also left 61 of 165 subjects at visibly worse EBEs.
+
+On ODE models the `θ + η` cap of 24 now bounds only the **outer** gradient (#1804). The inner EBE search differentiates with respect to η alone, so its sensitivity walk is sized on the η count and stays analytic up to 24 η, however many θ the model carries. FIX θ count towards `θ + η` just like estimated ones, so before #1804 a covariate model with many fixed effects could cross the cap without estimating anything new, and every subject's EBE search then ran on finite differences. On a 2-compartment oral ODE model with 10 axes, padding it to 25 axes with zero-effect FIX θ left the likelihood mathematically unchanged but moved the objective at the start values by 16.02, because the finite-difference inner stopped one subject at a worse EBE. The 24- and 25-axis variants now give bit-identical objectives, per-subject contributions and EBEs (`tests/ode_inner_past_axis_cap.rs`). Past the cap the outer gradient is still FD. The ODE output-scaling (`[scaling]`) path follows the same rule. The closed-form event walk and closed-form IOV are not covered by this change (#1907).
 
 ### Non-finite individual objectives {#non-finite-individual-objectives}
 
@@ -545,7 +548,7 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
   covariance_method = rsr
 ```
 
-`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite covariance Hessian, analytic R-matrix or FD stencil alike (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
+`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. `s` builds no `R` (#1803): `S⁻¹` reads only the per-subject scores, so it needs a full-rank `S` and nothing else, and it costs one pass over those scores instead of the `2n²` re-converged objective evaluations of `R`'s finite-difference stencil. An `R` with no usable curvature therefore no longer fails an `s` step whose `S⁻¹` exists. `rsr` reads both matrices and still needs a positive-definite `R`.
 
 #### NONMEM cross-check (S / RSR, FOCEI)
 

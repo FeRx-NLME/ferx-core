@@ -597,6 +597,7 @@ fn joint_pktte_event_times_match_model_survival() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("PIT simulation must succeed");
@@ -729,6 +730,7 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("joint PK-TTE simulation under SS dosing must succeed");
@@ -868,6 +870,7 @@ fn joint_pktte_sse_recovers_pk_and_omega() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("joint PK-TTE simulation must succeed");
@@ -1032,6 +1035,7 @@ fn rtte_forward_event_times_match_model_survival() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("RTTE PIT simulation must succeed");
@@ -1137,6 +1141,7 @@ fn rtte_sampler_injects_correct_frailty_variance() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("RTTE simulation must succeed");
@@ -1187,6 +1192,7 @@ fn rtte_sse_forward_exponential_recovers_rate() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("RTTE simulation must succeed");
@@ -1261,6 +1267,7 @@ fn rtte_sse_forward_gompertz_declining_recovers_negative_gamma() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
         .expect("declining-Gompertz RTTE simulation must succeed");

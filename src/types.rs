@@ -7103,6 +7103,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("w_iov_no_occasions") {
+        // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
+        // A simulated subject handled specially, like the arm above; matched on its token
+        // so no prose arm has to stay clear of its wording.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted
@@ -7481,8 +7486,12 @@ pub struct FitResult {
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
     pub nlopt_missing_algorithms: Vec<String>,
-    /// Estimated OFV evaluations for the covariance step (n_params²), set
-    /// when `run_covariance_step = true` and `n_parameters > 30`.
+    /// Estimated OFV evaluations for the covariance step's `R` matrix on the
+    /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
+    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
+    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
+    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
+    /// applies, which evaluates none of them.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -8213,7 +8222,7 @@ pub struct FitOptions {
     /// default. Exists only so the high-dimension routing guard (#1064) can
     /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
     /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
-    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// subject's EBEs at each of `2·n²` objective evaluations, so a *defaulted*
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
@@ -9587,9 +9596,10 @@ pub const BOBYQA_MAX_DIM: usize = 64;
 /// routes to the cross-product (#1064).
 ///
 /// The `R` matrix is a finite-difference Hessian of the objective that
-/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
-/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
-/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+/// reconverges every subject's EBEs at each of `2·n²` objective
+/// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
+/// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`
+/// builds no `R` (#1803) and needs one pass.
 pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method

@@ -1078,22 +1078,37 @@ pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interactio
 /// either the static superposition walk ([`ode_subject_supported`]) or the
 /// event-driven TV-cov walk ([`ode_tvcov_supported`]). Both are wired in
 /// [`ode_subject_eta_grad`], so the inner EBE loop takes the analytic η-gradient
-/// for TV-cov subjects too, matching the outer scope rather than splitting to an
-/// FD inner (#410; #449 review — the TV-cov inner gate was previously missing).
+/// for TV-cov subjects too, rather than splitting to an FD inner (#410; #449 review —
+/// the TV-cov inner gate was previously missing).
+///
+/// Both gates are asked in the **inner** scope (`OdeGradScope::Inner`, #1804): the walks
+/// behind [`ode_subject_eta_grad`] seed η alone, so `n_theta` does not bound them. Every
+/// subject the outer gradient serves is served here; past `MAX_ODE_AXES` total axes the
+/// reverse is not true, and the outer goes FD while this stays analytic.
 ///
 /// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported
 /// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
 /// [`ode_subject_eta_grad`]: crate::sens::ode_provider::ode_subject_eta_grad
 pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    use crate::sens::ode_provider::OdeGradScope;
     ODE_SENS_ENABLED
-        && (crate::sens::ode_provider::ode_subject_supported(model, subject)
-            || crate::sens::ode_provider::ode_tvcov_supported(model, subject))
+        && (crate::sens::ode_provider::ode_subject_supported_in(
+            model,
+            subject,
+            OdeGradScope::Inner,
+        ) || crate::sens::ode_provider::ode_tvcov_supported_in(
+            model,
+            subject,
+            OdeGradScope::Inner,
+        ))
 }
 
 /// Model-level umbrella for [`ode_inner_grad_supported`]: whether the light `Dual1`
 /// ODE inner η-gradient can serve the *best-case* subject of this model. Both
 /// per-subject gates ([`ode_subject_supported`], [`ode_tvcov_supported`]) require
-/// [`ode_analytical_supported`] as their subject-independent core, so a servable
+/// [`ode_analytical_supported`] as their subject-independent core — all three asked in
+/// the inner scope here (`ode_analytical_supported_in(model, OdeGradScope::Inner)`,
+/// #1804), the scope [`ode_inner_grad_supported`] uses — so a servable
 /// subject always exists when this holds — a plain-bolus, fixed-dose, no-TV-cov
 /// subject takes the static walk, and a lagtime / TV-cov / SS / modeled-dose subject
 /// routes to the event-driven walk. **Non-IOV only:** `ode_analytical_supported`
@@ -1116,7 +1131,11 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
 /// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
 /// [`ode_iov_supported`]: crate::sens::ode_provider::ode_iov_supported
 pub(crate) fn ode_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model)
+    ODE_SENS_ENABLED
+        && crate::sens::ode_provider::ode_analytical_supported_in(
+            model,
+            crate::sens::ode_provider::OdeGradScope::Inner,
+        )
 }
 
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
@@ -1954,6 +1973,22 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    subject_eta_grad_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`subject_eta_grad_iov`] over the subject's caller-built `layout`
+/// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
+/// so the EBE search walks every iterate on one layout (#2037). The ODE twin a
+/// closed-form transit/IG subject may be routed to shares it: same `n_eta`, `n_kappa`
+/// and subject, and no nested levels (`nested_levels_outside_analytic_scope`).
+pub(crate) fn subject_eta_grad_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
     if nested_levels_outside_analytic_scope(model) {
         return None;
     }
@@ -1963,20 +1998,27 @@ pub(crate) fn subject_eta_grad_iov(
     // Compartment-free (#811) first: `ode_spec` is `None` and `pk_model` is a
     // placeholder, so the closed-form branch below would misread it.
     if model.is_algebraic() {
-        return crate::sens::algebraic::subject_eta_grad_iov(model, subject, theta, stacked_eta);
+        return crate::sens::algebraic::subject_eta_grad_iov(
+            model,
+            subject,
+            layout,
+            theta,
+            stacked_eta,
+        );
     }
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
-            return crate::sens::ode_provider::ode_subject_eta_grad_iov(
+            return crate::sens::ode_provider::ode_subject_eta_grad_iov_in(
                 model,
                 subject,
+                layout,
                 theta,
                 stacked_eta,
             );
         }
         return None;
     }
-    subject_eta_grad_iov_analytical(model, subject, theta, stacked_eta)
+    subject_eta_grad_iov_analytical(model, subject, layout, theta, stacked_eta)
 }
 
 /// Exact analytic sensitivities for an analytical 1-/2-/3-cpt **IOV** subject, over
@@ -1991,6 +2033,19 @@ pub(crate) fn subject_eta_grad_iov(
 pub fn subject_sensitivities_iov(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    subject_sensitivities_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`subject_sensitivities_iov`] over the subject's caller-built `layout` (#2037); see
+/// [`subject_eta_grad_iov_in`].
+pub(crate) fn subject_sensitivities_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
@@ -2017,6 +2072,7 @@ pub fn subject_sensitivities_iov(
         return crate::sens::algebraic::subject_sensitivities_iov(
             model,
             subject,
+            layout,
             theta,
             stacked_eta,
         );
@@ -2045,9 +2101,10 @@ pub fn subject_sensitivities_iov(
     // salvage is visible rather than merely slow (#1154).
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
-            return crate::sens::ode_provider::ode_subject_sensitivities_iov(
+            return crate::sens::ode_provider::ode_subject_sensitivities_iov_in(
                 model,
                 subject,
+                layout,
                 theta,
                 stacked_eta,
             );
@@ -2064,7 +2121,7 @@ pub fn subject_sensitivities_iov(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let s = build_iov_sources(model, subject, theta, stacked_eta, false)?;
+    let s = build_iov_sources(model, subject, layout, theta, stacked_eta, false)?;
     // Modeled-`RATE=-1/-2` dose resolution (#486): each dose at its occasion's PK jet
     // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
     // effect); fixed subjects borrow `subject.doses`. Lagtime under IOV is read at each
@@ -2121,7 +2178,7 @@ pub fn subject_sensitivities_iov(
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
             |M| run_obs_iov::<M>(
                 model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-                &s.pkonly_src, &s.slot_row, s.n_eta, &s.layout, s.n_eff, s.n_stacked,
+                &s.pkonly_src, &s.slot_row, s.n_eta, s.layout, s.n_eff, s.n_stacked,
                 s.n_theta, cols, &eff_doses, &schedule, s.scale_groups.as_deref(),
                 s.bsv_amount.as_ref(), readout, into,
             )
@@ -2144,7 +2201,7 @@ pub fn subject_sensitivities_iov(
 /// and the inner Dual1 walk ([`subject_eta_grad_iov_analytical`]) so the per-subject
 /// scope and the κ-axis sources stay identical across the two dual orders. Callers
 /// must have checked [`iov_analytical_supported`] first. `None` out of scope (#439).
-struct IovSources {
+struct IovSources<'a> {
     /// `(pk, cd, group)` per source; `group = Some(g)` scatters κ to occasion group
     /// `g`'s stacked block, `None` (pk_only) drops it.
     sources: Vec<(crate::types::PkParams, CombinedDerivs, Option<usize>)>,
@@ -2155,7 +2212,7 @@ struct IovSources {
     n_eta: usize,
     /// The subject's layout. The walks seed each κ on `layout.kappa_axis(g, k)` — the
     /// compact axis under nested levels (#1082 PR3).
-    layout: crate::stats::stacked_layout::StackedLayout,
+    layout: &'a crate::stats::stacked_layout::StackedLayout,
     n_eff: usize,
     /// The jet's η-block width, `layout.n_axes()`; the stacked *value* vector the walk
     /// reads is `layout.n_stacked()` wide.
@@ -2179,9 +2236,10 @@ struct IovSources {
     bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
 }
 
-fn build_iov_sources(
+fn build_iov_sources<'a>(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &'a crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
     // `true` builds the η-only derivative block at dual width `n_eff` (see
@@ -2189,7 +2247,7 @@ fn build_iov_sources(
     // full `Dual2<n_theta + n_eff>` route is unavailable — so every model that worked
     // before this existed takes exactly the path it took before.
     eta_only: bool,
-) -> Option<IovSources> {
+) -> Option<IovSources<'a>> {
     // #419: decline a rate-defined infusion under `F ≠ 1` to the FD gradient — the
     // Dual2 walk applies `F` as an inline magnitude scale on the rate
     // (`propagate.rs`: `pk.f * rate`) over the unscaled window, so it can't
@@ -2219,7 +2277,6 @@ fn build_iov_sources(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
 
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     let k_groups = layout.n_groups();
     if k_groups == 0 {
         return None;
@@ -2447,6 +2504,7 @@ fn build_iov_sources(
 fn subject_eta_grad_iov_analytical(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
@@ -2483,14 +2541,14 @@ fn subject_eta_grad_iov_analytical(
     // model past 24 combined axes takes the full route as well: its program is chunked
     // over θ (#1907), and every chunk writes the same `deta`.
     let eta_only = !iov_analytical_supported(model) || nn_weight_theta_count(model) > 0;
-    let s = build_iov_sources(model, subject, theta, stacked_eta, eta_only)?;
+    let s = build_iov_sources(model, subject, layout, theta, stacked_eta, eta_only)?;
     let n_dim = s.n_stacked;
     const_dispatch!(
         n_dim;
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
         |N| run_obs_iov_eta::<N>(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-            &s.pkonly_src, &s.slot_row, s.n_eta, &s.layout, s.n_stacked,
+            &s.pkonly_src, &s.slot_row, s.n_eta, s.layout, s.n_stacked,
             s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
             readout,
         )
@@ -4983,8 +5041,10 @@ fn subject_eta_grad_impl(
         return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
     }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
-    // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
-    // scope the outer provider uses, so inner and outer stay on the same route.
+    // switch. Out-of-scope ODE subjects decline (→ FD inner). The inner scope bounds
+    // `n_eta` where the outer bounds `n_theta + n_eta` (#1804), so an analytic outer
+    // implies an analytic inner, but not the reverse: past the axis cap the inner
+    // stays analytic while the outer goes FD.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             // Closed-form modified-release fast path (#860 Phase A6): a *static*

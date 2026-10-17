@@ -140,8 +140,7 @@ pub fn run_covariance(
     // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
     crate::api::with_fit_scope(options, || {
         run_covariance_scoped(fit, model, population, options)
-    })
-    .map_err(crate::diagnostics::EngineError::uncoded)?
+    })?
 }
 
 fn run_covariance_scoped(

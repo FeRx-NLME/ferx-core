@@ -1194,10 +1194,12 @@ fn mr_sens_dual<const M: usize>(
 /// Phase A6) — the fast-path alternative to
 /// [`crate::sens::ode_provider::ode_subject_eta_grad`], mirroring
 /// [`mr_subject_sensitivities`] at `Dual1<N>` (`N = n_eta`) width via
-/// [`crate::sens::ode_provider::seed_pk_dual1`]. Per the shared per-subject
-/// scope contract ([`crate::sens::ode_provider::ode_subject_supported`]'s doc),
-/// this and [`mr_subject_sensitivities`] must serve exactly the same subjects —
-/// both share `mr_scope` and `mr_prog_axes_match`, so that holds structurally.
+/// [`crate::sens::ode_provider::seed_pk_dual1`]. The shared per-subject scope
+/// contract ([`crate::sens::ode_provider::ode_subject_supported`]'s doc) is
+/// *outer ⇒ inner*. This and [`mr_subject_sensitivities`] share `mr_scope` and
+/// `mr_prog_axes_match`, so they serve exactly the same subjects, which satisfies
+/// it. `mr_prog_axes_match` still bounds `θ + η`, so past the outer cap this fast
+/// path declines too and the inner falls through to the ODE `Dual1` walk.
 pub(crate) fn mr_subject_eta_grad(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,

@@ -37,37 +37,29 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime: a subject's posthoc EBE is non-finite",
     ),
     (
-        "src/api/simulate.rs",
-        "simulate_with_uncertainty_diag",
-        1,
-        "draw_parameter_samples: a missing covariance matrix / SIR pool (E_FIT_INPUT_MISSING's refusal), a \
-         covariance or SIR pool that does not match the template (E_FIT_INPUT_MODEL's family) and the logit-θ \
-         bound all lack a Diagnostic here, #2044; runtime: the sampler finds no valid draw",
+        "src/estimation/uncertainty_samples.rs",
+        "draw_asymptotic",
+        2,
+        "runtime: the covariance cannot be made positive definite, or the sampler finds too few valid draws; \
+         its input refusals are coded (#2044)",
     ),
     (
-        "src/estimation/run_covariance.rs",
-        "run_covariance",
+        "src/estimation/uncertainty_samples.rs",
+        "draw_sir",
         1,
-        "with_fit_scope: invalid ode_reltol / ode_abstol / ode_max_steps on the caller's FitOptions; no code yet, #2044",
+        "runtime: the sampler finds too few valid draws in the pool; its input refusals are coded (#2044)",
     ),
     (
-        "src/estimation/run_sir.rs",
-        "run_sir",
-        1,
-        "with_fit_scope: invalid ODE solver options on the caller's FitOptions; no code yet, #2044",
-    ),
-    (
-        "src/estimation/sir.rs",
-        "run_sir_core_coded",
-        1,
-        "with_fit_scope: invalid ODE solver options on the caller's FitOptions; no code yet, #2044",
+        "src/api/pool.rs",
+        "with_fit_scope",
+        2,
+        "runtime: the fit-scoped worker pool could not be built; its ODE-option refusal is coded (#2044)",
     ),
     (
         "src/estimation/sir.rs",
         "run_sir_in_box",
-        6,
-        "[mixture] vs per-class Ω/Σ mismatch on hand-built parameters and the logit-θ bound refusal (no code yet, #2044); \
-         runtime: no positive proposal direction, every weight invalid, sampler build",
+        3,
+        "runtime: no positive proposal direction, every weight invalid, sampler build",
     ),
     (
         "src/io/fitrx.rs",

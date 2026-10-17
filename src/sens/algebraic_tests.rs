@@ -13,6 +13,11 @@ use crate::pk::compute_predictions_with_tv;
 use crate::types::Population;
 use std::collections::HashMap;
 
+/// The layout the provider hands the IOV walks (`StackedLayout::sens_of`).
+fn sens_layout(model: &CompiledModel, subject: &Subject) -> StackedLayout {
+    StackedLayout::sens_of(model, subject).expect("a prepared subject has a layout")
+}
+
 /// Emax time-course with IIV on the baseline, the shape of an MBMA structural
 /// model: `y = E0·exp(η) − EMAX·t/(ET50 + t)`. `extra_params` / `extra_indiv` /
 /// `equation` let each test vary one axis of the model.
@@ -348,8 +353,14 @@ fn check_iov_vs_fd(model: &crate::types::CompiledModel, subject: &Subject, stack
     let k_groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
     assert_eq!(stacked.len(), n_eta + k_groups * n_kappa);
 
-    let sens = subject_sensitivities_iov(model, subject, &theta, stacked)
-        .expect("the IOV walk must serve this model");
+    let sens = subject_sensitivities_iov(
+        model,
+        subject,
+        &sens_layout(model, subject),
+        &theta,
+        stacked,
+    )
+    .expect("the IOV walk must serve this model");
 
     // Stacked vector → `predict_iov`'s (η_bsv, per-group κ) form.
     let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
@@ -477,8 +488,14 @@ fn algebraic_iov_kappa_derivatives_are_per_occasion() {
     ));
     let subj = iov_subject(vec![]);
     let theta = model.default_params.theta.clone();
-    let sens =
-        subject_sensitivities_iov(&model, &subj, &theta, &[0.15, 0.08, -0.12]).expect("in scope");
+    let sens = subject_sensitivities_iov(
+        &model,
+        &subj,
+        &sens_layout(&model, &subj),
+        &theta,
+        &[0.15, 0.08, -0.12],
+    )
+    .expect("in scope");
     // Observation 0 is in group 0, observation 3 in group 1. Stacked layout is
     // [η_E0, κ_g0, κ_g1], and `TIME = 0` for observation 0 makes its EMAX term
     // vanish — so use the later observation of each group.
@@ -554,8 +571,11 @@ fn algebraic_iov_inner_grad_matches_the_outer_jet() {
     let subj = iov_subject(vec![]);
     let theta = model.default_params.theta.clone();
     let stacked = [0.15, 0.08, -0.12];
-    let outer = subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("outer");
-    let inner = subject_eta_grad_iov(&model, &subj, &theta, &stacked).expect("inner");
+    let outer =
+        subject_sensitivities_iov(&model, &subj, &sens_layout(&model, &subj), &theta, &stacked)
+            .expect("outer");
+    let inner = subject_eta_grad_iov(&model, &subj, &sens_layout(&model, &subj), &theta, &stacked)
+        .expect("inner");
     assert_eq!(outer.obs.len(), inner.len());
     for (o, i) in outer.obs.iter().zip(&inner) {
         approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-14);
