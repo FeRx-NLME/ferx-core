@@ -92,10 +92,10 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/api/run.rs",
         "run_model_simulate_with_overrides",
-        7,
-        "[simulation] design refusals ferx check does not code: no [simulation] block, a TTE \
-         endpoint without horizon, a CTMM endpoint, no times for a continuous or binary endpoint, \
-         nothing to observe, a design missing a referenced covariate (#1788)",
+        6,
+        "[simulation] design refusals with no code yet: no [simulation] block, a TTE endpoint \
+         without horizon (wider than E_SIMULATE_HORIZON's row), no times for a continuous or \
+         binary endpoint, nothing to observe, a design missing a referenced covariate (#1788)",
     ),
     (
         "src/api/fit.rs",

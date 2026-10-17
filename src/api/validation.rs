@@ -453,6 +453,21 @@ pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceErr
     }
 }
 
+/// A failed model-file read as an entry point's `Err`: [`model_source_diagnostic`]'s
+/// code, block and line, with the read's own text as the message. The diagnostic
+/// rewords some parse errors for `ferx check`, which shows `block:line` beside them (it
+/// strips ` (line N)` and an `E_…:` prefix); an entry point prints only `Display`, so
+/// it keeps the text `ModelSource::read` returns, byte for byte (#2062 review B1).
+pub(crate) fn model_source_refusal(
+    e: crate::io::model_source::ModelSourceError,
+) -> crate::diagnostics::EngineError {
+    let message = e.message().to_string();
+    crate::diagnostics::EngineError::from_diagnostic_keeping_text(
+        model_source_diagnostic(e),
+        message,
+    )
+}
+
 /// The `[data_selection]` filter `ferx check`'s data read applies, compiled from
 /// the model file's own clauses by the **fit's** builder
 /// ([`crate::api::run::build_selection_filter`]) rather than a second spelling of

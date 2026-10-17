@@ -39,7 +39,7 @@ pub use validation::{
 pub(crate) use validation::{
     check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
-pub(crate) use validation::{data_read_diagnostic, model_source_diagnostic};
+pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use validation::check_survival_time_dependent_pk;

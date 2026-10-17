@@ -567,7 +567,8 @@ pub fn run_model_simulate_with_overrides(
     // (with `times`); the library `simulate()` chokepoint panics on the same case.
     #[cfg(feature = "markov")]
     if parsed.model.has_ctmm() {
-        return Err(EngineError::uncoded(
+        // `E_CTMM_UNSUPPORTED`, the code `simulate*` gives it (#2062 review N2).
+        return Err(super::entry_refusals::ctmm_unsupported(
             "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet — \
              sampling a discrete-state trajectory from the generator is a later slice. \
              fit() supports CTMM; --simulate does not.",
@@ -765,6 +766,10 @@ pub fn run_model_simulate_with_overrides(
             horizon: sim_spec.horizon,
         },
     )
+    // `in_context` only for its `Display` prefix: `Display` stays `"simulation failed: {e}"`
+    // byte for byte, which needs the inner error to carry no context of its own (none of
+    // `simulate_with_options_diag`'s does; `in_context` would overwrite one). `context()`
+    // here names the step, not an entry point.
     .map_err(|e| e.in_context("simulation failed"))?;
 
     // Group the simulation results by subject id once (they are emitted in
@@ -998,12 +1003,13 @@ pub fn run_model_simulate_with_overrides(
 
 /// Read and parse a model file once (#1752), coded by `ferx check`'s model-read
 /// classifier (#1772): a file that cannot be read is `E_MODEL_READ`, one that does
-/// not parse the parse's code. The message is `ModelSource::read`'s, byte for byte.
+/// not parse the parse's code. The message is `ModelSource::read`'s, byte for byte
+/// (`model_source_refusal`; #2062 review B1).
 pub(crate) fn read_model_source(
     model_path: &str,
 ) -> Result<crate::io::model_source::ModelSource, EngineError> {
     crate::io::model_source::ModelSource::load(Path::new(model_path), None, "", "")
-        .map_err(|e| EngineError::from_diagnostic(crate::api::model_source_diagnostic(e)))
+        .map_err(crate::api::model_source_refusal)
 }
 
 /// Give a model that declares no `model NAME` line the file stem as its name.

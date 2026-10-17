@@ -316,6 +316,17 @@ impl EngineError {
         }
     }
 
+    /// An error carrying `d` for its code, block and line, whose message is `message`
+    /// rather than `d.message`: for a refusal whose historical text the diagnostic
+    /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
+    /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
+    pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
+        EngineError {
+            message,
+            ..EngineError::from_diagnostic(d)
+        }
+    }
+
     /// An error carrying `d` whose `Display` folds the suggestion in after the
     /// message, capitalised and closed with a full stop — for a refusal whose
     /// historical text read that way. [`message`](Self::message) stays `d.message`.
