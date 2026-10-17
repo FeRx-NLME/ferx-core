@@ -19,6 +19,11 @@
 //! (`E_SIR_NOTHING_TO_SAMPLE`). Their re-reads of the model and data files are
 //! not here: those failures are `ferx check`'s own, and are coded by its read
 //! classifiers in `validation.rs`.
+//!
+//! Two more have no `ferx check` path (#2044): ODE solver settings on a hand-built
+//! `FitOptions` (`E_ODE_SOLVER_OPTIONS`; `ferx check` reads a model file, whose
+//! parser refuses the same values as `E_PARSE`), and a logit-scaled θ estimated
+//! outside (0, 1), which only a fit has (`E_LOGIT_THETA_OUT_OF_RANGE`).
 
 use crate::diagnostics::{Diagnostic, EngineError};
 
@@ -172,7 +177,8 @@ pub(crate) fn theta_length(message: impl Into<String>) -> EngineError {
 /// IOV model passed as `model = Some` on a fit with no recorded reader settings, the
 /// occasion rule of an IOV fit whose population carries no occasion labels, or the
 /// fitted values of a `[mixture]` fit's per-class overrides (which
-/// `simulate_with_uncertainty` needs too).
+/// `simulate_with_uncertainty` needs too), and the covariance matrix or SIR
+/// resamples `simulate_with_uncertainty` draws from, absent or empty (#2044).
 pub(crate) fn fit_input_missing(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MISSING", None, message.into())
 }
@@ -196,7 +202,8 @@ pub(crate) fn fit_input_changed_diag(message: impl Into<String>) -> Diagnostic {
 /// population does not reproduce, a model whose η count is not the width of the
 /// fit's per-subject η̂, a `[mixture]` fit whose packed estimate has another layout
 /// or no longer reproduces its reported estimates, or a covariance matrix that is
-/// not the size of the model's packed parameters (SIR's proposal).
+/// not the size of the model's packed parameters (SIR's proposal, or the covariance
+/// or SIR resamples `simulate_with_uncertainty` draws from, #2044).
 pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MODEL", None, message.into())
 }
@@ -206,6 +213,33 @@ pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
 /// degrees of freedom, or `sir_scale = natural` on a model with `prior(...)`.
 pub(crate) fn sir_options(message: impl Into<String>) -> EngineError {
     coded("E_SIR_OPTIONS", None, message.into())
+}
+
+/// `E_ODE_SOLVER_OPTIONS`: ODE solver settings on a caller's `FitOptions` that no
+/// solver can run with — an `ode_reltol` / `ode_abstol` that is not finite and
+/// positive, or `ode_max_steps = 0` (#2044). A model file's `[fit_options]` never
+/// gets here: the parser refuses the same values as `E_PARSE`, so only a hand-built
+/// `FitOptions` handed to `run_sir` / `run_covariance` / `run_sir_core` reaches it.
+pub(crate) fn ode_solver_options(message: impl Into<String>) -> EngineError {
+    coded("E_ODE_SOLVER_OPTIONS", None, message.into())
+}
+
+/// `E_LOGIT_THETA_OUT_OF_RANGE` on block `parameters`: a free θ used as
+/// `inv_logit(logit(θ) + ETA)` whose estimate is not strictly inside (0, 1), so it has
+/// no logit-scale draw (#1548, #2044). Reachable only with a declared upper bound
+/// above 1; the suggestion is that fix, and `Display` folds it in after the message,
+/// so `to_string()` is the text the refusal had before it carried a code.
+pub(crate) fn logit_theta_out_of_range(name: &str, estimate: f64) -> Diagnostic {
+    diag(
+        "E_LOGIT_THETA_OUT_OF_RANGE",
+        Some("parameters"),
+        format!(
+            "Cannot draw parameter uncertainty for {name}: it is used as \
+             inv_logit(logit({name}) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is {estimate}."
+        ),
+    )
+    .with_suggestion("declare its upper bound below 1 (e.g. 0.999) and refit")
 }
 
 /// `E_SIR_NOTHING_TO_SAMPLE`: every packed parameter of the fit is FIX, so SIR has

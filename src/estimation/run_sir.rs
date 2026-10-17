@@ -156,8 +156,7 @@ pub fn run_sir(
     // `ode_method` would be ignored and the sampled OFVs would come from a different
     // integration accuracy than the fit being refined. The scope also puts the sample
     // fan-out on a pool whose workers carry the same settings.
-    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))
-        .map_err(crate::diagnostics::EngineError::uncoded)?
+    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
 }
 
 /// `options` with every SIR setting the caller left at its default taken from
