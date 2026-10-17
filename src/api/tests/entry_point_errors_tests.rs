@@ -81,7 +81,7 @@ fn unroutable() -> (CompiledModel, Population) {
 /// What `fit()` says about this input — the reference every other entry point is held to.
 fn fit_err(model: &CompiledModel, pop: &Population, params: &ModelParameters) -> String {
     match fit(model, pop, params, &FitOptions::default()) {
-        Err(e) => e,
+        Err(e) => e.to_string(),
         Ok(_) => panic!("fixture is supposed to be refused by fit()"),
     }
 }
@@ -452,6 +452,303 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             "{}: suggestion",
             f.name
         );
+    }
+}
+
+/// #1772: `fit()` returns `EngineError`, and on every family above it carries the code,
+/// block and suggestion `predict` carries, with the text it returned as a `String`.
+///
+/// The text is pinned against `predict_diag`'s, which this change does not touch and
+/// which `each_precondition_family_is_an_err_carrying_its_own_message` already held equal
+/// to `fit()`'s pre-#1772 `String`. Mutation — route `fit_unstamped`'s closed-form check
+/// back through the `String` twin (`check_absorption_closed_form_support` +
+/// `EngineError::uncoded`) → the "absorption closed-form support" row's code is `None`;
+/// the same for the flip-flop twin and for the `check_model_data_rule_at` line. The row
+/// names its family.
+#[test]
+fn fit_refusals_carry_the_code_predict_carries() {
+    let families = families();
+    // The assertion below must be live on every row: each family is coded.
+    assert!(families.iter().all(|f| f.code.is_some()));
+    for f in &families {
+        let mut params = f.model.default_params.clone();
+        if let Some(theta) = &f.theta {
+            params.theta = theta.clone();
+        }
+        let got = match fit(&f.model, &f.pop, &params, &FitOptions::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("{}: fit() accepted the fixture", f.name),
+        };
+        let predicted = match predict_diag(&f.model, &f.pop, &params) {
+            Err(e) => e,
+            Ok(out) => panic!("{}: predict accepted, {} rows", f.name, out.results.len()),
+        };
+        assert_eq!(got.code(), f.code, "{}: fit()'s code", f.name);
+        assert_eq!(got.to_string(), predicted.to_string(), "{}: text", f.name);
+        assert_eq!(got.block(), predicted.block(), "{}: block", f.name);
+        assert_eq!(
+            got.suggestion(),
+            predicted.suggestion(),
+            "{}: suggestion",
+            f.name
+        );
+    }
+}
+
+/// #1772: `fit()`'s unbound-level refusal is `E_THETA_LEVELS_UNBOUND` on block
+/// `parameters`, the code `predict` and `simulate` give it, with `fit()`'s own text
+/// (pinned in full by `tests/theta_level_blocks.rs`) and no separate suggestion, since
+/// the way out is in that text. Mutation — return `uncoded` for it → `None`.
+#[test]
+fn fit_unbound_level_refusal_carries_the_level_code() {
+    let model = parse_model_string(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
+         theta PLACEBO[STUDY](0.0, -5.0, 5.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL) + PLACEBO\n  V  = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n",
+    )
+    .expect("parse");
+    assert!(!model.theta_blocks().unbound_level_blocks().is_empty());
+    let pop = population_of(vec![subject_with(vec![bolus()], 1)], &[]);
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("an unbound level block is refused");
+    assert_eq!(err.code(), Some("E_THETA_LEVELS_UNBOUND"));
+    assert_eq!(err.block(), Some("parameters"));
+    assert_eq!(err.suggestion(), None);
+    assert_eq!(err.message(), err.to_string());
+    assert!(
+        err.to_string()
+            .starts_with("`theta PLACEBO[...]` was never bound to data, so it has no levels."),
+        "{err}"
+    );
+}
+
+/// #2062 review N1: `fit()` carries `check_model_options`' code, block and text. The
+/// rails, priors and start-box `first_error` lines are pinned by `tests/check_command.rs`;
+/// this is the options line. Mutation: drop the code on `fit_inner`'s
+/// `first_error(&option_diags)?` → `None`.
+#[test]
+fn fit_carries_the_options_check_code() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 0,
+        ..FitOptions::default()
+    };
+    let want = check_model_options(&model, &opts)
+        .into_iter()
+        .find(|d| d.is_error())
+        .expect("check_model_options refuses n_agq = 0");
+    assert_eq!(
+        want.code, "E_AGQ_NODES_ZERO",
+        "the fixture trips the intended check"
+    );
+    let err = fit(&model, &pop, &model.default_params, &opts).expect_err("n_agq = 0");
+    assert_eq!(err.code(), Some("E_AGQ_NODES_ZERO"), "{err}");
+    assert_eq!(err.block(), Some("fit_options"));
+    assert_eq!(err.to_string(), want.message);
+}
+
+/// #2062 review 2, F2: ODE solver settings no solver can run with reach `fit()` as
+/// `E_ODE_SOLVER_OPTIONS`, the code `run_sir` / `run_covariance` give them (#2044). The
+/// check runs in `install_on_fit_pool` before any start, so the single-start and the
+/// multi-start installs are both cells. Mutation: map `install_on_fit_pool`'s
+/// `validate()` through `EngineError::uncoded` → `None` on both.
+#[test]
+fn fit_carries_the_ode_solver_options_code() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    for n_starts in [1, 2] {
+        let opts = FitOptions {
+            ode_reltol: -1.0,
+            n_starts,
+            ..FitOptions::default()
+        };
+        let err = fit(&model, &pop, &model.default_params, &opts).expect_err("ode_reltol = -1");
+        assert_eq!(
+            err.code(),
+            Some("E_ODE_SOLVER_OPTIONS"),
+            "n_starts = {n_starts}: {err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("ode_reltol must be finite and positive"),
+            "n_starts = {n_starts}: {err}"
+        );
+    }
+}
+
+/// #2062 review 2, F4: a coded refusal from `run_model_simulate`'s simulation step keeps
+/// its code, and its `"simulation failed: "` prefix is in the message, not in
+/// `context()`, which names entry points only. Fixture: a `[simulation]` design whose
+/// `GRP` is outside the declared levels, which only the simulation's data checks see
+/// (`E_COV_LEVEL_UNKNOWN`). Mutations: drop the diagnostic (`uncoded(text)` on both arms)
+/// → `None`; go back to `in_context("simulation failed")` → `context()` is `Some`.
+#[test]
+fn run_model_simulate_keeps_the_simulations_code_without_a_context() {
+    let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+    std::fs::write(
+        f.path(),
+        format!(
+            "{GRP_LEVELS_123}\n[simulation]\n  n_subjects = 1\n  dose_amt = 100\n  \
+             dose_cmt = 1\n  seed = 7\n  times = [1, 4]\n  covariate GRP = [4]\n"
+        ),
+    )
+    .unwrap();
+    let err = crate::api::run_model_simulate(f.path().to_str().unwrap())
+        .err()
+        .expect("a design level outside the declared levels is refused");
+    assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{err}");
+    assert_eq!(err.context(), None, "{err}");
+    let text = err.to_string();
+    assert!(text.starts_with("simulation failed: "), "{text}");
+    assert!(text.contains("`GRP` takes [4.0]"), "{text}");
+    assert_eq!(err.message(), text, "the prefix is part of the message");
+}
+
+/// #1772: `fit()`'s LTBS refusals for a hand-built model (the parser refuses both
+/// first, so only a Rust caller can reach them) keep their text and have no code yet
+/// (#1788). One fixture, an additive-error model with `log_transform` set, and one field
+/// changed per cell: a per-CMT error spec, then an SDE start. Mutation: drop either guard
+/// → that cell is accepted (or refused by a later check with other text), and the test
+/// names the cell.
+#[test]
+fn fit_ltbs_refusals_on_a_hand_built_model_keep_their_text_uncoded() {
+    let pop = accepted_population();
+    let ltbs = || {
+        let mut m = parse_model_string(&ONE_CPT_IV.replace("proportional(PROP)", "additive(PROP)"))
+            .expect("parse");
+        assert!(matches!(m.error_model, ErrorModel::Additive));
+        m.log_transform = true;
+        m
+    };
+    let mut per_cmt = ltbs();
+    per_cmt.error_spec = ErrorSpec::PerCmt(HashMap::new());
+    let mut sde = ltbs();
+    sde.diffusion_theta_start = Some(0);
+    for (label, model, want) in [
+        (
+            "per-CMT error",
+            per_cmt,
+            "LTBS (`log_transform = true`) is not supported with per-CMT \
+             (`ErrorSpec::PerCmt`) error models",
+        ),
+        (
+            "SDE",
+            sde,
+            "LTBS (`log_transform = true`) is not supported with an SDE \
+             model (`diffusion_theta_start = Some(_)`)",
+        ),
+    ] {
+        let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+            .err()
+            .unwrap_or_else(|| panic!("{label}: accepted"));
+        assert_eq!(err.to_string(), want, "{label}");
+        assert_eq!(err.code(), None, "{label}");
+    }
+}
+
+/// #1772: two of `run_model_simulate`'s `[simulation]` design refusals, which have no
+/// code yet (#1788): their text is unchanged by the retype and `code()` is `None`, as
+/// `UNCODED_SITES` lists. A model with no `[simulation]` block; and (`survival`) a
+/// binary-only model whose design gives a `horizon` but no `times`, refused before the
+/// design's covariates are read. A test flips when #1788 gives either a code.
+#[test]
+fn run_model_simulate_design_refusals_keep_their_text_uncoded() {
+    let write = |text: &str| {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), text).unwrap();
+        f
+    };
+    let no_block = write(ONE_CPT_IV);
+    let err = crate::api::run_model_simulate(no_block.path().to_str().unwrap())
+        .err()
+        .expect("no [simulation] block");
+    assert_eq!(
+        err.to_string(),
+        "Model file has no [simulation] block — use --data instead"
+    );
+    assert_eq!(err.code(), None);
+
+    #[cfg(feature = "survival")]
+    {
+        let src = std::fs::read_to_string("examples/binary_logistic.ferx").expect("example");
+        let binary = write(&format!(
+            "{src}\n[simulation]\n  n_subjects = 2\n  dose_amt = 0\n  dose_cmt = 1\n  \
+             seed = 7\n  horizon = 10\n"
+        ));
+        let err = crate::api::run_model_simulate(binary.path().to_str().unwrap())
+            .err()
+            .expect("a binary endpoint with no times");
+        assert!(
+            err.to_string().starts_with(
+                "[simulation] has no `times`, but the model has a [binary_model] endpoint."
+            ),
+            "{err}"
+        );
+        assert_eq!(err.code(), None, "{err}");
+    }
+}
+
+/// #1772: the file entry points code their reads and binders as `ferx check` does. A
+/// model file that does not exist is `E_MODEL_READ` (`fit_from_files`, `prepare_run`,
+/// `run_model_simulate`); a dataset missing a covariate the model reads is
+/// `E_MISSING_COVARIATE` (`fit_from_files`, `prepare_run`). Mutation — read through the
+/// `String` `ModelSource::read` / an uncoded data read → `None`.
+#[test]
+fn file_entry_points_code_their_reads() {
+    let missing = "definitely-not-here.ferx";
+    let errs = [
+        (
+            "fit_from_files",
+            crate::api::fit_from_files(missing, Some("data/warfarin.csv"), None, None)
+                .expect_err("missing model"),
+        ),
+        (
+            "prepare_run",
+            crate::api::prepare_run(missing, Some("data/warfarin.csv"))
+                .err()
+                .expect("missing model"),
+        ),
+        (
+            "run_model_simulate",
+            crate::api::run_model_simulate(missing).expect_err("missing model"),
+        ),
+    ];
+    for (entry, e) in &errs {
+        assert_eq!(e.code(), Some("E_MODEL_READ"), "{entry}: {e}");
+        assert!(e.to_string().contains(missing), "{entry}: {e}");
+    }
+
+    let dir = std::env::temp_dir().join(format!("ferx-1772-reads-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model_path = dir.join("reads_wt.ferx");
+    // `[covariates]` makes the read strict, so the refusal is the reader's (through
+    // `data_read_diagnostic`), not `fit()`'s own covariate check after a lenient read.
+    std::fs::write(
+        &model_path,
+        READS_WT.replace(
+            "[error_model]",
+            "[covariates]\n  WT continuous\n[error_model]",
+        ),
+    )
+    .unwrap();
+    let data_path = dir.join("no_wt.csv");
+    std::fs::write(
+        &data_path,
+        "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,0,1,100,1,1\n1,1,5,0,0,1,0\n",
+    )
+    .unwrap();
+    let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
+    let fit_e = crate::api::fit_from_files(m, Some(d), None, None).expect_err("WT missing");
+    let prep_e = crate::api::prepare_run(m, Some(d))
+        .err()
+        .expect("WT missing");
+    std::fs::remove_dir_all(&dir).ok();
+    for (entry, e) in [("fit_from_files", &fit_e), ("prepare_run", &prep_e)] {
+        assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{entry}: {e}");
+        assert!(e.to_string().contains("WT"), "{entry}: {e}");
     }
 }
 

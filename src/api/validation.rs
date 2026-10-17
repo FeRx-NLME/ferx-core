@@ -453,6 +453,21 @@ pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceErr
     }
 }
 
+/// A failed model-file read as an entry point's `Err`: [`model_source_diagnostic`]'s
+/// code, block and line, with the read's own text as the message. The diagnostic
+/// rewords some parse errors for `ferx check`, which shows `block:line` beside them (it
+/// strips ` (line N)` and an `E_…:` prefix); an entry point prints only `Display`, so
+/// it keeps the text `ModelSource::read` returns, byte for byte (#2062 review B1).
+pub(crate) fn model_source_refusal(
+    e: crate::io::model_source::ModelSourceError,
+) -> crate::diagnostics::EngineError {
+    let message = e.message().to_string();
+    crate::diagnostics::EngineError::from_diagnostic_keeping_text(
+        model_source_diagnostic(e),
+        message,
+    )
+}
+
 /// The `[data_selection]` filter `ferx check`'s data read applies, compiled from
 /// the model file's own clauses by the **fit's** builder
 /// ([`crate::api::run::build_selection_filter`]) rather than a second spelling of
@@ -983,6 +998,31 @@ pub(crate) fn check_unbound_theta_levels(
     model: &CompiledModel,
     entry: UnboundLevelsEntry,
 ) -> Vec<Diagnostic> {
+    let unbound = model.theta_blocks().unbound_level_blocks();
+    // `fit()`'s refusal names every unbound block in one message, with the way out
+    // in the message itself (its historical text, #1772), so it is one diagnostic.
+    if entry == UnboundLevelsEntry::Fit {
+        return unbound
+            .first()
+            .map(|first| {
+                Diagnostic::error(
+                    "E_THETA_LEVELS_UNBOUND",
+                    format!(
+                        "`theta {}[...]` was never bound to data, so it has no levels. Call \
+                         `bind_theta_levels(&mut parsed, &model_text, &mut population)` after \
+                         reading the population (`read_population_for`) and before `fit`. \
+                         `prepare_run` and the file entry points (`fit_from_files`, \
+                         `run_model_with_data`, the CLI) bind for you. Or declare the block \
+                         explicitly as `theta {}[N](...)` and index it with your own column.",
+                        unbound.join("`, `theta "),
+                        first,
+                    ),
+                )
+                .with_block("parameters")
+            })
+            .into_iter()
+            .collect();
+    }
     model
         .theta_blocks()
         .unbound_level_blocks()
@@ -1014,6 +1054,7 @@ pub(crate) fn check_unbound_theta_levels(
                      declare the block explicitly as `theta {name}[N](...)` and index it \
                      with your own column"
                 ),
+                UnboundLevelsEntry::Fit => unreachable!("`fit()`'s diagnostic is returned above"),
             };
             Diagnostic::error(
                 "E_THETA_LEVELS_UNBOUND",
@@ -1055,6 +1096,9 @@ pub(crate) enum UnboundLevelsEntry {
     /// `predict_diag` (#1644), `predict_survival`, `predict_categorical`,
     /// `compute_npde_npd` (#1763) — carrying the name the suggestion gives it.
     Predict(&'static str),
+    /// `fit()` (#1772): one diagnostic naming every unbound block, the advice in its
+    /// message and no suggestion.
+    Fit,
 }
 
 /// Every `NAME[COLUMN]` gather index the data carries must be an integer level
@@ -1557,7 +1601,13 @@ impl CmtConsumer {
                 if let Some(ar) = model.analytic_readout.as_ref() {
                     set.extend(per_cmt(&ar.readout));
                 }
-                keys(set, "[scaling] y[CMT=N]", "scaling")
+                // A compartment-free model writes its `y[CMT=N]` entries in
+                // `[structural_model]`; it has no `[scaling]` block (#1827).
+                if model.is_algebraic() {
+                    keys(set, "[structural_model] y[CMT=N]", "structural_model")
+                } else {
+                    keys(set, "[scaling] y[CMT=N]", "scaling")
+                }
             }
             // Already an *error*, not a warning: `E_ENDPOINT_NO_RECORDS` reports a
             // declared endpoint with no row routed to it, so reporting it here would
@@ -1931,23 +1981,15 @@ fn check_iov_occasions(
     .with_block("fit_options")]
 }
 
-/// The data checks of a model with nested levels (#1082), in this order:
-///
-/// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
-///   column. Every record needs its full label path, since its group at each level is
-///   identified by that path.
-/// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
-///   its parent, with a κ that has the same readers as a random effect of the parent
-///   level. That κ is then the parent's random effect by another name, and the two
-///   variances cannot be told apart. A level where some parents have several members
-///   is identified and is not refused.
-/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
-///   levels each lie within one group of a level that carries a κ (the innermost such
-///   level is named). The block could then absorb that κ, and the level-block binder
-///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
-///   block whose levels cross those groups cannot absorb the κ and binds as before.
-fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
-    use crate::stats::nested_levels::{label_path, record_paths, RecordKind};
+/// `E_LEVEL_MISSING_LABEL` (the first rule of [`check_nested_levels`]): the first record
+/// of a nested model with no value in a level column. Shared with the simulate
+/// chokepoint (#1082 PR4), which groups the κ draw by those labels and needs nothing
+/// else `check_nested_levels` asks of a fit.
+pub(crate) fn check_level_labels(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::{record_paths, RecordKind};
     let Some(levels) = model.nested_levels() else {
         return Vec::new();
     };
@@ -1992,6 +2034,33 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
             )
             .with_block("parameters")];
         }
+    }
+    Vec::new()
+}
+
+/// The data checks of a model with nested levels (#1082), in this order:
+///
+/// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
+///   column. Every record needs its full label path, since its group at each level is
+///   identified by that path.
+/// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
+///   its parent, with a κ that has the same readers as a random effect of the parent
+///   level. That κ is then the parent's random effect by another name, and the two
+///   variances cannot be told apart. A level where some parents have several members
+///   is identified and is not refused.
+/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
+///   levels each lie within one group of a level that carries a κ (the innermost such
+///   level is named). The block could then absorb that κ, and the level-block binder
+///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
+///   block whose levels cross those groups cannot absorb the κ and binds as before.
+fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::label_path;
+    let Some(levels) = model.nested_levels() else {
+        return Vec::new();
+    };
+    let missing = check_level_labels(model, population);
+    if !missing.is_empty() {
+        return missing;
     }
 
     // Per level, whether every parent group holds at most one of its groups, on the
@@ -2296,6 +2365,11 @@ pub(crate) fn with_derived_occasions<'a>(
     population: &'a Population,
     rule: Option<&IovOccasionRule>,
 ) -> std::borrow::Cow<'a, Population> {
+    // A nested model's groups are its level cells (#1082 PR4), which no rule regroups:
+    // `fit()` refuses a derived rule on one, and `simulate_with_options_diag` too.
+    if model.has_nested_levels() {
+        return crate::stats::nested_levels::with_level_cells(model, population);
+    }
     match rule {
         Some(rule) if model.n_kappa > 0 && *rule != IovOccasionRule::Column => {
             let mut derived = population.clone();

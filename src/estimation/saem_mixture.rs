@@ -1107,7 +1107,8 @@ mod tests {
         let mut opts = crate::types::FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
         let err = crate::api::fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("shared mixing/structural theta under SAEM must be rejected");
+            .expect_err("shared mixing/structural theta under SAEM must be rejected")
+            .to_string();
         assert!(
             err.contains("mixing-coefficient theta also drives the structural model")
                 && err.contains("TVV"),

@@ -97,6 +97,61 @@ fn code_in(diags: &[crate::diagnostics::Diagnostic], code: &str) -> Option<Strin
         .map(|d| d.message.clone())
 }
 
+/// #2062 review B1: a model file that does not parse keeps its exact text on the file
+/// entry points, while carrying the parse's code. `parse_error_to_diagnostic` rewrites
+/// the message for two kinds of parse error, so both are cells here: a misspelt block
+/// header (`locate()` strips ` (line N)`) and a level declared beside `iov_column`
+/// (the `E_…:` prefix is stripped). Either one alone would leave the other free to
+/// drift. Mutation: build the error from the diagnostic's message
+/// (`EngineError::from_diagnostic`) in `read_model_source` → both cells redden on the
+/// text.
+#[test]
+fn a_model_file_that_does_not_parse_keeps_its_text_and_carries_its_code() {
+    let cells = [
+        (
+            "misspelt block",
+            format!("{}\n[fit_optoins]\n  maxiter = 1\n", src()),
+            "E_UNKNOWN_BLOCK",
+        ),
+        (
+            "level beside iov_column",
+            src_with(
+                "",
+                "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
+                "[fit_options]\n  iov_column = OCC\n",
+            ),
+            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+        ),
+    ];
+    for (label, text, code) in cells {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), &text).unwrap();
+        let p = f.path().to_str().unwrap();
+        let old = crate::io::model_source::ModelSource::read(p)
+            .err()
+            .expect("the file does not parse");
+        let errs = [
+            (
+                "prepare_run",
+                crate::api::prepare_run(p, Some("data/warfarin.csv")).err(),
+            ),
+            (
+                "fit_from_files",
+                crate::api::fit_from_files(p, Some("data/warfarin.csv"), None, None).err(),
+            ),
+            (
+                "run_model_simulate",
+                crate::api::run_model_simulate(p).err(),
+            ),
+        ];
+        for (entry, e) in errs {
+            let e = e.unwrap_or_else(|| panic!("{label} via {entry}: accepted"));
+            assert_eq!(e.to_string(), old, "{label} via {entry}: text");
+            assert_eq!(e.code(), Some(code), "{label} via {entry}: code");
+        }
+    }
+}
+
 // ── grammar ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -571,22 +626,228 @@ fn a_residual_correlation_is_refused_on_a_nested_model() {
     .is_none());
 }
 
+/// `simulate()` draws a nested model per level since #1082 PR4 (the draw itself is
+/// tested in `tests/nested_levels_simulate.rs`); the full design simulates.
 #[test]
-fn simulate_refuses_a_nested_model() {
+fn simulate_runs_a_nested_model() {
     let m = model();
-    let err = crate::api::simulate(&m, &full_design(), &m.default_params, 1)
+    let rows = crate::api::simulate_with_seed(&m, &full_design(), &m.default_params, 1, 3)
+        .expect("a nested model simulates");
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|r| r.ipred.is_finite()));
+}
+
+/// What simulation still refuses on a nested model, each with the code `fit()` gives
+/// the same input: a residual `correlation` line (#1082 PR5), a derived `iov_occasion`
+/// rule, and a record with no label — and the adaptive-dosing entry points, whose κ
+/// stream has no per-level draw. Each half straddles its gate: the same input without
+/// the trigger simulates.
+#[test]
+fn simulate_refuses_what_the_nested_fit_refuses() {
+    let m = model();
+    let p = full_design();
+
+    let corr = parse_model_string(
+        &src_with(
+            "  theta RHO(0.3, -0.9, 0.9)\n",
+            "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
+            "",
+        )
+        .replace(
+            "DV ~ additive(ADD)\n",
+            "DV ~ additive(ADD)\n  correlation cs(RHO) by ARM\n",
+        ),
+    )
+    .expect("parse");
+    let err = crate::api::simulate_with_seed(&corr, &p, &corr.default_params, 1, 1)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_NESTED_LEVEL_CORRELATION_UNSUPPORTED"));
+    let msg = err.to_string();
+    assert!(msg.contains("in simulation as in the fit"), "{msg}");
+    assert!(
+        msg.contains("Simulate the levels without it, or the correlation with a single level."),
+        "{msg}"
+    );
+
+    let rule = crate::api::SimulateOptions {
+        seed: Some(1),
+        iov_occasion: Some(IovOccasionRule::PerDose),
+        ..Default::default()
+    };
+    let err = crate::api::simulate_with_options(&m, &p, &m.default_params, 1, &rule)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_LEVEL_MIXED_WITH_IOV_COLUMN"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains(
+            "the simulate options set `iov_occasion` on a model that declares `level STUDY`"
+        ),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("leave `iov_occasion` unset (or `column`)"),
+        "{msg}"
+    );
+    let column = crate::api::SimulateOptions {
+        seed: Some(1),
+        iov_occasion: Some(IovOccasionRule::Column),
+        ..Default::default()
+    };
+    assert!(crate::api::simulate_with_options(&m, &p, &m.default_params, 1, &column).is_ok());
+
+    let mut blank = full_design();
+    blank.subjects[1].obs_covariates[2].insert("ARM".to_string(), f64::NAN);
+    let err = crate::api::simulate_with_seed(&m, &blank, &m.default_params, 1, 1)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_LEVEL_MISSING_LABEL"));
+    assert!(
+        err.to_string().contains("level `ARM` reads column `ARM`"),
+        "{err}"
+    );
+
+    let err = crate::api::adaptive::check_adaptive_model_data(&m, &p)
         .err()
         .expect("refused");
     assert_eq!(err.code(), Some("E_NESTED_LEVEL_SIMULATE_UNSUPPORTED"));
-    assert!(err
-        .to_string()
-        .contains("simulation does not yet support nested levels"));
-    assert!(err
-        .to_string()
-        .contains("a kappa at an outer level must be drawn once per group"));
-    assert!(err
-        .to_string()
-        .contains("Fit the model; simulate from it in a later release."));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("adaptive dosing does not yet support nested levels"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("a kappa at an outer level must be drawn once per group"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("`simulate()` and `simulate_with_uncertainty()` support the model."),
+        "{msg}"
+    );
+}
+
+/// The NPDE reference draws κ through the same per-level draw, so it refuses what
+/// `simulate()` does (review r1 #1, #9 on #1082 PR4): a record with no label, and a
+/// derived `iov_occasion` rule. Both against a control that runs.
+#[test]
+fn the_npde_reference_refuses_what_simulate_refuses_on_a_nested_model() {
+    use crate::stats::npde::compute_npde_npd_diag;
+    let m = model();
+    let p = full_design();
+    assert!(compute_npde_npd_diag(&m, &p, &m.default_params, 20, Some(1), None).is_ok());
+    let mut blank = full_design();
+    blank.subjects[1].obs_covariates[2].insert("ARM".to_string(), f64::NAN);
+    let err = compute_npde_npd_diag(&m, &blank, &m.default_params, 20, Some(1), None)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_LEVEL_MISSING_LABEL"));
+    let err = compute_npde_npd_diag(
+        &m,
+        &p,
+        &m.default_params,
+        20,
+        Some(1),
+        Some(&IovOccasionRule::PerDose),
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(err.code(), Some("E_LEVEL_MIXED_WITH_IOV_COLUMN"));
+    assert!(compute_npde_npd_diag(
+        &m,
+        &p,
+        &m.default_params,
+        20,
+        Some(1),
+        Some(&IovOccasionRule::Column)
+    )
+    .is_ok());
+}
+
+/// An Ω_IOV that correlates kappas at two levels cannot be drawn per level (each level
+/// from its own block of the factor), so simulate and the NPDE reference refuse it
+/// (review r1 #2). The same Ω_IOV with that entry at zero simulates.
+#[test]
+fn simulation_refuses_an_omega_iov_that_couples_two_levels() {
+    let m = model();
+    let p = full_design();
+    let mut params = m.default_params.clone();
+    let iov = params.omega_iov.as_mut().unwrap();
+    let c = 0.5 * (iov.matrix[(0, 0)] * iov.matrix[(1, 1)]).sqrt();
+    *iov = crate::types::OmegaMatrix::from_matrix(
+        nalgebra::DMatrix::from_row_slice(2, 2, &[iov.matrix[(0, 0)], c, c, iov.matrix[(1, 1)]]),
+        iov.eta_names.clone(),
+        false,
+    );
+    let err = crate::api::simulate_with_seed(&m, &p, &params, 1, 1)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_PARAM_SHAPE"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("correlates kappa `K_ARM` at level `ARM` with `K_ST` at level `STUDY`"),
+        "{msg}"
+    );
+    assert!(msg.contains("Set the entry to 0."), "{msg}");
+    let err = crate::stats::npde::compute_npde_npd_diag(&m, &p, &params, 20, Some(1), None)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_PARAM_SHAPE"));
+    assert!(crate::api::simulate_with_seed(&m, &p, &m.default_params, 1, 1).is_ok());
+}
+
+/// A nested subject that reaches the κ draw without its cells is an `Err`, not a
+/// one-level draw (review r1 #1): every entry point assigns them first, so only a
+/// caller bypassing that reaches here.
+#[test]
+fn the_kappa_draw_refuses_a_nested_subject_without_cells() {
+    use crate::stats::nested_levels::{with_level_cells, KappaDraw};
+    let m = model();
+    let p = full_design();
+    let err = KappaDraw::of(&m, &p.subjects[0]).err().expect("refused");
+    assert!(err.to_string().contains("without its level cells"), "{err}");
+    let prepared = with_level_cells(&m, &p);
+    assert!(matches!(
+        KappaDraw::of(&m, &prepared.subjects[0]),
+        Ok(KappaDraw::Nested(_))
+    ));
+    // A prepared population is borrowed, not copied again.
+    assert!(matches!(
+        with_level_cells(&m, &prepared),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+/// Review r2 on #1082 PR4: a population whose records carry occasion ids that are not
+/// this model's cells — here coarser than the arms, as an `OCC` column read with the
+/// data would be — must be regrouped, not borrowed. The rows equal those of the same
+/// population without the foreign ids, bit for bit; borrowing it would merge each
+/// study's two arms into one `K_ARM`. And a layout built on such ids is refused, not
+/// grouped by them.
+#[test]
+fn foreign_occasion_ids_on_a_nested_population_are_regrouped_not_borrowed() {
+    use crate::stats::nested_levels::{with_level_cells, NestedLayout};
+    let m = model();
+    let clean = full_design();
+    let mut foreign = full_design();
+    for s in &mut foreign.subjects {
+        s.occasions = vec![1, 1, 2, 2];
+    }
+    assert!(matches!(
+        with_level_cells(&m, &foreign),
+        std::borrow::Cow::Owned(_)
+    ));
+    assert!(NestedLayout::of(&m, &foreign.subjects[0]).is_none());
+    let bits = |p: &Population| -> Vec<u64> {
+        crate::api::simulate_with_seed(&m, p, &m.default_params, 2, 7)
+            .expect("simulates")
+            .iter()
+            .map(|r| r.ipred.to_bits())
+            .collect()
+    };
+    let (a, b) = (bits(&clean), bits(&foreign));
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, b, "foreign occasion ids changed the simulated rows");
 }
 
 #[test]
@@ -599,7 +860,8 @@ fn fit_refuses_a_nested_model_under_saem_with_its_code() {
     };
     let err = crate::api::fit(&m, &full_design(), &m.default_params, &opts)
         .err()
-        .expect("refused");
+        .expect("refused")
+        .to_string();
     assert!(
         err.contains("method = saem is not yet supported on a model with nested levels"),
         "{err}"
@@ -856,7 +1118,8 @@ fn a_fit_time_occasion_rule_is_refused_on_a_nested_model() {
         );
         let err = crate::api::fit(&m, &full_design(), &m.default_params, &with(rule))
             .err()
-            .expect("fit refuses it");
+            .expect("fit refuses it")
+            .to_string();
         assert!(err.contains("the fit options set `iov_occasion`"), "{err}");
     }
     // A one-level model keeps the rule.

@@ -601,7 +601,9 @@ fn rho_range_is_checked_at_the_fits_init_params() {
     assert!(
         one(&at_init, "E_RESIDUAL_CORRELATION_RANGE").contains("lower bound of theta RHO is -0.6")
     );
-    let err = crate::api::fit(&m, &pop, &init, &focei()).expect_err("refused");
+    let err = crate::api::fit(&m, &pop, &init, &focei())
+        .expect_err("refused")
+        .to_string();
     assert!(err.contains("lower bound of theta RHO is -0.6"), "{err}");
 }
 

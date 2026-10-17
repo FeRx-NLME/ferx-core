@@ -414,20 +414,32 @@ fn install_on_ferx_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R +
 pub(crate) fn install_on_fit_pool<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
-) -> Result<R, String> {
+) -> Result<R, crate::diagnostics::EngineError> {
+    use crate::diagnostics::EngineError;
     let scope = FitScope::of(options);
-    scope.validate()?;
+    // ODE solver settings no solver can run with are `E_ODE_SOLVER_OPTIONS`, as in
+    // `with_fit_scope` (#2044), so `fit()` carries the code too (#2062 review 2, F2).
+    scope
+        .validate()
+        .map_err(super::entry_refusals::ode_solver_options)?;
     let f = scope.armed(f);
     if !scope.is_empty() {
         return match options.threads.filter(|&n| n > 0) {
-            Some(n) => Ok(fit_scope_pool(scope, n)?.install(f)),
-            None => Ok(shared_fit_scope_pool(scope, effective_default_threads())?.install(f)),
+            Some(n) => Ok(fit_scope_pool(scope, n)
+                .map_err(EngineError::uncoded)?
+                .install(f)),
+            None => Ok(shared_fit_scope_pool(scope, effective_default_threads())
+                .map_err(EngineError::uncoded)?
+                .install(f)),
         };
     }
     match options.threads.filter(|&n| n > 0) {
         // A pinned positive `threads` leases an idle pool or builds a new one,
         // preserving independently budgeted concurrent fits.
-        Some(n) => Ok(fit_pool_cache().acquire(n, FitScope::default())?.install(f)),
+        Some(n) => Ok(fit_pool_cache()
+            .acquire(n, FitScope::default())
+            .map_err(EngineError::uncoded)?
+            .install(f)),
         None => Ok(match default_fit_pool() {
             Some(pool) => pool.install(f),
             None => f(),

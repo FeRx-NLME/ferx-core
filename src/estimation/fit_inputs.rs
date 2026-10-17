@@ -116,7 +116,7 @@ fn read_model_file(
         "",
         &because,
     )
-    .map_err(|e| EngineError::from_diagnostic(crate::api::model_source_diagnostic(e)))?;
+    .map_err(crate::api::model_source_refusal)?;
     Ok((src.parsed, src.text))
 }
 

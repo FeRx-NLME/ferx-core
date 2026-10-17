@@ -188,7 +188,8 @@ mod ctmm_smoke {
         // DV = 2 is not a declared state (states are coded 0/1).
         let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 2)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("DV = 2 on a CTMM CMT must be rejected");
+            .expect_err("DV = 2 on a CTMM CMT must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5"),
             "message should name the CMT, got: {err}"
@@ -427,6 +428,34 @@ mod ctmm_smoke {
         assert!(err.to_string().contains("CTMM"), "unexpected Err: {err}");
     }
 
+    /// `run_model_simulate` (`ferx --simulate`) refuses a CTMM model with the code
+    /// `simulate()` gives it, `E_CTMM_UNSUPPORTED` on `markov_model`, and its own text
+    /// (#1772, #2062 review N2). Mutation: put that refusal back on
+    /// `EngineError::uncoded` → `None`.
+    #[test]
+    fn ctmm_run_model_simulate_errs_with_the_ctmm_code() {
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(
+            f.path(),
+            format!(
+                "{FIXED_MODEL}\n[simulation]\n  n_subjects = 2\n  dose_amt = 0\n  \
+                 dose_cmt = 1\n  seed = 7\n  times = [1, 2]\n"
+            ),
+        )
+        .unwrap();
+        let err = ferx_core::run_model_simulate(f.path().to_str().unwrap())
+            .err()
+            .expect("--simulate must refuse a CTMM model");
+        assert_eq!(err.code(), Some("E_CTMM_UNSUPPORTED"), "{err}");
+        assert_eq!(err.block(), Some("markov_model"));
+        assert!(
+            err.to_string().starts_with(
+                "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet"
+            ),
+            "{err}"
+        );
+    }
+
     /// A live CTMM fit must still write an sdtab. CTMM observations are
     /// `ObsRecord::DiscreteState`, the same variant a binary endpoint uses, but only the
     /// binary endpoint populates `SubjectResult::discrete_rows` (occupancy diagnostics are
@@ -522,7 +551,8 @@ mod ctmm_smoke {
         // Times 2.0 then 1.0 on CMT 5 — decreasing.
         let pop = common::binary_pop(&[(0.0, vec![(2.0, 0), (1.0, 1)])], 5);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("out-of-order CTMM times must be rejected");
+            .expect_err("out-of-order CTMM times must be rejected")
+            .to_string();
         assert!(
             err.contains("cmt = 5") && err.contains("non-decreasing"),
             "message should name the CMT and the constraint, got: {err}"

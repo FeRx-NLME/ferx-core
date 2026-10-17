@@ -544,6 +544,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         shrinkage_kappa: vec![],
         shrinkage_kappa_by_occ: vec![],
         ebe_kappas: vec![],
+        kappa_levels: Vec::new(),
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
@@ -2566,7 +2568,9 @@ fn fit_rejects_ltbs_with_proportional_error() {
     model.log_transform = true;
     let pop = tiny_population();
     let opts = FitOptions::default();
-    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("LTBS") && err.contains("Additive"),
         "expected LTBS+proportional rejection, got: {err}"

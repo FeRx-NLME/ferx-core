@@ -135,7 +135,8 @@ fn missing_selector_covariate_is_rejected() {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("missing selector covariate must be rejected");
+        .expect_err("missing selector covariate must be rejected")
+        .to_string();
     assert!(
         err.contains("FREE"),
         "error should name the missing covariate FREE: {err}"

@@ -105,26 +105,25 @@ pub fn ferx_core::api::check_model_data_rule(model: &ferx_core::CompiledModel, p
 pub fn ferx_core::api::check_model_data_warnings(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::api::check_model_options(model: &ferx_core::CompiledModel, options: &ferx_core::FitOptions) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::api::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
-pub fn ferx_core::api::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
-pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
+pub fn ferx_core::api::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::install_on_engine_pool<R: core::marker::Send>(f: impl core::ops::function::FnOnce() -> R + core::marker::Send) -> R
 pub fn ferx_core::api::layout_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::PredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
-pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
-pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
+pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::read_population_for(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
-pub fn ferx_core::api::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
+pub fn ferx_core::api::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
-pub fn ferx_core::api::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
-pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::api::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::api::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::api::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::api::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::api::simulate_adaptive_from_spec(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError>
@@ -965,6 +964,7 @@ pub ferx_core::io::output::EtaLinkedTheta::value: f64
 pub struct ferx_core::io::output::KappaRowsInput<'a>
 pub ferx_core::io::output::KappaRowsInput::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::io::output::KappaRowsInput::kappa_fixed: &'a [bool]
+pub ferx_core::io::output::KappaRowsInput::kappa_levels: &'a [alloc::string::String]
 pub ferx_core::io::output::KappaRowsInput::kappa_names: &'a [alloc::string::String]
 pub ferx_core::io::output::KappaRowsInput::kappa_param_types: &'a [ferx_core::EtaParamType]
 pub ferx_core::io::output::KappaRowsInput::kappa_weight_typical: &'a [core::option::Option<f64>]
@@ -3115,6 +3115,7 @@ pub ferx_core::types::FitResult::data_path: core::option::Option<alloc::string::
 pub ferx_core::types::FitResult::dw_statistic: f64
 pub ferx_core::types::FitResult::ebe_convergence_warnings: u32
 pub ferx_core::types::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
+pub ferx_core::types::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::types::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::types::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::types::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
@@ -3137,6 +3138,7 @@ pub ferx_core::types::FitResult::iwres_lag1_r: f64
 pub ferx_core::types::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_is_diagonal: core::option::Option<bool>
+pub ferx_core::types::FitResult::kappa_levels: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::types::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
@@ -3259,6 +3261,14 @@ pub ferx_core::types::KappaWeight::eval: ferx_core::KappaWeightFn
 pub ferx_core::types::KappaWeight::expr: alloc::string::String
 impl core::fmt::Debug for ferx_core::KappaWeight
 pub fn ferx_core::KappaWeight::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::LevelGroupEbe
+pub ferx_core::types::LevelGroupEbe::kappa: alloc::vec::Vec<f64>
+pub ferx_core::types::LevelGroupEbe::labels: alloc::vec::Vec<f64>
+pub struct ferx_core::types::LevelKappaEbes
+pub ferx_core::types::LevelKappaEbes::columns: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::LevelKappaEbes::groups: alloc::vec::Vec<alloc::vec::Vec<ferx_core::LevelGroupEbe>>
+pub ferx_core::types::LevelKappaEbes::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::LevelKappaEbes::level: alloc::string::String
 pub struct ferx_core::types::MixingExpr
 pub ferx_core::types::MixingExpr::class: usize
 pub ferx_core::types::MixingExpr::is_logit: bool
@@ -4618,6 +4628,7 @@ pub ferx_core::FitResult::data_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::dw_statistic: f64
 pub ferx_core::FitResult::ebe_convergence_warnings: u32
 pub ferx_core::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
+pub ferx_core::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
@@ -4640,6 +4651,7 @@ pub ferx_core::FitResult::iwres_lag1_r: f64
 pub ferx_core::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_is_diagonal: core::option::Option<bool>
+pub ferx_core::FitResult::kappa_levels: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
@@ -4780,6 +4792,14 @@ pub ferx_core::KappaWeight::eval: ferx_core::KappaWeightFn
 pub ferx_core::KappaWeight::expr: alloc::string::String
 impl core::fmt::Debug for ferx_core::KappaWeight
 pub fn ferx_core::KappaWeight::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::LevelGroupEbe
+pub ferx_core::LevelGroupEbe::kappa: alloc::vec::Vec<f64>
+pub ferx_core::LevelGroupEbe::labels: alloc::vec::Vec<f64>
+pub struct ferx_core::LevelKappaEbes
+pub ferx_core::LevelKappaEbes::columns: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::LevelKappaEbes::groups: alloc::vec::Vec<alloc::vec::Vec<ferx_core::LevelGroupEbe>>
+pub ferx_core::LevelKappaEbes::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::LevelKappaEbes::level: alloc::string::String
 pub struct ferx_core::MixingExpr
 pub ferx_core::MixingExpr::class: usize
 pub ferx_core::MixingExpr::is_logit: bool
@@ -5204,8 +5224,8 @@ pub fn ferx_core::check_strictness(result: &ferx_core::FitResult, s: &ferx_core:
 pub fn ferx_core::classify_warning(raw: &str) -> ferx_core::WarningEntry
 pub fn ferx_core::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::estimate_near_boundary(result: &ferx_core::FitResult) -> bool
-pub fn ferx_core::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
-pub fn ferx_core::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
+pub fn ferx_core::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::framework_keys() -> &'static [&'static str]
 pub fn ferx_core::inits_from_nca(model: &ferx_core::CompiledModel, population: &ferx_core::Population, method: ferx_core::suggest_start::NcaInit) -> core::result::Result<ferx_core::suggest_start::SuggestedStart, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::install_on_engine_pool<R: core::marker::Send>(f: impl core::ops::function::FnOnce() -> R + core::marker::Send) -> R
@@ -5223,19 +5243,18 @@ pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, populati
 pub fn ferx_core::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
-pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
-pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
+pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::read_nonmem_csv(path: &std::path::Path, covariate_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>) -> core::result::Result<ferx_core::Population, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv_with_covariates(path: &std::path::Path, decls: &[ferx_core::CovariateDecl], extra_columns: &[alloc::string::String], iov_column: core::option::Option<&str>) -> core::result::Result<(ferx_core::Population, ferx_core::CovariateTable), alloc::string::String>
-pub fn ferx_core::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
+pub fn ferx_core::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::run_covariance(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
-pub fn ferx_core::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
-pub fn ferx_core::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
-pub fn ferx_core::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::run_sir(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>

@@ -106,7 +106,8 @@ mod binary_smoke {
         let model = parse_model_string(FIXED_MODEL).unwrap();
         let pop = common::binary_pop(&[(0.5, vec![(0.0, 0), (1.0, 2)])], 3);
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("state = 2 on a binary CMT must be rejected");
+            .expect_err("state = 2 on a binary CMT must be rejected")
+            .to_string();
         assert!(
             err.contains("0 or 1"),
             "expected a fail-loud message, got: {err}"

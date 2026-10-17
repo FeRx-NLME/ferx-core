@@ -507,6 +507,7 @@ fn transit_fit_err(pop: &Population) -> String {
         .model;
     fit(&model, pop, &model.default_params, &FitOptions::default())
         .expect_err("fit should reject the unsupported transit configuration")
+        .to_string()
 }
 
 /// Steady-state (`SS=1`) dosing on a closed-form transit model now reroutes to its ODE twin
@@ -782,7 +783,8 @@ fn transit_iov_without_twin_rejected() {
     );
     let pop = iov_subject();
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("twin-less IOV transit should be rejected");
+        .expect_err("twin-less IOV transit should be rejected")
+        .to_string();
     assert!(
         e.contains("IOV"),
         "expected an IOV-rejection message, got: {e}"
@@ -824,7 +826,8 @@ fn transit_reset_rejected() {
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     pop.subjects[0].reset_times = vec![2.0];
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("transit + system reset should be rejected");
+        .expect_err("transit + system reset should be rejected")
+        .to_string();
     assert!(
         e.contains("reset") && e.contains("EVID"),
         "expected a reset-rejection message, got: {e}"
@@ -1519,7 +1522,8 @@ fn transit_flip_flop_without_twin_is_rejected() {
 
     // fit() rejects it with a clear, actionable error (not a silent zero-degenerate fit).
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("twin-less flip-flop must be rejected");
+        .expect_err("twin-less flip-flop must be rejected")
+        .to_string();
     assert!(
         e.contains("flip-flop") && e.contains("no ODE twin"),
         "expected an actionable twin-less flip-flop error, got: {e}"
@@ -1829,7 +1833,8 @@ fn two_cpt_transit_reset_rejected() {
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     pop.subjects[0].reset_times = vec![2.0];
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + system reset should be rejected");
+        .expect_err("2cpt transit + system reset should be rejected")
+        .to_string();
     assert!(
         e.contains("two_cpt_transit") && e.contains("reset"),
         "expected a two_cpt_transit reset-rejection message, got: {e}"
@@ -1848,7 +1853,8 @@ fn two_cpt_transit_non_depot_dose_rejected() {
     let central_dose = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0); // CMT=2, plain bolus
     let pop = population(vec![central_dose], vec![1.0, 4.0, 8.0]);
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + non-depot (CMT=2) dose should be rejected");
+        .expect_err("2cpt transit + non-depot (CMT=2) dose should be rejected")
+        .to_string();
     assert!(
         e.contains("two_cpt_transit") && e.contains("non-depot") && e.contains("CMT=2"),
         "expected a two_cpt_transit non-depot-dose rejection message, got: {e}"

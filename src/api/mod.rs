@@ -40,7 +40,7 @@ pub use validation::{
 pub(crate) use validation::{
     check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
-pub(crate) use validation::{data_read_diagnostic, model_source_diagnostic};
+pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use validation::check_survival_time_dependent_pk;
@@ -66,10 +66,11 @@ pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub(crate) use entry_refusals::{
     adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
-    fit_input_model, logit_theta_out_of_range, param_shape, sir_nothing_to_sample, sir_options,
-    theta_length,
+    fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
+    sir_nothing_to_sample, sir_options, theta_length,
 };
 pub use fit::{fit, fit_from_files};
+pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
@@ -114,9 +115,9 @@ pub(crate) use run::{
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    read_population_with, resolve_data_path, run_from_file, run_model_simulate,
-    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
-    run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
+    read_population_with, resolve_data_path, run_model_simulate, run_model_simulate_with_overrides,
+    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
+    ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
 pub(crate) use simulate::obs_row_time;
@@ -474,3 +475,7 @@ mod adaptive_snapshot_verify_tests;
 #[cfg(test)]
 #[path = "tests/param_shape_gate_tests.rs"]
 mod param_shape_gate_tests;
+
+#[cfg(test)]
+#[path = "tests/nested_levels_output_tests.rs"]
+mod nested_levels_output_tests;

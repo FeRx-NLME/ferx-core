@@ -169,7 +169,8 @@ fn run_allometry_command(args: &[String]) -> Result<i32, String> {
         (config.load_base()?, options, config.run_options())
     } else {
         let data = value(args, "--data")?;
-        let prepared = ferx_core::prepare_run(&path.to_string_lossy(), data)?;
+        let prepared =
+            ferx_core::prepare_run(&path.to_string_lossy(), data).map_err(|e| e.to_string())?;
         if let Some(w) = &prepared.data_path_warning {
             eprintln!("Warning: {w}");
         }

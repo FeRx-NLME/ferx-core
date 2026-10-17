@@ -258,7 +258,9 @@ fn population_from_model_source(
         let path = model_file
             .to_str()
             .ok_or("temporary model path is not valid UTF-8")?;
-        Ok(ferx_core::prepare_run(path, Some(data_path))?.population)
+        Ok(ferx_core::prepare_run(path, Some(data_path))
+            .map_err(|e| e.to_string())?
+            .population)
     })();
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -347,7 +349,8 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
         // ── Normal / --no-fit: parse model and fit (or eval-only) ────────────
         let model_path = model_path(args)?;
 
-        let mut prepared = ferx_core::prepare_run(model_path, data_path)?;
+        let mut prepared =
+            ferx_core::prepare_run(model_path, data_path).map_err(|e| e.to_string())?;
         if let Some(w) = &prepared.data_path_warning {
             eprintln!("Warning: {w}");
         }
@@ -392,7 +395,8 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
             &prepared.population,
             &prepared.init_params,
             &prepared.parsed.fit_options,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         eprintln!(
             "Fit: converged={}, OFV={:.3}, {:.1}s",
             fit.converged,

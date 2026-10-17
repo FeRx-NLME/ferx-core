@@ -914,7 +914,8 @@ fn compile_and_fit(
     // pool cannot be built, and the model-shaped bad outcome — a fit that
     // finishes without converging — is an `Ok` judged by the strictness gate,
     // not an error at all.
-    fit(&parsed.model, &population, &init_params, &fit_options).map_err(CandidateError::environment)
+    fit(&parsed.model, &population, &init_params, &fit_options)
+        .map_err(|e| CandidateError::environment(e.to_string()))
 }
 
 #[cfg(test)]

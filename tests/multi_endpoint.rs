@@ -161,7 +161,8 @@ fn per_cmt_error_missing_endpoint_is_rejected_at_fit() {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("observed CMT with no error endpoint must be rejected");
+        .expect_err("observed CMT with no error endpoint must be rejected")
+        .to_string();
     assert!(err.contains('3'), "error should name missing CMT 3: {err}");
 }
 

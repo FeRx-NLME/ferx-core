@@ -503,6 +503,71 @@ fn unmatched_per_cmt_readout_entry_warns_on_the_analytic_readout_too() {
     );
 }
 
+/// The `[block]` a `y[CMT=N]` finding names, read off the `Diagnostic` and its text.
+fn readout_finding_block(model: &CompiledModel) -> (Option<String>, String) {
+    let pop = population(OBS_CMT1_ONLY);
+    let found: Vec<Diagnostic> = warnings_of(model, &pop)
+        .into_iter()
+        .filter(|d| d.code == CODE)
+        .collect();
+    assert_eq!(found.len(), 1, "expected one finding, got {found:?}");
+    (found[0].block.clone(), found[0].message.clone())
+}
+
+#[test]
+fn a_compartment_free_readout_finding_names_structural_model() {
+    // #1827: a compartment-free model writes `y[CMT=N]` in `[structural_model]`, and
+    // its equations reach the readout through the `[scaling]` pipeline. The finding
+    // named `[scaling]`, a block the file does not have.
+    let m = model_of(
+        "[parameters]
+  theta TVB(10.0, 0.1, 100.0)
+  theta TVB2(5.0, 0.1, 100.0)
+  omega ETA_B ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  BASE = TVB * exp(ETA_B)
+  B2   = TVB2
+
+[structural_model]
+  y[CMT=1] = BASE
+  y[CMT=2] = B2
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    );
+    assert!(m.is_algebraic(), "fixture must be compartment-free");
+    assert_only_live_channel(&m, CmtConsumer::PerCmtReadout);
+
+    let (block, msg) = readout_finding_block(&m);
+    assert_eq!(block.as_deref(), Some("structural_model"), "{msg}");
+    assert!(
+        msg.contains("`[structural_model] y[CMT=N]` declares compartment(s) 2 "),
+        "must name the block the user wrote: {msg}"
+    );
+    assert!(
+        !msg.contains("[scaling]"),
+        "must not name a block the file does not have: {msg}"
+    );
+}
+
+#[test]
+fn a_compartmental_readout_finding_keeps_the_scaling_label() {
+    // The other side of the #1827 gate: on a compartmental model the entries really
+    // are in `[scaling]`, so the finding keeps that name.
+    let m = per_cmt_analytic_readout_model("  y[CMT=1] = CENTRAL / V\n  y[CMT=2] = CENTRAL / V");
+    assert!(!m.is_algebraic(), "fixture must carry compartments");
+
+    let (block, msg) = readout_finding_block(&m);
+    assert_eq!(block.as_deref(), Some("scaling"), "{msg}");
+    assert!(
+        msg.contains("`[scaling] y[CMT=N]` declares compartment(s) 2 "),
+        "a real [scaling] block keeps its own name: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The rendered list
 // ---------------------------------------------------------------------------
