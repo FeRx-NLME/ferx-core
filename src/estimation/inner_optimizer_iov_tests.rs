@@ -4672,8 +4672,8 @@ fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
 /// rebuild per call is invisible in every number the search returns; only the count
 /// (`LAYOUT_BUILDS`: every `StackedLayout::new` and `NestedLayout::of`) can see it.
 ///
-/// Measured: 2–5 builds per search (the search's own, plus the warm-start, FD-reason and
-/// variance setup around it) against 56–208 analytic gradient steps and their
+/// Measured: 1–3 builds per whole `find_ebe_for_stage` call against 56–208 analytic
+/// gradient steps and their
 /// line-search objectives. Before #2037 every objective built two layouts and every
 /// analytic gradient three or four, so the same searches built hundreds. The bound is
 /// the measured worst plus two. The FD-inner case pins the objective's prediction path
@@ -4682,7 +4682,7 @@ fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
 fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     use crate::stats::nested_levels::test_helpers as fx;
     use crate::stats::stacked_layout::LAYOUT_BUILDS;
-    const MAX_BUILDS: usize = 7;
+    const MAX_BUILDS: usize = 5;
     let stage = FitOptions {
         method: crate::types::EstimationMethod::FoceI,
         interaction: true,
@@ -4720,7 +4720,13 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
         let ebe = find_ebe_for_stage(m, s, &m.default_params, 200, 1e-8, None, None, 0, &stage);
         let builds = LAYOUT_BUILDS.with(|c| c.get());
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-        assert!(ebe.nll.is_finite(), "{label}");
+        // `is_finite()` alone passes the `1e20` refusal sentinel; these searches end
+        // between −12.5 and 2.7e5, fourteen orders below it (#2063 review 1, finding 2).
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{label}: EBE objective {}",
+            ebe.nll
+        );
         if *analytic_route {
             // The bound must be far below the work, or it could not tell the two apart.
             assert!(

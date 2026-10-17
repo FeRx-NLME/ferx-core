@@ -2687,7 +2687,17 @@ fn find_ebe_iov(
             for k in &kappas_vec {
                 stacked_hat.extend(k.iter().copied());
             }
-            crate::sens::provider::subject_eta_grad_iov(model, subject, &params.theta, &stacked_hat)
+            // The search's own layout (#2037 review 1); `None` is the unprepared subject,
+            // which no walk serves.
+            layout.as_ref().and_then(|l| {
+                crate::sens::provider::subject_eta_grad_iov_in(
+                    model,
+                    subject,
+                    l,
+                    &params.theta,
+                    &stacked_hat,
+                )
+            })
         } else {
             None
         };

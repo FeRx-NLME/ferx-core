@@ -86,7 +86,7 @@ thread_local! {
     pub(crate) static LAYOUT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Count one layout build (test builds only); see [`LAYOUT_BUILDS`].
+/// Count one layout build (test builds only); see `LAYOUT_BUILDS`.
 #[inline]
 pub(crate) fn count_build() {
     #[cfg(test)]
