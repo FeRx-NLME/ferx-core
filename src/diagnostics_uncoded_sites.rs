@@ -35,12 +35,17 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime: a subject's posthoc EBE is non-finite",
     ),
     (
-        "src/api/simulate.rs",
-        "simulate_with_uncertainty_diag",
+        "src/estimation/uncertainty_samples.rs",
+        "draw_asymptotic",
+        2,
+        "runtime: the covariance cannot be made positive definite, or the sampler finds too few valid draws; \
+         its input refusals are coded (#2044)",
+    ),
+    (
+        "src/estimation/uncertainty_samples.rs",
+        "draw_sir",
         1,
-        "draw_parameter_samples: a missing covariance matrix / SIR pool (E_FIT_INPUT_MISSING's refusal) and a \
-         covariance or SIR pool that does not match the template (E_FIT_INPUT_MODEL's family) lack a Diagnostic \
-         here; runtime: the sampler finds no valid draw. Its logit-θ bound is refused before it, coded (#2044)",
+        "runtime: the sampler finds too few valid draws in the pool; its input refusals are coded (#2044)",
     ),
     (
         "src/api/pool.rs",

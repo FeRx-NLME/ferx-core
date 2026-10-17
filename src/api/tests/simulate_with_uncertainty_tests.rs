@@ -3340,19 +3340,21 @@ fn asymptotic_errors_without_covariance_step() {
     };
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
     assert!(err.to_string().contains("covariance"));
+    // #2044: the input the fit lacks, coded as `run_sir` codes its own missing covariance.
+    assert_eq!(err.code(), Some("E_FIT_INPUT_MISSING"), "{err}");
 }
 
 /// #2044: a logit-scaled θ whose estimate is not strictly inside (0, 1) is
 /// `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` from `simulate_with_uncertainty` (and
 /// its `_diag` form, which it wraps), with the advice in `suggestion()` and folded into
 /// `to_string()` once — `message()` carries none. Zero draws sample nothing and stay
-/// `Ok`, as before #2044 (the pre-check is gated on them); `Sir` draws nothing on the
-/// logit scale, so its refusal here is its own missing pool, not this code.
+/// `Ok`, as before #2044; `Sir` draws nothing on the logit scale, so its refusal here
+/// is its own missing pool (`E_FIT_INPUT_MISSING`), not this code.
 ///
-/// Mutations — the pre-check deleted from `simulate_with_uncertainty_diag` (the
-/// sampler's uncoded `String` comes back: `code()` `None`); its zero-draw gate dropped
-/// (the zero-draw run is refused); the method gate dropped (`Sir` gets this code); a
-/// sentence of the message or the suggestion deleted (`to_string()`).
+/// Mutations — `simulate_with_uncertainty_diag` calling the `String` sampler through
+/// `EngineError::uncoded` (`code()` `None`); a sentence of the message or the
+/// suggestion deleted (`to_string()`). The sampler's other refusals are pinned row by row
+/// in `uncertainty_samples::tests::draw_parameter_samples_coded_codes_its_input_refusals`.
 #[test]
 fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
     let model = tiny_model();
@@ -3395,7 +3397,7 @@ fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
     );
     let sir = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Sir))
         .unwrap_err();
-    assert_ne!(sir.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"), "{sir}");
+    assert_eq!(sir.code(), Some("E_FIT_INPUT_MISSING"), "{sir}");
 }
 
 // ---------------------------------------------------------------------------

@@ -635,8 +635,6 @@ fn a_model_that_is_not_the_fits_carries_its_code() {
     check_rows(rows);
 }
 
-/// SIR's own input refusals through `run_sir`, from the shared core
-/// (`run_sir_core_coded`): `E_SIR_OPTIONS` for settings the resampler cannot run with,
 /// #2044: ODE solver settings no solver can run with, on a hand-built `FitOptions`
 /// (a model file's `[fit_options]` refuses them at parse time, as `E_PARSE`), are
 /// `E_ODE_SOLVER_OPTIONS` on every entry point that opens the fit scope: `run_sir`,
@@ -706,6 +704,8 @@ fn invalid_ode_solver_options_carry_their_code_on_every_entry() {
     check_rows(rows);
 }
 
+/// SIR's own input refusals through `run_sir`, from the shared core
+/// (`run_sir_core_coded`): `E_SIR_OPTIONS` for settings the resampler cannot run with,
 /// `E_FIT_INPUT_MODEL` for a covariance matrix that is not the size of the model's
 /// packed parameters, `E_SIR_NOTHING_TO_SAMPLE` on `[parameters]` for a fit whose
 /// θ, Ω and σ are all FIX. Not attributed to the entry point, as before. The fourth option

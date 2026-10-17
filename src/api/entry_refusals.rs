@@ -19,6 +19,11 @@
 //! (`E_SIR_NOTHING_TO_SAMPLE`). Their re-reads of the model and data files are
 //! not here: those failures are `ferx check`'s own, and are coded by its read
 //! classifiers in `validation.rs`.
+//!
+//! Two more have no `ferx check` path (#2044): ODE solver settings on a hand-built
+//! `FitOptions` (`E_ODE_SOLVER_OPTIONS`; `ferx check` reads a model file, whose
+//! parser refuses the same values as `E_PARSE`), and a logit-scaled θ estimated
+//! outside (0, 1), which only a fit has (`E_LOGIT_THETA_OUT_OF_RANGE`).
 
 use crate::diagnostics::{Diagnostic, EngineError};
 
@@ -172,7 +177,8 @@ pub(crate) fn theta_length(message: impl Into<String>) -> EngineError {
 /// IOV model passed as `model = Some` on a fit with no recorded reader settings, the
 /// occasion rule of an IOV fit whose population carries no occasion labels, or the
 /// fitted values of a `[mixture]` fit's per-class overrides (which
-/// `simulate_with_uncertainty` needs too).
+/// `simulate_with_uncertainty` needs too), and the covariance matrix or SIR
+/// resamples `simulate_with_uncertainty` draws from, absent or empty (#2044).
 pub(crate) fn fit_input_missing(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MISSING", None, message.into())
 }
@@ -196,7 +202,8 @@ pub(crate) fn fit_input_changed_diag(message: impl Into<String>) -> Diagnostic {
 /// population does not reproduce, a model whose η count is not the width of the
 /// fit's per-subject η̂, a `[mixture]` fit whose packed estimate has another layout
 /// or no longer reproduces its reported estimates, or a covariance matrix that is
-/// not the size of the model's packed parameters (SIR's proposal).
+/// not the size of the model's packed parameters (SIR's proposal, or the covariance
+/// or SIR resamples `simulate_with_uncertainty` draws from, #2044).
 pub(crate) fn fit_input_model(message: impl Into<String>) -> EngineError {
     coded("E_FIT_INPUT_MODEL", None, message.into())
 }

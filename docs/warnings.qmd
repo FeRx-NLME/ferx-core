@@ -133,14 +133,16 @@ carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
 same model and data. A caller can match on `code()` instead of parsing the
 message. `message()` never repeats the suggestion, so show either `to_string()`
 alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
-unbound `theta NAME[...]` block is the one whose `to_string()` also ends with its
-suggestion.) A refusal `ferx check` cannot reach has a code too, since it has no
+unbound `theta NAME[...]` block and `E_LOGIT_THETA_OUT_OF_RANGE` also end their
+`to_string()` with the suggestion.) A refusal `ferx check` cannot reach has a code too, since it has no
 parameter vector, no fit, no simulation options and no adaptive controller: the θ
 length and parameter shape codes, the binding codes on a fit's bindings, a population
 that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation, adaptive-dosing
 and post-hoc codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
 `code()` is `None` only for a failure that is not a refusal of the input, such as a posthoc eta that does not converge, a SIR run whose every draw is invalid,
 or an adaptive-dosing run whose frozen-schedule replay disagrees with it.
+
+##### Codes by precondition {#entry-point-codes-by-precondition}
 
 Each precondition check emits one of a fixed set of codes, depending on what it
 found:
@@ -172,9 +174,10 @@ found:
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
 | adaptive dosing: the model, the options, the spec, the controller's actions | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
+| the covariance matrix or SIR resamples to draw from (`simulate_with_uncertainty()`): not on the fit, or an empty pool; not the size of the model's packed parameters | `E_FIT_INPUT_MISSING`; `E_FIT_INPUT_MODEL` |
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
 | ODE solver settings on a `FitOptions` built in code (`run_sir()`, `run_covariance()`) | `E_ODE_SOLVER_OPTIONS` |
-| a logit-scaled θ estimated outside (0, 1) (`simulate_with_uncertainty()`, asymptotic method) | `E_LOGIT_THETA_OUT_OF_RANGE` |
+| a logit-scaled θ estimated outside (0, 1) (`simulate_with_uncertainty()` with the asymptotic method, `run_sir()`) | `E_LOGIT_THETA_OUT_OF_RANGE` |
 | re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
 
 `fit()` keeps returning a `String`.
@@ -227,6 +230,12 @@ Of the input refusals, these carry a code:
   with (`E_ODE_SOLVER_OPTIONS`): an `ode_reltol` or `ode_abstol` that is not
   finite and positive, or `ode_max_steps = 0`. A model file's `[fit_options]`
   refuses the same values when it is parsed (`E_PARSE`);
+- a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly
+  inside (0, 1), so `run_sir()` has no logit-scale proposal for it
+  (`E_LOGIT_THETA_OUT_OF_RANGE`, on `[parameters]`). Only an upper bound above 1
+  lets the estimate get there; `suggestion()` says to declare one below 1 and
+  refit. `simulate_with_uncertainty()` with the asymptotic method refuses it the
+  same way;
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
   above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
   prior. `fit()` with `sir = true` reports the same text as a warning;

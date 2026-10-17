@@ -1631,10 +1631,20 @@ mod tests {
 
         // An estimate past 1 (reachable only with such a bound) has no logit:
         // SIR refuses rather than falling back to the packed-scale proposal.
+        // The whole text, advice included: `run_sir_core`'s `String`, which `run_sir()`'s
+        // `to_string()` and `fit()`'s `SIR failed:` warning also carry. Building the
+        // coded error with `from_diagnostic` instead of `with_suggestion_in_display`
+        // drops the last sentence and reddens this (#2061 review, finding 1).
         let err = run("5.0", 1.2).unwrap_err();
-        assert!(err.contains("uncertainty for TVP"), "{err}");
-        // #2044: coded on the coded core, the `String` above being its `to_string()`.
-        // Back on `EngineError::uncoded`, `code()` is `None`.
+        assert_eq!(
+            err,
+            "Cannot draw parameter uncertainty for TVP: it is used as \
+             inv_logit(logit(TVP) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is 1.2. Declare its upper bound below 1 \
+             (e.g. 0.999) and refit."
+        );
+        // #2044: coded on the coded core. Back on `EngineError::uncoded`, `code()` is
+        // `None`.
         let model =
             crate::parser::model_parser::parse_model_string(&model_src.replace("UPPER", "5.0"))
                 .expect("parse");
