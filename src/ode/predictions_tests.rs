@@ -14758,3 +14758,314 @@ fn a_reader_split_tie_is_read_on_every_ode_engine() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     println!("reader-split tie, every ODE engine: worst relative difference {worst:.3e}");
 }
+
+// ----- #1578: a diverged state is refused, never handed to the controller -----
+
+/// The #1539 pole next to a decoupled `central`: `central' = −0.1·central`, `x' = 0.5·x²`.
+/// With a bolus of 1 into `x` at t=0, `x = 1/(1 − 0.5t)` has its pole at t = 2, so decision 0
+/// (t=1) sees a finite state and decision 1 (t=4) a diverged one.
+fn pole_ode_spec(readout: OdeReadout) -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = -0.1 * y[0];
+            dy[1] = 0.5 * y[1] * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "x".into()],
+        readout,
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// 100 into `central`, 1 into `x`, both at t=0; one observation past the pole.
+fn pole_subject() -> Subject {
+    make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 1.0, 2, 0.0, false, 0.0),
+        ],
+        vec![6.0],
+    )
+}
+
+const POLE_DECISIONS: [f64; 2] = [1.0, 4.0];
+
+/// The state refusal's text, whatever produced the non-finite value: runtime (uncoded), naming
+/// the non-finite states, both possible sources, and blaming neither the controller nor a dose
+/// amount. `at` is the decision's `decision {i} at t={t}` lead, `names` the parenthesised list.
+fn assert_state_refusal_text(err: &AdaptiveDriverError, at: &str, names: &str) {
+    let msg = err.to_string();
+    assert_eq!(err.kind(), None, "must be uncoded runtime, got {err:?}");
+    assert!(
+        msg.starts_with(&format!("{at}: the ODE state is non-finite {names}, ")),
+        "{msg}"
+    );
+    assert!(msg.contains("so there is no value to decide on"), "{msg}");
+    assert!(
+        msg.contains(
+            "an init() expression or the [odes] right-hand side produced a non-finite value"
+        ),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Check them and the parameter values."),
+        "{msg}"
+    );
+    // The #1578 review: a seeded state was blamed on the right-hand side, which had not run.
+    assert!(!msg.contains("diverged"), "{msg}");
+    assert!(!msg.contains("controller"), "{msg}");
+    assert!(!msg.contains("dose amount"), "{msg}");
+}
+
+/// The state refusal on the pole fixture, shared by T2–T4: decision 1, both states.
+fn assert_state_refusal(err: &AdaptiveDriverError) {
+    assert_state_refusal_text(err, "decision 1 at t=4", "(central, x)");
+}
+
+/// T2 (row A1): an `Ipred` monitor and an `amt = 10 / C` controller. Before #1578 this failed
+/// as `E_ADAPTIVE_CONTROLLER_ACTION` ("dose amount must be finite … got NaN").
+///
+/// Engine: the f64 adaptive driver. Mutation that reddens it: delete the state guard (kind
+/// becomes `ControllerAction`); swap the guards' order (the message names the monitor).
+#[test]
+fn adaptive_diverged_state_is_refused_not_blamed_on_the_controller() {
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+    let mut controller = |ctx: &ControllerCtx| {
+        vec![DoseAction::Bolus {
+            amt: 10.0 / ctx.signals["C"],
+            cmt: 1,
+        }]
+    };
+    let err = ode_predictions_adaptive(
+        &ode,
+        &pk_one(1.0, 10.0).values,
+        &[],
+        &[],
+        &pole_subject(),
+        &POLE_DECISIONS,
+        &[MonitorSpec::new("C", 1, ObserveMode::Ipred)],
+        &mut controller,
+        100,
+        None,
+    )
+    .unwrap_err();
+    assert_state_refusal(&err);
+}
+
+/// T3 (row A2): a `Dv` monitor on a clamping `ObsCmt` readout. Before #1578 `NaN.max(0.0)`
+/// fed the controller a `0`, it dosed 100 at t=4, and the run returned `Ok`.
+///
+/// Engine: the f64 adaptive driver. Mutation that reddens it: delete both guards (either alone
+/// is covered by T4 / T5).
+#[test]
+fn adaptive_dv_monitor_never_doses_on_a_fabricated_zero() {
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+    let mut controller = |ctx: &ControllerCtx| {
+        if ctx.signals["C"] < 50.0 {
+            vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    };
+    let unit_var = |_cmt: usize, _ipred: f64| Some(1.0);
+    let assay = AssayNoise {
+        resid_var: &unit_var,
+        base_seed: 7,
+    };
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk_one(1.0, 10.0).values,
+        &[],
+        &[],
+        &pole_subject(),
+        &POLE_DECISIONS,
+        &[MonitorSpec::new("C", 1, ObserveMode::Dv)],
+        &mut controller,
+        100,
+        Some(&assay),
+    );
+    match run {
+        Ok(r) => panic!(
+            "a diverged state must not return Ok; ledger {:?}",
+            r.ledger.iter().map(|d| (d.time, d.amt)).collect::<Vec<_>>()
+        ),
+        Err(err) => assert_state_refusal(&err),
+    }
+}
+
+/// T4: no monitors at all, the controller reads `ctx.state` itself. The latent guard cannot
+/// see this leg (there is no monitor), so it is the state guard's only killing fixture.
+///
+/// Engine: the f64 adaptive driver. Mutation that reddens it: delete the state guard only.
+#[test]
+fn adaptive_diverged_state_is_refused_with_no_monitors() {
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+    let mut controller = |ctx: &ControllerCtx| {
+        if ctx.state[0] < 50.0 {
+            vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    };
+    let err = ode_predictions_adaptive(
+        &ode,
+        &pk_one(1.0, 10.0).values,
+        &[],
+        &[],
+        &pole_subject(),
+        &POLE_DECISIONS,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .unwrap_err();
+    assert_state_refusal(&err);
+}
+
+/// T5: a finite state whose `Single` readout is `NaN` (`(s₀ − s₀)/0`). The state guard cannot
+/// see this leg (the state is finite), so it is the latent guard's only killing fixture.
+///
+/// Engine: the f64 adaptive driver. Mutation that reddens it: delete the latent guard only.
+#[test]
+fn adaptive_non_finite_readout_of_a_finite_state_names_the_monitor() {
+    // Two legs: `0/0 = NaN` and `1/0 = inf`, both from a finite `central`. The `inf` leg is
+    // what kills an `is_nan` guard (#1578 review, finding 3).
+    type Readout = fn(&[f64]) -> f64;
+    let legs: [(&str, Readout); 2] = [
+        ("NaN", |s| (s[0] - s[0]) / 0.0),
+        ("inf", |s| 1.0 / (s[0] - s[0])),
+    ];
+    for (shown, readout) in legs {
+        let ode = pole_ode_spec(OdeReadout::Single(Box::new(
+            move |s, _pk, _theta, _eta, _cov| readout(s),
+        )));
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &[],
+            &[],
+            &pole_subject(),
+            &POLE_DECISIONS,
+            &[MonitorSpec::new("C", 1, ObserveMode::Ipred)],
+            &mut controller,
+            100,
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.kind(), None, "{shown}: {err:?}");
+        assert!(msg.contains("decision 0 at t=1"), "{msg}");
+        assert!(
+            msg.contains(&format!("monitor 'C' read a non-finite value ({shown})")),
+            "{msg}"
+        );
+        assert!(msg.contains("from a finite state"), "{msg}");
+        assert!(msg.contains("readout / observe"), "{msg}");
+        assert!(!msg.contains("diverged"), "{msg}");
+        // `x` cannot be probed: "expression" contains it.
+        assert!(!msg.contains("central"), "{msg}");
+    }
+}
+
+/// T7 (#1578 review, findings 1 and 2): a non-finite **seed** is refused at t=0, before any
+/// right-hand side has run, with the same text as an integrated divergence and naming exactly
+/// the non-finite states. The pole fixture NaN-pads every component, so it cannot tell "all
+/// states" from "some", or `NaN` from `inf`; these seeds can.
+///
+/// * `init = [0, NaN]`: only `x`. Kills a guard that scans `u[..1]`.
+/// * `init = [inf, 0]`: only `central`, as `inf`. Kills a last-state-only scan and an
+///   `is_nan` guard.
+/// * the integrated pole (decision 1): both, the same sentences. A message that names one
+///   source only fails one of the two sides.
+///
+/// Engine: the f64 adaptive driver, through `ode.initial_state` (`init_fn`).
+#[test]
+fn adaptive_non_finite_seed_is_refused_naming_only_its_non_finite_states() {
+    for (init, names) in [
+        ([0.0, f64::NAN], "(x)"),
+        ([f64::INFINITY, 0.0], "(central)"),
+    ] {
+        let mut ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+        ode.init_fn = Some(Box::new(move |_pk: &[f64]| init.to_vec()));
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &[],
+            &[],
+            &make_subject(vec![], vec![6.0]),
+            &[0.0, 1.0],
+            &[],
+            &mut controller,
+            100,
+            None,
+        )
+        .unwrap_err();
+        assert_state_refusal_text(&err, "decision 0 at t=0", names);
+    }
+
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let err = ode_predictions_adaptive(
+        &ode,
+        &pk_one(1.0, 10.0).values,
+        &[],
+        &[],
+        &pole_subject(),
+        &POLE_DECISIONS,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .unwrap_err();
+    assert_state_refusal(&err);
+}
+
+/// T6 twin: a finite state and a controller that itself emits a `NaN` amount stays an
+/// `E_ADAPTIVE_CONTROLLER_ACTION` refusal with its pre-#1578 text.
+///
+/// Engine: the f64 adaptive driver. Mutation that reddens it: make the new guards fire on the
+/// controller's non-finite amount instead of on the state.
+#[test]
+fn adaptive_nan_amount_from_a_finite_state_is_still_a_controller_action() {
+    let ode = pole_ode_spec(OdeReadout::ObsCmt(0));
+    let mut controller = |_ctx: &ControllerCtx| {
+        vec![DoseAction::Bolus {
+            amt: f64::NAN,
+            cmt: 1,
+        }]
+    };
+    let err = ode_predictions_adaptive(
+        &ode,
+        &pk_one(1.0, 10.0).values,
+        &[],
+        &[],
+        &pole_subject(),
+        &POLE_DECISIONS,
+        &[MonitorSpec::new("C", 1, ObserveMode::Ipred)],
+        &mut controller,
+        100,
+        None,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(
+        err.kind(),
+        Some(AdaptiveRefusalKind::ControllerAction),
+        "{err:?}"
+    );
+    assert!(msg.contains("decision 0 at t=1"), "{msg}");
+    assert!(msg.contains("dose amount must be finite"), "{msg}");
+    assert!(!msg.contains("diverged"), "{msg}");
+}
