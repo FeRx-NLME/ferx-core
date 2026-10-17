@@ -1046,6 +1046,13 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
+        // A residual `correlation … by` line with kappa (#1082 PR5): the IOV outer
+        // assemblies score a diagonal `R` — FOCEI declines per subject through
+        // `corr_residual_diag`, while FOCE's (`subject_packed_gradient_foce_iov`) would
+        // silently differentiate the diagonal `R⁰`. Neither has a dense-`R` form, so the
+        // outer gradient is central differences of the OFV, on FOCE and FOCEI alike. The
+        // analytic IOV + dense-`R` gradient is a follow-up.
+        && !(model.n_kappa > 0 && model.residual_serial.is_some())
     // IIV on residual error (#474) needs no gate here: the analytic gradient (inner η-column +
     // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves every `iiv_on_ruv`
     // combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples

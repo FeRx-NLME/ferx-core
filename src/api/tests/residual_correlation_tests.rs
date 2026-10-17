@@ -144,37 +144,24 @@ fn scope_refuses_quadrature() {
     assert!(with_code(&scope_for(&s, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").is_empty());
 }
 
-/// κ: refused, and the message says why the two are not combined — the measured
-/// confounding of CS (ρ ≥ 0) with a weight-loaded arm κ.
+/// κ is in scope since #1082 PR5: the IOV objective takes the dense `R`, so the scope
+/// check names nothing for it. Whether `cs` is confounded with a κ is a data check
+/// (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, `nested_correlation_tests.rs`), not a scope.
 #[test]
-fn scope_refuses_kappa_and_says_it_is_the_same_covariance() {
-    let s = src(
-        "cs",
-        "(0.3, -0.4, 0.95)",
-        "  kappa K_CL ~ 0.04\n",
-        "  iov_column = OCC\n",
-    )
-    .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + K_CL)");
-    let msg = one(&scope_for(&s, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").to_string();
-    assert!(
-        msg.contains("is not supported with inter-occasion random effects (kappa)."),
-        "{msg}"
-    );
-    assert!(
-        msg.contains(
-            "A kappa intercept loaded by the residual weight on the same grouping is the same \
-             covariance as `cs` with ρ ≥ 0, so the two are not identifiable together"
-        ),
-        "{msg}"
-    );
-    assert!(msg.contains("fit one or the other (#1082)."), "{msg}");
-    // The confounding sentence belongs to κ only.
-    let saem = FitOptions {
-        method: crate::types::EstimationMethod::Saem,
-        ..FitOptions::default()
-    };
-    let other = scope_for(&src("cs", "(0.3, -0.4, 0.95)", "", ""), &saem);
-    assert!(!one(&other, "E_RESIDUAL_CORRELATION_SCOPE").contains("identifiable"));
+fn scope_accepts_kappa() {
+    for kind in ["cs", "ar1", "car1"] {
+        let s = src(
+            kind,
+            "(0.3, 0.0, 0.95)",
+            "  kappa K_CL ~ 0.04\n",
+            "  iov_column = OCC\n",
+        )
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + K_CL)");
+        assert!(
+            with_code(&scope_for(&s, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").is_empty(),
+            "{kind}"
+        );
+    }
 }
 
 /// M3 censoring and an SDE model each get their own refusal.

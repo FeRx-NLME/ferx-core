@@ -1,0 +1,368 @@
+Sat Oct 17 06:34:38 PM UTC 2026
+$PROBLEM ferx #1082 PR5 anchor V7 -- exact3 + within-arm residual correlation car1_p06 (MAXEVAL=0)
+; exact3 (../nested_levels_3_eval.ctl) at its optimum; L2 = ARMID (one EPS vector per arm);
+; VIS = visit index in the arm; T1..T5 = the arm's visit times. rho = THETA(5) FIX.
+$INPUT ID STUDY ARM L2 STUDYID=DROP SLOT TIME DV NARM DOSE VIS T1 T2 T3 T4 T5
+$DATA nested_levels_3_ar1.csv IGNORE=@
+$PRED
+  EST = 0
+  IF(STUDY.EQ.1) EST = ETA(2)
+  IF(STUDY.EQ.2) EST = ETA(3)
+  KAR = 0
+  IF(SLOT.EQ.1) KAR = ETA(4)
+  IF(SLOT.EQ.2) KAR = ETA(5)
+  IF(SLOT.EQ.3) KAR = ETA(6)
+  IF(SLOT.EQ.4) KAR = ETA(7)
+  EMAX = THETA(2)*EXP(ETA(1) + EST + KAR/SQRT(NARM))
+  IPRED = THETA(1) + EMAX*DOSE/(THETA(3)+DOSE)*TIME/(TIME+THETA(4))
+  RHO = THETA(5)
+
+; continuous-time AR(1): corr = rho^|dt|; L[j,k] = rho^(t_j - t_k) * s_k,
+; s_1 = 1, s_k = sqrt(1 - rho^(2 (t_k - t_{k-1}))).  0 < rho < 1.
+  LR = LOG(RHO)
+  Q2 = 0
+  Q3 = 0
+  Q4 = 0
+  Q5 = 0
+  IF (VIS.GE.2) Q2 = SQRT(1 - EXP(2*LR*(T2-T1)))
+  IF (VIS.GE.3) Q3 = SQRT(1 - EXP(2*LR*(T3-T2)))
+  IF (VIS.GE.4) Q4 = SQRT(1 - EXP(2*LR*(T4-T3)))
+  IF (VIS.GE.5) Q5 = SQRT(1 - EXP(2*LR*(T5-T4)))
+  L1=0
+  L2C=0
+  L3=0
+  L4=0
+  L5=0
+  IF (VIS.EQ.1) L1 = 1
+  IF (VIS.GE.2) L1 = EXP(LR*(TIME-T1))
+  IF (VIS.GE.2) L2C = EXP(LR*(TIME-T2))*Q2
+  IF (VIS.GE.3) L3 = EXP(LR*(TIME-T3))*Q3
+  IF (VIS.GE.4) L4 = EXP(LR*(TIME-T4))*Q4
+  IF (VIS.GE.5) L5 = EXP(LR*(TIME-T5))*Q5
+
+  RES = L1*EPS(1) + L2C*EPS(2) + L3*EPS(3) + L4*EPS(4) + L5*EPS(5)
+  SD = SQRT(0.255164)
+  Y = IPRED + SD*RES
+$THETA (0, 10.1818) FIX (0, 22.0140) FIX (0.1, 33.4048) FIX (0.01, 3.20150) FIX
+$THETA (0.001, 0.6, 0.999) FIX
+$OMEGA 0.0699388 FIX     ; ETA(1) sponsor
+$OMEGA BLOCK(1) 0.0904362 FIX ; ETA(2) study slot 1
+$OMEGA BLOCK(1) SAME   ; ETA(3) study slot 2
+$OMEGA BLOCK(1) 3.75478 FIX ; ETA(4) arm slot 1 (unweighted gamma^2)
+$OMEGA BLOCK(1) SAME
+$OMEGA BLOCK(1) SAME
+$OMEGA BLOCK(1) SAME
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$SIGMA 1 FIX
+$ESTIMATION METHOD=1 INTER MAXEVAL=0 NOABORT POSTHOC PRINT=1 FORMAT=s1PE23.16
+$TABLE ID STUDY SLOT TIME IPRED ETA1 ETA2 ETA3 ETA4 ETA5 ETA6 ETA7 NOPRINT NOAPPEND ONEHEADER FORMAT=s1PE23.16 FILE=car1_p06.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+             
+ (WARNING  13) WITH USER-WRITTEN PRED OR $PRED, NM-TRAN CANNOT APPEND THE
+ MDV DATA ITEM.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       17 OCT 2026
+Days until program expires : 302
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ ferx #1082 PR5 anchor V7 -- exact3 + within-arm residual correlation car
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:      240
+ NO. OF DATA ITEMS IN DATA SET:  15
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ L2 DATA ITEM IS DATA ITEM NO.:   4
+ DEP VARIABLE IS DATA ITEM NO.:   7
+0LABELS FOR DATA ITEMS:
+ ID STUDY ARM L2 SLOT TIME DV NARM DOSE VIS T1 T2 T3 T4 T5
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ IPRED
+0FORMAT FOR DATA:
+ (E3.0,2E2.0,E5.0,E2.0,E3.0,E9.0,E4.0,E3.0,5E2.0,E3.0)
+
+ TOT. NO. OF OBS RECS:      240
+ TOT. NO. OF INDIVIDUALS:       12
+0LENGTH OF THETA:   5
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS BLOCK FORM:
+  1
+  0  2
+  0  0  2
+  0  0  0  3
+  0  0  0  0  3
+  0  0  0  0  0  3
+  0  0  0  0  0  0  3
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   5
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.1018E+02     0.1018E+02     0.1018E+02
+  0.2201E+02     0.2201E+02     0.2201E+02
+  0.3340E+02     0.3340E+02     0.3340E+02
+  0.3201E+01     0.3201E+01     0.3201E+01
+  0.6000E+00     0.6000E+00     0.6000E+00
+0INITIAL ESTIMATE OF OMEGA:
+ BLOCK SET NO.   BLOCK                                                                    FIXED
+        1                                                                                  YES
+                  0.6994E-01
+        2                                                                                  YES
+                  0.9044E-01
+        3                                                                                  YES
+                  0.3755E+01
+0INITIAL ESTIMATE OF SIGMA:
+ 0.1000E+01
+ 0.0000E+00   0.1000E+01
+ 0.0000E+00   0.0000E+00   0.1000E+01
+ 0.0000E+00   0.0000E+00   0.0000E+00   0.1000E+01
+ 0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.1000E+01
+0SIGMA CONSTRAINED TO BE THIS INITIAL ESTIMATE
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    NO
+ PRINTED:                NO
+ HEADER:                YES
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE23.16
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID STUDY SLOT TIME IPRED ETA1 ETA2 ETA3 ETA4 ETA5 ETA6 ETA7
+1
+
+
+ #TBLN:      1
+ #METH: First Order Conditional Estimation with Interaction (Evaluation)
+
+ ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): car1_p06.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):       1PE23.16
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ Elapsed evaluation time in seconds:     0.03
+ Elapsed postprocess time in seconds:     0.02
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************         FIRST ORDER CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)       ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************           112.160       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************         FIRST ORDER CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)       ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4      TH 5     
+ 
+         1.02E+01  2.20E+01  3.34E+01  3.20E+00  6.00E-01
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1      ETA2      ETA3      ETA4      ETA5      ETA6      ETA7     
+ 
+ ETA1
++        6.99E-02
+ 
+ ETA2
++        0.00E+00  9.04E-02
+ 
+ ETA3
++        0.00E+00  0.00E+00  9.04E-02
+ 
+ ETA4
++        0.00E+00  0.00E+00  0.00E+00  3.75E+00
+ 
+ ETA5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  3.75E+00
+ 
+ ETA6
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  3.75E+00
+ 
+ ETA7
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  3.75E+00
+ 
+
+
+ SIGMA - COV MATRIX FOR RANDOM EFFECTS - EPSILONS  ****
+
+
+         EPS1      EPS2      EPS3      EPS4      EPS5     
+ 
+ EPS1
++        1.00E+00
+ 
+ EPS2
++        0.00E+00  1.00E+00
+ 
+ EPS3
++        0.00E+00  0.00E+00  1.00E+00
+ 
+ EPS4
++        0.00E+00  0.00E+00  0.00E+00  1.00E+00
+ 
+ EPS5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.00E+00
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1      ETA2      ETA3      ETA4      ETA5      ETA6      ETA7     
+ 
+ ETA1
++        2.64E-01
+ 
+ ETA2
++        0.00E+00  3.01E-01
+ 
+ ETA3
++        0.00E+00  0.00E+00  3.01E-01
+ 
+ ETA4
++        0.00E+00  0.00E+00  0.00E+00  1.94E+00
+ 
+ ETA5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.94E+00
+ 
+ ETA6
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.94E+00
+ 
+ ETA7
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.94E+00
+ 
+
+
+ SIGMA - CORR MATRIX FOR RANDOM EFFECTS - EPSILONS  ***
+
+
+         EPS1      EPS2      EPS3      EPS4      EPS5     
+ 
+ EPS1
++        1.00E+00
+ 
+ EPS2
++        0.00E+00  1.00E+00
+ 
+ EPS3
++        0.00E+00  0.00E+00  1.00E+00
+ 
+ EPS4
++        0.00E+00  0.00E+00  0.00E+00  1.00E+00
+ 
+ EPS5
++        0.00E+00  0.00E+00  0.00E+00  0.00E+00  1.00E+00
+ 
+ Elapsed finaloutput time in seconds:     0.01
+ #CPUT: Total CPU Time in Seconds,        0.086
+Stop Time:
+Sat Oct 17 06:34:40 PM UTC 2026

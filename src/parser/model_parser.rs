@@ -6528,8 +6528,12 @@ pub fn parse_full_model_with(
     // Registered after the warning above, which is about columns *model
     // expressions* read: a grouping column's type changes nothing, so a `by` column
     // the expressions do not also read is not reported there.
+    // A `by` naming a nested level (#1082 PR5) reads that level's columns, which the level
+    // declarations registered; the level's name is not a data column.
     if let Some(decl) = &correlation_decl {
-        register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
+        if crate::stats::residual_error::residual_level(&model).is_none() {
+            register_referenced_covariates(&mut model.referenced_covariates, decl.by.clone());
+        }
     }
 
     // Record what this model was compiled from (#1621), so a fit can carry it.
