@@ -3826,13 +3826,18 @@ pub fn parse_full_model_with(
             collect_referenced_identifiers(lines, &mut refs);
             for name in &weighted_names {
                 if refs.contains(&name.to_ascii_uppercase()) {
-                    return Err(format!(
-                        "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
-                         A weighted kappa is scaled where it is used, and only \
-                         `[individual_parameters]` applies that scaling — a reference here \
-                         would silently use the unweighted κ. Move the term into \
-                         `[individual_parameters]` (assign it to an individual parameter and \
-                         reference that name instead)."
+                    // A compartment-free model's equations sit under the
+                    // `scaling` key; name the block the user wrote (#1827).
+                    return Err(retarget_scaling_diag(
+                        is_algebraic,
+                        format!(
+                            "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
+                             A weighted kappa is scaled where it is used, and only \
+                             `[individual_parameters]` applies that scaling — a reference here \
+                             would silently use the unweighted κ. Move the term into \
+                             `[individual_parameters]` (assign it to an individual parameter and \
+                             reference that name instead)."
+                        ),
                     ));
                 }
             }

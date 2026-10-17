@@ -22270,6 +22270,60 @@ fn test_weighted_kappa_rejected_outside_individual_parameters() {
     );
 }
 
+/// A compartment-free model's equations are parsed under the internal `scaling`
+/// key (#811), so the weighted-kappa refusal used to name `[scaling]`, a block
+/// the file does not have (#1827). It must name `[structural_model]`.
+#[test]
+fn test_weighted_kappa_refusal_names_structural_model_when_compartment_free() {
+    let src = r"
+[parameters]
+  theta TVBASE(10.0)
+  omega ETA_BASE ~ 0.09
+  kappa KAPPA_ARM ~ 0.04 weight = NARM
+  sigma ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  BASE = TVBASE + ETA_BASE + KAPPA_ARM
+
+[structural_model]
+  y = BASE + KAPPA_ARM
+
+[error_model]
+  DV ~ additive(ADD)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains(
+            "[structural_model] references `KAPPA_ARM`, a kappa declared with `weight = ...`"
+        ),
+        "the refusal must name the block the user wrote, got: {err}"
+    );
+    assert!(
+        !err.contains("[scaling]"),
+        "the refusal must not name a block the file does not have, got: {err}"
+    );
+}
+
+/// The other side of the #1827 retarget: in a compartmental model a real
+/// `[scaling]` block is what the user wrote, so the refusal keeps that name.
+#[test]
+fn test_weighted_kappa_refusal_keeps_scaling_label_for_a_real_scaling_block() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[scaling]\n  y = central / V + KAPPA_CL\n",
+    ));
+    assert!(
+        err.contains("[scaling] references `KAPPA_CL`, a kappa declared with `weight = ...`"),
+        "a real [scaling] block keeps its own name, got: {err}"
+    );
+}
+
 /// The unweighted kappa keeps its freedom to appear elsewhere.
 #[test]
 fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
