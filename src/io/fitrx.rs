@@ -180,6 +180,10 @@ struct FitWire {
     // tally, for which `bic()` reports NaN rather than a wrong penalty.
     #[serde(default)]
     bic_inputs: BicInputs,
+    // #1065. Absent on bundles saved before it, and on every fit without a
+    // profiled block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profiled_blocks: Vec<String>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -1181,6 +1185,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
         bic_inputs: r.bic_inputs,
+        profiled_blocks: r.profiled_blocks.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -2866,6 +2871,7 @@ fn wire_to_fit_result(
         cov_eigenvalues: w.cov_eigenvalues,
         cov_condition_number: w.cov_condition_number,
         bic_inputs: w.bic_inputs,
+        profiled_blocks: w.profiled_blocks,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3611,6 +3617,30 @@ mod tests {
         assert!(
             crate::model_selection::bic(&l, crate::model_selection::BicType::Mixed).is_finite()
         );
+    }
+
+    /// #1065: `profiled_blocks` survives a bundle, and a fit without one writes no key
+    /// (so a bundle saved before the field existed reads back empty).
+    #[test]
+    fn profiled_blocks_round_trip_through_fitrx_and_are_omitted_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let path = dir.path().join("profiled.fitrx");
+        let mut r = minimal_fit_result();
+        r.profiled_blocks = vec!["PLACEBO".into(), "ARMFX".into()];
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(
+            load_fit(&path).unwrap().fit.profiled_blocks,
+            ["PLACEBO", "ARMFX"]
+        );
+
+        let r = minimal_fit_result();
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(wire.get("profiled_blocks").is_none(), "{wire}");
+        let path = dir.path().join("plain.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert!(load_fit(&path).unwrap().fit.profiled_blocks.is_empty());
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector

@@ -21116,6 +21116,33 @@ impl ThetaBlocks {
         self.decls.is_empty() && self.unbound_level_blocks.is_empty()
     }
 
+    /// Names of the blocks declared `profile` (#1065), in declaration order.
+    pub(crate) fn profiled_names(&self) -> Vec<String> {
+        self.decls
+            .iter()
+            .filter(|d| d.profiled)
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    /// θ indices of the profiled blocks' estimated levels (#1065): each `Free` level,
+    /// a `NegSum` dependent being no θ of its own. Sorted.
+    pub(crate) fn profiled_theta_indices(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .decls
+            .iter()
+            .filter(|d| d.profiled)
+            .flat_map(|d| d.spec.levels.iter())
+            .filter_map(|r| match r {
+                LevelRule::Free(i) => Some(*i as usize),
+                LevelRule::NegSum(..) => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Names of level blocks declared but not bound to data.
     pub fn unbound_level_blocks(&self) -> &[String] {
         &self.unbound_level_blocks

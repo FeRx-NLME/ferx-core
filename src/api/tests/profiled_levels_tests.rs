@@ -452,3 +452,79 @@ fn the_parse_time_profile_codes_map_to_their_diagnostics() {
         assert!(!d.message.starts_with(code), "{}", d.message);
     }
 }
+
+// ── P1: a profiled block's levels count as estimated parameters ─────────────
+
+/// The free count and BIC tally of `model` under `held` (a packed held mask), via
+/// the production counting hook.
+fn count_of(model: &CompiledModel, held: &[bool]) -> (usize, crate::types::BicInputs) {
+    let mask = crate::model_selection::counted_held_mask(model, &model.default_params, held);
+    let n = mask.iter().filter(|&&h| !h).count();
+    let bic = crate::model_selection::bic_inputs_for(model, &model.default_params, &mask, 100);
+    (n, bic)
+}
+
+/// PR2's shape: the optimizer holds every profiled level, the way it holds a FIX θ.
+fn held_like_the_profile_solve(model: &CompiledModel) -> Vec<bool> {
+    let mut held = crate::estimation::parameterization::packed_fixed_mask(&model.default_params);
+    let idx = model
+        .indiv_param_partials
+        .theta_blocks
+        .profiled_theta_indices();
+    assert!(!idx.is_empty(), "the fixture must have profiled levels");
+    for i in idx {
+        held[i] = true;
+    }
+    held
+}
+
+/// P1. With every profiled level held from the optimizer, `n_parameters` and the
+/// BIC tally equal the unprofiled model's — the counted form, and the column form
+/// under `sum_to_zero_within`, whose dependent levels are no θ. A level ferx froze
+/// stays uncounted on both sides.
+#[test]
+fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
+    let pairs = [
+        (
+            "theta PLACEBO[3](0.0) profile",
+            "theta PLACEBO[3](0.0, -10.0, 10.0)",
+            "PLACEBO[STUDY]",
+        ),
+        (
+            "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
+            "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 10.0)",
+            "PLACEBO",
+        ),
+    ];
+    for (p_decl, u_decl, read) in pairs {
+        let p = bind(&mbma(p_decl, read), &mut population(3, 4));
+        let u = bind(&mbma(u_decl, read), &mut population(3, 4));
+        let u_held = crate::estimation::parameterization::packed_fixed_mask(&u.default_params);
+        let want = count_of(&u, &u_held);
+        assert_eq!(
+            count_of(&p, &held_like_the_profile_solve(&p)),
+            want,
+            "{p_decl}"
+        );
+        // The straddle: held and not counted back, the levels would vanish.
+        let searched = held_like_the_profile_solve(&p)
+            .iter()
+            .filter(|&&h| !h)
+            .count();
+        assert!(searched < want.0, "{p_decl}: {searched} vs {}", want.0);
+
+        // One level frozen (as #1891's `theta_fixed` freezes one) on both sides.
+        let first = p.indiv_param_partials.theta_blocks.profiled_theta_indices()[0];
+        let (mut p, mut u) = (p, u);
+        p.default_params.theta_fixed[first] = true;
+        u.default_params.theta_fixed[first] = true;
+        let u_held = crate::estimation::parameterization::packed_fixed_mask(&u.default_params);
+        let want_frozen = count_of(&u, &u_held);
+        assert_eq!(want_frozen.0, want.0 - 1);
+        assert_eq!(
+            count_of(&p, &held_like_the_profile_solve(&p)),
+            want_frozen,
+            "{p_decl}: frozen"
+        );
+    }
+}

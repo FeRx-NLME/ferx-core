@@ -8068,6 +8068,13 @@ pub struct FitResult {
     /// returns `NaN`.
     #[serde(default)]
     pub bic_inputs: BicInputs,
+    /// The θ level blocks declared `profile` (#1065), in declaration order. Their
+    /// levels are solved for at every outer evaluation rather than searched by the
+    /// optimizer; they still sit in `theta` / `theta_names` and still count in
+    /// `n_parameters` and `bic_inputs`. Empty for a model without one, and on
+    /// `.fitrx` bundles saved before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiled_blocks: Vec<String>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
