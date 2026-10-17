@@ -2079,6 +2079,25 @@ pub struct OmegaMatrix {
     /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
     /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
     pub(crate) block_declared: Vec<bool>,
+    /// The factor a **simulation** draws η from, when it differs from `chol`
+    /// (#1605). `None` means "draw from `chol`", which is every positive-definite
+    /// input.
+    ///
+    /// `Some` only when the input matrix had **structural zeros** — an η whose
+    /// diagonal is exactly `0` and whose whole row and column are exactly `0`
+    /// (`omega ETA ~ 0.0`, with or without `FIX`). The constructor regularises
+    /// such a matrix by `+ 1e-8·I` so that `matrix`, `chol`, `inv` and `log_det`
+    /// stay finite for the fit; that regularisation would draw the zero η with
+    /// sd `1e-4` and add `1e-8` to every other η's variance too. This factor is
+    /// built from the *input* instead: the non-zero sub-block factored on its
+    /// own, the zero rows and columns left at exactly `0`. A genuinely indefinite
+    /// input has no such split and stays `None`, drawing from `chol` as before.
+    ///
+    /// Read it through [`OmegaMatrix::sim_draw_factor`], never directly: that is
+    /// where a zero carried by a fit's `1e-8` (which has no `sim_chol`) is
+    /// recovered from the declaration. `pub(crate)` for the same reason as
+    /// `block_declared`.
+    pub(crate) sim_chol: Option<DMatrix<f64>>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -2101,9 +2120,11 @@ impl OmegaMatrix {
         // all describe the *same* matrix downstream — otherwise the
         // FOCE inner loop's eta_prior (read from `matrix`) would be
         // inconsistent with the cached `inv` (computed from `m_reg`).
-        let (matrix, chol, inv) = match m.clone().cholesky() {
-            Some(c) => (m, c.l(), c.inverse()),
+        let (matrix, chol, inv, sim_chol) = match m.clone().cholesky() {
+            Some(c) => (m, c.l(), c.inverse(), None),
             None => {
+                // Taken from `m`, before the regularisation below touches it (#1605).
+                let sim_chol = structural_zero_factor(&m);
                 let eig = m.clone().symmetric_eigen();
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
@@ -2112,7 +2133,7 @@ impl OmegaMatrix {
                     .clone()
                     .cholesky()
                     .expect("Regularized matrix must be PD");
-                (m_reg, c.l(), c.inverse())
+                (m_reg, c.l(), c.inverse(), sim_chol)
             }
         };
         // log|Ω| = 2·Σᵢ log(L_ii). Negative or zero diagonals shouldn't
@@ -2136,6 +2157,7 @@ impl OmegaMatrix {
             diagonal,
             free_mask,
             block_declared: vec![false; n],
+            sim_chol,
             inv,
             log_det,
         }
@@ -2226,6 +2248,9 @@ impl OmegaMatrix {
             diagonal,
             free_mask,
             block_declared: vec![false; n],
+            // A factor has no exact zero to preserve: a FIX-0 η reaches here as
+            // `L_ii = 1e-4`, and `sim_draw_factor` recovers it from the declaration.
+            sim_chol: None,
             inv,
             log_det,
         }
@@ -2234,6 +2259,112 @@ impl OmegaMatrix {
     pub fn dim(&self) -> usize {
         self.matrix.nrows()
     }
+
+    /// Per η: is it a structural zero of the matrix this was built from — a
+    /// declared `~ 0.0`, diagonal and whole row/column exactly `0` (#1605)?
+    /// All-`false` for a positive-definite input and for one built from a factor.
+    pub(crate) fn structural_zeros(&self) -> Vec<bool> {
+        let n = self.dim();
+        match &self.sim_chol {
+            Some(l) => (0..n).map(|i| l.row(i).iter().all(|&x| x == 0.0)).collect(),
+            None => vec![false; n],
+        }
+    }
+
+    /// The factor a simulation draws `η = L·z` from (#1605). Every draw site —
+    /// `simulate`, `simulate_adaptive` and its verifier, the NPDE reference — goes
+    /// through here, for η and κ alike, and still draws the full `z` vector, so the
+    /// RNG stream is the same whichever factor comes back.
+    ///
+    /// `self` is the Ω being simulated from; `declared` / `declared_fixed` are the
+    /// model's own declaration (`model.default_params`). A structural-zero η draws
+    /// exactly `0` and every other η draws from its own variance, without the
+    /// `1e-8` the constructor adds to keep the fit finite:
+    ///
+    /// - `self` carries its own zeros (`sim_chol`): the declared Ω simulated
+    ///   directly, `FIX` or not.
+    /// - `self` came from a fit, whose Ω holds the regularised `1e-8` rather than
+    ///   the zero: an η is recovered as a zero when the declaration fixes it **and**
+    ///   declares it `0` **and** `self` still holds it at the regularisation floor.
+    ///   A `FIX` value never moves, so the declaration is the truth; the floor check
+    ///   keeps a caller who supplies a real variance for that η from losing it.
+    /// - Otherwise `chol`, borrowed, exactly as before.
+    pub(crate) fn sim_draw_factor<'a>(
+        &'a self,
+        declared: Option<&OmegaMatrix>,
+        declared_fixed: &[bool],
+    ) -> std::borrow::Cow<'a, DMatrix<f64>> {
+        use std::borrow::Cow;
+        if let Some(l) = &self.sim_chol {
+            return Cow::Borrowed(l);
+        }
+        let n = self.dim();
+        let zeros: Vec<bool> = match declared.filter(|d| d.dim() == n) {
+            Some(d) => d
+                .structural_zeros()
+                .iter()
+                .enumerate()
+                .map(|(i, &z)| {
+                    z && declared_fixed.get(i).copied().unwrap_or(false)
+                        && self.matrix[(i, i)] <= SIM_ZERO_RECOVERY_CEILING
+                })
+                .collect(),
+            None => vec![false; n],
+        };
+        if !zeros.iter().any(|&z| z) {
+            return Cow::Borrowed(&self.chol);
+        }
+        match factor_with_zeros(&self.matrix, &zeros) {
+            Some(l) => Cow::Owned(l),
+            None => Cow::Borrowed(&self.chol),
+        }
+    }
+}
+
+/// The largest diagonal a fit-carried Ω may hold on a `FIX`-ed declared zero and
+/// still be read back as that zero by [`OmegaMatrix::sim_draw_factor`] (#1605).
+/// A fit holds such an η at the constructor's `1e-8` floor, reached as
+/// `exp(ln 1e-4)²`, which lands 10 ULP above `1e-8` (measured through the
+/// parameterisation round trip; `a_fit_carried_fix_zero_is_recovered_from_the_declaration`
+/// bounds it). Twice the floor clears that by ~1e-8 and stays far below any variance a
+/// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
+const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
+
+/// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
+/// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
+/// `0`) and the rest factors on its own; `None` otherwise (#1605).
+fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
+    let n = m.nrows();
+    let zeros: Vec<bool> = (0..n)
+        .map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0))
+        .collect();
+    if !zeros.iter().any(|&z| z) {
+        return None;
+    }
+    factor_with_zeros(m, &zeros)
+}
+
+/// Lower Cholesky factor of `m` with the `zeros` rows and columns dropped,
+/// scattered back to `n × n` with those rows and columns exactly `0`. `None` when
+/// the remaining block is not positive definite. Off-diagonal entries between a
+/// zero and a non-zero η are ignored: on a declared zero they are `0` by
+/// definition, and on a fit-carried one they are the regularisation's residue.
+fn factor_with_zeros(m: &DMatrix<f64>, zeros: &[bool]) -> Option<DMatrix<f64>> {
+    let n = m.nrows();
+    let keep: Vec<usize> = (0..n).filter(|&i| !zeros[i]).collect();
+    let k = keep.len();
+    let mut l = DMatrix::zeros(n, n);
+    if k == 0 {
+        return Some(l);
+    }
+    let sub = DMatrix::from_fn(k, k, |a, b| m[(keep[a], keep[b])]);
+    let sub_l = sub.cholesky()?.l();
+    for (a, &i) in keep.iter().enumerate() {
+        for (b, &j) in keep.iter().enumerate() {
+            l[(i, j)] = sub_l[(a, b)];
+        }
+    }
+    Some(l)
 }
 
 /// Residual error parameters (Sigma)
