@@ -11,8 +11,11 @@
 //!
 //! Fixture: warfarin, FOCEI, covariance step, analytic (`Dual2`) inner gradients,
 //! measured via `gradient_method_inner` (fit A with `inner_optimizer = lbfgs`). Mutation: drop the inner half of the scope `run_covariance`
-//! opens (score under `FitOptions::default()`'s inner settings) → T4 (ii) and T5 die; write
-//! a fit's inner settings to a process global again → T4 (iii) dies.
+//! opens (score under `FitOptions::default()`'s inner settings) → T4 (i) dies here, and the
+//! `inner_optimizer` row and T10 in `run_covariance_scoring_record.rs` (measured on #1847;
+//! before #1847 it was T4 (ii) and T5, which since then start from the fit's own EBEs, where
+//! the default dense BFGS and L-BFGS reconverge to the same bits, see T4); write a fit's inner
+//! settings to a process global again → T4 (iii) dies.
 
 use ferx_core::{fit, prepare_run, run_covariance, FitOptions, FitResult, InnerOptimizer};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -104,24 +107,20 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
         inline,
         "(iii) a later Nelder–Mead fit changed run_covariance's inner solver"
     );
-    // #426 PR 2: on a fit carrying its scoring record, `Auto` reads as "no opinion" and
-    // resolves to the recorded `lbfgs`, so the premise clears the record first.
-    let default_inner = FitOptions {
-        inner_optimizer: InnerOptimizer::Auto,
+    // The premise uses the solver the leak would bring in. Since #1847 the step starts from
+    // the fit's own EBEs, and from there dense BFGS (`Auto` on warfarin) and L-BFGS reconverge
+    // to the same bits. On this fixture's analytic-Hessian route the step reconverges once, at
+    // the centre: 8 of 10 warm starts already meet the tolerance, and the other 2 move by
+    // ≤1.9e-9 with identical steps under both solvers (measured on #2092). So only a
+    // materially different solver can move the covariance. Before #1847 `Auto` did, through
+    // the cold solve it started from. A
+    // non-default caller value is scored as given, so the record stays.
+    let nelder_mead = FitOptions {
+        inner_optimizer: InnerOptimizer::NelderMead,
         ..f.lbfgs.clone()
     };
-    let mut unrecorded = f.fit_a.clone();
-    unrecorded.scoring_settings = None;
     assert_ne!(
-        bits(
-            &run_covariance(
-                &unrecorded,
-                Some(&f.prep.parsed.model),
-                Some(&f.prep.population),
-                &default_inner,
-            )
-            .expect("run_covariance")
-        ),
+        cov_under(f, &nelder_mead),
         inline,
         "(i) premise: the inner solver must move the covariance on this fixture"
     );

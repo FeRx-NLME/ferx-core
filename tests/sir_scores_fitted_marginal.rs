@@ -906,3 +906,32 @@ fn vi_never_reaches_a_mixture_override_fit() {
         "VI x [mixture] must be the up-front method refusal: {e}"
     );
 }
+
+/// #1847: a `.fitrx` bundle stores the EBEs exactly, and they warm-start every SIR draw, so
+/// `run_sir` on a reloaded FOCEI fit repeats the in-fit SIR bit for bit. Before, the bundle
+/// held them at six decimals and the ESS moved (8.5e-11 relative on this fixture, macOS
+/// arm64). Mutation: write the bundle's CSV doubles at six decimals again → the ESS dies.
+#[test]
+fn focei_run_sir_reloaded_from_fitrx_is_identical_to_in_fit() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let (prep, r) = warfarin_sir_fit(EstimationMethod::FoceI, Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("focei.fitrx");
+    save_fit(
+        &r,
+        &prep.population,
+        "model\n",
+        &path,
+        SaveFitOptions::default(),
+    )
+    .expect("save_fit");
+    let loaded = load_fit(&path).expect("load_fit").fit;
+    let s = run_sir(
+        &cleared(&loaded),
+        Some(&prep.parsed.model),
+        Some(&prep.population),
+        &sir_defaults(),
+    )
+    .expect("run_sir on the reloaded fit must run");
+    assert_sir_identical(&s, &r, "run_sir on reloaded vs in-fit (FOCEI)");
+}

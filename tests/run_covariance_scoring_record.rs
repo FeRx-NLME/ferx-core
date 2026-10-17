@@ -163,11 +163,15 @@ fn failing_inner() -> FitOptions {
     }
 }
 
+// Nelder–Mead, not L-BFGS: since #1847 the step starts from the fit's own EBEs, and from
+// there dense BFGS (the default on warfarin) and L-BFGS reconverge to the same bits (the one
+// reconvergence at the centre, on the analytic-Hessian route; see
+// `run_covariance_inner_scope.rs`), so an L-BFGS fit's premise fails.
 field_row!(
     inner_optimizer,
     WARFARIN,
     quiet(EstimationMethod::FoceI),
-    inner_optimizer = InnerOptimizer::Lbfgs
+    inner_optimizer = InnerOptimizer::NelderMead
 );
 field_row!(
     inner_maxiter,
@@ -286,13 +290,15 @@ fn inner_tol_ignores_a_trailing_evaluator() {
 
 /// T10: the caller's non-default value wins over the record, and only it. Both sides of the
 /// "caller left the default?" gate on one fit: `bfgs` (non-default) scores exactly as on an
-/// unrecorded fit — and not as the inline `lbfgs` step — while `auto` (the default) yields to
-/// the recorded `lbfgs`. Mutations: the record always wins → the first half dies; the caller
+/// unrecorded fit — and not as the inline `nelder_mead` step — while `auto` (the default)
+/// yields to the recorded `nelder_mead`. The fit is Nelder–Mead for the reason the
+/// `inner_optimizer` row gives: from the fit's own EBEs (#1847), BFGS and L-BFGS reconverge
+/// to the same bits. Mutations: the record always wins → the first half dies; the caller
 /// always wins → the second.
 #[test]
 fn a_callers_non_default_setting_wins_over_the_record() {
     let with = FitOptions {
-        inner_optimizer: InnerOptimizer::Lbfgs,
+        inner_optimizer: InnerOptimizer::NelderMead,
         ..quiet(EstimationMethod::FoceI)
     };
     let f = Fitted::new(&WARFARIN, &with, "T10");
@@ -308,7 +314,7 @@ fn a_callers_non_default_setting_wins_over_the_record() {
     );
     assert!(
         caller_wins != inline,
-        "T10: premise — bfgs must move the covariance away from the lbfgs fit's"
+        "T10: premise — bfgs must move the covariance away from the nelder_mead fit's"
     );
     let auto = FitOptions {
         inner_optimizer: InnerOptimizer::Auto,

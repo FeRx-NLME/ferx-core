@@ -20,13 +20,21 @@
 //! `160cc9a3`, 1.4e-11 at `afe7f52b`). A per-row table goes stale, so the test prints
 //! the set instead: one `premise` line per row with its max |Δ| over the covariance
 //! matrix and `se_theta`, then the rows that discriminate. It requires at least
-//! `MIN_DISCRIMINATING` of them: one is enough to kill the mutation below, two leave
-//! headroom for one more row landing bit-identical on some platform.
+//! `MIN_DISCRIMINATING` of them, and one is enough to kill the mutation below.
 //!
-//! Mutations (#1929, macOS arm64) — route `PackedEstimate::Usable` to the fallback arm
-//! in `run_covariance`: the claim dies on the first row whose premise holds (warfarin
-//! FOCE there). `load_fit` reads `packed_estimate: None`: the bundle assert dies first,
-//! on row one; with that assert removed, the claim dies on the same row as above.
+//! There used to be two, for headroom. Since #1847 the reload carries the EBEs exactly
+//! and `run_covariance` starts from them, so a re-decomposed Ω no longer moves the start,
+//! only the FD reconvergence, and most rows land bit-identical without the vector.
+//! Measured at `857e90a0`: on Linux/aarch64 (glibc 2.41) only warfarin Laplace
+//! discriminates (5.1e-9); on macOS arm64 warfarin FOCE (1.4e-11) and Laplace (2.9e-9).
+//! A platform on which Laplace also lands bit-identical fails the premise loudly; it
+//! cannot pass without testing anything.
+//!
+//! Mutations — route `PackedEstimate::Usable` to the fallback arm in `run_covariance`:
+//! the claim dies on the first row whose premise holds (warfarin FOCE on macOS arm64,
+//! #1929; warfarin Laplace on Linux/aarch64, #1847). `load_fit` reads
+//! `packed_estimate: None`: the bundle assert dies first, on row one; with that assert
+//! removed, the claim dies on the same row as above.
 //!
 //! Engines: every fixture runs analytic (`Dual2`) inner gradients, asserted per fit
 //! through `gradient_method_inner`; the outer optimizer is the `auto` default.
@@ -38,7 +46,7 @@ use ferx_core::{
 };
 
 /// Rows whose premise must hold, out of `ROWS` (module doc).
-const MIN_DISCRIMINATING: usize = 2;
+const MIN_DISCRIMINATING: usize = 1;
 
 const ROWS: [(&str, &str, EstimationMethod); 4] = [
     (
