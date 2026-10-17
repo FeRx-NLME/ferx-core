@@ -33685,6 +33685,9 @@ fn profile_refuses_a_route_through_an_if_branch() {
     for indiv in [
         "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
         "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        // The carrying assignment sits outside the `if`; a branch overwrites it, so
+        // two definitions reach the read — the gate the case above does not need.
+        "  PL = PLACEBO[STUDY]\n  if (DOSE > 0) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
     ] {
         let msg = route_err(indiv, "BASE", ADD);
         assert_route_frame(&msg);
