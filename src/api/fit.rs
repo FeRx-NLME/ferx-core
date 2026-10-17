@@ -2841,12 +2841,25 @@ fn fit_inner(
     // Shrinkage
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
-    let (shrinkage_kappa, shrinkage_kappa_by_occ) =
-        if let Some(ref omega_iov) = result.params.omega_iov {
+    // Nested levels (#1082 PR4): per-level κ̂, and each κ's shrinkage over the groups
+    // of its own level, which replaces the per-cell pool. The per-slot breakdown has no
+    // per-level meaning (a slot would mix studies and arms) and stays empty.
+    let nested_kappa = result.params.omega_iov.as_ref().and_then(|omega_iov| {
+        crate::api::postfit::nested_kappa_facts(
+            model,
+            population,
+            &result.kappas,
+            &omega_iov.matrix,
+        )
+    });
+    let (shrinkage_kappa, shrinkage_kappa_by_occ) = match (&result.params.omega_iov, &nested_kappa)
+    {
+        (_, Some(facts)) => (facts.shrinkage.clone(), Vec::new()),
+        (Some(omega_iov), None) => {
             kappa_shrinkages(model, population, &result.kappas, &omega_iov.matrix)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        }
+        (None, None) => (Vec::new(), Vec::new()),
+    };
 
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
@@ -3109,6 +3122,10 @@ fn fit_inner(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         ebe_kappas: result.kappas.clone(),
+        kappa_levels: nested_kappa
+            .as_ref()
+            .map_or_else(Vec::new, |f| f.kappa_levels.clone()),
+        ebe_kappas_by_level: nested_kappa.map_or_else(Vec::new, |f| f.by_level),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
         saem_mh_accept_tail: result.saem_mh_accept_tail,

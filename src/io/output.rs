@@ -535,6 +535,10 @@ pub struct KappaRowsInput<'a> {
     pub kappa_weights: &'a [Option<String>],
     /// Per-kappa typical (median-arm) weight, for the weight line's spread.
     pub kappa_weight_typical: &'a [Option<f64>],
+    /// Per-kappa level of a model with nested levels (#1082 PR4), printed after the
+    /// name as `K_ST at STUDY`. Empty — every model with at most one level — prints
+    /// no level; a short slice prints none for the missing kappas.
+    pub kappa_levels: &'a [String],
     /// The covariance step's status: a failed or SIR-fallback step suppresses
     /// every CV%/SD (#1698).
     pub covariance_status: CovarianceStatus,
@@ -551,6 +555,7 @@ impl<'a> KappaRowsInput<'a> {
             kappa_param_types: &r.kappa_param_types,
             kappa_weights: &r.kappa_weights,
             kappa_weight_typical: &r.kappa_weight_typical,
+            kappa_levels: &r.kappa_levels,
             covariance_status: r.covariance_status.clone(),
         })
     }
@@ -594,10 +599,15 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         let var = iov[(i, i)];
         let is_fixed = input.kappa_fixed.get(i).copied().unwrap_or(false);
         let name = kappa_name_in(input.kappa_names, i);
+        // Nested levels (#1082 PR4): the level the κ is drawn at, `K_ST at STUDY`.
+        let at_level = match input.kappa_levels.get(i) {
+            Some(level) => format!("{name} at {level}"),
+            None => name.to_string(),
+        };
         let label = if is_fixed {
-            fixed_label(name)
+            fixed_label(&at_level)
         } else {
-            name.to_string()
+            at_level
         };
         let se_str = if is_fixed {
             "---".to_string()
@@ -645,6 +655,16 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
 /// The name of kappa `k`, or `"KAPPA"` when the result carries none.
 fn kappa_name(result: &FitResult, k: usize) -> &str {
     kappa_name_in(&result.kappa_names, k)
+}
+
+/// Kappa `k`'s name with its level under nested levels (#1082 PR4), `K_ST at STUDY`,
+/// for the lines that report a per-level quantity (shrinkage); the bare name otherwise.
+fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
+    let name = kappa_name(result, k);
+    match result.kappa_levels.get(k) {
+        Some(level) => format!("{name} at {level}"),
+        None => name.to_string(),
+    }
 }
 
 /// [`kappa_name`] over the bare name list.
@@ -1581,7 +1601,15 @@ pub fn format_summary(result: &FitResult) -> String {
             .map(|(k, sh)| format!("{} {:.1}%", kappa_name(result, k), sh * 100.0))
             .collect()
     };
-    let pooled = kappa_parts(&result.shrinkage_kappa);
+    // Pooled per κ: under nested levels over the groups of the κ's own level, which the
+    // name then says (#1082 PR4).
+    let pooled: Vec<String> = result
+        .shrinkage_kappa
+        .iter()
+        .enumerate()
+        .filter(|(_, sh)| sh.is_finite())
+        .map(|(k, sh)| format!("{} {:.1}%", kappa_name_at_level(result, k), sh * 100.0))
+        .collect();
     if !pooled.is_empty() {
         let _ = writeln!(out, "  Kappa shrinkage: {}", pooled.join(", "));
     }
@@ -1994,6 +2022,41 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         cols.push(("MIXEST".to_string(), mixest_col));
         for (k, col) in pmix_cols.into_iter().enumerate() {
             cols.push((format!("PMIX_{}", k + 1), col));
+        }
+    }
+
+    // Nested levels (#1082 PR4): one column per kappa, named after it, holding the κ̂ of
+    // the row's own group at the κ's level — the arm κ̂ of the row's arm, the study κ̂
+    // of its study. Unlike an η, a κ̂ varies between the rows of one subject, so it is
+    // per-row data. The group is found by the row's own labels in the level's columns
+    // (`LevelKappaEbes::columns`), so the population need not carry the fit's cells.
+    // One-level IOV fits have no `ebe_kappas_by_level` and keep their columns. A row
+    // whose labels name no group of the fit reads NaN.
+    for level in &result.ebe_kappas_by_level {
+        for (k, name) in level.kappa_names.iter().enumerate() {
+            let mut col = Vec::with_capacity(n_total);
+            for (si, sr) in result.subjects.iter().enumerate() {
+                let subj = &population.subjects[si];
+                let groups = level.groups.get(si).map(Vec::as_slice).unwrap_or(&[]);
+                for j in 0..sr.ipred.len() {
+                    let cov = subj.obs_cov(j);
+                    let labels: Option<Vec<u64>> = level
+                        .columns
+                        .iter()
+                        .map(|c| cov.get(c).map(|v| v.to_bits()))
+                        .collect();
+                    let v = labels
+                        .and_then(|l| {
+                            groups.iter().find(|g| {
+                                g.labels.iter().map(|v| v.to_bits()).eq(l.iter().copied())
+                            })
+                        })
+                        .and_then(|g| g.kappa.get(k).copied())
+                        .unwrap_or(f64::NAN);
+                    col.push(v);
+                }
+            }
+            cols.push((name.clone(), col));
         }
     }
 
@@ -3027,6 +3090,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .cloned()
                 .unwrap_or_else(|| format!("kappa_{}", i + 1));
             writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
+            // Nested levels (#1082 PR4): the level the κ is drawn at.
+            if let Some(level) = result.kappa_levels.get(i) {
+                writeln!(f, "    level: {}", yaml_quote(level)).map_err(|e| e.to_string())?;
+            }
             writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
             if let Some(line) = variance_yaml_line(result.kappa_param_types.get(i).copied(), var) {
                 writeln!(f, "{}", line).map_err(|e| e.to_string())?;
@@ -3670,6 +3737,8 @@ mod tests {
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
+            kappa_levels: Vec::new(),
+            ebe_kappas_by_level: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
@@ -4728,6 +4797,8 @@ mod tests {
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
+            kappa_levels: Vec::new(),
+            ebe_kappas_by_level: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
@@ -7034,6 +7105,7 @@ mod tests {
                             kappa_param_types: &r.kappa_param_types,
                             kappa_weights: &r.kappa_weights,
                             kappa_weight_typical: &r.kappa_weight_typical,
+                            kappa_levels: &r.kappa_levels,
                             covariance_status: r.covariance_status.clone(),
                         };
                         let cell =

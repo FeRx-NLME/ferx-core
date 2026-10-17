@@ -176,6 +176,17 @@ pub fn compute_npde_npd_diag(
     .into_iter()
     .collect();
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
+    // record with none is refused as `simulate()` refuses it (review r1 #1), and a
+    // derived occasion rule, which would regroup the levels, as `fit()` refuses it.
+    crate::diagnostics::first_error(&crate::api::check_level_labels(model, population))?;
+    if let Some(levels) = model.nested_levels() {
+        if iov_occasion.is_some_and(|r| *r != IovOccasionRule::Column) {
+            return Err(crate::api::level_mixed_with_iov_rule(
+                &levels.levels[0].name,
+            ));
+        }
+    }
     // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
     // whose count is not yet the bound model's, as `predict_diag` orders them.
     crate::api::unbound_level_refusal(model, "compute_npde_npd")?;
@@ -191,6 +202,9 @@ pub fn compute_npde_npd_diag(
         vec![omega, sigma]
     };
     crate::api::check_param_shape(model, &blocks)?;
+    if let Some(omega_iov) = &params.omega_iov {
+        crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
+    }
     // A bound level block on a population never bound for it gathers `NaN` on every
     // record, and every npd came back `NaN` with `Ok` (#1647); one bound for other levels
     // read the wrong level's θ (#1762).
@@ -213,6 +227,15 @@ pub fn compute_npde_npd_diag(
     // A standalone caller (R, a script) is not on a Rayon worker, so this would run on
     // Rayon's global pool at machine width rather than the engine's declared count
     // (#1460); reached from inside `fit()`'s post-fit step it is a no-op.
+    let kappa_draws: Vec<crate::stats::nested_levels::KappaDraw> = if model.n_kappa > 0 {
+        population
+            .subjects
+            .iter()
+            .map(|s| crate::stats::nested_levels::KappaDraw::of(model, s))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     let scores = crate::api::install_on_engine_pool(|| {
         population
             .subjects
@@ -246,11 +269,19 @@ pub fn compute_npde_npd_diag(
                 // Empty when the subject carries no occasion labels, in which case
                 // `predict_iov` falls back to κ = 0 (matching the fit-time
                 // no-occasion diagnostic).
-                let iov: Option<(&crate::types::OmegaMatrix, usize)> = params
+                //
+                // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
+                // level, as `simulate()` draws it: both go through `KappaDraw`, built
+                // per subject before the parallel walk so a nested subject without its
+                // cells is an `Err` (review r1 #1 on #1082 PR4).
+                let iov: Option<(
+                    &crate::types::OmegaMatrix,
+                    &crate::stats::nested_levels::KappaDraw,
+                )> = params
                     .omega_iov
                     .as_ref()
                     .filter(|_| model.n_kappa > 0)
-                    .map(|om| (om, crate::stats::stacked_layout::group_count(subject)));
+                    .map(|om| (om, &kappa_draws[i]));
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
@@ -269,18 +300,8 @@ pub fn compute_npde_npd_diag(
                     // baseline-only `pk_param_fn(subject.covariates)` — and draw no
                     // extra randoms, so their sims are byte-identical.
                     let ipreds = match &iov {
-                        Some((omega_iov, n_groups)) => {
-                            let kappas: Vec<Vec<f64>> = (0..*n_groups)
-                                .map(|_| {
-                                    let z: Vec<f64> = (0..model.n_kappa)
-                                        .map(|_| normal.sample(&mut rng))
-                                        .collect();
-                                    (&omega_iov.chol * DVector::from_column_slice(&z))
-                                        .iter()
-                                        .copied()
-                                        .collect()
-                                })
-                                .collect();
+                        Some((omega_iov, kappa_draw)) => {
+                            let kappas = kappa_draw.draw(&omega_iov.chol, normal, &mut rng);
                             crate::pk::predict_iov(
                                 model,
                                 subject,

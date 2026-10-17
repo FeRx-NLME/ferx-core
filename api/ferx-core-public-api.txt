@@ -965,6 +965,7 @@ pub ferx_core::io::output::EtaLinkedTheta::value: f64
 pub struct ferx_core::io::output::KappaRowsInput<'a>
 pub ferx_core::io::output::KappaRowsInput::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::io::output::KappaRowsInput::kappa_fixed: &'a [bool]
+pub ferx_core::io::output::KappaRowsInput::kappa_levels: &'a [alloc::string::String]
 pub ferx_core::io::output::KappaRowsInput::kappa_names: &'a [alloc::string::String]
 pub ferx_core::io::output::KappaRowsInput::kappa_param_types: &'a [ferx_core::EtaParamType]
 pub ferx_core::io::output::KappaRowsInput::kappa_weight_typical: &'a [core::option::Option<f64>]
@@ -3114,6 +3115,7 @@ pub ferx_core::types::FitResult::data_path: core::option::Option<alloc::string::
 pub ferx_core::types::FitResult::dw_statistic: f64
 pub ferx_core::types::FitResult::ebe_convergence_warnings: u32
 pub ferx_core::types::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
+pub ferx_core::types::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::types::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::types::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::types::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
@@ -3136,6 +3138,7 @@ pub ferx_core::types::FitResult::iwres_lag1_r: f64
 pub ferx_core::types::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_is_diagonal: core::option::Option<bool>
+pub ferx_core::types::FitResult::kappa_levels: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::types::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
@@ -3258,6 +3261,14 @@ pub ferx_core::types::KappaWeight::eval: ferx_core::KappaWeightFn
 pub ferx_core::types::KappaWeight::expr: alloc::string::String
 impl core::fmt::Debug for ferx_core::KappaWeight
 pub fn ferx_core::KappaWeight::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::LevelGroupEbe
+pub ferx_core::types::LevelGroupEbe::kappa: alloc::vec::Vec<f64>
+pub ferx_core::types::LevelGroupEbe::labels: alloc::vec::Vec<f64>
+pub struct ferx_core::types::LevelKappaEbes
+pub ferx_core::types::LevelKappaEbes::columns: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::LevelKappaEbes::groups: alloc::vec::Vec<alloc::vec::Vec<ferx_core::LevelGroupEbe>>
+pub ferx_core::types::LevelKappaEbes::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::LevelKappaEbes::level: alloc::string::String
 pub struct ferx_core::types::MixingExpr
 pub ferx_core::types::MixingExpr::class: usize
 pub ferx_core::types::MixingExpr::is_logit: bool
@@ -4616,6 +4627,7 @@ pub ferx_core::FitResult::data_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::dw_statistic: f64
 pub ferx_core::FitResult::ebe_convergence_warnings: u32
 pub ferx_core::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
+pub ferx_core::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
@@ -4638,6 +4650,7 @@ pub ferx_core::FitResult::iwres_lag1_r: f64
 pub ferx_core::FitResult::kappa_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_is_diagonal: core::option::Option<bool>
+pub ferx_core::FitResult::kappa_levels: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::kappa_param_types: alloc::vec::Vec<ferx_core::EtaParamType>
 pub ferx_core::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
@@ -4778,6 +4791,14 @@ pub ferx_core::KappaWeight::eval: ferx_core::KappaWeightFn
 pub ferx_core::KappaWeight::expr: alloc::string::String
 impl core::fmt::Debug for ferx_core::KappaWeight
 pub fn ferx_core::KappaWeight::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::LevelGroupEbe
+pub ferx_core::LevelGroupEbe::kappa: alloc::vec::Vec<f64>
+pub ferx_core::LevelGroupEbe::labels: alloc::vec::Vec<f64>
+pub struct ferx_core::LevelKappaEbes
+pub ferx_core::LevelKappaEbes::columns: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::LevelKappaEbes::groups: alloc::vec::Vec<alloc::vec::Vec<ferx_core::LevelGroupEbe>>
+pub ferx_core::LevelKappaEbes::kappa_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::LevelKappaEbes::level: alloc::string::String
 pub struct ferx_core::MixingExpr
 pub ferx_core::MixingExpr::class: usize
 pub ferx_core::MixingExpr::is_logit: bool

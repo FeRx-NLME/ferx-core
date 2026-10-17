@@ -361,8 +361,10 @@ pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
 ) -> Result<(), EngineError> {
-    if model.has_nested_levels() {
-        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+    // Nested levels draw per level (#1082 PR4); a residual correlation on them is the
+    // fit's refusal too, until #1082 PR5 composes the two.
+    if model.has_nested_levels() && model.residual_serial.is_some() {
+        return Err(super::entry_refusals::nested_level_correlation_unsupported());
     }
     if model.n_kappa > 0 && params.omega_iov.is_none() {
         // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
@@ -374,6 +376,9 @@ pub(crate) fn validate_iov_simulatable(
             model.n_kappa
         );
         return Err(super::entry_refusals::param_shape(message));
+    }
+    if let Some(omega_iov) = &params.omega_iov {
+        crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
     }
     Ok(())
 }
@@ -556,6 +561,9 @@ fn check_simulate_preconditions(
     // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
     validate_iov_simulatable(model, params)?;
     check_param_shape(model, &ParamBlock::all_of(params))?;
+    // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
+    // record with none is refused, as `fit()` refuses it.
+    first_error(&super::validation::check_level_labels(model, population))?;
     // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES), then
     // ρ's range at the value drawn at.
     first_error(&super::validation::check_residual_correlation_data(
@@ -648,8 +656,22 @@ pub fn simulate_with_options_diag(
     // the SS trough, biasing simulated concentrations low.
     crate::dosing::clear_ss_nonconvergence_warnings();
 
+    // A derived rule on a nested model would regroup its level cells (#1082 PR4), the
+    // refusal `fit()` gives the same rule.
+    if let Some(levels) = model.nested_levels() {
+        if opts
+            .iov_occasion
+            .as_ref()
+            .is_some_and(|r| *r != IovOccasionRule::Column)
+        {
+            return Err(super::entry_refusals::level_mixed_with_iov_rule(
+                &levels.levels[0].name,
+            ));
+        }
+    }
     // A model-side occasion rule's labels come first (#1955), so every step below sees
-    // them: the checks, the propensity branch's posthoc pass, and the κ draw.
+    // them: the checks, the propensity branch's posthoc pass, and the κ draw. A nested
+    // model's level cells are assigned here instead (#1082 PR4).
     let derived = with_derived_occasions(model, population, opts.iov_occasion.as_ref());
     let population: &Population = &derived;
     let iov_warning = no_occasion_warning(
@@ -922,6 +944,7 @@ pub(crate) fn obs_row_time(subject: &Subject, j: usize) -> f64 {
 fn emit_subject_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
+    kappa_draw: Option<&crate::stats::nested_levels::KappaDraw>,
     params: &ModelParameters,
     eta_slice: &[f64],
     draw: usize,
@@ -955,16 +978,14 @@ fn emit_subject_rows<R: rand::Rng>(
         // exact order `predict_iov` indexes its `kappas` argument by. Empty when
         // the subject carries no occasion labels, in which case `predict_iov`
         // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
-        let n_groups = crate::stats::stacked_layout::group_count(subject);
-        let kappas: Vec<Vec<f64>> = (0..n_groups)
-            .map(|_| {
-                let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
-                (&omega_iov.chol * DVector::from_column_slice(&z))
-                    .iter()
-                    .copied()
-                    .collect()
-            })
-            .collect();
+        //
+        // Under nested levels (#1082 PR4) the groups are the level cells, and a κ is
+        // drawn once per group of its own level: one study κ shared by every arm of
+        // the study. The caller built `kappa_draw` per subject (`KappaDraw::of`, which
+        // refuses a nested subject without cells), so it is present for every κ model.
+        let kappas = kappa_draw
+            .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
+            .draw(&omega_iov.chol, normal, rng);
         pk::predict_iov(
             model,
             subject,
@@ -1262,6 +1283,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // Every precondition below is an `Err`, never a panic (#898), and every
     // `simulate*` entry point returns it as is.
     check_simulate_preconditions(model, population, params)?;
+    // Nested levels (#1082 PR4): each record's level labels name its cell, which the κ
+    // draw groups by level. `simulate()` takes the caller's population as given, so the
+    // cells are assigned here, as `fitted_population` does for `fit()`; a population an
+    // entry point already prepared (`with_derived_occasions`) is borrowed, not copied.
+    let with_cells = crate::stats::nested_levels::with_level_cells(model, population);
+    let population: &Population = &with_cells;
     // `simulate()` takes the caller's population as given, so a `correlation` line's
     // residual blocks are read off its `by` columns here, once per call rather than
     // once per replicate (#1081). A fitted population carries them already.
@@ -1306,6 +1333,18 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
+    // How each subject's κ is drawn, built once per subject rather than once per
+    // replicate: one κ per occasion group, or per group of each level (#1082 PR4).
+    let kappa_draws: Vec<crate::stats::nested_levels::KappaDraw> = if model.n_kappa > 0 {
+        population
+            .subjects
+            .iter()
+            .map(|s| crate::stats::nested_levels::KappaDraw::of(model, s))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+
     let mut results = Vec::new();
 
     for sim_idx in 0..n_sim {
@@ -1338,6 +1377,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     emit_subject_rows(
                         model,
                         subject,
+                        kappa_draws.get(i),
                         params,
                         &eta_slice,
                         draw,
@@ -1351,7 +1391,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 }
             }
             None => {
-                for subject in &population.subjects {
+                for (i, subject) in population.subjects.iter().enumerate() {
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
@@ -1362,6 +1402,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     emit_subject_rows(
                         model,
                         subject,
+                        kappa_draws.get(i),
                         params,
                         &eta_slice,
                         draw,
