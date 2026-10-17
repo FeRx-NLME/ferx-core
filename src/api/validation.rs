@@ -1601,7 +1601,13 @@ impl CmtConsumer {
                 if let Some(ar) = model.analytic_readout.as_ref() {
                     set.extend(per_cmt(&ar.readout));
                 }
-                keys(set, "[scaling] y[CMT=N]", "scaling")
+                // A compartment-free model writes its `y[CMT=N]` entries in
+                // `[structural_model]`; it has no `[scaling]` block (#1827).
+                if model.is_algebraic() {
+                    keys(set, "[structural_model] y[CMT=N]", "structural_model")
+                } else {
+                    keys(set, "[scaling] y[CMT=N]", "scaling")
+                }
             }
             // Already an *error*, not a warning: `E_ENDPOINT_NO_RECORDS` reports a
             // declared endpoint with no row routed to it, so reporting it here would
