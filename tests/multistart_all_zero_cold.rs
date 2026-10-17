@@ -17,11 +17,11 @@
 //! η = 0 (`MCETA=0`) and −235.253006 with `MCETA=1000`; ferx matches both to 6 decimals at
 //! `maxiter = 0` (#2013's comparison).
 //!
-//! Measured on macOS arm64, this test in a debug build: with the gate reverted to
-//! `eta_init.is_none()` the fit reports OFV −235.559329, `converged = false`,
-//! `W_EBE_START_DEPENDENT` and `TVCL = 1.065939` (the optimum of the trapped objective),
-//! after 17 outer iterations; with the fix, −235.559336, `converged = true` and
-//! `TVCL = 1.066269`, after 11. Both run in 0.4 s.
+//! This test in a debug build: with the gate reverted to `eta_init.is_none()` the fit
+//! reports OFV −235.559329, `converged = false`, `W_EBE_START_DEPENDENT` and
+//! `TVCL = 1.065939` (the optimum of the trapped objective; macOS arm64); with the fix,
+//! −235.559336063, `converged = true` and `TVCL = 1.066269578`, the same to the printed
+//! 9 decimals on Linux and macOS arm64. Both run in under a second.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, FitResult};
@@ -137,7 +137,8 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
         "subject 1 is not in the deeper mode: η_KA {}",
         eta_ka(&fixed, "1")
     );
-    // Both references are this test's own run (macOS arm64). The OFV bound is a sanity
+    // Both references are this test's own run, identical to 9 decimals on Linux and macOS
+    // arm64 (OFV −235.559336063, TVCL 1.066269578). The OFV bound is a sanity
     // check only: the reported OFV is a cold re-solve either way, and the trapped fit's is
     // 7e-6 away. The TVCL bound is what separates the two optima: 1.065939 is 3.3e-4 away,
     // 3.3× the bound.
