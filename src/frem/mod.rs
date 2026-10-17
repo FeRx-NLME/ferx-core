@@ -882,6 +882,38 @@ fn resolve_frem_covariates(
     Ok((names, cats))
 }
 
+/// The conversion-time advisory for an estimated θ no closed-form mu-reference
+/// shift moves, split by whether it carries an ETA (#1715) — attaching one is
+/// the remedy only for the second list. Empty when both lists are.
+fn unanchored_theta_warnings(with_eta: &[String], no_eta: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !no_eta.is_empty() {
+        out.push(format!(
+            "FREM conversion: estimated parameter(s) [{}] have no associated ETA. When fitting \
+             this model with IMP/IMPMAP, a fixed-effect-only parameter is estimated solely through \
+             the importance-weighted M-step, which is biased for weakly-identified parameters and \
+             may converge to the wrong value. Add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with \
+             a small, optionally FIX, omega — ferx mu-references automatically), hold it FIX, or \
+             fit with FOCEI.",
+            no_eta.join(", ")
+        ));
+    }
+    if !with_eta.is_empty() {
+        out.push(format!(
+            "FREM conversion: estimated parameter(s) [{}] enter an individual parameter that \
+             carries an ETA, but not as a mu-referenced typical value (`log P = log TVP + \
+             ETA_P`) — e.g. a transformed ETA (Box-Cox, power), a parameter inside that \
+             transform, one scaling the ETA, or a covariate coefficient. When fitting this model \
+             with IMP/IMPMAP, such a parameter has no closed-form shift and is estimated solely \
+             through the importance-weighted M-step, which is biased for weakly-identified \
+             parameters and may converge to the wrong value. This is no reason to remove the \
+             transform: cross-check the fit against FOCEI, or hold the parameter FIX.",
+            with_eta.join(", ")
+        ));
+    }
+    out
+}
+
 /// Orchestrate FREM preparation: parse model, read data, transform, generate, write.
 ///
 /// The model's `[covariates]` block defines the covariates to fold into the FREM
@@ -970,10 +1002,12 @@ pub fn prepare_frem(
 
     let n_total = base_model.n_eta + frem_info.covariate_names.len();
 
-    // Conversion-time advisory: estimated parameters with no random effect are
-    // estimated poorly by IMP/IMPMAP (the importance-weighted M-step is biased for
-    // weakly-identified fixed effects — see #406). Flag them now so the user can
-    // add an ETA before fitting; ferx mu-references automatically.
+    // Conversion-time advisory: estimated parameters no closed-form mu-reference
+    // shift moves are estimated poorly by IMP/IMPMAP (the importance-weighted
+    // M-step is biased for weakly-identified fixed effects — see #406). Flag them
+    // now: one with no random effect can have an ETA added before fitting (ferx
+    // mu-references automatically); one whose ETA is there in a form the shift
+    // cannot use (a Box-Cox ETA, its shape θ) is told so instead (#1715).
     let mut warnings: Vec<String> = Vec::new();
     // No class-aware mu-ref thetas are excluded here: conversion time does not
     // know the estimator, `mu_referencing`, or the packing/IIV filters that decide
@@ -991,23 +1025,16 @@ pub fn prepare_frem(
         .flat_map(|g| g.theta_names.iter())
         .filter_map(|n| base_model.theta_names.iter().position(|t| t == n))
         .collect();
-    let no_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
+    let (with_eta, no_eta) = crate::estimation::impmap::partition_by_eta(
         base_model,
-        &base_model.default_params.theta_fixed,
-        &parsed_cov_group_thetas,
-        &[],
+        crate::estimation::impmap::non_fixed_unanchored_thetas(
+            base_model,
+            &base_model.default_params.theta_fixed,
+            &parsed_cov_group_thetas,
+            &[],
+        ),
     );
-    if !no_eta.is_empty() {
-        warnings.push(format!(
-            "FREM conversion: estimated parameter(s) [{}] have no associated ETA. When fitting \
-             this model with IMP/IMPMAP, a fixed-effect-only parameter is estimated solely through \
-             the importance-weighted M-step, which is biased for weakly-identified parameters and \
-             may converge to the wrong value. Add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with \
-             a small, optionally FIX, omega — ferx mu-references automatically), hold it FIX, or \
-             fit with FOCEI.",
-            no_eta.join(", ")
-        ));
-    }
+    warnings.extend(unanchored_theta_warnings(&with_eta, &no_eta));
 
     // Advise when `fit_init` was supplied but shares no names with the base
     // model — most likely a fit of a different model was passed in, so the
@@ -1063,6 +1090,125 @@ mod tests {
     use crate::types::*;
     #[allow(unused_imports)]
     use std::collections::HashMap;
+
+    /// #1715 at conversion time: a θ whose ETA is there in a non-mu-referenceable
+    /// form is not told to add one, and an ETA-less θ keeps the pre-#1715 text.
+    /// One fragment per sentence of the new message, and every cell of
+    /// (with-ETA list, ETA-less list).
+    #[test]
+    fn frem_unanchored_theta_advisory_text() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(unanchored_theta_warnings(&[], &[]).is_empty());
+
+        let with_eta_sentences = [
+            "enter an individual parameter that carries an ETA, but not as a mu-referenced typical value",
+            "e.g. a transformed ETA (Box-Cox, power)",
+            "has no closed-form shift and is estimated solely through the importance-weighted M-step",
+            "no reason to remove the transform: cross-check the fit against FOCEI, or hold the parameter FIX",
+        ];
+        let ws = unanchored_theta_warnings(&names(&["TVCL", "LAMBDA"]), &[]);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("FREM conversion: estimated parameter(s) [TVCL, LAMBDA] "),
+            "{w}"
+        );
+        for frag in with_eta_sentences {
+            assert!(w.contains(frag), "missing {frag:?} in: {w}");
+        }
+        assert!(
+            !w.contains("no associated ETA") && !w.contains("Add an ETA"),
+            "{w}"
+        );
+
+        let ws = unanchored_theta_warnings(&[], &names(&["TVKA"]));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert!(ws[0].contains("[TVKA] have no associated ETA"), "{}", ws[0]);
+        assert!(ws[0].contains("Add an ETA to each"), "{}", ws[0]);
+        assert!(!ws[0].contains(with_eta_sentences[0]), "{}", ws[0]);
+
+        let ws = unanchored_theta_warnings(&names(&["LAMBDA"]), &names(&["TVKA"]));
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        assert!(
+            ws.iter()
+                .any(|w| w.contains("[TVKA] have no associated ETA")),
+            "{ws:?}"
+        );
+        assert!(
+            ws.iter()
+                .any(|w| w.contains("[LAMBDA]") && w.contains(with_eta_sentences[0])),
+            "{ws:?}"
+        );
+    }
+
+    /// #1715 end to end through `prepare_frem`: the Box-Cox typical value and
+    /// its shape θ get the transformed-ETA advisory, the ETA-less `TVKA` the
+    /// "add an ETA" one, and the mu-referenced `TVV` neither.
+    #[test]
+    fn prepare_frem_splits_the_unanchored_theta_advisory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_path = tmp.path().join("boxcox.ferx");
+        std::fs::write(
+            &model_path,
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta LAMBDA(0.5, 0.05, 2.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.04
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  ETAT = (exp(ETA_CL)^LAMBDA - 1) / LAMBDA
+  CL   = TVCL * exp(ETAT)
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .unwrap();
+        let data_path = tmp.path().join("boxcox.csv");
+        std::fs::write(
+            &data_path,
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n\
+             1,0,.,1,100,1,0,1,70\n1,1,5.0,0,.,1,0,0,70\n1,4,3.0,0,.,1,0,0,70\n\
+             2,0,.,1,100,1,0,1,80\n2,1,4.0,0,.,1,0,0,80\n2,4,2.5,0,.,1,0,0,80\n",
+        )
+        .unwrap();
+        let res = prepare_frem(
+            &model_path,
+            &data_path,
+            &["WT".to_string()],
+            None,
+            Some(&tmp.path().join("frem.ferx")),
+            Some(&tmp.path().join("frem.csv")),
+            None,
+            None,
+        )
+        .expect("prepare_frem");
+        let ws = &res.warnings;
+        let no_eta = ws
+            .iter()
+            .find(|w| w.contains("have no associated ETA"))
+            .unwrap_or_else(|| panic!("expected the ETA-less advisory, got {ws:?}"));
+        assert!(no_eta.contains("[TVKA]"), "{no_eta}");
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains("but not as a mu-referenced typical value"))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVCL, LAMBDA]"), "{with_eta}");
+        assert!(ws.iter().all(|w| !w.contains("TVV")), "{ws:?}");
+    }
 
     fn make_test_population() -> Population {
         let subjects = vec![

@@ -479,6 +479,52 @@ fn default_mstep_damping(has_iiv_on_ruv: bool) -> f64 {
     }
 }
 
+/// The SAEM advisory for an estimated θ the closed-form mu-reference shift does
+/// not move, split by whether it carries an ETA (#1715). Empty when both lists
+/// are.
+///
+/// The two halves give opposite advice, which is why they cannot share a
+/// message. A θ with no η anywhere is fixed-effect-only and attaching one is
+/// the remedy. A θ that shares an individual parameter with an η in a form the
+/// shift cannot use — `log P = log TVP + h_λ(η)` for a Box-Cox `h_λ`, its shape
+/// θ λ, a covariate coefficient — is the numerical M-step working as intended,
+/// and telling the user to rewrite it as `TVP * exp(ETA_P)` would tell them to
+/// remove a transform they chose on purpose.
+fn unanchored_theta_warnings(with_eta: &[String], without_eta: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !without_eta.is_empty() {
+        out.push(format!(
+            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
+             mu-referenced and are moved only by the η-frozen numerical M-step, which \
+             re-maximises the conditional likelihood against each iteration's MCMC η draw. \
+             That is a valid (stochastic) EM update, but a noisier and slower one than the \
+             closed-form mu-reference shift, and it can settle away from the marginal optimum \
+             on a poorly mixing chain. For a typical value, put it in a mu-referenceable form \
+             (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
+             mu-referencing automatically). For a covariate coefficient, an allometric \
+             exponent or a structural constant, cross-check the fit against FOCEI/IMPMAP, or \
+             hold it FIX.",
+            without_eta.join(", ")
+        ));
+    }
+    if !with_eta.is_empty() {
+        out.push(format!(
+            "SAEM: estimated parameter(s) [{}] enter an individual parameter that carries an \
+             ETA, but not as a mu-referenced typical value. The closed-form mu-reference shift \
+             (log TVP += mean(η), then re-centre η) is exact only when `log P = log TVP + \
+             ETA_P`, linear in the ETA; a transformed ETA (Box-Cox, power), a parameter inside \
+             that transform, one scaling the ETA, or a covariate coefficient leaves no closed \
+             form. They are therefore moved only by the η-frozen numerical M-step — a valid \
+             (stochastic) EM update, but a noisier and slower one that can settle away from the \
+             marginal optimum on a poorly mixing chain. This is expected for such a model and \
+             no reason to remove the transform: cross-check the fit against FOCEI/IMPMAP, or \
+             hold the parameter FIX.",
+            with_eta.join(", ")
+        ));
+    }
+    out
+}
+
 /// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
 ///
 /// Since #1415 the damping is opt-in (`mstep_damping` below 1.0; the default
@@ -4527,31 +4573,23 @@ pub fn run_saem(
             .chain(logit_messaged.iter())
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
-    let thetas_without_eta: Vec<String> = crate::estimation::impmap::non_fixed_thetas_without_eta(
+    let (thetas_with_eta, thetas_without_eta) = crate::estimation::impmap::partition_by_eta(
         model,
-        &init_params.theta_fixed,
-        // Resolved groups, not parsed ones: a dropped group anchors nothing.
-        &cov_group_thetas,
-        &class_mu_ref_thetas,
-    )
-    .into_iter()
-    .filter(|n| !already_explained.contains(n.as_str()))
-    .collect();
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
-             mu-referenced and are moved only by the η-frozen numerical M-step, which \
-             re-maximises the conditional likelihood against each iteration's MCMC η draw. \
-             That is a valid (stochastic) EM update, but a noisier and slower one than the \
-             closed-form mu-reference shift, and it can settle away from the marginal optimum \
-             on a poorly mixing chain. For a typical value, put it in a mu-referenceable form \
-             (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
-             mu-referencing automatically). For a covariate coefficient, an allometric \
-             exponent or a structural constant, cross-check the fit against FOCEI/IMPMAP, or \
-             hold it FIX.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+        crate::estimation::impmap::non_fixed_unanchored_thetas(
+            model,
+            &init_params.theta_fixed,
+            // Resolved groups, not parsed ones: a dropped group anchors nothing.
+            &cov_group_thetas,
+            &class_mu_ref_thetas,
+        )
+        .into_iter()
+        .filter(|n| !already_explained.contains(n.as_str()))
+        .collect(),
+    );
+    warnings.extend(unanchored_theta_warnings(
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
 
     // #1011: is the numerical M-step left estimating a fixed-effect-only θ this
     // fit? A θ that is FIXed, or pinned out by the closed-form mu-ref shift, is
@@ -6633,6 +6671,158 @@ mod tests {
         crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("SAEM Ok")
             .warnings
+    }
+
+    /// #1715 fixture: one cell of the advisory's input space per θ.
+    ///
+    /// * `TVCL` — a Box-Cox typical value: `log CL = log TVCL + h_λ(ETA_CL)`,
+    ///   not linear in the η, so no closed-form shift. Carries an ETA.
+    /// * `LAMBDA` — the transform's shape θ: inside the η transform. Carries an
+    ///   ETA.
+    /// * `TVKA` — a plain fixed-effect-only θ: no ETA in any statement.
+    /// * `TVV` — mu-referenced: must not be listed at all.
+    /// * `TVQ` — FIX: must not be listed at all.
+    fn boxcox_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta LAMBDA(0.5, 0.05, 2.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVQ(0.5, FIX)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  ETAT = (exp(ETA_CL)^LAMBDA - 1) / LAMBDA
+  CL   = TVCL * exp(ETAT)
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA + TVQ
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses")
+    }
+
+    /// The classification `run_saem` feeds the advisory, without a fit: every
+    /// cell of [`boxcox_model`] lands in its own list (#1715). Before the split
+    /// `TVCL` and `LAMBDA` were in the "NO associated ETA" list next to `TVKA`.
+    #[test]
+    fn unanchored_thetas_split_by_whether_they_carry_an_eta() {
+        let model = boxcox_model();
+        let unanchored = crate::estimation::impmap::non_fixed_unanchored_thetas(
+            &model,
+            &model.default_params.theta_fixed,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            unanchored,
+            ["TVCL", "LAMBDA", "TVKA"],
+            "premise: TVV anchors a mu-ref and TVQ is FIX"
+        );
+        let (with_eta, without_eta) =
+            crate::estimation::impmap::partition_by_eta(&model, unanchored);
+        assert_eq!(with_eta, ["TVCL", "LAMBDA"]);
+        assert_eq!(without_eta, ["TVKA"]);
+    }
+
+    /// One required fragment per sentence of the transformed-ETA advisory, so
+    /// deleting any sentence fails [`saem_transformed_eta_advisory_text`].
+    const SAEM_WITH_ETA_SENTENCES: [&str; 4] = [
+        "enter an individual parameter that carries an ETA, but not as a mu-referenced typical value",
+        "is exact only when `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA",
+        "moved only by the η-frozen numerical M-step — a valid (stochastic) EM update, but a noisier and slower one",
+        "no reason to remove the transform: cross-check the fit against FOCEI/IMPMAP, or hold the parameter FIX",
+    ];
+
+    /// Each cell of the #1715 input space — (with-ETA list, ETA-less list) each
+    /// empty or not — produces exactly the messages it should, and the
+    /// transformed-ETA message never carries the ETA-less advice.
+    #[test]
+    fn saem_transformed_eta_advisory_text() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(unanchored_theta_warnings(&[], &[]).is_empty());
+
+        // Box-Cox TV + shape θ only.
+        let ws = unanchored_theta_warnings(&names(&["TVCL", "LAMBDA"]), &[]);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("SAEM: estimated parameter(s) [TVCL, LAMBDA] "),
+            "{w}"
+        );
+        for frag in SAEM_WITH_ETA_SENTENCES {
+            assert!(w.contains(frag), "missing {frag:?} in: {w}");
+        }
+        assert!(!w.contains("NO associated ETA"), "{w}");
+        assert!(!w.contains("put it in a mu-referenceable form"), "{w}");
+
+        // ETA-less θ only: today's text, unchanged.
+        let ws = unanchored_theta_warnings(&[], &names(&["TVKA"]));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("SAEM: estimated parameter(s) [TVKA] have NO associated ETA"),
+            "{w}"
+        );
+        assert!(w.contains("put it in a mu-referenceable form"), "{w}");
+        assert!(!w.contains(SAEM_WITH_ETA_SENTENCES[0]), "{w}");
+
+        // Both: two messages, each naming only its own θ.
+        let ws = unanchored_theta_warnings(&names(&["LAMBDA"]), &names(&["TVKA"]));
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        let no_eta = ws.iter().find(|w| w.contains("NO associated ETA")).unwrap();
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(SAEM_WITH_ETA_SENTENCES[0]))
+            .unwrap();
+        assert!(
+            no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"),
+            "{no_eta}"
+        );
+        assert!(
+            with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"),
+            "{with_eta}"
+        );
+    }
+
+    /// End to end through `fit()`: the Box-Cox typical value and its shape θ
+    /// are reported as carrying a non-mu-referenceable ETA, `TVKA` as ETA-less,
+    /// and neither `TVV` (mu-referenced) nor `TVQ` (FIX) anywhere (#1715).
+    #[test]
+    fn saem_boxcox_typical_value_is_not_reported_as_eta_less() {
+        let model = boxcox_model();
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        let no_eta = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the ETA-less advisory, got {ws:?}"));
+        assert!(no_eta.contains("[TVKA]"), "only TVKA is ETA-less: {no_eta}");
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(SAEM_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVCL, LAMBDA]"), "{with_eta}");
+        for w in [no_eta, with_eta] {
+            assert!(!w.contains("TVV") && !w.contains("TVQ"), "{w}");
+        }
     }
 
     /// An estimated θ with no ETA is not mu-referenced, so it never gets the
