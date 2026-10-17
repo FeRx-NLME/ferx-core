@@ -704,17 +704,7 @@ fn dcm_iov_eta_gradient_is_analytic_and_matches_central_fd() {
     assert_eq!(z.len(), n_eta + k * model.n_kappa);
 
     let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &theta,
-        &z,
-        &omega,
-        &omega_iov,
-        &sigma,
-        n_eta,
-        model.n_kappa,
-        k,
-        None,
+        &model, &subject, &theta, &z, &omega, &omega_iov, &sigma, None,
     )
     .expect("the eta-only analytic route must serve a DCM+IOV subject");
 

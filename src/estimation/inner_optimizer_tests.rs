@@ -3509,14 +3509,12 @@ mod frozen_ebe_variance {
                 analytic_eta_nll_gradient_iov_frozen(
                     &model,
                     s,
+                    &crate::stats::stacked_layout::StackedLayout::sens_of(&model, s).unwrap(),
                     &p.theta,
                     &b,
                     &p.omega,
                     omega_iov,
                     &p.sigma.values,
-                    3,
-                    1,
-                    2,
                     None,
                     frozen,
                 )

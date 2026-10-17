@@ -316,12 +316,18 @@ fn shared_fit_scope_pool(
 /// A worker carrying a *different* scope is left, also when the requested one is empty:
 /// otherwise the `par_iter` jobs inside `f` would run on that worker's siblings and read the
 /// enclosing call's settings (#426).
+///
+/// Refuses ODE solver settings no solver can run with as `E_ODE_SOLVER_OPTIONS` (#2044),
+/// before any pool is leased. A pool that cannot be built is a runtime failure, uncoded.
 pub(crate) fn with_fit_scope<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
-) -> Result<R, String> {
+) -> Result<R, crate::diagnostics::EngineError> {
+    use crate::diagnostics::EngineError;
     let scope = FitScope::of(options);
-    scope.validate()?;
+    scope
+        .validate()
+        .map_err(super::entry_refusals::ode_solver_options)?;
     let requested_threads = options
         .threads
         .filter(|&n| n > 0)
@@ -346,8 +352,12 @@ pub(crate) fn with_fit_scope<R: Send>(
         return Ok(f());
     }
     match options.threads.filter(|&n| n > 0) {
-        Some(n) => Ok(fit_scope_pool(scope, n)?.install(f)),
-        None => Ok(shared_fit_scope_pool(scope, requested_threads)?.install(f)),
+        Some(n) => Ok(fit_scope_pool(scope, n)
+            .map_err(EngineError::uncoded)?
+            .install(f)),
+        None => Ok(shared_fit_scope_pool(scope, requested_threads)
+            .map_err(EngineError::uncoded)?
+            .install(f)),
     }
 }
 

@@ -62,11 +62,12 @@ use crate::types::{CompiledModel, Subject};
 
 /// Widest `(θ, η)` axis count the dispatch ladders below instantiate.
 ///
-/// Shares [`MAX_ODE_AXES`] rather than picking its own number: the inner walk's
-/// `∂p/∂η` comes from `param_derivatives_at_cov`, whose own dispatch table is
-/// bounded by that constant, so a model admitted here but wider than that would
-/// take an analytic outer gradient against an FD inner — the scope split the ODE
-/// provider forbids for the same reason.
+/// Shares [`MAX_ODE_AXES`] rather than picking its own number: the outer walk's
+/// `∂p/∂(θ, η)` comes from [`seed_pk_dual2`], whose program evaluation is dispatched
+/// up to that constant. One bound gates both loops here. The inner walk's
+/// [`seed_pk_dual1`] has seeded η alone since #1804, so for the inner this bound is
+/// conservative: a compartment-free model past it takes FD on both loops, where the
+/// ODE provider now keeps the inner analytic (`OdeGradScope`).
 ///
 /// It is a **separate constant on purpose**, initialised to `MAX_ODE_AXES` rather
 /// than spelled as it: the coupling is a real constraint today, but it is one
@@ -319,27 +320,21 @@ const _: () = assert!(
 /// label (κ held at 0, matching `pk::predict_iov`).
 type ObsGroups = Vec<Option<usize>>;
 
-/// Per-observation occasion groups and the subject's stacked layout, or `None` when
+/// Per-observation occasion groups under the subject's stacked `layout`, or `None` when
 /// the subject's labelling does not fit the stacked convention.
-fn iov_layout(
-    model: &CompiledModel,
-    subject: &Subject,
-    stacked_eta: &[f64],
-) -> Option<(ObsGroups, StackedLayout)> {
-    let layout = StackedLayout::sens_of(model, subject)?;
+fn obs_groups(layout: &StackedLayout, subject: &Subject, stacked_eta: &[f64]) -> Option<ObsGroups> {
     if layout.n_groups() == 0 || stacked_eta.len() != layout.n_stacked() {
         return None;
     }
     // An unlabelled observation is legitimate (production holds its κ at 0); an
     // observation whose label is not a known group is not, and declining beats
     // guessing which block its κ derivatives belong in.
-    let groups = (0..subject.obs_times.len())
+    (0..subject.obs_times.len())
         .map(|j| match subject.occasions.get(j) {
             Some(&occ) => layout.group_of(occ).map(Some),
             None => Some(None),
         })
-        .collect::<Option<ObsGroups>>()?;
-    Some((groups, layout))
+        .collect::<Option<ObsGroups>>()
 }
 
 /// Widest stacked `(θ, η_bsv, κ…)` axis count these IOV walks admit. Shares the
@@ -403,13 +398,14 @@ fn iov_programs(model: &CompiledModel) -> Option<(&IndivParamProgram, &OdeOutput
 fn run_obs_iov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
     let (prog_indiv, prog_out) = iov_programs(model)?;
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
-    let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
+    let groups = obs_groups(layout, subject, stacked_eta)?;
     // The jet's width is the layout's axis count: the compact one under nested levels
     // (#1082), where cells sharing a group share its κ axis.
     let n_stacked = layout.n_axes();
@@ -502,13 +498,14 @@ fn run_obs_iov<const M: usize>(
 fn run_obs_grad_iov<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     let (prog_indiv, prog_out) = iov_programs(model)?;
     let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
     let n_eff = n_eta + n_kappa;
-    let (groups, layout) = iov_layout(model, subject, stacked_eta)?;
+    let groups = obs_groups(layout, subject, stacked_eta)?;
     // The jet's width is the layout's axis count: the compact one under nested levels
     // (#1082), where cells sharing a group share its κ axis.
     let n_stacked = layout.n_axes();
@@ -583,14 +580,15 @@ fn run_obs_grad_iov<const N: usize>(
 pub(crate) fn subject_sensitivities_iov(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let dim = model.n_theta + StackedLayout::sens_of(model, subject)?.n_axes();
+    let dim = model.n_theta + layout.n_axes();
     macro_rules! arms {
         ($($m:literal),+ $(,)?) => {
             match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
-                $($m => run_obs_iov::<$m>(model, subject, theta, stacked_eta),)+
+                $($m => run_obs_iov::<$m>(model, subject, layout, theta, stacked_eta),)+
                 _ => None,
             }
         };
@@ -605,14 +603,15 @@ pub(crate) fn subject_sensitivities_iov(
 pub(crate) fn subject_eta_grad_iov(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &StackedLayout,
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let dim = StackedLayout::sens_of(model, subject)?.n_axes();
+    let dim = layout.n_axes();
     macro_rules! arms {
         ($($n:literal),+ $(,)?) => {
             match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
-                $($n => run_obs_grad_iov::<$n>(model, subject, theta, stacked_eta),)+
+                $($n => run_obs_grad_iov::<$n>(model, subject, layout, theta, stacked_eta),)+
                 _ => None,
             }
         };

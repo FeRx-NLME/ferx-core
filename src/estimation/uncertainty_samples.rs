@@ -404,11 +404,12 @@ impl LogitThetaCoord {
 /// falling back to the packed-scale draw would hand back the draws above 1
 /// that `Op::Logit` clamps to a point mass. It is reachable only with a
 /// declared upper bound above 1, where the clamped likelihood is flat past 1.
+/// It is `E_LOGIT_THETA_OUT_OF_RANGE` (#2044), whose suggestion is that fix.
 pub(crate) fn logit_theta_coords(
     template: &ModelParameters,
     theta_transform: &[ThetaTransform],
     fixed_mask: &[bool],
-) -> Result<Vec<LogitThetaCoord>, String> {
+) -> Result<Vec<LogitThetaCoord>, crate::diagnostics::Diagnostic> {
     let mut coords = Vec::new();
     for i in 0..template.theta.len() {
         if theta_transform.get(i) != Some(&ThetaTransform::LogitProbability) || fixed_mask[i] {
@@ -421,12 +422,7 @@ pub(crate) fn logit_theta_coords(
                 .get(i)
                 .map(String::as_str)
                 .unwrap_or("?");
-            return Err(format!(
-                "Cannot draw parameter uncertainty for {name}: it is used as \
-                 inv_logit(logit({name}) + ETA), so it must lie strictly inside \
-                 (0, 1), but its estimate is {t}. Declare its upper bound below 1 \
-                 (e.g. 0.999) and refit."
-            ));
+            return Err(crate::api::logit_theta_out_of_range(name, t));
         }
         coords.push(LogitThetaCoord {
             index: i,
@@ -635,6 +631,25 @@ pub fn draw_parameter_samples(
     method: UncertaintyMethod,
     rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, String> {
+    draw_parameter_samples_coded(fit_result, template, n_draws, method, rng)
+        .map_err(|e| e.to_string())
+}
+
+/// [`draw_parameter_samples`], refusing with an [`EngineError`] that carries the code of
+/// a refusal of its input (#2044): `E_FIT_INPUT_MISSING` for a covariance matrix or SIR
+/// pool the fit does not carry (or an empty pool), `E_FIT_INPUT_MODEL` for one that is
+/// not the size of the template's packed parameters, and `E_LOGIT_THETA_OUT_OF_RANGE` on
+/// `[parameters]` for a free logit-scaled θ estimated outside (0, 1). The sampler's
+/// runtime failures (a covariance that cannot be made positive definite, too few valid
+/// draws) carry none. `simulate_with_uncertainty` returns it as is; the public `String`
+/// function is its `to_string()`, unchanged.
+pub(crate) fn draw_parameter_samples_coded(
+    fit_result: &FitResult,
+    template: &ModelParameters,
+    n_draws: usize,
+    method: UncertaintyMethod,
+    rng: &mut impl Rng,
+) -> Result<Vec<ModelParameters>, EngineError> {
     if n_draws == 0 {
         return Ok(Vec::new());
     }
@@ -649,11 +664,12 @@ fn draw_asymptotic(
     template: &ModelParameters,
     n_draws: usize,
     rng: &mut impl Rng,
-) -> Result<Vec<ModelParameters>, String> {
+) -> Result<Vec<ModelParameters>, EngineError> {
     let cov = fit_result.covariance_matrix.as_ref().ok_or_else(|| {
-        "Asymptotic uncertainty requires FitResult.covariance_matrix; run the \
-         fit with `covariance = true` and ensure the covariance step succeeds."
-            .to_string()
+        crate::api::fit_input_missing(
+            "Asymptotic uncertainty requires FitResult.covariance_matrix; run the \
+             fit with `covariance = true` and ensure the covariance step succeeds.",
+        )
     })?;
     let PackedStart {
         packed: x_hat,
@@ -664,31 +680,32 @@ fn draw_asymptotic(
     } = pack_with_bounds(template);
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
-        return Err(format!(
+        return Err(crate::api::fit_input_model(format!(
             "Covariance matrix ({}x{}) doesn't match packed parameters ({})",
             cov.nrows(),
             cov.ncols(),
             n_packed
-        ));
+        )));
     }
     // Draw a `LogitProbability` θ on the logit scale (#1548); every other
     // coordinate is drawn on its packed scale as before.
-    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask)?;
+    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask)
+        .map_err(EngineError::with_suggestion_in_display)?;
     let (y_hat, cov_y) = to_draw_scale(&x_hat, cov, &logit_coords);
-    let chol = regularised_cholesky(&cov_y)?;
+    let chol = regularised_cholesky(&cov_y).map_err(EngineError::uncoded)?;
 
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
     let mut tries = 0usize;
     while draws.len() < n_draws {
         if tries >= max_tries {
-            return Err(format!(
+            return Err(EngineError::uncoded(format!(
                 "Asymptotic sampler: only {}/{} valid draws after {} attempts \
                  (covariance may be ill-conditioned or near a bound)",
                 draws.len(),
                 n_draws,
                 tries
-            ));
+            )));
         }
         tries += 1;
         let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
@@ -714,23 +731,24 @@ fn draw_sir(
     template: &ModelParameters,
     n_draws: usize,
     rng: &mut impl Rng,
-) -> Result<Vec<ModelParameters>, String> {
+) -> Result<Vec<ModelParameters>, EngineError> {
     let pool = fit_result.sir_resamples_packed.as_ref().ok_or_else(|| {
-        "SIR uncertainty requires FitResult.sir_resamples_packed; run the fit \
-         with `sir = true` and `sir_keep_samples = true`."
-            .to_string()
+        crate::api::fit_input_missing(
+            "SIR uncertainty requires FitResult.sir_resamples_packed; run the fit \
+             with `sir = true` and `sir_keep_samples = true`.",
+        )
     })?;
     if pool.is_empty() {
-        return Err("SIR resample pool is empty".to_string());
+        return Err(crate::api::fit_input_missing("SIR resample pool is empty"));
     }
     let expected_len = crate::estimation::parameterization::packed_len(template);
     if pool[0].len() != expected_len {
-        return Err(format!(
+        return Err(crate::api::fit_input_model(format!(
             "SIR resample length ({}) doesn't match packed parameters ({}) — \
              the FitResult and template may come from different models",
             pool[0].len(),
             expected_len
-        ));
+        )));
     }
 
     // Bounds-rejection sampling. SIR already filtered for finite weights, but
@@ -749,12 +767,12 @@ fn draw_sir(
     let mut tries = 0usize;
     while draws.len() < n_draws {
         if tries >= max_tries {
-            return Err(format!(
+            return Err(EngineError::uncoded(format!(
                 "SIR sampler: only {}/{} valid draws after {} attempts",
                 draws.len(),
                 n_draws,
                 tries
-            ));
+            )));
         }
         tries += 1;
         let idx = rng.random_range(0..pool.len());
@@ -1589,10 +1607,21 @@ mod tests {
         for (f_hat, lower) in [(1.0, 0.001), (1.2, 0.001), (0.0, -1.0), (-0.3, -1.0)] {
             let (template, _) =
                 logit_fixture(f_hat, lower, 5.0, 0.09, ThetaTransform::LogitProbability);
-            let err = logit_theta_coords(&template, &tt, &[false; 5]).unwrap_err();
-            assert!(
-                err.contains("uncertainty for F") && err.contains(&format!("is {f_hat}")),
-                "{err}"
+            let d = logit_theta_coords(&template, &tt, &[false; 5]).unwrap_err();
+            // #2044: coded on `[parameters]`, the fix in the suggestion and only there.
+            assert_eq!(d.code, "E_LOGIT_THETA_OUT_OF_RANGE");
+            assert_eq!(d.block.as_deref(), Some("parameters"));
+            assert_eq!(
+                d.message,
+                format!(
+                    "Cannot draw parameter uncertainty for F: it is used as \
+                     inv_logit(logit(F) + ETA), so it must lie strictly inside \
+                     (0, 1), but its estimate is {f_hat}."
+                )
+            );
+            assert_eq!(
+                d.suggestion.as_deref(),
+                Some("declare its upper bound below 1 (e.g. 0.999) and refit")
             );
             let mut fixed = [false; 5];
             fixed[2] = true;
@@ -1602,7 +1631,8 @@ mod tests {
         }
     }
 
-    /// The `Err` reaches `draw_parameter_samples`'s caller.
+    /// The `Err` reaches `draw_parameter_samples`'s caller, as the text it had before
+    /// #2044 coded it: message then advice, byte for byte.
     #[test]
     fn asymptotic_errors_on_a_logit_probability_estimate_above_one() {
         let (template, fit) =
@@ -1611,7 +1641,183 @@ mod tests {
         let err =
             draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
                 .unwrap_err();
-        assert!(err.contains("uncertainty for F"), "{err}");
+        assert_eq!(
+            err,
+            "Cannot draw parameter uncertainty for F: it is used as \
+             inv_logit(logit(F) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is 1.2. Declare its upper bound below 1 \
+             (e.g. 0.999) and refit."
+        );
+    }
+
+    /// #2044: every input refusal of the sampler carries its code on the coded twin, and
+    /// the public `String` function is its `to_string()`, whole text pinned. One row per
+    /// refusal text, through the method that raises it.
+    ///
+    /// Mutations — any site back on a bare `String` / `EngineError::uncoded` (its row's
+    /// `code()`); `fit_input_missing` / `fit_input_model` swapped (code); the logit site
+    /// built with `from_diagnostic` (its `to_string()` loses the advice); a sentence of a
+    /// text deleted (`to_string()`); the public function no longer the twin's
+    /// `to_string()` (the parity assertion). The two order rows pin that a fit missing its
+    /// input is refused for that first, as before #2044 (#2061 review, finding 6).
+    #[test]
+    fn draw_parameter_samples_coded_codes_its_input_refusals() {
+        use UncertaintyMethod::{Asymptotic, Sir};
+        let (template, fit) = logit_fixture(0.7, 0.001, 5.0, 0.09, ThetaTransform::Log);
+        let n = crate::estimation::parameterization::packed_len(&template);
+        let (logit_t, logit_fit) =
+            logit_fixture(1.2, 0.001, 5.0, 0.09, ThetaTransform::LogitProbability);
+        let with = |f: &FitResult, set: &dyn Fn(&mut FitResult)| {
+            let mut f = f.clone();
+            set(&mut f);
+            f
+        };
+        let no_cov = with(&fit, &|f| f.covariance_matrix = None);
+        let small_cov = with(&fit, &|f| {
+            f.covariance_matrix = Some(DMatrix::identity(2, 2))
+        });
+        let no_pool = with(&fit, &|f| f.sir_resamples_packed = None);
+        let empty_pool = with(&fit, &|f| f.sir_resamples_packed = Some(Vec::new()));
+        let short_pool = with(&fit, &|f| f.sir_resamples_packed = Some(vec![vec![0.0; 2]]));
+        let logit_no_cov = with(&logit_fit, &|f| f.covariance_matrix = None);
+        let logit_small_cov = with(&logit_fit, &|f| {
+            f.covariance_matrix = Some(DMatrix::identity(2, 2))
+        });
+        let missing_cov = "Asymptotic uncertainty requires FitResult.covariance_matrix; run the \
+             fit with `covariance = true` and ensure the covariance step succeeds.";
+        let small = format!("Covariance matrix (2x2) doesn't match packed parameters ({n})");
+        let rows: Vec<(
+            &str,
+            &FitResult,
+            &ModelParameters,
+            UncertaintyMethod,
+            &str,
+            Option<&str>,
+            String,
+        )> = vec![
+            (
+                "no covariance",
+                &no_cov,
+                &template,
+                Asymptotic,
+                "E_FIT_INPUT_MISSING",
+                None,
+                missing_cov.to_string(),
+            ),
+            (
+                "covariance size",
+                &small_cov,
+                &template,
+                Asymptotic,
+                "E_FIT_INPUT_MODEL",
+                None,
+                small.clone(),
+            ),
+            (
+                "logit θ outside (0, 1)",
+                &logit_fit,
+                &logit_t,
+                Asymptotic,
+                "E_LOGIT_THETA_OUT_OF_RANGE",
+                Some("parameters"),
+                "Cannot draw parameter uncertainty for F: it is used as \
+                 inv_logit(logit(F) + ETA), so it must lie strictly inside \
+                 (0, 1), but its estimate is 1.2. Declare its upper bound below 1 \
+                 (e.g. 0.999) and refit."
+                    .to_string(),
+            ),
+            (
+                "order: no covariance and a logit θ outside",
+                &logit_no_cov,
+                &logit_t,
+                Asymptotic,
+                "E_FIT_INPUT_MISSING",
+                None,
+                missing_cov.to_string(),
+            ),
+            (
+                "order: covariance size and a logit θ outside",
+                &logit_small_cov,
+                &logit_t,
+                Asymptotic,
+                "E_FIT_INPUT_MODEL",
+                None,
+                small,
+            ),
+            (
+                "no SIR pool",
+                &no_pool,
+                &template,
+                Sir,
+                "E_FIT_INPUT_MISSING",
+                None,
+                "SIR uncertainty requires FitResult.sir_resamples_packed; run the fit \
+                 with `sir = true` and `sir_keep_samples = true`."
+                    .to_string(),
+            ),
+            (
+                "empty SIR pool",
+                &empty_pool,
+                &template,
+                Sir,
+                "E_FIT_INPUT_MISSING",
+                None,
+                "SIR resample pool is empty".to_string(),
+            ),
+            (
+                "SIR pool length",
+                &short_pool,
+                &template,
+                Sir,
+                "E_FIT_INPUT_MODEL",
+                None,
+                format!(
+                    "SIR resample length (2) doesn't match packed parameters ({n}) — \
+                     the FitResult and template may come from different models"
+                ),
+            ),
+        ];
+        let mut bad = Vec::new();
+        for (name, f, t, method, code, block, text) in rows {
+            let mut rng = StdRng::seed_from_u64(0);
+            let e = match draw_parameter_samples_coded(f, t, 10, method, &mut rng) {
+                Ok(_) => {
+                    bad.push(format!("{name}: accepted"));
+                    continue;
+                }
+                Err(e) => e,
+            };
+            let mut rng = StdRng::seed_from_u64(0);
+            let s = draw_parameter_samples(f, t, 10, method, &mut rng).unwrap_err();
+            if e.code() != Some(code) {
+                bad.push(format!("{name}: code {:?}, want {code}", e.code()));
+            }
+            if e.block() != block {
+                bad.push(format!("{name}: block {:?}, want {block:?}", e.block()));
+            }
+            if e.to_string() != text {
+                bad.push(format!("{name}: text\n  got:  {e}\n  want: {text}"));
+            }
+            if s != e.to_string() {
+                bad.push(format!("{name}: String {s:?} is not the coded to_string()"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+
+        // The same out-of-range θ FIX'd is pinned, never drawn, so it is not refused
+        // (#2061 review, finding 2); zero draws sample nothing and refuse nothing.
+        let mut pinned = logit_t.clone();
+        pinned.theta_fixed[2] = true;
+        let mut rng = StdRng::seed_from_u64(0);
+        assert!(
+            draw_parameter_samples_coded(&logit_fit, &pinned, 10, Asymptotic, &mut rng).is_ok()
+        );
+        let mut rng = StdRng::seed_from_u64(0);
+        assert!(
+            draw_parameter_samples_coded(&no_cov, &template, 0, Asymptotic, &mut rng)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// From `y ≈ 36.7` on, `inv_logit(y)` rounds to exactly 1.0 — through

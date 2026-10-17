@@ -98,6 +98,38 @@ const _: () = assert!(
 /// + 6-covariate-θ + 5-η model sits at exactly 16, i.e. right on the old edge.
 pub(crate) const MAX_ODE_AXES: usize = 24;
 
+/// Which of the two ODE gradients a scope predicate is asked about (#1804).
+///
+/// The two differ in one thing only: the width of the individual-parameter program
+/// evaluation behind their walks. The outer `Dual2` sensitivities seed `(θ, η)`, so they
+/// need `n_theta + n_eta ≤ MAX_ODE_AXES`. The inner `Dual1` η-gradient seeds η alone, on
+/// both the static walk (`param_eta_derivatives`) and the event-driven one
+/// (`seed_pk_dual1`), so it needs only `n_eta ≤ MAX_ODE_AXES`. Every other clause of the
+/// scope predicates is about the walk and the data, and is shared.
+///
+/// Until #1804 both gradients were gated on the outer width. A model with many θ — FIX ones
+/// included, since every declared θ is an axis — then lost its analytic inner gradient
+/// together with the outer one, although nothing on the inner path ever seeds a θ axis.
+/// The two scopes now satisfy `Outer ⇒ Inner` rather than equality: past the outer cap, the
+/// outer gradient goes FD while the EBE search keeps the exact η-gradient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OdeGradScope {
+    /// The outer `Dual2` sensitivities ([`ode_subject_sensitivities`]), seeded on `(θ, η)`.
+    Outer,
+    /// The inner `Dual1` η-gradient ([`ode_subject_eta_grad`]), seeded on η only.
+    Inner,
+}
+
+impl OdeGradScope {
+    /// The dual width of the individual-parameter program evaluation this scope's walks run.
+    fn program_width(self, n_theta: usize, n_eta: usize) -> usize {
+        match self {
+            OdeGradScope::Outer => n_theta + n_eta,
+            OdeGradScope::Inner => n_eta,
+        }
+    }
+}
+
 /// Largest stacked `(θ, η_bsv, κ_1..κ_K)` axis count for ODE IOV subjects.
 /// Kept separate from [`MAX_ODE_AXES`] because high-occasion IOV subjects are wide
 /// only in the kappa stack; the per-event individual-parameter derivative program
@@ -238,14 +270,20 @@ macro_rules! dispatch_ode_iov_axes {
 /// non-IOV ([`ode_analytical_supported`]) and IOV ([`ode_iov_supported`]) gate arms so
 /// the admissibility rule lives in one place — a future narrowing can't drift between the
 /// two routes and admit a scale on one path that the other rejects (#575 review).
+///
+/// The width bound follows `scope` (#1804): the outer quotient evaluates the scale over
+/// `(θ, η)`, the inner one over η alone (`apply_expression_scale_inner_dispatch` dispatches
+/// on `n_eta`).
 fn expression_scale_axes_admissible(
     p: &crate::parser::model_parser::ScaleDerivProgram,
     model: &CompiledModel,
+    scope: OdeGradScope,
 ) -> bool {
     !model.log_transform
         && p.n_theta_axis() == model.n_theta
         && p.n_eta_axis() == model.n_eta
-        && (1..=MAX_ODE_AXES).contains(&p.n_axes())
+        && p.n_axes() >= 1
+        && scope.program_width(p.n_theta_axis(), p.n_eta_axis()) <= MAX_ODE_AXES
 }
 
 /// The model-level scaling allowlist [`ode_analytical_supported`] requires: `None`
@@ -261,10 +299,15 @@ fn expression_scale_axes_admissible(
 /// `run_subject`'s per-observation loop — can require the identical scaling scope
 /// without a second, driftable copy of this match.
 pub(crate) fn ode_scaling_supported(model: &CompiledModel) -> bool {
+    ode_scaling_supported_in(model, OdeGradScope::Outer)
+}
+
+/// [`ode_scaling_supported`] for either gradient's scope (#1804).
+fn ode_scaling_supported_in(model: &CompiledModel, scope: OdeGradScope) -> bool {
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => true,
         ScalingSpec::ExpressionScale { deriv: Some(p), .. } => {
-            expression_scale_axes_admissible(p, model)
+            expression_scale_axes_admissible(p, model, scope)
         }
         _ => false,
     }
@@ -276,7 +319,16 @@ pub(crate) fn ode_scaling_supported(model: &CompiledModel) -> bool {
 /// parameter. Per-subject gates (bolus-only doses, no TV covariates/resets, and the
 /// static walk's `MAX_ODE_SENS_DIM` individual-parameter cap) are checked in
 /// [`ode_subject_sensitivities`].
+///
+/// This is the **outer** scope. The inner η-gradient's scope is wider for a model with many
+/// θ (see `OdeGradScope`, #1804).
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
+    ode_analytical_supported_in(model, OdeGradScope::Outer)
+}
+
+/// [`ode_analytical_supported`] for either gradient's scope (#1804). The two scopes share
+/// every clause but the program-width bound.
+pub(crate) fn ode_analytical_supported_in(model: &CompiledModel, scope: OdeGradScope) -> bool {
     // A `TIME`-built-in structural parameter is served analytically on the ODE path
     // too: the subject routes through the event-driven TV-cov walk (`ode_tvcov_supported`
     // admits `uses_time_builtin`), which seeds each event's PK-param duals at that
@@ -371,7 +423,7 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // LTBS keeps the FD fallback). Both compose with a Form-C readout (`y = state/V`), the
     // other supported route. Allowlist (not denylist) so a future scaling variant can only
     // *narrow* the analytic scope, never silently admit an unhandled one.
-    if !ode_scaling_supported(model) {
+    if !ode_scaling_supported_in(model, scope) {
         return false;
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
@@ -420,14 +472,17 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     {
         return false;
     }
-    // The η/θ chain evaluates the individual-parameter program over `Dual2`
-    // seeded on (θ, η); require it present, with matching axis counts (no NN-θ /
-    // IOV), and within the analytic-chain dual-width cap.
+    // The outer η/θ chain evaluates the individual-parameter program over `Dual2` seeded on
+    // (θ, η), the inner one over `Dual1` seeded on η alone. Require the program present, with
+    // matching axis counts (no NN-θ / IOV), and that scope's evaluation within the dual-width
+    // cap — the one clause the two scopes do not share (#1804). This is the only width bound:
+    // both TV-cov dispatch tables (`M = n_theta + n_eta` outer, `n_eta` inner) and both
+    // program-evaluation tables cover exactly `1..=MAX_ODE_AXES`.
     match ode.indiv_param_program.as_ref() {
         Some(p) => {
             if p.n_theta_axis() != model.n_theta
                 || p.n_eta_axis() != model.n_eta
-                || p.n_axes() > MAX_ODE_AXES
+                || scope.program_width(model.n_theta, model.n_eta) > MAX_ODE_AXES
             {
                 return false;
             }
@@ -438,7 +493,7 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // walk's per-individual-parameter dual tables, so it is a static-walk gate
     // (`static_walk_dim_supported`, applied in `ode_subject_supported`). A model past it
     // routes every subject to the event-driven walk (`ode_tvcov_supported`), whose dual
-    // width is the `θ + η` program width bounded just above.
+    // width is the scope's program width bounded just above.
     //
     // A model with no θ and no η at all (σ-only: every individual parameter a constant or a
     // data column) has nothing to seed either walk with — the event walk's tables start at
@@ -483,11 +538,25 @@ pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subj
             .any(|d| d.is_infusion() && ode.input_rate.iter().any(|f| f.cmt == d.cmt_idx()))
 }
 
-/// Per-subject scope gate, shared by the full (outer `Dual2`) and light (inner
-/// `Dual1`) ODE providers so a subject is served analytically for **both** the
-/// outer gradient and the inner EBE loop, or neither (the inner/outer scope must
-/// match — a split would mix an analytic gradient with an FD Jacobian).
+/// Per-subject scope gate of the static superposition walk, in the **outer** scope.
+///
+/// Shared by the full (outer `Dual2`) and light (inner `Dual1`) ODE providers through
+/// [`ode_subject_supported_in`], so the two scopes differ only in the program-width bound
+/// (`OdeGradScope`). The invariant is `Outer ⇒ Inner`: a subject served an analytic outer
+/// gradient is always served the analytic inner one, because the other split would pair an
+/// analytic gradient with an FD Jacobian. The reverse split — analytic inner, FD outer — is
+/// what a model past the outer width cap gets (#1804); FD then differentiates an objective
+/// whose EBEs and `∂f/∂η` are exact.
 pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    ode_subject_supported_in(model, subject, OdeGradScope::Outer)
+}
+
+/// [`ode_subject_supported`] for either gradient's scope (#1804).
+pub(crate) fn ode_subject_supported_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    scope: OdeGradScope,
+) -> bool {
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (see
     // `has_infusion_into_input_rate`): the f64 prediction is exact, but the dual walk's `+rate`
     // injection would double-count the mass the convolved `R_in_inf` already delivers.
@@ -541,7 +610,7 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     // walk (the file is full of "#486: SS now composes" notes, so this is live pressure)
     // reopens the pre-arrival `NaN`. If you relax one, add the pre-arrival clause here.
     // The padded 30 θ + 2 η fixture confirmed only the axis-cap cause, not the other six.
-    if !ode_analytical_supported(model)
+    if !ode_analytical_supported_in(model, scope)
         || subject.has_tv_covariates()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
     {
@@ -725,7 +794,21 @@ pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject:
         && subject.has_ss_doses()
 }
 
+/// Per-subject scope gate of the event-driven walk, in the **outer** scope; see
+/// [`ode_tvcov_supported_in`].
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    ode_tvcov_supported_in(model, subject, OdeGradScope::Outer)
+}
+
+/// Whether the event-driven walk ([`run_subject_tvcov`] outer, [`run_subject_tvcov_eta`]
+/// inner) serves `(model, subject)` in `scope` (#1804). The scopes differ only in the
+/// program-width bound `ode_analytical_supported_in` applies, so they route the same
+/// subjects to this walk rather than to the static one.
+pub(crate) fn ode_tvcov_supported_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    scope: OdeGradScope,
+) -> bool {
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (the f64
     // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
     // as the static gate above — see `has_infusion_into_input_rate`.
@@ -837,7 +920,7 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // with TV covariates here). So a wide model takes this walk for *every* subject
     // rather than falling to FD for the ones with no other trigger.
     let too_wide_for_static_walk = !static_walk_dim_supported(model);
-    if !ode_analytical_supported(model)
+    if !ode_analytical_supported_in(model, scope)
         || !(subject.has_tv_covariates()
             || has_reset_snapshots
             || model.has_lagtime()
@@ -864,15 +947,11 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
-    // Bound total axes so BOTH TV-cov dispatch tables resolve: the outer
-    // `run_subject_tvcov` dispatches `M = n_theta + n_eta` and the inner
-    // `run_subject_tvcov_eta` dispatches `n_eta`, each over `1..=MAX_ODE_AXES`. With
-    // `n_eta ≤ n_theta + n_eta ≤ MAX_ODE_AXES`, both succeed — so the inner and outer
-    // analytic scope stay matched (never an analytic outer with an FD inner, and no
-    // silent `_ => None` downgrade) (#449 review #4).
-    if model.n_theta + model.n_eta > MAX_ODE_AXES {
-        return false;
-    }
+    // The dispatch-table bound (outer `M = n_theta + n_eta`, inner `n_eta`, each over
+    // `1..=MAX_ODE_AXES`, #449 review #4) is the scoped program-width clause of
+    // `ode_analytical_supported_in` above. It used to be repeated here as a total-axes bound,
+    // which applied the outer width to the inner walk too and cost every model past
+    // `MAX_ODE_AXES` its analytic η-gradient (#1804).
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
@@ -1184,7 +1263,7 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
         // matching the pre-#575 `|| model.log_transform` guard.
         ScalingSpec::None | ScalingSpec::ScalarScale(_) if !model.log_transform => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
-            if expression_scale_axes_admissible(p, model) => {}
+            if expression_scale_axes_admissible(p, model, OdeGradScope::Outer) => {}
         _ => return false,
     }
     // Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` ARE supported under
@@ -1393,17 +1472,19 @@ const _: () = assert!(MIXED_NA_CAP == 11);
 /// light provider ([`super::provider::subject_eta_grad`]). The inner EBE loop needs
 /// only `∂f/∂η`, so this skips the `Dual2` Hessian *and* the θ-chain: one `Dual1`
 /// integration (≈`N`-cost) replaces FD's `2·n_eta+1` plain integrations. Same scope
-/// as [`ode_subject_sensitivities`]; `None` falls back to the FD inner gradient
-/// (issue #410).
+/// as [`ode_subject_sensitivities`] except for the program width: every dual here is
+/// seeded on η alone, so the gate is the inner scope (`n_eta ≤ MAX_ODE_AXES`, not
+/// `n_theta + n_eta`, #1804). `None` falls back to the FD inner gradient (issue #410).
 pub fn ode_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    // Time-varying covariates: the light η-only walk (`Dual1<n_eta>`), mirroring the
-    // outer TV-cov dispatch so the inner/outer analytic scope stays matched.
-    if ode_tvcov_supported(model, subject) {
+    // Time-varying covariates: the light η-only walk (`Dual1<n_eta>`). The scopes split the
+    // same subjects between the two walks, so a subject on the outer TV-cov walk is on this
+    // one too (Outer ⇒ Inner).
+    if ode_tvcov_supported_in(model, subject, OdeGradScope::Inner) {
         macro_rules! dispatch_tv {
             ($($n:literal),+) => {
                 match model.n_eta {
@@ -1412,13 +1493,13 @@ pub fn ode_subject_eta_grad(
                 }
             };
         }
-        // Up to MAX_ODE_AXES (matches the outer `run_subject_tvcov` M-dispatch and
-        // the `ode_tvcov_supported` axis bound), so inner/outer stay matched (#449 #4).
+        // Up to MAX_ODE_AXES, the inner scope's program-width bound
+        // (`ode_analytical_supported_in`), so an admitted model never reaches `_` (#449 #4).
         return dispatch_tv!(
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         );
     }
-    if !ode_subject_supported(model, subject) {
+    if !ode_subject_supported_in(model, subject, OdeGradScope::Inner) {
         return None;
     }
     // `pk` and the η-block `∂p/∂η` are evaluated once here and threaded into the driver
@@ -2744,8 +2825,9 @@ fn run_subject_tvcov<const M: usize>(
 /// (`Dual1`) ODE IOV walks so their analytic scope stays matched (a subject is served
 /// analytically for both, or neither). Mirrors `ode_tvcov_supported`'s bolus-only
 /// screen; time-varying covariates ARE supported (each event is seeded at its own
-/// covariate snapshot). Returns `(occasion groups, n_stacked = n_eta + K·n_kappa,
-/// m_dim = n_theta + n_stacked)`, or `None` out of scope.
+/// covariate snapshot). Returns `m_dim = n_theta + layout.n_axes()`, or `None` out of
+/// scope. `layout` is the subject's `StackedLayout::sens_of`, built once by the entry
+/// point, or by the EBE search that walks every iterate on it (#2037).
 ///
 /// The cap is on `m_dim` (the *outer* dual width); since `n_stacked ≤ m_dim`, the
 /// inner walk's `Dual1<n_stacked>` always resolves too — so capping here keeps the
@@ -2753,7 +2835,8 @@ fn run_subject_tvcov<const M: usize>(
 fn ode_iov_subject_supported(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<(crate::stats::stacked_layout::StackedLayout, usize)> {
+    layout: &crate::stats::stacked_layout::StackedLayout,
+) -> Option<usize> {
     if !ode_iov_supported(model) {
         return None;
     }
@@ -2826,7 +2909,6 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     if layout.n_groups() == 0 {
         return None;
     }
@@ -2838,7 +2920,7 @@ fn ode_iov_subject_supported(
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
-    Some((layout, m_dim))
+    Some(m_dim)
 }
 
 /// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
@@ -2857,7 +2939,19 @@ pub fn ode_subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let (layout, m_dim) = ode_iov_subject_supported(model, subject)?;
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    ode_subject_sensitivities_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`ode_subject_sensitivities_iov`] over the subject's caller-built `layout` (#2037).
+pub(crate) fn ode_subject_sensitivities_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let m_dim = ode_iov_subject_supported(model, subject, layout)?;
     if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
@@ -2868,7 +2962,7 @@ pub fn ode_subject_sensitivities_iov(
         subject,
         theta,
         stacked_eta,
-        &layout,
+        layout,
     )
 }
 
@@ -2884,7 +2978,21 @@ pub fn ode_subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    ode_subject_eta_grad_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`ode_subject_eta_grad_iov`] over the subject's caller-built `layout`
+/// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
+/// so an EBE search walks every iterate on one layout (#2037).
+pub(crate) fn ode_subject_eta_grad_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    ode_iov_subject_supported(model, subject, layout)?;
     if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
@@ -2895,7 +3003,7 @@ pub fn ode_subject_eta_grad_iov(
         subject,
         theta,
         stacked_eta,
-        &layout,
+        layout,
     )
 }
 
@@ -3554,6 +3662,13 @@ pub(crate) fn param_derivatives_at_cov(
 /// covariate snapshot — the light-inner counterpart of [`seed_pk_dual2`]. Slot for
 /// individual parameter `i` carries `∂p/∂η_k` on axis `k`; other slots are constant.
 ///
+/// The program is evaluated over `Dual1<N>` with θ held constant
+/// (`eval_param_eta_grad`), so the width is `n_eta` whatever `n_theta` is. It used to
+/// read `dp_deta` off the `Dual2<n_theta + n_eta>` [`param_derivatives_at_cov`], which
+/// returns `None` past `MAX_ODE_AXES` total axes and so cost every such model its
+/// analytic inner gradient (#1804). Both give the same first derivatives: the η block of
+/// a forward-mode gradient does not depend on which other axes are seeded.
+///
 /// `pub(crate)`: also reused by `pk::modified_release::mr_subject_eta_grad`
 /// (#860 Phase A6), the closed-form counterpart of `ode_subject_eta_grad`.
 pub(crate) fn seed_pk_dual1<const N: usize>(
@@ -3574,14 +3689,15 @@ pub(crate) fn seed_pk_dual1<const N: usize>(
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` guard is always a no-op
     // — flat loop (#449 review #15).
     debug_assert_eq!(N, n_eta);
-    let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    let p = prog.eval_param_eta_grad::<N>(theta, eta, cov);
     let pk = (model.pk_param_fn)(theta, eta, cov, time);
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; N];
-        for k in 0..n_eta {
-            grad[k] = pd.dp_deta[i][k];
-        }
+        grad[..n_eta].copy_from_slice(&p[i].grad[..n_eta]);
         out[slot] = Dual1 {
             value: pk.values[slot],
             grad,

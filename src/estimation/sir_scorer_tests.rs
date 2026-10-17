@@ -155,6 +155,9 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
 
 /// T8. `run_sir_core` refuses parameters whose mixture shape disagrees with the model —
 /// both directions — with an `Err`, not the `mixture_ofv` panic the scorer would hit.
+/// #2044: as `E_PARAM_SHAPE` (no block) on the coded core, the `String` core's text
+/// being its `to_string()`. Each whole text is pinned, so deleting a sentence reddens
+/// its direction; either site back on `EngineError::uncoded` reddens its `code()`.
 #[test]
 fn run_sir_core_refuses_mixture_params_mismatch() {
     let (model, pop) = mixture_inputs();
@@ -167,11 +170,19 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
 
     let mut flat = model.default_params.clone();
     flat.mixture = None;
-    let e = run_sir_core(&model, &pop, &flat, &etas, &cov, 0.0, &opts)
-        .expect_err("a [mixture] model with one-class parameters must be refused");
-    assert!(
-        e.contains("the model declares [mixture] but the parameters carry no per-class"),
-        "{e}"
+    let coded = |m: &CompiledModel, p: &ModelParameters| {
+        let e = run_sir_core_coded(m, &pop, p, &etas, &cov, 0.0, &opts).expect_err("refused");
+        let s = run_sir_core(m, &pop, p, &etas, &cov, 0.0, &opts).expect_err("refused");
+        assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "{e}");
+        assert_eq!(e.block(), None, "{e}");
+        assert_eq!(e.to_string(), s);
+        s
+    };
+    assert_eq!(
+        coded(&model, &flat),
+        "run_sir_core: the model declares [mixture] but the parameters carry \
+         no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
+         fitted_params_from_result or pass the fit's own parameters."
     );
 
     // The same model without its `[mixture]` block.
@@ -188,9 +199,11 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
     )
     .expect("non-mixture variant must parse");
     assert!(plain.mixture.is_none(), "fixture premise: no [mixture]");
-    let e = run_sir_core(&plain, &pop, &model.default_params, &etas, &cov, 0.0, &opts)
-        .expect_err("per-class parameters on a non-mixture model must be refused");
-    assert!(e.contains("the model declares no [mixture]"), "{e}");
+    assert_eq!(
+        coded(&plain, &model.default_params),
+        "run_sir_core: the parameters carry per-class Ω/Σ \
+         (ModelParameters::mixture) but the model declares no [mixture]."
+    );
 }
 
 /// #1774: `fitted_params_from_result`'s three `[mixture]` override refusals carry a

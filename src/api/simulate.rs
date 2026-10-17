@@ -1514,14 +1514,14 @@ pub fn simulate_with_uncertainty_diag(
         population,
         &template.theta,
     ))?;
-    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
+    // The sampler's input refusals carry their codes (#2044).
+    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples_coded(
         fit_result,
         &template,
         opts.n_uncertainty_draws,
         opts.method,
         &mut rng,
-    )
-    .map_err(EngineError::uncoded)?;
+    )?;
 
     // Final size is deterministic, so we can size the buffer once and avoid
     // repeated reallocations for large simulations.
