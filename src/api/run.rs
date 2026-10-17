@@ -661,6 +661,8 @@ pub fn run_model_simulate_with_overrides(
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -740,6 +742,20 @@ pub fn run_model_simulate_with_overrides(
         .map_err(|e| e.to_string())?;
     let template = template;
 
+    // #2005: the template has no occasion labels, so without a model-side rule `fit()`
+    // would refuse it with `E_IOV_MISSING_OCC` — after simulating, and with the dataset
+    // advice (set `iov_column`), which cannot label a simulated population. Refuse here
+    // instead, with the one remedy that works on this path. Every refusal above keeps
+    // its precedence.
+    if let Some(d) = check_simulation_iov_occasions(
+        &parsed.model,
+        &template,
+        &parsed.fit_options.iov_occasion,
+        parsed.fit_options.iov_column.as_deref(),
+    ) {
+        return Err(crate::diagnostics::EngineError::from_diagnostic(d).to_string());
+    }
+
     // Simulate
     eprintln!(
         "Simulating {} subjects (seed={})...",
@@ -761,6 +777,11 @@ pub fn run_model_simulate_with_overrides(
             seed: Some(sim_spec.seed),
             match_method: None,
             horizon: sim_spec.horizon,
+            // The template subjects carry no occasion labels, so a derived rule is the
+            // only way an IOV model's κ is drawn here (#1955). Without one,
+            // `check_simulation_iov_occasions` above has already refused the template
+            // with `E_IOV_MISSING_OCC` (#2005), so `W_IOV_NO_OCCASIONS` never reaches here.
+            iov_occasion: Some(parsed.fit_options.iov_occasion.clone()),
         },
     )
     .map_err(|e| format!("simulation failed: {e}"))?;
@@ -991,6 +1012,9 @@ pub fn run_model_simulate_with_overrides(
         }
     }
     rebuild_warnings_structured(&mut result);
+    // The labels the fit derived on its own copy, onto the population returned for sdtab,
+    // as the data path does: without them `OCC` is not written (#1979 review).
+    derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
 }
 
@@ -1189,9 +1213,16 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     #[cfg(not(feature = "markov"))]
     let design_states: HashMap<usize, usize> = HashMap::new();
 
+    // Nested levels (#1082): a blank level cell is missing, not the previous record's label.
+    let no_carry_forward: std::collections::HashSet<String> = model
+        .nested_levels()
+        .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
+        .unwrap_or_default();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
+        .with_no_carry_forward(no_carry_forward)
 }
 
 /// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
@@ -1233,11 +1264,14 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
 /// (#1622), so the re-read cannot drop a clause the fit applied: before it, the
 /// re-read took no selection filter and a fit with `ignore_subjects` came back
 /// with the ignored subjects in it.
+///
+/// A failure is the [`Diagnostic`](crate::Diagnostic) `ferx check` gives it
+/// ([`read_population_with_diag`]).
 pub(crate) fn read_population_as_fitted(
     parsed: &ParsedModel,
     data_path: &str,
-) -> Result<(Population, Option<CovariateTable>), String> {
-    read_population_with(
+) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
+    read_population_with_diag(
         &parsed.model,
         &ReaderSettings::from_parsed(parsed),
         data_path,
@@ -1344,7 +1378,21 @@ pub fn read_population_with(
     settings: &ReaderSettings,
     data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    let filter = settings.selection_filter()?;
+    read_population_with_diag(model, settings, data_path).map_err(|d| d.message)
+}
+
+/// [`read_population_with`], refusing with the [`Diagnostic`](crate::Diagnostic)
+/// `ferx check` gives the same failure (#1774): a selection clause that does not
+/// compile through `selection_filter_diagnostic`, a read failure through
+/// `data_read_diagnostic`. The message is [`read_population_with`]'s, byte for byte.
+pub(crate) fn read_population_with_diag(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    data_path: &str,
+) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
+    let filter = settings
+        .selection_filter()
+        .map_err(super::validation::selection_filter_diagnostic)?;
     let fallback: Option<Vec<&str>> = settings
         .fallback_columns
         .as_ref()
@@ -1358,6 +1406,7 @@ pub fn read_population_with(
         filter.as_ref(),
         &settings.column_map,
     )
+    .map_err(|e| super::validation::data_read_diagnostic(&e))
 }
 
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`

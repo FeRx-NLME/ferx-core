@@ -268,6 +268,7 @@ fn simulated_event_times_read_dose_quantities_at_the_dose_record() {
         horizon: Some(30.0),
         seed: Some(1575),
         match_method: None,
+        iov_occasion: None,
     };
     let draw = |m: &CompiledModel| -> Vec<f64> {
         ferx_core::api::simulate_with_options(m, &population(m), &m.default_params, 40, &opts)

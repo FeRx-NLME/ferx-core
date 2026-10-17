@@ -117,6 +117,10 @@ struct FitWire {
     covariance_wall_time_secs: f64,
     n_threads_used: usize,
     uses_ode_solver: bool,
+    // Absent on bundles saved before #852 added the exact linear path; those fits
+    // integrated every ODE model, so the default is the truth for them.
+    #[serde(default)]
+    ode_linear_exact: bool,
     uses_sde: bool,
     gradient_method_inner: String,
     gradient_method_outer: String,
@@ -905,6 +909,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         covariance_wall_time_secs: r.covariance_wall_time_secs,
         n_threads_used: r.n_threads_used,
         uses_ode_solver: r.uses_ode_solver,
+        ode_linear_exact: r.ode_linear_exact,
         uses_sde: r.uses_sde,
         gradient_method_inner: r.gradient_method_inner.clone(),
         gradient_method_outer: r.gradient_method_outer.clone(),
@@ -2408,6 +2413,7 @@ fn wire_to_fit_result(
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,
         uses_ode_solver: w.uses_ode_solver,
+        ode_linear_exact: w.ode_linear_exact,
         uses_sde: w.uses_sde,
         n_threads_used: w.n_threads_used,
         nlopt_missing_algorithms: w.nlopt_missing_algorithms,
@@ -2576,6 +2582,8 @@ mod tests {
                 dose_covariates: vec![],
                 obs_covariates: vec![],
                 pk_only_times: vec![],
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: vec![],
                 reset_times: vec![],
                 reset_covariates: Vec::new(),

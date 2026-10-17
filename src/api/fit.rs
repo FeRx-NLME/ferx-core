@@ -557,9 +557,15 @@ pub(crate) fn fitted_population<'a>(
                 .to_string(),
         );
     }
-    let derive_occ = iov_rule_set && model.n_kappa > 0;
+    // A nested model's groups are its level cells (#1082), which a derived rule would
+    // overwrite. `fit()` refuses such a rule up front; the post-hoc steps that prepare
+    // with the fit's recorded rule must not regroup either, so the cells win here.
+    let derive_occ = iov_rule_set && model.n_kappa > 0 && !model.has_nested_levels();
     // A `correlation … by COL` line reads its blocks off the `by` columns (#1081).
     let needs_rgroup = model.residual_serial.is_some();
+    // Nested levels (#1082): each record's level labels name its cell, written into the
+    // occasion labels the prediction reads.
+    let needs_cells = model.has_nested_levels();
     let needs_prune = population.subjects.iter().any(|s| {
         !s.dose_covariates.is_empty()
             || !s.obs_covariates.is_empty()
@@ -569,11 +575,14 @@ pub(crate) fn fitted_population<'a>(
             // `reset_covariates` must reach it rather than being gated out here.
             || !s.reset_covariates.is_empty()
     });
-    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup) {
+    if !(needs_prune || needs_dv_log || derive_occ || needs_rgroup || needs_cells) {
         return population;
     }
     let mut population = population;
     let p = population.to_mut();
+    if needs_cells {
+        crate::stats::nested_levels::assign_level_cells(model, p);
+    }
     if needs_prune {
         p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
     }
@@ -752,9 +761,7 @@ fn fit_unstamped(
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
-    if let Some(e) = check_analytic_readout_support(model, population) {
-        return Err(e);
-    }
+    first_error(&check_analytic_readout_support(model, population)).map_err(|e| e.to_string())?;
     // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
     // gap-time — require time-sorted records and do not support interval-censored /
     // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
@@ -767,17 +774,13 @@ fn fit_unstamped(
     // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
     // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
     #[cfg(feature = "survival")]
-    if let Some(e) = check_survival_tv_covariates(model, population) {
-        return Err(e);
-    }
+    first_error(&check_survival_tv_covariates(model, population)).map_err(|e| e.to_string())?;
     // The `TIME` axis of the same freeze: an ODE-accumulated hazard integrates the
     // disposition at its TIME=0 snapshot while the Gaussian half reads `$PK` at every
     // record, so a TIME-dependent CL/V/init would put the two halves of the objective on
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
-    if let Some(e) = check_survival_time_dependent_pk(model) {
-        return Err(e);
-    }
+    first_error(&check_survival_time_dependent_pk_diags(model)).map_err(|e| e.to_string())?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
@@ -1516,14 +1519,16 @@ fn fit_inner(
     };
 
     // Covariance step cost warning: fire before chain so user sees it
-    // immediately. Use checked_mul so an absurd parameter count cannot wrap
-    // and produce a bogus estimate; on overflow we still warn but suppress
-    // the numeric estimate.
-    let covariance_n_evals_estimated = if options.run_covariance_step && n_params_pre > 30 {
-        n_params_pre.checked_mul(n_params_pre)
-    } else {
-        None
-    };
+    // immediately. The count is checked arithmetic, so an absurd parameter
+    // count cannot wrap and produce a bogus estimate; on overflow we still warn
+    // but suppress the numeric estimate. No note at all when the step will run
+    // an estimator that builds no `R` (#1803).
+    let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
+        n_params_pre,
+        options,
+        !model.priors.is_empty(),
+    );
+    let covariance_n_evals_estimated = covariance_cost.flatten();
 
     // Compute observation time range from the population.
     let obs_time_range: Option<(f64, f64)> = {
@@ -1631,23 +1636,10 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
-    if options.run_covariance_step && n_params_pre > 30 {
-        if let Some(n_evals) = covariance_n_evals_estimated {
-            accumulated_warnings.push(format!(
-                "Covariance step: {} parameters → {} OFV evaluations \
-                 (finite-difference Hessian). This may take several minutes \
-                 on complex models.",
-                n_params_pre, n_evals
-            ));
-        } else {
-            // n_params² overflowed usize — warn without the (wrapped) number.
-            accumulated_warnings.push(format!(
-                "Covariance step: {} parameters → n² OFV evaluations \
-                 (finite-difference Hessian). Estimate exceeds usize range; \
-                 expect this to be very slow.",
-                n_params_pre
-            ));
-        }
+    if let Some(note) =
+        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
+    {
+        accumulated_warnings.push(note);
     }
 
     // inits_from_nca: derive NCA-based starting values before the optimizer
@@ -3123,6 +3115,15 @@ fn fit_inner(
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),
+        // Read while this fit's ODE override is still armed, so a caller's
+        // `FitOptions::ode_method = rk45` on a linear model reports `false` (#852). Routed is
+        // not enough: a segment the propagator declined at the final estimates was integrated,
+        // so the predictions are not all exact and the flag must say so.
+        ode_linear_exact: model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|o| o.effective_solver_opts().method == crate::ode::OdeMethod::Linear)
+            && ode_solver_stats.linear_declined_segments == 0,
         uses_sde: model.is_sde(),
         n_threads_used,
         nlopt_missing_algorithms: nlopt_missing,

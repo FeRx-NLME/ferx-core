@@ -78,6 +78,8 @@ fn main() {
             dose_covariates: vec![],
             obs_covariates: vec![],
             pk_only_times: vec![],
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: vec![],
@@ -109,6 +111,7 @@ fn main() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect("ferx joint PK-TTE simulation must succeed");

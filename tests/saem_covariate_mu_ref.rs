@@ -970,3 +970,157 @@ fn imp_recovers_the_shared_exponent_coordinates() {
          {BEFORE_SHARED_IMPMAP_TH_CRCL} / {BEFORE_SHARED_IMPMAP_TVCL}"
     );
 }
+
+// ── #1630: a covariate mu-reference reading another eta's anchor ─────────────
+
+/// NONMEM 7.6.0 `METHOD=SAEM` finals, `nonmem_anchor/results/covmuref_anchor_a_saem.ext`
+/// (the `-1000000000` row). `V1 = TVCL·TH_R·(WT/70)^THETA_WT_V1`, so the
+/// typical V1 is the product `TVCL·TH_R`.
+const NM_ANCHOR_A_TVCL: f64 = 4.935_73;
+const NM_ANCHOR_A_TH_CRCL: f64 = 0.556_429;
+const NM_ANCHOR_A_TVV1: f64 = 4.935_73 * 9.753_24;
+
+/// NONMEM 7.6.0 `METHOD=SAEM` finals, `nonmem_anchor/results/covmuref_anchor_b_saem.ext`.
+/// `V1 = TVV2·TH_R·(WT/70)^THETA_WT_V1`, typical V1 `TVV2·TH_R`.
+const NM_ANCHOR_B_TH_WT_V1: f64 = 0.591_068;
+const NM_ANCHOR_B_TVV1: f64 = 94.477_4 * 0.510_426;
+
+/// Where ferx landed before #1630 on the same fixtures and options (`54deede9`,
+/// release CLI, Linux x86_64): case A at seed 1, 150/250, case B at seed 1,
+/// 300/700.
+const BEFORE_ANCHOR_A_TH_CRCL: f64 = 0.213_731;
+const BEFORE_ANCHOR_B_TH_WT_V1: f64 = 0.401_657;
+const BEFORE_ANCHOR_B_TVV1: f64 = 94.696_502 * 0.483_249;
+
+/// Bounds against the NONMEM anchors, from the realised errors (Linux x86_64,
+/// release) at the time of writing, seed 1 being the tested arm:
+///
+/// | arm | `THETA_CRCL` | `TVCL` | typical V1 | `THETA_WT_V1` |
+/// |---|---:|---:|---:|---:|
+/// | A, 150/250, seeds 1 / 2 / 3 | 0.0001 / 0.0005 / 0.0027 | 0.0011 / 0.0095 / 0.0052 | 0.10 / 0.42 / 0.03 | — |
+/// | B, 300/700, seeds 1 / 2 / 3 | — | — | 0.46 / 0.03 / 0.51 | 0.0063 / 0.0006 / 0.0143 |
+///
+/// `THETA_CRCL` and `TVCL` keep #1620's 0.015, ≥1.6× the worst seed. The typical
+/// V1 takes 1.0 for A and 1.2 for B, ≥2.4× theirs. `THETA_WT_V1` is asserted on
+/// B at 300/700 only: at 150/250 the pre-fix seed 1 (0.68) is closer to NONMEM
+/// than the post-fix seeds' spread, so that arm cannot tell the two apart; at
+/// 300/700 0.05 is 3.5× the worst seed and a quarter of the pre-fix 0.19. Both
+/// fixtures reproduce the reparameterised control (`V1 = TVV1·…`) to every
+/// printed digit of OFV, which no tolerance here needs to rely on.
+const ANCHOR_TH_CRCL_TOL: f64 = 0.015;
+const ANCHOR_TVCL_TOL: f64 = 0.015;
+const ANCHOR_A_TVV1_TOL: f64 = 1.0;
+const ANCHOR_B_TVV1_TOL: f64 = 1.2;
+const ANCHOR_B_TH_WT_V1_TOL: f64 = 0.05;
+
+/// `nonmem_anchor/<file>` on the bundled data through the CLI's file entry
+/// point, its own `[fit_options]` edited by `edit`. Returns the fit and its
+/// mu-reference notes, which each arm pins whole.
+fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult, Vec<String>) {
+    let model = Path::new("nonmem_anchor").join(file);
+    let src = std::fs::read_to_string(&model).expect("anchor model file");
+    let mut opts = parse_full_model(&src)
+        .expect("anchor model parses")
+        .fit_options;
+    edit(&mut opts);
+    let result = ferx_core::fit_from_files(
+        model.to_str().unwrap(),
+        Some("data/two_cpt_oral_cov.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("the fit must run");
+    let notes = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("mu-reference"))
+        .cloned()
+        .collect();
+    (result, notes)
+}
+
+/// Tier-3, #1630 case A. `V1` reads `TVCL`, the anchor of `ETA_CL`, whose own
+/// covariate mu-reference supersedes that pair. Before #1630 `V1`'s group was
+/// declined over the non-running pair and SAEM landed 10–29 OFV units above
+/// the reparameterised control, `THETA_CRCL` at 0.214 here. Now the two groups
+/// share `TVCL` and take #1620's joint step, with the exact engine.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
+)]
+fn saem_merges_a_group_reading_a_superseded_anchor() {
+    let (result, notes) = fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |_| {});
+    assert_eq!(
+        notes,
+        vec![
+            "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
+             ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
+             re-centres both (#1620)."
+                .to_string()
+        ]
+    );
+    let th_crcl = theta(&result, "THETA_CRCL");
+    assert_finite_close(
+        "A: THETA_CRCL",
+        th_crcl,
+        NM_ANCHOR_A_TH_CRCL,
+        ANCHOR_TH_CRCL_TOL,
+    );
+    assert!(
+        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.3,
+        "A: THETA_CRCL = {th_crcl:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_A_TH_CRCL}"
+    );
+    let tvcl = theta(&result, "TVCL");
+    assert_finite_close("A: TVCL", tvcl, NM_ANCHOR_A_TVCL, ANCHOR_TVCL_TOL);
+    assert_finite_close(
+        "A: TVCL·TH_R",
+        tvcl * theta(&result, "TH_R"),
+        NM_ANCHOR_A_TVV1,
+        ANCHOR_A_TVV1_TOL,
+    );
+}
+
+/// Tier-3, #1630 case B. `V1` reads `TVV2`, the plain anchor of `ETA_V2`,
+/// whose closed-form shift runs. Before #1630 `V1`'s group was declined and
+/// its covariate exponent sat on the η-frozen numerical M-step: 0.402 here, and
+/// 0.68 / 1.07 / 0.63 over seeds 1/2/3 at 150/250. Now the anchor joins the
+/// group as a one-theta member, and since nothing else reads `TVV2` the joint
+/// step takes the exact engine — the note list pins that no observation-term
+/// note fires.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
+)]
+fn saem_takes_a_colliding_plain_anchor_into_the_group() {
+    let (result, notes) = fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
+        o.saem_n_exploration = 300;
+        o.saem_n_convergence = 700;
+    });
+    assert_eq!(
+        notes,
+        vec![
+            "SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 (anchored \
+             on TVV2) share TVV2 and take one joint M-step that re-centres both (#1620, #1630)."
+                .to_string()
+        ]
+    );
+    let th_wt_v1 = theta(&result, "THETA_WT_V1");
+    assert_finite_close(
+        "B: THETA_WT_V1",
+        th_wt_v1,
+        NM_ANCHOR_B_TH_WT_V1,
+        ANCHOR_B_TH_WT_V1_TOL,
+    );
+    assert!(
+        (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
+        "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
+    );
+    let tvv1 = theta(&result, "TVV2") * theta(&result, "TH_R");
+    assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
+    assert!(
+        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 2.0,
+        "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
+    );
+}

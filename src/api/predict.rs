@@ -195,11 +195,11 @@ pub fn predict_diag(
     // A time-varying covariate on a survival hazard would be silently frozen — refuse
     // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // Same freeze on the `TIME` axis (#1853; as fit() does).
     #[cfg(feature = "survival")]
-    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
-    check_analytic_readout_support(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
+    first_error(&check_analytic_readout_support(model, population))?;
     first_error(&check_absorption_dosing(model, population))?;
     // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
     // Gaussian loop below never visits, so a CTMM-only model would silently return an
@@ -217,13 +217,11 @@ pub fn predict_diag(
     // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
     if model.has_ctmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
-        return Err(
+        return Err(super::entry_refusals::ctmm_unsupported(
             "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \
              has no continuous observations either — so the call would return an empty vec rather \
-             than an occupancy π(t). State-occupancy prediction is a later slice (#820)."
-                .to_string()
-                .into(),
-        );
+             than an occupancy π(t). State-occupancy prediction is a later slice (#820).",
+        ));
     }
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
@@ -338,7 +336,7 @@ pub fn predict_categorical(
     // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
     // level block, a population not bound for the bound block, or a covariate the data
     // lacks each returned `Ok` here — `NaN` probabilities for the first two, the
@@ -478,10 +476,10 @@ pub fn predict_survival(
     // Like predict()/simulate(), the survival curves read the hazard at a frozen
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so refuse instead (#741).
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // Same freeze on the `TIME` axis — this entry point is the one that reports `H`/`h`
     // off the frozen snapshot (#1853; as fit() does).
-    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
     // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
     // level block, a population not bound for the bound block, or a covariate the data
     // lacks each returned `Ok` here — `NaN` survival for the first two, the covariate

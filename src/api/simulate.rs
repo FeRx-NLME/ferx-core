@@ -39,6 +39,12 @@ use std::time::Instant;
 /// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
+/// An IOV model's occasions are read from `population` as given: this entry point takes
+/// no `iov_occasion` rule, and a subject with no occasion labels is simulated at κ = 0
+/// without a warning. For a model fitted under `iov_occasion = dose | time(...)`, use
+/// [`simulate_with_options_diag`] with [`SimulateOptions::iov_occasion`], which also
+/// reports `W_IOV_NO_OCCASIONS` (#1955).
+///
 /// # Errors
 ///
 /// On a model/data precondition failure — a dose the model cannot route or honour, an
@@ -57,6 +63,8 @@ pub fn simulate(
 }
 
 /// Simulate with a fixed seed for reproducibility.
+///
+/// Takes no `iov_occasion` rule and returns no warnings, as [`simulate`] (#1955).
 ///
 /// # Errors
 ///
@@ -96,6 +104,28 @@ pub struct SimulateOptions {
     /// rather than drawing unbounded — the decoupled horizon a competing-risks VPC
     /// needs. `None` keeps the per-record window. No effect on Gaussian endpoints.
     pub horizon: Option<f64>,
+    /// The model-side IOV occasion rule (`iov_occasion = dose | time(...)` in
+    /// `[fit_options]`, #1955). For a model that declares κ, a `PerDose` or `TimeWindows`
+    /// rule re-derives every subject's occasion labels from its own timeline before
+    /// anything else runs, the propensity branch's posthoc pass included, exactly as
+    /// `fit()` derives them. One κ is then drawn per derived occasion.
+    ///
+    /// `None` and `Some(IovOccasionRule::Column)` keep the population's labels as given.
+    /// A subject with none is simulated at κ = 0, which the `_diag` form reports as
+    /// `W_IOV_NO_OCCASIONS`. Pass the rule the model was fitted under:
+    /// [`FitResult::iov_occasion`], or the model file's `[fit_options] iov_occasion`.
+    pub iov_occasion: Option<IovOccasionRule>,
+}
+
+/// What a `simulate*` entry point lets its caller supply as the TTE administrative
+/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
+#[cfg(feature = "survival")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TteHorizon {
+    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
+    Given(Option<f64>),
+    /// The entry point takes none (`simulate_with_uncertainty`).
+    NotAccepted,
 }
 
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
@@ -132,12 +162,36 @@ pub struct SimulateOptions {
 ///
 /// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
 /// it surfaces loudly during integration (never as a silent censor).
+///
+/// `horizon` says what the caller could have supplied. Where a horizon is required and
+/// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
+/// that takes none (`simulate_with_uncertainty`) cannot act on that, so it is told the
+/// model cannot be simulated there and where it can (`E_TTE_NOT_SIMULATABLE`, #1774).
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
-    horizon: Option<f64>,
-) -> Result<(), String> {
+    horizon: TteHorizon,
+) -> Result<(), EngineError> {
+    use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
+    // The refusal for a required horizon that is missing or not finite and positive.
+    // `what` names the endpoint kind, `why` the reason it needs one.
+    let missing_horizon = |what: &str, why: &str| match horizon {
+        TteHorizon::Given(_) => simulate_horizon(format!(
+            "{what} simulation requires a finite, positive administrative horizon: set \
+             `[simulation] horizon` (or `SimulateOptions.horizon`). {why}"
+        )),
+        TteHorizon::NotAccepted => tte_not_simulatable(format!(
+            "{what} simulation requires a finite, positive administrative horizon, and \
+             `simulate_with_uncertainty` takes none (`SimulateUncertaintyOptions` has no \
+             horizon). {why} Simulate this model with `simulate_with_options` and \
+             `SimulateOptions.horizon` instead."
+        )),
+    };
+    let horizon = match horizon {
+        TteHorizon::Given(h) => h,
+        TteHorizon::NotAccepted => None,
+    };
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
 
     // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
@@ -177,13 +231,10 @@ pub(crate) fn validate_tte_simulatable(
         match horizon {
             Some(h) if h.is_finite() && h > 0.0 => {}
             _ => {
-                return Err(
-                    "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
-                     positive administrative horizon: set `[simulation] horizon` (or \
-                     `SimulateOptions.horizon`). The recurrent event stream is generated up to \
-                     that horizon."
-                        .to_string(),
-                );
+                return Err(missing_horizon(
+                    "Repeated time-to-event (RTTE, `type = rtte`)",
+                    "The recurrent event stream is generated up to that horizon.",
+                ));
             }
         }
         for subject in &population.subjects {
@@ -211,27 +262,27 @@ pub(crate) fn validate_tte_simulatable(
                 continue;
             }
             if rtte_cmts.len() > 1 {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation supports one recurrent stream per subject, but subject '{}' \
                      has RTTE endpoints on multiple CMTs ({:?}); multi-cause RTTE simulation is a \
                      later slice",
                     subject.id, rtte_cmts
-                ));
+                )));
             }
             if has_single_tte_sibling {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation does not support an RTTE cause combined with a competing \
                      single-event TTE cause on subject '{}'; simulate them separately",
                     subject.id
-                ));
+                )));
             }
             if !subject.reset_times.is_empty() {
-                return Err(format!(
+                return Err(tte_not_simulatable(format!(
                     "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
                      hazard clock mid-stream; selective per-state reset is a later slice); subject \
                      '{}' has resets",
                     subject.id
-                ));
+                )));
             }
         }
     }
@@ -258,12 +309,10 @@ pub(crate) fn validate_tte_simulatable(
     match horizon {
         Some(h) if h.is_finite() && h > 0.0 => {}
         _ => {
-            return Err(
-                "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
-                 administrative horizon: set `[simulation] horizon` (or `SimulateOptions.horizon`). \
-                 A drug-driven hazard can vanish, so there is no implicit observation window."
-                    .to_string(),
-            );
+            return Err(missing_horizon(
+                "ODE-accumulated TTE (joint PK-TTE)",
+                "A drug-driven hazard can vanish, so there is no implicit observation window.",
+            ));
         }
     }
     for subject in &population.subjects {
@@ -275,24 +324,24 @@ pub(crate) fn validate_tte_simulatable(
             continue;
         }
         if !subject.reset_times.is_empty() {
-            return Err(format!(
+            return Err(tte_not_simulatable(format!(
                 "ODE-accumulated TTE simulation does not support EVID=3/4 resets (a full reset \
                  zeros the cumulative hazard mid-flight; selective per-state reset is a later \
                  slice); subject '{}' has resets",
                 subject.id
-            ));
+            )));
         }
         if let Some(ObsRecord::Event { entry_time, .. }) = subject
             .obs_records
             .iter()
             .find(|r| matches!(r, ObsRecord::Event { cmt, entry_time, .. } if is_ode_tte(cmt) && *entry_time > 0.0))
         {
-            return Err(format!(
+            return Err(tte_not_simulatable(format!(
                 "ODE-accumulated TTE simulation does not support left truncation \
                  (entry_time={entry_time} for subject '{}'); conditional sampling past entry is \
                  a deferred follow-up",
                 subject.id
-            ));
+            )));
         }
     }
     Ok(())
@@ -311,14 +360,20 @@ pub(crate) fn validate_tte_simulatable(
 pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
-) -> Result<(), String> {
+) -> Result<(), EngineError> {
+    if model.has_nested_levels() {
+        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+    }
     if model.n_kappa > 0 && params.omega_iov.is_none() {
-        return Err(format!(
+        // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
+        // message stays #1019's, which names the remedy a rebuilt parameter set needs.
+        let message = format!(
             "model declares {} kappa (IOV) but the supplied parameters carry no omega_iov; \
              simulation draws one kappa vector per occasion from it. Rebuild the parameters \
              with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
             model.n_kappa
-        ));
+        );
+        return Err(super::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -366,7 +421,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
                 .join(", ")
         ));
     }
-    first_error(&[Diagnostic::error("E_THETA_LENGTH", message)])
+    Err(super::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for
@@ -467,7 +522,7 @@ pub(crate) fn check_param_shape(
             },
             _ => continue,
         };
-        return first_error(&[Diagnostic::error("E_PARAM_SHAPE", message)]);
+        return Err(super::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -487,9 +542,10 @@ pub(crate) fn check_param_shape(
 /// twin-less flip-flop typical value, a time-varying covariate on a hazard (#741 — it would
 /// be silently frozen), an individual parameter that reads `TIME` and reaches an
 /// ODE-accumulated hazard (#1853 — the same freeze on the `TIME` axis, and
-/// `draw_ode_tte_latent` root-finds that frozen snapshot for its event times) or a
-/// malformed built-in absorption input rate (#588) reaches the emitter and produces wrong
-/// rows or a panic deep in the prediction loop.
+/// `draw_ode_tte_latent` root-finds that frozen snapshot for its event times), a
+/// depot-reading analytic readout on a subject superposition cannot reconstruct (#650 / #375 /
+/// #1488) or a malformed built-in absorption input rate (#588) reaches the emitter and
+/// produces wrong rows or a panic deep in the prediction loop.
 fn check_simulate_preconditions(
     model: &CompiledModel,
     population: &Population,
@@ -517,11 +573,17 @@ fn check_simulate_preconditions(
         model, population, theta,
     ))?;
     #[cfg(feature = "survival")]
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
     // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
     // snapshot for its event times (#1853; as fit() does).
     #[cfg(feature = "survival")]
-    check_survival_time_dependent_pk(model).map_or(Ok(()), Err)?;
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // A Form C readout of the oral depot amount on a subject whose doses superposition
+    // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
+    // compartment (#375). Without it a release build returns rows from a phantom depot and
+    // a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
+    // predict_diag() do).
+    first_error(&check_analytic_readout_support(model, population))?;
     first_error(&check_absorption_dosing(model, population))
 }
 
@@ -559,12 +621,14 @@ pub fn simulate_with_options(
 /// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
 /// only the rows.
 ///
-/// Four sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// Five sources feed `warnings`, in this order: per-subject simulation diagnostics (a
 /// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
 /// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their
 /// observations whose sampled η entered a twin-less transit / IG closed form's flip-flop
 /// regime, so their entire dose-driven concentration was clamped to zero (#1823), capped
-/// steady-state equilibrations (#867), and — new in #1280 / #1304 — the shared non-fit
+/// steady-state equilibrations (#867), `W_IOV_NO_OCCASIONS` for an IOV model handed
+/// subjects with no occasion labels after `opts.iov_occasion` is applied (#1955), and —
+/// new in #1280 / #1304 — the shared non-fit
 /// diagnostics bundle (parse warnings, data-reader warnings, the model/data checks,
 /// experimental-feature notices, and this pass's ODE-solver diagnostics). Before it, a model
 /// `fit()` refuses to stay quiet about served the same rows here with nothing attached.
@@ -584,13 +648,26 @@ pub fn simulate_with_options_diag(
     // the SS trough, biasing simulated concentrations low.
     crate::dosing::clear_ss_nonconvergence_warnings();
 
+    // A model-side occasion rule's labels come first (#1955), so every step below sees
+    // them: the checks, the propensity branch's posthoc pass, and the κ draw.
+    let derived = with_derived_occasions(model, population, opts.iov_occasion.as_ref());
+    let population: &Population = &derived;
+    let iov_warning = no_occasion_warning(
+        params.omega_iov.is_some(),
+        population,
+        "no kappa was drawn for them: they were simulated",
+        "Label the occasions in the data (`iov_column` in [fit_options]), or derive them with \
+         `iov_occasion = dose | time(...)`; `simulate_with_options` takes the rule as \
+         `SimulateOptions::iov_occasion`.",
+    );
+
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
     // via the augmented-ODE root-finder (Slice 2.2). Validate its preventable
     // preconditions up front so a caller gets a clean Err here rather than a panic
     // deep in sampling (a finite horizon is required; resets and left truncation are
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, opts.horizon)?;
+    validate_tte_simulatable(model, population, TteHorizon::Given(opts.horizon))?;
 
     // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
     // as a clean Err here; `simulate` / `simulate_with_seed` get the same `Err` from
@@ -615,7 +692,9 @@ pub fn simulate_with_options_diag(
     // subject at or before entry (#522 review).
     if let Some(h) = opts.horizon {
         if !h.is_finite() || h <= 0.0 {
-            return Err(format!("SimulateOptions.horizon must be finite and > 0 (got {h})").into());
+            return Err(super::entry_refusals::simulate_horizon(format!(
+                "SimulateOptions.horizon must be finite and > 0 (got {h})"
+            )));
         }
         // A horizon below a subject's TTE entry_time would censor it before it
         // entered observation (a row with time = h < entry_time). The
@@ -628,13 +707,12 @@ pub fn simulate_with_options_diag(
                     continue;
                 };
                 if *entry_time > h {
-                    return Err(format!(
+                    return Err(super::entry_refusals::simulate_horizon(format!(
                         "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
                          ({entry_time}); the administrative horizon must be ≥ every \
                          subject's entry time",
                         subject.id
-                    )
-                    .into());
+                    )));
                 }
             }
         }
@@ -686,6 +764,7 @@ pub fn simulate_with_options_diag(
             let results = results?;
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+            warnings.extend(iov_warning);
             warnings.extend(super::non_fit_diagnostics(
                 model,
                 population,
@@ -698,23 +777,20 @@ pub fn simulate_with_options_diag(
     };
 
     if population.subjects.is_empty() {
-        return Err(
-            "propensity-score matching requires a non-empty observed population"
-                .to_string()
-                .into(),
-        );
+        return Err(super::entry_refusals::propensity_input(
+            "propensity-score matching requires a non-empty observed population",
+        ));
     }
     if let Some(s) = population
         .subjects
         .iter()
         .find(|s| s.observations.is_empty())
     {
-        return Err(format!(
+        return Err(super::entry_refusals::propensity_input(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
             s.id
-        )
-        .into());
+        )));
     }
     // A `DV = .` design template read by `read_population_for_simulation` (#957)
     // has rows but NaN observations, so the emptiness check above no longer
@@ -728,14 +804,13 @@ pub fn simulate_with_options_diag(
         .iter()
         .find(|s| s.observations.iter().any(|v| !v.is_finite()))
     {
-        return Err(format!(
+        return Err(super::entry_refusals::propensity_input(format!(
             "propensity-score matching requires finite observations for every subject \
              (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
              design template carries NaN placeholders — match against the observed dataset \
              instead",
             s.id
-        )
-        .into());
+        )));
     }
 
     // Fitted (posthoc) BSV etas depend only on the observed data + params, so
@@ -757,12 +832,11 @@ pub fn simulate_with_options_diag(
         .enumerate()
         .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
     {
-        return Err(format!(
+        return Err(EngineError::uncoded(format!(
             "propensity-score matching: the posthoc eta for subject '{}' is \
              non-finite (its EBE did not converge); cannot match",
             population.subjects[i].id
-        )
-        .into());
+        )));
     }
 
     let omega_inv = &params.omega.inv;
@@ -789,6 +863,7 @@ pub fn simulate_with_options_diag(
     let results = results?;
     warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    warnings.extend(iov_warning);
     warnings.extend(super::non_fit_diagnostics(
         model,
         population,
@@ -1199,13 +1274,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
-        return Err(
+        return Err(super::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
              discrete-state trajectory has no simulation path, so the Gaussian emitter would \
-             produce meaningless all-zero observations. CTMM simulation is a later slice."
-                .to_string()
-                .into(),
-        );
+             produce meaningless all-zero observations. CTMM simulation is a later slice.",
+        ));
     }
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
@@ -1213,7 +1286,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // returns a clean Err; `simulate` / `simulate_with_seed` reach them only here,
     // and return the same `Err` rather than emitting wrong rows.
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, horizon)?;
+    validate_tte_simulatable(model, population, TteHorizon::Given(horizon))?;
 
     // Same split for the model-vs-population checks (#1083). The
     // `Result`-returning entry points above have already run this list and
@@ -1339,6 +1412,10 @@ pub struct SimulateUncertaintyOptions {
 /// n_obs`. Each `SimulationResult` carries the originating `draw` and `sim`
 /// indices so downstream code can compute per-time uncertainty bands.
 ///
+/// For an IOV model, a fit under a derived `iov_occasion = dose | time(...)` rule
+/// ([`FitResult::iov_occasion`]) has the population's occasion labels re-derived with that
+/// rule first, as `fit()` derived them, so κ is drawn per occasion (#1955).
+///
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
 pub fn simulate_with_uncertainty(
@@ -1360,7 +1437,9 @@ pub fn simulate_with_uncertainty(
 /// `W_SIMULATED_FLIP_FLOP` count of the eligible individuals *inside* the draws that ran
 /// whose own sampled η landed there (#1823 — the skip is decided at each draw's η = 0 θ, so
 /// both can fire on one run), capped steady-state
-/// equilibrations (#867), and the shared non-fit diagnostics bundle — parse warnings, the
+/// equilibrations (#867), `W_IOV_NO_OCCASIONS` for an IOV model handed subjects with no
+/// occasion labels after the fit's [`FitResult::iov_occasion`] is applied (#1955), and the
+/// shared non-fit diagnostics bundle — parse warnings, the
 /// data-reader warnings through the same suppression filter `fit()` uses, the model/data checks
 /// at the fit's point estimate, experimental-feature notices, and the ODE-solver diagnostics
 /// collected over every draw. `postfit::non_fit_diagnostics` documents what that bundle
@@ -1385,6 +1464,19 @@ pub fn simulate_with_uncertainty_diag(
     // does, so this run's `warnings` carry only its own capped equilibrations (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();
 
+    // The occasions the fit derived (#1955): `FitResult::iov_occasion` is the rule it ran
+    // under (#1783), applied before anything reads the population.
+    let derived = with_derived_occasions(model, population, fit_result.iov_occasion.as_ref());
+    let population: &Population = &derived;
+    let iov_warning = no_occasion_warning(
+        fit_result.omega_iov.is_some(),
+        population,
+        "no kappa was drawn for them: they were simulated",
+        "Label the occasions in the data (`iov_column` in [fit_options]), or derive them with \
+         `iov_occasion = dose | time(...)`; `simulate_with_uncertainty` applies the rule the \
+         fit ran under, `FitResult::iov_occasion`.",
+    );
+
     // The fit's θ against this model's layout (#1614), before anything is drawn around
     // it: the per-draw chokepoint runs the same gate, but a mismatched point estimate
     // would first be handed to the draw machinery, and a zero-draw run never reaches it.
@@ -1392,11 +1484,11 @@ pub fn simulate_with_uncertainty_diag(
     // Ω / σ / Ω_IOV (#1764, #1833) are refused by `fitted_params_from_result` below,
     // before any draw: a second gate here rejected exactly the same inputs.
 
-    // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
-    // uncertainty path does not yet expose — validate once here rather than per
-    // draw at the inner chokepoint (which returns the same `Err`).
+    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon, which this
+    // uncertainty path does not expose — validate once here rather than per draw, and say
+    // so rather than ask for an option the caller cannot set (#1774).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, None)?;
+    validate_tte_simulatable(model, population, TteHorizon::NotAccepted)?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -1428,7 +1520,8 @@ pub fn simulate_with_uncertainty_diag(
         opts.n_uncertainty_draws,
         opts.method,
         &mut rng,
-    )?;
+    )
+    .map_err(EngineError::uncoded)?;
 
     // Final size is deterministic, so we can size the buffer once and avoid
     // repeated reallocations for large simulations.
@@ -1454,6 +1547,7 @@ pub fn simulate_with_uncertainty_diag(
     });
     looped?;
     sim_warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    sim_warnings.extend(iov_warning);
     sim_warnings.extend(super::non_fit_diagnostics(
         model,
         population,

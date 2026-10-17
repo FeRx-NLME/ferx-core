@@ -16,8 +16,9 @@ mod validation;
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
 pub(crate) use validation::{
-    all_uncertainty_draws_skipped_diags, twinless_absorption_closed_form,
-    uncertainty_draws_skipped_warning, SimulatedFlipFlopTally,
+    all_uncertainty_draws_skipped_diags, check_simulation_iov_occasions, no_occasion_warning,
+    twinless_absorption_closed_form, uncertainty_draws_skipped_warning, with_derived_occasions,
+    SimulatedFlipFlopTally,
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{
@@ -26,9 +27,10 @@ pub(crate) use validation::{
     check_absorption_flip_flop_no_twin, check_absorption_flip_flop_no_twin_diags,
     check_analytic_readout_support, check_covariate_levels, check_covariate_model_bound,
     check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_level_index_columns, check_modeled_dose_rates, check_packed_start_in_box,
-    check_residual_magnitude, check_simulation_data, check_unbound_theta_levels,
-    check_variance_init_rails, unbound_level_refusal, LevelDataEntry, UnboundLevelsEntry,
+    check_level_index_columns, check_modeled_dose_rates, check_ode_method_linear,
+    check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
+    check_unbound_theta_levels, check_variance_init_rails, unbound_level_refusal, LevelDataEntry,
+    UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
@@ -36,12 +38,17 @@ pub use validation::{
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
-    check_rtte_records, check_survival_time_dependent_pk, check_survival_tv_covariates,
+    check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
+pub(crate) use validation::{data_read_diagnostic, model_source_diagnostic};
+// The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
+#[cfg(all(test, feature = "survival"))]
+pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
 mod covariate_stats;
+mod entry_refusals;
 mod fit;
 mod levels;
 mod output_columns;
@@ -57,6 +64,10 @@ pub use adaptive::{
 };
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+pub(crate) use entry_refusals::{
+    adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
+    fit_input_model, sir_nothing_to_sample, sir_options, theta_length,
+};
 pub use fit::{fit, fit_from_files};
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
@@ -97,6 +108,7 @@ pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
+    read_population_with_diag,
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
@@ -199,6 +211,10 @@ const OUTPUT_MANDATORY: &[&str] = &[
 #[cfg(test)]
 #[path = "tests/multistart_prefers_tests.rs"]
 mod multistart_prefers_tests;
+
+#[cfg(test)]
+#[path = "tests/nested_levels_tests.rs"]
+mod nested_levels_tests;
 
 #[cfg(test)]
 #[path = "tests/written_time_message_tests.rs"]
@@ -372,6 +388,10 @@ mod survival_time_dependent_pk_tests;
 #[cfg(test)]
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
+// #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(test)]
+#[path = "tests/entry_refusal_codes_tests.rs"]
+mod entry_refusal_codes_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]

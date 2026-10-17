@@ -207,6 +207,8 @@ A YAML file containing parameter estimates, standard errors, and model diagnosti
 ```yaml
 model:
   converged: true
+  final_gradient_max_abs: 2.290000e-4
+  final_gradient_source: optimizer
   method: FOCE
   covariance_method: r
 objective_function:
@@ -275,17 +277,30 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 ### Key Fields
 
+#### Run status and objective
+
 - **converged**: whether the run reached a solution of the problem posed. It is
   never `true` at an objective that is not a usable number — `NaN`, infinite, or
   the clamped divergence sentinel all report `converged: false` with a
   `W_NONFINITE_OBJECTIVE` warning saying which. See [A non-finite
   objective](warnings.qmd#non-finite-objective).
+- **final_gradient_max_abs** / **final_gradient_source**: |g|∞, the largest
+  absolute component of the fit's `final_gradient`, and where that vector came
+  from (`optimizer` or `finite_difference`). The console prints the same thing
+  as a `Final gradient:` line right under `Converged:` (#1934). It is measured in
+  the packed optimizer coordinates and is a comparative figure, not a pass/fail
+  test — see [What the reporting gradient
+  reads](estimation/optimizers.qmd#what-the-reporting-gradient-reads). Both keys
+  are omitted when the fit reported no gradient; a non-finite component is
+  written as `.nan`.
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
   observations). The Delattre-style variants a model search ranks on (`mixed`,
   `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see
   [Ranking candidates](api/fitting.qmd#ranking-candidates-bic-variants-and-strictness).
+#### Parameter estimates
+
 - **se**: Standard error from the covariance step — see
   [Which covariance estimator produced these numbers](#covariance-estimator)
   before comparing one against another tool
@@ -504,7 +519,7 @@ describe and the field is `None` (and the YAML key is omitted, never `null`).
 
 **It is the estimator that ran, not the one requested.** Above 100 free
 parameters a *defaulted* `covariance_method = r` is routed onto the
-cross-product, because the `R` matrix would need `n(n+1)/2` re-converged
+cross-product, because the `R` matrix would need `2n²` re-converged
 objective evaluations; the substitution is reported as a warning and this field
 reports `s`. Reading `covariance_method` back off `[fit_options]` would report
 `r` for standard errors that came out of `S⁻¹`.
@@ -540,7 +555,7 @@ fabricated provenance.
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
-| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step will run, populated only when `run_covariance_step = true` and `n_parameters > 30` |
+| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's `R` matrix runs on the finite-difference route (`2n²`; the analytic assembly, where it applies, runs none, which this count does not yet check), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R` |
 | `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |
 
 ### Environment Info

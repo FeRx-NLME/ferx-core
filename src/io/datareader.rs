@@ -531,6 +531,12 @@ pub(crate) struct ObsRouting {
     /// placeholder that no `state_codes` lookup can map back to a generator
     /// index (#957 review).
     pub design_states: HashMap<usize, usize>,
+    /// Covariate columns a missing cell is **not** carried forward in (#1082): the row's
+    /// snapshot holds `NaN` there instead of the previous record's value. The level
+    /// columns of a nested-level model, whose value names the record's group, so a blank
+    /// cell must be seen as missing rather than silently joining the group before it.
+    /// Empty for every other model, which keeps the ordinary carry-forward.
+    pub no_carry_forward: HashSet<String>,
 }
 
 impl ObsRouting {
@@ -553,6 +559,13 @@ impl ObsRouting {
     /// value the endpoint can decode. CMTs left out keep the `0` default.
     pub(crate) fn with_design_states(mut self, codes: HashMap<usize, usize>) -> Self {
         self.design_states = codes;
+        self
+    }
+
+    /// Name the covariate columns whose missing cells read as `NaN` rather than being
+    /// carried forward (builder form; see [`ObsRouting::no_carry_forward`]).
+    pub(crate) fn with_no_carry_forward(mut self, columns: HashSet<String>) -> Self {
+        self.no_carry_forward = columns;
         self
     }
 
@@ -2400,6 +2413,9 @@ fn parse_subject(
     let mut obs_rec: Vec<usize> = Vec::new();
     // The same for each pk-only record, parallel to `pk_only_times` (#1810).
     let mut pk_only_rec: Vec<usize> = Vec::new();
+    // The TIME each pk-only record was written with, parallel to `pk_only_times`
+    // (#1969): the #1810 pass below moves an engine time, never this.
+    let mut pk_only_raw_times: Vec<f64> = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
@@ -2500,7 +2516,16 @@ fn parse_subject(
                 }
             }
         }
-        if is_tv {
+        // A column that must not carry forward (#1082) needs per-record snapshots as
+        // soon as one of its cells is missing while another holds a value, or the
+        // missing record would read the subject-static value.
+        let gapped = || {
+            first_val.is_some()
+                && rows
+                    .iter()
+                    .any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
+        };
+        if is_tv || (routing.no_carry_forward.contains(name) && gapped()) {
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
@@ -2545,6 +2570,9 @@ fn parse_subject(
     // event time emitted so far.
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
+    // `(engine time, TIME as written)` of every dose and reset row once `time_offset`
+    // is non-zero: `Subject::reset_period_times` (#1969).
+    let mut reset_period_times: Vec<(f64, f64)> = Vec::new();
 
     // Only string-valued covariate filters (IGNORE(C.EQ.C)) read the raw-cell
     // map; numeric-only filters never touch it, so skip the per-row allocation.
@@ -2556,12 +2584,19 @@ fn parse_subject(
         // with this record's covariate values" semantics.
         if any_tv {
             for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
-                if let Some(s) = row.get(*idx) {
-                    if let Ok(v) = s.parse::<f64>() {
-                        if v.is_finite() {
-                            locf_state.insert((*name).to_string(), v);
-                        }
+                let value = row
+                    .get(*idx)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite());
+                match value {
+                    Some(v) => {
+                        locf_state.insert((*name).to_string(), v);
                     }
+                    // #1082: a level label is not carried forward.
+                    None if routing.no_carry_forward.contains(*name) => {
+                        locf_state.insert((*name).to_string(), f64::NAN);
+                    }
+                    None => {}
                 }
             }
         }
@@ -2871,6 +2906,11 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
+            // reads (#1969). Doses below do the same.
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             // A reset row is a data record: NONMEM runs `$PK` at it, so an
             // `[odes] init(...)` re-seeded here is evaluated with THIS row's
             // covariates (#1133). `locf_state` was refreshed from this row at the
@@ -2947,6 +2987,9 @@ fn parse_subject(
             )?;
 
             doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -2997,6 +3040,9 @@ fn parse_subject(
                         doses.push(dose_for_rate_mode(
                             addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
+                        if time_offset != 0.0 {
+                            reset_period_times.push((addl_time, raw_time + (k as f64) * ii));
+                        }
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
@@ -3335,6 +3381,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            pk_only_raw_times.push(raw_time);
             pk_only_rec.push(row_seq);
             if any_tv {
                 pk_only_covariates.push(locf_state.clone());
@@ -3410,6 +3457,8 @@ fn parse_subject(
     // The remedy is #614's: the first record moves one ULP below the tie, so every
     // engine reaches it first. Only the first record needs moving, since the later
     // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
+    // That leaves two observations one ULP apart whenever the tie holds more than one,
+    // which the ODE engines must save as two points (`ode::predictions::segment_saveat`).
     // One ULP is always enough, too: the #614 pass below moves only observations, and an
     // observation sorts last among the kinds, so a pk-only row sharing its ULP still
     // goes first.
@@ -3501,6 +3550,12 @@ fn parse_subject(
         }
     }
 
+    // ADDL trains extend past later rows of their period, so the table is filled out
+    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
+    // reset and a dose at one `(engine, written)` pair, kept once.
+    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    reset_period_times.dedup();
+
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
@@ -3527,6 +3582,8 @@ fn parse_subject(
             dose_covariates: sorted_dose_cov,
             obs_covariates,
             pk_only_times,
+            pk_only_raw_times,
+            reset_period_times,
             pk_only_covariates,
             reset_times,
             reset_covariates,

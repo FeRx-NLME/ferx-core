@@ -549,16 +549,7 @@ pub fn solve_ekf(
             }
         }
 
-        let mut saveat: Vec<f64> = obs_times
-            .iter()
-            .filter(|&&t| crate::ode::predictions::reads_in_segment(t, t_start, t_end))
-            .cloned()
-            .collect();
-        if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
-            saveat.push(t_end);
-        }
-        saveat.sort_by(|a, b| a.total_cmp(b));
-        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+        let saveat = crate::ode::predictions::segment_saveat(obs_times, t_start, t_end);
 
         if (t_end - t_start).abs() < 1e-15 {
             continue;
@@ -623,32 +614,42 @@ pub fn solve_ekf(
                 n,
             );
 
-            if let Some(here) = obs_map.get(&pt.t.to_bits()) {
-                // Same assimilate-once mask as the boundary read: an observation sitting
-                // exactly on this segment's `t_end` is read here *and* at the next break as
-                // its `t_start`, and `kalman_update` is not idempotent.
-                //
-                // Records sharing this exact time are **one** measurement instant and share
-                // a single update, exactly as the boundary path above does — `solve_ekf`
-                // has one `obs_cmt_idx`, so N records here are N reads of the same
-                // compartment at the same time, and updating N times would shrink `p_mat`
-                // as though N independent measurements had arrived. Before #1263 only the
-                // last index of a shared time was in the map at all, so the others kept
-                // their `{ ipred: 0.0, p_obs: 0.0 }` prefill.
-                if let Some(&first) = here.iter().find(|&&j| !assimilated[j]) {
-                    let r = r_obs_vec.get(first).copied().unwrap_or(1.0);
-                    let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
-                    p_mat = p_new;
-                    let v = pt.u[obs_cmt_idx];
-                    let point = EkfObsPoint {
-                        ipred: ekf_ipred(v),
-                        p_obs,
-                    };
-                    for &j in here {
-                        if !assimilated[j] {
-                            results[j] = point.clone();
-                            assimilated[j] = true;
-                        }
+            // Same assimilate-once mask as the boundary read: an observation sitting
+            // exactly on this segment's `t_end` is read here *and* at the next break as
+            // its `t_start`, and `kalman_update` is not idempotent.
+            //
+            // Records sharing this exact time are **one** measurement instant and share
+            // a single update, exactly as the boundary path above does — `solve_ekf`
+            // has one `obs_cmt_idx`, so N records here are N reads of the same
+            // compartment at the same time, and updating N times would shrink `p_mat`
+            // as though N independent measurements had arrived. Before #1263 only the
+            // last index of a shared time was in the map at all, so the others kept
+            // their `{ ipred: 0.0, p_obs: 0.0 }` prefill.
+            //
+            // So are the records one ULP above it: the reader moves the first of two
+            // co-timed records one ULP below their tie (#614, #1810), and the pair is still
+            // one instant (`crate::types::same_instant`). Both times are in `saveat`, so the
+            // earlier point takes the pair's single update and the later finds every index
+            // already assimilated. No break sits between the two times, so the solver saves
+            // both off one step and they share a state as well.
+            let here = obs_map
+                .get(&pt.t.to_bits())
+                .into_iter()
+                .chain(obs_map.get(&pt.t.next_up().to_bits()))
+                .flatten();
+            if let Some(&first) = here.clone().find(|&&j| !assimilated[j]) {
+                let r = r_obs_vec.get(first).copied().unwrap_or(1.0);
+                let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
+                p_mat = p_new;
+                let v = pt.u[obs_cmt_idx];
+                let point = EkfObsPoint {
+                    ipred: ekf_ipred(v),
+                    p_obs,
+                };
+                for &j in here {
+                    if !assimilated[j] {
+                        results[j] = point.clone();
+                        assimilated[j] = true;
                     }
                 }
             }
@@ -758,6 +759,8 @@ mod tests {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1002,6 +1005,8 @@ mod tests {
                 dose_covariates: Vec::new(),
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
                 reset_covariates: Vec::new(),
@@ -1149,6 +1154,8 @@ mod tests {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -2149,6 +2156,8 @@ mod tests {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -2375,6 +2384,142 @@ mod tests {
             (p_new[(0, 0)] - dup[0].p_obs).abs() > 1e-9,
             "a second update at the same instant must move p_mat, or this test is vacuous"
         );
+    }
+
+    /// **A co-timed pair the reader split one ULP apart is filled, from one update.**
+    ///
+    /// Two observations at `TIME 4` with an EVID=2 row after the first reach the engine as
+    /// `[4⁻, 4]`: the reader moves the first one ULP below the tie (#1810). The segment
+    /// `saveat` deduped at `1e-15`, which merged the pair, so the record at `4` was never
+    /// saved and kept its `{ ipred: 0.0, p_obs: 0.0 }` prefill, a finite zero in the
+    /// likelihood. With both times saved, the in-segment read must still treat the pair as the
+    /// one instant it was written as (`crate::types::same_instant`): one update, as for the
+    /// unsplit `[4, 4]`, not two.
+    ///
+    /// Measured on macOS arm64: worst relative difference from the unsplit run 2.1e-16, over
+    /// `ipred` and `p_obs` of all three records. Bound `1e-12`.
+    ///
+    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
+    /// record at `4` measured 0.0097 against the unsplit 0.337. Restoring the `1e-15` dedup
+    /// alone leaves this test green, since the lookup fills the record at `4` from the `4⁻`
+    /// point either way. That dedup is pinned on the other engines, by
+    /// `a_reader_split_tie_is_read_on_every_ode_engine` in `predictions_tests.rs`. With both
+    /// reverted, the code before the fix, the record at `4` keeps its `0.0` prefill and the
+    /// first assertion below fails.
+    #[test]
+    fn ekf_reader_split_tie_is_one_instant() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let doses = vec![bolus_dose(100.0)];
+        let t = 4.0f64;
+        assert!(
+            t - t.next_down() < 1e-15,
+            "the pair must be close enough for the old 1e-15 dedup to merge it"
+        );
+        let run = |obs: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1],
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                obs,
+                &[0.01; 3],
+                opts,
+            )
+        };
+        let split = run(&[t.next_down(), t, 8.0]);
+        let unsplit = run(&[t, t, 8.0]);
+        let mut worst = 0.0_f64;
+        for (i, (s, u)) in split.iter().zip(&unsplit).enumerate() {
+            assert!(
+                s.ipred > 0.0 && s.p_obs > 0.0 && s.p_obs.is_finite(),
+                "split idx {i}: {s:?} (a prefill reads 0.0)"
+            );
+            assert_relative_eq!(s.ipred, u.ipred, max_relative = 1e-12);
+            assert_relative_eq!(s.p_obs, u.p_obs, max_relative = 1e-12);
+            worst = worst
+                .max((s.ipred - u.ipred).abs() / u.ipred)
+                .max((s.p_obs - u.p_obs).abs() / u.p_obs);
+        }
+        println!("EKF reader-split tie: worst relative difference {worst:.3e}");
+    }
+
+    /// **An obs / dose / obs tie the reader split takes one update too.**
+    ///
+    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4`
+    /// between the pair. The `4⁻` record reads the state before the dose and the `4` record
+    /// the state after it, but the pair is still one instant, so it takes one update, as the
+    /// unsplit `[4, 4]` does. This tie was already filled before #2010's fix, since a break
+    /// sits at `4`, but from two updates: the `4⁻` point took an in-segment update and the
+    /// boundary read at `4` a second one. The one-ULP-up lookup makes it one, so an EKF fit
+    /// with such a tie moves its objective.
+    ///
+    /// Measured on macOS arm64: `p_obs` 0.33658 / 0.0097115 / 0.33985 before the fix and
+    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred`
+    /// is 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
+    ///
+    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
+    /// record at `4` falls back to 0.0097 and the bit-equality below fails.
+    #[test]
+    fn ekf_reader_split_tie_across_a_dose_is_one_update() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let t = 4.0f64;
+        let dosed = vec![
+            bolus_dose(100.0),
+            DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let run_dosed = |obs: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1],
+                &pk,
+                &Default::default(),
+                &[],
+                &dosed,
+                obs,
+                &[0.01; 3],
+                opts,
+            )
+        };
+        let split = run_dosed(&[t.next_down(), t, 8.0]);
+        let unsplit = run_dosed(&[t, t, 8.0]);
+        for (i, s) in split.iter().enumerate() {
+            assert!(
+                s.ipred > 0.0 && s.p_obs > 0.0 && s.p_obs.is_finite(),
+                "dosed split idx {i}: {s:?} (a prefill reads 0.0)"
+            );
+        }
+        // The means straddle the dose: `4⁻` is pre-dose, `4` post-dose (`ipred` is the
+        // amount here, so the step is the dose itself), and the post-dose one is the
+        // unsplit run's.
+        assert_relative_eq!(split[1].ipred - split[0].ipred, 100.0, max_relative = 1e-12);
+        assert_relative_eq!(split[1].ipred, unsplit[1].ipred, max_relative = 1e-12);
+        // One update for the pair: both records carry its `p_obs`, the unsplit pair's, and
+        // the next observation sees the covariance one update leaves.
+        assert_eq!(
+            split[0].p_obs.to_bits(),
+            split[1].p_obs.to_bits(),
+            "obs / dose / obs at one instant must share one update: p_obs {} then {}",
+            split[0].p_obs,
+            split[1].p_obs
+        );
+        assert_relative_eq!(split[1].p_obs, unsplit[1].p_obs, max_relative = 1e-12);
+        assert_relative_eq!(split[2].p_obs, unsplit[2].p_obs, max_relative = 1e-12);
     }
 
     /// **The EKF covariance on a time-varying rate, against a quadrature oracle.**

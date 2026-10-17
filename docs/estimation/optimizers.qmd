@@ -260,6 +260,10 @@ zero is a stationarity claim the optimizer itself acted on. A `"finite_differenc
 an independent check on a run that had no gradient at all — and a large one says the fit stopped
 somewhere the objective was still moving, whatever `converged` says.
 
+The largest component, |g|∞, is printed with its source as a `Final gradient:` line right under
+`Converged:` in the console report and `ferx summary`, and written to the fit YAML as
+`final_gradient_max_abs` / `final_gradient_source` (#1934); the full vector is in the `.fitrx`.
+
 #### What it reads on a fit that is right, and one that is not {#what-the-reporting-gradient-reads}
 
 Measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv` under `method = focei`,

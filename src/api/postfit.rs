@@ -973,10 +973,10 @@ pub(crate) fn kappa_weight_typicals(
             for subj in &population.subjects {
                 for (_occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
                     let (cov, time) = match obs_idx.first() {
-                        Some(&j) => (subj.obs_cov(j), subj.obs_times.get(j).copied()),
-                        None => (&subj.covariates, None),
+                        Some(&j) => (subj.obs_cov(j), subj.param_time_obs(j)),
+                        None => (&subj.covariates, 0.0),
                     };
-                    let v = (w.eval)(theta, cov, time.unwrap_or(0.0));
+                    let v = (w.eval)(theta, cov, time);
                     if v.is_finite() {
                         vals.push(v);
                     }
