@@ -4553,15 +4553,24 @@ fn simulate_adaptive_carries_the_solver_diagnostics_of_its_own_run() {
         "and a clean one must carry no solver diagnostic: {:?}",
         clean.warnings
     );
+    // The steady-state non-convergence note is excluded: it comes from a process-global sink
+    // this driver drains (#1652), and lib-binary writers take no guard (#1289), so a concurrent
+    // test capping an equilibration can land it here. Its absence is pinned under a binary-local
+    // guard in `tests/ss_absorption_nonmem_anchor.rs`.
+    let others: Vec<&String> = clean
+        .warnings
+        .iter()
+        .filter(|w| !w.contains("Steady-state (SS=1) equilibration"))
+        .collect();
     assert_eq!(
-        clean.warnings.len(),
+        others.len(),
         1,
         "the only thing a clean run of this fixture may carry is its unreferenced-omega parse \
          warning; a second entry means something else started firing: {:?}",
         clean.warnings
     );
     assert!(
-        clean.warnings[0].contains("not referenced in any model expression"),
+        others[0].contains("not referenced in any model expression"),
         "{:?}",
         clean.warnings
     );

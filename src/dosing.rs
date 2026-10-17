@@ -577,20 +577,25 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
 /// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
 /// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// set and drained by the draining `api` boundaries (`fit` / `simulate_with_options_diag` /
-/// `simulate_with_uncertainty_diag`) into `FitResult.warnings` / `SimulationOutput.warnings` via
-/// [`take_ss_nonconvergence_warnings`].
+/// set and drained by every `api` boundary that returns a `warnings` channel — `fit`,
+/// `simulate_with_options_diag`, `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive
+/// driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
+/// [`take_ss_nonconvergence_warnings`]. Bare `predict()` / `simulate()` are wrappers over their
+/// `_diag` forms, so they drain too and discard the note with the rest of the diagnostics.
 ///
 /// The message is model-structural (independent of subject and of objective-eval count), so the
 /// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its
 /// deterministic ordering keeps the surfaced list stable. This assumes one top-level `api`
 /// operation per process at a time (the CLI / ferx-r usage): each draining entrypoint
 /// [`clear_ss_nonconvergence_warnings`] on entry and [`take_ss_nonconvergence_warnings`] on exit to
-/// bracket its own run; genuinely concurrent in-process operations would share the sink. Note that
-/// bare `predict()` reaches the *write* (via `equilibrate_ss_state`) but has no warnings channel to
-/// drain into — it neither clears nor takes, so its message only ever lingers until the next
-/// draining entrypoint clears the sink (harmless in sequential use; the follow-up that gives
-/// `predict()` a channel is #867 Option B).
+/// bracket its own run; genuinely concurrent in-process operations would share the sink. A
+/// draining call *nested* inside another's window clears the outer run's notes, so code that runs
+/// inside an entry point must not call one. `suggest_start::sweep`, which predicts inside `fit()`
+/// (via `inits_from_nca`) — once per start of a multi-start fit, concurrently with the other
+/// starts' objective passes — therefore uses the non-draining `api::predict_diag_undrained`
+/// rather than `predict()` (#1652 review r1 #1). Writers that do not drain (e.g. the public
+/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint,
+/// whose clear discards it.
 fn ss_nonconvergence_sink() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
     static SINK: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
         std::sync::OnceLock::new();
@@ -713,7 +718,11 @@ fn ss_equilibration_tail_warning(
 
 /// Serializes the tests that *read* the process-global SS non-convergence sink
 /// ([`take_ss_nonconvergence_warnings`], #867) so cargo's parallel harness can't have one test
-/// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
+/// drain another's entry mid-read. It does **not** serialize them against the draining `api`
+/// entry points (`fit`, `predict`/`predict_diag`, the `simulate*` family, the adaptive driver),
+/// which clear the sink on entry without taking this guard: a lib test calling one of those can
+/// empty the sink between a reader's write and its take. Known exposure, tracked separately
+/// (#1652 review r1 #2).
 /// Lives here rather than beside any one test module because the sink is now shared by the ODE
 /// (`ode::predictions`) and analytical (`pk::event_driven`) fallbacks, which sit in different
 /// files but the *same* lib-test binary — a per-file guard would not serialize them against
