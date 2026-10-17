@@ -57,16 +57,19 @@ use nalgebra::{DMatrix, DVector};
 /// after the fit, or a model of the same packed length with a different layout, is
 /// evaluated at the reported estimates instead. A fit with no vector — SAEM /
 /// importance-sampling / Bayes, a fit built in R, a bundle saved before #1815 or
-/// written by ferx-r — takes that re-decomposition fallback too. Pure Gauss-Newton,
-/// SAEM, importance sampling and VI are not bit-for-bit with their inline step even
-/// in memory (#1847).
+/// written by ferx-r — takes that re-decomposition fallback too.
 ///
 /// The step starts from the EBEs the fit reports, which are the ones the inline step
 /// was handed — not always a cold solve: when the fit's final cold re-solve scored
 /// worse than the optimizer's own EBEs (`W_EBE_START_DEPENDENT`), the fit reported the
-/// better candidate (#2026). A reloaded bundle stores EBEs to six decimals, so a
-/// reloaded fit of that kind runs from the rounded EBEs and is not bit-for-bit; one
-/// whose EBEs are the cold solve still is.
+/// better candidate (#2026), and Gauss-Newton, SAEM, IMP, IMPMAP and VI report the EBEs
+/// of their own warm-started mode solves. With both of those in place, every engine with
+/// an inline step — FOCE, FOCEI, Laplace, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP and VI —
+/// is repeated **bit for bit**, in memory and reloaded from a bundle `save_fit` wrote,
+/// which stores the EBEs exactly (#1847). A bundle saved before #1847 stored them to six
+/// decimals: such a reloaded fit runs from the cold solve, as it always did, which repeats
+/// FOCE / FOCEI / `gn_hybrid` exactly and the warm-started engines to finite-difference
+/// noise (about 1e-7 relative on the SEs). Bayes has no inline step to repeat.
 ///
 /// # Failure semantics
 ///
@@ -113,8 +116,9 @@ use nalgebra::{DMatrix, DVector};
 ///   and yields to the record; to override with a default value, clear or edit
 ///   `fit.scoring_settings` first. A fit without that record (a `.fitrx` written before
 ///   #426) falls back to `fit.sir_settings.scoring`, then to `options` as given. The EBEs
-///   the step starts from are not among these settings: they are the fit's own, to within
-///   the `.fitrx` rounding, whatever the inner settings say (#2026). A non-default
+///   the step starts from are not among these settings: they are the fit's own (to within
+///   the rounding of a bundle saved before #1847), whatever the inner settings say (#2026,
+///   #1847). A non-default
 ///   `inner_maxiter` / `inner_tol` / `inner_restarts` changes the cold re-solve they are
 ///   compared against, which can only move the start onto the fit's EBEs, and it changes
 ///   the reconvergence at every FD point; it does not change the central EBEs at which
@@ -331,13 +335,17 @@ fn run_covariance_scoped(
     Ok(out)
 }
 
-/// Absolute agreement within which reported EBEs are taken to be the cold solve's. A
-/// `.fitrx` bundle writes EBEs and κ̂ at six decimals (`io::output::fmt_num`), so a
-/// reloaded fit's EBEs sit within 5e-7 of the values the fit held; twice that leaves
-/// headroom for the decimal round-trip. A fit that reported a non-cold candidate differs
-/// from the cold solve by far more on some subject — the solve it beat is a different
-/// local minimum — so the band does not mistake one for the other (#2026).
-const REPORTED_EBE_TOL: f64 = 1e-6;
+/// Absolute agreement within which EBEs read from a **six-decimal** `.fitrx` bundle are
+/// taken to be the cold solve's. Before #1847 the bundle wrote EBEs and κ̂ at six decimals,
+/// so such a reloaded fit's EBEs sit within 5e-7 of the values the fit held; twice that
+/// leaves headroom for the decimal round-trip. A fit that reported a non-cold candidate
+/// differs from the cold solve by far more on some subject — the solve it beat is a
+/// different local minimum — so the band does not mistake one for the other (#2026).
+///
+/// Every other fit is compared bit for bit: its EBEs are the ones the fit held, and the
+/// warm-started EBEs of Gauss–Newton, SAEM, IMP, IMPMAP and VI sit inside this band
+/// without being the cold solve (#1847).
+const LEGACY_REPORTED_EBE_TOL: f64 = 1e-6;
 
 /// The `(eta_hats, h_matrices, kappas)` the covariance step runs from: the EBEs the fit
 /// reports, which are the ones its inline covariance step was handed (#2026).
@@ -345,21 +353,26 @@ const REPORTED_EBE_TOL: f64 = 1e-6;
 /// The fit's final inner loop solves cold, and when that cold solve misses the objective
 /// the optimizer measured it also scores the incumbent EBEs and a re-solve seeded from
 /// them, reporting the lowest (#833). Which candidate won is not recorded, but it does not
-/// need to be: the reported EBEs are the inputs. When they agree with a cold re-solve here
-/// to within the `.fitrx` rounding, the cold triple is used as is, so every fit the cold
-/// solve served — in memory or reloaded — runs exactly as before. Otherwise the fit
-/// reported another candidate, and the step runs from the reported EBEs and κ̂ themselves,
-/// with `h_matrices` (read only by `s` / `rsr`) rebuilt at them: `H` is `∂f/∂η` at the
-/// EBE, a function of the EBE alone, so it is the one the inline step was handed (to about
-/// one ULP when a Laplace/AGQ evaluation captured it alongside its terminal Hessian). A
-/// reloaded fit of that kind runs from the rounded EBEs and is close to the inline result,
-/// not bit-identical to it.
+/// need to be: the reported EBEs are the inputs. When they are bit-equal to a cold
+/// re-solve here, the cold triple is used as is, so every fit the cold solve served — in
+/// memory or reloaded — runs exactly as before. Otherwise the fit reported another
+/// candidate, and the step runs from the reported EBEs and κ̂ themselves, with
+/// `h_matrices` (read only by `s` / `rsr`) rebuilt at them: `H` is `∂f/∂η` at the EBE, a
+/// function of the EBE alone, so it is the one the inline step was handed (to about one
+/// ULP when a Laplace/AGQ evaluation captured it alongside its terminal Hessian).
 ///
-/// The selection above is FOCE's, but the test is on the EBEs, not on the engine. SAEM, VI,
-/// Gauss–Newton and importance-sampling fits report the EBEs of their own warm-started mode
-/// solves, which need not agree with a cold one either, and whenever they do not they take
-/// the reported branch too. Whether that brings them closer to their inline step is not
-/// measured (#1847).
+/// The selection above is FOCE's, but the test is on the EBEs, not on the engine.
+/// Gauss–Newton, SAEM, IMP, IMPMAP and VI report the EBEs of their own warm-started mode
+/// solves, and their inline step started from those. Those EBEs agree with a cold solve to
+/// about 1e-7, not bit for bit, so these engines take the reported branch and repeat their
+/// inline step exactly (#1847).
+///
+/// A bundle written before #1847 stored EBEs and κ̂ at six decimals, so its EBEs are never
+/// bit-equal to anything the fit held. When every reported value has that spelling
+/// (`written_at_six_decimals`), the comparison widens to [`LEGACY_REPORTED_EBE_TOL`] and
+/// such a reloaded fit runs from the cold solve, as it did before; a non-cold candidate is
+/// still told apart, and runs from its rounded EBEs, close to the inline result but not
+/// bit-identical to it.
 ///
 /// A `[mixture]` fit keeps the cold triple, and the guard only saves work: the mixture
 /// step reads none of the three. Its `r` stencil and base point score the K-fold
@@ -418,11 +431,16 @@ fn reported_ebe_inputs(
             .zip(&cold_kappas)
             .all(|(r, c)| r.len() == c.len() && r.iter().all(|k| k.len() == model.n_kappa));
     let agrees = || {
-        reported_matches(&reported, &cold_ehs)
+        let tol = if written_at_six_decimals(&reported, &reported_kappas) {
+            LEGACY_REPORTED_EBE_TOL
+        } else {
+            0.0
+        };
+        reported_matches(&reported, &cold_ehs, tol)
             && reported_kappas
                 .iter()
                 .zip(&cold_kappas)
-                .all(|(r, c)| reported_matches(r, c))
+                .all(|(r, c)| reported_matches(r, c, tol))
     };
     if params.mixture.is_some() || !comparable || agrees() {
         return (cold_ehs, cold_hms, cold_kappas);
@@ -431,16 +449,33 @@ fn reported_ebe_inputs(
     (reported, h_matrices, reported_kappas)
 }
 
-/// Do two per-subject (or per-occasion) EBE lists agree within [`REPORTED_EBE_TOL`]? A
-/// length mismatch is not agreement, and a `NaN` on either side fails the comparison.
-fn reported_matches(reported: &[DVector<f64>], cold: &[DVector<f64>]) -> bool {
+/// Do two per-subject (or per-occasion) EBE lists agree within `tol`? At `tol = 0` that is
+/// bit equality (`+0` and `-0` aside, which start the step identically). A length mismatch
+/// is not agreement, and a `NaN` on either side fails the comparison.
+fn reported_matches(reported: &[DVector<f64>], cold: &[DVector<f64>], tol: f64) -> bool {
     reported.len() == cold.len()
         && reported.iter().zip(cold).all(|(r, c)| {
-            r.len() == c.len()
-                && r.iter()
-                    .zip(c.iter())
-                    .all(|(a, b)| (a - b).abs() <= REPORTED_EBE_TOL)
+            r.len() == c.len() && r.iter().zip(c.iter()).all(|(a, b)| (a - b).abs() <= tol)
         })
+}
+
+/// Is every reported η̂ and κ̂ a value a six-decimal `.fitrx` bundle could have written —
+/// the double nearest some `x.xxxxxx`? A bundle saved before #1847 wrote them that way
+/// (`{:.6}`), and so does nothing else: a full-precision EBE is such a value with odds of
+/// about one in 1e10, and a fit has at least one per subject and random effect. The lone
+/// exception is an EBE that is exactly zero, which carries no information either way; a fit
+/// whose EBEs are all zero is compared within the band, as every fit was before #1847.
+///
+/// The spelling is read off the values rather than off a marker, so it covers every
+/// producer of such EBEs without a new field: a pre-#1847 bundle, and a ferx-r fit
+/// object rebuilt from one.
+fn written_at_six_decimals(reported: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> bool {
+    let six = |x: &f64| {
+        format!("{x:.6}")
+            .parse::<f64>()
+            .is_ok_and(|y| y.to_bits() == x.to_bits())
+    };
+    reported.iter().all(|e| e.iter().all(six)) && kappas.iter().flatten().all(|k| k.iter().all(six))
 }
 
 /// Does this warning describe the covariance step itself — the step
@@ -1844,38 +1879,134 @@ mod packed_estimate_guard_per_engine {
 mod reported_ebes {
     use super::*;
 
-    /// #2026: the band `reported_ebe_inputs` keeps the cold solve within. An EBE that went
-    /// through a `.fitrx` round trip — six decimals, the worst case half a unit in the last
-    /// place — still agrees, so a reloaded cold-solve fit keeps the cold triple bit for bit;
-    /// one twice that far off does not, nor a `NaN` or a length mismatch. Mutation: drop
-    /// the band to zero → the round-trip row dies; widen it past 2e-6 → the off row dies.
+    /// #2026: the legacy band. An EBE that went through a pre-#1847 `.fitrx` round trip —
+    /// six decimals, the worst case half a unit in the last place — still agrees, so such a
+    /// reloaded cold-solve fit keeps the cold triple bit for bit; one twice that far off
+    /// does not, nor a `NaN` or a length mismatch. At `tol = 0` (#1847) only the identity
+    /// agrees. Mutation: drop the band to zero → the round-trip row dies; widen it past
+    /// 2e-6 → the off row dies.
     #[test]
     fn reported_matches_holds_the_fitrx_rounding_and_nothing_wider() {
+        let tol = LEGACY_REPORTED_EBE_TOL;
         let v = |xs: &[f64]| vec![DVector::from_column_slice(xs)];
         let cold = v(&[0.123_456_5, -1.000_000_499_9, 0.0]);
         let rounded: Vec<f64> = cold[0]
             .iter()
-            .map(|x| crate::io::output::fmt_num(*x).parse().unwrap())
+            .map(|x| format!("{x:.6}").parse().unwrap())
             .collect();
         assert!(
             rounded.iter().zip(cold[0].iter()).any(|(r, c)| r != c),
             "premise: the rounding must move the values"
         );
-        assert!(reported_matches(&v(&rounded), &cold), "a .fitrx round trip");
-        assert!(reported_matches(&cold, &cold), "identity");
         assert!(
-            !reported_matches(&v(&[0.123_458_5, -1.000_000_499_9, 0.0]), &cold),
+            reported_matches(&v(&rounded), &cold, tol),
+            "a .fitrx round trip"
+        );
+        assert!(reported_matches(&cold, &cold, tol), "identity");
+        assert!(
+            !reported_matches(&v(&[0.123_458_5, -1.000_000_499_9, 0.0]), &cold, tol),
             "2e-6 off on one coordinate"
         );
         assert!(
-            !reported_matches(&v(&[f64::NAN, -1.000_000_499_9, 0.0]), &cold),
+            !reported_matches(&v(&[f64::NAN, -1.000_000_499_9, 0.0]), &cold, tol),
             "NaN"
         );
         assert!(
-            !reported_matches(&v(&[0.123_456_5, -1.000_000_499_9]), &cold),
+            !reported_matches(&v(&[0.123_456_5, -1.000_000_499_9]), &cold, tol),
             "dimension"
         );
-        assert!(!reported_matches(&[], &cold), "subject count");
+        assert!(!reported_matches(&[], &cold, tol), "subject count");
+        assert!(reported_matches(&cold, &cold, 0.0), "identity, exact");
+        let one_ulp = v(&[0.123_456_5_f64.next_up(), -1.000_000_499_9, 0.0]);
+        assert!(
+            !reported_matches(&one_ulp, &cold, 0.0),
+            "one ULP off, exact"
+        );
+    }
+
+    /// #1847: the six-decimal spelling that marks a pre-#1847 bundle's EBEs. Both sides of
+    /// the gate on one list: the rounded values have it, the full-precision ones they came
+    /// from do not, and one full-precision κ̂ among six-decimal η̂ (or the reverse) is
+    /// enough to lose it. All-zero EBEs count as six-decimal (doc). Mutation: test only the
+    /// η̂ → the κ̂ row dies; test any value instead of every one → the mixed η̂ row dies;
+    /// compare with a tolerance instead of bits → the full-precision row dies.
+    #[test]
+    fn written_at_six_decimals_reads_the_spelling_of_every_value() {
+        let v = |xs: &[f64]| DVector::from_column_slice(xs);
+        let exact = vec![v(&[0.123_456_5, -1.000_000_499_9]), v(&[0.25, 3e-7])];
+        let rounded: Vec<DVector<f64>> = exact
+            .iter()
+            .map(|e| e.map(|x| format!("{x:.6}").parse().unwrap()))
+            .collect();
+        let none: Vec<Vec<DVector<f64>>> = Vec::new();
+        assert!(written_at_six_decimals(&rounded, &none), "rounded");
+        assert!(!written_at_six_decimals(&exact, &none), "full precision");
+        let mut mixed = rounded.clone();
+        mixed[1][1] = 3e-7;
+        assert!(!written_at_six_decimals(&mixed, &none), "one exact η̂");
+        let kappas_rounded = vec![vec![v(&[0.5, -0.000_001])]];
+        let kappas_exact = vec![vec![v(&[0.5, -1.25e-6])]];
+        assert!(
+            written_at_six_decimals(&rounded, &kappas_rounded),
+            "κ̂ rounded"
+        );
+        assert!(
+            !written_at_six_decimals(&rounded, &kappas_exact),
+            "one exact κ̂"
+        );
+        assert!(
+            written_at_six_decimals(&[v(&[0.0, -0.0])], &none),
+            "all zero (doc)"
+        );
+    }
+
+    /// #1847: a fit whose reported EBEs sit within the legacy band of the cold solve but are
+    /// not bit-equal to it — what Gauss–Newton, SAEM, IMP, IMPMAP and VI report — runs from
+    /// the reported EBEs, while the same EBEs rounded to six decimals (a pre-#1847 bundle)
+    /// run from the cold solve. Mutation: compare within `LEGACY_REPORTED_EBE_TOL` always
+    /// (the pre-#1847 rule) → the first half dies; compare bits always (no legacy path) →
+    /// the second half dies.
+    #[test]
+    fn a_near_cold_full_precision_fit_runs_from_its_own_ebes() {
+        let prep = crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare");
+        let (model, population, params) = (prep.parsed.model, prep.population, prep.init_params);
+        let options = FitOptions::default();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        let template = fit.subjects[0].clone();
+        fit.subjects.clear();
+        let (cold_etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        // 1e-8 off, inside the band; full precision, so not the six-decimal spelling.
+        fit.subjects = population
+            .subjects
+            .iter()
+            .zip(&cold_etas)
+            .map(|(s, e)| crate::types::SubjectResult {
+                id: s.id.clone(),
+                eta: e.map(|x| x + 1e-8 * std::f64::consts::PI),
+                ..template.clone()
+            })
+            .collect();
+        let near: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+        assert!(
+            reported_matches(&near, &cold_etas, LEGACY_REPORTED_EBE_TOL)
+                && !reported_matches(&near, &cold_etas, 0.0),
+            "premise: inside the legacy band, not bit-equal"
+        );
+        let (etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == near,
+            "full precision: the step must run from the reported EBEs"
+        );
+
+        for s in &mut fit.subjects {
+            s.eta = s.eta.map(|x| format!("{x:.6}").parse().unwrap());
+        }
+        let (etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == cold_etas,
+            "six decimals (a pre-#1847 bundle): the step must run from the cold solve"
+        );
     }
 
     /// #2026 review: an IOV fit that reports η̂ off the cold solve but no κ̂ has no
