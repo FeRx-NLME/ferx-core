@@ -252,7 +252,7 @@ A covariate mu-reference can also read the theta that **anchors another eta** on
 
 ##### Scope, and when a group is declined
 
-A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
+A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that an `if` assigns in only some of its arms (or from a theta) is not recorded at all; a covariate local every arm of an `if` / `else` assigns, and a `min` / `max` of one, are seen through ([#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422)).
 
 #### Scalar residual-error update
 
@@ -346,9 +346,12 @@ FOCE approximation the fit YAML reports — see below):
 
 On thiotepa every no-ETA theta had ended within a few percent of its initial
 value; after the fix they land where FOCEI lands. The in-repo anchor is
-`covmuref_power` with the weight covariate routed through an `if` block so the
-#619 group detection does not apply and `TH_WT` rides this channel: NONMEM
-SAEM 0.921, ferx 0.332 before (its 0.3 start) and 0.961 after.
+`covmuref_power` with the weight covariate routed through a local assigned
+before an `if` with no `else` and again in its arm, so the #619 group detection
+does not apply and `TH_WT` rides this channel: NONMEM SAEM 0.921, ferx 0.332
+before (its 0.3 start) and 0.961 after. (The fixture wrote a plain `if` / `else`
+until [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422) made that form
+a group; the values it computes are unchanged.)
 
 Two structural remedies remain better than this channel where they apply:
 
@@ -356,8 +359,9 @@ Two structural remedies remain better than this channel where they apply:
   `FIX`). ferx then mu-references it automatically and the exact closed-form
   update takes over.
 * **Write a covariate model in a form #619 can see** — a covariate read from
-  the data directly, not through a conditionally assigned local — so the slope
-  joins the typical value's mu-reference group.
+  the data directly or through a local, including one every arm of an
+  `if` / `else` assigns, rather than one assigned in only some arms — so the
+  slope joins the typical value's mu-reference group.
 
 Otherwise cross-check against [FOCEI](foce.qmd) or [IMPMAP](impmap.qmd), which
 do not depend on this channel.

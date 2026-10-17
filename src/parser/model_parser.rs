@@ -888,8 +888,8 @@ fn expr_contains_eta(expr: &Expression) -> bool {
 }
 
 /// [`expr_contains_eta`] over a [`RhsView`]. A substituted local definition is
-/// skipped without a walk, since [`InlineScope::record`] admits only eta-free
-/// ones.
+/// skipped without a walk, since [`InlineScope::record`] and
+/// [`InlineScope::record_branch_definition`] admit only eta-free ones.
 fn rhs_contains_eta<'a, V: RhsView<'a>>(v: V) -> bool {
     if v.is_definition() {
         return false;
@@ -989,10 +989,10 @@ thread_local! {
 ///
 /// A right-hand side read through the scope ([`Self::view`]) is the tree you
 /// get by replacing each name defined earlier with that definition's own
-/// inlined body. Replacement descends through operators, powers and function
-/// calls, but not into a conditional or a gather index, where a name stays a
-/// name. The tree is never built: a node is resolved when a matcher looks at
-/// it. On a diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`)
+/// inlined body. Replacement descends through operators, powers, function
+/// calls and conditionals (condition included), but not into a gather index,
+/// where a name stays a name. The tree is never built: a node is resolved when
+/// a matcher looks at it. On a diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`)
 /// the inlined tree doubles per level, and building it, as the scan did before
 /// #1684, made the parse exponential in the depth. Read through the scope, each
 /// definition is stored once however many paths reach it, and the two walks
@@ -1028,10 +1028,12 @@ struct InlineScope<'a> {
     assign_counts: HashMap<&'a str, usize>,
     /// Name → (statement index of its one assignment, right-hand side as written).
     defs: HashMap<&'a str, (usize, &'a Expression)>,
-    /// [`RhsView::mul_anchors`] per definition (by statement index).
-    anchors: std::cell::RefCell<HashMap<usize, Vec<MuRefAnchor>>>,
-    /// [`RhsView::typical_summary`] per definition (by statement index).
-    summaries: std::cell::RefCell<HashMap<usize, std::rc::Rc<TypicalSummary>>>,
+    /// [`RhsView::mul_anchors`] per definition (by body address: the locals an
+    /// `if` statement defines share its statement index, see
+    /// [`Self::record_branch_definition`]).
+    anchors: std::cell::RefCell<HashMap<*const Expression, Vec<MuRefAnchor>>>,
+    /// [`RhsView::typical_summary`] per definition (by body address).
+    summaries: std::cell::RefCell<HashMap<*const Expression, std::rc::Rc<TypicalSummary>>>,
 }
 
 impl<'a> InlineScope<'a> {
@@ -1064,6 +1066,33 @@ impl<'a> InlineScope<'a> {
         self.defs.insert(name, (at, raw_expr));
     }
 
+    /// Make a local that the `if` statement at index `at` assigns in every
+    /// branch available to the lines below it, as the conditional `body` that
+    /// [`fold_branch_definitions`] built (#1422).
+    ///
+    /// The body resolves against the scope *before* the `if`, like any
+    /// definition written at `at`: a name assigned earlier in the same branch
+    /// stays a name, and so rejects the typical value that reads it.
+    ///
+    /// Not recorded when the body reads an eta, in an arm or a condition —
+    /// every definition is eta-free, which [`rhs_contains_eta`] relies on to
+    /// skip one unread — or, resolved, a theta: a theta in an arm's condition
+    /// puts a kink in the typical value that moves with θ, and #1422 keeps the
+    /// folding to covariate expressions. What else a body may read (`TIME`, an
+    /// unresolved name) the classifier rejects on its own, at the typical value
+    /// that reads the local.
+    fn record_branch_definition(&mut self, at: usize, name: &'a str, body: &'a Expression) {
+        if !extract_eta_indices(body).is_empty()
+            || !Inlined::resolve(self, body, at, false)
+                .typical_summary()
+                .thetas
+                .is_empty()
+        {
+            return;
+        }
+        self.defs.insert(name, (at, body));
+    }
+
     /// The right-hand side `raw_expr` of the top-level statement at index `at`,
     /// with the definitions recorded so far substituted in.
     fn view<'s>(&'s self, at: usize, raw_expr: &'a Expression) -> Inlined<'a, 's> {
@@ -1080,10 +1109,10 @@ struct Inlined<'a, 's> {
     /// node: the use site's own index at the top, a definition's index inside
     /// its body.
     limit: usize,
-    /// The definition (by statement index) whose body this node is the root of.
-    def: Option<usize>,
-    /// Below a node substitution does not descend into (a conditional, a gather
-    /// index): names stay names.
+    /// The definition (by body address) whose body this node is the root of.
+    def: Option<*const Expression>,
+    /// Below a node substitution does not descend into (a gather index): names
+    /// stay names.
     frozen: bool,
 }
 
@@ -1105,7 +1134,7 @@ impl<'a, 's> Inlined<'a, 's> {
                     Some(&(at, body)) if at < limit => {
                         expr = body;
                         limit = at;
-                        def = Some(at);
+                        def = Some(body as *const Expression);
                     }
                     _ => break,
                 }
@@ -1120,12 +1149,18 @@ impl<'a, 's> Inlined<'a, 's> {
         }
     }
 
-    /// Whether substitution reaches this node's children.
+    /// Whether substitution reaches this node's children. A conditional's
+    /// operands, condition included, are substituted like any other (#1422):
+    /// `min(CRCLR, 120)` is the conditional `if (CRCLR <= 120) CRCLR else 120`,
+    /// and its `CRCLR` is the same local the branches read.
     fn rewrites_children(self) -> bool {
         !self.frozen
             && matches!(
                 self.expr,
-                Expression::BinOp(..) | Expression::Power(..) | Expression::UnaryFn(..)
+                Expression::BinOp(..)
+                    | Expression::Power(..)
+                    | Expression::UnaryFn(..)
+                    | Expression::Conditional(..)
             )
     }
 }
@@ -1188,6 +1223,15 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
                 Expression::UnaryFn(name, a) => {
                     return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
                 }
+                Expression::Conditional(c, t, e) => {
+                    return Expression::Conditional(
+                        Box::new(map_condition_operands(c, &mut |x| {
+                            self.child(x).materialise()
+                        })),
+                        Box::new(self.child(t).materialise()),
+                        Box::new(self.child(e).materialise()),
+                    )
+                }
                 _ => {}
             }
         }
@@ -1197,14 +1241,90 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
 
 // ── Multi-theta (covariate) mu-referencing (#619) ────────────────────────────
 
+/// The locals a top-level `if` statement assigns in **every** arm, each folded
+/// into the inline conditional that computes the same value (#1422):
+///
+/// ```text
+///   if (AGE >= 17) {
+///     CRCLR = (140 - AGE) * WT / (72 * SCR)
+///   } else {
+///     CRCLR = 0.413 * HT / SCR
+///   }
+/// ```
+///
+/// is `CRCLR = if (AGE >= 17) (140 - AGE) * WT / (72 * SCR) else 0.413 * HT / SCR`,
+/// condition for condition, the first true arm winning as it does when the
+/// statement is evaluated. Returned as `(statement index, name, folded
+/// right-hand side)`.
+///
+/// A name qualifies only when the `if` has an `else`, every arm assigns it at
+/// the arm's own top level, and the block assigns it exactly once per arm — so
+/// nothing before or after the `if`, no nested `if` and no second line in an
+/// arm assigns it, and the folded value is the one every later line reads. Any
+/// other local stays unresolved. Whether the value is a closed function of the
+/// data is judged when it is recorded
+/// ([`InlineScope::record_branch_definition`]), on the resolved form.
+fn fold_branch_definitions(stmts: &[Statement]) -> Vec<(usize, String, Expression)> {
+    let mut counts = HashMap::new();
+    count_all_assignments(stmts, &mut counts);
+    // A top-level assignment to `name` in `arm`. With one assignment per arm in
+    // the whole block, finding one in every arm means it is the only one there.
+    fn assignment_in<'s>(arm: &'s [Statement], name: &str) -> Option<&'s Expression> {
+        arm.iter().find_map(|s| match s {
+            Statement::Assign(n, e) if n == name => Some(e),
+            _ => None,
+        })
+    }
+    let mut out = Vec::new();
+    for (at, s) in stmts.iter().enumerate() {
+        let Statement::If {
+            branches,
+            else_body: Some(else_body),
+        } = s
+        else {
+            continue;
+        };
+        let n_arms = branches.len() + 1;
+        for st in else_body {
+            let Statement::Assign(name, else_value) = st else {
+                continue;
+            };
+            if counts.get(name.as_str()) != Some(&n_arms) {
+                continue;
+            }
+            let Some(values) = branches
+                .iter()
+                .map(|(_, body)| assignment_in(body, name))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let folded = branches.iter().zip(values).rev().fold(
+                else_value.clone(),
+                |rest, ((cond, _), value)| {
+                    Expression::Conditional(
+                        Box::new(cond.clone()),
+                        Box::new(value.clone()),
+                        Box::new(rest),
+                    )
+                },
+            );
+            out.push((at, name.clone(), folded));
+        }
+    }
+    out
+}
+
 /// Scan `[individual_parameters]` for typical values that read **two or more**
 /// thetas — the covariate models [`detect_mu_refs`] cannot anchor to one theta
 /// (#619): `(TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`, `TVCL * (WT/70)^TH_WT *
 /// exp(ETA_CL)`, `inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`.
 ///
-/// Same statement walk and local-definition inlining as [`detect_mu_refs`]. The
-/// two scans run side by side and never edit each other's result: a typical
-/// value that also matches a single-anchor pattern (the power form, whose
+/// Same statement walk and local-definition inlining as [`detect_mu_refs`], plus
+/// the locals an `if` / `else` assigns in every arm from data and literals
+/// ([`fold_branch_definitions`], #1422) — the usual way a renal-function
+/// covariate is written. The two scans run side by side and never edit each
+/// other's result: a typical value that also matches a single-anchor pattern (the power form, whose
 /// `mul_anchors_of` sees only `TVCL`) keeps its `MuRef` for the inner-loop
 /// centring and reporting consumers exactly as before, while SAEM / IMP prefer
 /// the group for the M-step. Only BSV etas (`eta_idx < n_bsv_eta`) are recorded
@@ -1230,6 +1350,7 @@ fn detect_covariate_mu_refs(
     n_bsv_eta: usize,
     outside_idents: &HashSet<String>,
 ) -> Vec<CovariateMuRef> {
+    let branch_defs = fold_branch_definitions(stmts);
     let mut scope = InlineScope::new(stmts);
     let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
     // One-theta typical values, kept apart from `found` (#1630): eta, owner,
@@ -1268,7 +1389,9 @@ fn detect_covariate_mu_refs(
             }
             // A branch body can overwrite a typical value recorded above it, and
             // nothing inside it may *record* one (the branch need not be taken),
-            // so an `if` only retires.
+            // so an `if` only retires. What it may do is define a local for the
+            // lines below: one every arm assigns is a conditional value,
+            // whichever arm runs (#1422).
             Statement::If {
                 branches,
                 else_body,
@@ -1280,6 +1403,9 @@ fn detect_covariate_mu_refs(
                 if let Some(eb) = else_body {
                     retire_superseded_groups_in(&mut found, eb);
                     retire_superseded_groups_in(&mut anchors, eb);
+                }
+                for (_, name, body) in branch_defs.iter().filter(|(at, ..)| *at == si) {
+                    scope.record_branch_definition(si, name, body);
                 }
             }
             _ => {}
@@ -1591,8 +1717,12 @@ fn spread_theta_taint(
 /// `TIME` (the mu would vary within the subject), `MIXNUM` (the class is
 /// re-drawn every iteration), an NN output or a θ level block (no closed
 /// per-subject evaluation), a second eta, or a local variable the inliner could
-/// not resolve (assigned conditionally or later — reading it here would give
-/// 0.0, not its value).
+/// not resolve (assigned in only some arms of an `if`, or later, or from a
+/// theta inside an `if` — reading it here would give 0.0, not its value). A
+/// local every arm of an `if` / `else` assigns from data is resolved
+/// ([`fold_branch_definitions`]), and so is a two-argument `min` / `max` of a
+/// local: it is a conditional, whose condition is substituted like its arms
+/// (#1422).
 fn classify_covariate_mu_ref<'a, V: RhsView<'a>>(
     expr: V,
     theta_names: &[String],
@@ -1737,9 +1867,7 @@ fn typical_summary_of<'a, V: RhsView<'a>>(v: V) -> TypicalSummary {
         Expression::UnaryFn(_, a) => s.merge(&v.child(a).typical_summary()),
         Expression::ThetaGather { idx, .. } => s.merge(&v.child(idx).typical_summary()),
         Expression::Conditional(c, t, e) => {
-            // Substitution never enters a conditional, so its condition is read
-            // as written.
-            visit_condition_nodes(c, &mut |n| s.note(n));
+            for_each_condition_operand(c, &mut |x| s.merge(&v.child(x).typical_summary()));
             s.merge(&v.child(t).typical_summary());
             s.merge(&v.child(e).typical_summary());
         }
@@ -21537,6 +21665,48 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
         }
         Condition::Not(c) => visit_condition_nodes(c, f),
         Condition::Present(e) => visit_expr_nodes(e, f),
+    }
+}
+
+/// Each expression operand of a condition (the two sides of a comparison, the
+/// argument of `present`), left to right — the roots only, unlike
+/// [`visit_condition_nodes`], so a caller can descend through its own view.
+fn for_each_condition_operand<'a>(cond: &'a Condition, f: &mut dyn FnMut(&'a Expression)) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            f(l);
+            f(r);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            for_each_condition_operand(l, f);
+            for_each_condition_operand(r, f);
+        }
+        Condition::Not(c) => for_each_condition_operand(c, f),
+        Condition::Present(e) => f(e),
+    }
+}
+
+/// `cond` with each expression operand ([`for_each_condition_operand`])
+/// replaced by `f` of it.
+fn map_condition_operands<'a>(
+    cond: &'a Condition,
+    f: &mut dyn FnMut(&'a Expression) -> Expression,
+) -> Condition {
+    match cond {
+        Condition::Compare(l, op, r) => {
+            let l = f(l);
+            Condition::Compare(l, *op, f(r))
+        }
+        Condition::And(l, r) => {
+            let l = map_condition_operands(l, f);
+            Condition::And(Box::new(l), Box::new(map_condition_operands(r, f)))
+        }
+        Condition::Or(l, r) => {
+            let l = map_condition_operands(l, f);
+            Condition::Or(Box::new(l), Box::new(map_condition_operands(r, f)))
+        }
+        Condition::Not(c) => Condition::Not(Box::new(map_condition_operands(c, f))),
+        Condition::Present(e) => Condition::Present(f(e)),
     }
 }
 

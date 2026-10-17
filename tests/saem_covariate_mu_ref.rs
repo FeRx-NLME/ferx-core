@@ -159,6 +159,57 @@ fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
     );
 }
 
+/// Tier-2, #1422: a weight ratio assigned in both arms of an `if`/`else` is the
+/// same covariate group as the direct `(WT/70)^TH_WT` form, so `TH_WT` gets
+/// the group step instead of the "NO associated ETA" advisory. The pair
+/// straddles the fold: the #1415 fixture writes the same values through a
+/// local the fold does not resolve (assigned before an `if` with no `else`),
+/// and must still carry the advisory — so a test that passed because the
+/// advisory had stopped being emitted at all would fail here.
+#[test]
+fn an_if_else_assigned_covariate_local_joins_the_group() {
+    let (direct, _) = load("covmuref_power_saem_fit.ferx", "covmuref_power.csv");
+    let (ifelse, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
+    let (numeric, _) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+    assert_eq!(
+        ifelse.covariate_mu_refs.len(),
+        1,
+        "{:?}",
+        ifelse.covariate_mu_refs
+    );
+    let (g, d) = (&ifelse.covariate_mu_refs[0], &direct.covariate_mu_refs[0]);
+    assert_eq!(g.eta_name, d.eta_name);
+    assert_eq!(g.theta_names, d.theta_names);
+    assert_eq!(g.covariate_names, d.covariate_names);
+    assert_eq!(g.transform, d.transform);
+    assert!(
+        numeric.covariate_mu_refs.is_empty(),
+        "{:?}",
+        numeric.covariate_mu_refs
+    );
+
+    let opts = FitOptions {
+        saem_n_exploration: 2,
+        saem_n_convergence: 1,
+        ..saem_opts()
+    };
+    let no_eta_advisory_names_th_wt = |model: &ferx_core::CompiledModel| {
+        let result = fit(model, &pop, &model.default_params, &opts).expect("short SAEM must run");
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT"))
+    };
+    assert!(
+        no_eta_advisory_names_th_wt(&numeric),
+        "control: the unresolved local must still leave TH_WT on the numerical M-step"
+    );
+    assert!(
+        !no_eta_advisory_names_th_wt(&ifelse),
+        "the if/else local must put TH_WT in the covariate group"
+    );
+}
+
 /// Tier-3: the additive renal gradient — NONMEM's *nonlinear* MU case — lands
 /// where NONMEM SAEM lands. Bounds are measured: realised |Δ| on the anchor run
 /// was 4e-3 (TVCL), 8e-6 (TH_CRCL), 3e-4 (TVV), 2e-4 (both ω²); each bound
@@ -227,10 +278,56 @@ fn saem_recovers_the_allometric_exponent() {
     );
 }
 
+/// Tier-3, #1422: the allometric exponent with the weight ratio assigned in
+/// both arms of an `if`/`else`, which is now the same group as the direct form
+/// above and lands on the same NONMEM SAEM anchor with the group's
+/// tolerances. Before #1422 this model was the #1415 numerical-M-step fixture
+/// and realised |Δ| 0.040 on `TH_WT`. Realised |Δ| on the anchor run (Linux,
+/// `ci-fast`): 2.2e-3 (TH_WT), 7.4e-3 (TVCL), 1.2e-2 (TVV), 3.0e-4 / 2.2e-4
+/// (ω²). Each bound keeps ≥ 4× headroom on that, and the TH_WT bound (0.01)
+/// also excludes the numerical channel's 0.040, so a fixture that silently
+/// fell back to it fails here as well as on the group-count assertion.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariate mu-referencing (#1422): opt in with --features slow-tests"
+)]
+fn saem_recovers_the_allometric_exponent_through_an_if_else_local() {
+    let (model, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
+    assert_eq!(
+        model.covariate_mu_refs.len(),
+        1,
+        "{:?}",
+        model.covariate_mu_refs
+    );
+    let result = fit(&model, &pop, &model.default_params, &saem_opts()).expect("SAEM must run");
+    let th_wt = theta(&result, "TH_WT");
+    assert_finite_close("TH_WT", th_wt, NM_POW_TH_WT, 0.01);
+    assert!(
+        (th_wt - BEFORE_TH_WT).abs() > 0.3,
+        "TH_WT = {th_wt:.4} must be clear of the pre-#619 stall at {BEFORE_TH_WT}"
+    );
+    assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.05);
+    assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 0.1);
+    assert_finite_close(
+        "omega^2(ETA_CL)",
+        omega(&result, "ETA_CL"),
+        NM_POW_OMEGA_CL,
+        0.002,
+    );
+    assert_finite_close(
+        "omega^2(ETA_V)",
+        omega(&result, "ETA_V"),
+        NM_POW_OMEGA_V,
+        0.002,
+    );
+}
+
 /// Tier-3, #1415: the same allometric exponent with **no** mu-reference group —
-/// the weight covariate goes through a conditionally assigned local, which the
-/// #619 classifier rejects, so `TH_WT` carries no ETA and is moved only by the
-/// eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
+/// the weight covariate goes through a local assigned before an `if` with no
+/// `else` and again in its arm, which the #619 classifier cannot resolve (the
+/// `if`/`else` form this fixture used before #1422 is now a group), so `TH_WT`
+/// carries no ETA and is moved only by the eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
 /// [`saem_recovers_the_allometric_exponent`].
 ///
 /// Before #1415 this fixture reproduced the issue exactly: the M-step's NLopt

@@ -535,13 +535,35 @@ on the eta-frozen numerical M-step where it used to drift. Local definitions are
 seen through (`TVCL = THETA_CL + TH_CRCL * (CRCL - 90)` then `CL = TVCL *
 exp(ETA_CL)`), as long as the intermediate is assigned once and carries no eta.
 
+Since [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422) a covariate
+local that an `if` / `else` assigns in **every** arm is seen through as well, and
+so is a two-argument `min` / `max` of a local — the usual way a renal-function
+covariate is written:
+
+```
+if (AGE >= 17) {
+  CRCLR = (((140 - AGE) * WT) / (72 * SCR)) * 0.85 ^ (1 - SEX)
+} else {
+  CRCLR = 0.413 * HT / SCR
+}
+CRCLM = min(CRCLR, 120)
+CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)
+```
+
+`CL_CRCL` joins `TVCL` in the covariate mu-reference, as `THETA(7)*LOG(CRCLM/100)`
+sits inside `MU_1` in the NONMEM control stream. The local qualifies when the
+`if` has an `else`, each arm assigns it once at the arm's own level, nothing
+outside the `if` assigns it, and the arms and conditions read only data,
+literals and locals defined above the `if` — no theta, eta or `TIME`.
+
 The single-anchor forms above are unaffected: a value with exactly one theta keeps
 its plain mu-reference, and a form that also matches one (the allometric power, whose
 anchor is `TVCL`) keeps it alongside the covariate mu-reference for the inner-loop
 centring and reporting. FOCE/FOCEI/Laplace fits do not change. Not recorded: a value
 that reads `TIME` or `MIXNUM`, a second eta, an NN output or θ level block, or a local
-variable assigned inside an `if` — those stay on the numerical M-step, and the SAEM
-warning still names them.
+variable an `if` assigns in only some of its arms, also assigns outside the `if`, or
+computes from a theta — those stay on the numerical M-step, and the SAEM warning
+still names them.
 
 A theta the rest of the model also reads (`CL = (TVCL + TH_X*WT) * exp(ETA_CL)` next
 to `V = TVV + TH_X`) is still estimated by the group, but the M-step keeps the
