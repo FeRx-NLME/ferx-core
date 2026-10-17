@@ -2825,8 +2825,9 @@ fn run_subject_tvcov<const M: usize>(
 /// (`Dual1`) ODE IOV walks so their analytic scope stays matched (a subject is served
 /// analytically for both, or neither). Mirrors `ode_tvcov_supported`'s bolus-only
 /// screen; time-varying covariates ARE supported (each event is seeded at its own
-/// covariate snapshot). Returns `(occasion groups, n_stacked = n_eta + K·n_kappa,
-/// m_dim = n_theta + n_stacked)`, or `None` out of scope.
+/// covariate snapshot). Returns `m_dim = n_theta + layout.n_axes()`, or `None` out of
+/// scope. `layout` is the subject's `StackedLayout::sens_of`, built once by the entry
+/// point, or by the EBE search that walks every iterate on it (#2037).
 ///
 /// The cap is on `m_dim` (the *outer* dual width); since `n_stacked ≤ m_dim`, the
 /// inner walk's `Dual1<n_stacked>` always resolves too — so capping here keeps the
@@ -2834,7 +2835,8 @@ fn run_subject_tvcov<const M: usize>(
 fn ode_iov_subject_supported(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<(crate::stats::stacked_layout::StackedLayout, usize)> {
+    layout: &crate::stats::stacked_layout::StackedLayout,
+) -> Option<usize> {
     if !ode_iov_supported(model) {
         return None;
     }
@@ -2907,7 +2909,6 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
     if layout.n_groups() == 0 {
         return None;
     }
@@ -2919,7 +2920,7 @@ fn ode_iov_subject_supported(
     if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
-    Some((layout, m_dim))
+    Some(m_dim)
 }
 
 /// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
@@ -2938,7 +2939,19 @@ pub fn ode_subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    let (layout, m_dim) = ode_iov_subject_supported(model, subject)?;
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    ode_subject_sensitivities_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`ode_subject_sensitivities_iov`] over the subject's caller-built `layout` (#2037).
+pub(crate) fn ode_subject_sensitivities_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let m_dim = ode_iov_subject_supported(model, subject, layout)?;
     if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
@@ -2949,7 +2962,7 @@ pub fn ode_subject_sensitivities_iov(
         subject,
         theta,
         stacked_eta,
-        &layout,
+        layout,
     )
 }
 
@@ -2965,7 +2978,21 @@ pub fn ode_subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    let (layout, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    ode_subject_eta_grad_iov_in(model, subject, &layout, theta, stacked_eta)
+}
+
+/// [`ode_subject_eta_grad_iov`] over the subject's caller-built `layout`
+/// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
+/// so an EBE search walks every iterate on one layout (#2037).
+pub(crate) fn ode_subject_eta_grad_iov_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    ode_iov_subject_supported(model, subject, layout)?;
     if stacked_eta.len() != layout.n_stacked() {
         return None;
     }
@@ -2976,7 +3003,7 @@ pub fn ode_subject_eta_grad_iov(
         subject,
         theta,
         stacked_eta,
-        &layout,
+        layout,
     )
 }
 

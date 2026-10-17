@@ -2650,9 +2650,6 @@ fn node_nll_gradient(
             &params.omega,
             iov,
             &params.sigma.values,
-            stack.n_eta,
-            stack.n_kappa,
-            stack.n_occ,
             mult,
         )
     } else {

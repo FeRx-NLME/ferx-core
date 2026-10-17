@@ -222,6 +222,7 @@ impl NestedLayout {
     /// [`unprepared`] tells the second case apart from the first.
     pub(crate) fn of(model: &CompiledModel, subject: &Subject) -> Option<Self> {
         let levels = model.nested_levels()?;
+        crate::stats::stacked_layout::count_build();
         if !cells_assigned(subject) {
             return None;
         }

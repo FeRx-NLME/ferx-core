@@ -441,7 +441,6 @@ fn eta_data_grad(
     mode: EtaGradMode,
     scratch: &mut EventPkParams,
 ) -> (Vec<f64>, bool) {
-    let n_eta = params.omega.dim();
     let iov = k_occasions > 0 && model.n_kappa > 0;
     if mode != EtaGradMode::Fd {
         // Both providers return the gradient of the **joint** inner NLL, i.e. data plus
@@ -460,9 +459,6 @@ fn eta_data_grad(
                     .as_ref()
                     .expect("an IOV subject implies an Omega_iov"),
                 sigma,
-                n_eta,
-                model.n_kappa,
-                k_occasions,
                 model.ruv_obs_mult(subject, theta).as_deref(),
             )
         } else {
