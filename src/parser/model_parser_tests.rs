@@ -33526,8 +33526,8 @@ fn profile_refuses_a_single_theta_fix_and_bounds() {
 #[test]
 fn profile_is_peeled_off_a_theta_line_only() {
     assert_eq!(
-        split_profile_modifier("omega ETA ~ 0.1 profile"),
-        ("omega ETA ~ 0.1 profile".to_string(), false)
+        split_profile_modifier("omega ETA ~ 0.1 (variance) profile"),
+        ("omega ETA ~ 0.1 (variance) profile".to_string(), false)
     );
     assert_eq!(
         split_profile_modifier("theta A[3](0.0) profile"),
@@ -33541,8 +33541,10 @@ fn profile_is_peeled_off_a_theta_line_only() {
         split_profile_modifier("theta A[3](0.0)"),
         ("theta A[3](0.0)".to_string(), false)
     );
-    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")
-        .replace("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 4.0 profile");
+    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]").replace(
+        "omega ETA_E0 ~ 4.0",
+        "omega ETA_E0 ~ 4.0 (variance) profile",
+    );
     assert!(parse_full_model(&text).is_err());
 }
 
@@ -33624,6 +33626,12 @@ fn profile_accepts_every_affine_route_with_a_data_coefficient() {
         (
             "  BASE = TVE0 + ETA_E0 + ETA_EM",
             "BASE + PLACEBO[STUDY] * WPSE",
+        ),
+        // A branch assignment the block reaches but `y` never reads is off the route.
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    Z = PLACEBO[STUDY] * \
+             EMAX\n  } else {\n    Z = 0\n  }",
+            "BASE",
         ),
     ] {
         parse_full_model(&route_model(indiv, y, ADD))

@@ -22655,13 +22655,6 @@ pub(crate) fn profile_route_check(
     if error_reads {
         return Err((ProfileRouteBreak::Residual, None));
     }
-    // A condition of an assignment that carries the block, or of one the block
-    // reaches through, is a branch on the route.
-    for (d, a) in assigns.iter().enumerate() {
-        if taint.contains(&d) && !a.conds.is_empty() {
-            return Err((ProfileRouteBreak::Branch, Some(a.lhs.to_string())));
-        }
-    }
     let walk = ProfileWalk {
         ctx: &ctx,
         src: &src,
@@ -22764,6 +22757,11 @@ impl ProfileWalk<'_, '_> {
                     .copied()
                     .filter(|d| self.taint.contains(d))
                     .collect();
+                // Two reaching definitions mean an `if` chose between them, so the
+                // coefficient depends on the branch taken. The one gate: a single
+                // definition inside a branch cannot be read here, since the parser
+                // refuses a name not assigned on every path. Only a definition on the
+                // route counts; a branch assignment `y` never reads does not.
                 if defs.len() > 1 {
                     return Err((ProfileRouteBreak::Branch, Some(n.clone())));
                 }
