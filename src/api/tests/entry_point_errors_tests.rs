@@ -607,6 +607,48 @@ fn run_model_simulate_keeps_the_simulations_code_without_a_context() {
     assert_eq!(err.message(), text, "the prefix is part of the message");
 }
 
+/// #1772: `fit()`'s LTBS refusals for a hand-built model (the parser refuses both
+/// first, so only a Rust caller can reach them) keep their text and have no code yet
+/// (#1788). One fixture, an additive-error model with `log_transform` set, and one field
+/// changed per cell: a per-CMT error spec, then an SDE start. Mutation: drop either guard
+/// → that cell is accepted (or refused by a later check with other text), and the test
+/// names the cell.
+#[test]
+fn fit_ltbs_refusals_on_a_hand_built_model_keep_their_text_uncoded() {
+    let pop = accepted_population();
+    let ltbs = || {
+        let mut m = parse_model_string(&ONE_CPT_IV.replace("proportional(PROP)", "additive(PROP)"))
+            .expect("parse");
+        assert!(matches!(m.error_model, ErrorModel::Additive));
+        m.log_transform = true;
+        m
+    };
+    let mut per_cmt = ltbs();
+    per_cmt.error_spec = ErrorSpec::PerCmt(HashMap::new());
+    let mut sde = ltbs();
+    sde.diffusion_theta_start = Some(0);
+    for (label, model, want) in [
+        (
+            "per-CMT error",
+            per_cmt,
+            "LTBS (`log_transform = true`) is not supported with per-CMT \
+             (`ErrorSpec::PerCmt`) error models",
+        ),
+        (
+            "SDE",
+            sde,
+            "LTBS (`log_transform = true`) is not supported with an SDE \
+             model (`diffusion_theta_start = Some(_)`)",
+        ),
+    ] {
+        let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+            .err()
+            .unwrap_or_else(|| panic!("{label}: accepted"));
+        assert_eq!(err.to_string(), want, "{label}");
+        assert_eq!(err.code(), None, "{label}");
+    }
+}
+
 /// #1772: two of `run_model_simulate`'s `[simulation]` design refusals, which have no
 /// code yet (#1788): their text is unchanged by the retype and `code()` is `None`, as
 /// `UNCODED_SITES` lists. A model with no `[simulation]` block; and (`survival`) a
