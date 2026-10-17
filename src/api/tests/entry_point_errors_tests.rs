@@ -523,6 +523,33 @@ fn fit_unbound_level_refusal_carries_the_level_code() {
     );
 }
 
+/// #2062 review N1: `fit()` carries `check_model_options`' code, block and text. The
+/// rails, priors and start-box `first_error` lines are pinned by `tests/check_command.rs`;
+/// this is the options line. Mutation: drop the code on `fit_inner`'s
+/// `first_error(&option_diags)?` → `None`.
+#[test]
+fn fit_carries_the_options_check_code() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 0,
+        ..FitOptions::default()
+    };
+    let want = check_model_options(&model, &opts)
+        .into_iter()
+        .find(|d| d.is_error())
+        .expect("check_model_options refuses n_agq = 0");
+    assert_eq!(
+        want.code, "E_AGQ_NODES_ZERO",
+        "the fixture trips the intended check"
+    );
+    let err = fit(&model, &pop, &model.default_params, &opts).expect_err("n_agq = 0");
+    assert_eq!(err.code(), Some("E_AGQ_NODES_ZERO"), "{err}");
+    assert_eq!(err.block(), Some("fit_options"));
+    assert_eq!(err.to_string(), want.message);
+}
+
 /// #1772: the file entry points code their reads and binders as `ferx check` does. A
 /// model file that does not exist is `E_MODEL_READ` (`fit_from_files`, `prepare_run`,
 /// `run_model_simulate`); a dataset missing a covariate the model reads is
