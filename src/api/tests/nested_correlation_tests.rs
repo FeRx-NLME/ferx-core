@@ -226,30 +226,40 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
         "engine {engine:.12}  hand {hand:.12}  |Δ| {:.3e}",
         (engine - hand).abs()
     );
-    // Measured |Δ| 1.4e-14 (macOS arm64; the two sums associate differently). Each term
-    // moves the marginal by 2.1 (η), 11.4 (STUDY), 33.7 (ARM), 4.6 (serial R) — so 1e-9
-    // is 5 orders above the agreement, and 1e-3 three orders below the smallest term.
-    assert!(
-        (engine - hand).abs() < 1e-9,
-        "engine {engine} vs hand {hand}"
-    );
-    for (name, t) in [
+    // Measured |Δ| 1.4e-14 (macOS arm64 and Linux aarch64; the two sums associate
+    // differently). Each term moves the marginal by 2.1 (η), 11.4 (STUDY), 33.7 (ARM), 4.6
+    // (serial R) — so 1e-3 is three orders below the smallest term, and 1e-9 five above the
+    // agreement.
+    //
+    // One named check per term, all evaluated before any assertion, then the list of the
+    // terms the engine does not carry asserted empty: deleting one term from the engine
+    // reports that term's name and no other (the equality is checked last, so it cannot
+    // fire first and hide which term went missing).
+    let missing: Vec<&str> = [
         ("(a) the sponsor η block of Σ_b", &t_eta),
         ("(b) the STUDY κ blocks of Σ_b", &t_study),
         ("(c) the ARM κ blocks of Σ_b", &t_arm),
         ("(d) the off-diagonal of the serial R", &r_off),
-    ] {
+    ]
+    .into_iter()
+    .filter_map(|(name, t)| {
         let without = sb_marginal(&(&all - t), &resid);
         eprintln!(
             "without {name}: {without:.12}  |Δ| {:.3e}",
             (without - engine).abs()
         );
-        assert!(
-            (without - engine).abs() > 1e-3,
-            "the IOV FOCE marginal does not carry {name}: engine {engine} equals the marginal \
-             without it ({without})"
-        );
-    }
+        ((without - engine).abs() <= 1e-3).then_some(name)
+    })
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "the IOV FOCE marginal does not carry {missing:?}: engine {engine} equals the \
+         marginal without it"
+    );
+    assert!(
+        (engine - hand).abs() < 1e-9,
+        "engine {engine} vs hand {hand}"
+    );
 }
 
 /// V1 + V2, and the branch the FOCEI marginal takes.
