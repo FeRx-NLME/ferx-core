@@ -4449,6 +4449,13 @@ fn lbfgs_core(
     false
 }
 
+// Rescaled retries `dense_bfgs_core` has taken on this thread after a failed quasi-Newton
+// line search, so a test can tell a recovered solve from one that never failed (#2080).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BFGS_RESCALED_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
@@ -4508,6 +4515,8 @@ fn dense_bfgs_core(
     // the structural model by reference for everything else, and `AbsorptionTwin::built` is
     // a field read, not a rebuild.
     let mut enable_stall = false;
+    // One rescaled retry per solve after a failed quasi-Newton line search (#2080).
+    let mut rescaled_retry_used = false;
 
     for _iter in 0..max_iter {
         enable_stall = enable_stall || stall_at(x);
@@ -4583,8 +4592,21 @@ fn dense_bfgs_core(
             &mut line_search_point,
             short_line_search,
         );
-        // No sufficient-decrease step found: report non-convergence so the caller takes the
-        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
+        // No sufficient-decrease step found. Since #464 the Ω-preconditioned path skips the
+        // first-step scaling above, so from a far start (a multi-start seed whose objective
+        // is ~1e10) the first direction has the gradient's own magnitude and 30 halvings
+        // cannot bring it back to O(1) (#2080). Retry once from the preconditioned metric
+        // scaled by 1/‖g‖, the scaling the identity path already gets. Only a solve that
+        // would otherwise fail here takes it, so every succeeding solve keeps its path.
+        if alpha == 0.0 && !rescaled_retry_used && seed_inv.is_none() && gnorm > 1.0 {
+            rescaled_retry_used = true;
+            #[cfg(test)]
+            BFGS_RESCALED_RETRIES.with(|c| c.set(c.get() + 1));
+            h_inv = init_h_inv(n, precond, None) * (1.0 / gnorm);
+            continue;
+        }
+        // Still no step: report non-convergence so the caller takes the argmin Nelder–Mead
+        // fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
