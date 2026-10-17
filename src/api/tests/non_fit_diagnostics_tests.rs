@@ -115,6 +115,18 @@ fn has(warnings: &[String], token: &str) -> bool {
     warnings.iter().any(|w| w.contains(token))
 }
 
+/// `warnings` without the steady-state non-convergence note (#867). That note comes from a
+/// process-global sink every draining entry point takes (#1652), and lib-binary writers take no
+/// guard (#1289), so any concurrent test that caps an equilibration can land it in a clean arm
+/// here. The property these arms pin is the bundle, never that note; its absence is pinned under
+/// a binary-local guard in `tests/ss_absorption_nonmem_anchor.rs`.
+fn without_ss_sink_note(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| !w.contains("Steady-state (SS=1) equilibration"))
+        .collect()
+}
+
 const SS_II: &str = "SS=1 doses with missing or non-positive II";
 const SOLVER: &str = "W_ODE_SOLVER_DIAGNOSTICS";
 const FREEZE_PAD: &str = "stopped before their requested end time and freeze-padded";
@@ -146,7 +158,7 @@ fn predict_carries_the_model_data_bundle_that_predict_used_to_drop() {
     // on an implementation that pushes a fixed string into every prediction.
     let clean = predict_diag(&m, &pop(1), &m.default_params).unwrap();
     assert!(
-        clean.warnings.is_empty(),
+        without_ss_sink_note(&clean.warnings).is_empty(),
         "a well-formed model/data pair must come back silent, or the warning above proves \
          nothing: {:?}",
         clean.warnings
@@ -188,7 +200,7 @@ fn simulate_carries_the_model_data_bundle_that_simulate_used_to_drop() {
     )
     .expect("simulate");
     assert!(
-        clean.warnings.is_empty(),
+        without_ss_sink_note(&clean.warnings).is_empty(),
         "and stay silent on a clean one: {:?}",
         clean.warnings
     );

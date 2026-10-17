@@ -43,9 +43,8 @@ use std::time::Instant;
 /// which is what #1280 / #1304 were filed about. It is kept because the R wrapper and every
 /// existing caller bind this signature.
 ///
-/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here **or** by
-/// [`predict_diag`]; callers that obtained `population` via [`crate::read_nonmem_csv`] should
-/// inspect `population.warnings` before calling either.
+/// Data-reader warnings (e.g. missing II for ADDL doses) are discarded here with everything
+/// else; [`predict_diag`] carries them in its `warnings`, filtered as `fit()` filters them.
 ///
 /// Subjects are evaluated in parallel when more than one worker is available.
 /// Calls made inside a [`PoolPlan`] reuse that enclosing pool; standalone calls
@@ -76,8 +75,9 @@ pub fn predict(
 /// `warnings` carries the non-fit diagnostics bundle: parse warnings, data-reader warnings,
 /// the model/data checks (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …),
 /// experimental-feature notices, and — for an `[odes]` model — the ODE-solver diagnostics of
-/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean prediction on a
-/// well-formed model.
+/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`) — plus, first, the steady-state (`SS=1`)
+/// equilibration non-convergence note of this pass, when a nonlinear pulse train hit its cycle
+/// cap short of steady state (#867, #1652). Empty for a clean prediction on a well-formed model.
 ///
 /// It is **not** everything `fit()` reports, and the difference is principled rather than a
 /// subset: findings whose subject is the *fit* — the estimator/optimizer option warnings, the
@@ -109,6 +109,11 @@ pub struct PredictionOutput {
 /// segment that exhausted `ode_max_steps` came back as a column of *identical* finite numbers
 /// (#959), which is worse: it is plottable.
 ///
+/// It also carries the steady-state (`SS=1`) equilibration non-convergence note of this pass —
+/// the one [`crate::simulate_with_options_diag`] reports on the same input (#1652). The note is
+/// collected in a process-global sink, so this function clears it on entry: a note left by an
+/// earlier call is never reported as this pass's.
+///
 /// Returns exactly what [`predict`] returns in `results`; the rows are unchanged and no
 /// prediction moves by a ULP. The scope that collects the solver counters is opened per subject
 /// task and only on a model that integrates something, so a closed-form model takes the
@@ -138,6 +143,11 @@ pub fn predict_diag(
     population: &Population,
     params: &ModelParameters,
 ) -> Result<PredictionOutput, EngineError> {
+    // Start the process-global SS-equilibration non-convergence sink clean, then drain it into
+    // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
+    // the clear, a note left by an earlier non-draining caller would be reported as this pass's.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
@@ -283,16 +293,15 @@ pub fn predict_diag(
             None => predict_subjects_serial(),
         }
     };
-    Ok(PredictionOutput {
-        results,
-        warnings: super::non_fit_diagnostics(
-            model,
-            population,
-            params,
-            &stats,
-            super::SolverStatsPhase::Predict,
-        ),
-    })
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(super::non_fit_diagnostics(
+        model,
+        population,
+        params,
+        &stats,
+        super::SolverStatsPhase::Predict,
+    ));
+    Ok(PredictionOutput { results, warnings })
 }
 
 /// A single prediction

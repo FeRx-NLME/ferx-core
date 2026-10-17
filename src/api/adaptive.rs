@@ -197,8 +197,12 @@ pub struct AdaptiveSimulationResult {
     /// Adaptive dosing is the path where a silent solver diagnostic matters most: the
     /// controller reads the simulated state to choose the next dose, so a segment that
     /// freeze-padded its tail does not merely mis-plot — it feeds the wrong signal into the
-    /// next decision, and the realized ledger inherits it. Empty for a clean run on a
-    /// well-formed model.
+    /// next decision, and the realized ledger inherits it.
+    ///
+    /// Ahead of the bundle comes this run's steady-state (`SS=1`) equilibration
+    /// non-convergence note, when a nonlinear pulse train hit its cycle cap short of steady
+    /// state — the note [`crate::SimulationOutput::warnings`] carries on the same input
+    /// (#867, #1652). Empty for a clean run on a well-formed model.
     pub warnings: Vec<String>,
 }
 
@@ -453,6 +457,12 @@ where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
 {
+    // Start the process-global SS-equilibration non-convergence sink clean (#867, #1652). This
+    // must stay the FIRST statement: the base-snapshot precompute below runs its own SS
+    // equilibrations, and a clear placed after it would drop the note they wrote. The frozen-
+    // replay verifier and the signal-AUC pass write into the same window — same run, deduped.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
     // Reject model/data the reactive driver cannot faithfully simulate (SDE) with a
     // typed error — never a silent wrong answer (#391). IOV, time-varying covariates,
     // and system resets are now supported (#700/#701/#716). Both public entry points
@@ -975,18 +985,21 @@ where
         .unwrap_or_default();
     drop(stats_scope);
 
+    // The SS note first, then the bundle — the order the simulate paths use.
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(super::non_fit_diagnostics(
+        model,
+        population,
+        params,
+        &stats,
+        super::SolverStatsPhase::SimulateAdaptive,
+    ));
     Ok(AdaptiveSimulationResult {
         trajectories,
         ledger,
         decisions,
         metrics,
-        warnings: super::non_fit_diagnostics(
-            model,
-            population,
-            params,
-            &stats,
-            super::SolverStatsPhase::SimulateAdaptive,
-        ),
+        warnings,
     })
 }
 
