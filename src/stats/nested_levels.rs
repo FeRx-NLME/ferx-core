@@ -94,35 +94,48 @@ pub(crate) fn assign_level_cells(model: &CompiledModel, population: &mut Populat
         return;
     };
     for s in &mut population.subjects {
-        let mut cells: Vec<Vec<u64>> = Vec::new();
-        let mut occasions = vec![0u32; s.obs_times.len()];
-        let mut dose_occasions = vec![0u32; s.doses.len()];
-        let mut pk_only_occasions = vec![0u32; s.pk_only_times.len()];
-        let mut reset_occasions = vec![0u32; s.reset_times.len()];
-        for (kind, i, path) in record_paths(levels, s) {
-            let id = match path {
-                None => 0,
-                Some(p) => match cells.iter().position(|c| *c == p) {
-                    Some(c) => c as u32 + 1,
-                    None => {
-                        cells.push(p);
-                        cells.len() as u32
-                    }
-                },
-            };
-            match kind {
-                RecordKind::Observation => occasions[i] = id,
-                RecordKind::Dose => dose_occasions[i] = id,
-                RecordKind::PkOnly => pk_only_occasions[i] = id,
-                RecordKind::Reset => reset_occasions[i] = id,
-            }
-        }
+        let [occasions, dose_occasions, pk_only_occasions, reset_occasions] = cell_ids(levels, s);
         s.occasions = occasions;
         s.dose_occasions = dose_occasions;
         s.pk_only_occasions = pk_only_occasions;
         s.reset_occasions = reset_occasions;
     }
 }
+
+/// The cell ids [`assign_level_cells`] gives `subject`'s records: observation, dose,
+/// pk-only and reset labels, in that order.
+fn cell_ids(levels: &NestedLevels, s: &Subject) -> [Vec<u32>; 4] {
+    let mut cells: Vec<Vec<u64>> = Vec::new();
+    let mut ids = [
+        vec![0u32; s.obs_times.len()],
+        vec![0u32; s.doses.len()],
+        vec![0u32; s.pk_only_times.len()],
+        vec![0u32; s.reset_times.len()],
+    ];
+    for (kind, i, path) in record_paths(levels, s) {
+        let id = match path {
+            None => 0,
+            Some(p) => match cells.iter().position(|c| *c == p) {
+                Some(c) => c as u32 + 1,
+                None => {
+                    cells.push(p);
+                    cells.len() as u32
+                }
+            },
+        };
+        let slot = match kind {
+            RecordKind::Observation => 0,
+            RecordKind::Dose => 1,
+            RecordKind::PkOnly => 2,
+            RecordKind::Reset => 3,
+        };
+        ids[slot][i] = id;
+    }
+    ids
+}
+
+/// The lower factor a κ draw multiplies by; built only by [`KappaDraw::factor`].
+pub(crate) struct KappaFactor<'a>(std::borrow::Cow<'a, DMatrix<f64>>);
 
 /// How one subject's κ is drawn when a model is simulated: one κ vector per occasion
 /// group, or — under nested levels — one block per group of each κ's own level
@@ -164,13 +177,29 @@ impl KappaDraw {
         }
     }
 
-    /// One draw of the per-group κ vectors from Ω_IOV's lower Cholesky factor.
+    /// The factor every κ draw multiplies by: the declared Ω_IOV's
+    /// [`crate::types::OmegaMatrix::sim_draw_factor`], so a zero κ draws exactly 0
+    /// (#1605). The only way to build a [`KappaFactor`], so no draw site can hand
+    /// [`Self::draw`] the regularised `chol` instead (review r2 on #1082 PR4: under nested
+    /// levels the NPDE reference cannot observe that difference, so a type has to).
+    pub(crate) fn factor<'a>(
+        model: &CompiledModel,
+        omega_iov: &'a crate::types::OmegaMatrix,
+    ) -> KappaFactor<'a> {
+        KappaFactor(omega_iov.sim_draw_factor(
+            model.default_params.omega_iov.as_ref(),
+            &model.default_params.kappa_fixed,
+        ))
+    }
+
+    /// One draw of the per-group κ vectors from `factor` ([`Self::factor`]).
     pub(crate) fn draw<R: rand::Rng>(
         &self,
-        omega_iov_chol: &DMatrix<f64>,
+        factor: &KappaFactor<'_>,
         normal: rand_distr::Normal<f64>,
         rng: &mut R,
     ) -> Vec<Vec<f64>> {
+        let omega_iov_chol: &DMatrix<f64> = &factor.0;
         match self {
             Self::Nested(layout) => layout.draw(omega_iov_chol, normal, rng),
             Self::OneLevel { n_groups, n_kappa } => (0..*n_groups)
@@ -229,7 +258,10 @@ pub(crate) fn with_level_cells<'a>(
     model: &CompiledModel,
     population: &'a Population,
 ) -> std::borrow::Cow<'a, Population> {
-    if !model.has_nested_levels() || cells_ready(population) {
+    let Some(levels) = model.nested_levels() else {
+        return std::borrow::Cow::Borrowed(population);
+    };
+    if cells_ready(levels, population) {
         return std::borrow::Cow::Borrowed(population);
     }
     let mut owned = population.clone();
@@ -293,19 +325,18 @@ fn level_groups(levels: &NestedLevels, cell_paths: &[Vec<u64>]) -> (Vec<Vec<usiz
     (cell_groups, counts)
 }
 
-/// Whether every record of every subject carries a cell id: labels parallel to the
-/// records, and none 0 (the id [`assign_level_cells`] gives a record with a missing
-/// label, and the value a population read without cells has nowhere).
-fn cells_ready(population: &Population) -> bool {
+/// Whether every subject already carries exactly the cell ids [`assign_level_cells`]
+/// would write. Not merely non-zero ids: occasion labels read from a data column, or
+/// another model's cells, are non-zero and group the records differently, and a
+/// population carrying them must be reassigned rather than borrowed (review r2 on
+/// #1082 PR4).
+fn cells_ready(levels: &NestedLevels, population: &Population) -> bool {
     population.subjects.iter().all(|s| {
-        cells_assigned(s)
-            && !s
-                .occasions
-                .iter()
-                .chain(&s.dose_occasions)
-                .chain(&s.pk_only_occasions)
-                .chain(&s.reset_occasions)
-                .any(|&c| c == 0)
+        let [o, d, p, r] = cell_ids(levels, s);
+        s.occasions == o
+            && s.dose_occasions == d
+            && s.pk_only_occasions == p
+            && s.reset_occasions == r
     })
 }
 
@@ -367,7 +398,16 @@ impl NestedLayout {
                 RecordKind::Reset => subject.reset_occasions.get(i),
             };
             if let (Some(&occ), Some(path)) = (occ, path) {
-                path_of.entry(occ).or_insert(path);
+                // One cell id, one label path: an id two paths share is not this
+                // model's cells (labels from elsewhere), and grouping by it would merge
+                // two groups — the subject is unprepared (review r2 on #1082 PR4).
+                match path_of.get(&occ) {
+                    Some(p) if *p != path => return None,
+                    Some(_) => {}
+                    None => {
+                        path_of.insert(occ, path);
+                    }
+                }
             }
         }
         let cells = crate::stats::likelihood::iov_occasion_groups(subject);

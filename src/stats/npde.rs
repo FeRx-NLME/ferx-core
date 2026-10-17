@@ -287,12 +287,8 @@ pub fn compute_npde_npd_diag(
                     Some(&model.default_params.omega),
                     &model.default_params.omega_fixed,
                 );
-                let kappa_factor = iov.map(|(om, _)| {
-                    om.sim_draw_factor(
-                        model.default_params.omega_iov.as_ref(),
-                        &model.default_params.kappa_fixed,
-                    )
-                });
+                let kappa_factor =
+                    iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
@@ -313,7 +309,7 @@ pub fn compute_npde_npd_diag(
                     let ipreds = match &iov {
                         Some((_, kappa_draw)) => {
                             let kappa_factor = kappa_factor
-                                .as_deref()
+                                .as_ref()
                                 .expect("kappa_factor is Some whenever iov is");
                             let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
                             crate::pk::predict_iov(

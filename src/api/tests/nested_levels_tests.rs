@@ -763,6 +763,38 @@ fn the_kappa_draw_refuses_a_nested_subject_without_cells() {
     ));
 }
 
+/// Review r2 on #1082 PR4: a population whose records carry occasion ids that are not
+/// this model's cells — here coarser than the arms, as an `OCC` column read with the
+/// data would be — must be regrouped, not borrowed. The rows equal those of the same
+/// population without the foreign ids, bit for bit; borrowing it would merge each
+/// study's two arms into one `K_ARM`. And a layout built on such ids is refused, not
+/// grouped by them.
+#[test]
+fn foreign_occasion_ids_on_a_nested_population_are_regrouped_not_borrowed() {
+    use crate::stats::nested_levels::{with_level_cells, NestedLayout};
+    let m = model();
+    let clean = full_design();
+    let mut foreign = full_design();
+    for s in &mut foreign.subjects {
+        s.occasions = vec![1, 1, 2, 2];
+    }
+    assert!(matches!(
+        with_level_cells(&m, &foreign),
+        std::borrow::Cow::Owned(_)
+    ));
+    assert!(NestedLayout::of(&m, &foreign.subjects[0]).is_none());
+    let bits = |p: &Population| -> Vec<u64> {
+        crate::api::simulate_with_seed(&m, p, &m.default_params, 2, 7)
+            .expect("simulates")
+            .iter()
+            .map(|r| r.ipred.to_bits())
+            .collect()
+    };
+    let (a, b) = (bits(&clean), bits(&foreign));
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, b, "foreign occasion ids changed the simulated rows");
+}
+
 #[test]
 fn fit_refuses_a_nested_model_under_saem_with_its_code() {
     let m = model();

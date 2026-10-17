@@ -219,6 +219,41 @@ fn one_level_simulation_is_unchanged() {
 
 const ONE_LEVEL_HASH: u64 = 0x2d97_0f91_8913_b10f;
 
+/// A declared zero κ draws exactly 0 under nested levels too (#1605's factor, which the
+/// per-level draw restricts by level; review r2 on #1082 PR4). With `K ~ 0.0 FIX at
+/// STUDY` every row of a subject reads `TVB·exp(η)` exactly; drawing from the
+/// regularised Cholesky factor instead would add ~1e-4 per study. The NPDE reference
+/// agrees bit for bit with the one-level spelling, which #1605 already pins.
+#[test]
+fn a_zero_kappa_at_a_level_draws_exactly_zero() {
+    let nested = model(LEVELS, "kappa K ~ 0.0 FIX at STUDY", "");
+    let one_level = model(
+        "",
+        "kappa K ~ 0.0 FIX",
+        "[fit_options]\n  iov_column = STUDYID\n",
+    );
+    let rows = simulate_with_seed(&nested, &population(None), &nested.default_params, 1, 3)
+        .expect("simulates");
+    for id in ["1", "2", "3"] {
+        let ipred: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.id == id)
+            .map(|r| r.ipred)
+            .collect();
+        assert_eq!(ipred.len(), ROWS.len());
+        assert!(ipred[0].is_finite());
+        assert!(
+            ipred.iter().all(|&v| v.to_bits() == ipred[0].to_bits()),
+            "subject {id}: a zero κ at STUDY moved the rows: {ipred:?}"
+        );
+    }
+    assert_eq!(
+        npde_bits(&nested, population(None)),
+        npde_bits(&one_level, population(Some("STUDYID"))),
+        "the NPDE reference draws a zero κ at STUDY as exactly 0"
+    );
+}
+
 // ── the NPDE reference distribution ──────────────────────────────────────────────
 
 /// The NPDE reference simulates κ through the same per-level draw (`KappaDraw`), so the

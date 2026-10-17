@@ -984,10 +984,7 @@ fn emit_subject_rows<R: rand::Rng>(
         // the study. The caller built `kappa_draw` per subject (`KappaDraw::of`, which
         // refuses a nested subject without cells), so it is present for every κ model.
         // The factor is the declared Ω_IOV's, a zero κ exactly 0 (#1605).
-        let kappa_factor = omega_iov.sim_draw_factor(
-            model.default_params.omega_iov.as_ref(),
-            &model.default_params.kappa_fixed,
-        );
+        let kappa_factor = crate::stats::nested_levels::KappaDraw::factor(model, omega_iov);
         let kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
             .draw(&kappa_factor, normal, rng);
