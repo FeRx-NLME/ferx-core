@@ -733,8 +733,10 @@ fn gate_b_applies_a_derived_occasion_rule() {
         }
     }
     // The warning half on the same derived rule: subject 2's `WIN` no longer follows the
-    // windows, so 1 of 2 subjects matches. `fit()` must hand the warnings walk its own
-    // `iov_occasion` — given `column`, the occasions stay empty and nothing matches.
+    // windows, so 1 of 2 subjects matches. `fit()` runs the warnings walk on the population
+    // it prepared (occasions already derived); `ferx check` reads the data as written, so
+    // it must hand the walk the rule — given `column`, the occasions stay empty and nothing
+    // matches (mutation W4').
     let mut partial = pop.clone();
     for c in partial.subjects[1].obs_covariates.iter_mut() {
         c.insert("WIN".to_string(), 1.0);
@@ -759,6 +761,28 @@ fn gate_b_applies_a_derived_occasion_rule() {
         "{:?}",
         r.warnings
     );
+
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("m.ferx");
+    let data_path = dir.path().join("d.csv");
+    std::fs::write(&model_path, src("cs")).unwrap();
+    let mut csv = String::from("ID,TIME,DV,WIN\n");
+    for (id, s) in partial.subjects.iter().enumerate() {
+        for (j, t) in s.obs_times.iter().enumerate() {
+            csv += &format!("{},{t},10,{}\n", id + 1, s.obs_cov(j)["WIN"]);
+        }
+    }
+    std::fs::write(&data_path, csv).unwrap();
+    let report = crate::api::validation::validate_model_file(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    );
+    let warns = codes(
+        &report.diagnostics,
+        "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA",
+    );
+    assert_eq!(warns.len(), 1, "{:?}", report.diagnostics);
+    assert!(warns[0].contains("in 1 of 2 subjects"), "{}", warns[0]);
 
     // Finding 9: two kappas at the grouping are named in the plural.
     let two = src("cs")

@@ -7719,8 +7719,10 @@ pub fn check_model_data_warnings(
 
 /// [`check_model_data_warnings`] aware of the model-side IOV occasion rule, which the one
 /// warning on derived occasions needs (`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`,
-/// #1082 PR5): `fit()` and `ferx check` pass the fit's `iov_occasion`, as they do to
-/// [`check_model_data_rule`].
+/// #1082 PR5). `ferx check` reads the data as written and passes the fit's
+/// `iov_occasion`, as it does to [`check_model_data_rule`]; `fit()` runs the walk on the
+/// population it has already prepared, whose occasions the rule has labelled, so
+/// [`check_model_data_warnings`] serves it.
 pub(crate) fn check_model_data_warnings_rule(
     model: &CompiledModel,
     population: &Population,
