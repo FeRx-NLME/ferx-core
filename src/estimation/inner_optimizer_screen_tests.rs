@@ -178,12 +178,22 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
     want.sort_by(|a, b| sq(a).total_cmp(&sq(b)));
     assert_eq!(got, want[..3].to_vec());
 
-    // A draw whose objective is not finite is dropped, not ranked.
-    let first = draws[0].clone();
-    let nan_first = |e: &[f64]| if e == first.as_slice() { f64::NAN } else { 0.0 };
+    // A draw whose objective is not finite is dropped, not ranked. `−∞` and a negative
+    // NaN both sort ahead of every finite value under `total_cmp`, so a kept one would
+    // take a top-K slot.
+    let (first, second) = (draws[0].clone(), draws[1].clone());
+    let not_finite = |e: &[f64]| {
+        if e == first.as_slice() {
+            f64::NEG_INFINITY
+        } else if e == second.as_slice() {
+            -f64::NAN
+        } else {
+            0.0
+        }
+    };
     assert_eq!(
-        screen_starts(&nan_first, &omega, 3, 100, "S1"),
-        draws[1..4].to_vec()
+        screen_starts(&not_finite, &omega, 3, 100, "S1"),
+        draws[2..5].to_vec()
     );
 
     // Keyed by the ID: another ID draws another stream, the same ID the same one.
@@ -244,7 +254,8 @@ fn the_screen_carries_a_flip_flop_subject_to_the_deeper_mode() {
 }
 
 /// A unimodal subject is bit-identical with the screen on: every descent reconverges to the
-/// incumbent's basin and the Ω⁻¹ gate turns it away, however small an improvement it finds.
+/// incumbent's mode and none comes back lower by more than `1e-9`. (A loose `inner_tol`,
+/// where one does, is the distance gate's test below.)
 #[test]
 fn the_screen_leaves_a_unimodal_subject_bit_identical() {
     for cfg in &CONFIGS {
@@ -413,4 +424,36 @@ fn a_fit_names_the_subjects_the_screen_moved() {
     let w = screen_warning(100).expect("the screen moved S1");
     assert!(w.contains("of 1 subject (S1)"), "{w}");
     assert!(screen_warning(0).is_none());
+}
+
+/// The Ω⁻¹ distance gate, on its own: under a loose `inner_tol` the incumbent and the
+/// screen's descents all stop short inside the one basin, at slightly different points,
+/// and some descents stop lower than the incumbent by more than `1e-9`. The objective gate
+/// alone would take them and move a unimodal subject's EBE; the distance gate turns them
+/// away. At the default `inner_tol` no descent comes back lower on these subjects, which
+/// is why `the_screen_leaves_a_unimodal_subject_bit_identical` cannot see this gate.
+#[test]
+fn the_distance_gate_keeps_a_loosely_converged_unimodal_subject() {
+    for cfg in &CONFIGS {
+        let (m, opts) = model(cfg.omega);
+        let loose = FitOptions {
+            inner_tol: 1e-2,
+            ..opts.clone()
+        };
+        let subj = &controls()[0];
+        let off = solve(&m, &loose, subj, 0, 1, None);
+        SCREEN_SAME_BASIN_REJECTS.with(|n| n.set(0));
+        let on = solve(&m, &loose, subj, 100, 1, None);
+        // Straddle: the gate actually turned a lower descent away (3 of 3 on macOS arm64
+        // in both configurations), so the bit-identity below is the gate's doing.
+        let rejects = SCREEN_SAME_BASIN_REJECTS.with(|n| n.get());
+        assert!(
+            rejects > 0,
+            "{}: no screen descent came back lower within the basin",
+            cfg.name
+        );
+        assert_eq!(bits(&on.eta), bits(&off.eta), "{}", cfg.name);
+        assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{}", cfg.name);
+        assert!(!on.screen_moved, "{}", cfg.name);
+    }
 }

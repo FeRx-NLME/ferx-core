@@ -1677,6 +1677,10 @@ thread_local! {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// #2013 screen descents that came back lower than the incumbent but within
+    /// `SCREEN_MIN_OMEGA_DIST` of it, so the distance gate alone turned them away.
+    pub(crate) static SCREEN_SAME_BASIN_REJECTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
@@ -2232,13 +2236,16 @@ fn find_ebe_solve(
                     continue;
                 }
                 let cand_nll = obj(&cand);
-                if cand_nll + 1e-9 < nll
-                    && omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST
-                {
-                    nll = cand_nll;
-                    eta = cand;
-                    ebe_converged = ebe_converged || ok;
-                    screen_moved = true;
+                if cand_nll + 1e-9 < nll {
+                    if omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST {
+                        nll = cand_nll;
+                        eta = cand;
+                        ebe_converged = ebe_converged || ok;
+                        screen_moved = true;
+                    } else {
+                        #[cfg(test)]
+                        SCREEN_SAME_BASIN_REJECTS.with(|n| n.set(n.get() + 1));
+                    }
                 }
             }
         }
