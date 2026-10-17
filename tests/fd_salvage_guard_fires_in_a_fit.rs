@@ -41,6 +41,11 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
             interaction: true,
             optimizer,
             outer_maxiter: 8,
+            // The #1520 sweep predates the #2013 Sobol screen. With the screen on, the
+            // cold start's EBEs move and neither optimizer declines a subject within 8
+            // evaluations (measured: SLSQP on Linux, NLopt L-BFGS on macOS arm64), so the
+            // guard has nothing to skip. The screen is not what this test is about.
+            inner_screen: 0,
             run_covariance_step: false,
             verbose: false,
             ..FitOptions::default()
