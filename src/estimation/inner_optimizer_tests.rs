@@ -4538,3 +4538,221 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
         }
     }
 }
+
+// ── #2080: a far seed's first line search on the Ω-preconditioned path ──────────────────
+
+/// #2013's single-subject flip-flop: one 100-unit oral dose, 15 samples simulated
+/// noise-free at CL = 1, V = `v`, KA = 0.02 (absorption is the slow phase), against a model
+/// whose typical values are CL = 1, V = 10, KA = 1. The DVs go through the `{:.10e}` text
+/// round-trip a CSV would give them, so the objectives match #2080's tables.
+fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
+    use crate::types::{DoseEvent, Subject};
+    let times = [
+        0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0,
+    ];
+    let (cl, ka) = (1.0f64, 0.02f64);
+    let k = cl / v;
+    let observations: Vec<f64> = times
+        .iter()
+        .map(|&t| {
+            let c = 100.0 * ka / (v * (ka - k)) * ((-k * t).exp() - (-ka * t).exp());
+            format!("{c:.10e}").parse().unwrap()
+        })
+        .collect();
+    let model = crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100)\n  theta TVV(10.0, 0.1, 1000)\n  theta TVKA(1.0, 0.001, 100)\n  omega ETA_CL ~ {}\n  omega ETA_V ~ {}\n  omega ETA_KA ~ {}\n  sigma PROP_ERR ~ 0.05 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+        omega[0], omega[1], omega[2]
+    ))
+    .expect("parse the flip-flop model");
+    let n = times.len();
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: times.to_vec(),
+        obs_raw_times: Vec::new(),
+        observations,
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    (model, subject)
+}
+
+/// Solve from η = 0, then again from that η̂ with η_V moved to −2 sd (the seed
+/// `inner_restarts = 1` tries). Returns `(from η = 0, from the seed, rescaled retries the
+/// seeded solve took)`.
+fn flip_flop_eta_v_minus_2sd(v: f64, omega: [f64; 3]) -> (EbeResult, EbeResult, usize) {
+    let (model, subject) = flip_flop_oral_fixture(v, omega);
+    let params = &model.default_params;
+    let trapped = find_ebe(
+        &model,
+        &subject,
+        params,
+        200,
+        1e-5,
+        Some(&[0.0; 3]),
+        None,
+        0,
+    );
+    let mut seed = trapped.eta.as_slice().to_vec();
+    seed[1] = -2.0 * omega[1].sqrt();
+    BFGS_RESCALED_RETRIES.with(|c| c.set(0));
+    let from_seed = find_ebe(&model, &subject, params, 200, 1e-5, Some(&seed), None, 0);
+    let retries = BFGS_RESCALED_RETRIES.with(|c| c.get());
+    (trapped, from_seed, retries)
+}
+
+/// #2080. On config 2 (V = 5, Ω = diag(0.04, 0.04, 2.0)) the η_V −2 sd seed starts at an
+/// objective of ~1.3e10 with ‖g‖ ~ 3.8e11. The Ω-preconditioned path skips the first-step
+/// scaling, so the first step is ~1.6e11 long and 30 halvings never bring a trial back
+/// below the start: BFGS failed, the fallback restarted from η = 0, and the solve returned
+/// the trapped mode. One rescaled retry lets BFGS reach the deeper mode from the seed.
+#[test]
+fn far_seed_reaches_the_deeper_mode_after_one_rescaled_retry() {
+    let (trapped, r, retries) = flip_flop_eta_v_minus_2sd(5.0, [0.04, 0.04, 2.0]);
+    eprintln!(
+        "config 2: trapped {:.6}, from seed {:.6}, retries {retries}, fallback {}",
+        trapped.nll, r.nll, r.used_fallback
+    );
+    assert!(trapped.nll.is_finite() && r.nll.is_finite());
+    assert_eq!(
+        retries, 1,
+        "the seeded solve must take exactly one rescaled retry"
+    );
+    assert!(
+        !r.used_fallback,
+        "BFGS must converge from the seed itself, not through the Nelder–Mead fallback"
+    );
+    assert!(
+        r.nll < trapped.nll - 1.0,
+        "the seed must reach the deeper mode: {} vs trapped {}",
+        r.nll,
+        trapped.nll
+    );
+}
+
+/// The symptom #2080 was filed for: the cold multi-start drops that seed. The multi-start has
+/// no Nelder–Mead fallback of its own, so on `main` config 2 at `inner_restarts = 1` kept the
+/// twin at −21.073865. A per-row covariate the model never reads puts the subject on the
+/// scan-all arm (`has_tv_covariates`), which tries the η_V −2 sd seed; the predictions do
+/// not depend on it.
+#[test]
+fn cold_multi_start_keeps_the_far_seed_after_the_rescaled_retry() {
+    let (model, mut subject) = flip_flop_oral_fixture(5.0, [0.04, 0.04, 2.0]);
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|i| HashMap::from([("WT".to_string(), 70.0 + i as f64)]))
+        .collect();
+    assert!(
+        subject.has_tv_covariates() && !subject.has_resets(),
+        "test premise: the subject is on the scan-all arm through its covariates"
+    );
+    let params = &model.default_params;
+    let single = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 0);
+    BFGS_RESCALED_RETRIES.with(|c| c.set(0));
+    let multi = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 1);
+    let retries = BFGS_RESCALED_RETRIES.with(|c| c.get());
+    eprintln!(
+        "config 2 multi-start: r=0 {:.6}, r=1 {:.6}, retries {retries}",
+        single.nll, multi.nll
+    );
+    assert!(single.nll.is_finite() && multi.nll.is_finite());
+    assert!(
+        retries >= 1,
+        "the η_V −2 sd seed must take the rescaled retry"
+    );
+    assert!(
+        multi.nll < single.nll - 1.0,
+        "inner_restarts = 1 must keep the deeper mode: {} vs r = 0 {}",
+        multi.nll,
+        single.nll
+    );
+}
+
+/// The control: on config 1 (V = 10, Ω = diag(0.04, 0.1, 1.0)) the same seed's first line
+/// search already succeeds, so the retry must not fire and the solve keeps the path it had
+/// before #2080, still reaching the deeper mode.
+#[test]
+fn far_seed_whose_line_search_succeeds_takes_no_retry() {
+    let (trapped, r, retries) = flip_flop_eta_v_minus_2sd(10.0, [0.04, 0.1, 1.0]);
+    eprintln!(
+        "config 1: trapped {:.6}, from seed {:.6}, retries {retries}, fallback {}",
+        trapped.nll, r.nll, r.used_fallback
+    );
+    assert!(trapped.nll.is_finite() && r.nll.is_finite());
+    assert_eq!(
+        retries, 0,
+        "a succeeding solve must not take the rescaled retry"
+    );
+    assert!(!r.used_fallback);
+    assert!(
+        r.nll < trapped.nll - 1.0,
+        "{} vs trapped {}",
+        r.nll,
+        trapped.nll
+    );
+}
+
+/// The retry's guards, on an objective that is finite only at the start, so every line
+/// search fails. The retry fires once per solve (the second failure returns `false`), only
+/// when ‖g‖ > 1 (below that, 1/‖g‖ would lengthen the step), and never under an accepted
+/// Hessian seed, which already carries the curvature's scale.
+#[test]
+fn rescaled_retry_fires_once_only_for_a_large_gradient_and_no_seed() {
+    let obj = |x: &[f64]| -> f64 {
+        if x.iter().all(|v| *v == 0.0) {
+            1.0
+        } else {
+            f64::INFINITY
+        }
+    };
+    let precond = [1.0, 1.0];
+    let run = |gscale: f64, seed: Option<&DMatrix<f64>>| -> usize {
+        let grad = move |_: &[f64]| -> Vec<f64> { vec![gscale, 0.0] };
+        let mut x = vec![0.0, 0.0];
+        BFGS_RESCALED_RETRIES.with(|c| c.set(0));
+        let ok = dense_bfgs_core(
+            &obj,
+            &grad,
+            &mut x,
+            2,
+            50,
+            1e-8,
+            Some(&precond),
+            seed,
+            None,
+            &never_stall,
+            false,
+        );
+        assert!(!ok, "no step exists, so the solve must report failure");
+        assert_eq!(
+            x,
+            vec![0.0, 0.0],
+            "a failed solve must leave x at the start"
+        );
+        BFGS_RESCALED_RETRIES.with(|c| c.get())
+    };
+    assert_eq!(run(1e3, None), 1, "‖g‖ > 1, no seed: exactly one retry");
+    assert_eq!(run(0.5, None), 0, "‖g‖ < 1: no retry");
+    let seed = DMatrix::<f64>::identity(2, 2);
+    assert_eq!(
+        run(1e3, Some(&seed)),
+        0,
+        "an accepted Hessian seed: no retry"
+    );
+}
