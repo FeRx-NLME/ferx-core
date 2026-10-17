@@ -1365,7 +1365,8 @@ fn write_ebes_kappa_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxE
 /// the level per subject. `GROUP` is the group's 1-based position in its subject's list
 /// (first-record order); the label columns name it, outermost level first. A label is
 /// written in full (shortest round-trip form), since it identifies the group and must
-/// reload to the same bits; a κ̂ at the 6 decimals of `ebes_kappa.csv`, NaN as empty.
+/// reload to the same bits; a κ̂ exactly too, as every bundle double is (`fmt_f64`, #1847),
+/// NaN as empty.
 fn write_level_kappa_csv<W: Write>(
     w: &mut W,
     r: &FitResult,
