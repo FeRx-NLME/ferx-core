@@ -4417,7 +4417,7 @@ pub fn parse_full_model_with(
     // with the individual parameters in scope so they can carry a taint: the
     // parsed readout has its θ/η and liftable gathers rewritten into
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
-    if !level_block_decls.is_empty() {
+    if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
         let readout = match blocks.get("scaling") {
             Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
                 .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
@@ -4463,6 +4463,26 @@ pub fn parse_full_model_with(
             decl.eta_readers = (0..eta_names.len())
                 .map(|k| direct_eta_readers(&indiv_stmts, k))
                 .collect();
+        }
+        // #1065: a profiled block must reach `y` affinely, with a data-only
+        // coefficient, on the same walk the couplings above take.
+        let profiled: Vec<String> = vector_theta_decls
+            .iter()
+            .filter(|d| d.profiled)
+            .map(|d| d.name.clone())
+            .collect();
+        let error_lines = blocks.get("error_model").cloned().unwrap_or_default();
+        for block in &profiled {
+            let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
+            profile_route_check(
+                &indiv_stmts,
+                &readout_with_states,
+                &error_lines,
+                block,
+                &others,
+                &states,
+            )
+            .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
         }
     }
 
@@ -22530,6 +22550,244 @@ fn flatten_binop<'e>(e: &'e Expression, sum: bool, out: &mut Vec<&'e Expression>
             flatten_binop(r, sum, out);
         }
         _ => out.push(e),
+    }
+}
+
+/// Why a `profile`d block's route to `y` is not `c × block + (the rest)` with a
+/// data-only `c` (#1065).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileRouteBreak {
+    /// Inside a function (`exp`, `log`, …), a power or an inline `if`.
+    Construct(String),
+    /// An individual parameter on the route is assigned inside an `if` branch.
+    Branch,
+    /// Read twice in one prediction.
+    Twice,
+    /// Multiplied by, or divided by, something that is not data.
+    Coefficient,
+    /// The divisor of a division.
+    Divisor,
+    /// Through the model's states.
+    State,
+    /// In the residual error (its magnitude or `weight =`).
+    Residual,
+    /// The same prediction reads another profiled block too.
+    OtherBlock(String),
+}
+
+/// Where a [`ProfileRouteBreak`] was found: the `[individual_parameters]`
+/// assignment, by its left-hand side, or `None` for the `y` readout.
+pub(crate) type ProfileRouteSite = Option<String>;
+
+/// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
+/// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
+/// only, along `+`, `−`, and `×`/`÷` by such a `c`, through individual parameters
+/// that are assigned once and outside any `if`, and never through the states.
+/// That is what makes the profile solve a least-squares problem with design
+/// matrix `c`.
+///
+/// It runs on the walk the binder's identifiability questions use
+/// ([`coupling_defs`], [`CouplingCtx`]), so a name resolves to the same reaching
+/// definitions here as there. `others` names the other profiled blocks, for the
+/// disjointness rule.
+pub(crate) fn profile_route_check(
+    stmts: &[Statement],
+    readout: &[Expression],
+    error_lines: &[String],
+    block: &str,
+    others: &[String],
+    states: &StateInputs,
+) -> Result<(), (ProfileRouteBreak, ProfileRouteSite)> {
+    let (assigns, reach_out) = coupling_defs(stmts);
+    let ctx = CouplingCtx {
+        assigns: &assigns,
+        reach_out: &reach_out,
+        readout,
+        block,
+        states,
+        constant: Default::default(),
+    };
+    let is_block =
+        |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == block);
+    let src = Source {
+        node: &is_block,
+        token: states.tokens.contains(block),
+    };
+    let taint = ctx.taint(&src, &[]);
+    if ctx.state_tainted(&src, &taint) {
+        return Err((ProfileRouteBreak::State, None));
+    }
+    // The residual error: a name after an `[error_model]` line's `~` that is the
+    // block, or an individual parameter carrying it at the end of the block. The
+    // variance then reads the block, and the solve is no longer least squares.
+    let error_reads = error_lines.iter().any(|l| {
+        let rhs = l.split_once('~').map_or("", |(_, r)| r);
+        rhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
+    });
+    if error_reads {
+        return Err((ProfileRouteBreak::Residual, None));
+    }
+    // A condition of an assignment that carries the block, or of one the block
+    // reaches through, is a branch on the route.
+    for (d, a) in assigns.iter().enumerate() {
+        if taint.contains(&d) && !a.conds.is_empty() {
+            return Err((ProfileRouteBreak::Branch, Some(a.lhs.to_string())));
+        }
+    }
+    let walk = ProfileWalk {
+        ctx: &ctx,
+        src: &src,
+        taint: &taint,
+    };
+    for y in readout {
+        if !ctx.expr_reads(y, &src, &taint, ctx.out(), false) {
+            continue;
+        }
+        walk.affine(y, ctx.out(), &None)?;
+        for other in others {
+            let is_other = |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == *other);
+            let osrc = Source {
+                node: &is_other,
+                token: false,
+            };
+            let ot = ctx.taint(&osrc, &[]);
+            if ctx.expr_reads(y, &osrc, &ot, ctx.out(), false) {
+                return Err((ProfileRouteBreak::OtherBlock(other.clone()), None));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `E_PROFILE_NOT_LINEAR` message for a [`profile_route_check`] refusal.
+fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRouteSite) -> String {
+    let at = match site {
+        Some(p) => format!("in `{p}` in [individual_parameters]"),
+        None => "in the `y` readout".to_string(),
+    };
+    let here = match why {
+        ProfileRouteBreak::Construct(c) => format!("Here `{block}` reaches `y` through {c} {at}."),
+        ProfileRouteBreak::Branch => {
+            format!(
+                "Here `{block}` is carried by a parameter assigned inside an `if` branch, {at}."
+            )
+        }
+        ProfileRouteBreak::Twice => {
+            format!("Here `{block}` is read twice in one prediction, {at}.")
+        }
+        ProfileRouteBreak::Coefficient => format!(
+            "Here `{block}` is scaled by a term that reads a parameter or a random effect, \
+             not only data, {at}."
+        ),
+        ProfileRouteBreak::Divisor => format!("Here `{block}` is a divisor {at}."),
+        ProfileRouteBreak::State => format!(
+            "Here `{block}` reaches `y` through the model's states (a compartment or an \
+             `[odes]` equation)."
+        ),
+        ProfileRouteBreak::Residual => format!(
+            "Here the residual error reads `{block}`, so its variance would depend on the \
+             levels."
+        ),
+        ProfileRouteBreak::OtherBlock(o) => format!(
+            "Here one prediction reads `{block}` and `{o}`, which is profiled too; a \
+             prediction may read only one profiled block."
+        ),
+    };
+    format!(
+        "{PROFILE_NOT_LINEAR}[parameters] theta {block}[...] is `profile`d, so each \
+         prediction must read it as `c × {block}` plus terms that do not read it, with `c` \
+         taken from the data alone. {here} Remove `profile` to estimate the levels as \
+         ordinary θ."
+    )
+}
+
+/// One [`profile_route_check`] walk: the block's source and taint over the
+/// assignments.
+struct ProfileWalk<'w, 'a> {
+    ctx: &'w CouplingCtx<'a>,
+    src: &'w Source<'w>,
+    taint: &'w HashSet<usize>,
+}
+
+impl ProfileWalk<'_, '_> {
+    fn reads(&self, e: &Expression, at: At<'_>) -> bool {
+        self.ctx.expr_reads(e, self.src, self.taint, at, false)
+    }
+
+    /// Whether `e` reads the block, `Err` when it does but not affinely.
+    fn affine(
+        &self,
+        e: &Expression,
+        at: At<'_>,
+        site: &ProfileRouteSite,
+    ) -> Result<bool, (ProfileRouteBreak, ProfileRouteSite)> {
+        let fail = |why| Err((why, site.clone()));
+        if !self.reads(e, at) {
+            return Ok(false);
+        }
+        match e {
+            Expression::ThetaGather { .. } => Ok(true),
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                // Read, so it is an individual parameter the block reaches: one
+                // reaching assignment, walked where it is.
+                let defs = self.ctx.resolve(at, n);
+                let carrying: Vec<usize> = defs
+                    .iter()
+                    .copied()
+                    .filter(|d| self.taint.contains(d))
+                    .collect();
+                if defs.len() > 1 {
+                    return Err((ProfileRouteBreak::Branch, Some(n.clone())));
+                }
+                let d = carrying[0];
+                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &Some(n.clone()))
+            }
+            Expression::BinOp(_, BinOp::Mod, _) => {
+                fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
+            }
+            Expression::BinOp(l, op, r) => {
+                let (a, b) = (self.affine(l, at, site)?, self.affine(r, at, site)?);
+                match (op, a, b) {
+                    (_, true, true) => fail(ProfileRouteBreak::Twice),
+                    (BinOp::Div, _, true) => fail(ProfileRouteBreak::Divisor),
+                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
+                    (_, true, false) if self.data_only(r, at) => Ok(true),
+                    (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
+                    _ => fail(ProfileRouteBreak::Coefficient),
+                }
+            }
+            Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
+            Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
+            _ => fail(ProfileRouteBreak::Construct("an inline `if`".into())),
+        }
+    }
+
+    /// Whether `e` reads data and literals only: no θ, η, block, state or
+    /// network output, through individual parameters too.
+    fn data_only(&self, e: &Expression, at: At<'_>) -> bool {
+        match e {
+            Expression::Literal(_) | Expression::Time => true,
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                if self.ctx.states.is_state(n) {
+                    false
+                } else if self.ctx.assigns.iter().any(|a| a.lhs == n.as_str()) {
+                    let defs = self.ctx.resolve(at, n);
+                    !defs.is_empty()
+                        && defs.iter().all(|&d| {
+                            let a = &self.ctx.assigns[d];
+                            a.conds.is_empty() && self.data_only(a.rhs, self.ctx.at(d))
+                        })
+                } else {
+                    true
+                }
+            }
+            Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                self.data_only(l, at) && self.data_only(r, at)
+            }
+            Expression::UnaryFn(_, a) => self.data_only(a, at),
+            _ => false,
+        }
     }
 }
 

@@ -33545,3 +33545,275 @@ fn profile_is_peeled_off_a_theta_line_only() {
         .replace("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 4.0 profile");
     assert!(parse_full_model(&text).is_err());
 }
+
+// ── #1065: the route of a `profile`d block (E_PROFILE_NOT_LINEAR) ───────────
+
+/// An algebraic model with a counted `profile` block `PLACEBO[3]` and, optionally,
+/// a second one `ARMFX[3]`. `indiv` is the `[individual_parameters]` body, `y` the
+/// readout, `error` the `[error_model]` line.
+fn route_model(indiv: &str, y: &str, error: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta PLACEBO[3](0.0) profile
+  theta ARMFX[3](0.0) profile
+  omega ETA_E0 ~ 4.0
+  omega ETA_EM ~ 0.1
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+  ARM categorical
+  WPSE continuous
+  DOSE continuous
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  y = {y}
+
+[error_model]
+  {error}
+"#
+    )
+}
+
+const ADD: &str = "DV ~ additive(ADD_ERR)";
+
+fn route_err(indiv: &str, y: &str, error: &str) -> String {
+    parse_full_model(&route_model(indiv, y, error))
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal for y = {y}"))
+}
+
+/// The two sentences every route refusal carries, around the class sentence.
+fn assert_route_frame(msg: &str) {
+    for must in [
+        "E_PROFILE_NOT_LINEAR: [parameters] theta PLACEBO[...] is `profile`d, so each \
+         prediction must read it as `c × PLACEBO` plus terms that do not read it, with `c` \
+         taken from the data alone.",
+        "Remove `profile` to estimate the levels as ordinary θ.",
+    ] {
+        assert!(msg.contains(must), "missing {must:?} in {msg}");
+    }
+}
+
+/// Every accepted route: a plain sum (F1), a data coefficient (`× DOSE`, `/ WPSE`,
+/// a literal), through a chain of parameters, and a model nonlinear in η but affine
+/// in the block (F2). `ARMFX` is profiled too and read nowhere, which is allowed.
+#[test]
+fn profile_accepts_every_affine_route_with_a_data_coefficient() {
+    for (indiv, y) in [
+        ("  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0", "BASE"),
+        ("  BASE = (TVE0 + PLACEBO[STUDY]) / WPSE + ETA_E0", "BASE"),
+        (
+            "  BASE = TVE0 + 2.0 * DOSE * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  PL = 0 - PLACEBO[STUDY] / 2\n  BASE = TVE0 + PL + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  EM = EMAX * exp(ETA_EM)",
+            "BASE - EM * DOSE / (DOSE + 10)",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] * WPSE",
+        ),
+    ] {
+        parse_full_model(&route_model(indiv, y, ADD))
+            .unwrap_or_else(|e| panic!("{indiv} / y = {y}: {e}"));
+    }
+    // F1 itself: η and a BTAV κ on `BASE`, `weight = SE`, a `[structural_model]`
+    // intermediate on the readout.
+    let f1 = std::fs::read_to_string("tests/data/mbma_placebo/mbma_placebo.ferx").unwrap();
+    let decl = "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)";
+    assert!(f1.contains(decl), "fixture moved");
+    let f1 = f1.replace(
+        decl,
+        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
+    );
+    parse_full_model(&f1).unwrap_or_else(|e| panic!("F1: {e}"));
+}
+
+/// Through a function, a power, a remainder or an inline `if`: the construct and
+/// the site are named.
+#[test]
+fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
+    for (indiv, y, construct, at) in [
+        (
+            "  BASE = TVE0 * exp(PLACEBO[STUDY]) + ETA_E0",
+            "BASE",
+            "`exp(...)`",
+            "in `BASE` in [individual_parameters]",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY]^2",
+            "a power (`^`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] mod 2",
+            "a remainder (`mod`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
+            "BASE",
+            "an inline `if`",
+            "in `BASE` in [individual_parameters]",
+        ),
+    ] {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through {construct} {at}.");
+        assert!(msg.contains(&here), "missing {here:?} in {msg}");
+    }
+}
+
+/// A parameter on the route assigned inside an `if` branch, whether one branch or
+/// both assign it.
+#[test]
+fn profile_refuses_a_route_through_an_if_branch() {
+    for indiv in [
+        "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+    ] {
+        let msg = route_err(indiv, "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch, in `PL` \
+                 in [individual_parameters]."
+            ),
+            "{indiv}: {msg}"
+        );
+    }
+}
+
+/// Twice in one prediction (a sum, a product of two reads), scaled by a parameter
+/// or a random effect, or as a divisor.
+#[test]
+fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "BASE + PLACEBO[STUDY]",
+            "Here `PLACEBO` is read twice in one prediction, in the `y` readout.",
+        ),
+        (
+            "  PL = PLACEBO[STUDY]\n  BASE = TVE0 + PL * PL + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is read twice in one prediction, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is scaled by a term that reads a parameter or a random effect, not \
+             only data, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] / exp(ETA_EM)",
+            "Here `PLACEBO` is scaled by a term that reads a parameter or a random effect, not \
+             only data, in the `y` readout.",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + 1 / PLACEBO[STUDY]",
+            "Here `PLACEBO` is a divisor in the `y` readout.",
+        ),
+    ];
+    for (indiv, y, here) in cases {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        assert!(msg.contains(here), "y = {y}: missing {here:?} in {msg}");
+    }
+}
+
+/// The residual error reads the block, through `weight =` directly or through a
+/// parameter carrying it. The message says *residual error*, never "nonlinear".
+#[test]
+fn profile_refuses_a_residual_error_that_reads_the_block() {
+    for (indiv, error) in [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "DV ~ additive(ADD_ERR) weight = 1 + PLACEBO[STUDY] * 0",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  W = WPSE + BASE",
+            "DV ~ additive(ADD_ERR) weight = W",
+        ),
+    ] {
+        let msg = route_err(indiv, "BASE", error);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here the residual error reads `PLACEBO`, so its variance would depend on the \
+                 levels."
+            ),
+            "{error}: {msg}"
+        );
+        assert!(!msg.to_lowercase().contains("nonlinear"), "{msg}");
+    }
+}
+
+/// One prediction reading two profiled blocks names both.
+#[test]
+fn profile_refuses_a_prediction_reading_two_profiled_blocks() {
+    let msg = route_err(
+        "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+        "BASE + ARMFX[ARM]",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here one prediction reads `PLACEBO` and `ARMFX`, which is profiled too; a \
+             prediction may read only one profiled block."
+        ),
+        "{msg}"
+    );
+}
+
+/// A block reaching `y` through the states of a compartment model.
+#[test]
+fn profile_refuses_a_route_through_the_states() {
+    let text = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[3](0.0) profile
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) + PLACEBO[STUDY]
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+    let msg = parse_full_model(text).err().expect("refused");
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here `PLACEBO` reaches `y` through the model's states (a compartment or an \
+             `[odes]` equation)."
+        ),
+        "{msg}"
+    );
+}
