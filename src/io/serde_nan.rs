@@ -13,6 +13,7 @@
 //! - `crate::io::serde_nan::vec_vec` for `Vec<Vec<f64>>`
 //! - `crate::io::serde_nan::opt`     for `Option<f64>`
 //! - `crate::io::serde_nan::opt_vec` for `Option<Vec<f64>>`
+//! - `crate::io::serde_nan::opt_present` for an `Option<f64>` whose `None` is an absent key
 
 use serde::{Serialize, Serializer};
 
@@ -132,5 +133,55 @@ pub mod opt_vec {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Vec<f64>>, D::Error> {
         let opts: Option<Vec<Option<f64>>> = Option::deserialize(de)?;
         Ok(opts.map(|v| v.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect()))
+    }
+}
+
+/// `Option<f64>` field whose `None` is an *absent key*, not a `null` value. Pair
+/// it with `default` + `skip_serializing_if = "Option::is_none"`: key presence
+/// then carries `Some`/`None`, so the value can use `null` for a non-finite
+/// `Some` and read it back as `Some(NaN)`. Under [`opt`], a `Some(NaN)` would come
+/// back as `None` — lossless only where `None` and `NaN` mean the same thing.
+pub mod opt_present {
+    use super::NanNull;
+    use serde::{Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<f64>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => NanNull(*v).serialize(ser),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
+        super::scalar::deserialize(de).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    struct Holder {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "super::opt_present"
+        )]
+        x: Option<f64>,
+    }
+
+    /// `opt_present` keeps `Some(NaN)` as `Some(NaN)` where `opt` would return
+    /// `None`, and a finite value and an absent key each as themselves.
+    #[test]
+    fn opt_present_round_trips_some_nan_finite_and_none() {
+        let rt = |x: Option<f64>| -> (String, Option<f64>) {
+            let json = serde_json::to_string(&Holder { x }).unwrap();
+            let back: Holder = serde_json::from_str(&json).unwrap();
+            (json, back.x)
+        };
+        let (json, back) = rt(Some(f64::NAN));
+        assert_eq!(json, r#"{"x":null}"#);
+        assert!(back.is_some_and(f64::is_nan), "got {back:?}");
+        assert_eq!(rt(Some(2.5)), (r#"{"x":2.5}"#.into(), Some(2.5)));
+        assert_eq!(rt(None), ("{}".into(), None));
     }
 }
