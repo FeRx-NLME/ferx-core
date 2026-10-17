@@ -28193,21 +28193,25 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). For any in-scope
-        // `ExpressionScale` model the provider gate caps `n_theta + n_eta` at
-        // `MAX_SCALE_AXES`, so both `theta` and `eta` fit a stack buffer — build them
-        // there instead of per-call heap `Vec`s (#534 review #4). (`cov_vec` /
-        // bytecode `stack` lengths are not axis-bounded, so they stay on the heap.)
+        // η_k seeds axis k directly (no `n_theta` offset). The inner ODE scope caps
+        // `n_eta`, not `n_theta + n_eta` (#1804), so a wide model can carry more θ
+        // values than the common stack buffer even though none consumes a dual axis.
+        // Keep the stack fast path and fall back to a heap `Vec` for that case. η still
+        // fits the buffer under every caller's η-width gate. (`cov_vec` / bytecode
+        // `stack` lengths are not axis-bounded, so they stay on the heap.)
         const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
-        debug_assert!(
-            theta.len() <= CAP && eta.len() <= CAP,
-            "scale eval θ/η exceed MAX_SCALE_AXES; caller must be gate-checked"
-        );
+        debug_assert!(eta.len() <= CAP, "scale eval η exceed MAX_SCALE_AXES");
         let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
-        for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
-            *d = Dual1::constant(v);
-        }
-        let theta_d = &theta_buf[..theta.len()];
+        let theta_heap: Vec<Dual1<N>>;
+        let theta_d: &[Dual1<N>] = if theta.len() <= CAP {
+            for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
+                *d = Dual1::constant(v);
+            }
+            &theta_buf[..theta.len()]
+        } else {
+            theta_heap = theta.iter().map(|&v| Dual1::constant(v)).collect();
+            &theta_heap
+        };
         let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
         for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
             *d = if k < N {

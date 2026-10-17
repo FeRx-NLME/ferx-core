@@ -13172,9 +13172,11 @@ fn seed_pk_dual1_matches_the_dual2_eta_block() {
 }
 
 /// An η-dependent `ExpressionScale` is admitted by the inner scope past the cap, and its
-/// quotient is applied: the 25-axis inner gradient matches FD of the production predictor
-/// (which divides by the scale) and the 24-axis twin. The scale admissibility is a
-/// separate width check from the model's own, so it needs its own straddle.
+/// quotient is applied: the 25- and 27-axis inner gradients match FD of the production
+/// predictor (which divides by the scale) and the 24-axis twin. The latter carries 25 θ,
+/// past `eval_scale_dual1`'s stack-buffer width; before the heap fallback it panicked even
+/// though θ are constants on this η-only path. The scale admissibility is a separate width
+/// check from the model's own, so it needs its own straddle.
 #[test]
 fn ode_expression_scale_inner_scope_past_axis_cap() {
     let padded = |n_pad: usize| -> CompiledModel {
@@ -13199,47 +13201,61 @@ fn ode_expression_scale_inner_scope_past_axis_cap() {
     let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
 
     let at_cap = padded(18);
-    let past = padded(19);
     assert_eq!(at_cap.n_theta + at_cap.n_eta, MAX_ODE_AXES);
-    assert_eq!(past.n_theta + past.n_eta, MAX_ODE_AXES + 1);
-    let ScalingSpec::ExpressionScale { deriv: Some(p), .. } = &past.scaling else {
-        panic!("fixture must carry a differentiable scale program");
-    };
-    assert!(!expression_scale_axes_admissible(
-        p,
-        &past,
-        OdeGradScope::Outer
-    ));
-    assert!(expression_scale_axes_admissible(
-        p,
-        &past,
-        OdeGradScope::Inner
-    ));
-    assert!(!ode_analytical_supported(&past));
-    assert!(ode_analytical_supported_in(&past, OdeGradScope::Inner));
-
     let reference = ode_subject_eta_grad(&at_cap, &subject, &theta(18), &eta).expect("24 axes");
-    let got = ode_subject_eta_grad(&past, &subject, &theta(19), &eta).expect("25 axes");
-    let th = theta(19);
-    let pred = |e: &[f64], j: usize| compute_predictions_with_tv(&past, &subject, &th, e)[j];
-    // Measured (macOS arm64): the 24-axis twin bit-identical; `f` vs the production predictor
-    // rel 1.8e-16; `∂f/∂η` vs central FD rel 1.9e-9 over the 14 (row, η) pairs. FD bound at
-    // about 10× that.
-    let he = 1e-6;
-    assert_eq!(got.len(), reference.len());
-    for (j, (o, r)) in got.iter().zip(&reference).enumerate() {
-        assert!(o.f.is_finite(), "row {j}: non-finite f");
-        assert_eq!(o.f, r.f, "row {j}: f");
-        approx::assert_relative_eq!(o.f, pred(&eta, j), max_relative = 1e-14, epsilon = 1e-16);
-        for k in 0..past.n_eta {
-            assert!(o.df_deta[k].is_finite(), "row {j}: non-finite ∂f/∂η{k}");
-            assert_eq!(o.df_deta[k], r.df_deta[k], "row {j}: ∂f/∂η{k}");
-            let mut ep = eta.to_vec();
-            ep[k] += he;
-            let mut em = eta.to_vec();
-            em[k] -= he;
-            let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
-            approx::assert_relative_eq!(o.df_deta[k], fd, max_relative = 2e-8, epsilon = 1e-16);
+    for n_pad in [19, 21] {
+        let past = padded(n_pad);
+        let axes = past.n_theta + past.n_eta;
+        let tag = format!("{axes} axes ({} θ)", past.n_theta);
+        assert!(axes > MAX_ODE_AXES, "{tag}: past the outer cap");
+        if n_pad == 21 {
+            assert!(
+                past.n_theta > crate::sens::provider::MAX_SCALE_AXES,
+                "{tag}: regression must cross the scale evaluator's θ buffer"
+            );
+        }
+        let ScalingSpec::ExpressionScale { deriv: Some(p), .. } = &past.scaling else {
+            panic!("{tag}: fixture must carry a differentiable scale program");
+        };
+        assert!(!expression_scale_axes_admissible(
+            p,
+            &past,
+            OdeGradScope::Outer
+        ));
+        assert!(expression_scale_axes_admissible(
+            p,
+            &past,
+            OdeGradScope::Inner
+        ));
+        assert!(!ode_analytical_supported(&past));
+        assert!(ode_analytical_supported_in(&past, OdeGradScope::Inner));
+
+        let th = theta(n_pad);
+        let got = ode_subject_eta_grad(&past, &subject, &th, &eta)
+            .unwrap_or_else(|| panic!("{tag}: inner gradient"));
+        let pred = |e: &[f64], j: usize| compute_predictions_with_tv(&past, &subject, &th, e)[j];
+        // Measured (macOS arm64): both twins bit-identical to the 24-axis reference;
+        // `f` vs the production predictor rel 1.8e-16; `∂f/∂η` vs central FD rel 1.9e-9
+        // over each case's 14 (row, η) pairs. FD bound at about 10× that.
+        let he = 1e-6;
+        assert_eq!(got.len(), reference.len());
+        for (j, (o, r)) in got.iter().zip(&reference).enumerate() {
+            assert!(o.f.is_finite(), "{tag}, row {j}: non-finite f");
+            assert_eq!(o.f, r.f, "{tag}, row {j}: f");
+            approx::assert_relative_eq!(o.f, pred(&eta, j), max_relative = 1e-14, epsilon = 1e-16);
+            for k in 0..past.n_eta {
+                assert!(
+                    o.df_deta[k].is_finite(),
+                    "{tag}, row {j}: non-finite ∂f/∂η{k}"
+                );
+                assert_eq!(o.df_deta[k], r.df_deta[k], "{tag}, row {j}: ∂f/∂η{k}");
+                let mut ep = eta.to_vec();
+                ep[k] += he;
+                let mut em = eta.to_vec();
+                em[k] -= he;
+                let fd = (pred(&ep, j) - pred(&em, j)) / (2.0 * he);
+                approx::assert_relative_eq!(o.df_deta[k], fd, max_relative = 2e-8, epsilon = 1e-16);
+            }
         }
     }
 }
