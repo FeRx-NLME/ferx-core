@@ -518,6 +518,9 @@ fn evaluate_at_initial_params(
     // Mixture (#977 Phase 3): the eval-only OFV is the K-fold log-sum-exp at the
     // initial parameters; EBEs reported are the MIXEST class per subject.
     let is_mixture = params.mixture.is_some();
+    // #2013: the IDs of the subjects whose EBE the Sobol screen moved, as on the
+    // estimating path's final re-solve. Feeds the warning only.
+    let mut screen_moved_ids: Vec<String> = Vec::new();
     let (eta_hats, h_matrices, kappas, ofv, mixture_posteriors) = if is_mixture {
         let m = crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
         // Carry PMIX/MIXEST like the converged path so an eval-only mixture run
@@ -544,7 +547,9 @@ fn evaluate_at_initial_params(
         // posterior — system resets / TV-covariates, or a weakly-identified random effect
         // (#891) — is re-seeded instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
-        let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm_seeded(
+        // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013 `screen_moved`
+        // flag read back alongside it.
+        let (eta_hats, h_matrices, _, kappas, moved) = run_inner_loop_warm_map(
             model,
             population,
             &params,
@@ -554,9 +559,20 @@ fn evaluate_at_initial_params(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
-            InnerHessianSeed::for_options(options),
-            options,
+            InnerSolvePolicy {
+                seed: InnerHessianSeed::for_options(options),
+                ..InnerSolvePolicy::for_stage(options, model)
+            },
+            None,
+            |_, ebe| ebe.screen_moved,
         );
+        screen_moved_ids = population
+            .subjects
+            .iter()
+            .zip(&moved)
+            .filter(|&(_, &m)| m)
+            .map(|(subject, _)| subject.id.clone())
+            .collect();
         let ofv = 2.0
             * pop_nll_opts(
                 model,
@@ -575,7 +591,9 @@ fn evaluate_at_initial_params(
         eprintln!("outer_maxiter = 0: evaluation only, no optimization performed.");
     }
 
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = ebe_screen_moved_warning(&screen_moved_ids)
+        .into_iter()
+        .collect();
     // Mixture (#983 Phase 6): the covariance step now builds its FD Hessian on the
     // K-fold mixture OFV (`compute_covariance` branches on `template.mixture`), so
     // it runs for mixtures exactly like the single-population path.

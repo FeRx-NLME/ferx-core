@@ -392,7 +392,9 @@ fn the_stage_policy_carries_the_screen_size() {
 }
 
 /// End to end through `fit()`: the final re-solve's warning names the flip-flop subject
-/// and neither control, and `inner_screen = 0` silences it on the same data.
+/// and neither control, and `inner_screen = 0` silences it on the same data. Both on an
+/// estimating fit and on `maxiter = 0`, whose evaluation-only solve is the other place a
+/// fit reports its EBEs from.
 #[test]
 fn a_fit_names_the_subjects_the_screen_moved() {
     let cfg = &CONFIGS[0];
@@ -407,10 +409,10 @@ fn a_fit_names_the_subjects_the_screen_moved() {
         exclusions: None,
         warnings: Vec::new(),
     };
-    let screen_warning = |screen: usize| {
+    let screen_warning = |screen: usize, outer_maxiter: usize| {
         let options = FitOptions {
             inner_screen: screen,
-            outer_maxiter: 2,
+            outer_maxiter,
             run_covariance_step: false,
             threads: Some(1),
             ..opts.clone()
@@ -421,9 +423,18 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    let w = screen_warning(100).expect("the screen moved S1");
-    assert!(w.contains("of 1 subject (S1)"), "{w}");
-    assert!(screen_warning(0).is_none());
+    for outer_maxiter in [2, 0] {
+        let w = screen_warning(100, outer_maxiter)
+            .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: the screen moved S1"));
+        assert!(
+            w.contains("of 1 subject (S1)"),
+            "maxiter = {outer_maxiter}: {w}"
+        );
+        assert!(
+            screen_warning(0, outer_maxiter).is_none(),
+            "maxiter = {outer_maxiter}: no screen ran"
+        );
+    }
 }
 
 /// The Ω⁻¹ distance gate, on its own: under a loose `inner_tol` the incumbent and the
