@@ -132,3 +132,323 @@ fn the_counted_form_reads_its_plain_index_column_and_unprofiled_blocks_are_skipp
     let plain = bind(&mbma("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]"), &mut pop);
     assert!(active_levels(&plain, &pop).is_empty());
 }
+
+// ── E_PROFILE_SCOPE: what a profiled block can be fitted with ───────────────
+
+use crate::types::{CovarianceMethod, EstimationMethod, FitOptions};
+
+const FRAME: &str = "theta PLACEBO[...] is `profile`d, ";
+const REMOVE: &str = "Remove `profile` to estimate the levels as ordinary θ.";
+const NOT_YET: &str = "but profiled estimation is not implemented yet (#1065): this release \
+                       checks the declaration and nothing more.";
+
+fn counted() -> String {
+    mbma("theta PLACEBO[3](0.0) profile", "PLACEBO[STUDY]")
+}
+
+fn model_of(text: &str) -> CompiledModel {
+    parse_full_model(text)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .model
+}
+
+/// The `E_PROFILE_SCOPE` messages `check_model_options` raises, in order.
+fn scope(model: &CompiledModel, options: &FitOptions) -> Vec<String> {
+    crate::api::check_model_options(model, options)
+        .into_iter()
+        .filter(|d| d.code == "E_PROFILE_SCOPE")
+        .map(|d| {
+            assert_eq!(d.block.as_deref(), Some("parameters"), "{}", d.message);
+            d.message
+        })
+        .collect()
+}
+
+/// Exactly one class refusal besides the PR1 `not implemented` one, framed, with
+/// `must` and its fix sentence; returns it for the must-not-say checks.
+fn one_refusal(msgs: &[String], must: &str, fix: &str) -> String {
+    let hits: Vec<&String> = msgs.iter().filter(|m| !m.contains(NOT_YET)).collect();
+    assert_eq!(hits.len(), 1, "{msgs:#?}");
+    let m = hits[0];
+    for s in [FRAME, must, fix] {
+        assert!(m.contains(s), "missing {s:?} in {m}");
+    }
+    m.clone()
+}
+
+/// The control: a profiled block in scope gets the PR1 refusal alone, framed, and an
+/// unprofiled model gets nothing.
+#[test]
+fn an_in_scope_profiled_block_gets_only_the_not_yet_implemented_refusal() {
+    let msgs = scope(&model_of(&counted()), &FitOptions::default());
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    for s in [FRAME, NOT_YET, REMOVE] {
+        assert!(msgs[0].contains(s), "missing {s:?} in {}", msgs[0]);
+    }
+    let plain = model_of(&mbma("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]"));
+    assert!(scope(&plain, &FitOptions::default()).is_empty());
+}
+
+/// Every estimator outside `foce`/`focei`, alone or as a chain step, and quadrature.
+/// The message names what it saw and never claims a fallback.
+#[test]
+fn profile_refuses_every_method_outside_foce_and_focei() {
+    for m in [
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Laplace,
+        EstimationMethod::FoceGn,
+        EstimationMethod::Bayes,
+    ] {
+        let alone = FitOptions {
+            method: m,
+            ..FitOptions::default()
+        };
+        let chain = FitOptions {
+            methods: vec![EstimationMethod::FoceI, m],
+            ..FitOptions::default()
+        };
+        for opts in [alone, chain] {
+            let msg = one_refusal(
+                &scope(&model_of(&counted()), &opts),
+                &format!(
+                    "which only `foce` and `focei` estimate; this fit runs `{}`.",
+                    m.label()
+                ),
+                REMOVE,
+            );
+            assert!(!msg.contains("fall"), "{msg}");
+        }
+    }
+    for ok in [EstimationMethod::Foce, EstimationMethod::FoceI] {
+        let opts = FitOptions {
+            method: ok,
+            ..FitOptions::default()
+        };
+        assert_eq!(scope(&model_of(&counted()), &opts).len(), 1, "{ok:?}");
+    }
+    let agq = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    let msg = one_refusal(
+        &scope(&model_of(&counted()), &agq),
+        "which only `foce` and `focei` estimate, at `n_agq = 1`; this fit asks for \
+         `n_agq = 3` quadrature.",
+        REMOVE,
+    );
+    assert!(!msg.contains("fall"), "{msg}");
+}
+
+/// Proportional, power, combined and a log-transformed additive error, by name.
+#[test]
+fn profile_refuses_a_residual_error_that_is_not_additive() {
+    for (error, extra_sigma, must) in [
+        (
+            "DV ~ proportional(ADD_ERR)",
+            "",
+            "which needs an additive residual error; this model's is proportional (or power), \
+             whose variance reads the prediction.",
+        ),
+        (
+            "DV ~ power(ADD_ERR, 0.5)",
+            "",
+            "which needs an additive residual error; this model's is proportional (or power), \
+             whose variance reads the prediction.",
+        ),
+        (
+            "DV ~ combined(PROP_ERR, ADD_ERR)",
+            "  sigma PROP_ERR ~ 0.01\n",
+            "which needs an additive residual error; this model's is combined, whose variance \
+             reads the prediction.",
+        ),
+        (
+            "log(DV) ~ additive(ADD_ERR)",
+            "",
+            "which needs an additive residual error on the data's own scale; this model \
+             transforms both sides by a log, so the levels enter through `log(...)`.",
+        ),
+    ] {
+        let text = counted()
+            .replace("DV ~ additive(ADD_ERR)", error)
+            .replace("  sigma ADD_ERR", &format!("{extra_sigma}  sigma ADD_ERR"));
+        one_refusal(
+            &scope(&model_of(&text), &FitOptions::default()),
+            must,
+            REMOVE,
+        );
+    }
+}
+
+/// M3 censoring: armed through the options, as `fit()` arms it.
+#[test]
+fn profile_refuses_m3_censoring() {
+    let opts = FitOptions {
+        bloq_method: Some(crate::types::BloqMethod::M3),
+        ..FitOptions::default()
+    };
+    one_refusal(
+        &scope(&model_of(&counted()), &opts),
+        "which needs a Gaussian likelihood on every row; this fit scores censored rows by M3, \
+         a normal-tail probability.",
+        REMOVE,
+    );
+}
+
+/// A `correlation` line: not yet, with the issue, never "invalid".
+#[test]
+fn profile_refuses_a_correlation_line_as_not_yet_supported() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta RHO(0.3, -0.2, 0.95)\n  omega ETA_E0",
+        )
+        .replace(
+            "  STUDY categorical",
+            "  STUDY categorical\n  ARM categorical",
+        )
+        .replace(
+            "DV ~ additive(ADD_ERR)",
+            "DV ~ additive(ADD_ERR)\n  correlation cs(RHO) by ARM",
+        );
+    let msg = one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        "and a `correlation` line is not yet supported together with `profile` (#1082).",
+        "Remove one of the two for now.",
+    );
+    assert!(!msg.to_lowercase().contains("invalid"), "{msg}");
+}
+
+/// `[mixture]` parsed; `[diffusion]` and FREM set on the parsed model by hand (the
+/// check reads `is_sde()` and `frem_config`, and those blocks need an ODE model or a
+/// FREM dataset this algebraic fixture does not have).
+#[test]
+fn profile_refuses_mixture_diffusion_and_frem() {
+    let mix = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta MIXL(0.0, -5.0, 5.0)\n  omega ETA_E0",
+        )
+        .replace(
+            "[error_model]",
+            "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[error_model]",
+        );
+    one_refusal(
+        &scope(&model_of(&mix), &FitOptions::default()),
+        "which does not yet combine with a `[mixture]`.",
+        REMOVE,
+    );
+
+    let mut sde = model_of(&counted());
+    sde.diffusion_theta_start = Some(sde.n_theta);
+    one_refusal(
+        &scope(&sde, &FitOptions::default()),
+        "which does not yet combine with a `[diffusion]` block.",
+        REMOVE,
+    );
+
+    let mut frem = model_of(&counted());
+    frem.frem_config = Some(crate::types::FremConfig {
+        fremtype_to_indices: HashMap::new(),
+        covariate_sigma_index: 0,
+    });
+    one_refusal(
+        &scope(&frem, &FitOptions::default()),
+        "which does not yet combine with a FREM covariate model.",
+        REMOVE,
+    );
+}
+
+/// An explicit `s` or `rsr` covariance; a defaulted one, or no covariance step, is
+/// not refused.
+#[test]
+fn profile_refuses_an_s_or_sandwich_covariance() {
+    for m in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+        let opts = FitOptions {
+            run_covariance_step: true,
+            covariance_method: m,
+            covariance_method_set: true,
+            ..FitOptions::default()
+        };
+        one_refusal(
+            &scope(&model_of(&counted()), &opts),
+            &format!(
+                "whose covariance step computes `r` only for now; this fit asks for \
+                 `covariance_method = {}`.",
+                m.label()
+            ),
+            "Use `covariance_method = r`, or remove `profile`.",
+        );
+        let off = FitOptions {
+            run_covariance_step: false,
+            covariance_method: m,
+            covariance_method_set: true,
+            ..FitOptions::default()
+        };
+        assert_eq!(scope(&model_of(&counted()), &off).len(), 1, "no step");
+    }
+}
+
+/// Two profiled blocks are both named, in declaration order.
+#[test]
+fn every_profiled_block_is_named() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta ARMFX[2](0.0) profile\n  omega ETA_E0",
+        )
+        .replace(
+            "  STUDY categorical",
+            "  STUDY categorical\n  ARM categorical",
+        );
+    let model = model_of(&text);
+    let msgs = scope(&model, &FitOptions::default());
+    assert!(
+        msgs[0].starts_with("theta PLACEBO[...] and ARMFX[...] are `profile`d, "),
+        "{}",
+        msgs[0]
+    );
+}
+
+/// A binary endpoint beside the Gaussian rows.
+#[cfg(feature = "survival")]
+#[test]
+fn profile_refuses_a_model_with_a_non_gaussian_endpoint() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0",
+            "  theta TH0(0.0, -10.0, 10.0)\n  omega ETA_E0",
+        )
+        .replace(
+            "[error_model]",
+            "[binary_model]\n  cmt   = 3\n  logit = TH0\n\n[error_model]",
+        );
+    one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        "which needs a Gaussian likelihood on every row; this model also has a binary \
+         endpoint.",
+        REMOVE,
+    );
+}
+
+/// The parse-time codes reach the check report as their own code, on `[parameters]`.
+#[test]
+fn the_parse_time_profile_codes_map_to_their_diagnostics() {
+    for (text, code) in [
+        (
+            mbma("theta PLACEBO(0.0) profile", "PLACEBO"),
+            "E_PROFILE_SCOPE",
+        ),
+        (
+            mbma("theta PLACEBO[3](0.0) profile", "exp(PLACEBO[STUDY])"),
+            "E_PROFILE_NOT_LINEAR",
+        ),
+    ] {
+        let err = parse_full_model(&text).err().expect("refused");
+        let d = crate::api::validation::parse_error_to_diagnostic(&err);
+        assert_eq!(d.code, code, "{err}");
+        assert_eq!(d.block.as_deref(), Some("parameters"));
+        assert!(!d.message.starts_with(code), "{}", d.message);
+    }
+}
