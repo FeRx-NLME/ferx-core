@@ -2290,10 +2290,11 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         // the value both cells read back as, not as text: a consistent bundle
         // writes both with one formatter, but which one depends on its writer
         // (six decimals before #1847, the shortest round-trip text after, R's
-        // own shortest spelling in ferx-r).
+        // own shortest spelling in ferx-r). `+0` and `-0` agree, as in `run_covariance`'s
+        // EBE comparison, and two `NaN`s do.
         let ebe = fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN);
         let mode = parse_or_nan(&fields[4])?;
-        if mode.to_bits() != ebe.to_bits() && !(mode.is_nan() && ebe.is_nan()) {
+        if mode != ebe && !(mode.is_nan() && ebe.is_nan()) {
             let expected_mode = fmt_f64(ebe);
             return Err(FitrxError::Corrupt(format!(
                 "conddist.csv: COND_MODE {:?} for ID {:?} ETA {:?} disagrees with EBE {:?}",
@@ -3879,6 +3880,35 @@ mod tests {
             matches!(&err, FitrxError::Corrupt(m) if m.contains("COND_MODE")),
             "one ULP off: expected COND_MODE mismatch, got {err:?}"
         );
+    }
+
+    /// #2092 review Q1: a `conddist.csv` that ferx-r's `ferx_save_fit` writes loads. R
+    /// spells each double as the shortest of `%.15g` / `%.16g` / `%.17g` that reads back,
+    /// so a value is full precision and an exponent has two digits; the cells below are R's
+    /// own output for these doubles (`Rscript`, `.fitrx_double_text`'s rule). Before #1847
+    /// the check compared that text with the EBE at six decimals, so every R bundle whose
+    /// EBEs were not six-decimal numbers was refused as corrupt. The second CSV is R's `-0`
+    /// against an EBE of `+0`, which agree (review nit). Mutations: compare the text with
+    /// `fmt_f64` → the R-spelling half dies (`e-07` vs `e-7`); compare bits → the `-0` half
+    /// dies; the pre-#1847 six-decimal text compare → the R-spelling half dies.
+    #[test]
+    fn parse_conddist_csv_accepts_r_written_spelling() {
+        let mut fit = minimal_fit_result();
+        fit.subjects[0].eta = DVector::from_vec(vec![0.027974420148319645, 1.2345678901234568e-7]);
+        fit.subjects[1].eta = DVector::from_vec(vec![-0.06290220762098092, 0.0]);
+        let csv = |s2_v: &str| {
+            format!(
+                "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+                 S1,eta_CL,0.11,0.05,0.027974420148319645\n\
+                 S1,eta_V,-0.19,0.06,1.2345678901234568e-07\n\
+                 S2,eta_CL,0.29,0.07,-0.06290220762098092\n\
+                 S2,eta_V,0.41,0.08,{s2_v}\n"
+            )
+        };
+        parse_conddist_csv(&csv("0"), &fit)
+            .unwrap_or_else(|e| panic!("R's full-precision spelling: {e:?}"));
+        parse_conddist_csv(&csv("-0"), &fit)
+            .unwrap_or_else(|e| panic!("R's -0 against an EBE of +0: {e:?}"));
     }
 
     /// #1705: a SIR fit's kappa intervals survive the bundle, per kappa and in
