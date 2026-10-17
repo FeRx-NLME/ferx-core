@@ -339,7 +339,7 @@ A fit that ran SIR records every setting its draws were scored under in `FitResu
 
 The test is by value, so **an explicit default cannot override a non-default record**: `sir_scale = SirScale::Packed` on a fit recorded `natural` reruns `natural`. To force a default, write it into `fit.sir_settings` (or set that field to `None`) before calling. `method` and `interaction` are not part of the record; the scored marginal comes from the fit itself (#1710).
 
-After a `.fitrx` round trip the record is intact, but the bundle stores EBEs at 6 decimals ([#1631](https://github.com/FeRx-NLME/ferx-core/issues/1631)) and they warm-start every draw, so the repeat is close rather than bit-identical: on the bundled warfarin example the ESS moved by 8.5e-11 relative (measured on macOS arm64).
+After a `.fitrx` round trip the record is intact and the EBEs that warm-start every draw are stored exactly, so the repeat is bit-identical too ([#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)). A bundle saved before #1847 stores the EBEs at six decimals, so on such a bundle the repeat is close rather than bit-identical: on the bundled warfarin example the ESS moved by 8.5e-11 relative (measured on macOS arm64).
 
 ### Which objective weights the draws
 
