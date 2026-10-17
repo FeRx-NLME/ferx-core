@@ -181,9 +181,15 @@ Measured on the #904 reprex (split layout, σ started 5.5× low at 0.032), Linux
 | Estimator | ω_RUV | σ | objective |
 |---|---:|---:|---|
 | ferx SAEM (`n_exploration = n_convergence = 1000`, `n_mh_steps = 50`) | 0.269 | 0.174 | IS −2 log L 6866.6 ± 1.2 (K = 20000) |
+| NONMEM 7.6 IMP `EONLY=1` at the ferx SAEM estimates (`ISAMPLE=20000`) | 0.269 | 0.174 | 6869.7 (mean of iterations 2–6, sd 1.2) |
 | NONMEM IMP, as reported in #904 (`run6_imp`) | 0.279 | 0.177 | 6852 |
 | ferx FOCEI | 0.298 | 0.032 | 12039.4523, never leaves the start |
 | NONMEM 7.6 FOCEI, same start | 0.298 | 0.032 | 12039.4523, `MINIMIZATION TERMINATED` at the start |
+
+Scored at the same point, the two engines' importance-sampled objectives agree to
+about 3 units. ferx integrates the FREM covariate etas out analytically
+(`frem_rao_blackwell`) and NONMEM samples them, so the two estimators are not
+identical.
 
 Use **SAEM** (or IMPMAP), and compare fits by the importance-sampled objective
 (`imp_eval_only = true`, `imp_samples = 20000`). The FOCE objective is not a
