@@ -1530,21 +1530,6 @@ fn new_nlopt_state(
     }
 }
 
-/// Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a
-/// gradient-free global pre-search before the local optimizer. Returns
-/// the best point found in the same scaled coordinate system as the
-/// caller's `x0` / `lower_s` / `upper_s`. Falls back with `Err(...)`
-/// when the NLopt build doesn't ship CRS2-LM (a clear-message failure
-/// is more useful than the local optimizer silently using the original
-/// `x0`).
-///
-/// CRS2-LM is a population-based algorithm: it maintains a pool of
-/// `population_size` candidate points (NLopt's default is `10*(n+1)`),
-/// repeatedly drawing new candidates inside the simplex of the best-so-far
-/// points and mutating one at a time. It needs explicit bounds (which
-/// the FOCE outer-loop space provides) and is generally insensitive to
-/// the initial point — useful precisely when our initial point lies in
-/// a bad basin.
 /// The options every inner solve of the global pre-search runs under: the
 /// fit's own, with the inner multi-start switched off.
 ///
@@ -1563,6 +1548,21 @@ fn presearch_probe_options(options: &FitOptions) -> FitOptions {
     }
 }
 
+/// Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a
+/// gradient-free global pre-search before the local optimizer. Returns
+/// the best point found in the same scaled coordinate system as the
+/// caller's `x0` / `lower_s` / `upper_s`. Falls back with `Err(...)`
+/// when the NLopt build doesn't ship CRS2-LM (a clear-message failure
+/// is more useful than the local optimizer silently using the original
+/// `x0`).
+///
+/// CRS2-LM is a population-based algorithm: it maintains a pool of
+/// `population_size` candidate points (NLopt's default is `10*(n+1)`),
+/// repeatedly drawing new candidates inside the simplex of the best-so-far
+/// points and mutating one at a time. It needs explicit bounds (which
+/// the FOCE outer-loop space provides) and is generally insensitive to
+/// the initial point — useful precisely when our initial point lies in
+/// a bad basin.
 fn run_global_presearch(
     model: &CompiledModel,
     population: &Population,
