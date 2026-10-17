@@ -66,10 +66,11 @@ pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub(crate) use entry_refusals::{
     adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
-    fit_input_model, logit_theta_out_of_range, param_shape, sir_nothing_to_sample, sir_options,
-    theta_length,
+    fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
+    sir_nothing_to_sample, sir_options, theta_length,
 };
 pub use fit::{fit, fit_from_files};
+pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
@@ -474,3 +475,7 @@ mod adaptive_snapshot_verify_tests;
 #[cfg(test)]
 #[path = "tests/param_shape_gate_tests.rs"]
 mod param_shape_gate_tests;
+
+#[cfg(test)]
+#[path = "tests/nested_levels_output_tests.rs"]
+mod nested_levels_output_tests;

@@ -7386,6 +7386,37 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     }
 }
 
+/// The κ̂ of one level of a model with nested levels (#1082 PR4), in
+/// [`FitResult::ebe_kappas_by_level`].
+///
+/// A κ at a level is drawn once per group of it and shared by every record of the
+/// group: one study κ for all arms of a study. `groups[i]` lists subject `i`'s groups of
+/// this level in the order their first record appears, each with its label path and its
+/// κ̂ — the same values [`FitResult::ebe_kappas`] repeats once per cell.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct LevelKappaEbes {
+    /// The level's name (`level STUDY by …`).
+    pub level: String,
+    /// The data columns of this level's label path, outermost level first, ending with
+    /// this level's own column: `["STUDY", "ARM"]` for an arm inside a study. Under
+    /// nesting by key a group is named by the whole path, since `ARM = 1` labels an arm
+    /// in every study.
+    pub columns: Vec<String>,
+    /// The kappas that live at this level, in declaration order.
+    pub kappa_names: Vec<String>,
+    /// Per subject (parallel to [`FitResult::subjects`]), per group of this level.
+    pub groups: Vec<Vec<LevelGroupEbe>>,
+}
+
+/// One group's κ̂ in a [`LevelKappaEbes`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct LevelGroupEbe {
+    /// The group's label in each of [`LevelKappaEbes::columns`].
+    pub labels: Vec<f64>,
+    /// κ̂ of each of [`LevelKappaEbes::kappa_names`].
+    pub kappa: Vec<f64>,
+}
+
 /// Full fit result
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct FitResult {
@@ -7574,8 +7605,24 @@ pub struct FitResult {
     /// Per-subject, per-occasion kappa EBEs.
     /// `ebe_kappas[i][k]` is the kappa vector for subject i, occasion k.
     /// Outer vec is empty when `n_kappa == 0`.
+    ///
+    /// Under nested levels (#1082) `k` is the occasion **cell** — one combination of
+    /// labels, one arm of one study — and the vector is the κ that cell reads, so a
+    /// study κ̂ appears once per arm. [`Self::ebe_kappas_by_level`] holds each κ̂ once,
+    /// per group of its own level.
     #[serde(with = "crate::serde_nalgebra::vec_vec_dvector")]
     pub ebe_kappas: Vec<Vec<DVector<f64>>>,
+    /// The level each kappa lives at, parallel to `kappa_names`, for a model with
+    /// nested levels (#1082): `kappa K_ST … at STUDY` gives `"STUDY"`. Empty for every
+    /// other model, including a single `level` (today's IOV), so their output is
+    /// unchanged. The KAPPA rows print it as `at STUDY`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kappa_levels: Vec<String>,
+    /// The κ̂ of a model with nested levels, one entry per level, outermost first
+    /// (#1082 PR4): each group's κ̂ once, with the labels that name the group. Empty
+    /// for every other model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ebe_kappas_by_level: Vec<LevelKappaEbes>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
     pub saem_mu_ref_m_step_evals_saved: Option<u64>,

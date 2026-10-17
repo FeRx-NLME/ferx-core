@@ -64,7 +64,7 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
 /// so a model covariate absent from the data read as `0.0` and the run returned
 /// `Ok` — the frozen-replay verifier passed too, since it replays the same
 /// snapshots (#1571).
-fn check_adaptive_model_data(
+pub(crate) fn check_adaptive_model_data(
     model: &CompiledModel,
     population: &Population,
 ) -> Result<(), EngineError> {

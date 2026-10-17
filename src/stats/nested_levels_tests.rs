@@ -217,3 +217,91 @@ fn obs_groups_at_keys_a_group_by_its_whole_path() {
     // ...and its label says which study: `B 1` alone would name an arm in both.
     assert_eq!(b[2], ("A 2 / B 1".into(), vec![3]));
 }
+
+// ── the per-level κ draw (#1082 PR4) ─────────────────────────────────────────────
+
+/// Cells in group order: (1,1) (1,2) (2,1) (2,2) (1,3). Study of each cell, and the
+/// cells that are one arm each.
+const CELL_STUDY: [usize; 5] = [0, 0, 1, 1, 0];
+
+fn draw_once(seed: u64) -> Vec<Vec<f64>> {
+    use rand::SeedableRng;
+    let (m, p) = prepared();
+    let n = NestedLayout::of(&m, &p.subjects[0]).unwrap();
+    let chol = omega_iov().cholesky().unwrap().l();
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    n.draw(&chol, normal, &mut rand::rngs::StdRng::seed_from_u64(seed))
+}
+
+/// Level A's κ (K1) is one draw per study, read by every arm of that study; level B's
+/// (K0, K2) one per arm. Each half fails on its own level's mutation: a study κ drawn
+/// per cell breaks the first, an arm κ drawn once per level (or per study) the second.
+#[test]
+fn the_draw_shares_each_kappa_inside_its_own_level_group_only() {
+    let cells = draw_once(7);
+    assert_eq!(cells.len(), 5);
+    for g in 0..5 {
+        for h in 0..5 {
+            let same_study = CELL_STUDY[g] == CELL_STUDY[h];
+            assert_eq!(
+                cells[g][1] == cells[h][1],
+                same_study,
+                "level A (STUDY): K1 of cells {g} and {h} must agree exactly when they share a \
+                 study: {:?}",
+                cells.iter().map(|c| c[1]).collect::<Vec<_>>()
+            );
+            for k in [0, 2] {
+                assert_eq!(
+                    cells[g][k] == cells[h][k],
+                    g == h,
+                    "level B (ARM): K{k} of cells {g} and {h} must differ between arms: {:?}",
+                    cells.iter().map(|c| c[k]).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+/// Each level's κ has its own level's covariance: var K1 = 0.3 (level A), var K0 = 0.2,
+/// var K2 = 0.4 and cov(K0, K2) = 0.05 (level B, from `L_B`, the rows and columns of the
+/// full factor at K0, K2). Over 20 000 seeded draws (seed 1082) the realised relative
+/// errors are 0.49% (var K1), 0.76% (var K0), 0.87% (var K2) and 0.89% (cov, on the
+/// scale of var K0); the bound, 5%, is 5.6× the worst, and five standard errors of a
+/// variance from 20 000 normal draws (√(2/20000) = 1%). A level drawn from the wrong rows
+/// of the factor, or from the identity, misses a variance by ≥ 25%.
+#[test]
+fn each_level_s_draw_has_its_own_level_s_covariance() {
+    use rand::SeedableRng;
+    let (m, p) = prepared();
+    let n = NestedLayout::of(&m, &p.subjects[0]).unwrap();
+    let chol = omega_iov().cholesky().unwrap().l();
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1082);
+    let n_draw = 20_000;
+    let (mut s00, mut s11, mut s22, mut s02) = (0.0, 0.0, 0.0, 0.0);
+    for _ in 0..n_draw {
+        let c = n.draw(&chol, normal, &mut rng);
+        // Study 2's K1 (cell 2) and arm (2,2)'s K0, K2 (cell 3).
+        s11 += c[2][1] * c[2][1];
+        s00 += c[3][0] * c[3][0];
+        s22 += c[3][2] * c[3][2];
+        s02 += c[3][0] * c[3][2];
+    }
+    let f = n_draw as f64;
+    let got = [
+        ("level A var K1", s11 / f, 0.3),
+        ("level B var K0", s00 / f, 0.2),
+        ("level B var K2", s22 / f, 0.4),
+        ("level B cov K0 K2", s02 / f, 0.05),
+    ];
+    for (what, v, want) in got {
+        assert!(v.is_finite(), "{what}: {v}");
+        // The covariance is small; compare it on the scale of its variances.
+        let scale = if what.contains("cov") { 0.2 } else { want };
+        eprintln!(
+            "{what}: realised relative error {:.4}",
+            ((v - want) / scale).abs()
+        );
+        assert!(((v - want) / scale).abs() < 0.05, "{what}: {v} vs {want}");
+    }
+}

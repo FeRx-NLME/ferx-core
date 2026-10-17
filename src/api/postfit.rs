@@ -967,14 +967,57 @@ pub(crate) fn kappa_weight_typicals(
     model
         .kappa_weights
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(k, w)| {
             let w = w.as_ref()?;
             let mut vals: Vec<f64> = Vec::new();
             for subj in &population.subjects {
-                for (_occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
-                    let (cov, time) = match obs_idx.first() {
+                let cells = crate::stats::likelihood::iov_occasion_groups(subj);
+                // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
+                // level, so one weight is taken per group: its first cell with an
+                // observation (`W` is constant within the group, or the data check
+                // warned). Without levels every cell is its own group.
+                let groups: Vec<Vec<usize>> =
+                    match crate::stats::nested_levels::NestedLayout::of(model, subj) {
+                        Some(layout) if layout.n_cells() == cells.len() => {
+                            let l = model.nested_levels().map_or(0, |n| n.kappa_level[k]);
+                            let mut groups = vec![Vec::new(); layout.level_count(l)];
+                            for g in 0..cells.len() {
+                                groups[layout.cell_group(g, l)].push(g);
+                            }
+                            groups
+                        }
+                        _ => (0..cells.len()).map(|g| vec![g]).collect(),
+                    };
+                for group in groups {
+                    let first_obs = group.iter().find_map(|&g| cells[g].1.first());
+                    // A group with no observation: under nested levels its own record — an
+                    // `MDV = 1` row, then a dose — since a whole study can be such a group
+                    // and the subject's covariates are another group's (review r1 #5).
+                    // One-level IOV keeps the subject's covariates, as before.
+                    let own_record = || {
+                        if !model.has_nested_levels() {
+                            return None;
+                        }
+                        let occs: Vec<u32> = group.iter().map(|&g| cells[g].0).collect();
+                        let pk_only = (0..subj.pk_only_times.len())
+                            .find(|&m| {
+                                subj.pk_only_occasions
+                                    .get(m)
+                                    .is_some_and(|o| occs.contains(o))
+                            })
+                            .map(|m| (subj.pk_only_cov(m), subj.param_time_pk_only(m)));
+                        pk_only.or_else(|| {
+                            (0..subj.doses.len())
+                                .find(|&d| {
+                                    subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
+                                })
+                                .map(|d| (subj.dose_cov(d), subj.param_time_at(subj.doses[d].time)))
+                        })
+                    };
+                    let (cov, time) = match first_obs {
                         Some(&j) => (subj.obs_cov(j), subj.param_time_obs(j)),
-                        None => (&subj.covariates, 0.0),
+                        None => own_record().unwrap_or((&subj.covariates, 0.0)),
                     };
                     let v = (w.eval)(theta, cov, time);
                     if v.is_finite() {
@@ -1013,11 +1056,19 @@ fn informed_kappas<'a>(
 /// `1 - sqrt(mean(κ̂²)) / sqrt(var)` over `kappas` for kappa `k`; NaN when `var` is
 /// non-positive or fewer than two vectors are pooled.
 fn kappa_shrinkage_over(kappas: &[&DVector<f64>], var: f64, k: usize) -> f64 {
-    let n = kappas.len();
+    let vals: Vec<f64> = kappas.iter().map(|kv| kv[k]).collect();
+    shrinkage_of(&vals, var)
+}
+
+/// `1 - sqrt(mean(v²)) / sqrt(var)` over `vals`; NaN when `var` is non-positive or fewer
+/// than two values are pooled. The one shrinkage formula of the κ pools, per cell and
+/// per level (#1082 PR4).
+fn shrinkage_of(vals: &[f64], var: f64) -> f64 {
+    let n = vals.len();
     if var <= 0.0 || n < 2 {
         return f64::NAN;
     }
-    let ms = kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+    let ms = vals.iter().map(|v| v.powi(2)).sum::<f64>() / n as f64;
     1.0 - ms.sqrt() / var.sqrt()
 }
 
@@ -1066,6 +1117,107 @@ pub(crate) fn kappa_shrinkages(
         compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
         compute_kappa_shrinkage_by_occ(kappas_per_subject, &informed, omega_iov),
     )
+}
+
+/// The per-level κ facts of a fit of a model with nested levels (#1082 PR4), read off
+/// the per-cell κ̂ (`kappas_per_subject`, parallel to each subject's cells):
+///
+/// - `kappa_levels`: each κ's level name, parallel to `kappa_names`;
+/// - `by_level`: each level's κ̂ once per group, with the group's labels
+///   ([`crate::LevelKappaEbes`]);
+/// - `shrinkage`: each κ's shrinkage pooled over the **groups of its own level**, not
+///   the cells. A study κ̂ is one value per study, read by every arm; pooled over cells
+///   it would be counted once per arm. Only informed groups count (#1911): a group is
+///   informed when one of its cells is ([`crate::stats::likelihood::iov_group_informed`]),
+///   since every cell of the group reads the same κ.
+///
+/// `None` for a model without nested levels; a subject without a layout or with a κ̂
+/// list of the wrong length contributes nothing.
+pub(crate) struct NestedKappaFacts {
+    pub(crate) kappa_levels: Vec<String>,
+    pub(crate) by_level: Vec<crate::types::LevelKappaEbes>,
+    pub(crate) shrinkage: Vec<f64>,
+}
+
+pub(crate) fn nested_kappa_facts(
+    model: &CompiledModel,
+    population: &Population,
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Option<NestedKappaFacts> {
+    use crate::stats::nested_levels::NestedLayout;
+    let levels = model.nested_levels()?;
+    let kappa_levels: Vec<String> = levels
+        .kappa_level
+        .iter()
+        .map(|&l| levels.levels[l].name.clone())
+        .collect();
+    let mut by_level: Vec<crate::types::LevelKappaEbes> = levels
+        .levels
+        .iter()
+        .enumerate()
+        .map(|(l, level)| crate::types::LevelKappaEbes {
+            level: level.name.clone(),
+            columns: levels.levels[..=l]
+                .iter()
+                .map(|x| x.column.clone())
+                .collect(),
+            kappa_names: (0..model.n_kappa)
+                .filter(|&k| levels.kappa_level[k] == l)
+                .map(|k| model.kappa_names[k].clone())
+                .collect(),
+            groups: Vec::with_capacity(population.subjects.len()),
+        })
+        .collect();
+    // Per κ, the informed groups' κ̂ of its level, pooled over subjects.
+    let mut pooled: Vec<Vec<f64>> = vec![Vec::new(); model.n_kappa];
+    for (i, subj) in population.subjects.iter().enumerate() {
+        let cells = kappas_per_subject.get(i);
+        let layout =
+            NestedLayout::of(model, subj).filter(|n| cells.is_some_and(|c| c.len() == n.n_cells()));
+        let (Some(layout), Some(cells)) = (layout, cells) else {
+            for entry in &mut by_level {
+                entry.groups.push(Vec::new());
+            }
+            continue;
+        };
+        let informed = crate::stats::likelihood::iov_group_informed(subj, !model.is_algebraic());
+        for (l, entry) in by_level.iter_mut().enumerate() {
+            let ks = layout.kappas_at(l);
+            let mut group_informed = vec![false; layout.level_count(l)];
+            for g in 0..layout.n_cells() {
+                if informed.get(g).copied().unwrap_or(true) {
+                    group_informed[layout.cell_group(g, l)] = true;
+                }
+            }
+            let groups = layout
+                .first_cells(l)
+                .into_iter()
+                .enumerate()
+                .map(|(gi, g)| {
+                    let kappa: Vec<f64> = ks.iter().map(|&k| cells[g][k]).collect();
+                    if group_informed[gi] {
+                        for (&k, &v) in ks.iter().zip(&kappa) {
+                            pooled[k].push(v);
+                        }
+                    }
+                    crate::types::LevelGroupEbe {
+                        labels: layout.labels(g, l),
+                        kappa,
+                    }
+                })
+                .collect();
+            entry.groups.push(groups);
+        }
+    }
+    let shrinkage = (0..model.n_kappa)
+        .map(|k| shrinkage_of(&pooled[k], omega_iov[(k, k)]))
+        .collect();
+    Some(NestedKappaFacts {
+        kappa_levels,
+        by_level,
+        shrinkage,
+    })
 }
 
 /// Kappa shrinkage broken out by occasion index.

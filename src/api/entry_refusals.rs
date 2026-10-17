@@ -58,17 +58,46 @@ pub(crate) fn observe_covariate_missing(message: impl Into<String>) -> EngineErr
 }
 
 /// `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: a model with nested levels (more than one
-/// `level`, #1082) reached a `simulate*` or adaptive entry point, which draw one κ per
-/// occasion and have no per-level draw yet.
+/// `level`, #1082) reached an adaptive-dosing entry point, whose seeded κ stream draws
+/// one κ per occasion and has no per-level draw yet. `simulate*` draws per level since
+/// #1082 PR4.
 pub(crate) fn nested_level_simulate_unsupported() -> EngineError {
     coded(
         "E_NESTED_LEVEL_SIMULATE_UNSUPPORTED",
         Some("parameters"),
-        "simulation does not yet support nested levels (more than one `level`): it draws \
-         one kappa per occasion, and a kappa at an outer level must be drawn once per group \
-         and shared by the groups inside it. Fit the model; simulate from it in a later \
-         release."
+        "adaptive dosing does not yet support nested levels (more than one `level`): it \
+         draws one kappa per occasion, and a kappa at an outer level must be drawn once per \
+         group and shared by the groups inside it. `simulate()` and \
+         `simulate_with_uncertainty()` support the model."
             .to_string(),
+    )
+}
+
+/// `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED` on a `simulate*` entry point: a nested model
+/// with a residual `correlation … by` line, which `fit()` refuses too (#1082 PR5).
+pub(crate) fn nested_level_correlation_unsupported() -> EngineError {
+    coded(
+        "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED",
+        Some("error_model"),
+        "a residual `correlation … by` line is not yet supported on a model with nested \
+         levels (more than one `level`), in simulation as in the fit. Simulate the levels \
+         without it, or the correlation with a single level."
+            .to_string(),
+    )
+}
+
+/// `E_LEVEL_MIXED_WITH_IOV_COLUMN` on a `simulate*` entry point: a derived `iov_occasion`
+/// rule handed with a nested model, whose groups are its level cells (#1082 PR4). `fit()`
+/// refuses the same rule.
+pub(crate) fn level_mixed_with_iov_rule(first_level: &str) -> EngineError {
+    coded(
+        "E_LEVEL_MIXED_WITH_IOV_COLUMN",
+        Some("fit_options"),
+        format!(
+            "the simulate options set `iov_occasion` on a model that declares `level \
+             {first_level}`. The levels already define the groups; leave `iov_occasion` unset \
+             (or `column`)."
+        ),
     )
 }
 
