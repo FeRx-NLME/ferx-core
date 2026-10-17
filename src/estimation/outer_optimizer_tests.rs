@@ -3546,6 +3546,98 @@ fn global_presearch_branch_runs_or_warns() {
     assert_eq!(result.covariance_wall_time_secs, 0.0);
 }
 
+/// #2014 review: every global pre-search solve starts from all-zero EBEs, which the
+/// inner loop treats as cold, so without `presearch_probe_options` each CRS2-LM probe
+/// runs the guarded multi-start (10× the pre-search on `examples/schnider.ferx`). The
+/// pre-search must run none. The other side of the gate is the same all-zero solve
+/// under the fit's own options, which must multi-start on this fixture; otherwise the
+/// zero count would hold for a fixture that never reaches the gate.
+#[test]
+fn global_presearch_probes_skip_the_inner_multistart() {
+    use crate::estimation::inner_optimizer::{EBE_MULTISTARTS_STARTED, EBE_SOLVES_STARTED};
+    use crate::types::{EstimationMethod, FitOptions};
+    let model = make_model();
+    let population = make_population(4);
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        global_search: true,
+        global_maxeval: 8,
+        inner_restarts: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = &model.default_params;
+    let x0 = pack_params(init);
+    let bounds = compute_bounds(init);
+    let scale = vec![1.0; x0.len()];
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let counts = || {
+        (
+            EBE_SOLVES_STARTED.with(|n| n.get()),
+            EBE_MULTISTARTS_STARTED.with(|n| n.get()),
+        )
+    };
+
+    let (pre, solves, multistarts) = pool.install(|| {
+        let (s0, m0) = counts();
+        let pre = run_global_presearch(
+            &model,
+            &population,
+            init,
+            &opts,
+            &scale,
+            &bounds.lower,
+            &bounds.upper,
+            &x0,
+        );
+        let (s1, m1) = counts();
+        (pre, s1 - s0, m1 - m0)
+    });
+    if let Err(e) = pre {
+        // The linked NLopt has no CRS2-LM; `global_presearch_branch_runs_or_warns`
+        // covers that arm.
+        eprintln!("skipped: {e}");
+        return;
+    }
+    // The initial-point evaluation plus 8 probes, one solve per subject each.
+    assert_eq!(
+        solves,
+        9 * population.subjects.len(),
+        "pre-search solve count"
+    );
+    assert_eq!(
+        multistarts, 0,
+        "a pre-search probe ran the inner multi-start"
+    );
+
+    let fit_side = pool.install(|| {
+        let (_, m0) = counts();
+        let zeros = vec![DVector::zeros(model.n_eta); population.subjects.len()];
+        let mu_k = compute_mu_k(&model, &init.theta, opts.mu_referencing);
+        let _ = run_inner_loop_and_nll(
+            &model,
+            &population,
+            init,
+            &opts,
+            Some(&zeros),
+            Some(&mu_k),
+            None,
+            None,
+        );
+        counts().1 - m0
+    });
+    assert_eq!(
+        fit_side,
+        population.subjects.len(),
+        "an all-zero solve under the fit's own options must multi-start every subject"
+    );
+}
+
 // ── Covariance Hessian throughput benchmark (issue #209) ─────────────────
 //
 // Run with:  cargo test --lib --no-default-features --features ci \

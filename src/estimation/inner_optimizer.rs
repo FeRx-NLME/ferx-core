@@ -1651,6 +1651,14 @@ thread_local! {
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Solves on this thread that entered the guarded cold-start multi-start in `find_ebe_solve`,
+// so a test can observe which callers pay for it (#2014 review).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
 /// fit, for reuse across every outer-loop evaluation via [`find_ebe_cached`]. Mirrors the
 /// once-per-population `schedules` cache `bayes.rs`'s chain loop already builds — the schedule
@@ -1746,7 +1754,7 @@ fn find_ebe_impl(
     //
     // An all-zero "warm" start is a cold placeholder (the outer loop's first evaluation and
     // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
-    let genuinely_warm = eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0));
+    let genuinely_warm = is_warm_start(eta_init);
     let normal = solve(false).expect("an unforced solve always returns a result");
     if genuinely_warm || policy.seed == InnerHessianSeed::None {
         return normal;
@@ -1755,6 +1763,16 @@ fn find_ebe_impl(
         Some(seeded) if seeded.nll + COLD_SEED_TIE_TOL < normal.nll => seeded,
         _ => normal,
     }
+}
+
+/// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
+/// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
+/// pre-flight solve and `freeze_flat_thetas` pass zeros as a placeholder for "no previous
+/// mode", so testing `is_none()` alone misreads every one of them as warm. The guarded
+/// multi-start did exactly that until #2014, and never ran before an estimating fit's final
+/// cold re-solve. Every cold/warm decision in the inner solve goes through this one test.
+fn is_warm_start(eta_init: Option<&[f64]>) -> bool {
+    eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0))
 }
 
 /// Minimum objective improvement for a cold seeded solve to replace the unseeded one (see
@@ -1996,7 +2014,7 @@ fn find_ebe_solve(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
-    let warm_start = eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0));
+    let warm_start = is_warm_start(eta_init);
     let seed =
         (seed_kind != InnerHessianSeed::None && dense_bfgs_route && (warm_start || cold_seed))
             .then(|| {
@@ -2136,16 +2154,28 @@ fn find_ebe_solve(
     //      scan only it.
     // When `inner_restarts > 0` a scanned coordinate re-solves from `inner_restarts`
     // Ω-scaled alternate seeds (`±2·sd`, `±3·sd`, …) and keeps the lowest-objective
-    // mode. Gated on a COLD start (`eta_init.is_none()`): the outer loop warm-starts
+    // mode. Gated on a COLD start (`!is_warm_start`: no `eta_init`, or the all-zero
+    // placeholder the outer loop's first evaluation passes): the outer loop warm-starts
     // the inner EBE from the previous iteration's mode, so once the basin is picked at
     // iteration 0 the warm start carries it forward — no re-scan every outer eval
-    // (~12× slower). One multi-start per subject per fit.
+    // (~12× slower). So the scan runs on each cold solve only: the pre-flight
+    // (`freeze_flat_thetas`), the first evaluation of each optimizer leg (a #1565 basin
+    // restart is a new leg, from a fresh all-zero cache) and the final cold re-solve, each
+    // under both Hessian metrics when the policy is seeded (`find_ebe_impl`) — six scans
+    // per subject per fit on `examples/schnider.ferx`, measured, with no restart. The
+    // `global_search` pre-search's probes start from zeros too, but run with
+    // `inner_restarts = 0` (`presearch_probe_options`). A subject whose η̂ is
+    // exactly zero (no observations: the prior alone) hands zeros back as its next start,
+    // so it is re-scanned each evaluation; its seeds solve the prior's quadratic and
+    // reconverge to zero.
     // An alternate seed replaces the warm-start mode only when it reaches a
     // meaningfully lower objective (`cand_nll + 1e-9 < nll`); a seed that merely
     // reconverges to the same basin is rejected by that guard. So a scanned
     // coordinate's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
     // strictly better mode.
-    if restarts > 0 && eta_init.is_none() {
+    if restarts > 0 && !is_warm_start(eta_init) {
+        #[cfg(test)]
+        EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         // Reset / TV-covariate subjects (family 1) scan every coordinate, exactly
         // as before — bit-identical. Everyone else (family 2) is probed per
         // coordinate and scans only the weakly-identified ones, so well-informed

@@ -538,11 +538,11 @@ fn evaluate_at_initial_params(
     } else {
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         // Genuine cold start: an eval-only run has no warm EBE history, so pass
-        // `None` (not `Some(zeros)`). Both seed the inner search at η = 0, but `None`
-        // is what marks this as a cold start to the guarded multi-start inner EBE
-        // (`inner_restarts`), so a subject with a multimodal individual posterior —
-        // system resets / TV-covariates, or a weakly-identified random effect (#891)
-        // — is re-seeded here instead of silently reporting a sub-optimal mode. This
+        // `None`. The inner solve treats `None` and `Some(zeros)` alike as cold (#2014),
+        // so the guarded multi-start inner EBE (`inner_restarts`) runs here exactly as on
+        // an estimating fit's first evaluation: a subject with a multimodal individual
+        // posterior — system resets / TV-covariates, or a weakly-identified random effect
+        // (#891) — is re-seeded instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
         let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm_seeded(
             model,
@@ -1530,6 +1530,24 @@ fn new_nlopt_state(
     }
 }
 
+/// The options every inner solve of the global pre-search runs under: the
+/// fit's own, with the inner multi-start switched off.
+///
+/// Every pre-search solve starts from all-zero EBEs, which the inner loop
+/// treats as cold (#2014), so each of the `30·(n+1)` probes would otherwise
+/// run the guarded multi-start: 10× the pre-search's wall time on
+/// `examples/schnider.ferx` with `global_search = true`. The pre-search only
+/// ranks points for the local optimizer, whose own first evaluation
+/// multi-starts at the point it picks. So the probes, and the initial-point
+/// evaluation they are compared against, solve from η = 0 alone, as they did
+/// before #2014.
+fn presearch_probe_options(options: &FitOptions) -> FitOptions {
+    FitOptions {
+        inner_restarts: 0,
+        ..options.clone()
+    }
+}
+
 /// Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a
 /// gradient-free global pre-search before the local optimizer. Returns
 /// the best point found in the same scaled coordinate system as the
@@ -1588,6 +1606,9 @@ fn run_global_presearch(
                 .into(),
         );
     }
+
+    let probe_options = presearch_probe_options(options);
+    let options = &probe_options;
 
     let n_evals = Arc::new(AtomicUsize::new(0));
     let n_evals_cl = Arc::clone(&n_evals);
