@@ -3108,7 +3108,8 @@ fn cli_simulate_draws_kappa_under_the_model_files_rule() {
         let (result, population) = crate::api::run_model_simulate_with_overrides(
             path.to_str().unwrap(),
             &crate::api::RunOverrides::default(),
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         let found: Vec<String> = result
             .warnings
             .iter()
