@@ -98,7 +98,15 @@ fn eta_ka(result: &FitResult, id: &str) -> f64 {
     s.eta[2]
 }
 
+// A fit to convergence, so nightly. The same mutation (the gate reverted to
+// `eta_init.is_none()`) also kills two per-PR Tier-1 tests in `estimation::inner_optimizer`
+// and `estimation::outer_optimizer`: `an_all_zero_start_runs_the_guarded_multistart_like_none`
+// and `global_presearch_probes_skip_the_inner_multistart`.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn estimating_fit_multistarts_on_its_first_evaluation() {
     let fixed = run(1);
     let start_dependent: Vec<&String> = fixed

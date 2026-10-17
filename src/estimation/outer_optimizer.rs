@@ -1545,6 +1545,24 @@ fn new_nlopt_state(
 /// the FOCE outer-loop space provides) and is generally insensitive to
 /// the initial point — useful precisely when our initial point lies in
 /// a bad basin.
+/// The options every inner solve of the global pre-search runs under: the
+/// fit's own, with the inner multi-start switched off.
+///
+/// Every pre-search solve starts from all-zero EBEs, which the inner loop
+/// treats as cold (#2014), so each of the `30·(n+1)` probes would otherwise
+/// run the guarded multi-start: 10× the pre-search's wall time on
+/// `examples/schnider.ferx` with `global_search = true`. The pre-search only
+/// ranks points for the local optimizer, whose own first evaluation
+/// multi-starts at the point it picks. So the probes, and the initial-point
+/// evaluation they are compared against, solve from η = 0 alone, as they did
+/// before #2014.
+fn presearch_probe_options(options: &FitOptions) -> FitOptions {
+    FitOptions {
+        inner_restarts: 0,
+        ..options.clone()
+    }
+}
+
 fn run_global_presearch(
     model: &CompiledModel,
     population: &Population,
@@ -1588,6 +1606,9 @@ fn run_global_presearch(
                 .into(),
         );
     }
+
+    let probe_options = presearch_probe_options(options);
+    let options = &probe_options;
 
     let n_evals = Arc::new(AtomicUsize::new(0));
     let n_evals_cl = Arc::clone(&n_evals);
