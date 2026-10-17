@@ -4628,6 +4628,10 @@ fn dense_bfgs_core(
         // cannot bring it back to O(1) (#2080). Retry once from the preconditioned metric
         // scaled by 1/‖g‖, the scaling the identity path already gets. Only a solve that
         // would otherwise fail here takes it, so every succeeding solve keeps its path.
+        // ‖g‖ is `gnorm`, the stopping metric: the raw L2 norm on a general fit, but on FREM
+        // (`stop_precond` is `Some`) the Ω-weighted √(Σ gᵢ²·pᵢ). There both the `> 1` gate
+        // and the scale use it, so the retry's step is unit length in the Ω⁻¹ metric rather
+        // than 1/‖g‖₂. No FREM fixture reaches this retry.
         if alpha == 0.0 && !rescaled_retry_used && seed_inv.is_none() && gnorm > 1.0 {
             rescaled_retry_used = true;
             #[cfg(test)]

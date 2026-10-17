@@ -4826,19 +4826,31 @@ fn far_seed_whose_line_search_succeeds_takes_no_retry() {
 /// search fails. The retry fires once per solve (the second failure returns `false`), only
 /// when ‖g‖ > 1 (below that, 1/‖g‖ would lengthen the step), and never under an accepted
 /// Hessian seed, which already carries the curvature's scale.
+///
+/// The preconditioner is non-uniform and the gradient has both components non-zero, so the
+/// retry's first trial point (α = 1) pins the step itself: exactly `−precond ⊙ g / ‖g‖₂`.
+/// A retry scaled by 1/‖g‖², one that drops the preconditioner, or one that divides by the
+/// Ω-weighted norm (√(Σ gᵢ²·pᵢ) = 3162.3 here, against ‖g‖₂ = 2500) each lands elsewhere,
+/// and so does a fixed scale: ‖g‖₂ is kept off a power of ten so 1/‖g‖ is not a round number.
 #[test]
 fn rescaled_retry_fires_once_only_for_a_large_gradient_and_no_seed() {
+    let trials = std::cell::RefCell::new(Vec::<Vec<f64>>::new());
     let obj = |x: &[f64]| -> f64 {
+        trials.borrow_mut().push(x.to_vec());
         if x.iter().all(|v| *v == 0.0) {
             1.0
         } else {
             f64::INFINITY
         }
     };
-    let precond = [1.0, 1.0];
+    let precond = [4.0, 0.25];
+    // A gradient along (0.6, 0.8), so ‖g‖₂ = gscale exactly.
+    let gradient = |gscale: f64| vec![0.6 * gscale, 0.8 * gscale];
     let run = |gscale: f64, seed: Option<&DMatrix<f64>>| -> usize {
-        let grad = move |_: &[f64]| -> Vec<f64> { vec![gscale, 0.0] };
+        let g0 = gradient(gscale);
+        let grad = move |_: &[f64]| -> Vec<f64> { g0.clone() };
         let mut x = vec![0.0, 0.0];
+        trials.borrow_mut().clear();
         BFGS_RESCALED_RETRIES.with(|c| c.set(0));
         let ok = dense_bfgs_core(
             &obj,
@@ -4861,7 +4873,19 @@ fn rescaled_retry_fires_once_only_for_a_large_gradient_and_no_seed() {
         );
         BFGS_RESCALED_RETRIES.with(|c| c.get())
     };
-    assert_eq!(run(1e3, None), 1, "‖g‖ > 1, no seed: exactly one retry");
+    assert_eq!(run(2.5e3, None), 1, "‖g‖ > 1, no seed: exactly one retry");
+    // Point 0 is the start's objective, then the first line search's trials, all rejected.
+    // The next point is the retry's first trial, at α = 1.
+    let g = gradient(2.5e3);
+    let gnorm = (g[0] * g[0] + g[1] * g[1]).sqrt();
+    let want: Vec<f64> = (0..2)
+        .map(|i| -((precond[i] * (1.0 / gnorm)) * g[i]))
+        .collect();
+    let first_retry_trial = trials.borrow()[1 + inner_line_search_trials(false)].clone();
+    assert_eq!(
+        first_retry_trial, want,
+        "the retry's first step must be −precond ⊙ g / ‖g‖₂ = (−0.96, −0.08)"
+    );
     assert_eq!(run(0.5, None), 0, "‖g‖ < 1: no retry");
     let seed = DMatrix::<f64>::identity(2, 2);
     assert_eq!(
