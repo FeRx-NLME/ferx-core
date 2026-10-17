@@ -6443,6 +6443,59 @@ fn covariate_mu_ref_sees_through_a_min_or_max_of_a_local() {
     }
 }
 
+/// A folded `if` whose condition is compound — `&&`, `||`, `!` and
+/// `present(...)` over locals — is substituted operand by operand through
+/// every connective. The typical value must equal the model's own `CL` on a
+/// grid that flips each sub-condition, so a connective rebuilt as another, an
+/// operand left unsubstituted (a local read as 0), or a `present` dropped
+/// changes the value at some point. `present` reads a *local*: left
+/// unsubstituted, `C` evaluates as 0, which is present, so a missing `CRCL`
+/// at `WT` 60 would take the raised arm. `AGE` is read only under the `!`. `AGE` and `CRCL` reach the group only
+/// through the condition, so the covariate list also pins that the summary
+/// walks every connective.
+#[test]
+fn covariate_mu_ref_substitutes_through_a_compound_condition() {
+    let src = "\
+A = WT / 70
+B = AGE * 1
+C = CRCL * 1
+if (((A > 1) && !(B < 18)) || (present(C) && (A < 0.9))) {
+  F = 1.2
+} else {
+  F = 1.0
+}
+CL = TVCL * F * (WT / 70) ^ TH_WT * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    for c in ["WT", "AGE", "CRCL"] {
+        assert!(
+            g[0].covariate_names.iter().any(|n| n == c),
+            "{c} in {:?}",
+            g[0].covariate_names
+        );
+    }
+    let theta = [5.0, 0.75];
+    let (mut raised, mut plain) = (0, 0);
+    for wt in [60.0, 80.0] {
+        for age in [10.0, 30.0] {
+            for crcl in [f64::NAN, 100.0] {
+                let covs = [("WT", wt), ("AGE", age), ("CRCL", crcl)];
+                let want = block_value(&stmts, &theta, &covs, "CL");
+                let f = block_value(&stmts, &theta, &covs, "F");
+                if f == 1.2 {
+                    raised += 1;
+                } else {
+                    plain += 1;
+                }
+                assert!(want.is_finite(), "{covs:?}: {want}");
+                assert_eq!(group_typical(&g[0], &theta, &covs), want, "{covs:?}");
+            }
+        }
+    }
+    // The grid straddles the condition: both arms are taken.
+    assert!(raised > 0 && plain > 0, "raised {raised}, plain {plain}");
+}
+
 /// Every definition in an [`InlineScope`] is eta-free — `rhs_contains_eta`
 /// skips one without reading it — and a folded `if` local keeps that: one
 /// whose arm or condition reads an eta is not recorded. Asserted on the scope
@@ -6506,6 +6559,10 @@ fn covariate_mu_ref_rejects_an_if_local_it_cannot_fold() {
         (
             "if (WT > 0) { WTN = WT / 70.0 } else { if (AGE > 1) { WTN = 1.0 } else { WTN = 0.9 } }",
             "assigned in a nested if",
+        ),
+        (
+            "if (WT > 0) { if (AGE > 1) { WTN = WT / 70.0 } } else { WTN = 1.0 }",
+            "one arm assigns it only inside a nested if (one per arm by count)",
         ),
         (
             "if (WT > 0) { WTN = WT / 70.0 * TIME } else { WTN = 1.0 }",
