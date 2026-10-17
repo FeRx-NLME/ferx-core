@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The merge queue (#2042): GitHub runs this workflow on the PR's commit stacked on
+  # the current `main` and the PRs queued ahead of it, and merges only if the
+  # required checks pass there. That is the combination a plain PR run never tests:
+  # two PRs each green against an older `main` that break together with no textual
+  # conflict (#1784 for #1768 x #1746, #1966 for #1957 x #1925). The fast gates
+  # below run in the queue; the test and coverage jobs already ran on the PR and
+  # are skipped here (see `merge-queue-coverage-status`).
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * 1'  # Mondays 03:00 UTC — coverage job
@@ -63,6 +72,9 @@ jobs:
   endpoints:
     name: Tests + coverage (TTE/CTMM endpoints)
     runs-on: ubuntu-latest
+    # Ran on the PR; a merge-queue run checks that the combination compiles and
+    # lints, not the suite again (#2042). A skipped job satisfies a required check.
+    if: github.event_name != 'merge_group'
     # Override the global nightly: the crate has no nightly-only code, so this
     # job builds fine on stable. Stable's rustc version holds for ~6 weeks vs
     # nightly's daily bump, so the instrumented cache (keyed on rustc version)
@@ -193,6 +205,8 @@ jobs:
   release-semantics:
     name: Tests (release semantics)
     runs-on: ubuntu-latest
+    # Ran on the PR; skipped in the merge queue like `endpoints` (#2042).
+    if: github.event_name != 'merge_group'
     # Stable, like the coverage jobs: no nightly-only code, and `rust-cache` keys on
     # the rustc version, so nightly would cold-rebuild the dep graph daily.
     env:
@@ -523,3 +537,25 @@ jobs:
           elif [ "$below" = "1" ]; then
             gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null
           fi
+
+  # `codecov/patch` is a required check, but it is a commit status Codecov posts after
+  # a coverage upload, and the coverage jobs do not run in the merge queue (#2042). A
+  # required check that never reports blocks the queue until it times out. The patch
+  # gate was already enforced on the PR (a PR cannot enter the queue with a red
+  # required check), so the queue's commit gets the status here, saying so.
+  merge-queue-coverage-status:
+    name: Merge queue — codecov/patch carried from the PR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+    permissions:
+      statuses: write
+    steps:
+      - name: Report codecov/patch on the merge-group commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state=success \
+            -f context=codecov/patch \
+            -f description="enforced on the pull request before it entered the queue"
+
