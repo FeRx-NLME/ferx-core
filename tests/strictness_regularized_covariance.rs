@@ -26,18 +26,34 @@
 //! initials) so the fit genuinely moves and converges, which keeps the init-stall and
 //! convergence gates out of the verdict. The landing point is therefore pinned by
 //! construction: every trajectory reaches the same well-identified (CL, V, KA) optimum with
-//! the same `Q`, and the covariance step sees the same matrix.
+//! the same `Q`, and the covariance step sees the same matrix — once that matrix is computed
+//! analytically, see `# Why FOCEI`.
 //!
 //! The pin sits in a measured window, and both of its edges are asserted below:
 //!
 //! * **Too flat, and `Q` is frozen before the fit starts.** The outer pre-flight freezes a θ
 //!   whose initial gradient is below `1e-8` (`[parameters] … has no effect on the objective`),
 //!   and a frozen `Q` leaves no flat direction to floor. Measured: frozen whenever
-//!   `V2²/Q ≲ 1.4e-10` (V2 = 5e-5 frozen at Q₀ = 20, not at 16; V2 = 1e-4 frozen at Q₀ = 80,
-//!   not at 60). Here `V2²/Q₀ = 4.2e-10`, 3× inside.
+//!   `V2²/Q ≲ 1e-10` (V2 = 5e-5 frozen at Q₀ = 30, not at 20; V2 = 1e-4 frozen at Q₀ = 120,
+//!   not at 80; at Q₀ = 6, V2 = 2e-5 frozen, 3e-5 not). Here `V2²/Q₀ = 4.2e-10`, more than
+//!   3× inside.
 //! * **Not flat enough, and the floor does not fire.** The floor clips an eigenvalue below
-//!   `1e-10·λ_max = 2.285e-7`. Measured here: min eigenvalue 2.50e-8 (2.43e-8 with the inner
-//!   seed killed), 9× inside. Across the window (V2 ∈ [2e-5, 1e-4]) it was 1e-8 to 1.1e-7.
+//!   `1e-10·λ_max = 2.078e-7`. Measured here: min eigenvalue 1.89e-8 (2.57e-8 with the inner
+//!   seed killed), 8–11× inside. Across the window it grew with V2, to 1.33e-7 at V2 = 1e-4
+//!   (still floored) and past the floor by V2 = 2e-4 (nothing floored).
+//!
+//! # Why FOCEI (#2116)
+//!
+//! The fixture used to fit non-interaction FOCE. With a proportional error model that route
+//! declines the analytic R-matrix, so the covariance step took an FD Hessian, and the flat
+//! `Q` direction's eigenvalue was FD noise rather than curvature. On one landing point (θ and
+//! OFV agreeing to 9–11 digits) it measured +2.5e-8 and +3.2e-8 on macOS arm64 and −7.2e-7
+//! and −5.0e-7 on Linux x86_64 (two commits each), and on CI x86_64 it once came out above
+//! the 2.3e-7 floor, so nothing floored and the test failed with a TVQ RSE of 68 607 %.
+//! Noise of ±7e-7 against a 2.3e-7 clip threshold leaves the window no inside. Under FOCEI
+//! the analytic R-matrix is used and the eigenvalue is the curvature the window above
+//! describes: it moves by ~1e-8 between inner-solve trajectories (1.89e-8 and 2.57e-8
+//! above), well inside the floor.
 //!
 //! The test asserts the straddle first — the same fit with the floor warning removed *passes*
 //! `Strictness::default()` outright — so the exclusion it then asserts can only come from the
@@ -85,10 +101,11 @@ const WARFARIN_COLLAPSED_PERIPHERAL: &str = r"
 const REGULARIZED_FAILURE: &str = "covariance matrix regularized:";
 
 fn options(m: CovarianceMethod) -> FitOptions {
-    // `parse_model_string` drops `[fit_options]`, so the method is pinned here.
+    // `parse_model_string` drops `[fit_options]`, so the method is pinned here. FOCEI, not
+    // FOCE: see the module docs' `# Why FOCEI`.
     FitOptions {
-        method: EstimationMethod::Foce,
-        interaction: false,
+        method: EstimationMethod::FoceI,
+        interaction: true,
         outer_maxiter: 300,
         run_covariance_step: true,
         covariance_method: m,
@@ -167,7 +184,7 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
     assert!(r.converged, "{:?}", r.warnings);
 
     // The collapse the fixture exists for: the covariance step floored the flat direction.
-    // The margin is a canary — measured 2.50e-8 against a 2.285e-7 floor, so a drift that
+    // The margin is a canary — measured 1.89e-8 against a 2.078e-7 floor, so a drift that
     // halves it (toward the edge where nothing floors) reddens here, with the numbers, rather
     // than silently flipping the straddle below.
     let msg = floor_message(&r)
