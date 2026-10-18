@@ -341,6 +341,63 @@ fn unit_dirs<const N: usize>() -> [[f64; N]; N] {
     std::array::from_fn(|k| std::array::from_fn(|m| if m == k { 1.0 } else { 0.0 }))
 }
 
+#[cfg(feature = "nn")]
+thread_local! {
+    /// `[covariate_nn]` raw outputs fixed for the recordings on this thread, one
+    /// `Vec<Vec<T>>` (per network, per output) per number type, set by [`NnPresetGuard`].
+    static NN_PRESET: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Set when a recording found presets but none of its number type: the caller's
+    /// seeding never reached the networks, so its pass is void.
+    static NN_PRESET_MISS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII: the `[covariate_nn]` outputs every recording on this thread reads in place of
+/// evaluating the networks over the taped weights. The covariance Hessian's reduced basis
+/// (`ode_adjoint_hessian`) seeds the outputs themselves as pass directions; the weights
+/// reach the likelihood through them alone (`nn_output_chain_supported`).
+#[cfg(feature = "nn")]
+pub(super) struct NnPresetGuard;
+
+#[cfg(feature = "nn")]
+impl NnPresetGuard {
+    pub(super) fn enter(sets: Vec<Box<dyn std::any::Any>>) -> Self {
+        NN_PRESET.with(|c| *c.borrow_mut() = sets);
+        NN_PRESET_MISS.with(|m| m.set(false));
+        NnPresetGuard
+    }
+
+    /// Whether a recording under this guard found no preset of its number type.
+    pub(super) fn missed(&self) -> bool {
+        NN_PRESET_MISS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(feature = "nn")]
+impl Drop for NnPresetGuard {
+    fn drop(&mut self) {
+        NN_PRESET.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// The preset outputs of type `T`, if a [`NnPresetGuard`] is live.
+#[cfg(feature = "nn")]
+fn nn_preset<T: VmNum>() -> Option<Vec<Vec<T>>> {
+    NN_PRESET.with(|c| {
+        let sets = c.borrow();
+        if sets.is_empty() {
+            return None;
+        }
+        let hit = sets
+            .iter()
+            .find_map(|b| b.downcast_ref::<Vec<Vec<T>>>().cloned());
+        if hit.is_none() {
+            NN_PRESET_MISS.with(|m| m.set(true));
+        }
+        hit
+    })
+}
+
 /// The individual parameters over the tape, placed in their PK slots (`None` where the
 /// program writes no slot): the parameter program itself evaluated on the recording's number type, so its
 /// η-tangents are `∂p/∂η`, its payload `∂²p/∂η²`, and its θ-dependence is on the tape.
@@ -352,21 +409,31 @@ fn taped_params<T: VmNum>(
     eta: &[T],
     cov: &std::collections::HashMap<String, f64>,
 ) -> Vec<Option<T>> {
-    // `[covariate_nn]` outputs: the networks over the θ (weight) inputs, on `T`.
+    // `[covariate_nn]` outputs: the networks over the θ (weight) inputs, on `T`, or the
+    // outputs a caller fixed for this thread's recordings (`NnPresetGuard`).
     #[cfg(feature = "nn")]
     let _nn = (!model.covariate_nns.is_empty()).then(|| {
-        crate::parser::model_parser::ModelNnDualGuard::enter::<T>(
-            model
-                .covariate_nns
-                .iter()
-                .map(|nn| {
-                    nn.mapper.forward_raw_g(
-                        &theta[nn.weights_offset..nn.weights_offset + nn.mapper.mlp().n_weights()],
-                        cov,
-                    )
-                })
-                .collect(),
-        )
+        crate::parser::model_parser::ModelNnDualGuard::enter::<T>(nn_preset::<T>().unwrap_or_else(
+            || {
+                model
+                    .covariate_nns
+                    .iter()
+                    .map(|nn| {
+                        let w = &theta
+                            [nn.weights_offset..nn.weights_offset + nn.mapper.mlp().n_weights()];
+                        // Weights with no derivative (every inner recording): the network on
+                        // `f64` — memoised across the solve — lifted, not on the dual.
+                        if w.iter().all(|t| t.is_constant()) {
+                            let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
+                            if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
+                                return y.into_iter().map(T::from_f64).collect();
+                            }
+                        }
+                        nn.mapper.forward_raw_g(w, cov)
+                    })
+                    .collect()
+            },
+        ))
     });
     #[cfg(not(feature = "nn"))]
     let _ = model;

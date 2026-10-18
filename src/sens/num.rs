@@ -74,6 +74,13 @@ pub trait PkNum:
     fn is_taped(self) -> bool {
         false
     }
+    /// Whether this value carries no derivative at all (no jet, no tape), so a function of
+    /// it may be evaluated on `f64` and lifted with [`Self::from_f64`]. Conservative:
+    /// `false` unless an implementor can tell cheaply.
+    #[inline]
+    fn is_constant(self) -> bool {
+        false
+    }
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -219,6 +226,10 @@ pub trait PkNum:
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
+    #[inline]
+    fn is_constant(self) -> bool {
+        true
+    }
     #[inline]
     fn from_f64(x: f64) -> Self {
         x

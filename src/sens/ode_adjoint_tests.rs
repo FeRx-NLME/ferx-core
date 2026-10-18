@@ -3241,6 +3241,91 @@ fn covariate_nn_matches_reconverged_fd() {
     let fd = fd_oracle(&model, &s, true);
     eprintln!("covariate NN FOCEI vs reconverged FD {fd:.2e}");
     assert!(fd < 1e-5, "covariate NN FOCEI vs FD {fd:.2e}");
+    // The FOCEI R-matrix through the network: its nested dual differentiates `tanh`'s
+    // `φ‴` (`DualT::lift3`), which the gradient above never reaches.
+    let (fd, _) = hessian_gaps_for(&model, &s, Objective::Focei);
+    eprintln!("covariate NN FOCEI Hessian vs reconverged FD {fd:.2e}");
+    assert!(fd < 1e-5, "covariate NN FOCEI Hessian vs FD {fd:.2e}");
+}
+
+/// The covariance Hessian of a covariate-NN subject is assembled in the networks' output
+/// basis (`NnReduction`: 1 + 3 + 2 directions here against 21 weights), and must equal the
+/// one assembled along every packed axis, under each objective. Dropping the weights' own
+/// curvature (`Σ ∂Ψ/∂z_k ∇²z_k`) or the η part of a weight's direction moves the weight
+/// block; the counter shows the reduction ran, the switch that it stood aside.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_reduced_hessian_equals_the_full_one() {
+    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    let (model, s) = covariate_nn_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    for (objective, interaction, name) in [
+        (Objective::Focei, true, "FOCEI"),
+        (Objective::Foce, false, "FOCE"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            true,
+            "Laplace",
+        ),
+        (
+            Objective::Agq {
+                n_agq: 3,
+                exact: false,
+            },
+            true,
+            "AGQ-3",
+        ),
+    ] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let run = |off: bool| {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        NN_REDUCE_OFF.with(|c| c.set(off));
+                        let h = subject_adjoint_cov_hessian(
+                            &model,
+                            &s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            objective,
+                        );
+                        (h, NN_REDUCED_HITS.with(|c| c.get()))
+                    })
+                    .expect("spawn")
+                    .join()
+                    .expect("join")
+            })
+        };
+        let (full, off_hits) = run(true);
+        let (reduced, hits) = run(false);
+        let (full, reduced) = (
+            full.expect("full Hessian in scope"),
+            reduced.expect("reduced Hessian in scope"),
+        );
+        assert_eq!(
+            off_hits, 0,
+            "{name}: the switch must turn the reduction off"
+        );
+        assert_eq!(hits, 1, "{name}: the reduction did not run");
+        let w = model.covariate_nns[0].weights_offset;
+        assert!(
+            (w..w + 21).any(|i| full[(i, i)].abs() > 1e-3),
+            "{name}: a vanishing weight block tests nothing"
+        );
+        let mut worst = 0.0f64;
+        for (a, b) in reduced.iter().zip(full.iter()) {
+            assert!(a.is_finite() && b.is_finite(), "{name}: {a} vs {b}");
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        eprintln!("covariate NN {name}: reduced vs full Hessian {worst:.2e}");
+        assert!(worst < 1e-9, "{name}: reduced vs full Hessian {worst:.2e}");
+    }
 }
 
 /// The exact anchor through a `tanh` network: its taped-Hessian sweep differentiates the

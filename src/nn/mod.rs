@@ -300,6 +300,18 @@ pub struct MlpMapper {
     /// the start of layer `l+1`'s W block in the flat weight vector
     /// (`offsets[0] = 0`, `offsets[L] = n_params`).
     offsets: Vec<usize>,
+    /// Identity for [`NamedMlpMapper::forward_raw`]'s memo: unique per construction,
+    /// shared by clones (which compute the same function).
+    id: u64,
+}
+
+/// Source of [`MlpMapper`] identities.
+static MLP_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The last `forward_raw` per network on this thread: `(id, weights, inputs, outputs)`.
+    static FORWARD_MEMO: std::cell::RefCell<Vec<(u64, Vec<f64>, Vec<f64>, Vec<f64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl MlpMapper {
@@ -334,6 +346,7 @@ impl MlpMapper {
             output_activation,
             n_params,
             offsets,
+            id: MLP_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -1211,7 +1224,39 @@ impl NamedMlpMapper {
         covariates: &HashMap<String, f64>,
     ) -> Result<Vec<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
-        self.mlp.forward(&x, weights)
+        // `pk_param_fn` calls this once per event on every objective evaluation, and an inner
+        // EBE solve holds the weights and the subject's inputs fixed throughout — so the last
+        // result per network is kept, compared on the exact bits.
+        let id = self.mlp.id;
+        // Exact bits, branch-free so it vectorises (an early-exit `all` does not).
+        let same = |v: &[f64], u: &[f64]| {
+            v.len() == u.len()
+                && v.iter()
+                    .zip(u)
+                    .fold(true, |eq, (a, b)| eq & (a.to_bits() == b.to_bits()))
+        };
+        if let Some(y) = FORWARD_MEMO.with(|m| {
+            m.borrow()
+                .iter()
+                .find(|e| e.0 == id && same(&e.1, weights) && same(&e.2, &x))
+                .map(|e| e.3.clone())
+        }) {
+            return Ok(y);
+        }
+        let y = self.mlp.forward(&x, weights)?;
+        FORWARD_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            match m.iter_mut().find(|e| e.0 == id) {
+                Some(e) => {
+                    e.1.clear();
+                    e.1.extend_from_slice(weights);
+                    e.2 = x;
+                    e.3.clone_from(&y);
+                }
+                None => m.push((id, weights.to_vec(), x, y.clone())),
+            }
+        });
+        Ok(y)
     }
 
     /// [`Self::forward_raw`] on any number type: the weights on it, the (zero-filled,

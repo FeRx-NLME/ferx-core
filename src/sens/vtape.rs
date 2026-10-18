@@ -737,6 +737,10 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     fn is_taped(self) -> bool {
         self.i != NONE
     }
+    #[inline]
+    fn is_constant(self) -> bool {
+        self.i == NONE && self.g.iter().chain(&self.h).all(|&d| d == 0.0)
+    }
     fn from_f64(x: f64) -> Self {
         DualV::constant(x)
     }
