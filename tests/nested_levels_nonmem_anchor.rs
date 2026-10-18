@@ -245,12 +245,14 @@ fn the_anchor_files_are_where_the_tests_read_them() {
     }
 }
 
-/// The covariance step on a nested model is the finite-difference one. Its analytic
-/// R-matrix assembly is reached on `analytic_cov_hessian` and the covariance scope walk,
-/// which serves a closed-form one-compartment IOV model; its jets and stacked prior are
-/// laid out per occasion, which would treat every phase as owning its own occasion κ. A
-/// nested model declines it, so asking for the analytic matrix and asking for the stencil
-/// give the same bits — any analytic route would differ from the stencil in the last bits.
+/// The covariance step on a nested model takes the exact analytic R-matrix (#486): the
+/// adjoint records over the compact axes and places the prior per group of each level, so a
+/// phase does not own its own occasion κ. Asking for the analytic matrix and for the stencil
+/// therefore gives different bits (the route, asserted) and the same matrix to the stencil's
+/// accuracy. Measured, scaled by the diagonals: 1.7e-3 at the default `fd_hessian_step`
+/// (1e-2) and `inner_tol`, 1.5e-4 at step 3e-3 with `inner_tol` 1e-9 (used here), 7.0e-4 at
+/// step 1e-3 (EBE noise over h² takes over) — the stencil converging on the analytic matrix,
+/// whose own check is against Richardson FD (1.65e-5 on a nested subject). Bound 3× the worst.
 ///
 /// The fixture is closed-form PK on purpose: a compartment-free model is outside the
 /// analytic covariance scope for a reason of its own, so it could not see the gate.
@@ -303,6 +305,8 @@ fn the_covariance_step_finite_differences_a_nested_pk_model() {
             outer_maxiter: 0,
             run_covariance_step: true,
             analytic_cov_hessian: analytic,
+            fd_hessian_step: 3e-3,
+            inner_tol: 1e-9,
             ..parsed.fit_options.clone()
         };
         fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap()
@@ -321,12 +325,24 @@ fn the_covariance_step_finite_differences_a_nested_pk_model() {
         .filter(|&i| cov(&fd)[(i, i)] > 0.0)
         .count();
     assert_eq!(free, 7, "three θ, ω², two κ variances, σ: {}", cov(&fd));
+    // The analytic route was taken: it cannot reproduce the stencil's bits.
     let bits = |m: nalgebra::DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-    assert_eq!(
+    assert_ne!(
         bits(cov(&a)),
         bits(cov(&fd)),
-        "analytic {} vs fd {}",
-        cov(&a),
-        cov(&fd)
+        "the nested covariance stayed on the stencil"
     );
+    let (ca, cf) = (cov(&a), cov(&fd));
+    let mut worst = 0.0f64;
+    for i in 0..ca.nrows() {
+        for j in 0..ca.ncols() {
+            let scale = (cf[(i, i)] * cf[(j, j)]).abs().sqrt();
+            if scale > 0.0 {
+                assert!(ca[(i, j)].is_finite(), "analytic {ca}");
+                worst = worst.max((ca[(i, j)] - cf[(i, j)]).abs() / scale);
+            }
+        }
+    }
+    eprintln!("MEASURE nested covariance analytic vs stencil: {worst:.3e}");
+    assert!(worst < 5e-4, "analytic {ca} vs fd {cf}: {worst:.3e}");
 }
