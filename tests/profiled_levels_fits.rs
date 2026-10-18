@@ -111,9 +111,9 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
     assert!(worst_se < D_SE, "{worst_se}");
 }
 
-/// Realised (macOS arm64): D1 the unprofiled restart improves by 1.7e-6, D2 by −2.6e-7;
-/// the structural θ move 2.6e-4 (D1) and 0 (D2) relative; SEs differ by 7.0e-3 (D1) and
-/// 4.7e-3 (D2). Bands at ≥ 2.9× the worst.
+/// Realised on Linux aarch64: D1 the unprofiled restart improves by 2.2e-6, D2 by
+/// −2.4e-7; the structural θ move 2.5e-4 (D1) and 0 (D2) relative; SEs differ by 7.0e-3
+/// (D1) and 4.7e-3 (D2). macOS arm64 within 5e-7 of each. Bands at ≥ 2.9× the worst.
 const D_OFV: f64 = 1e-4;
 const D_THETA: f64 = 1e-3;
 const D_SE: f64 = 2e-2;
@@ -177,7 +177,8 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
 }
 
-/// Realised 1.5e-8 (macOS arm64), from the model file's inits, 26 evaluations. A
+/// Realised 2.4e-8 on Linux aarch64 (24 evaluations; 1.5e-8 macOS arm64), from the
+/// model file's inits. A
 /// stopping rule, not an engine difference, sets this; 1e-5 leaves room for another
 /// platform's path to the optimum while still failing the 0.0185 BOBYQA stopped at.
 const A2_FIT_OFV: f64 = 1e-5;
@@ -187,7 +188,8 @@ const A2_FIT_OFV: f64 = 1e-5;
 /// (705 packed coordinates) it is fitted without its covariance step, which the plan's
 /// M6 measured routing to `s` and failing (S rank-deficient: 100 subjects, 705
 /// coordinates). The profiled OFV must not be above the unprofiled one; measured
-/// (macOS arm64) it is 0.42 below, the unprofiled fit stopping early at `|g|∞` 2.6.
+/// (Linux aarch64, macOS the same to the printed digit) it is 0.42 below, the
+/// unprofiled fit stopping early.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

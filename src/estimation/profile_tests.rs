@@ -308,7 +308,8 @@ fn the_profile_objective_is_the_minimum_over_the_levels() {
     );
 }
 
-/// Worst realised |ΔOFV| 7.3e-9 (macOS arm64), the oracle's own FD and inner-solve noise
+/// Worst realised |ΔOFV| 1.8e-8 (N2 `ref`, macOS arm64; 6.2e-9 Linux aarch64; D3 6.1e-9
+/// Linux), the oracle's own FD and inner-solve noise
 /// included; 14× headroom. The frozen-EBE point is 1.44e-2 above the minimum on this
 /// fixture, five orders of magnitude past the bound.
 const D3_OFV_BOUND: f64 = 1e-7;
@@ -459,7 +460,7 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
 }
 
 /// The envelope identity `dO_p/dθ = ∂O/∂θ|β̂`, both sides FD, no engine involved. Worst
-/// realised 3.0e-5 (F2, three studies, macOS arm64), the β residual at `PROFILE_TOL` and
+/// realised 3.1e-5 (F2, three studies, Linux aarch64 and macOS arm64), the β residual at `PROFILE_TOL` and
 /// FD noise; ~3× headroom.
 const G1_IDENTITY_BOUND: f64 = 1e-4;
 /// The gradient the optimizer is handed against FD of the profile objective. This also

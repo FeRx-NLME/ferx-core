@@ -261,7 +261,7 @@ fn profile_curvature_se(name: &str) -> f64 {
     (2.0 / c).sqrt()
 }
 
-/// ΔOFV realised 2.6e-8 (macOS arm64): two engines' objectives at one point, the levels
+/// ΔOFV realised 2.3e-8 Linux aarch64, 2.6e-8 macOS arm64: two engines' objectives at one point, the levels
 /// solved by ferx and estimated by NONMEM; 3.8× headroom.
 const A2_OFV: f64 = 1e-7;
 /// Worst level gap realised 7.4e-6 NONMEM SEs; 13× headroom.
@@ -319,7 +319,8 @@ fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     assert!(worst_var < C1_BOUND, "{worst_var}");
 }
 
-/// Worst realised 4.7e-3 (structural), 2.3e-4 (levels), 3.0e-3 (Ω, Ω_IOV), macOS arm64:
+/// Worst realised 4.7e-3 (structural), 2.3e-4 (levels), 3.0e-3 (Ω, Ω_IOV), Linux aarch64
+/// and macOS arm64 alike:
 /// two FD Hessians of one objective, at the same step rule but over 5 coordinates
 /// re-profiled against 41 held; 2.1× headroom on the worst.
 const C1_BOUND: f64 = 1e-2;
