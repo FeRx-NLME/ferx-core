@@ -26,7 +26,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 pub(crate) const NONE: u32 = u32::MAX;
 
 /// Packed lower-triangle index of the symmetric pair `(k, l)`.
-#[inline(always)]
+#[inline]
 pub(crate) const fn tri(k: usize, l: usize) -> usize {
     if l <= k {
         k * (k + 1) / 2 + l
@@ -40,7 +40,7 @@ pub(crate) const fn tri(k: usize, l: usize) -> usize {
 /// pure second derivative `(k, k)` along tangent direction `k` — the diagonal of a
 /// product or chain rule never reads an off-diagonal entry, so it is a closed algebra.
 /// A first-order dual (`M = 0`) carries none.
-#[inline(always)]
+#[inline]
 #[allow(clippy::reversed_empty_ranges)]
 pub(crate) const fn hrange<const TH: bool, const M: usize>(
     k: usize,
@@ -55,7 +55,7 @@ pub(crate) const fn hrange<const TH: bool, const M: usize>(
 }
 
 /// Storage index of second-order entry `(k, l)` ([`hrange`]).
-#[inline(always)]
+#[inline]
 pub(crate) const fn hidx<const TH: bool>(k: usize, l: usize) -> usize {
     if TH {
         k
@@ -145,7 +145,7 @@ thread_local! {
     }) };
 }
 
-#[inline(always)]
+#[inline]
 fn vt() -> &'static mut VTape {
     // SAFETY: the tape is thread-local. Every function in this module takes the
     // reference, uses it, and drops it before calling back into the module, so no two
@@ -209,7 +209,7 @@ fn vrollback(mark: usize) {
 /// discriminator such as φ′). Pure ops on identical inputs give identical values and
 /// tangents, so the reuse is exact. A hit is verified against the node itself, so stale
 /// entries (rolled-back nodes) can never alias.
-#[inline(always)]
+#[inline]
 fn push_cse<const N: usize>(
     op: Op,
     a: u32,
@@ -243,7 +243,7 @@ fn push_cse<const N: usize>(
     id
 }
 
-#[inline(always)]
+#[inline]
 fn push<const N: usize>(op: Op, a: u32, b: u32, x: u32, v: f64, g: &[f64; N], h: &[f64]) -> u32 {
     let t = vt();
     debug_assert!(t.nc == N + 1 || t.nc == N + 1 + h.len());
@@ -274,7 +274,7 @@ pub struct DualV<const N: usize, const M: usize, const TH: bool = false> {
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
     const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
-    #[inline(always)]
+    #[inline]
     pub fn constant(v: f64) -> Self {
         DualV {
             v,
@@ -286,7 +286,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     /// An input that is not on the tape: a recording made only of these (and constants)
     /// is a plain forward dual — the η-Jacobian (`M = 0`) or the η-jets `(f, G, Q)` —
     /// with no tape traffic at all.
-    #[inline(always)]
+    #[inline]
     pub fn free(v: f64, g: [f64; N], h: [f64; M]) -> Self {
         DualV { v, g, h, i: NONE }
     }
@@ -311,11 +311,11 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 .zip(&other.h)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
     }
-    #[inline(always)]
+    #[inline]
     pub fn hess(&self, k: usize, l: usize) -> f64 {
         self.h[tri(k, l)]
     }
-    #[inline(always)]
+    #[inline]
     fn zero_tan(&self) -> bool {
         self.g.iter().all(|x| *x == 0.0)
     }
@@ -363,6 +363,13 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 i: NONE,
             };
         }
+        self.unary_taped(hv, h1, h2, if TH { h3() } else { 0.0 }, g, h)
+    }
+    /// The tape record of [`Self::unary`], out of line so the untaped arithmetic above
+    /// stays small enough to inline (#2093: forcing the whole body inline was most of
+    /// the crate's compile time).
+    #[inline(never)]
+    fn unary_taped(self, hv: f64, h1: f64, h2: f64, h3: f64, g: [f64; N], h: [f64; M]) -> Self {
         let x = vt().auxf.len() as u32;
         let i = push_cse::<N>(Op::Unary, self.i, NONE, x, hv, h1, &g, &h);
         if i as usize == vt().nodes.len() - 1 && vt().nodes[i as usize].x == x {
@@ -370,32 +377,82 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
             t.auxf.push(h1);
             t.auxf.push(h2);
             if TH {
-                t.auxf.push(h3());
+                t.auxf.push(h3);
             }
         }
         DualV { v: hv, g, h, i }
     }
-    #[inline(always)]
-    fn scaled(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
-        if Self::WIDE {
-            self.scaled_wide(c, v, g, h)
-        } else {
-            self.scaled_body(c, v, g, h)
-        }
-    }
-    /// [`Self::scaled`]'s body out of line ([`Self::WIDE`]).
+    /// A taped value times a constant: always a tape record, so always out of line.
     #[inline(never)]
-    fn scaled_wide(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
-        self.scaled_body(c, v, g, h)
-    }
-    #[inline(always)]
-    fn scaled_body(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
+    fn scaled(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
         let x = vt().auxf.len() as u32;
         let i = push_cse::<N>(Op::Scale, self.i, NONE, x, v, c, &g, &h);
         if i as usize == vt().nodes.len() - 1 && vt().nodes[i as usize].x == x {
             vt().auxf.push(c);
         }
         DualV { v, g, h, i }
+    }
+}
+
+/// Arithmetic with a constant operand (the bytecode VM's literals, covariates and `TIME`):
+/// the generic operator's values and record, without building and multiplying through a
+/// zero dual. The tape tails are the generic ones, handed that constant.
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    pub(crate) fn add_c(self, c: f64) -> Self {
+        let v = self.v + c;
+        if self.i == NONE {
+            return DualV { v, ..self };
+        }
+        self.add_taped(Self::constant(c), v, self.g, self.h)
+    }
+    #[inline(always)]
+    pub(crate) fn sub_c(self, c: f64) -> Self {
+        let v = self.v - c;
+        if self.i == NONE {
+            return DualV { v, ..self };
+        }
+        self.sub_taped(Self::constant(c), v, self.g, self.h)
+    }
+    #[inline(always)]
+    pub(crate) fn rsub_c(self, c: f64) -> Self {
+        Self::constant(c) - self
+    }
+    #[inline(always)]
+    pub(crate) fn mul_c(self, c: f64) -> Self {
+        if Self::WIDE {
+            return self * Self::constant(c);
+        }
+        let v = self.v * c;
+        let mut g = self.g;
+        let mut h = self.h;
+        g.iter_mut().for_each(|x| *x *= c);
+        h.iter_mut().for_each(|x| *x *= c);
+        if self.i == NONE {
+            return DualV { v, g, h, i: NONE };
+        }
+        self.mul_taped(Self::constant(c), v, g, h)
+    }
+    #[inline(always)]
+    pub(crate) fn div_c(self, c: f64) -> Self {
+        if Self::WIDE {
+            return self / Self::constant(c);
+        }
+        let q = self.v / c;
+        let ib = 1.0 / c;
+        let mut g = self.g;
+        let mut h = self.h;
+        g.iter_mut().for_each(|x| *x *= ib);
+        h.iter_mut().for_each(|x| *x *= ib);
+        if self.i == NONE {
+            return DualV {
+                v: q,
+                g,
+                h,
+                i: NONE,
+            };
+        }
+        self.div_taped(Self::constant(c), q, ib, g, h)
     }
 }
 
@@ -423,6 +480,14 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = self.h[t] + o.h[t];
         }
+        if self.i == NONE && o.i == NONE {
+            return DualV { v, g, h, i: NONE };
+        }
+        self.add_taped(o, v, g, h)
+    }
+    /// The tape record of an addition (see [`Self::unary_taped`]).
+    #[inline(never)]
+    fn add_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
         let i = match (self.i == NONE, o.i == NONE) {
             (true, true) => NONE,
             (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, &g, &h),
@@ -462,6 +527,14 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = self.h[t] - o.h[t];
         }
+        if self.i == NONE && o.i == NONE {
+            return DualV { v, g, h, i: NONE };
+        }
+        self.sub_taped(o, v, g, h)
+    }
+    /// The tape record of a subtraction (see [`Self::unary_taped`]).
+    #[inline(never)]
+    fn sub_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
         let i = match (self.i == NONE, o.i == NONE) {
             (true, true) => NONE,
             (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, &g, &h),
@@ -502,6 +575,14 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 h[t] = self.h[t] * o.v + self.v * o.h[t] + self.g[k] * o.g[l] + self.g[l] * o.g[k];
             }
         }
+        if self.i == NONE && o.i == NONE {
+            return DualV { v, g, h, i: NONE };
+        }
+        self.mul_taped(o, v, g, h)
+    }
+    /// The tape record of a product (see [`Self::unary_taped`]).
+    #[inline(never)]
+    fn mul_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
         match (self.i == NONE, o.i == NONE) {
             (true, true) => DualV { v, g, h, i: NONE },
             (true, false) if self.zero_tan() => {
@@ -559,6 +640,19 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 h[t] = (self.h[t] - g[k] * o.g[l] - g[l] * o.g[k] - q * o.h[t]) * ib;
             }
         }
+        if self.i == NONE && o.i == NONE {
+            return DualV {
+                v: q,
+                g,
+                h,
+                i: NONE,
+            };
+        }
+        self.div_taped(o, q, ib, g, h)
+    }
+    /// The tape record of a quotient (see [`Self::unary_taped`]).
+    #[inline(never)]
+    fn div_taped(self, o: Self, q: f64, ib: f64, g: [f64; N], h: [f64; M]) -> Self {
         match (self.i == NONE, o.i == NONE) {
             (true, true) => DualV {
                 v: q,
@@ -604,11 +698,20 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = -self.h[t];
         }
-        let i = if self.i == NONE {
-            NONE
-        } else {
-            push_cse::<N>(Op::Neg, self.i, NONE, NONE, -self.v, 0.0, &g, &h)
-        };
+        if self.i == NONE {
+            return DualV {
+                v: -self.v,
+                g,
+                h,
+                i: NONE,
+            };
+        }
+        self.neg_taped(g, h)
+    }
+    /// The tape record of a negation (see [`Self::unary_taped`]).
+    #[inline(never)]
+    fn neg_taped(self, g: [f64; N], h: [f64; M]) -> Self {
+        let i = push_cse::<N>(Op::Neg, self.i, NONE, NONE, -self.v, 0.0, &g, &h);
         DualV {
             v: -self.v,
             g,
@@ -629,6 +732,11 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     /// payload is untaped: order ≤ 2 throughout. The exact-anchor mode (`TH`) tapes the
     /// payload too, which is order 3.
     const TAYLOR2_EXACT: bool = !TH;
+    const ETA_HESSIAN: bool = M > 0;
+    #[inline]
+    fn is_taped(self) -> bool {
+        self.i != NONE
+    }
     fn from_f64(x: f64) -> Self {
         DualV::constant(x)
     }
@@ -957,7 +1065,7 @@ pub(crate) fn vadj_init<const L: usize>() -> &'static mut [f64] {
     &mut t.adj
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn vadj_index<const N: usize, const L: usize>(
     node: u32,
     comp: usize,
@@ -1169,7 +1277,7 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
 
 /// Index of component `comp` (0 = value, `1 + k` = tangent `k`, `1 + N + t` = taped
 /// Hessian entry `t`) of `node` in a taped-Hessian adjoint buffer ([`vsweep_h`]).
-#[inline(always)]
+#[inline]
 pub(crate) fn vadj_index_h<const N: usize, const M: usize>(node: u32, comp: usize) -> usize {
     node as usize * (1 + N + M) + comp
 }

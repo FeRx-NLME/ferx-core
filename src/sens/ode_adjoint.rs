@@ -556,6 +556,16 @@ fn pk_space_predictions<T: VmNum>(
         .enumerate()
         .filter_map(|(s, d)| d.map(|d| (s, d)))
         .collect();
+    // The polynomial's order is the jet's: a tape-free first-order recording (the inner
+    // loop's η-gradient) needs `∂c/∂p` alone; the η-Hessian payload, or a tape that
+    // differentiates the η-tangents once more in θ, needs `∂²c/∂p²` too.
+    let second = T::ETA_HESSIAN || live.iter().any(|&(_, d)| d.is_taped());
+    // A tape-free first-order recording (the inner loop's η-gradient) records nothing either
+    // way, and runs the closed form over about as many lanes: there the generic path is the
+    // cheaper one.
+    if !second {
+        return None;
+    }
     fn go<const P: usize, const MP: usize, T: VmNum>(
         model: &CompiledModel,
         subject: &Subject,
@@ -574,29 +584,33 @@ fn pk_space_predictions<T: VmNum>(
             &[],
             &[],
         )?;
-        // The polynomial's basis, once per subject: `δp_i`, then `δp_i·δp_j` (i ≤ j) in the
-        // payload's packed order, each with value 0 and the full jet of its product.
+        // The polynomial's basis, once per subject: `δp_i`, then (second order) `δp_i·δp_j`
+        // (i ≥ j), each with value 0 and the full jet of its product.
         let n = live.len();
         let dp: Vec<T> = live
             .iter()
             .map(|&(_, d)| d - T::from_f64(d.val()))
             .collect();
         let mut basis = dp.clone();
-        for i in 0..n {
-            for j in 0..=i {
-                basis.push(dp[i] * dp[j]);
+        if MP > 0 {
+            for i in 0..n {
+                for j in 0..=i {
+                    basis.push(dp[i] * dp[j]);
+                }
             }
         }
         let mut coef = vec![0.0; basis.len()];
         jets.iter()
             .map(|q| {
                 coef[..n].copy_from_slice(&q.g[..n]);
-                let mut t = n;
-                for i in 0..n {
-                    for j in 0..=i {
-                        let hij = q.h[crate::sens::vtape::tri(i, j)];
-                        coef[t] = if i == j { 0.5 * hij } else { hij };
-                        t += 1;
+                if MP > 0 {
+                    let mut t = n;
+                    for i in 0..n {
+                        for j in 0..=i {
+                            let hij = q.h[crate::sens::vtape::tri(i, j)];
+                            coef[t] = if i == j { 0.5 * hij } else { hij };
+                            t += 1;
+                        }
                     }
                 }
                 Some(T::lincomb(T::from_f64(q.v), 1.0, &coef, &basis))
@@ -605,14 +619,20 @@ fn pk_space_predictions<T: VmNum>(
     }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    match live.len() {
-        0 => None,
-        1 => go::<1, 1, T>(model, subject, pk, &live),
-        2 => go::<2, 3, T>(model, subject, pk, &live),
-        3 => go::<3, 6, T>(model, subject, pk, &live),
-        4 => go::<4, 10, T>(model, subject, pk, &live),
-        5 | 6 => go::<6, 21, T>(model, subject, pk, &live),
-        7 | 8 => go::<8, 36, T>(model, subject, pk, &live),
+    match (live.len(), second) {
+        (0, _) => None,
+        (1, true) => go::<1, 1, T>(model, subject, pk, &live),
+        (2, true) => go::<2, 3, T>(model, subject, pk, &live),
+        (3, true) => go::<3, 6, T>(model, subject, pk, &live),
+        (4, true) => go::<4, 10, T>(model, subject, pk, &live),
+        (5 | 6, true) => go::<6, 21, T>(model, subject, pk, &live),
+        (7 | 8, true) => go::<8, 36, T>(model, subject, pk, &live),
+        (1, false) => go::<1, 0, T>(model, subject, pk, &live),
+        (2, false) => go::<2, 0, T>(model, subject, pk, &live),
+        (3, false) => go::<3, 0, T>(model, subject, pk, &live),
+        (4, false) => go::<4, 0, T>(model, subject, pk, &live),
+        (5 | 6, false) => go::<6, 0, T>(model, subject, pk, &live),
+        (7 | 8, false) => go::<8, 0, T>(model, subject, pk, &live),
         _ => None,
     }
 }

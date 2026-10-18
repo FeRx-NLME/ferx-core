@@ -88,13 +88,14 @@ const HESSIAN_BUCKETS: [usize; 4] = [4, 6, 8, 24];
 /// not, so it stops at 8 (a 5- or 6-effect subject pads to 8).
 const EXACT_ANCHOR_HESSIAN_BUCKETS: [usize; 2] = [4, 8];
 
-/// The widest subject the exact anchor's Hessian serves.
+/// The widest subject the exact anchor's Hessian serves (pinned by the width-rule test).
+#[cfg(test)]
 pub(crate) const EXACT_ANCHOR_HESSIAN_WIDTH: usize =
     EXACT_ANCHOR_HESSIAN_BUCKETS[EXACT_ANCHOR_HESSIAN_BUCKETS.len() - 1];
 
 /// The Hessian dispatch bucket for a subject `width` random effects wide (the stacked or
 /// compact `[η, κ]` under IOV) under `objective`, or `None` when none serves it: past the
-/// widest bucket, or past [`EXACT_ANCHOR_HESSIAN_WIDTH`] under the exact anchor. The one
+/// widest bucket, or past `EXACT_ANCHOR_HESSIAN_BUCKETS` under the exact anchor. The one
 /// width rule the dispatch runs on and [`cov_width_declines`] reports, so the covariance
 /// step's decline diagnostics cannot promise a route the dispatch refuses.
 pub(crate) fn hessian_bucket(width: usize, objective: Objective) -> Option<usize> {

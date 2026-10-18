@@ -12,9 +12,10 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 /// than a call, while inlining it into every closed form, event walk and ODE step was most
 /// of the binary (#486); narrow duals — small models' hot path — stay inlined. Decided
 /// per type at compile time from `size_of::<Self>()`, so nested duals are covered too.
-/// 192 rather than 256 takes the 6-direction gradient dual (`DualV<6, 21>`, 228 B, 8 MB of
-/// inlined code) out of line; every narrower width stays inlined.
-pub(crate) const OUTLINE_BYTES: usize = 192;
+/// The narrow duals' operations are `#[inline]` hints, not `#[inline(always)]`: forcing them
+/// into every kernel made LLVM's optimisation of the recorders most of the crate's compile
+/// time (610 s vs 298 s for the lib, and 84 vs 37 MB of text, measured on #2093).
+pub(crate) const OUTLINE_BYTES: usize = 256;
 
 /// Direction count from which a dual is outlined whatever its size: every `N ≥ 8` bucket
 /// serves a rare wide fit, and inlining its lane loops cost 4–7 MB of binary per
@@ -63,6 +64,16 @@ pub trait PkNum:
     /// `sens::ode_adjoint`). `false` unless an implementor opts in; a type whose taped or
     /// nested parts differentiate a second-order jet again must not.
     const TAYLOR2_EXACT: bool = false;
+    /// Whether the forward jet carries second derivatives in its own directions (the
+    /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
+    /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].
+    const ETA_HESSIAN: bool = Self::SECOND_ORDER;
+    /// Whether this value is on a reverse tape, i.e. something downstream differentiates
+    /// it once more. `false` for every type without one.
+    #[inline]
+    fn is_taped(self) -> bool {
+        false
+    }
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -581,23 +592,23 @@ pub(crate) mod vm {
         }
         #[inline]
         fn add_scalar_in(&mut self, c: f64) {
-            *self = *self + Self::constant(c);
+            *self = self.add_c(c);
         }
         #[inline]
         fn sub_scalar_in(&mut self, c: f64) {
-            *self = *self - Self::constant(c);
+            *self = self.sub_c(c);
         }
         #[inline]
         fn rsub_scalar_in(&mut self, c: f64) {
-            *self = Self::constant(c) - *self;
+            *self = self.rsub_c(c);
         }
         #[inline]
         fn mul_scalar_in(&mut self, c: f64) {
-            *self = *self * Self::constant(c);
+            *self = self.mul_c(c);
         }
         #[inline]
         fn div_scalar_in(&mut self, c: f64) {
-            *self = *self / Self::constant(c);
+            *self = self.div_c(c);
         }
         #[inline]
         fn same_bits(&self, other: &Self) -> bool {
