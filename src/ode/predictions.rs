@@ -2978,9 +2978,13 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// slot the `[odes]` RHS reads is unanchored (`NaN`) there, and the RHS's derivative over the
 /// segment depends on that slot's value** — measured by [`unanchored_clock_dependence`], which
 /// evaluates the RHS directly and re-solves nothing. Called after [`integrate_segment`], so
-/// `ext_params` holds the anchors the segment actually ran under and `u` its advanced state. A
-/// zero-length segment needs no special case: [`integrate_segment`] returns before touching
-/// either, so `u` is whatever the previous segment left.
+/// `ext_params` holds the anchors the segment actually ran under and `u` its advanced state.
+///
+/// Since #1572 the driver calls this only for a segment whose state went **non-finite**
+/// (phase A), which is judged at once at the window-end anchor. A segment whose state stayed
+/// finite is held and judged at the first realized dose, on its trajectory, by
+/// [`unanchored_dose_clock_error_at_dose`] (phase B); [`unanchored_clock_dependence`] says why
+/// the two differ. This function's verdicts and text are unchanged by that split.
 ///
 /// That asks the harm question directly — would the answer change if the clock had a value? —
 /// and it replaced three approximations of it, each falsified by a measurement:
@@ -3035,31 +3039,153 @@ fn unanchored_dose_clock_error(
     t_start: f64,
     t_end: f64,
 ) -> Option<String> {
-    let prog = ode.rhs_program.as_ref()?;
     // The anchors exactly as the segment received them: `integrate_segment` wrote the `TAD`
     // slot itself, and the `TAFD` slot is the one it inherited. Reading the quantities the
     // RHS was handed — rather than re-deriving "is the shadow dose-free?" — keeps the
     // diagnostic gated on its own mechanism, and costs no second fold of the dose list.
-    let tad_unanchored = prog.pk_reads_tad() && ext_params[TAD_ANCHOR_SLOT].is_nan();
-    let tafd_unanchored = prog.pk_reads_tafd() && ext_params[TAFD_ANCHOR_SLOT].is_nan();
-    if !tad_unanchored && !tafd_unanchored {
-        return None;
-    }
+    let (tad_unanchored, tafd_unanchored) =
+        unanchored_clock_candidates(ode, || ext_params[TAD_ANCHOR_SLOT], ext_params)?;
+    // Phase A pairs the window's start and end states with every grid time (see
+    // [`unanchored_clock_dependence`] for why a diverged window keeps this pairing).
+    let times = clock_probe_grid(t_start, t_end);
+    let pairs: Vec<(f64, &[f64])> = [u_start, u]
+        .into_iter()
+        .flat_map(|state| times.iter().map(move |&t| (t, state)))
+        .collect();
     let dependence = unanchored_clock_dependence(
         ode,
         ext_params,
         tad_unanchored,
         tafd_unanchored,
-        u_start,
-        u,
-        t_start,
+        &pairs,
         t_end,
     )?;
-    let slot = match (dependence.tad, dependence.tafd) {
-        (true, true) => "`TAD` and `TAFD`",
-        (true, false) => "`TAD`",
-        _ => "`TAFD`",
+    let slot = dependence.slot_names();
+    let reads = clock_window_reads(subject, t_start, t_end);
+    // Both conjuncts, or the non-finite opener would be false of a state that stayed finite,
+    // or would blame the clock for a divergence it did not cause (see the doc comment).
+    let opener = if dependence.nan_reached_derivative && !u.iter().all(|x| x.is_finite()) {
+        format!(
+            "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
+             non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
+             dose has been given in this run."
+        )
+    } else {
+        format!(
+            "ode_predictions_adaptive: over the segment ({t_start}, {t_end}] the [odes] RHS \
+             reads {slot}, which has no referent there: no dose has been given in this run. \
+             The derivative it computes there changes when that clock is anchored, so the \
+             trajectory depends on a dose time this run does not have. {CLOCK_COMPARISON_NOTE}"
+        )
     };
+    Some(format!(
+        "{opener} {reads} Where the record contains a dose, the \
+         static engines anchor such a window at the first one — a dose a reactive run has \
+         not decided yet, and may never decide — so this driver refuses the window rather \
+         than read one out of the future. Give the subject a pre-scheduled base regimen, or \
+         have the controller dose at a decision at or before the subject's first record; a \
+         controller that never doses leaves a model reading {slot} unanchored for the whole \
+         run."
+    ))
+}
+
+/// The sentence both openers that blame a comparison share: how a finite run can depend on an
+/// unanchored clock at all.
+const CLOCK_COMPARISON_NOTE: &str = "A comparison against an unanchored clock does not fail, \
+     it answers one way — `NaN < 5` is false — which is how an `if`, `min` or `max` on it \
+     picks a side without producing a `NaN`.";
+
+/// #1572: which dose-clock slots the `[odes]` RHS reads **and** has no anchor for, given the
+/// `TAD` anchor the segment runs (or ran) under and the `ext_params` carrying the `TAFD` one.
+/// `None` when neither — the probe's pre-filter, and the reason a model that reads no clock
+/// never pays for it: `tad_anchor` is called only when the program reads `TAD`, so the driver's
+/// dose-list fold is skipped otherwise. Taking the `TAD` anchor separately lets the driver ask
+/// before the solve, when `ext_params` still holds the previous segment's, so it can request
+/// the soft samples phase B reads.
+fn unanchored_clock_candidates(
+    ode: &OdeSpec,
+    tad_anchor: impl FnOnce() -> f64,
+    ext_params: &[f64],
+) -> Option<(bool, bool)> {
+    let prog = ode.rhs_program.as_ref()?;
+    let tad = prog.pk_reads_tad() && tad_anchor().is_nan();
+    let tafd = prog.pk_reads_tafd() && ext_params[TAFD_ANCHOR_SLOT].is_nan();
+    (tad || tafd).then_some((tad, tafd))
+}
+
+/// The probe grid: [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning
+/// `[t_start, t_end]`, both ends included and the last one exactly `t_end` — so the soft
+/// samples phase B requests at `grid[1..]` lie in `integrate_segment`'s `(t_start, t_end]`.
+fn clock_probe_grid(t_start: f64, t_end: f64) -> Vec<f64> {
+    (0..=CLOCK_PROBE_INTERVALS)
+        .map(|k| {
+            if k == CLOCK_PROBE_INTERVALS {
+                t_end
+            } else {
+                t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64)
+            }
+        })
+        .collect()
+}
+
+/// #1572: a reactive pre-dose window whose state stayed finite, held until the run's first
+/// realized dose supplies the anchor it is judged at (phase B of
+/// [`unanchored_dose_clock_error_at_dose`]).
+struct PendingClockWindow {
+    t_start: f64,
+    t_end: f64,
+    tad: bool,
+    tafd: bool,
+    /// `ext_params` exactly as the segment ran: its PK snapshot (per segment on the TV path)
+    /// and its unanchored clock slots.
+    ext_params: Vec<f64>,
+    /// The trajectory on the probe grid: `(t_start, u_start)`, then the soft samples at
+    /// `grid[1..]`.
+    samples: Vec<(f64, Vec<f64>)>,
+}
+
+/// #1572, phase B: a window whose state stayed finite, judged at the run's first realized dose
+/// `dose_time` — the anchor `predict()` gives the same window on the realized schedule. The
+/// derivative is compared at the (time, state) pairs the trajectory visited, never at a pairing
+/// it did not. `Some(message)` when the window must be refused.
+fn unanchored_dose_clock_error_at_dose(
+    ode: &OdeSpec,
+    subject: &Subject,
+    window: &PendingClockWindow,
+    dose_time: f64,
+) -> Option<String> {
+    let pairs: Vec<(f64, &[f64])> = window
+        .samples
+        .iter()
+        .map(|(t, state)| (*t, state.as_slice()))
+        .collect();
+    let dependence = unanchored_clock_dependence(
+        ode,
+        &window.ext_params,
+        window.tad,
+        window.tafd,
+        &pairs,
+        dose_time,
+    )?;
+    let slot = dependence.slot_names();
+    let (t_start, t_end) = (window.t_start, window.t_end);
+    let reads = clock_window_reads(subject, t_start, t_end);
+    Some(format!(
+        "ode_predictions_adaptive: over the segment ({t_start}, {t_end}] the [odes] RHS reads \
+         {slot}, which had no referent there: no dose had been given yet. The derivative it \
+         computes there changes when that clock is anchored at the first dose this run gave, \
+         at t={dose_time}, which is where the static engines anchor that window on the \
+         realized schedule. {CLOCK_COMPARISON_NOTE} {reads} The window was integrated before \
+         the controller decided that dose, so this driver refuses the run rather than return a \
+         trajectory the dose's own clock contradicts. Give the subject a pre-scheduled base \
+         regimen, or have the controller dose at a decision at or before the subject's first \
+         record."
+    ))
+}
+
+/// The sentence naming what a refused clock window feeds: the first observation read off it,
+/// or the state it carries forward.
+fn clock_window_reads(subject: &Subject, t_start: f64, t_end: f64) -> String {
     // The reads taken off this segment, resolved with the same predicate
     // [`integrate_segment`] builds its `saveat` from — minus `t_end`'s own band. A record
     // there IS sampled pre-dose into `saveat`, but the value finally reported for it is the
@@ -3074,41 +3200,13 @@ fn unanchored_dose_clock_error(
         .copied()
         .filter(|&t| reads_in_segment(t, t_start, t_end) && (t_end - t).abs() > EVENT_MATCH_TOL)
         .fold(f64::INFINITY, f64::min);
-    let reads = if first_obs.is_finite() {
+    if first_obs.is_finite() {
         format!("The observation at t={first_obs} is read off that segment.")
     } else {
         "No observation is read off that segment, but the state integrated there carries \
          into every later read."
             .to_string()
-    };
-    // Both conjuncts, or the non-finite opener would be false of a state that stayed finite,
-    // or would blame the clock for a divergence it did not cause (see the doc comment).
-    let opener = if dependence.nan_reached_derivative && !u.iter().all(|x| x.is_finite()) {
-        format!(
-            "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
-             non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
-             dose has been given in this run."
-        )
-    } else {
-        format!(
-            "ode_predictions_adaptive: over the segment ({t_start}, {t_end}] the [odes] RHS \
-             reads {slot}, which has no referent there: no dose has been given in this run. \
-             The derivative it computes there changes when that clock is anchored, so the \
-             trajectory depends on a dose time this run does not have. A comparison against \
-             an unanchored clock does not fail, it answers one way — `NaN < 5` is false — \
-             which is how an `if`, `min` or `max` on it picks a side without producing a \
-             `NaN`."
-        )
-    };
-    Some(format!(
-        "{opener} {reads} Where the record contains a dose, the \
-         static engines anchor such a window at the first one — a dose a reactive run has \
-         not decided yet, and may never decide — so this driver refuses the window rather \
-         than read one out of the future. Give the subject a pre-scheduled base regimen, or \
-         have the controller dose at a decision at or before the subject's first record; a \
-         controller that never doses leaves a model reading {slot} unanchored for the whole \
-         run."
-    ))
+    }
 }
 
 /// Intervals in the grid [`unanchored_clock_dependence`] evaluates a segment's RHS on:
@@ -3136,33 +3234,61 @@ struct ClockDependence {
     nan_reached_derivative: bool,
 }
 
-/// #1535: does the `[odes]` RHS's derivative over `[t_start, t_end]` depend on the value of an
-/// unanchored dose clock? `None` when it does not.
+impl ClockDependence {
+    /// The spelling(s) the message names.
+    fn slot_names(&self) -> &'static str {
+        match (self.tad, self.tafd) {
+            (true, true) => "`TAD` and `TAFD`",
+            (true, false) => "`TAD`",
+            _ => "`TAFD`",
+        }
+    }
+}
+
+/// #1535 / #1572: does the `[odes]` RHS's derivative, at the given `(time, state)` pairs,
+/// depend on the value of an unanchored dose clock? `None` when it does not.
 ///
 /// `tad` / `tafd` mark the candidate slots: `NaN` in `ext_params`, and read by the program. The
-/// raw RHS — without the dose forcings, which read no clock — is evaluated at
-/// [`CLOCK_PROBE_INTERVALS`]` + 1` evenly spaced times spanning the segment, at `u_start` and
-/// at the end state `u`, each only when every component is finite: once with `ext_params`
-/// exactly as the segment ran, and once with every candidate slot anchored at `t_end`. The
-/// segment depends on the clock iff some derivative component differs. Each of these choices is
-/// pinned by a test:
+/// raw RHS — without the dose forcings, which read no clock — is evaluated at each pair whose
+/// state is finite in every component: once with `ext_params` exactly as the segment ran, and
+/// once with every candidate slot at `anchor`. The segment depends on the clock iff some
+/// derivative component differs. The pairs and the anchor come from the caller, split on the
+/// segment's outcome (#1572):
 ///
-/// - **One anchor: the window's end** (#1570 review, row 1). A window reaches this probe only
-///   when no dose has landed by `t_start`, so on the realized schedule the first dose — and with
-///   it the static engines' anchor — comes at `t_end` or later, and their clock is ≤ 0 across
-///   the window. A dose landing right at `t_end` is the earliest anchor a schedule can give; it
-///   puts `TAD` in `[-L, 0]` for a window of length `L`. An anchor at `t_start` would put it in
-///   `[0, L]`, where no schedule can: it refused `if (TAD > 5)` and `max(TAD, 0)`, whose
-///   unanchored arm is the arm every `TAD ≤ 0` takes, so those runs already equal `predict()`
-///   (measured bit-identical, and to 4.3e-16). The one shape only it could see — a RHS that is
-///   non-finite on all of `[-L, 0]`, such as `TAD^(-0.5)` — is non-finite in `predict()` too.
-/// - **Only states whose every component is finite** (#1570 review, row 2). `u` is probed as
-///   well as `u_start` because an empty compartment at the start can hide a comparison that the
-///   state filled during the segment makes visible. But once any component goes non-finite the
-///   solver pads every state with its last value (#1539), so the finite components of such a
-///   state are that pad, not an integrated one: `u` after this segment diverged, or `u_start`
-///   after an earlier segment did — a divergence that is not this window's clock's. Neither is
-///   probed, which also keeps the verdict the same whatever the pad holds.
+/// - **Phase A, the state went non-finite** ([`unanchored_dose_clock_error`]). Judged at once,
+///   at the window's start and end states × the [`clock_probe_grid`], anchored at `t_end`.
+/// - **Phase B, the state stayed finite** ([`unanchored_dose_clock_error_at_dose`]). Judged at
+///   the run's first realized dose `a`, at the trajectory's own state on the grid (soft samples,
+///   #570), anchored at `a`. That is the anchor `predict()` gives the window on the realized
+///   schedule, so the probe asks the oracle's own question; a run that never doses judges none.
+///
+/// Each choice is pinned by a test:
+///
+/// - **Phase B's anchor: the dose that came** (#1572). The window-end anchor saw only the
+///   earliest clock a schedule can give (`[-L, 0]`), so `if (TAD < -20)` with the first dose at
+///   36 ran 23.5× off `predict()`. Anchoring at every decision a dose could land at (the
+///   issue's first proposal) refuses that window even when the dose comes at 12, where the run
+///   equals `predict()` to 1.6e-15, and costs O(n²) on long hold schedules (17M RHS evaluations
+///   at n = 1000, measured).
+/// - **Phase B's states: the trajectory** (#1572). Pairing `u_start` with every grid time
+///   refused `if (central > 40 && TIME > 6)`, whose `central` falls below 40 before `TIME > 6`
+///   holds: a state the run never had at those times. The soft samples are Hermite-interpolated
+///   inside the solver's steps and leave the step sequence alone, so a comparison within about
+///   `reltol` of its threshold could fall either way.
+/// - **Phase A keeps the start/end pairing at `t_end`.** A window the clock itself drove
+///   non-finite has one finite trajectory sample, its start: `Y' = 0.01·TAD` under `TIME > 6`
+///   on `(6, 20]` is `NaN` right after 6, and at 6 the condition is false, so the trajectory
+///   alone sees nothing and the next decision's state guard names the symptom. Judging such a
+///   window now, from `u_start` at every grid time, names the clock. Its residues are the old
+///   pairing limit — a diverged window could be blamed through a pairing it never reached — for
+///   which no measured case exists, and the `t_end` anchor's, below. The window-end anchor is the earliest a schedule can give
+///   (#1570 review, row 1): an anchor at `t_start` would put `TAD` in `[0, L]`, where no
+///   schedule can, and refused `if (TAD > 5)` and `max(TAD, 0)`, whose runs equal `predict()`.
+/// - **Only states whose every component is finite, per pair** (#1570 review, row 2; #2089).
+///   Once any component goes non-finite the solver pads every state with `NaN` (#1539), so a
+///   partly finite state is not an integrated one. A derivative component that reads no state
+///   is still finite on the pad: `min(TAD, 24)` there is 24 unanchored and `TAD` anchored, and
+///   without the filter a window integrated from the pad is blamed on the clock.
 /// - **The grid, not the endpoints.** A condition can hold only inside the window — `TAD`
 ///   between −8 and −6 on a 12 h one — so the ends alone would miss it.
 /// - **Compared only where the anchored derivative is finite.** A component whose derivative is
@@ -3181,30 +3307,31 @@ struct ClockDependence {
 ///   named when its `NaN` alone, the other anchored, moves the anchored derivative; when only
 ///   the pair does (`if (TAD < 5 || TAFD < 5)`), both are named.
 ///
-/// Its limits, stated rather than hidden — measured on #1570, filed as #1572, and left to the
-/// default-on frozen-replay verifier until then:
+/// Its limits, stated rather than hidden:
 ///
-/// - A first dose later than `t_end` puts the clock further below zero than the anchor reaches,
-///   so a condition that switches only there is not seen: `if (TAD < -20)` over 12 h windows,
-///   with the first dose at 36, runs 23.5× off `predict()` at its worst read.
-/// - It samples 17 times and pairs the window's start and end states with each. A dependence
-///   between two sample times, or one that shows only at states inside the window, is missed;
-///   and a pairing the trajectory never reaches can be refused although the run matches
-///   `predict()` — measured with a condition on both the state and `TIME`.
+/// - It samples 17 times, so a dependence confined between two sample times is missed. The
+///   default-on frozen-replay verifier remains the net for that.
+/// - **Phase A still anchors at `t_end`** (#2119 review, row 1). A window that diverges under
+///   the unanchored clock, but would not under the anchor the realized first dose gives it, is
+///   not refused here when the `t_end` anchor diverges too: `if (TAD < -20 || TIME > 12)
+///   {Y' = 0} else {Y' = Y·Y}`, with decisions at 12/24/36 and the dose at 36, takes the `Y²`
+///   arm under both `NaN` and `TAD ∈ [-12, 0]`, so the next decision's state guard refuses the
+///   run naming `Y`, while `predict()` on the realized schedule stays finite. The run still
+///   ends in `Err`, so no number is returned; only the cause is misnamed. Holding such a window
+///   for the realized dose cannot help: the state guard refuses at the first decision on the
+///   diverged state, which here comes before any dose.
 ///
-/// Cost: `2 × 17 × 2` RHS evaluations on a segment with an unanchored clock the program reads,
-/// plus `2 × 17 × 3` to name the slots when both are candidates and the segment is refused.
-/// Nothing on segments with an anchored clock, and nothing on the RHS hot path.
-#[allow(clippy::too_many_arguments)]
+/// Cost: `2 × pairs` RHS evaluations — `2 × 34` in phase A, `2 × 17` per held window in phase
+/// B, which also keeps `17 × n_states` floats per held window until the first dose — plus
+/// `3 × pairs` to name the slots when both are candidates and the segment is refused. Nothing on
+/// segments with an anchored clock, and nothing on the RHS hot path.
 fn unanchored_clock_dependence(
     ode: &OdeSpec,
     ext_params: &[f64],
     tad: bool,
     tafd: bool,
-    u_start: &[f64],
-    u: &[f64],
-    t_start: f64,
-    t_end: f64,
+    pairs: &[(f64, &[f64])],
+    anchor: f64,
 ) -> Option<ClockDependence> {
     // A fixed order: `alone[j]` below is indexed like this list.
     let candidates: Vec<usize> = [(tad, TAD_ANCHOR_SLOT), (tafd, TAFD_ANCHOR_SLOT)]
@@ -3214,30 +3341,28 @@ fn unanchored_clock_dependence(
     // The one comparison the rule makes, per derivative component — see the doc comment.
     let moves = |ran: f64, anchored: f64| anchored.is_finite() && ran != anchored;
 
-    let n = u_start.len();
-    let (mut du_ran, mut du_anchored) = (vec![0.0; n], vec![0.0; n]);
-    // Every candidate slot at the window's end: the earliest anchor a schedule can give.
+    // Every candidate slot at the one anchor the caller names.
     let mut anchored = ext_params.to_vec();
     for &slot in &candidates {
-        anchored[slot] = t_end;
+        anchored[slot] = anchor;
     }
-    let states: Vec<&[f64]> = [u_start, u]
-        .into_iter()
-        .filter(|state| state.iter().all(|x| x.is_finite()))
+    // Per pair, only a state whose every component is finite (see the doc comment).
+    let pairs: Vec<(f64, &[f64])> = pairs
+        .iter()
+        .copied()
+        .filter(|(_, state)| state.iter().all(|x| x.is_finite()))
         .collect();
-    let times = (0..=CLOCK_PROBE_INTERVALS)
-        .map(|k| t_start + (t_end - t_start) * (k as f64 / CLOCK_PROBE_INTERVALS as f64));
+    let n = pairs.first().map_or(0, |(_, state)| state.len());
+    let (mut du_ran, mut du_anchored) = (vec![0.0; n], vec![0.0; n]);
     let mut depends = false;
     let mut nan_reached_derivative = false;
-    for &state in &states {
-        for t in times.clone() {
-            (ode.rhs)(state, ext_params, t, &mut du_ran);
-            (ode.rhs)(state, &anchored, t, &mut du_anchored);
-            for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
-                if moves(ran, anch) {
-                    depends = true;
-                    nan_reached_derivative |= !ran.is_finite();
-                }
+    for &(t, state) in &pairs {
+        (ode.rhs)(state, ext_params, t, &mut du_ran);
+        (ode.rhs)(state, &anchored, t, &mut du_anchored);
+        for (&ran, &anch) in du_ran.iter().zip(&du_anchored) {
+            if moves(ran, anch) {
+                depends = true;
+                nan_reached_derivative |= !ran.is_finite();
             }
         }
     }
@@ -3250,18 +3375,16 @@ fn unanchored_clock_dependence(
     let mut alone = [false; 2];
     if candidates.len() > 1 {
         let mut alone_unanchored = anchored.clone();
-        for &state in &states {
-            for t in times.clone() {
-                (ode.rhs)(state, &anchored, t, &mut du_anchored);
-                for (j, &slot) in candidates.iter().enumerate() {
-                    alone_unanchored.copy_from_slice(&anchored);
-                    alone_unanchored[slot] = f64::NAN;
-                    (ode.rhs)(state, &alone_unanchored, t, &mut du_ran);
-                    alone[j] |= du_ran
-                        .iter()
-                        .zip(&du_anchored)
-                        .any(|(&ran, &anch)| moves(ran, anch));
-                }
+        for &(t, state) in &pairs {
+            (ode.rhs)(state, &anchored, t, &mut du_anchored);
+            for (j, &slot) in candidates.iter().enumerate() {
+                alone_unanchored.copy_from_slice(&anchored);
+                alone_unanchored[slot] = f64::NAN;
+                (ode.rhs)(state, &alone_unanchored, t, &mut du_ran);
+                alone[j] |= du_ran
+                    .iter()
+                    .zip(&du_anchored)
+                    .any(|(&ran, &anch)| moves(ran, anch));
             }
         }
     }
@@ -5426,6 +5549,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // it the state stays at `init` and no segment is integrated, so a decision there reads
     // the seeded state, as the static subject (base ∪ ledger) would have it.
     let mut started = false;
+    // #1572: pre-dose windows on a clock-reading RHS whose state stayed finite, held for the
+    // first realized dose to judge them at (phase B). Empty for every model that reads no
+    // dose clock, and dropped unjudged by a run that never doses.
+    let mut pending_clock_windows: Vec<PendingClockWindow> = Vec::new();
     while k < break_times.len() {
         let t_start = break_times[k];
         if t_start >= t_base0 - EVENT_MATCH_TOL {
@@ -5854,6 +5981,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     }
                 }
 
+                // #1572, phase B: this decision gave the run's first realized dose, so the
+                // finite pre-dose windows now have the anchor `predict()` gives them on the
+                // realized schedule. Judge each at it, in walk order, and refuse at the first
+                // that depends on it; a window integrated after this dose is anchored by it.
+                if n_dosed > 0 {
+                    for window in &pending_clock_windows {
+                        if let Some(msg) =
+                            unanchored_dose_clock_error_at_dose(ode, &shadow, window, t_start)
+                        {
+                            return Err(AdaptiveDriverError::unsupported(msg));
+                        }
+                    }
+                    pending_clock_windows.clear();
+                }
+
                 // Log every decision — including holds and no-change, which leave
                 // no ledger row. `stopped` was false on entry to this hook (it gates
                 // the hook), so its truth here means the `Stop` fired this decision.
@@ -6007,7 +6149,27 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // #936: nothing evolves before the origin (see `started`).
             if started {
                 let u_start = u.clone();
-                integrate_segment(
+                // #1572: ask the probe's pre-filter once, BEFORE the solve — with the `TAD`
+                // anchor `integrate_segment` is about to write (the same expression), and the
+                // `TAFD` slot it does not touch — so that only a segment the probe will judge
+                // requests the trajectory's soft samples on the probe grid. Every other segment
+                // passes `&[]`, which is the solve it always was, bit for bit. A zero-length
+                // segment integrates nothing, so it has nothing to hold.
+                let clock_candidates = if (t_end - t_start).abs() >= 1e-15 {
+                    unanchored_clock_candidates(
+                        ode,
+                        || tad_anchor(&shadow, &dose_lagtimes, t_start),
+                        &ext_params,
+                    )
+                } else {
+                    None
+                };
+                let probe_times: Vec<f64> = if clock_candidates.is_some() {
+                    clock_probe_grid(t_start, t_end)[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let soft = integrate_segment(
                     ode,
                     &mut u,
                     t_start,
@@ -6024,23 +6186,41 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     &mut predictions,
                     None,
                     &mut auto_state,
-                    &[],
+                    &probe_times,
                 );
 
-                // #1151 / #1535: a segment whose dose clock had no referent — a window before the
-                // first realized (or base) dose on a `TAD`/`TAFD`-reading RHS — is refused when
-                // the RHS's derivative there depends on that clock's value: through arithmetic
-                // (`0.0 * NaN` reaches the *state*, so every later read inherits it) or through a
-                // comparison that silently picks a side. Refused here rather than left to the
-                // (default-on, but opt-out) frozen-replay verifier, whose message names the
-                // symptom and not the cause.
+                // #1151 / #1535 / #1572: a segment whose dose clock had no referent — a window
+                // before the first realized (or base) dose on a `TAD`/`TAFD`-reading RHS — is
+                // refused when the RHS's derivative there depends on that clock's value: through
+                // arithmetic (`0.0 * NaN` reaches the *state*, so every later read inherits it) or
+                // through a comparison that silently picks a side. Refused by the driver rather
+                // than left to the (default-on, but opt-out) frozen-replay verifier, whose message
+                // names the symptom and not the cause.
                 //
-                // Placed AFTER the solve: the helper probes the RHS at the segment's end state as
-                // well as its start, and `ext_params` now carries the anchors this segment ran
-                // under, so it re-folds nothing. It evaluates the RHS directly and re-solves
-                // nothing, so when it returns `None` the walk continues exactly as it would have
-                // without it.
-                if let Some(msg) = unanchored_dose_clock_error(
+                // Split on the segment's outcome (#1572). **Phase A**, a state that went
+                // non-finite: judged now, at the window's end anchor and its start and end
+                // states, so a divergence the clock's `NaN` caused is named as the clock's
+                // rather than left to the next decision's state guard. (One that a later anchor
+                // would have prevented still is — see `unanchored_clock_dependence`'s limits.)
+                // **Phase B**, a state that stayed finite: held, with its trajectory on the probe
+                // grid, until the first realized dose supplies the anchor `predict()` would use
+                // (the decision hook above). Both evaluate the RHS directly and re-solve nothing,
+                // so a window that is not refused leaves the walk exactly as it was.
+                if u.iter().all(|x| x.is_finite()) {
+                    if let Some((tad, tafd)) = clock_candidates {
+                        let mut samples = Vec::with_capacity(probe_times.len() + 1);
+                        samples.push((t_start, u_start));
+                        samples.extend(probe_times.iter().copied().zip(soft));
+                        pending_clock_windows.push(PendingClockWindow {
+                            t_start,
+                            t_end,
+                            tad,
+                            tafd,
+                            ext_params: ext_params.to_vec(),
+                            samples,
+                        });
+                    }
+                } else if let Some(msg) = unanchored_dose_clock_error(
                     ode,
                     &shadow,
                     &u_start,

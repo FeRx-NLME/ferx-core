@@ -5719,16 +5719,15 @@ fn adaptive_unrelated_divergence_is_not_blamed_on_the_dose_clock() {
     // really does read the unanchored `TAD`, and the dose-clock refusal there is right (#1578
     // review, finding 5). That schedule used to hold at 12 and dose at 36, so that `(12, 36]`
     // started from the solver's pad with the clock unanchored — the shape #1570 row 2 fixed. Since
-    // #1578 the decision at 12 refuses before that window runs, and no test now reaches a window
-    // that *starts* from a pad: that needs a segment break after the divergence and before the
-    // first decision (#2089).
+    // #1578 the decision at 12 refuses before that window runs. A window that *starts* from a
+    // pad needs a segment break after the divergence and before the first decision, which only
+    // a time-varying-covariate record gives: that is
+    // `adaptive_clock_probe_skips_the_solvers_pad_after_a_divergence` (#2089).
     //
     // Mutation that reddens it: drop the dependence test from `unanchored_dose_clock_error` —
     // refuse whenever the clock is read and unanchored (it was the `resolve_with_finite_clock`
-    // conjunct before #1535) — for both schedules. It does **not** kill "probe `u_start`
-    // whatever its components" (drop the all-finite filter in `unanchored_clock_dependence`),
-    // which needs the padded-start window above: measured surviving at `60cbec31` (the #1578
-    // review) and after #1578 with the second schedule at 18 (#2089).
+    // conjunct before #1535) — for both schedules. It does **not** kill dropping the probe's
+    // all-finite filter, which the #2089 test above does.
     let model =
         parse_model_string(ODE_TAD_PLUS_DIVERGENT_STATE).expect("parse divergent-state model");
     let obs = vec![0.0, 6.0, 20.0, 40.0];
@@ -6193,10 +6192,9 @@ fn adaptive_tad_rhs_refuses_over_a_pre_dose_window_longer_than_the_clock_survive
     // `62b9a6ef`, `verify: false` returned `Ok([NaN, NaN])` and the default verifier gave its
     // symptom message (`reactive=NaN, static=54.881163607201266`).
     //
-    // The dependence test anchors at the window's end only (#1570 review, row 1), which puts
-    // `TAD` in `[-800, 0]` where `exp(TAD)` never overflows, and refuses this window on its
-    // `NaN`-versus-finite derivative. The anchor's own pin is
-    // `adaptive_tad_dependence_is_judged_at_the_window_end_anchor`.
+    // The window diverges, so the dependence test judges it at once, anchored at the window's
+    // end (#1570 review, row 1; phase A since #1572), which puts `TAD` in `[-800, 0]` where
+    // `exp(TAD)` never overflows, and refuses it on its `NaN`-versus-finite derivative.
     //
     // Mutation that reddens it: drop the refusal.
     //
@@ -6414,10 +6412,12 @@ const ODE_TAD_IN_AN_INTERIOR_WINDOW: &str = r#"
 "#;
 
 #[test]
-fn adaptive_tad_dependence_is_judged_at_the_window_end_anchor() {
-    // #1535 T6, as settled on #1570's review (row 1). The probe anchors the clock at the
-    // window's end, the earliest a first dose can land, which gives the pre-dose window
-    // `TAD ∈ [-L, 0]` — the only values any schedule can give it.
+fn adaptive_tad_dependence_is_judged_at_a_first_dose_on_the_window_end() {
+    // #1535 T6, as settled on #1570's review (row 1), and renamed on #1572. The first dose
+    // lands at 12, the window's end, so the anchor the window is judged at — the dose that came
+    // (phase B, #1572) — is the earliest any schedule can give, `TAD ∈ [-L, 0]`. Where the
+    // first dose lands later, `adaptive_finite_pre_dose_window_is_judged_at_the_first_realized_dose`
+    // pins the anchor.
     //
     // - `min(TAD, 0)` is `TAD` there and 0 under the unanchored clock: the run is wrong, and is
     //   refused (measured with the check disabled: 0.31 off `predict()` at its worst read).
@@ -6510,6 +6510,373 @@ fn adaptive_tad_dependence_is_probed_inside_the_window_not_only_at_its_ends() {
         vs_static <= 1e-8,
         "no schedule gives the pre-dose window a positive clock, so `TAD` in (2, 4) must run and \
          match predict(): worst rel {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+// ============ #1572: a finite window is judged at the dose that came, on its trajectory ============
+//
+// A pre-dose window whose state stayed finite is held until the run's first realized dose and
+// judged with the clock anchored there — the anchor `predict()` gives that window on the
+// realized schedule — at the (time, state) pairs the trajectory visited (phase B). A window
+// whose state went non-finite is judged at once, as before (phase A).
+
+/// The #1572 issue's first fixture: `TAD < -20` holds before a first dose only when that dose
+/// lands more than 20 h after the time read. The window-end anchor (12, before #1572) put `TAD`
+/// in `[-12, 0]` on `(0, 12]` and never saw it.
+fn ode_tad_below_minus_20() -> String {
+    let src = ODE_TAD_IN_A_COMPARISON.replacen("if (TAD < 5.0)", "if (TAD < -20.0)", 1);
+    assert_ne!(
+        src, ODE_TAD_IN_A_COMPARISON,
+        "the fixture moves the threshold"
+    );
+    src
+}
+
+#[test]
+fn adaptive_finite_pre_dose_window_is_judged_at_the_first_realized_dose() {
+    // #1572 T1. One input varies, the index of the one decision that doses, over decisions at
+    // 12, 24 and 36. On the realized schedule `predict()` anchors `(0, 12]` at that dose:
+    //
+    //   dose at   TAD on (0, 12]   `TAD < -20`        verdict
+    //   12        [-12, 0]         never              runs, equals predict()
+    //   24        [-24, -12]       on t < 4           refused at the dose
+    //   36        [-36, -24]       everywhere         refused at the dose
+    //   none      NaN              never (both)       runs, equals predict()
+    //
+    // Measured before #1572: no cell was refused — the window-end anchor at 12 sees the first
+    // row's clock for every row — and with the check off the dose-at-36 run read
+    // `[50, 27.44, 6.77, 67.95]` against `predict()`'s `[50, 8.26, 0.276, 67.07]`, 23.5× off.
+    // The 12 and 36 legs therefore straddle the new gate, and neither was refused under the old.
+    //
+    // The table holds for `TAFD` too, which a first dose anchors at the same time, and the
+    // `TAFD` spelling is the only phase-B leg reading that clock (#2119 review, row 2): every
+    // other `TAFD` driver fixture reads it in arithmetic, and so goes to phase A.
+    //
+    // Mutations that redden it: judge phase B at the window's end (the 24 and 36 legs run); turn
+    // phase B off (likewise); anchor every reachable decision, the issue's proposal (the 12 leg
+    // is refused although it equals predict()); drop the `TAFD` candidate from the held window
+    // (`tafd: false` — the `TAFD` legs run).
+    let tad_src = ode_tad_below_minus_20();
+    let tafd_src = tad_src.replacen("if (TAD < -20.0)", "if (TAFD < -20.0)", 1);
+    assert_ne!(tafd_src, tad_src, "the `TAFD` twin swaps the clock alone");
+    let decisions = [12.0, 24.0, 36.0];
+    let obs = [0.0, 6.0, 20.0, 40.0];
+
+    for (clock, src) in [("TAD", &tad_src), ("TAFD", &tafd_src)] {
+        // Measured worst rel 1.6e-15 (dose at 12) and 1.8e-15 (no dose), for either clock.
+        for (leg, dose_idx) in [("dose at 12", vec![0]), ("no dose", vec![])] {
+            let (adaptive, static_pred) = tad_oracle_cell(src, &decisions, dose_idx, &obs, vec![]);
+            let vs_static = worst_rel(&adaptive, &static_pred, leg);
+            assert!(
+                vs_static <= 1e-12,
+                "{clock}, {leg}: `{clock} < -20` takes the unanchored (else) arm on the clock \
+                 predict() gives the window, so the run must equal predict(): worst rel \
+                 {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+            );
+        }
+
+        for (leg, idx, dose_time) in [("dose at 24", 1, "t=24"), ("dose at 36", 2, "t=36")] {
+            let err = tad_refusal(src, &decisions, vec![idx], &obs, vec![]).unwrap_or_else(|| {
+                panic!("{clock}, {leg}: the window's clock is below -20 — refuse")
+            });
+            assert!(
+                err.contains(&format!("reads `{clock}`, which")) && err.contains("(0, 12]"),
+                "{clock}, {leg}: must name the slot and the first window: {err}"
+            );
+            assert!(
+                err.contains(&format!(
+                    "anchored at the first dose this run gave, at {dose_time}"
+                )),
+                "{clock}, {leg}: must name the dose that anchors it: {err}"
+            );
+            assert!(
+                !err.contains("no dose has been given in this run"),
+                "{clock}, {leg}: the run did give one: {err}"
+            );
+        }
+    }
+
+    // The default verifier setting gives the same refusal: the driver refuses before the replay.
+    let src = &tad_src;
+    let model = parse_model_string(src).expect("parse F1");
+    let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        ..Default::default()
+    };
+    assert!(opts.verify, "the default runs the frozen-replay verifier");
+    let err = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(vec![2]),
+        &opts,
+    )
+    .expect_err("verify: true must refuse too")
+    .to_string();
+    assert!(
+        err.contains("(0, 12]") && err.contains("at t=36"),
+        "verify: true: {err}"
+    );
+    assert!(
+        !err.contains("frozen-schedule replay verification failed"),
+        "the driver refuses before the verifier runs: {err}"
+    );
+}
+
+/// The #1572 issue's second fixture with the clock in a `min`: the `TAD` arm needs both
+/// `central > THRESH` and `TIME > 6`. With `central(0) = 50` and `k = 0.1`, `central` falls
+/// below 40 at t ≈ 2.2 and below 20 at t ≈ 9.2.
+fn ode_state_and_time_gate(thresh: &str) -> String {
+    ODE_INIT50_AUTONOMOUS.replacen(
+        "  d/dt(central) = -(CL / V) * central\n",
+        &format!(
+            "  if (central > {thresh} && TIME > 6.0) {{\n    d/dt(central) = -(CL / V) * central \
+             * (1.0 - 0.05 * min(TAD, 0.0))\n  }} else {{\n    d/dt(central) = -(CL / V) * \
+             central\n  }}\n"
+        ),
+        1,
+    )
+}
+
+#[test]
+fn adaptive_finite_pre_dose_window_is_judged_on_its_trajectory() {
+    // #1572 T2, decisions at 12 and 36, dosing at both.
+    //
+    // - The issue's own fixture, `central > 40 && TIME > 6` with `(1 + 0.01·TAD)`: `central`
+    //   falls below 40 before `TIME > 6` holds, so the `TAD` arm never runs and the run equals
+    //   predict(). Before #1572 it was refused on `(0, 12]`: the probe paired `u_start`
+    //   (`central = 50`) with the grid's times after 6, a state the trajectory never has there.
+    // - The same gate with `min(TAD, 0)`, so the dependence is through a comparison and the state
+    //   stays finite whatever the clock: threshold 40 runs, as above; threshold 20 holds on
+    //   `(6, ~9.2]`, where the trajectory does enter the `TAD` arm, and is refused at the dose at
+    //   12. The pair differs by the threshold alone.
+    //
+    // Mutations that redden it: phase B pairs `u_start` with every grid time (both runs are
+    // refused); phase B reads `(t_start, u_start)` only (the threshold-20 cell runs).
+    let decisions = [12.0, 36.0];
+    let obs = [0.0, 6.0, 20.0, 40.0];
+
+    let issue_f2 = ODE_INIT50_AUTONOMOUS.replacen(
+        "  d/dt(central) = -(CL / V) * central\n",
+        "  if (central > 40.0 && TIME > 6.0) {\n    d/dt(central) = -(CL / V) * central * \
+         (1.0 + 0.01 * TAD)\n  } else {\n    d/dt(central) = -(CL / V) * central\n  }\n",
+        1,
+    );
+    let gate40 = ode_state_and_time_gate("40.0");
+    let gate20 = ode_state_and_time_gate("20.0");
+    for src in [&issue_f2, &gate40, &gate20] {
+        assert_ne!(
+            src.as_str(),
+            ODE_INIT50_AUTONOMOUS,
+            "the fixture adds the gate"
+        );
+    }
+    assert_eq!(
+        gate40.replacen("central > 40.0", "central > 20.0", 1),
+        gate20,
+        "the pair differs by the threshold alone"
+    );
+
+    // Measured worst rel: the issue's fixture 2.53e-12 (the issue's own 2.5e-12) — after the
+    // dose at 12 `central` is above 40 again and its `TAD` arm runs anchored, switching off at
+    // `central = 40`, which neither engine breaks on — so its bound carries 40× headroom;
+    // threshold 40, 1.6e-15, where `min(TAD, 0)` is 0 once dosed and the arm is the decay.
+    for (leg, src, bound) in [
+        ("issue F2", &issue_f2, 1e-10),
+        ("threshold 40", &gate40, 1e-12),
+    ] {
+        let (adaptive, static_pred) = tad_oracle_cell(src, &decisions, vec![0, 1], &obs, vec![]);
+        let vs_static = worst_rel(&adaptive, &static_pred, leg);
+        assert!(
+            vs_static <= bound,
+            "{leg}: the trajectory never enters the `TAD` arm, so the run must equal predict(): \
+             worst rel {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+        );
+    }
+
+    let err = tad_refusal(&gate20, &decisions, vec![0, 1], &obs, vec![]).unwrap_or_else(|| {
+        panic!("threshold 20: the trajectory enters the `TAD` arm on (6, ~9.2] — refuse")
+    });
+    assert!(
+        err.contains("`TAD`") && err.contains("(0, 12]") && err.contains("at t=12"),
+        "threshold 20: must name the slot, the window and the dose: {err}"
+    );
+    assert!(
+        !err.contains("non-finite state"),
+        "threshold 20: the state stayed finite: {err}"
+    );
+}
+
+/// #2089's fixture, on the time-varying-covariate path, where every record is a segment
+/// break: `X` runs to its pole at t = 2 when `x_rate` is 0.5, so the windows after it start
+/// from the solver's all-`NaN` pad (#1539); `Y` reads `TAD` after t = 6, through `y_rhs`.
+fn tv_pole_clock_model(x_rate: &str, y_rhs: &str) -> CompiledModel {
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, X, Y])
+[odes]
+  init(central) = 50.0
+  init(X) = 1.0
+  d/dt(central) = -(CL / V) * central
+  d/dt(X) = {x_rate} * X * X
+  if (TIME > 6.0) {{ d/dt(Y) = {y_rhs} }} else {{ d/dt(Y) = 0.0 }}
+[error_model]
+  DV ~ proportional(PROP)
+"#
+    ))
+    .expect("parse TV pole/clock model")
+}
+
+/// One reactive run of [`tv_pole_clock_model`]: CRCL changes at every observation (0, 6, 20,
+/// 40), and the one decision, at 36, doses.
+fn tv_pole_clock_run(model: &CompiledModel) -> Result<AdaptiveSimulationResult, String> {
+    let obs = vec![0.0, 6.0, 20.0, 40.0];
+    let mut s = subj("1", obs, vec![]);
+    let crcl = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+    s.covariates = crcl(100.0);
+    s.obs_covariates = vec![crcl(100.0), crcl(90.0), crcl(80.0), crcl(70.0)];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![36.0],
+        verify: false,
+        ..Default::default()
+    };
+    simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn adaptive_clock_probe_skips_the_solvers_pad_after_a_divergence() {
+    // #2089 / #1572 T3. With the pole, `(6, 20]` starts and ends on the solver's all-`NaN` pad,
+    // so nothing in it was integrated: the probe must not read it, and the decision at 36 is
+    // refused by the #1578 state guard, naming the state. Its `Y` derivative reads no state, so
+    // on the pad it is still finite — `min(NaN, 24)` is 24 unanchored, `TAD` anchored — and a
+    // probe that read the pad would blame the clock for a window it never integrated.
+    //
+    // The reach twin, `x_rate = 0`, removes the pole alone: `(6, 20]` stays finite, is held, and
+    // is refused at the dose at 36 naming `TAD` — so the window does reach the probe with a live
+    // clock read, and the pole is the only thing between the two verdicts.
+    //
+    // Mutation that reddens it: delete the probe's per-pair finite filter (the pole cell then
+    // blames `TAD` on `(6, 20]`; measured on #1572's plan, B5).
+    let y = "0.01 * min(TAD, 24.0)";
+    let err = tv_pole_clock_run(&tv_pole_clock_model("0.5", y))
+        .err()
+        .expect("a decision on a diverged state is refused");
+    assert!(
+        err.contains("decision 0 at t=36: the ODE state is non-finite (central, X, Y)"),
+        "the state guard names the diverged state: {err}"
+    );
+    assert!(
+        !err.contains("no referent"),
+        "the dose clock did not cause this and must not be named: {err}"
+    );
+
+    let err = tv_pole_clock_run(&tv_pole_clock_model("0.0", y))
+        .err()
+        .expect("without the pole the window's clock dependence is real — refuse");
+    assert!(
+        err.contains("`TAD`") && err.contains("(6, 20]") && err.contains("at t=36"),
+        "reach twin: must name the slot, the window and the dose: {err}"
+    );
+}
+
+#[test]
+fn adaptive_diverged_clock_window_is_judged_at_once() {
+    // #1572 T4: why phase A keeps the start/end pairing for a window whose state went
+    // non-finite. `Y' = 0.01·TAD` after t = 6, no pole: the unanchored clock puts `NaN` into
+    // `Y` right after 6, so `(6, 20]` diverges *because of* the clock. Its trajectory has one
+    // finite sample, at t = 6, where `TIME > 6` is still false — so a trajectory-only probe
+    // sees no dependence, and the decision at 36 is refused by the state guard instead, naming
+    // the symptom (measured on #1572's plan: `TVDIV4`). Phase A pairs the finite `u_start` with
+    // the grid's times after 6 and refuses the window at once, with the non-finite opener.
+    //
+    // Mutation that reddens it: judge a diverged window on its trajectory samples only.
+    let err = tv_pole_clock_run(&tv_pole_clock_model("0.0", "0.01 * TAD"))
+        .err()
+        .expect("the clock's NaN reached the state — refuse");
+    assert!(
+        err.contains("the segment (6, 20] integrated to a non-finite state")
+            && err.contains("`TAD`"),
+        "must name the window, the outcome and the slot: {err}"
+    );
+    assert!(
+        !err.contains("the ODE state is non-finite"),
+        "refused at the window, not by the state guard at the next decision: {err}"
+    );
+}
+
+#[test]
+fn adaptive_diverged_window_that_only_a_later_anchor_saves_is_named_as_a_divergence() {
+    // #2119 review, row 1: the documented limit of phase A's window-end anchor, pinned so the
+    // docs sentence describing it is a checked claim. `Y' = Y·Y` from `Y(0) = 1` has a pole at
+    // t = 1 unless `TAD < -20 || TIME > 12` holds. With the first dose at 36, `predict()` gives
+    // `(0, 12]` the clock `[-36, -24]`, so `Y` never moves and the run is finite. The reactive
+    // driver integrates `(0, 12]` under the unanchored clock (the else arm, the pole), and the
+    // phase-A probe anchors at 12, where `TAD ∈ [-12, 0]` takes the else arm too: no
+    // dependence. The decision at 12 is then refused for its diverged state, and the clock is
+    // not named. No number is returned.
+    //
+    // The control is the same model under `predict()` on the realized schedule (finite), so the
+    // refusal is the limit, not a model that diverges for every schedule.
+    //
+    // A change that judges a diverged window at the realized dose would redden this test — and
+    // should then rewrite the docs' "What the check cannot see" paragraph with it.
+    let src = ODE_INIT50_AUTONOMOUS
+        .replacen(
+            "ode(states=[central])",
+            "ode(obs_cmt=central, states=[central, Y])",
+            1,
+        )
+        .replacen(
+            "  init(central) = 50.0\n",
+            "  init(central) = 50.0\n  init(Y) = 1.0\n  if (TAD < -20.0 || TIME > 12.0) { d/dt(Y) \
+             = 0.0 } else { d/dt(Y) = Y * Y }\n",
+            1,
+        )
+        .replacen("[scaling]\n  y = central\n", "", 1);
+    assert!(
+        src.contains("d/dt(Y) = Y * Y") && !src.contains("[scaling]"),
+        "the fixture adds the gated pole: {src}"
+    );
+    let model = parse_model_string(&src).expect("parse gated-pole model");
+    let obs = vec![0.0, 6.0, 20.0, 40.0];
+
+    let static_pop = population(vec![subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(36.0, 100.0, 1, 0.0, false, 0.0)],
+    )]);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite()),
+        "predict() on the realized schedule is finite: {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+
+    let err = tad_refusal(&src, &[12.0, 24.0, 36.0], vec![2], &obs, vec![])
+        .expect("the reactive run diverges on (0, 12] and is refused");
+    assert!(
+        err.contains("decision 0 at t=12: the ODE state is non-finite (central, Y)"),
+        "refused by the state guard, naming the state: {err}"
+    );
+    assert!(
+        !err.contains("no referent"),
+        "the window-end anchor diverges too, so the clock is not named: {err}"
     );
 }
 
