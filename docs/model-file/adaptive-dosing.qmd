@@ -170,6 +170,8 @@ bioavailability `F` of any dose it issues there. That record is the **latest dat
 record at or before `t`**: an observation, an EVID=2 row, a pre-scheduled dose row
 or an EVID=3/4 reset row. When several records share that time, the observation
 wins over an EVID=2 row, which wins over a dose row, which wins over a reset row.
+Among several rows of the same kind at that time, the one listed last in the file
+wins.
 
 | Decision at `t` | Reads |
 |---|---|
@@ -330,10 +332,10 @@ correctly. The verifier therefore also **independently re-derives** each snapsho
 (the per-occasion `kappa`, the per-decision PK at the decision's covariate, the
 per-record PK) from the run's primitives and bit-checks it against what the driver
 used, so a mis-resolved covariate or occasion fails loudly rather than being applied
-by both sides and slipping through unnoticed (#748). It finds the decision's record
-with the driver's own resolver, so it checks the plumbing, not which record a
-decision reads ([What a decision reads](#what-a-decision-reads) is tested against
-`predict()` directly).
+by both sides and slipping through unnoticed (#748). Which record a decision reads
+([What a decision reads](#what-a-decision-reads)) is checked the same way: the
+verifier works it out again from the subject's data rows with code of its own, and
+fails the run if the driver read a different row (#1599).
 
 ## Validation
 

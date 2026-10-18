@@ -1975,7 +1975,11 @@ pub(crate) fn forcing_consumes_cmt(
 /// `check_dose_compartments` rejects a `CMT=0` infusion (`E_DOSE_CMT_NOT_INFUSABLE`) and
 /// any `cmt > n_states`, and `check_absorption_dosing` rejects an SS infusion into an
 /// absorption compartment (`E_ABSORPTION_SS_INFUSION`). Recorded because "confined to
-/// the plain `+rate`" would understate the change for a hand-built [`OdeSpec`].
+/// the plain `+rate`" would understate the change for a hand-built [`OdeSpec`]. Pinned by
+/// `residual_ss_infusion_window_obeys_the_membership_predicate` (#1236) for the
+/// compartment and forcing tests; the real-infusion test is redundant on that branch
+/// (`ss_residual_infusion_end` returns `None` for a non-infusion itself), so no test of the
+/// residual window can observe it.
 #[inline]
 pub(crate) fn infusion_contributes(
     input_rate: &[crate::pk::absorption::InputRateForcing],
@@ -4739,12 +4743,28 @@ pub(crate) struct AdaptiveRecordIndex {
     /// Time bits -> the LAST reset at that instant (the one whose re-seed survives, as
     /// the driver's `rposition` match applies it).
     reset: HashMap<u64, usize>,
-    /// Time bits -> index into the base regimen.
-    dose: HashMap<u64, usize>,
-    /// Time bits -> index into `pk_only_times`.
-    pk_only: HashMap<u64, usize>,
-    /// Time bits -> first index into `obs_times` at that instant.
-    obs: HashMap<u64, usize>,
+    /// Time bits -> `(first, last)` index into the base regimen at that instant.
+    dose: HashMap<u64, (usize, usize)>,
+    /// Time bits -> `(first, last)` index into `pk_only_times` at that instant.
+    pk_only: HashMap<u64, (usize, usize)>,
+    /// Time bits -> `(first, last)` index into `obs_times` at that instant.
+    ///
+    /// Both ends are kept because the two lookups want different rows of a co-timed
+    /// same-kind group: [`Self::at`] the first (the row that terminates the segment),
+    /// [`Self::last_at`] the last (the row in force after the instant). Keeping only the
+    /// first made a decision after two co-timed observations read the FIRST row's
+    /// covariates — 2.5× in an injected dose's `F` (2.37× in IPRED@42 on the #1599 plan's
+    /// fixture) — while every verifier shared this index and passed.
+    obs: HashMap<u64, (usize, usize)>,
+}
+
+/// Record index `i` into a `(first, last)` slot: the first insert sets both ends, every
+/// later one at the same instant moves only `last`. Each record vector is in file order
+/// within its kind, so `last` is the row processed last.
+fn push_first_last(map: &mut HashMap<u64, (usize, usize)>, t: f64, i: usize) {
+    map.entry(t.to_bits())
+        .and_modify(|e| e.1 = i)
+        .or_insert((i, i));
 }
 
 impl AdaptiveRecordIndex {
@@ -4760,15 +4780,15 @@ impl AdaptiveRecordIndex {
             idx.times.push(t);
         }
         for (k, d) in subject.doses.iter().take(n_base).enumerate() {
-            idx.dose.entry(d.time.to_bits()).or_insert(k);
+            push_first_last(&mut idx.dose, d.time, k);
             idx.times.push(d.time);
         }
         for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            idx.pk_only.entry(t.to_bits()).or_insert(m);
+            push_first_last(&mut idx.pk_only, t, m);
             idx.times.push(t);
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
-            idx.obs.entry(t.to_bits()).or_insert(j);
+            push_first_last(&mut idx.obs, t, j);
             idx.times.push(t);
         }
         idx.times.sort_by(|a, b| a.total_cmp(b));
@@ -4785,27 +4805,28 @@ impl AdaptiveRecordIndex {
         if let Some(&r) = self.reset.get(&bits) {
             return Some(AdaptiveRecord::Reset(r));
         }
-        if let Some(&k) = self.dose.get(&bits) {
+        if let Some(&(k, _)) = self.dose.get(&bits) {
             return Some(AdaptiveRecord::Dose(k));
         }
-        if let Some(&m) = self.pk_only.get(&bits) {
+        if let Some(&(m, _)) = self.pk_only.get(&bits) {
             return Some(AdaptiveRecord::PkOnly(m));
         }
-        self.obs.get(&bits).copied().map(AdaptiveRecord::Obs)
+        self.obs.get(&bits).map(|&(j, _)| AdaptiveRecord::Obs(j))
     }
 
     /// The **last** record sitting exactly at `t` in `kind_order` — the reverse of
     /// [`Self::at`]. Processing order at an instant is `Reset`, then the dose, EVID=2 and
-    /// observation rows, so the last one processed is what is in force after the instant.
+    /// observation rows, each kind in file order, so the last one processed is what is in
+    /// force after the instant: the last row of the last kind present, not its first (#1599).
     fn last_at(&self, t: f64) -> Option<AdaptiveRecord> {
         let bits = t.to_bits();
-        if let Some(&j) = self.obs.get(&bits) {
+        if let Some(&(_, j)) = self.obs.get(&bits) {
             return Some(AdaptiveRecord::Obs(j));
         }
-        if let Some(&m) = self.pk_only.get(&bits) {
+        if let Some(&(_, m)) = self.pk_only.get(&bits) {
             return Some(AdaptiveRecord::PkOnly(m));
         }
-        if let Some(&k) = self.dose.get(&bits) {
+        if let Some(&(_, k)) = self.dose.get(&bits) {
             return Some(AdaptiveRecord::Dose(k));
         }
         self.reset.get(&bits).copied().map(AdaptiveRecord::Reset)
@@ -5000,10 +5021,11 @@ fn earliest_record_pk(
 ///
 /// The driver resolves its readout PK and an injected dose's `F` from the **same**
 /// `in_force` record, so the covariates a controller reads and the parameters behind its
-/// signals cannot come from different rows. `run_adaptive_population` calls this for
-/// each IOV `decision_pk[g]` snapshot, and `verify_adaptive_snapshots` re-derives it the
-/// same way — which is why it is `pub(crate)`, and also why that verifier pins the
-/// plumbing, not this rule: it shares the resolver.
+/// signals cannot come from different rows. The driver's `ctx.covariates` and
+/// `run_adaptive_population`'s IOV `decision_pk[g]` both call this, which is why it is
+/// `pub(crate)`. `verify_adaptive_snapshots` calls it only to get what the driver read, and
+/// bit-checks that against a derivation sharing no code with [`AdaptiveRecordIndex`]
+/// (#1599), so a wrong rule here fails that check rather than passing on every side.
 pub(crate) fn locf_decision_cov<'a>(
     records: &AdaptiveRecordIndex,
     t: f64,
@@ -5706,8 +5728,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // an `observe` / `[scaling]` expression that references a time-varying
                 // covariate directly reads the row the PK was built from. The constant path
                 // keeps the subject-static map (byte-identical; `obs_cov` equals it there).
+                // Through `locf_decision_cov`, the one function the IOV build and the
+                // verifier's #1599 cross-check also call, so the map that check compares is
+                // the map the controller gets.
                 let decision_cov = if tv {
-                    in_force.map_or(&shadow.covariates, |rec| rec.cov(subject))
+                    locf_decision_cov(&records, t_start, subject, &shadow.covariates)
                 } else {
                     match obs_map
                         .get(&t_start.to_bits())

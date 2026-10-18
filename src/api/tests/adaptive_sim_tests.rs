@@ -1623,6 +1623,93 @@ fn adaptive_base_infusion_under_tv_covariate_matches_closed_form() {
 }
 
 #[test]
+fn adaptive_base_infusion_end_colliding_with_a_decision_dose_applies_it_once() {
+    // #1236 part 1. Both the reactive driver and its frozen replay (`adaptive_frozen_replay_tv`)
+    // break at every base infusion's end, so a derived end landing within `EVENT_MATCH_TOL` of
+    // a controller dose — but past the 1e-15 dedup — is a second break where that dose
+    // matches. Only the apply-once masks stop it applying twice (#1186).
+    //
+    // Two geometries, because the two sides are reachable from opposite sides of the gap:
+    //  - the infusion ends 3.55e-15 BEFORE the decision (0.2 + 239/10 = 24.099999999999998
+    //    vs 24.1): the replay, whose ledger already holds the bolus, meets it at the earlier
+    //    break; the driver has not injected it yet, so only the replay's mask is live;
+    //  - it ends 3.55e-15 AFTER (0.1 + 103/5 = 20.700000000000003 vs 20.7): the driver has
+    //    injected and applied the bolus, then meets it again; both masks are live.
+    // Measured with each mask deleted on its own: replay → "diverges from the frozen-schedule
+    // replay" `Err` on both geometries; driver → the same `Err` on the second. With both
+    // deleted the two sides agree on the doubled bolus, which the `predict()` comparison
+    // catches. The run needs the time-varying path (CRCL changes): the replay runs only there.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    for (label, infusion, decision, ends_after) in [
+        (
+            "ends after",
+            DoseEvent::new(0.1, 103.0, 1, 5.0, false, 0.0),
+            20.7,
+            true,
+        ),
+        (
+            "ends before",
+            DoseEvent::new(0.2, 239.0, 1, 10.0, false, 0.0),
+            24.1,
+            false,
+        ),
+    ] {
+        let end = infusion.time + infusion.bioavailable_infusion(1.0).1;
+        let gap = end - decision;
+        assert!(
+            gap.abs() > 1e-15
+                && gap.abs() < crate::ode::predictions::EVENT_MATCH_TOL
+                && (gap > 0.0) == ends_after,
+            "{label}: the infusion end must sit past the dedup, inside the match, on the \
+             intended side: end {end:?}, decision {decision}"
+        );
+
+        let mut s = subj("1", vec![12.0, 30.0], vec![infusion.clone()]);
+        s.covariates = crcl_1148(100.0);
+        s.dose_covariates = vec![crcl_1148(100.0)];
+        s.obs_covariates = vec![crcl_1148(100.0), crcl_1148(60.0)];
+        let mut pop = population(vec![s.clone()]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1236),
+            decision_times: vec![decision],
+            ..Default::default() // verify = true
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .unwrap_or_else(|e| panic!("{label}: the colliding bolus must apply once: {e:?}"));
+        assert_eq!(res.ledger.len(), 1, "{label}: one controller bolus");
+
+        // `predict()` on base ∪ ledger. The bolus row is a record there and governs
+        // (12, decision], which on the adaptive walk obs@30 governs — so it carries obs@30's
+        // CRCL; that restates the governing rule, it is not what this test is about.
+        let mut realized = s;
+        realized.doses = vec![
+            infusion,
+            DoseEvent::new(decision, 100.0, 1, 0.0, false, 0.0),
+        ];
+        realized.dose_covariates = vec![crcl_1148(100.0), crcl_1148(60.0)];
+        realized.dose_occasions = vec![1; 2];
+        let mut pop = population(vec![realized]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        let want = predict(&model, &pop, &model.default_params).unwrap();
+        let got = ipred_at_1148(&res, 30.0);
+        let p30 = want
+            .iter()
+            .find(|p| (p.time - 30.0).abs() < 1e-9)
+            .unwrap()
+            .pred;
+        assert!(got.is_finite() && p30.is_finite(), "{label}: {got} / {p30}");
+        // Measured: bit-identical on both geometries. The 1e-9 band is this file's
+        // degenerate-oracle convention; a doubled bolus is ≥ 57 away.
+        assert!(
+            (got - p30).abs() <= 1e-9 * p30.abs(),
+            "{label}: IPRED@30 = {got} vs predict() {p30}; a doubled bolus adds {:.4}",
+            100.0 * (-0.06f64 * (30.0 - decision)).exp()
+        );
+    }
+}
+
+#[test]
 fn adaptive_base_loading_plus_titration_under_tv_covariate_passes_verifier() {
     // #930: a base loading dose augmented by a controller under a time-varying covariate. The
     // controller doses at every decision (state-independent), so base ∪ realized ledger
@@ -8201,6 +8288,121 @@ fn adaptive_decision_before_any_record_reads_the_baseline() {
             100.0 * 0.48 * (-1.2f64).exp()
         );
     }
+}
+
+/// #1599 fixture: two records of ONE kind share t=24 with different `CRCL`, `first` then
+/// `second` in file order; obs@12 (90) before them, obs@42 (`second`) after.
+fn cotimed_same_kind_subject_1599(kind: &str, first: f64, second: f64) -> Subject {
+    let mut s = match kind {
+        "obs" => {
+            let mut s = subj("1", vec![12.0, 24.0, 24.0, 42.0], vec![]);
+            s.obs_covariates = vec![
+                crcl_1148(90.0),
+                crcl_1148(first),
+                crcl_1148(second),
+                crcl_1148(second),
+            ];
+            s
+        }
+        "dose" => {
+            let mut s = subj(
+                "1",
+                vec![12.0, 42.0],
+                vec![
+                    DoseEvent::new(24.0, 50.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(24.0, 50.0, 1, 0.0, false, 0.0),
+                ],
+            );
+            s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(second)];
+            s.dose_covariates = vec![crcl_1148(first), crcl_1148(second)];
+            s
+        }
+        "evid2" => {
+            let mut s = subj("1", vec![12.0, 42.0], vec![]);
+            s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(second)];
+            s.pk_only_times = vec![24.0, 24.0];
+            s.pk_only_covariates = vec![crcl_1148(first), crcl_1148(second)];
+            s.pk_only_occasions = vec![1, 1];
+            s
+        }
+        _ => unreachable!("{kind}"),
+    };
+    s.covariates = crcl_1148(90.0);
+    s
+}
+
+#[test]
+fn adaptive_decision_after_cotimed_same_kind_rows_reads_the_last() {
+    // #1599: a decision reads the LAST row processed at the latest instant. Within one kind
+    // the rows are processed in file order, so that is the kind's last row. The index kept
+    // only each kind's FIRST row at an instant (right for the governing lookup, wrong for
+    // this one): measured before the fix, obs@24 (50 then 20) → ctx CRCL 50 and
+    // IPRED@42 21.951 instead of 8.781, 2.5× in the injected dose, with every verifier green.
+    //
+    // Both file orders run for every kind, so the pair straddles first-vs-last: a rule that
+    // keyed on the value (max, min) or on the first row fails one of the two orders.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    for kind in ["obs", "dose", "evid2"] {
+        for (first, second) in [(50.0, 20.0), (20.0, 50.0)] {
+            let label = format!("{kind} {first} then {second}");
+            let s = cotimed_same_kind_subject_1599(kind, first, second);
+            let (res, seen) = run_capture_1148(&model, s, &[36.0]);
+            assert_eq!(
+                crcl_seen_at_1148(&seen, 36.0),
+                second,
+                "{label}: ctx CRCL at t=36 must be the last row at 24 ({second}), not the first \
+                 ({first})"
+            );
+            // The decision dose at 36 with F from the last row; base doses (the "dose" kind)
+            // keep their own rows' F.
+            let base = if kind == "dose" {
+                [first, second]
+                    .iter()
+                    .map(|&c| 50.0 * (0.8 * c / 100.0) * (-0.1f64 * 18.0).exp())
+                    .sum()
+            } else {
+                0.0
+            };
+            let want = base + bolus_closed_form_1148(second, 6.0);
+            let stale = base + bolus_closed_form_1148(first, 6.0);
+            let got = ipred_at_1148(&res, 42.0);
+            assert!(
+                (got - want).abs() <= band_1148(want),
+                "{label}: IPRED@42 = {got}, want the last row's {want:.6} (first row: {stale:.6})"
+            );
+            assert!(
+                (want - stale).abs() > 100.0 * band_1148(want),
+                "{label}: the fixture must separate the two rows"
+            );
+        }
+    }
+}
+
+#[test]
+fn adaptive_state_past_cotimed_final_rows_carries_the_last() {
+    // #1599, the carry half. `ODE_TV_COV`: CL = 5·CRCL/100. obs@12 (90) then two obs@24
+    // (60 then 30) are the final records; a decision@36 reads the state. (0, 12] runs under
+    // obs@12 (k 0.09), (12, 24] under the FIRST obs@24 — the governing lookup, the row that
+    // ends the interval, unchanged — (k 0.06), and (24, 36] past the final record under the
+    // carry, which is the record in force: the LAST obs@24 (k 0.03). State@36 =
+    // 100·e^(−1.08−0.72−0.36) = 11.532512; carrying the first row gives 100·e^(−2.52) =
+    // 8.045960.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj("1", vec![12.0, 24.0, 24.0], vec![]);
+    s.covariates = crcl_1148(90.0);
+    s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(60.0), crcl_1148(30.0)];
+    let (_, seen) = run_capture_1148(&model, s, &[0.0, 36.0]);
+    let state36 = seen
+        .iter()
+        .find(|v| (v.0 - 36.0).abs() < 1e-9)
+        .expect("a decision at 36")
+        .2;
+    let want = 100.0 * (-2.16f64).exp();
+    assert!(
+        (state36 - want).abs() <= band_1148(want),
+        "ctx.state@36 = {state36}, want {want:.6} under the last obs@24's CL (first row's: {:.6})",
+        100.0 * (-2.52f64).exp()
+    );
 }
 
 #[test]
