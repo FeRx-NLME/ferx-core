@@ -311,12 +311,37 @@ fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     let worst_var = ((om(&prof) - om(&plain)).abs() / om(&plain))
         .max((ka(&prof) - ka(&plain)).abs() / ka(&plain));
     assert!(worst_var.is_finite());
+
+    // The off-diagonal blocks the SEs cannot see (#2130 review #3): `Cov(θ, β)` and the
+    // level × level covariances, in the published packed matrix, as a correlation gap
+    // `|C_p − C_u| / sqrt(C_u,ii · C_u,jj)` against the unprofiled one. Over every θ
+    // pair — structural × level and level × level — each off its own diagonal.
+    let (cp, cu) = (
+        prof.covariance_matrix.as_ref().unwrap(),
+        plain.covariance_matrix.as_ref().unwrap(),
+    );
+    assert_eq!(cp.shape(), cu.shape());
+    let (mut worst_cross, mut worst_bb) = (0.0_f64, 0.0_f64);
+    for i in 0..a.len() {
+        for j in (0..a.len()).filter(|&j| j != i && j >= 3) {
+            let gap = (cp[(i, j)] - cu[(i, j)]).abs() / (cu[(i, i)] * cu[(j, j)]).sqrt();
+            assert!(gap.is_finite(), "({i}, {j})");
+            if i < 3 {
+                worst_cross = worst_cross.max(gap);
+            } else {
+                worst_bb = worst_bb.max(gap);
+            }
+        }
+    }
     eprintln!(
-        "C1: structural SE {worst_struct:.3e}, level SE {worst_level:.3e}, variance SE {worst_var:.3e}"
+        "C1: structural SE {worst_struct:.3e}, level SE {worst_level:.3e}, variance SE \
+         {worst_var:.3e}; correlation gap Cov(θ,β) {worst_cross:.3e}, Cov(β,β') {worst_bb:.3e}"
     );
     assert!(worst_struct < C1_BOUND, "{worst_struct}");
     assert!(worst_level < C1_BOUND, "{worst_level}");
     assert!(worst_var < C1_BOUND, "{worst_var}");
+    assert!(worst_cross < C1_CORR_BOUND, "{worst_cross}");
+    assert!(worst_bb < C1_CORR_BOUND, "{worst_bb}");
 }
 
 /// Worst realised 4.7e-3 (structural), 2.3e-4 (levels), 3.0e-3 (Ω, Ω_IOV), Linux aarch64
@@ -324,6 +349,10 @@ fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
 /// two FD Hessians of one objective, at the same step rule but over 5 coordinates
 /// re-profiled against 41 held; 2.1× headroom on the worst.
 const C1_BOUND: f64 = 1e-2;
+/// Correlation-scale gap of the off-diagonal blocks: worst realised 9.0e-3 (`Cov(θ, β)`)
+/// and 5.7e-4 (`Cov(β, β')`), macOS arm64. The `Cov(θ, β)` gap is the structural SEs'
+/// own 4.7e-3 FD difference carried through `−Cov(θ)·B·D⁻¹`; 2.8× headroom on it.
+const C1_CORR_BOUND: f64 = 2.5e-2;
 
 /// `run_covariance` on a profiled fit replays the profiled step the fit ran: the same
 /// standard errors, levels included. The unprofiled step it would otherwise take is the
