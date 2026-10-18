@@ -494,3 +494,86 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_analytic_engine() {
         true,
     );
 }
+
+// ── Backtracking: a start far from the minimum ─────────────────────────────────────
+
+/// From levels 20 units off (the data's spread is ~1.5), the Newton matrix taken at the
+/// start's η̂ overshoots on F2; the backtracking keeps the solve on the way down and it
+/// lands on the oracle's minimum. Dies when the backtracking is removed.
+#[test]
+fn a_bad_start_still_reaches_the_minimum() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let good = ProfileWarm::from_template(&layout, &p.init_params);
+    let bad = ProfileWarm {
+        beta: vec![BAD_START; layout.coords.len()],
+        etas: None,
+    };
+    let s = c.solve(&p.init_params, &bad).expect("the solve converges");
+    let (o_star, _) = oracle_min(&c, &p.init_params, &good.beta);
+    eprintln!(
+        "backtracking: from {BAD_START} {:.10} vs oracle {:.10} in {} steps",
+        s.ofv, o_star, s.iterations
+    );
+    assert!(
+        (s.ofv - o_star).abs() < D3_OFV_BOUND,
+        "{} vs {}",
+        s.ofv,
+        o_star
+    );
+}
+
+const BAD_START: f64 = 20.0;
+
+// ── N2: every contrast ─────────────────────────────────────────────────────────────
+
+/// Each contrast's profile objective is the oracle's minimum: `sum_to_zero_within` (one
+/// group per study), the global `sum_to_zero` (its dependent level couples every study,
+/// so the whole block is one group), `ref`, and `none` — the last on a `[TIME]` block
+/// with no intercept, since on `[STUDY, TIME]` the binder refuses `none` beside a
+/// subject-level η (it would carry the same study mean). Each `[TIME]` level is read by
+/// both studies, one group again. Dies when coupled levels are solved as separate
+/// groups.
+#[test]
+fn every_contrast_profiles_to_the_minimum() {
+    let within = "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]";
+    for (block, n_groups) in [
+        ("PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]", 2),
+        ("PLACEBO[STUDY, TIME, contrast = sum_to_zero]", 1),
+        ("PLACEBO[STUDY, TIME, contrast = ref]", 2),
+        ("PLACEBO[TIME, contrast = none]", 1),
+    ] {
+        let contrast = block;
+        let p = prep(F2, F2_DATA, Some(2), |t| {
+            let t = t.replace(within, block);
+            if block.contains("none") {
+                t.replace("BASE  = TVE0 + PLACEBO", "BASE  = PLACEBO")
+            } else {
+                t
+            }
+        });
+        let layout = layout_of(&p);
+        assert_eq!(layout.groups.len(), n_groups, "{contrast}");
+        let o = options(&p);
+        let c = ctx(&p, &layout, &o);
+        let warm = ProfileWarm::from_template(&layout, &p.init_params);
+        let s = c
+            .solve(&p.init_params, &warm)
+            .unwrap_or_else(|e| panic!("{contrast}: {e:?}"));
+        let (o_star, _) = oracle_min(&c, &p.init_params, &warm.beta);
+        eprintln!(
+            "N2 {contrast}: {} coords, profile {:.10} oracle {:.10}",
+            layout.coords.len(),
+            s.ofv,
+            o_star
+        );
+        assert!(
+            (s.ofv - o_star).abs() < D3_OFV_BOUND,
+            "{contrast}: {} vs {}",
+            s.ofv,
+            o_star
+        );
+    }
+}

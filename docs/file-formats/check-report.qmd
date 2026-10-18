@@ -105,8 +105,8 @@ A level block declared `profile` ([#1065](https://github.com/FeRx-NLME/ferx-core
 
 | Code | Severity | Meaning |
 |------|----------|---------|
-| `E_PROFILE_SCOPE` | error | A profiled block that cannot be fitted that way: `profile` on a single θ, with `FIX` or with bounds; a method other than `foce` / `focei`, or `n_agq > 1`; a non-Gaussian endpoint; a residual error that is not additive, or log-transformed; M3 censoring; a `correlation` line (not yet); a `[mixture]`, `[diffusion]` or FREM model; `covariance_method = s` or `rsr`. Profiled estimation itself is not implemented yet, so every profiled block is also refused with that reason. Block `parameters`. |
-| `E_PROFILE_NOT_LINEAR` | error | A profiled block that a prediction does not read as `c × block` plus terms that do not read it, with `c` from the data alone. The message names the construct (a function, power, remainder or inline `if`, an `if` branch, a second read, a parameter coefficient, a divisor, the states, the residual error, a second profiled block) and where it is. Block `parameters`. |
+| `E_PROFILE_SCOPE` | error | A profiled block that cannot be fitted that way: `profile` on a single θ, with `FIX` or with bounds; a method other than `foce` / `focei`, or `n_agq > 1`; a non-Gaussian endpoint; a residual error that is not additive, or log-transformed; M3 censoring; a `correlation` line (not yet); a `[mixture]`, `[diffusion]` or FREM model; `covariance_method = s` or `rsr`; `optimizer = trust_region` or `mma`; `global_search`; a parameter prior. Block `parameters`. |
+| `E_PROFILE_NOT_LINEAR` | error | A profiled block that a prediction does not read as `c × block` plus terms that do not read it, with `c` from the data alone. The message names the construct (a function, power, remainder or inline `if`, an `if` branch, a second read, a parameter coefficient, a divisor, the states, the residual error, a second profiled block) and where it is, or says that no prediction reads the block. Block `parameters`. |
 
 #### Nested variability levels
 

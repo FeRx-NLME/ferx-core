@@ -807,11 +807,12 @@ pub(crate) fn optimize_profiled(
                     }
                     if options.verbose {
                         eprintln!(
-                            "Eval {:>4}: OFV = {:.6} (profile: {} Newton step{})",
+                            "Eval {:>4}: OFV = {:.6} (profile: {} Newton step{}, gradient {:.1e} SE)",
                             n_evals.load(Ordering::Relaxed),
                             solve.ofv,
                             solve.iterations,
-                            if solve.iterations == 1 { "" } else { "s" }
+                            if solve.iterations == 1 { "" } else { "s" },
+                            solve.criterion
                         );
                     }
                     solve.ofv
@@ -928,6 +929,71 @@ pub(crate) fn optimize_profiled(
         mixture_posteriors: None,
         vi: None,
     }
+}
+
+/// The covariance step of a profiled fit, re-run on its estimates (`run_covariance`), or
+/// `None` when `model` profiles nothing. The levels are re-profiled from the fit's own
+/// values first, so a reloaded fit gets the step the fit ran — not the unprofiled `R`
+/// over every level, which at a few hundred levels is the stencil profiling exists to
+/// avoid. As in `fit()`, only `r` is computed (#2108).
+pub(crate) fn replay_covariance(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> Option<CovStepOutcome> {
+    let layout = ProfileLayout::build(model, population, params)?;
+    if options.covariance_method != CovarianceMethod::Hessian {
+        return Some(CovStepOutcome {
+            matrix: None,
+            wall_time_secs: 0.0,
+            warnings: vec![format!(
+                "Covariance step not run: a profiled θ level block's covariance step \
+                 computes `r` only for now (#2108); this call asks for \
+                 `covariance_method = {}`.",
+                options.covariance_method.label()
+            )],
+            sir_fallback_proposal: None,
+            method: None,
+        });
+    }
+    let hold = hold_template(&layout, params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let ctx = ProfileCtx {
+        model,
+        population,
+        layout: &layout,
+        options,
+        inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+    };
+    let warm = ProfileWarm {
+        beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
+        etas: (eta_hats.len() == population.subjects.len()).then(|| eta_hats.to_vec()),
+    };
+    let solve = match ctx.solve(params, &warm) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(CovStepOutcome {
+                matrix: None,
+                wall_time_secs: 0.0,
+                warnings: vec![format!(
+                    "Covariance step failed: the profile solve did not converge at the \
+                     estimates ({e:?}). SE estimates not available."
+                )],
+                sir_fallback_proposal: None,
+                method: None,
+            })
+        }
+    };
+    let mut x_hat = x;
+    for &k in &layout.coords {
+        x_hat[k] = packed_theta(&hold, k, solve.params.theta[k]);
+    }
+    Some(ctx.covariance(&hold, &x_hat, &free, &solve))
 }
 
 /// An `OuterResult` for a fit whose profile solve never succeeded.

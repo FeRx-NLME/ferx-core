@@ -262,23 +262,30 @@ fn run_covariance_scoped(
     // hence `run_covariance_step_inner`, not the gated `run_covariance_step`). The
     // `FailedNonPd` proposal is only useful to the SIR fallback, a separate step
     // here — callers wanting it run `run_sir` afterwards — so it is discarded.
+    // A `profile`d block (#1065) replays the profiled step the fit ran, not the
+    // unprofiled one over every level.
     let CovStepOutcome {
         matrix: covariance_matrix,
         wall_time_secs: covariance_wall_time_secs,
         warnings: new_warnings,
         sir_fallback_proposal: _,
         method: covariance_method,
-    } = run_covariance_step_inner(
-        &x_hat,
-        &params,
-        model_ref,
-        pop_ref,
-        &eta_hats,
-        &h_matrices,
-        &kappas,
-        options,
-        None,
-    );
+    } = crate::estimation::profile::replay_covariance(
+        model_ref, pop_ref, &params, &eta_hats, options,
+    )
+    .unwrap_or_else(|| {
+        run_covariance_step_inner(
+            &x_hat,
+            &params,
+            model_ref,
+            pop_ref,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options,
+            None,
+        )
+    });
 
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =
