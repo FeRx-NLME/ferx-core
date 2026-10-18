@@ -1051,11 +1051,21 @@ where
 /// are trusted primitive draws (not "built" snapshots) so — like the seed and Ω — they
 /// are consumed, not re-derived.
 ///
-/// "Independent" covers the orchestration, **not** the covariate rule: `decision_pk`'s
-/// covariate is re-derived through the same `locf_decision_cov` resolver the driver and
-/// the build loop call, so a wrong record-selection rule is mirrored on all three sides
-/// and passes here. That rule is pinned against `predict()` and closed forms instead
-/// (#1148's `adaptive_decision_*` tests).
+/// **The decision's covariate row is derived twice, on purpose** (#1599). Everywhere else
+/// the rule is "one implementation", and the driver, its frozen replay and the IOV build
+/// do share one record index (`AdaptiveRecordIndex::in_force`). That rule exists so two
+/// *production* paths cannot drift; this check's output reaches no user, and its only job
+/// is to disagree when the shared rule is wrong — which a call into the same resolver
+/// cannot do. It did not: before #1148 the verifier passed a 3× `F` error because it
+/// shared the scan, and before #1599 it passed a 2.4× one for the same reason. So, on
+/// every per-event path, [`decision_covs_by_scan`] re-derives each decision's covariate
+/// row from the subject's raw records with no shared code, the row `locf_decision_cov`
+/// picks — the function the driver builds `ctx.covariates` with — is bit-checked against
+/// it ([`check_decision_cov`]), and the IOV `decision_pk[g]` is rebuilt from the derived
+/// row. Two things are still shared and trusted: the `Subject` row accessors (data, not
+/// the rule) and `EVENT_MATCH_TOL`. Not seen: a driver that stopped calling
+/// `locf_decision_cov` — this function never receives `ctx.covariates` itself; the #1148
+/// tests' `crcl_seen` assertions pin that wiring.
 ///
 /// Scope: the constant-path baseline `pk` (a single t=0 evaluation at the subject-static
 /// covariate) is a shared snapshot too, but a trivial one — it is left to the degenerate
@@ -1076,6 +1086,27 @@ pub(crate) fn verify_adaptive_snapshots(
     event_pk: Option<&crate::pk::EventPkParams>,
 ) -> Result<(), String> {
     let n_eta = model.n_eta;
+
+    // ── Every per-event path: each decision's covariate row, derived independently ──
+    // (#1599). The constant path never consults the record index, so there is nothing to
+    // check there.
+    let derived_cov = if event_pk.is_some() || decision_pk.is_some() {
+        let derived = decision_covs_by_scan(subject, decision_times);
+        let records =
+            crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
+        for (g, &t) in decision_times.iter().enumerate() {
+            let picked = crate::ode::predictions::locf_decision_cov(
+                &records,
+                t,
+                subject,
+                &subject.covariates,
+            );
+            check_decision_cov(g, t, derived[g], picked)?;
+        }
+        Some(derived)
+    } else {
+        None
+    };
 
     // ── IOV path: re-derive eta_occ + decision_pk, then event_pk inline ─────────
     if let (Some(eta_occ), Some(decision_pk)) = (eta_occ, decision_pk) {
@@ -1103,8 +1134,9 @@ pub(crate) fn verify_adaptive_snapshots(
             ));
         }
 
-        let records =
-            crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
+        let derived_cov = derived_cov
+            .as_deref()
+            .expect("decision_pk present ⇒ the covariate rows were derived above");
         let mut eta_occ_check: Vec<Vec<f64>> = Vec::with_capacity(n_occ);
         for g in 0..n_occ {
             // Re-draw occasion g's κ on the dedicated substream and assemble the
@@ -1128,21 +1160,13 @@ pub(crate) fn verify_adaptive_snapshots(
 
             // decision_pk[g] must equal pk_param_fn at the covariate the driver's live
             // `decision_cov` uses — the in-force record's row, NOT the frozen t=0 baseline
-            // (the twice-fixed #732 / #739 defect). This goes through the SAME resolver the
-            // driver and the build loop use, so it pins the plumbing (the right time, the
-            // right η, the right array slot), not the record-selection rule itself: that rule
-            // is pinned against `predict()` and closed forms (#1148's
-            // `adaptive_decision_*` tests).
-            let dcov = crate::ode::predictions::locf_decision_cov(
-                &records,
-                decision_times[g],
-                subject,
-                &subject.covariates,
-            );
+            // (the twice-fixed #732 / #739 defect). The row is the independently derived one
+            // (#1599), not the build loop's `locf_decision_cov`, so a defect in that resolver
+            // fails here as well as in `check_decision_cov` above.
             let dpk = (model.pk_param_fn)(
                 &params.theta,
                 &e,
-                dcov,
+                derived_cov[g],
                 subject.param_time_at(decision_times[g]),
             );
             if !pk_bits_eq(&dpk, &decision_pk[g]) {
@@ -1238,6 +1262,83 @@ pub(crate) fn pk_bits_eq(a: &PkParams, b: &PkParams) -> bool {
 /// Bit-equality of two eta slices (#748).
 fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| f64_bits_eq(*x, *y))
+}
+
+/// The covariate row each decision reads, derived from the subject's raw records with **no
+/// code shared** with `AdaptiveRecordIndex` (#1599) — see [`verify_adaptive_snapshots`] for
+/// why a second derivation is the point here. Parallel to `decision_times`.
+///
+/// The rule, written out: the latest data record at or before `t` (within
+/// `EVENT_MATCH_TOL`) — a base dose row, an EVID=2 row, an observation or an EVID=3/4
+/// reset row; at one instant the last processed, i.e. observation over EVID=2 over dose
+/// over reset, and within one kind the row listed last; the subject's baseline covariates
+/// before the first record. `subject.doses` must hold the base regimen only, as it does
+/// in `run_adaptive_population`.
+///
+/// One sorted pass over the records walked alongside the decisions in time order, so this
+/// default-on check costs O((R + D) log) per subject and replicate, not O(R × D).
+pub(super) fn decision_covs_by_scan<'a>(
+    subject: &'a Subject,
+    decision_times: &[f64],
+) -> Vec<&'a HashMap<String, f64>> {
+    // Pushed in processing order at an instant — resets, doses, EVID=2 rows, observations,
+    // each kind in file order — and sorted by time only. `sort_by` is stable, so the push
+    // order IS the tie order: one mechanism, not a key that restates it.
+    let mut rows: Vec<(f64, &HashMap<String, f64>)> = Vec::new();
+    rows.extend(
+        (0..subject.reset_times.len()).map(|r| (subject.reset_times[r], subject.reset_cov(r))),
+    );
+    rows.extend((0..subject.doses.len()).map(|k| (subject.doses[k].time, subject.dose_cov(k))));
+    rows.extend(
+        (0..subject.pk_only_times.len())
+            .map(|m| (subject.pk_only_times[m], subject.pk_only_cov(m))),
+    );
+    rows.extend((0..subject.obs_times.len()).map(|j| (subject.obs_times[j], subject.obs_cov(j))));
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut order: Vec<usize> = (0..decision_times.len()).collect();
+    order.sort_by(|&a, &b| decision_times[a].total_cmp(&decision_times[b]));
+    let mut out = vec![&subject.covariates; decision_times.len()];
+    let mut next = 0;
+    let mut in_force = &subject.covariates;
+    for g in order {
+        let horizon = decision_times[g] + crate::ode::predictions::EVENT_MATCH_TOL;
+        while next < rows.len() && rows[next].0 <= horizon {
+            in_force = rows[next].1;
+            next += 1;
+        }
+        out[g] = in_force;
+    }
+    out
+}
+
+/// Bit-compare the covariate row the shared record index picked for decision `g` against
+/// the independently derived one (#1599). Same keys, same bits, or an `Err` naming the
+/// decision and the first covariate that differs.
+pub(super) fn check_decision_cov(
+    g: usize,
+    t: f64,
+    derived: &HashMap<String, f64>,
+    picked: &HashMap<String, f64>,
+) -> Result<(), String> {
+    let mut keys: Vec<&String> = derived.keys().chain(picked.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let (want, got) = (derived.get(key), picked.get(key));
+        if want.map(|v| v.to_bits()) != got.map(|v| v.to_bits()) {
+            let show = |v: Option<&f64>| v.map_or("absent".to_string(), |v| v.to_string());
+            return Err(format!(
+                "decision {g} at t={t} reads covariate {key} = {} from the record index, but an \
+                 independent scan of the subject's records gives {}. The controller saw the \
+                 index's value, and the driver and the frozen replay share that index, so the \
+                 replay cannot catch it (#1599).",
+                show(got),
+                show(want)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Re-derive each per-record (base dose / obs / EVID=2 pk-only) PK snapshot **inline** —

@@ -4894,10 +4894,11 @@ fn earliest_record_pk(
 ///
 /// The driver resolves its readout PK and an injected dose's `F` from the **same**
 /// `in_force` record, so the covariates a controller reads and the parameters behind its
-/// signals cannot come from different rows. `run_adaptive_population` calls this for
-/// each IOV `decision_pk[g]` snapshot, and `verify_adaptive_snapshots` re-derives it the
-/// same way — which is why it is `pub(crate)`, and also why that verifier pins the
-/// plumbing, not this rule: it shares the resolver.
+/// signals cannot come from different rows. The driver's `ctx.covariates` and
+/// `run_adaptive_population`'s IOV `decision_pk[g]` both call this, which is why it is
+/// `pub(crate)`. `verify_adaptive_snapshots` calls it only to get what the driver read, and
+/// bit-checks that against a derivation sharing no code with [`AdaptiveRecordIndex`]
+/// (#1599), so a wrong rule here fails that check rather than passing on every side.
 pub(crate) fn locf_decision_cov<'a>(
     records: &AdaptiveRecordIndex,
     t: f64,
@@ -5596,8 +5597,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // an `observe` / `[scaling]` expression that references a time-varying
                 // covariate directly reads the row the PK was built from. The constant path
                 // keeps the subject-static map (byte-identical; `obs_cov` equals it there).
+                // Through `locf_decision_cov`, the one function the IOV build and the
+                // verifier's #1599 cross-check also call, so the map that check compares is
+                // the map the controller gets.
                 let decision_cov = if tv {
-                    in_force.map_or(&shadow.covariates, |rec| rec.cov(subject))
+                    locf_decision_cov(&records, t_start, subject, &shadow.covariates)
                 } else {
                     match obs_map
                         .get(&t_start.to_bits())

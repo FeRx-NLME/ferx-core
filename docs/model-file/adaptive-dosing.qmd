@@ -332,10 +332,10 @@ correctly. The verifier therefore also **independently re-derives** each snapsho
 (the per-occasion `kappa`, the per-decision PK at the decision's covariate, the
 per-record PK) from the run's primitives and bit-checks it against what the driver
 used, so a mis-resolved covariate or occasion fails loudly rather than being applied
-by both sides and slipping through unnoticed (#748). It finds the decision's record
-with the driver's own resolver, so it checks the plumbing, not which record a
-decision reads ([What a decision reads](#what-a-decision-reads) is tested against
-`predict()` directly).
+by both sides and slipping through unnoticed (#748). Which record a decision reads
+([What a decision reads](#what-a-decision-reads)) is checked the same way: the
+verifier works it out again from the subject's data rows with code of its own, and
+fails the run if the driver read a different row (#1599).
 
 ## Validation
 
