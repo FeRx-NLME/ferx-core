@@ -1290,30 +1290,33 @@ What the existing level-SE anchor (#1890) does not have, and this one does:
   levels and the frozen-EBE shortcut the solve avoids would be exact (measured on a
   first draft with `TVE0·exp(η)`: 1.8e-5 OFV).
 
-NONMEM OBJ **101.911514122** (`anchor`); arm64 101.911514127. `nm3` cannot run a `SAME`
-stream (prsame.set), so both configs ran through `nmfe76` directly
+NONMEM OBJ **101.911514106** (`anchor`); arm64 101.911514121. `$ESTIMATION … SIGL=12
+NSIG=4` and `$COVARIANCE MATRIX=R SIGL=12`. `nm3` cannot run a `SAME` stream
+(prsame.set), so both configs ran through `nmfe76` directly
 (`~/NONMEMruns/ferx-1065-profile-mbma/`). Results: `results/profile_mbma.{lst,ext,cov,phi}`.
 
 | | NONMEM | ferx (profiled, at NONMEM's structural point) | gap |
 |---|---|---|---|
-| OFV | 101.911514122 | 101.911514147 | 2.6e-8 |
-| 36 free levels | `THETA4–39` | solved | ≤ 7.4e-6 NONMEM SEs |
+| OFV | 101.911514106 | 101.911514155 | 4.9e-8 |
+| 36 free levels | `THETA4–39` | solved | ≤ 8.2e-6 NONMEM SEs |
 | SE TVE0 / EMAX / ET50 | profile likelihood 0.3182 / 0.8692 / 0.5758 | 0.3175 / 0.8627 / 0.5788 | ≤ 7.5e-3 |
-| SE, 36 free levels | `$COV` | profiled `R` level block | ≤ 2.9e-2 |
-| SE, 12 dependent levels | delta method on `$COV` | delta method on the profiled `R` | ≤ 3.5e-2 |
+| SE, 36 free levels | `$COV` | profiled `R` level block | ≤ 4.0e-3 |
+| SE, 12 dependent levels | delta method on `$COV` | delta method on the profiled `R` | ≤ 6.4e-3 |
 
 **The structural SEs are compared with NONMEM's profile likelihood, not with its
-`$COV`.** NONMEM's `$COV MATRIX=R` gives 0.311 / 0.804 / **0.234**. The ET50 value was
-settled a third way: NONMEM refits with ET50 FIXed at its estimate ±0.1 and ±0.2, every
-other parameter re-estimated, give a curvature whose SE is 0.575 (Richardson-extrapolated
-0.576). So NONMEM's own `R` disagrees with NONMEM's own objective by 59% on ET50 (34% RSE,
-weakly identified), 8% on EMAX and 2.6% on TVE0. The 15 profile objectives are committed
-as `results/profile_mbma_profiles.txt`. ferx's unprofiled `R` at the same point agrees with
-its profiled one to 4.7e-3 (`tests/profiled_levels.rs`, C1), so the gap is not the
-profile. The level SEs can only be compared with `$COV`, which accounts for their looser
-band.
+`$COV`.** `$COV` here is a finite-difference `R`, and its accuracy follows the
+estimation's precision; ET50 is weakly identified (34% RSE). The first run of this
+stream used `SIGDIGITS=4`, and its `$COV` gave TVE0 / EMAX / ET50 = 0.311 / 0.804 /
+**0.234**. At `SIGL=12` (the committed run, found in review of #2130) it gives 0.3125 /
+0.8514 / 0.5232. The profile is the reference that does not move: NONMEM refits with
+each THETA FIXed at its estimate ±δ and ±2δ, every other parameter re-estimated
+(`results/profile_mbma_profiles.txt`, 15 objectives at `SIGDIGITS=4`, their centre row
+the first run's OBJ). For ET50, ±0.1 and ±0.2 give 0.575 and 0.572, Richardson 0.576; an
+incomplete re-estimation could only bias these low. ferx's unprofiled `R` at the same point
+agrees with its profiled one to 4.7e-3 (`tests/profiled_levels.rs`, C1), so no remaining
+gap is the profile's. The level SEs are compared with the `SIGL=12` `$COV`.
 
 `tests/profiled_levels.rs` (Tier 2, evaluations only) holds the comparison:
-ΔOFV < 1e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 7e-2. Its
+ΔOFV < 2e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 2e-2. Its
 `profiled_levels_fits.rs` twin (`slow-tests`) fits from the model file's inits and lands
 on NONMEM's OBJ.

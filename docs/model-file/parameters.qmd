@@ -608,8 +608,8 @@ through two parameters that are then added. Write those as one product instead.
 **Validation.** On a synthetic 12-study set where the drug effect is nonlinear in η
 and a between-arm κ shares the block's rows, NONMEM fits every level as a `THETA`.
 ferx is given only NONMEM's structural optimum, and solves the levels itself. Its OFV
-is NONMEM's to 3e-8, its levels are NONMEM's to 1e-5 standard errors, its structural
-SEs are within 1% of NONMEM's profile likelihood, and its level SEs are within 4% of
+is NONMEM's to 5e-8, its levels are NONMEM's to 1e-5 standard errors, its structural
+SEs are within 1% of NONMEM's profile likelihood, and its level SEs are within 1% of
 NONMEM's `$COV` (`nonmem_anchor/README.md`, *Profiled level blocks*).
 
 ## Omega (Between-Subject Variability)

@@ -230,11 +230,12 @@ fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
 /// re-estimated (`results/profile_mbma_profiles.txt`), Richardson-extrapolated to δ → 0,
 /// as `sqrt(2 / c)` since the OFV is −2 log L.
 ///
-/// Why not NONMEM's `$COV` SE: on this fixture it disagrees with NONMEM's *own*
-/// curvature by 2.6% (TVE0), 8% (EMAX) and 59% (ET50) — `$COV` reads 0.234 for ET50,
-/// the profile 0.576. ferx's `R` (profiled and unprofiled, which agree to 4.7e-3, C1)
-/// matches the profile; NONMEM's `R` approximation is the outlier on a model nonlinear in
-/// η with a weakly identified ET50 (34% RSE).
+/// Why not NONMEM's `$COV` SE for these three: it is a finite-difference `R` whose
+/// accuracy follows the estimation's precision, and ET50 is weakly identified (34% RSE).
+/// Measured on this fixture (#2130 review #4): at `SIGDIGITS=4` `$COV` gave ET50 0.234,
+/// 59% below the profile's 0.576; at `SIGL=12 NSIG=4` (the committed run) it gives 0.523,
+/// still 9% below, and EMAX moves from 8% to 2% below. The profile is the stable
+/// reference; ferx's `R` (profiled and unprofiled, which agree to 4.7e-3, C1) matches it.
 fn profile_curvature_se(name: &str) -> f64 {
     let text =
         std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma_profiles.txt"))
@@ -261,18 +262,19 @@ fn profile_curvature_se(name: &str) -> f64 {
     (2.0 / c).sqrt()
 }
 
-/// ΔOFV realised 2.3e-8 Linux aarch64, 2.6e-8 macOS arm64: two engines' objectives at one point, the levels
-/// solved by ferx and estimated by NONMEM; 3.8× headroom.
-const A2_OFV: f64 = 1e-7;
-/// Worst level gap realised 7.4e-6 NONMEM SEs; 13× headroom.
+/// ΔOFV realised 4.9e-8 (macOS arm64) against the `SIGL=12` run's OBJ: two engines'
+/// objectives at one point, the levels solved by ferx and estimated by NONMEM. NONMEM's
+/// own two images differ by 1.5e-8 here. 4× headroom.
+const A2_OFV: f64 = 2e-7;
+/// Worst level gap realised 8.2e-6 NONMEM SEs; 12× headroom.
 const A2_LEVEL: f64 = 1e-4;
 /// Structural SE against NONMEM's profile likelihood: worst realised 7.5e-3 (EMAX); the
 /// reference's own finite-δ extrapolation moves it by ~5e-3. 2.7× headroom.
 const A2_STRUCT_SE: f64 = 2e-2;
-/// Level SEs against NONMEM's `$COV`: worst realised 2.9e-2 (free) and 3.5e-2
-/// (dependent). That is NONMEM's `R` again, 8% off its own curvature on EMAX above, so
-/// the band is looser than the structural one; 2× headroom on the worst.
-const A2_LEVEL_SE: f64 = 7e-2;
+/// Level SEs against NONMEM's `$COV` at `SIGL=12`: worst realised 4.0e-3 (free) and
+/// 6.4e-3 (dependent), macOS arm64. (Against the earlier `SIGDIGITS=4` run they were
+/// 2.9e-2 / 3.5e-2: that `R` was the imprecise side.) 3.1× headroom on the worst.
+const A2_LEVEL_SE: f64 = 2e-2;
 
 // ── C1: the profiled covariance is the unprofiled one ────────────────────────────
 
