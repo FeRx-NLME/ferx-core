@@ -13259,10 +13259,9 @@ fn unanchored_dose_clock_error_opens_with_a_non_finite_state_only_when_the_clock
     //
     // C is a comparison-read clock while another state diverges on its own: the clock is
     // refused on its own merits, but the non-finite opener would pin that divergence on it. D
-    // is what the driver hits when the probe pairs a state with a time the trajectory never
-    // reaches (#1570 review, row 4: a condition on both the state and `TIME`, whose run matches
-    // `predict()` to 2.5e-12, is refused through this cell) — a false positive tracked in #1572.
-    // Here it is the cell that separates the outcome conjunct.
+    // is a finite end state, which the driver no longer sends here since #1572 (it is judged at
+    // the first dose, on its trajectory, instead); here it is the cell that separates the
+    // outcome conjunct.
     //
     // Mutations that redden it: drop the `nan_reached_derivative` conjunct (C flips); drop the
     // outcome conjunct (D flips); either opener unconditionally (A, or B–D). And deleting any
@@ -13610,6 +13609,157 @@ fn unanchored_dose_clock_error_is_silent_without_a_compiled_rhs_program() {
     assert!(
         unanchored_dose_clock_error(&ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0).is_none(),
         "no compiled RHS program ⇒ no dose clock to refuse"
+    );
+}
+
+/// A held phase B window on `(0, 12]` (#1572) with the given trajectory samples, `TAD` the
+/// one candidate.
+fn pending_tad_window(samples: Vec<(f64, Vec<f64>)>) -> PendingClockWindow {
+    PendingClockWindow {
+        t_start: 0.0,
+        t_end: 12.0,
+        tad: true,
+        tafd: false,
+        ext_params: dose_clock_ext_params().to_vec(),
+        samples,
+    }
+}
+
+/// A `central` trajectory decaying from 50 at `k = 0.1` on `(0, 12]`'s probe grid.
+fn decaying_samples() -> Vec<(f64, Vec<f64>)> {
+    clock_probe_grid(0.0, 12.0)
+        .into_iter()
+        .map(|t| (t, vec![50.0 * (-0.1 * t).exp()]))
+        .collect()
+}
+
+#[test]
+fn unanchored_dose_clock_error_at_dose_says_which_dose_anchors_the_window() {
+    // #1572 T5, phase B's message, one `contains` per sentence, on its input space:
+    //
+    //   cell  input                                  must say / must not say
+    //   A     comparison RHS, obs at 6, dose at 36   every sentence below; nothing claiming
+    //                                                that no dose was given, or the outcome
+    //   B     same, no observation in the window     the carry-forward clause instead
+    //
+    // (Phase A's text is `unanchored_dose_clock_error`'s, unchanged; a run that never doses
+    // judges no phase B window, which the driver tests pin.)
+    //
+    // Mutations that redden it: delete any one sentence of the message (each has its own
+    // assertion); restore phase A's "no dose has been given in this run" clause.
+    let ode = tad_comparison_ode_spec();
+    let window = pending_tad_window(decaying_samples());
+
+    let a =
+        unanchored_dose_clock_error_at_dose(&ode, &make_subject(vec![], vec![6.0]), &window, 36.0)
+            .expect("cell A: `TAD < 5` on a filled compartment moves with the anchor — refuse");
+    for (what, sentence) in [
+        (
+            "1 — the window, the slot, and that it had no referent",
+            "ode_predictions_adaptive: over the segment (0, 12] the [odes] RHS reads `TAD`, \
+             which had no referent there: no dose had been given yet.",
+        ),
+        (
+            "2 — what was measured, and at which dose",
+            "The derivative it computes there changes when that clock is anchored at the first \
+             dose this run gave, at t=36, which is where the static engines anchor that window \
+             on the realized schedule.",
+        ),
+        (
+            "3 — how a finite run can depend on the clock",
+            "A comparison against an unanchored clock does not fail, it answers one way — `NaN \
+             < 5` is false — which is how an `if`, `min` or `max` on it picks a side without \
+             producing a `NaN`.",
+        ),
+        (
+            "4 — the read in the window",
+            "The observation at t=6 is read off that segment.",
+        ),
+        (
+            "5 — why the driver refuses",
+            "The window was integrated before the controller decided that dose, so this driver \
+             refuses the run rather than return a trajectory the dose's own clock contradicts.",
+        ),
+        (
+            "6 — the fix",
+            "Give the subject a pre-scheduled base regimen, or have the controller dose at a \
+             decision at or before the subject's first record.",
+        ),
+    ] {
+        assert!(a.contains(sentence), "cell A, sentence {what}: {a}");
+    }
+    for false_claim in [
+        "no dose has been given in this run",
+        "this run does not have",
+        "non-finite state",
+        "never doses",
+    ] {
+        assert!(
+            !a.contains(false_claim),
+            "cell A must not say {false_claim:?}: {a}"
+        );
+    }
+
+    let b =
+        unanchored_dose_clock_error_at_dose(&ode, &make_subject(vec![], vec![20.0]), &window, 36.0)
+            .expect("cell B: refused as A");
+    assert!(
+        b.contains(
+            "No observation is read off that segment, but the state integrated there carries \
+             into every later read."
+        ),
+        "cell B: {b}"
+    );
+    assert!(!b.contains("The observation at t="), "cell B: {b}");
+}
+
+#[test]
+fn unanchored_dose_clock_error_at_dose_is_judged_at_that_dose() {
+    // #1572 T5, the anchor. `TAD < -20` on `(0, 12]`: a dose at 12 puts the window's clock in
+    // `[-12, 0]`, where the condition never holds (the unanchored else arm is right); a dose at
+    // 36 puts it in `[-36, -24]`, where it always does. The straddle is on the dose time alone.
+    //
+    // Mutation that reddens it: anchor phase B at the window's end instead of the dose (the
+    // dose-at-36 cell is silent).
+    let ode = dose_clock_ode_spec(
+        "  if (TAD < -20.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else             { d/dt(central) = -(CL / V) * central }",
+    );
+    let subject = make_subject(vec![], vec![6.0]);
+    let window = pending_tad_window(decaying_samples());
+    assert!(
+        unanchored_dose_clock_error_at_dose(&ode, &subject, &window, 12.0).is_none(),
+        "a dose at 12 gives the window a clock above -20"
+    );
+    let msg = unanchored_dose_clock_error_at_dose(&ode, &subject, &window, 36.0)
+        .expect("a dose at 36 gives the window a clock below -20 — refuse");
+    assert!(msg.contains("at t=36"), "{msg}");
+}
+
+#[test]
+fn unanchored_dose_clock_error_at_dose_reads_only_finite_samples() {
+    // #1572 / #2089, the per-pair filter. A sample whose state is partly non-finite is not an
+    // integrated state, and is not evidence. Here only such a sample has `central` filled
+    // (`X` is `inf`): the comparison would move there, and must not be read. The control
+    // replaces the `inf` with a finite value and is refused.
+    //
+    // Mutation that reddens it: drop the per-pair finite filter in
+    // `unanchored_clock_dependence`.
+    let ode = dose_clock_ode_spec_with_states(
+        "central, X",
+        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
+         else           { d/dt(central) = -(CL / V) * central }\n  \
+         d/dt(X) = 0.0",
+    );
+    let subject = make_subject(vec![], vec![6.0]);
+    let window = |x: f64| pending_tad_window(vec![(0.0, vec![0.0, 1.0]), (6.0, vec![30.0, x])]);
+    assert!(
+        unanchored_dose_clock_error_at_dose(&ode, &subject, &window(f64::INFINITY), 12.0).is_none(),
+        "a partly non-finite sample is not read"
+    );
+    assert!(
+        unanchored_dose_clock_error_at_dose(&ode, &subject, &window(1.0), 12.0).is_some(),
+        "the same sample with every component finite shows the dependence"
     );
 }
 
