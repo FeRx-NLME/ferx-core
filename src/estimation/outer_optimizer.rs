@@ -1238,7 +1238,7 @@ struct NloptState {
 /// A negative `max_unconverged_frac` disables the fraction trigger (but never the hard
 /// reject). Centralising the predicate keeps the five evaluation sites in this module from
 /// drifting (#603 review #8).
-fn ebe_guard_rejects(
+pub(crate) fn ebe_guard_rejects(
     stats: &InnerLoopStats,
     n_subj: usize,
     raw_ofv: f64,

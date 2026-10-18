@@ -386,6 +386,47 @@ fn run_covariance_replays_the_profiled_step() {
 /// optimum, so only the re-solved EBEs differ; 18× headroom.
 const REPLAY_BOUND: f64 = 1e-4;
 
+// ── EBE convergence: counted and guarded, as unprofiled (#2130 review #2) ──────────
+
+/// A starved inner solve (`inner_maxiter = 12` on F1: 4 subjects unconverged, 11 Nelder–Mead
+/// fallbacks, measured; fewer iterations fail the profile solve outright) leaves EBEs
+/// unconverged. The profiled fit
+/// publishes that count, and the unprofiled loop's EBE guard applies to it: under
+/// `max_unconverged_frac = 0` the evaluation is rejected and no objective is reported,
+/// while under `1.0` (the guard off) the same evaluation is accepted. The pair straddles
+/// the gate.
+#[test]
+fn a_profiled_fit_counts_and_guards_unconverged_ebes() {
+    let run = |frac: f64| {
+        let p = prep(F1, F1_DATA, true);
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            inner_maxiter: 12,
+            max_unconverged_frac: frac,
+            ..p.parsed.fit_options.clone()
+        };
+        ferx_core::fit(&p.parsed.model, &p.population, &p.init_params, &opts)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let open = run(1.0);
+    assert!(open.ofv.is_finite(), "the guard is off: {}", open.ofv);
+    assert!(
+        open.max_unconverged_subjects > 0,
+        "a starved inner solve leaves EBEs unconverged, and the fit says so"
+    );
+    assert_eq!(open.ebe_convergence_warnings, 0);
+    let shut = run(0.0);
+    assert!(
+        !shut.ofv.is_finite(),
+        "the guard rejects the evaluation: {}",
+        shut.ofv
+    );
+    assert!(shut.ebe_convergence_warnings >= 1);
+    assert!(!shut.converged);
+}
+
 // ── P1: the levels count, through `fit()` ────────────────────────────────────────
 
 /// A profiled fit reports the unprofiled fit's `n_parameters` and BIC tally and names

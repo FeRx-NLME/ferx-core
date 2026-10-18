@@ -43,11 +43,11 @@ use rayon::prelude::*;
 
 use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed,
+    find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
 use crate::estimation::outer_optimizer::{
-    population_gradient, resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog,
-    OuterResult, OuterTrial,
+    ebe_guard_rejects, population_gradient, resolve_outer_ftol, runs_outer_optimizer, subject_nll,
+    OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, theta_packs_log, unpack_params, PackedBounds,
@@ -255,6 +255,11 @@ pub(crate) struct ProfileSolve {
     /// Per coordinate, `1 / sqrt(M_kk)`: the conditional standard error the step sizes
     /// are measured in.
     pub(crate) se_scale: Vec<f64>,
+    /// The EBE convergence of this evaluation, for the outer loop's guard and published
+    /// counts (#2130 review #2): the population inner loop at the start levels, plus every
+    /// subject whose final mode came from a re-solve that did not converge or fell back to
+    /// Nelder–Mead.
+    pub(crate) ebe: InnerLoopStats,
 }
 
 /// Why a profile solve did not return a point. The outer evaluation is then
@@ -279,6 +284,11 @@ struct SubjectState {
     h: DMatrix<f64>,
     kappas: Vec<DVector<f64>>,
     nll: f64,
+    /// The re-solve that produced this mode did not converge, or fell back to
+    /// Nelder–Mead. `false` for a mode from the population inner loop, whose own counts
+    /// are carried separately.
+    unconverged: bool,
+    fallback: bool,
 }
 
 /// Everything a profile solve reads.
@@ -322,6 +332,8 @@ impl ProfileCtx<'_> {
             h: ebe.h_matrix,
             kappas: ebe.kappas,
             nll,
+            unconverged: !ebe.converged,
+            fallback: ebe.used_fallback,
         }
     }
 
@@ -423,7 +435,7 @@ impl ProfileCtx<'_> {
         let mu_k = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
         // The start point's EBEs through the population inner loop, so the guarded
         // multi-start (`inner_restarts`) sees every evaluation as it does unprofiled.
-        let (etas, hms, _stats, kaps) = run_inner_loop_warm_seeded(
+        let (etas, hms, start_stats, kaps) = run_inner_loop_warm_seeded(
             self.model,
             self.population,
             &p,
@@ -444,6 +456,8 @@ impl ProfileCtx<'_> {
                     h: hms[i].clone(),
                     kappas: kaps.get(i).cloned().unwrap_or_default(),
                     nll: 0.0,
+                    unconverged: false,
+                    fallback: false,
                 };
                 s.nll = self.held(i, &p, &s, self.options.interaction);
                 s
@@ -480,6 +494,13 @@ impl ProfileCtx<'_> {
             }
         }
         let ofv = 2.0 * states.iter().map(|s| s.nll).sum::<f64>();
+        let ebe = InnerLoopStats {
+            n_unconverged: start_stats
+                .n_unconverged
+                .max(states.iter().filter(|s| s.unconverged).count()),
+            n_fallback: start_stats.n_fallback + states.iter().filter(|s| s.fallback).count(),
+            n_start_rejected: start_stats.n_start_rejected,
+        };
         let (mut etas, mut h_matrices, mut kappas) = (Vec::new(), Vec::new(), Vec::new());
         for s in states {
             etas.push(s.eta);
@@ -495,6 +516,7 @@ impl ProfileCtx<'_> {
             iterations,
             criterion,
             se_scale,
+            ebe,
         })
     }
 
@@ -783,11 +805,28 @@ pub(crate) fn optimize_profiled(
         }
         x
     };
+    let ebe_accum = Mutex::new(EbeAccum::default());
     let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
         let solve = ctx.solve(&params, &warm).ok()?;
+        {
+            let mut acc = ebe_accum.lock().unwrap();
+            acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
+            acc.total_fallback += solve.ebe.n_fallback;
+            // The unprofiled loop's EBE guard, on the same counts: too many unconverged
+            // subjects (or one hard-rejected at its start) and the trial is a wall.
+            if ebe_guard_rejects(
+                &solve.ebe,
+                population.subjects.len(),
+                solve.ofv,
+                options.max_unconverged_frac,
+            ) {
+                acc.n_guarded += 1;
+                return None;
+            }
+        }
         let mut b = best.lock().unwrap();
         if b.solve.as_ref().is_none_or(|s| solve.ofv < s.ofv) {
             b.x = x.to_vec();
@@ -900,7 +939,8 @@ pub(crate) fn optimize_profiled(
             "Profile solve failed at every evaluated point: no objective is available.".to_string(),
         );
         let params = unpack_params(&x0, init_params);
-        return failed_result(params, population, model, warnings);
+        let ebe = ebe_accum.into_inner().unwrap();
+        return failed_result(params, population, model, warnings, &ebe);
     };
     let mut x_hat = x_best.clone();
     for &k in &layout.coords {
@@ -922,6 +962,7 @@ pub(crate) fn optimize_profiled(
     }
     let mut params = solve.params.clone();
     params.theta_fixed = init_params.theta_fixed.clone();
+    let ebe = ebe_accum.into_inner().unwrap();
     OuterResult {
         params,
         ofv: solve.ofv,
@@ -937,9 +978,9 @@ pub(crate) fn optimize_profiled(
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
+        ebe_convergence_warnings: ebe.n_guarded as u32,
+        max_unconverged_subjects: ebe.max_unconverged as u32,
+        total_ebe_fallbacks: ebe.total_fallback as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,
@@ -1018,12 +1059,22 @@ pub(crate) fn replay_covariance(
     Some(ctx.covariance(&hold, &x_hat, &free, &solve))
 }
 
+/// EBE convergence over a profiled run, as the unprofiled NLopt loop keeps it: the worst
+/// unconverged count, the fallbacks, and the evaluations the EBE guard rejected.
+#[derive(Default)]
+struct EbeAccum {
+    max_unconverged: usize,
+    total_fallback: usize,
+    n_guarded: usize,
+}
+
 /// An `OuterResult` for a fit whose profile solve never succeeded.
 fn failed_result(
     params: ModelParameters,
     population: &Population,
     model: &CompiledModel,
     warnings: Vec<String>,
+    ebe: &EbeAccum,
 ) -> OuterResult {
     let n = population.subjects.len();
     OuterResult {
@@ -1045,9 +1096,9 @@ fn failed_result(
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
+        ebe_convergence_warnings: ebe.n_guarded as u32,
+        max_unconverged_subjects: ebe.max_unconverged as u32,
+        total_ebe_fallbacks: ebe.total_fallback as u32,
         final_gradient: None,
         final_gradient_source: None,
         sir_fallback_proposal: None,
