@@ -5741,12 +5741,9 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             their residuals are correlated across observation rows (a paired `block_sigma` or \
-             a `correlation` line) and the analytic outer gradient cannot serve them: the model \
-             pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
-             (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
-             subject's dosing is outside the analytic sensitivities; those gradients include \
-             the EBE-response term but are slower.";
+             no analytic recorder serves them: their data shape is outside the recorders' scope \
+             at every parameter point (for example a steady-state infusion under a lag time on \
+             the event walk). Those gradients include the EBE-response term but are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \

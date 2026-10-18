@@ -4332,3 +4332,55 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
         }
     }
 }
+
+/// #2093 review (round 2): `gradient = fd` keeps the inner search and the `H` matrix off
+/// the adjoint kernel. `find_ebe`'s non-analytic arm returned `exact_inner_gradient`
+/// whenever it served the subject, and `ebe_h_matrix` fell through to the exact
+/// η-Jacobian, so a forced-FD fit ran analytic derivatives under an FD label. The
+/// mutation this catches is dropping `inner_analytic_opted_out` from either route: the
+/// `fd` arm's exact count goes non-zero, or its `H` equals the exact Jacobian's bits.
+#[test]
+fn gradient_fd_keeps_the_inner_search_and_h_off_the_exact_routes() {
+    use std::path::Path;
+    let mut model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+            .expect("warfarin parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let subj = &pop.subjects[0];
+    let params = model.default_params.clone();
+    model.gradient_method = GradientMethod::Fd;
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+    let ebe = find_ebe(&model, subj, &params, 200, 1e-8, None, None, 0);
+    let (exact, fd) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    assert!(ebe.nll.is_finite(), "{}", ebe.nll);
+    assert!(
+        exact == 0 && fd > 0,
+        "gradient = fd: {exact} exact / {fd} FD steps"
+    );
+    // H at the same EBE: the FD Jacobian, not the exact one bit for bit.
+    let exact_j = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        &model,
+        subj,
+        &params.theta,
+        ebe.eta.as_slice(),
+    )
+    .expect("the adjoint serves warfarin");
+    let h = &ebe.h_matrix;
+    assert_eq!((h.nrows(), h.ncols()), (exact_j.nrows(), exact_j.ncols()));
+    assert!(
+        h.iter()
+            .zip(exact_j.iter())
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "gradient = fd must build H by finite differences"
+    );
+    let gap = h
+        .iter()
+        .zip(exact_j.iter())
+        .map(|(a, b)| (a - b).abs() / (1.0 + b.abs()))
+        .fold(0.0, f64::max);
+    assert!(
+        gap < 1e-4,
+        "the FD H must still be the same matrix: gap {gap:.2e}"
+    );
+}

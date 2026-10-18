@@ -185,6 +185,7 @@ pub(crate) fn subject_adjoint_eta_dx(
     }
     match bucket {
         4 => go::<4, 10, DualT<4, f64>>(&sc, subject, template, x, objective),
+        6 => go::<6, 21, DualT<6, f64>>(&sc, subject, template, x, objective),
         8 => go::<8, 36, DualT<8, f64>>(&sc, subject, template, x, objective),
         24 => go::<24, 300, DualT<24, f64>>(&sc, subject, template, x, objective),
         _ => None,

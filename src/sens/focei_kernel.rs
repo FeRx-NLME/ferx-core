@@ -206,10 +206,14 @@ impl<'a> LikCtx<'a> {
     /// has no censored or FREM rows (`foce_subject_nll` and
     /// `individual_nll_into_prepared_with_schedule_frozen`); otherwise both score it row
     /// by row, with the live correlated variance.
+    ///
+    /// A FREM row is any `FREMTYPE > 0`, mapped by `[frem]` or not: production's own test
+    /// (`subject.fremtype.iter().any(|&ft| ft > 0)`, `stats::likelihood`), so an unmapped
+    /// non-zero `FREMTYPE` is scored row by row here too (#2093 review).
     fn dense(&self) -> bool {
         self.cov.is_dense()
-            && !(0..self.subject.observations.len())
-                .any(|j| self.censored(j).is_some() || self.frem_row(j).is_some())
+            && !self.subject.fremtype.iter().any(|&ft| ft > 0)
+            && !(0..self.subject.observations.len()).any(|j| self.censored(j).is_some())
     }
 
     /// A FREM covariate pseudo-observation row: `(θ index, η index, covariate σ index)`
@@ -689,7 +693,19 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
         .map(|&j| c(ctx.subject.observations[j]) - f0[j])
         .collect();
     let nq = quant.len();
-    if let Some(m) = rm {
+    // Woodbury on a diagonal `R⁰` is a subtractive identity, accurate to `≈ eps·(1 + tr S)`
+    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
+    // floor while its `G` is O(1) (FOCE's `R⁰` is taken at η = 0, `G` at η̂) drives
+    // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
+    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
+    let woodbury = rm.is_none() && {
+        let tr: f64 = quant
+            .iter()
+            .map(|&j| (0..N).map(|k| lg[j][k].val() * lg[j][k].val()).sum::<f64>() / rdiag[j].val())
+            .sum();
+        1.0 + tr <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
+    };
+    if !woodbury {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
         let rt: Vec<Vec<T>> = (0..nq)
             .map(|a| {
@@ -701,7 +717,7 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
                         } else if ctx.frem_row(ja).is_some() || ctx.frem_row(jb).is_some() {
                             c(0.0)
                         } else {
-                            m[ja][jb]
+                            rm.as_ref().map_or(c(0.0), |m| m[ja][jb])
                         };
                         T::wsum3(0.0, (0..N).map(|k| (one, lg[ja][k], lg[jb][k]))) + r0
                     })
@@ -713,23 +729,24 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
         let quad = T::wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
         return Some(c(0.5) * (quad + chol_logdet(&l) + bloq));
     }
-    // Woodbury / determinant lemma on the diagonal R⁰.
+    // Woodbury / determinant lemma on the diagonal R⁰, Ω-normalised: with `B = D⁻¹GL`,
+    // `R̃⁻¹ = D⁻¹ − B(I + S)⁻¹Bᵀ` and `|R̃| = |D|·|I + S|`. Factoring `I + S` rather than
+    // `Ω⁻¹ + GᵀD⁻¹G` keeps `cond(Ω)` (a near-rail `block_omega`) out of the subtraction,
+    // which the trace gate above does not see.
     let iv: Vec<T> = quant.iter().map(|&j| one / rdiag[j]).collect();
-    let oi = &p.omega.inv;
     let mut a: Vec<Vec<T>> = vec![vec![c(0.0); N]; N];
     for k in 0..N {
         for l in 0..=k {
             let e = T::wsum3(
-                0.0,
-                std::iter::once((oi[k][l], one, one))
-                    .chain((0..nq).map(|i| (iv[i], gs[quant[i]][k], gs[quant[i]][l]))),
+                if k == l { 1.0 } else { 0.0 },
+                (0..nq).map(|i| (iv[i], lg[quant[i]][k], lg[quant[i]][l])),
             );
             a[k][l] = e;
             a[l][k] = e;
         }
     }
     let b: Vec<T> = (0..N)
-        .map(|k| T::wsum3(0.0, (0..nq).map(|i| (iv[i], gs[quant[i]][k], res[i]))))
+        .map(|k| T::wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i]))))
         .collect();
     let la = chol(&a)?;
     let ab = chol_solve(&la, &b);
@@ -739,7 +756,29 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
     for &j in &quant {
         log_r = log_r + rdiag[j].ln();
     }
-    Some(c(0.5) * (quad + log_r + p.omega.log_det + chol_logdet(&la) + bloq))
+    Some(c(0.5) * (quad + log_r + chol_logdet(&la) + bloq))
+}
+
+/// The largest `1 + tr(S)` the FOCE kernel's Woodbury branch is trusted under, `S` the
+/// Ω-normalised information `LᵀGᵀD⁻¹GL` (#1498; base's `foce_rtilde_inverse`). A Cholesky
+/// inverse at condition `κ` keeps `≈ eps·κ`, so `1e6` bounds the error near `2e-10`. Measured
+/// on base: warfarin's worst FOCE trace 2.7e4 (error 1.6e-12); `ss_oral_q24` subject 3's
+/// smallest 1.2e11 (error 0.16–0.27). Anywhere in `[1e5, 1e9]` separates them.
+const WOODBURY_MAX_INFO_TRACE: f64 = 1e6;
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the Woodbury branch whatever `1 + tr(S)` says, to show a fixture
+    /// can expose the loss the gate exists for.
+    pub(crate) static FORCE_WOODBURY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn woodbury_forced() -> bool {
+    #[cfg(test)]
+    return FORCE_WOODBURY.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
 }
 
 /// Dense-`R` FOCEI `F`: `½(rᵀR⁻¹r + log|R| + ηᵀΩ⁻¹η + log|Ω| + log|H̃|)`.

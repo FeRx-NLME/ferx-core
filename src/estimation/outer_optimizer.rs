@@ -6365,12 +6365,9 @@ pub(crate) fn outer_fd_fallback_warning(
          `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
          evaluation.";
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
-         their residuals are correlated across observation rows (a paired `block_sigma` or \
-         a `correlation` line) and the analytic outer gradient cannot serve them: the model \
-         pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
-         (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
-         subject's dosing is outside the analytic sensitivities; those gradients include \
-         the EBE-response term but are slower.";
+         no analytic recorder serves them: their data shape is outside the recorders' scope \
+         at every parameter point (for example a steady-state infusion under a lag time on \
+         the event walk). Those gradients include the EBE-response term but are slower.";
     // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.

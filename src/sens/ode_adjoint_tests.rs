@@ -1321,6 +1321,21 @@ fn focei_objective_is_inner_plus_log_det_across_residual_structures() {
     let srs = dense_subject(&sr);
     let g = objective_gaps::<3>(&sr, &srs, &sr.default_params, &[0.08, -0.06, 0.12]);
     assert!(g.0 < 1e-10 && g.1 < 1e-10, "block_sigma + RUV IIV: {g:?}");
+
+    // 5. a serial correlation with a `FREMTYPE > 0` row that no `[frem]` block maps:
+    //    production scores the subject row by row on any non-zero FREMTYPE (#2093 review
+    //    round 2, finding 10); the kernel used to require a mapping and scored it densely.
+    //    Cross-row correlation is what makes the two differ (a `block_sigma` pair correlates
+    //    within a row, where dense and row-wise agree), so the straddle uses `ar1`.
+    let mut sf = dense_subject(&sm);
+    sf.fremtype = vec![0; sf.observations.len()];
+    sf.fremtype[3] = 3;
+    assert!(sm.frem_config.is_none(), "the FREMTYPE must be unmapped");
+    let g = objective_gaps::<2>(&sm, &sf, &sm.default_params, &eta);
+    assert!(
+        g.0 < 1e-10 && g.1 < 1e-10,
+        "serial + unmapped FREMTYPE: {g:?}"
+    );
 }
 
 // ---- expression `obs_scale` divisor as its own tape leaf ---------------------------------
@@ -2049,11 +2064,14 @@ fn laplace_kernel<const N: usize, const M: usize>(
 }
 
 /// Where the regularised exact anchor is not positive-definite, production's Laplace
-/// objective falls back to the prior precision `Ω⁻¹` (`build_proposal`) and stays finite;
-/// the adjoint must serve that objective's gradient there rather than decline (a decline
-/// costs the reconverged FD score: on a 141-weight covariate network, most of the fit). The
-/// fixture point is found on a fixed grid of η where `H` is indefinite, which is asserted —
-/// the straddle — so the check cannot pass on a point that never reaches the fallback.
+/// objective falls back to the prior precision `Ω⁻¹` (`build_proposal`) and stays finite.
+/// The fixture point is found on a fixed grid of η where `H` is indefinite, which is
+/// asserted — the straddle — so the check cannot pass on a point that never reaches the
+/// fallback. A grid point is not a mode: there the adjoint declines (its identity needs
+/// `∇_η l = 0`; #2093 review round 2, finding 14), and the decline is asserted. At a
+/// stationary point it serves an indefinite `H` through `mode_solve`'s LU branch
+/// (`mode_solve_takes_an_indefinite_nonsingular_hessian`,
+/// `mode_solve_declines_an_indefinite_hessian_off_the_mode`).
 #[test]
 fn laplace_serves_the_prior_precision_anchor_fallback() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
@@ -2102,9 +2120,10 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         n_agq: 1,
         exact: true,
     };
-    let g = subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace)
-        .expect("the adjoint serves the fallback anchor");
-    assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+    assert!(
+        subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace).is_none(),
+        "off the mode, an indefinite H must decline rather than drop wᵀ∇_η l"
+    );
 }
 
 #[test]
@@ -2125,7 +2144,8 @@ fn laplace_kernel_is_the_production_objective() {
         laplace_prod(&one, &s, &one.default_params, &eta),
     );
     eprintln!("kernel {k:.15e} production {p:.15e}");
-    assert!((k - p).abs() / (1.0 + p.abs()) < 1.0, "{k} vs {p}");
+    // Measured worst 0 (bit-identical) on Linux (#2093 review round 2); ~10× headroom.
+    assert!((k - p).abs() / (1.0 + p.abs()) < 1e-12, "{k} vs {p}");
 }
 
 /// [`fd_oracle`] for an AGQ objective: Richardson FD of production's AGQ objective with
@@ -2191,7 +2211,11 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
     for (n_agq, exact) in [(3, true), (1, false), (3, false)] {
         let worst = fd_oracle_agq(&one, &s, n_agq, exact);
         eprintln!("n_agq = {n_agq}, exact = {exact}: worst {worst:.2e}");
-        assert!(worst < 1.0, "n_agq = {n_agq}, exact = {exact}: {worst:.2e}");
+        // Measured worst 6.0e-8 on Linux (#2093 review round 2); ~10× headroom.
+        assert!(
+            worst < 6e-7,
+            "n_agq = {n_agq}, exact = {exact}: {worst:.2e}"
+        );
     }
 }
 
@@ -2208,7 +2232,8 @@ fn laplace_adjoint_matches_reconverged_fd() {
         &[0.1, -0.05, 0.2],
     );
     let worst = fd_oracle_laplace(&one, &s);
-    assert!(worst < 1.0, "closed form: {worst:.2e}");
+    // Measured worst 3.7e-7 on Linux (#2093 review round 2); ~10× headroom.
+    assert!(worst < 4e-6, "closed form: {worst:.2e}");
     let ode = with_tol(
         parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap(),
         1e-12,
@@ -2224,7 +2249,8 @@ fn laplace_adjoint_matches_reconverged_fd() {
         &[0.1, -0.05, 0.08],
     );
     let worst = fd_oracle_laplace(&ode, &s);
-    assert!(worst < 1.0, "ODE: {worst:.2e}");
+    // Measured worst 5.0e-8 on Linux (#2093 review round 2); ~10× headroom.
+    assert!(worst < 5e-7, "ODE: {worst:.2e}");
 }
 
 // ---- the exact η-Jacobian and inner Hessian that replace production FD ---------------
@@ -2313,7 +2339,8 @@ fn exact_inner_hessian_matches_fd_of_the_production_objective() {
         }
     }
     eprintln!("exact Hessian vs Richardson FD: {worst:.2e}");
-    assert!(worst < 1.0, "{worst:.2e}");
+    // Measured worst 3.5e-10 on Linux (#2093 review round 2); ~10× headroom.
+    assert!(worst < 4e-9, "{worst:.2e}");
 }
 
 #[test]
@@ -2449,7 +2476,8 @@ fn custom_residual_magnitude_objective_and_gradients() {
             ("Laplace", fd_oracle_laplace(&model, &s)),
         ] {
             eprintln!("{label}: worst {worst:.2e}");
-            assert!(worst < 1.0, "{label}: {worst:.2e}");
+            // Measured worst 8.9e-7 on Linux (#2093 review round 2); ~10× headroom.
+            assert!(worst < 9e-6, "{label}: {worst:.2e}");
         }
     }
 }
@@ -2489,7 +2517,8 @@ fn closed_form_init_impulse_static_and_event_walk() {
         &[0.1, -0.05],
     );
     let worst = parity(&model, &s);
-    assert!(worst < 1.0, "static: {worst:.2e}");
+    // Measured worst 1.2e-7 on Linux (#2093 review round 2); ~10× headroom.
+    assert!(worst < 1.2e-6, "static: {worst:.2e}");
     // Time-varying covariate (the event walk): against the reconverged objective.
     let src = CF_INIT.replace(
         "CL = TVCL * exp(ETA_CL)",
@@ -2504,7 +2533,43 @@ fn closed_form_init_impulse_static_and_event_walk() {
             .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
             .collect();
     let worst = fd_oracle(&m2, &s2, true);
-    assert!(worst < 1.0, "event walk: {worst:.2e}");
+    // Measured worst 1.7e-7 on Linux (#2093 review round 2); ~10× headroom.
+    assert!(worst < 1.7e-6, "event walk: {worst:.2e}");
+}
+
+/// #527, restored on the adjoint (#2093 review round 2, finding 3): an `init()` amount that
+/// evaluates to exactly 0 still carries a gradient. At `TVC0 = 0` (bounds admit it, and the
+/// oracle's `moved_params` keeps it at 0) `A₀ = TVC0·V = 0` but `∂A₀/∂TVC0 = V`, so the
+/// impulse adds nothing to the value and `V·kernel` to `∂f/∂TVC0`. Skipping the impulse on
+/// `A₀ == 0` zeroed that axis while the reconverged FD sees the slope. The mutation this
+/// catches is restoring the `a0.val() == 0.0` skip in `provider.rs`.
+#[test]
+fn closed_form_init_with_a_zero_amount_keeps_its_gradient() {
+    let src = CF_INIT.replace(
+        "theta TVC0(0.4, 0.01, 10.0)",
+        "theta TVC0(0.0, -50.0, 50.0)",
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert_eq!(model.analytical_init.len(), 1);
+    assert_eq!(
+        moved_params(&model).theta[3],
+        0.0,
+        "the oracle must sit on A₀ = 0"
+    );
+    // Dosed at t = 0 and sampled after it, as the #527 fixture was: every prediction then
+    // carries the dose, so the init's ±h·V·kernel stays a small perturbation and no row
+    // sits on the proportional-error variance floor (a row seeing only `A₀ = 0` would,
+    // and the FD would measure the floor, not the slope).
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 2.0, 4.0, 8.0, 24.0],
+        &[0.1, -0.05],
+    );
+    let worst = fd_oracle(&model, &s, true);
+    eprintln!("zero-amount init vs reconverged FD {worst:.2e}");
+    // Measured worst 3.6e-8 on Linux; ~10× headroom.
+    assert!(worst < 4e-7, "zero-amount init vs FD {worst:.2e}");
 }
 
 #[test]
@@ -2562,8 +2627,9 @@ fn closed_form_iov_with_expression_scale_and_readout_matches_reconverged_fd() {
     let s = iov_subject(&model);
     for interaction in [true, false] {
         let worst = iov_parity(&model, &s, interaction);
+        // Measured worst 1.0e-6 on Linux (#2093 review round 2); ~10× headroom.
         assert!(
-            worst < 1.0,
+            worst < 1e-5,
             "expression scale, interaction = {interaction}: {worst:.2e}"
         );
     }
@@ -2577,8 +2643,9 @@ fn closed_form_iov_with_expression_scale_and_readout_matches_reconverged_fd() {
     let s = iov_subject(&model);
     for interaction in [true, false] {
         let worst = iov_parity(&model, &s, interaction);
+        // Measured worst 2.8e-7 on Linux (#2093 review round 2); ~10× headroom.
         assert!(
-            worst < 1.0,
+            worst < 3e-6,
             "readout, interaction = {interaction}: {worst:.2e}"
         );
     }
@@ -2607,7 +2674,8 @@ fn closed_form_per_compartment_scale_matches_reconverged_fd() {
     assert!(in_scope(&model, &s));
     for interaction in [true, false] {
         let worst = fd_oracle(&model, &s, interaction);
-        assert!(worst < 1.0, "interaction = {interaction}: {worst:.2e}");
+        // Measured worst 5.3e-7 on Linux (#2093 review round 2); ~10× headroom.
+        assert!(worst < 5e-6, "interaction = {interaction}: {worst:.2e}");
     }
 }
 
@@ -3875,14 +3943,155 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
         "the fixture must be indefinite"
     );
     let b = DVector::from_column_slice(&[1.0, -3.0]);
-    let w = super::mode_solve(&h, &b).expect("nonsingular");
+    let stationary = [0.0, 3e-6];
+    let w = super::mode_solve(&h, &b, &stationary).expect("nonsingular");
     let r = &h * &w - &b;
     assert!(r.norm() < 1e-14, "residual {:.2e}", r.norm());
     // A strict mode keeps the Cholesky solve.
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    let w = super::mode_solve(&spd, &b).expect("definite");
+    let w = super::mode_solve(&spd, &b, &stationary).expect("definite");
     assert!((&spd * &w - &b).norm() < 1e-14);
     // Singular: declined, not a non-finite `w`.
     let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    assert!(super::mode_solve(&sing, &b).is_none());
+    assert!(super::mode_solve(&sing, &b, &stationary).is_none());
+}
+
+/// #2093 review (round 2, finding 14): the indefinite branch serves only a stationary `η̂`.
+/// A fallback end point the inner search left short of the mode (gradient 1e-2 here) has a
+/// non-zero `wᵀ∇_η l`, which the identity drops, so it declines to the reconverged score.
+/// The straddle is `∇_η l` alone, on the same indefinite `H`; a strict mode keeps its
+/// Cholesky solve whatever the gradient (the inner search's own convergence gate covers
+/// it). A `NaN` gradient declines too. The mutation this catches is removing the gate.
+#[test]
+fn mode_solve_declines_an_indefinite_hessian_off_the_mode() {
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let b = DVector::from_column_slice(&[1.0, -3.0]);
+    assert!(super::mode_solve(&h, &b, &[0.0, 5e-5]).is_some());
+    assert!(super::mode_solve(&h, &b, &[1e-2, 0.0]).is_none());
+    assert!(super::mode_solve(&h, &b, &[f64::NAN, 0.0]).is_none());
+    let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0]).is_some());
+}
+
+/// #2093 review (round 2, finding 13): the EBE warm-start predictor `dη̂/dx` serves 5- and
+/// 6-effect subjects, which `hessian_bucket` sends to width 6. That arm was missing, so every
+/// such model lost the predictor. Checked against a central difference of the re-solved EBE
+/// (the EBE is re-found at `x ± h·e_k`): an oracle sharing no derivative code with it.
+#[test]
+fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
+    use crate::estimation::parameterization::unpack_params;
+    let model = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    assert_eq!(model.n_eta, 5);
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    let dx = std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(sc, || {
+                subject_adjoint_eta_dx(&model, &s, &params, &x, eta.as_slice(), true)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+    .expect("a five-effect subject must be served (width-6 bucket)");
+    let mut worst = 0.0f64;
+    for k in 0..x.len() {
+        let h = 1e-4 * (1.0 + x[k].abs());
+        let at = |d: f64| {
+            let mut xp = x.clone();
+            xp[k] += d;
+            ebe_for(&model, &s, &unpack_params(&xp, &params), 1e-12, true)
+        };
+        let (ep, em) = (at(h), at(-h));
+        for j in 0..5 {
+            let fd = (ep[j] - em[j]) / (2.0 * h);
+            assert!(fd.is_finite() && dx[k][j].is_finite(), "x[{k}] η[{j}]");
+            worst = worst.max((dx[k][j] - fd).abs() / (1.0 + fd.abs()));
+        }
+    }
+    eprintln!("eta_dx (5 η) vs re-solved EBE {worst:.2e}");
+    // Measured worst 1.8e-7 on Linux; ~10× headroom.
+    assert!(worst < 2e-6, "eta_dx vs re-solved EBE {worst:.2e}");
+}
+
+/// The `tests/ss_fit_smoke.rs` model, subject 3 of `data/ss_oral_q24.csv` (#1498).
+const SS_ORAL_Q24: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #2093 review (round 2, finding 9): base's `foce_rtilde_inverse` declined the Woodbury
+/// identity above `1 + tr(S) = 1e6` (#1498), and the adjoint's FOCE kernel had no such gate.
+/// On this subject the typical prediction at t = 23 h is ~1.5e-11, so its `R⁰` is on the
+/// variance floor while `G(η̂)` is O(1), and `1 + tr(S)` is ~1e11. The oracle is
+/// production's FOCE objective at the same `η̂` (its dense route), compared with the
+/// kernel's `F` with no re-solve: the reconverged FD of the gradient measures the EBE's own
+/// noise here, since the floored row weights the inner objective by ~1e12. The straddle:
+/// with the gate forced open (`FORCE_WOODBURY`) the kernel's value must be visibly wrong,
+/// or the gated assertion would pass on a fixture that cannot see the loss.
+#[test]
+fn foce_kernel_declines_woodbury_on_a_variance_floored_row() {
+    use crate::sens::focei_kernel::FORCE_WOODBURY;
+    let model = parse_model_string(SS_ORAL_Q24).unwrap();
+    let mut s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+        &[1.0, 4.0, 12.0, 23.0],
+        &[0.0, 0.0, 0.0],
+    );
+    s.observations = vec![4.048116, 4.014245, 2.184979, 0.872772];
+    let p = model.default_params.clone();
+    let typ = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.0; 3]);
+    assert!(
+        model.residual_variance_at(1, typ[3], &p.sigma.values) <= 1e-12,
+        "the t = 23 h typical prediction ({}) must put R⁰ on the variance floor",
+        typ[3]
+    );
+    let eta = ebe_for(&model, &s, &p, 1e-10, false);
+    let gated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
+    FORCE_WOODBURY.with(|c| c.set(true));
+    let ungated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
+    FORCE_WOODBURY.with(|c| c.set(false));
+    eprintln!(
+        "floored row: gated F gap {:.3e}, ungated {:.3e}",
+        gated.0, ungated.0
+    );
+    // Measured on Linux: ungated 6.2e-7 relative (the Ω-normalised form already loses fewer
+    // digits than base's unnormalised 16% in `R̃⁻¹`), gated 2.3e-11 — 27 000× apart. Each
+    // bound sits ~10× inside its side, so either reddens if the gate stops separating them.
+    assert!(
+        ungated.0 > 6e-8,
+        "the fixture no longer exposes the Woodbury loss (ungated gap {:.2e})",
+        ungated.0
+    );
+    assert!(
+        gated.0 < 2.5e-10,
+        "gated FOCE F vs production: {:.2e}",
+        gated.0
+    );
 }

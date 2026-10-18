@@ -1438,7 +1438,9 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
             .map(|&s| slot(amount, s))
             .collect();
         let a0 = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
-        if a0.val() == 0.0 || !a0.val().is_finite() {
+        // Only a non-finite amount is skipped. A zero one still carries `∂A₀/∂(θ, η)`, which
+        // reaches `∂C` as `kernel · ∂A₀` (#527): skipping it zeroes that gradient.
+        if !a0.val().is_finite() {
             continue;
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {

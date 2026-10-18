@@ -520,8 +520,6 @@ pub mod ferx_core::estimation::sens_outer_gradient
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], interaction: bool) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
 pub fn ferx_core::estimation::sens_outer_gradient::population_eta_dx(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>>
-pub fn ferx_core::estimation::sens_outer_gradient::population_gradient_sens(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::sens_outer_gradient::population_gradient_sens_foce(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::predict_warm_etas(prev_etas: &[nalgebra::base::alias::DVector<f64>], jacs: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], x_prev: &[f64], x_new: &[f64]) -> alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_foce(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
@@ -1790,7 +1788,6 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::val(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub mod ferx_core::sens::jet
 pub mod ferx_core::sens::num
 pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
 pub const ferx_core::sens::num::PkNum::ETA_HESSIAN: bool
@@ -1936,13 +1933,6 @@ pub fn ferx_core::sens::one_cpt::one_cpt_transit_conc_g<T: ferx_core::sens::num:
 pub fn ferx_core::sens::one_cpt::one_cpt_transit_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T
 pub fn ferx_core::sens::one_cpt::one_cpt_zero_order_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T
 pub fn ferx_core::sens::one_cpt::oral_sens(amt: f64, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub mod ferx_core::sens::one_cpt_explicit
-pub fn ferx_core::sens::one_cpt_explicit::infusion_explicit(rate: f64, dur: f64, amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
-pub fn ferx_core::sens::one_cpt_explicit::infusion_ss_explicit(rate: f64, dur: f64, amt: f64, t: f64, ii: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
-pub fn ferx_core::sens::one_cpt_explicit::iv_bolus_explicit(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
-pub fn ferx_core::sens::one_cpt_explicit::iv_bolus_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
-pub fn ferx_core::sens::one_cpt_explicit::oral_explicit(amt: f64, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub fn ferx_core::sens::one_cpt_explicit::oral_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
 pub mod ferx_core::sens::propagate
 pub struct ferx_core::sens::propagate::EigenCacheG
 impl ferx_core::sens::propagate::EigenCacheG
@@ -2018,13 +2008,6 @@ pub fn ferx_core::sens::three_cpt::three_cpt_iv_bolus_ss_g<T: ferx_core::sens::n
 pub fn ferx_core::sens::three_cpt::three_cpt_oral_amt_g<T: ferx_core::sens::num::PkNum>(amt: T, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T) -> T
 pub fn ferx_core::sens::three_cpt::three_cpt_oral_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T) -> T
 pub fn ferx_core::sens::three_cpt::three_cpt_oral_ss_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T) -> T
-pub mod ferx_core::sens::three_cpt_explicit
-pub fn ferx_core::sens::three_cpt_explicit::infusion_explicit(rate: f64, dur: f64, amt: f64, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
-pub fn ferx_core::sens::three_cpt_explicit::infusion_ss_explicit(rate: f64, dur: f64, amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
-pub fn ferx_core::sens::three_cpt_explicit::iv_bolus_explicit(amt: f64, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
-pub fn ferx_core::sens::three_cpt_explicit::iv_bolus_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
-pub fn ferx_core::sens::three_cpt_explicit::oral_explicit(amt: f64, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64, f_bio: f64) -> (f64, [f64; 8], [[f64; 8]; 8])
-pub fn ferx_core::sens::three_cpt_explicit::oral_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64, f_bio: f64) -> (f64, [f64; 8], [[f64; 8]; 8])
 pub mod ferx_core::sens::two_cpt
 pub fn ferx_core::sens::two_cpt::two_cpt_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T, oral: bool) -> T
 pub fn ferx_core::sens::two_cpt::two_cpt_ig_amt_g<T: ferx_core::sens::num::PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T, mat: T, cv2: T, f_bio: T) -> T
@@ -2042,13 +2025,6 @@ pub fn ferx_core::sens::two_cpt::two_cpt_transit_amt_g<T: ferx_core::sens::num::
 pub fn ferx_core::sens::two_cpt::two_cpt_transit_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v1: T, q: T, v2: T, n: T, mtt: T, f_bio: T) -> T
 pub fn ferx_core::sens::two_cpt::two_cpt_transit_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, n: T, mtt: T, f_bio: T) -> T
 pub fn ferx_core::sens::two_cpt::two_cpt_zero_order_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, dur: T, f_bio: T) -> T
-pub mod ferx_core::sens::two_cpt_explicit
-pub fn ferx_core::sens::two_cpt_explicit::infusion_explicit(rate: f64, dur: f64, amt: f64, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub fn ferx_core::sens::two_cpt_explicit::infusion_ss_explicit(rate: f64, dur: f64, amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub fn ferx_core::sens::two_cpt_explicit::iv_bolus_explicit(amt: f64, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub fn ferx_core::sens::two_cpt_explicit::iv_bolus_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
-pub fn ferx_core::sens::two_cpt_explicit::oral_explicit(amt: f64, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64, f_bio: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
-pub fn ferx_core::sens::two_cpt_explicit::oral_ss_explicit(amt: f64, t: f64, ii: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64, f_bio: f64) -> (f64, [f64; 6], [[f64; 6]; 6])
 pub mod ferx_core::sim
 pub mod ferx_core::sim::adaptive
 pub enum ferx_core::sim::adaptive::AdaptiveAction

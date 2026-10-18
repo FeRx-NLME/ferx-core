@@ -205,10 +205,11 @@ fn vrollback(mark: usize) {
 }
 
 /// Record a pure binary/unary op, reusing an existing node when the same op was already
-/// applied to the same parents with the same result (`v`, and `w` = an op-specific
-/// discriminator such as φ′). Pure ops on identical inputs give identical values and
-/// tangents, so the reuse is exact. A hit is verified against the node itself, so stale
-/// entries (rolled-back nodes) can never alias.
+/// applied to the same parents with the same record: the value, every stored tangent and
+/// payload entry, and (unary/scale) the rule on the aux stream `ws`. Matching the parents
+/// and the value alone is not enough, because an untaped operand can carry η-tangents the
+/// parents do not show (a free `c` in `c − K` is folded into a `Neg` of `K`). A hit is
+/// verified against the node itself, so stale entries (rolled-back nodes) can never alias.
 #[inline]
 fn push_cse<const N: usize>(
     op: Op,
@@ -216,10 +217,11 @@ fn push_cse<const N: usize>(
     b: u32,
     x: u32,
     v: f64,
-    w: f64,
+    ws: &[f64],
     g: &[f64; N],
     hs: &[f64],
 ) -> u32 {
+    let w = ws.first().copied().unwrap_or(0.0);
     let k1 = ((op as u64) << 56) ^ ((a as u64) << 28) ^ (b as u64);
     let k2 = v.to_bits() ^ w.to_bits().rotate_left(17);
     let hk = (k1 ^ k2.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - CSE_BITS);
@@ -227,14 +229,26 @@ fn push_cse<const N: usize>(
     let (e1, e2, id) = t.cse[hk as usize];
     if id != NONE && e1 == k1 && e2 == k2 && (id as usize) < t.nodes.len() {
         let nd = t.nodes[id as usize];
-        let same_val = t.vals[id as usize * t.nc].to_bits() == v.to_bits();
+        let same = |x: f64, y: f64| x.to_bits() == y.to_bits();
+        // A node is the same record only if every stored component matches, not just the
+        // value: two expressions with equal values and parents can still carry different
+        // η-tangents (`exp(η₁) − K` and `exp(η₂) − K` at η̂₁ = η̂₂, or `1 − K` beside
+        // `exp(η) − K` at η = 0), and the sweep reads the stored ones (#2093 review).
+        let row = &t.vals[id as usize * t.nc..(id as usize + 1) * t.nc];
+        let stored = std::iter::once(v)
+            .chain(g.iter().copied())
+            .chain(hs.iter().copied().take(t.nc - 1 - N));
+        let same_row = row.iter().zip(stored).all(|(&p, q)| same(p, q));
+        // Unary and scale nodes keep their rule on the aux stream: every recorded
+        // derivative (`φ′, φ″` and, taped-Hessian, `φ‴`), or the scale factor, must match.
         let same_aux = match op {
-            Op::Unary | Op::Scale => {
-                t.auxf.get(nd.x as usize).map(|c| c.to_bits()) == Some(w.to_bits())
-            }
+            Op::Unary | Op::Scale => t
+                .auxf
+                .get(nd.x as usize..nd.x as usize + ws.len())
+                .is_some_and(|aux| aux.iter().zip(ws).all(|(&p, &q)| same(p, q))),
             _ => true,
         };
-        if nd.op == op && nd.a == a && nd.b == b && same_val && same_aux {
+        if nd.op == op && nd.a == a && nd.b == b && same_row && same_aux {
             return id;
         }
     }
@@ -355,23 +369,39 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 h[t] = h1 * self.h[t] + h2 * self.g[k] * self.g[l];
             }
         }
-        if self.i == NONE {
-            return DualV {
-                v: hv,
-                g,
-                h,
-                i: NONE,
-            };
+        let mut r = DualV {
+            v: hv,
+            g,
+            h,
+            i: NONE,
+        };
+        // The record (if any) only adds the tape index: the value, tangents and payload are
+        // the same either way. A cold call that returns just the index keeps `r` in
+        // registers on the untaped path; returning a whole `DualV` from it made the join a
+        // memory value, and every untaped operation a store-forwarding stall (~5× slower).
+        if self.i != NONE {
+            r.i = self.unary_taped(h1, h2, if TH { h3() } else { 0.0 }, &r);
         }
-        self.unary_taped(hv, h1, h2, if TH { h3() } else { 0.0 }, g, h)
+        r
     }
     /// The tape record of [`Self::unary`], out of line so the untaped arithmetic above
     /// stays small enough to inline (#2093: forcing the whole body inline was most of
     /// the crate's compile time).
     #[inline(never)]
-    fn unary_taped(self, hv: f64, h1: f64, h2: f64, h3: f64, g: [f64; N], h: [f64; M]) -> Self {
+    #[cold]
+    fn unary_taped(&self, h1: f64, h2: f64, h3: f64, r: &Self) -> u32 {
         let x = vt().auxf.len() as u32;
-        let i = push_cse::<N>(Op::Unary, self.i, NONE, x, hv, h1, &g, &h);
+        let rule = [h1, h2, h3];
+        let i = push_cse::<N>(
+            Op::Unary,
+            self.i,
+            NONE,
+            x,
+            r.v,
+            &rule[..if TH { 3 } else { 2 }],
+            &r.g,
+            &r.h,
+        );
         if i as usize == vt().nodes.len() - 1 && vt().nodes[i as usize].x == x {
             let t = vt();
             t.auxf.push(h1);
@@ -380,17 +410,17 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 t.auxf.push(h3);
             }
         }
-        DualV { v: hv, g, h, i }
+        i
     }
     /// A taped value times a constant: always a tape record, so always out of line.
     #[inline(never)]
-    fn scaled(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
+    fn scaled(&self, c: f64, r: &Self) -> u32 {
         let x = vt().auxf.len() as u32;
-        let i = push_cse::<N>(Op::Scale, self.i, NONE, x, v, c, &g, &h);
+        let i = push_cse::<N>(Op::Scale, self.i, NONE, x, r.v, &[c], &r.g, &r.h);
         if i as usize == vt().nodes.len() - 1 && vt().nodes[i as usize].x == x {
             vt().auxf.push(c);
         }
-        DualV { v, g, h, i }
+        i
     }
 }
 
@@ -401,18 +431,20 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     #[inline(always)]
     pub(crate) fn add_c(self, c: f64) -> Self {
         let v = self.v + c;
-        if self.i == NONE {
-            return DualV { v, ..self };
+        let mut r = DualV { v, i: NONE, ..self };
+        if self.i != NONE {
+            r.i = self.add_taped(&Self::constant(c), &r);
         }
-        self.add_taped(Self::constant(c), v, self.g, self.h)
+        r
     }
     #[inline(always)]
     pub(crate) fn sub_c(self, c: f64) -> Self {
         let v = self.v - c;
-        if self.i == NONE {
-            return DualV { v, ..self };
+        let mut r = DualV { v, i: NONE, ..self };
+        if self.i != NONE {
+            r.i = self.sub_taped(&Self::constant(c), &r);
         }
-        self.sub_taped(Self::constant(c), v, self.g, self.h)
+        r
     }
     #[inline(always)]
     pub(crate) fn rsub_c(self, c: f64) -> Self {
@@ -428,10 +460,11 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         let mut h = self.h;
         g.iter_mut().for_each(|x| *x *= c);
         h.iter_mut().for_each(|x| *x *= c);
-        if self.i == NONE {
-            return DualV { v, g, h, i: NONE };
+        let mut r = DualV { v, g, h, i: NONE };
+        if self.i != NONE {
+            r.i = self.mul_taped(&Self::constant(c), &r);
         }
-        self.mul_taped(Self::constant(c), v, g, h)
+        r
     }
     #[inline(always)]
     pub(crate) fn div_c(self, c: f64) -> Self {
@@ -444,15 +477,16 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         let mut h = self.h;
         g.iter_mut().for_each(|x| *x *= ib);
         h.iter_mut().for_each(|x| *x *= ib);
-        if self.i == NONE {
-            return DualV {
-                v: q,
-                g,
-                h,
-                i: NONE,
-            };
+        let mut r = DualV {
+            v: q,
+            g,
+            h,
+            i: NONE,
+        };
+        if self.i != NONE {
+            r.i = self.div_taped(&Self::constant(c), ib, &r);
         }
-        self.div_taped(Self::constant(c), q, ib, g, h)
+        r
     }
 }
 
@@ -480,21 +514,27 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = self.h[t] + o.h[t];
         }
-        if self.i == NONE && o.i == NONE {
-            return DualV { v, g, h, i: NONE };
+        let mut r = DualV { v, g, h, i: NONE };
+        // The record (if any) only adds the tape index: the value, tangents and payload are
+        // the same either way. A cold call that returns just the index keeps `r` in
+        // registers on the untaped path; returning a whole `DualV` from it made the join a
+        // memory value, and every untaped operation a store-forwarding stall (~5× slower).
+        if self.i != NONE || o.i != NONE {
+            r.i = self.add_taped(&o, &r);
         }
-        self.add_taped(o, v, g, h)
+        r
     }
     /// The tape record of an addition (see [`Self::unary_taped`]).
     #[inline(never)]
-    fn add_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
-        let i = match (self.i == NONE, o.i == NONE) {
+    #[cold]
+    fn add_taped(&self, o: &Self, r: &Self) -> u32 {
+        let (v, g, h) = (r.v, &r.g, &r.h);
+        match (self.i == NONE, o.i == NONE) {
             (true, true) => NONE,
-            (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, &g, &h),
-            (true, false) => push::<N>(Op::Shift, o.i, NONE, NONE, v, &g, &h),
-            (false, false) => push_cse::<N>(Op::Add, self.i, o.i, NONE, v, 0.0, &g, &h),
-        };
-        DualV { v, g, h, i }
+            (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, g, h),
+            (true, false) => push::<N>(Op::Shift, o.i, NONE, NONE, v, g, h),
+            (false, false) => push_cse::<N>(Op::Add, self.i, o.i, NONE, v, &[], g, h),
+        }
     }
     /// [`Self::add_body`] out of line ([`Self::WIDE`]).
     #[inline(never)]
@@ -527,21 +567,23 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = self.h[t] - o.h[t];
         }
-        if self.i == NONE && o.i == NONE {
-            return DualV { v, g, h, i: NONE };
+        let mut r = DualV { v, g, h, i: NONE };
+        if self.i != NONE || o.i != NONE {
+            r.i = self.sub_taped(&o, &r);
         }
-        self.sub_taped(o, v, g, h)
+        r
     }
     /// The tape record of a subtraction (see [`Self::unary_taped`]).
     #[inline(never)]
-    fn sub_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
-        let i = match (self.i == NONE, o.i == NONE) {
+    #[cold]
+    fn sub_taped(&self, o: &Self, r: &Self) -> u32 {
+        let (v, g, h) = (r.v, &r.g, &r.h);
+        match (self.i == NONE, o.i == NONE) {
             (true, true) => NONE,
-            (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, &g, &h),
-            (true, false) => push_cse::<N>(Op::Neg, o.i, NONE, NONE, v, 0.0, &g, &h),
-            (false, false) => push_cse::<N>(Op::Sub, self.i, o.i, NONE, v, 0.0, &g, &h),
-        };
-        DualV { v, g, h, i }
+            (false, true) => push::<N>(Op::Shift, self.i, NONE, NONE, v, g, h),
+            (true, false) => push_cse::<N>(Op::Neg, o.i, NONE, NONE, v, &[], g, h),
+            (false, false) => push_cse::<N>(Op::Sub, self.i, o.i, NONE, v, &[], g, h),
+        }
     }
     /// [`Self::sub_body`] out of line ([`Self::WIDE`]).
     #[inline(never)]
@@ -575,32 +617,33 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 h[t] = self.h[t] * o.v + self.v * o.h[t] + self.g[k] * o.g[l] + self.g[l] * o.g[k];
             }
         }
-        if self.i == NONE && o.i == NONE {
-            return DualV { v, g, h, i: NONE };
+        let mut r = DualV { v, g, h, i: NONE };
+        if self.i != NONE || o.i != NONE {
+            r.i = self.mul_taped(&o, &r);
         }
-        self.mul_taped(o, v, g, h)
+        r
     }
     /// The tape record of a product (see [`Self::unary_taped`]).
     #[inline(never)]
-    fn mul_taped(self, o: Self, v: f64, g: [f64; N], h: [f64; M]) -> Self {
+    #[cold]
+    fn mul_taped(&self, o: &Self, r: &Self) -> u32 {
         match (self.i == NONE, o.i == NONE) {
-            (true, true) => DualV { v, g, h, i: NONE },
+            (true, true) => NONE,
             (true, false) if self.zero_tan() => {
                 if self.v == 0.0 {
-                    return DualV { v, g, h, i: NONE };
+                    return NONE;
                 }
-                o.scaled(self.v, v, g, h)
+                o.scaled(self.v, r)
             }
             (false, true) if o.zero_tan() => {
                 if o.v == 0.0 {
-                    return DualV { v, g, h, i: NONE };
+                    return NONE;
                 }
-                self.scaled(o.v, v, g, h)
+                self.scaled(o.v, r)
             }
             _ => {
                 let (a, b) = (self.mat(), o.mat());
-                let i = push_cse::<N>(Op::Mul, a.i, b.i, NONE, v, 0.0, &g, &h);
-                DualV { v, g, h, i }
+                push_cse::<N>(Op::Mul, a.i, b.i, NONE, r.v, &[], &r.g, &r.h)
             }
         }
     }
@@ -640,31 +683,27 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
                 h[t] = (self.h[t] - g[k] * o.g[l] - g[l] * o.g[k] - q * o.h[t]) * ib;
             }
         }
-        if self.i == NONE && o.i == NONE {
-            return DualV {
-                v: q,
-                g,
-                h,
-                i: NONE,
-            };
+        let mut r = DualV {
+            v: q,
+            g,
+            h,
+            i: NONE,
+        };
+        if self.i != NONE || o.i != NONE {
+            r.i = self.div_taped(&o, ib, &r);
         }
-        self.div_taped(o, q, ib, g, h)
+        r
     }
     /// The tape record of a quotient (see [`Self::unary_taped`]).
     #[inline(never)]
-    fn div_taped(self, o: Self, q: f64, ib: f64, g: [f64; N], h: [f64; M]) -> Self {
+    #[cold]
+    fn div_taped(&self, o: &Self, ib: f64, r: &Self) -> u32 {
         match (self.i == NONE, o.i == NONE) {
-            (true, true) => DualV {
-                v: q,
-                g,
-                h,
-                i: NONE,
-            },
-            (false, true) if o.zero_tan() => self.scaled(ib, q, g, h),
+            (true, true) => NONE,
+            (false, true) if o.zero_tan() => self.scaled(ib, r),
             _ => {
                 let (a, b) = (self.mat(), o.mat());
-                let i = push_cse::<N>(Op::Div, a.i, b.i, NONE, q, 0.0, &g, &h);
-                DualV { v: q, g, h, i }
+                push_cse::<N>(Op::Div, a.i, b.i, NONE, r.v, &[], &r.g, &r.h)
             }
         }
     }
@@ -698,26 +737,22 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         for t in 0..M {
             h[t] = -self.h[t];
         }
-        if self.i == NONE {
-            return DualV {
-                v: -self.v,
-                g,
-                h,
-                i: NONE,
-            };
-        }
-        self.neg_taped(g, h)
-    }
-    /// The tape record of a negation (see [`Self::unary_taped`]).
-    #[inline(never)]
-    fn neg_taped(self, g: [f64; N], h: [f64; M]) -> Self {
-        let i = push_cse::<N>(Op::Neg, self.i, NONE, NONE, -self.v, 0.0, &g, &h);
-        DualV {
+        let mut r = DualV {
             v: -self.v,
             g,
             h,
-            i,
+            i: NONE,
+        };
+        if self.i != NONE {
+            r.i = self.neg_taped(&r);
         }
+        r
+    }
+    /// The tape record of a negation (see [`Self::unary_taped`]).
+    #[inline(never)]
+    #[cold]
+    fn neg_taped(&self, r: &Self) -> u32 {
+        push_cse::<N>(Op::Neg, self.i, NONE, NONE, r.v, &[], &r.g, &r.h)
     }
     /// [`Self::neg_body`] out of line ([`Self::WIDE`]).
     #[inline(never)]
@@ -1693,6 +1728,46 @@ mod tests {
         let da = adj[vadj_index::<2, 1>(a.i, 0, 0)];
         let want = 2.0 * (1.7 / 0.6) / 0.6 + 1.7f64.exp();
         assert!((da - want).abs() < 1e-12, "{da} vs {want}");
+    }
+
+    /// #2093 review: `c − K` with an untaped `c` is recorded as a `Neg` of `K`, so two such
+    /// expressions with equal values (`exp(η₁) − K` and `exp(η₂) − K` at η₁ = η₂) have the
+    /// same op, parent and value but different η-tangents. Sharing one node made the sweep
+    /// read the first one's tangents: `∂/∂K` of `∂(d₂²)/∂η₂` came out 0 instead of −2(…).
+    /// The mutation this catches is dropping the stored-row comparison from `push_cse`.
+    #[test]
+    fn cse_does_not_alias_records_with_different_tangents() {
+        vtape_reset(3);
+        let k = DualV::<2, 0>::leaf(0.4, [0.0, 0.0], []);
+        let c1 = DualV::<2, 0>::free(1.3, [1.0, 0.0], []);
+        let c2 = DualV::<2, 0>::free(1.3, [0.0, 1.0], []);
+        let d1 = c1 - k;
+        let d2 = c2 - k;
+        assert_eq!(
+            d1.v.to_bits(),
+            d2.v.to_bits(),
+            "the straddle needs equal values"
+        );
+        assert_ne!(
+            d1.i, d2.i,
+            "records with different tangents must not share a node"
+        );
+        // d₂² has η₂-tangent 2·d₂·1; its K-derivative is −2. Seed that tangent component.
+        let out = d2 * d2;
+        let buf = vadj_init::<1>();
+        buf[vadj_index::<2, 1>(out.i, 2, 0)] = 1.0;
+        let adj = vsweep::<2, 1>(out.i as usize + 1);
+        let dk = adj[vadj_index::<2, 1>(k.i, 0, 0)];
+        assert!(
+            (dk + 2.0).abs() < 1e-12,
+            "∂/∂K of the η₂-tangent: {dk}, want −2"
+        );
+        // A unary rule with equal value and φ′ but a different φ″ is a different record.
+        vtape_reset(3);
+        let x = DualV::<2, 0>::leaf(0.7, [1.0, 0.0], []);
+        let u1 = x.lift2(2.0, 3.0, 5.0);
+        let u2 = x.lift2(2.0, 3.0, 7.0);
+        assert_ne!(u1.i, u2.i, "a different φ″ is a different unary record");
     }
 
     #[test]

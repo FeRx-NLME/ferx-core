@@ -8,7 +8,7 @@
 //! `Ω ⊕ (I_K ⊗ Ω_IOV)`. A subject no recorder serves returns `None`, and the caller fills it
 //! with its own per-subject salvage.
 
-use crate::estimation::parameterization::{packed_fixed_mask, theta_packs_log};
+use crate::estimation::parameterization::theta_packs_log;
 use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::DVector;
 use rayon::prelude::*;
@@ -79,64 +79,6 @@ fn subject_gradient(
         eta_hat,
         interaction,
     )
-}
-
-/// `d(OFV)/dx = 2·Σᵢ per_subject(i)` in packed space, `None` if any subject is
-/// unsupported, fixed coordinates zeroed. Subject-parallel, summed in subject order so
-/// the result is bit-reproducible.
-fn population_sum(
-    population: &Population,
-    template: &ModelParameters,
-    n: usize,
-    per_subject: impl Fn(usize, &Subject) -> Option<Vec<f64>> + Sync,
-) -> Option<Vec<f64>> {
-    let grads: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| per_subject(i, subject))
-        .collect::<Option<Vec<_>>>()?;
-    let mut grad = vec![0.0f64; n];
-    for gi in &grads {
-        for (g, v) in grad.iter_mut().zip(gi) {
-            *g += 2.0 * v;
-        }
-    }
-    for (g, fixed) in grad.iter_mut().zip(packed_fixed_mask(template)) {
-        if fixed {
-            *g = 0.0;
-        }
-    }
-    Some(grad)
-}
-
-/// The exact FOCEI population gradient `d(OFV)/dx = 2·Σᵢ dFᵢ/dx`, or `None` if any single
-/// subject is unsupported (all-or-nothing; the outer loop's mixed route,
-/// [`per_subject_packed_gradients`], salvages declined subjects one by one instead).
-/// `eta_hats[i]` must be subject `i`'s EBE at `x`.
-pub fn population_gradient_sens(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-) -> Option<Vec<f64>> {
-    population_sum(population, template, x.len(), |i, subject| {
-        subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
-    })
-}
-
-/// [`population_gradient_sens`] for **FOCE**.
-pub fn population_gradient_sens_foce(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-) -> Option<Vec<f64>> {
-    population_sum(population, template, x.len(), |i, subject| {
-        subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())
-    })
 }
 
 /// Per-subject packed gradients `d(nllᵢ)/dx` (FOCEI when `interaction`, FOCE otherwise),

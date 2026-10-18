@@ -49,6 +49,7 @@ use crate::sens::focei_kernel::{foce_f, focei_f_grad, inner_grad, inner_l, LikCt
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::PkNum;
 use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+use crate::sens::vfree::DualF;
 use crate::sens::vtape::{
     vadj_index, vadj_index_h, vadj_init, vsweep, vsweep_h, vtape_reset, DualV, NONE,
 };
@@ -309,13 +310,26 @@ pub(crate) fn subject_adjoint_gradient(
 /// it sent the subject to the reconverged finite-difference score, `2·n_x` EBE re-solves (on
 /// a 141-weight covariate network under Laplace, 43 such subject-iterations were most of the
 /// fit). `None` when `H` is singular or the solve is not finite.
-fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
+///
+/// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
+/// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
+/// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
+/// [`MODE_STATIONARY_TOL`] the subject declines to the reconverged score (#2093 review).
+fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVector<f64>> {
     if let Some(c) = h.clone().cholesky() {
         return Some(c.solve(b));
+    }
+    if !(crate::sens::num::nan_max_abs(grad_l.iter().copied()) <= MODE_STATIONARY_TOL) {
+        return None;
     }
     let w = h.clone().full_piv_lu().solve(b)?;
     w.iter().all(|v| v.is_finite()).then_some(w)
 }
+
+/// The largest `|∇_η l(η̂)|` [`mode_solve`] treats as a stationary point on its indefinite
+/// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`),
+/// which a certified fallback end point meets.
+const MODE_STATIONARY_TOL: f64 = 1e-4;
 
 /// The θ leaves of a recording (value leaves, no tangent) for each θ the parameter
 /// program reads; shared by every recording on one tape.
@@ -1319,6 +1333,24 @@ fn canonical_jets<const N: usize, const M: usize>(
         .filter(|p| p.len() == subject.observations.len())
 }
 
+/// [`canonical_jets`] at first order (`(f, ∂f/∂η)`), the inner loop's per-step recording, on
+/// the index-free [`DualF`] (`sens::vfree`): the same jets as a free `DualV<N, 0>`, kept in
+/// registers. Only this order gets its own instantiation of the recorders; the
+/// second-order jets share the outer gradient's `DualV<N, M>` ones.
+fn canonical_jets1<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<DualF<N, 0>>> {
+    let th: Vec<DualF<N, 0>> = theta.iter().map(|&v| DualF::constant(v)).collect();
+    let unit = unit_dirs::<N>();
+    let et: [DualF<N, 0>; N] = std::array::from_fn(|k| DualF::free(eta[k], unit[k], []));
+    record(model, subject, lay, theta, eta, &th, &et)
+        .filter(|p| p.len() == subject.observations.len())
+}
+
 /// The model the predictor would evaluate for this subject (a closed-form absorption model
 /// may route to its ODE twin), the dual width, and `eta` in the recordings' basis padded to
 /// its dispatch bucket. The width is `n_eta`, the stacked `[η, κ]` under IOV, or — under
@@ -1440,7 +1472,7 @@ pub(crate) fn exact_eta_jacobian(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, lay, theta, eta)?;
+        let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
         Some(DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]))
     }
     let (model, w, eta, lay) = resolve(model, subject, theta, eta, None)?;
@@ -1500,7 +1532,7 @@ pub(crate) fn exact_obs_grads_into(
         w: usize,
         rows: &mut Vec<crate::sens::provider::ObsGrad>,
     ) -> Option<()> {
-        let p = canonical_jets::<N, 0>(model, subject, lay, theta, eta)?;
+        let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
         rows.resize_with(p.len(), || crate::sens::provider::ObsGrad {
             f: 0.0,
             df_deta: Vec::new(),
@@ -1630,7 +1662,7 @@ pub(crate) fn exact_htilde(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, lay, &params.theta, eta)?;
+        let p = canonical_jets1::<N>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -1689,7 +1721,7 @@ pub(crate) fn exact_inner_gradient_in(
         frozen: Option<&[f64]>,
         w: usize,
     ) -> Option<Vec<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, lay, &params.theta, eta)?;
+        let p = canonical_jets1::<N>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -1974,8 +2006,9 @@ fn run<const N: usize, const M: usize>(
     let pop_v: Option<Vec<f64>> = pop
         .as_ref()
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| p.v).collect());
-    let (grad_f, h) = eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
-    let w = mode_solve(&h, &grad_f)?;
+    let (grad_f, h, grad_l) =
+        eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
+    let w = mode_solve(&h, &grad_f, &grad_l)?;
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -2054,7 +2087,7 @@ pub(super) fn eta_derivatives<const N: usize, const M: usize>(
     fpop: Option<&[f64]>,
     eta: &[f64],
     pv: &ParT<f64>,
-) -> Option<(DVector<f64>, DMatrix<f64>)> {
+) -> Option<(DVector<f64>, DMatrix<f64>, [f64; N])> {
     type D<const N: usize> = DualT<N, f64>;
     let fd: Vec<D<N>> = preds.iter().map(|p| DualT { v: p.v, g: p.g }).collect();
     let gd: Vec<[D<N>; N]> = preds
@@ -2083,7 +2116,7 @@ pub(super) fn eta_derivatives<const N: usize, const M: usize>(
         &pv.wrap::<N>(),
     )?;
     let h = DMatrix::from_fn(N, N, |k, m| 0.5 * (la[k].g[m] + la[m].g[k]));
-    Some((DVector::from_column_slice(&fa.g), h))
+    Some((DVector::from_column_slice(&fa.g), h, la.map(|l| l.v)))
 }
 
 /// Theta leaves (shared by every recording on the tape) and η leaves with tangent rows
@@ -2560,7 +2593,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         )
     };
     let (grad_eta, _) = sweep(&s1);
-    let w = mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta))?;
+    let grad_l: Vec<f64> = lg.iter().map(|l| l.v).collect();
+    let w = mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta), &grad_l)?;
 
     // ---- sweep 2: Ψ = A − wᵀ∇_η l(η̂) ----------------------------------------------
     let psi =

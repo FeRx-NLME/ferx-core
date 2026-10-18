@@ -188,6 +188,18 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
         w.contains(&declining_id),
         "warning must name the declining subject ({declining_id}); got: {w}"
     );
+    // #2093 review round 2 (finding 4): the subject's decline is scope, so it took the
+    // reconverged gradient, and the sentence says why in those terms. Before, it told this
+    // subject (diagonal proportional error) that its residuals were correlated.
+    assert!(
+        w.contains("no analytic recorder serves them")
+            && w.contains("include the EBE-response term but are slower"),
+        "the structural sentence must name the recorder scope; got: {w}"
+    );
+    assert!(
+        !w.contains("correlated across observation rows"),
+        "a diagonal-error subject must not be told its residuals are correlated; got: {w}"
+    );
     // The whole point: the report and the run disagree, and only the warning says so.
     assert_eq!(
         result.gradient_method_outer, "analytic (Dual2)",

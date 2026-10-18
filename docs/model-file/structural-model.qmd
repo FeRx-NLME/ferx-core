@@ -304,9 +304,9 @@ rewriting the reference as `K / sqrt(NARM)`, which reaches the equation as an
 ordinary individual parameter.
 
 Finite differences are used — correctly, just more slowly, and reported as FD
-rather than claimed as analytic — past the axis caps: more than 24 estimated
-`(θ, η)` without `kappa`, more than 24 `(θ, η, kappa)` per occasion with it, or
-more than 96 stacked `(θ, η, kappa₁…kappa_K)` axes across a subject's occasions.
+rather than claimed as analytic — past the width cap: more than 24 random effects
+for a subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions
+under IOV. The number of θ does not count.
 
 See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*
 model, which shares this grammar.

@@ -1856,6 +1856,7 @@ fn find_ebe_solve(
     // throughout. Checking the fallback with a *different* (FD) gradient than the analytic
     // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
     let use_analytic = analytic_inner_grad_supported(model, subject);
+    let opted_out = inner_analytic_opted_out(model);
     let profile = inner_profile_enabled();
     let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
     let agrad = |e: &[f64]| -> Vec<f64> {
@@ -1863,12 +1864,26 @@ fn find_ebe_solve(
             return g;
         }
         let exact = || {
+            if opted_out {
+                return None;
+            }
             crate::sens::ode_provider::adjoint::exact_inner_gradient(
                 model, subject, params, e, frozen,
             )
         };
         if !use_analytic {
-            return exact().unwrap_or_else(|| gradient_fd(&obj, e, n_eta));
+            return match exact() {
+                Some(g) => {
+                    #[cfg(test)]
+                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
+                None => {
+                    #[cfg(test)]
+                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, e, n_eta)
+                }
+            };
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -2281,12 +2296,17 @@ fn ebe_h_matrix(
     match analytic_jac {
         Some(j) => j,
         // The exact Jacobian from the adjoint's recording (every engine it serves).
-        None => match crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-            model,
-            subject,
-            &params.theta,
-            eta,
-        ) {
+        None => match (!inner_analytic_opted_out(model))
+            .then(|| {
+                crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta,
+                )
+            })
+            .flatten()
+        {
             Some(mut j) => {
                 overwrite_frem_pseudo_obs_rows(&mut j, model, subject, n_eta);
                 j
@@ -2352,6 +2372,11 @@ thread_local! {
     /// per-iterate fallback — the fit still reports the analytic route — so a test that
     /// means "the search ran on the analytic gradient" reads this (#2053 review 1).
     pub(crate) static IOV_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    /// `(exact, fd)` inner-gradient evaluations of `find_ebe` on this thread when the legacy
+    /// analytic route is out of scope (`gradient = fd`, the escape hatch, or a shape it
+    /// declines): the adjoint kernel's exact gradient, or central differences.
+    pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
 }
 
@@ -2523,7 +2548,11 @@ fn find_ebe_iov(
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
     // The recording's exact stacked gradient, at η_true (identical in psi-space).
+    let opted_out = inner_analytic_opted_out(model);
     let exact = |p: &[f64]| {
+        if opted_out {
+            return None;
+        }
         let mut stacked_true = p.to_vec();
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
@@ -2778,13 +2807,17 @@ fn iov_ebe_h_matrix(
         stacked_hat.extend(k.iter().copied());
     }
     let n_obs = subject.obs_times.len();
-    match crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-        model,
-        subject,
-        &params.theta,
-        &stacked_hat,
-    )
-    .filter(|j| j.nrows() == n_obs && j.ncols() >= n_eta)
+    match (!inner_analytic_opted_out(model))
+        .then(|| {
+            crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+                model,
+                subject,
+                &params.theta,
+                &stacked_hat,
+            )
+        })
+        .flatten()
+        .filter(|j| j.nrows() == n_obs && j.ncols() >= n_eta)
     {
         Some(j) => {
             let mut h = j.columns(0, n_eta).into_owned();
@@ -3116,6 +3149,14 @@ pub fn profile_report() {
 /// common bail at all — it has its own inline bail list in [`analytic_inner_grad_supported`]
 /// and its own per-subject scope (`ode_inner_grad_supported`, which admits exactly the
 /// static-walk and TV-cov-walk `ExpressionScale` that the ODE provider actually applies).
+/// Whether the user switched the inner loop off analytic derivatives: `gradient = fd` or
+/// `FERX_NO_ANALYTIC_INNER=1`. Every exact route of the inner loop (the adjoint kernel's
+/// inner gradient, its η-Jacobian for `H`) honours it, so the search runs on the finite
+/// differences the gradient report says it does (#2093 review).
+pub(crate) fn inner_analytic_opted_out(model: &CompiledModel) -> bool {
+    no_analytic_inner_forced() || GradientMethod::forced_fd(model)
+}
+
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || GradientMethod::forced_fd(model)

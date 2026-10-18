@@ -199,6 +199,11 @@ impl Neg for R {
 
 impl PkNum for R {
     const SECOND_ORDER: bool = false;
+    /// No tape node: nothing downstream differentiates it.
+    #[inline]
+    fn is_constant(self) -> bool {
+        self.i == NONE
+    }
     fn from_f64(x: f64) -> Self {
         R::c(x)
     }
@@ -479,6 +484,10 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
 
 impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     const SECOND_ORDER: bool = false;
+    #[inline]
+    fn is_constant(self) -> bool {
+        self.v.is_constant() && self.g.iter().all(|d| d.is_constant() && d.val() == 0.0)
+    }
     fn from_f64(x: f64) -> Self {
         DualT::constant(x)
     }
@@ -506,6 +515,18 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         self.chain(s, d)
     }
     fn pow(self, e: Self) -> Self {
+        // A constant exponent (`(AGE − 40)^2`, `C^2` in `[odes]`) is the power rule in `B`,
+        // as `DualV::pow` has it: `exp(e·ln x)` is NaN at `x ≤ 0` and declined the subject
+        // to finite differences (#2093 review). `DualV`'s convention at `x = 0` (a zero
+        // derivative) is kept, so this differentiates the function the gradient records.
+        if e.is_constant() {
+            let n = e.v.val();
+            if self.v.val() == 0.0 {
+                return DualT::constant(0.0f64.powf(n));
+            }
+            let d1 = B::from_f64(n) * self.v.pow(B::from_f64(n - 1.0));
+            return self.chain(self.v.pow(B::from_f64(n)), d1);
+        }
         (e * self.ln()).exp()
     }
     fn abs(self) -> Self {
@@ -784,6 +805,15 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
 
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N, M, B, D> {
     const SECOND_ORDER: bool = true;
+    #[inline]
+    fn is_constant(self) -> bool {
+        self.v.is_constant()
+            && self
+                .g
+                .iter()
+                .chain(&self.h)
+                .all(|d| d.is_constant() && d.val() == 0.0)
+    }
     fn from_f64(x: f64) -> Self {
         DualH::constant(x)
     }
@@ -811,6 +841,17 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         self.chain2(s, d1, -(d1 / (B::from_f64(2.0) * self.v)))
     }
     fn pow(self, e: Self) -> Self {
+        // The constant-exponent power rule, as [`DualT::pow`] (#2093 review).
+        if e.is_constant() {
+            let n = e.v.val();
+            if self.v.val() == 0.0 {
+                return DualH::constant(0.0f64.powf(n));
+            }
+            let c = B::from_f64;
+            let d1 = c(n) * self.v.pow(c(n - 1.0));
+            let d2 = c(n * (n - 1.0)) * self.v.pow(c(n - 2.0));
+            return self.chain2(self.v.pow(c(n)), d1, d2);
+        }
         (e * self.ln()).exp()
     }
     fn abs(self) -> Self {
@@ -896,6 +937,34 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2093 review (round 2, finding 12): a constant exponent is the power rule, finite at a
+    /// negative base where `exp(e·ln x)` is NaN (`(AGE − 40)^2` at AGE = 30). `x = −2 + t₀`,
+    /// `x²`: value 4, first derivative `2x = −4`, second `2`. The straddle is a non-constant
+    /// exponent at the same base, which keeps the `exp(e·ln x)` route (NaN there).
+    #[test]
+    fn a_constant_exponent_is_the_power_rule_at_a_negative_base() {
+        let x = DualT::<2, f64> {
+            v: -2.0,
+            g: [1.0, 0.5],
+        };
+        let y = x.pow(DualT::constant(2.0));
+        assert_eq!(y.v, 4.0);
+        assert_eq!(y.g, [-4.0, -2.0]);
+        let xh = DualH::<2, 3, f64> {
+            v: -2.0,
+            g: [1.0, 0.0],
+            h: [0.0; 3],
+        };
+        let yh = xh.pow(DualH::constant(2.0));
+        assert_eq!((yh.v, yh.g[0]), (4.0, -4.0));
+        assert_eq!(yh.h[crate::sens::vtape::tri(0, 0)], 2.0, "∂²(x²)/∂t₀² = 2");
+        let live = DualT::<2, f64> {
+            v: 2.0,
+            g: [0.0, 1.0],
+        };
+        assert!(x.pow(live).v.is_nan(), "a live exponent keeps exp(e·ln x)");
+    }
 
     fn prog_h<T: PkNum>(x: T, y: T) -> T {
         let c = |v: f64| T::from_f64(v);
