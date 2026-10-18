@@ -745,11 +745,20 @@ pub(crate) fn envelope_gradient(
 /// gradient is checked against FD of that profile (G1, 5.5e-5 relative on the FD
 /// engine). Measured on F2 (#1065): BOBYQA stopped 0.0185 OFV above NONMEM's optimum
 /// after 110 evaluations, L-BFGS 1.5e-8 above it after 26 (7.9 s against 22.9 s).
+///
+/// `Optimizer::Bfgs` and `Optimizer::Lbfgs` — the hand-rolled loops, reachable only by
+/// constructing the variant in Rust, since the parser reads `bfgs` and `lbfgs` as
+/// `nlopt_lbfgs` (#483) — also run NLopt L-BFGS here, the profiled loop having no
+/// hand-rolled arm (#2130 review #6). The docs say so.
 fn profiled_algorithm(options: &FitOptions) -> nlopt::Algorithm {
     match options.optimizer {
         Optimizer::Bobyqa => nlopt::Algorithm::Bobyqa,
         Optimizer::Slsqp => nlopt::Algorithm::Slsqp,
-        _ => nlopt::Algorithm::Lbfgs,
+        Optimizer::Auto | Optimizer::NloptLbfgs | Optimizer::Bfgs | Optimizer::Lbfgs => {
+            nlopt::Algorithm::Lbfgs
+        }
+        // Refused by `check_profiled_levels` before a fit gets here.
+        Optimizer::TrustRegion | Optimizer::Mma => nlopt::Algorithm::Lbfgs,
     }
 }
 

@@ -570,8 +570,9 @@ parameters becomes a 5-dimensional search, and the default covariance stays `r`.
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
 the structural parameters is the ordinary outer gradient with the levels held
 (envelope theorem), and the profile objective is smooth enough for it, where BOBYQA
-stopped early on the test fixture. `bobyqa`, `slsqp` and the L-BFGS spellings can be
-chosen explicitly.
+stopped early on the test fixture. `bobyqa` and `slsqp` can be chosen explicitly;
+`nlopt_lbfgs`, `lbfgs` and `bfgs` all run the same NLopt L-BFGS (from the model file
+they always do, profiled or not). `trust_region` and `mma` are refused.
 
 Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so the OFV, the structural estimates and their standard errors are the
