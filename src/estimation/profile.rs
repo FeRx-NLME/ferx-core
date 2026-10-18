@@ -914,6 +914,12 @@ pub(crate) fn optimize_profiled(
     } else {
         None
     };
+    // #1303: the verdict a consumer keys on is gated on the objective it describes.
+    if let Some(w) =
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, solve.ofv)
+    {
+        warnings.push(w);
+    }
     let mut params = solve.params.clone();
     params.theta_fixed = init_params.theta_fixed.clone();
     OuterResult {
