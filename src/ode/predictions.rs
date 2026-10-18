@@ -4630,8 +4630,8 @@ pub(crate) struct AdaptiveRecordIndex {
     /// same-kind group: [`Self::at`] the first (the row that terminates the segment),
     /// [`Self::last_at`] the last (the row in force after the instant). Keeping only the
     /// first made a decision after two co-timed observations read the FIRST row's
-    /// covariates — 2.37× in an injected dose's `F` on the #1599 fixture — while every
-    /// verifier shared this index and passed.
+    /// covariates — 2.5× in an injected dose's `F` (2.37× in IPRED@42 on the #1599 plan's
+    /// fixture) — while every verifier shared this index and passed.
     obs: HashMap<u64, (usize, usize)>,
 }
 
