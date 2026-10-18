@@ -30,16 +30,20 @@ const F1_DATA: &str = "tests/data/mbma_placebo/mbma_placebo.csv";
 const PROFILED: &str = "](0.0) profile";
 const UNPROFILED: &str = "](0.0, -50.0, 50.0)";
 
+/// A temp path no other call in this process gets: tests run on parallel threads, and two
+/// that prep one fixture under one name raced — one read the other's half-written file
+/// ("Missing [parameters] block", slow-tests run 39170264924; #2090 is the same bug).
+fn unique_temp(stem: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{stem}_{}_{n}.ferx", std::process::id()))
+}
+
 /// `model` on `data`, profiled or not (the block line rewritten).
 fn prep(model: &str, data: &str, profiled: bool) -> ferx_core::PreparedRun {
     let text = std::fs::read_to_string(root().join(model)).unwrap();
     assert!(text.contains(PROFILED), "fixture moved");
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profiled_levels_{}_{}_{}.ferx",
-        std::process::id(),
-        profiled,
-        model.replace('/', "_")
-    ));
+    let path = unique_temp("ferx_profiled_levels");
     let text = if profiled {
         text
     } else {
@@ -401,10 +405,7 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
     let text =
         std::fs::read_to_string(root().join("nonmem_anchor/level_se_mbma_fit.ferx")).unwrap();
     assert!(text.contains(UNPROFILED), "fixture moved");
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profiled_levels_{}_a1.ferx",
-        std::process::id()
-    ));
+    let path = unique_temp("ferx_profiled_levels_a1");
     std::fs::write(&path, text.replace(UNPROFILED, PROFILED)).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),

@@ -22,6 +22,15 @@ fn root() -> PathBuf {
 
 const PROFILED: &str = "](0.0) profile";
 
+/// A temp path no other call in this process gets: tests run on parallel threads, and two
+/// that prep one fixture under one name raced — one read the other's half-written file
+/// ("Missing [parameters] block", slow-tests run 39170264924; #2090 is the same bug).
+fn unique_temp(stem: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{stem}_{}_{n}.ferx", std::process::id()))
+}
+
 fn prep(model: &str, data: &str, unprofiled: Option<&str>) -> ferx_core::PreparedRun {
     let text = std::fs::read_to_string(root().join(model)).unwrap();
     assert!(text.contains(PROFILED), "fixture moved");
@@ -29,12 +38,7 @@ fn prep(model: &str, data: &str, unprofiled: Option<&str>) -> ferx_core::Prepare
         Some(decl) => text.replace(PROFILED, decl),
         None => text,
     };
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profiled_fits_{}_{}_{}.ferx",
-        std::process::id(),
-        unprofiled.is_some(),
-        model.replace('/', "_")
-    ));
+    let path = unique_temp("ferx_profiled_fits");
     std::fs::write(&path, text).unwrap();
     ferx_core::prepare_run(
         path.to_str().unwrap(),
