@@ -1975,7 +1975,11 @@ pub(crate) fn forcing_consumes_cmt(
 /// `check_dose_compartments` rejects a `CMT=0` infusion (`E_DOSE_CMT_NOT_INFUSABLE`) and
 /// any `cmt > n_states`, and `check_absorption_dosing` rejects an SS infusion into an
 /// absorption compartment (`E_ABSORPTION_SS_INFUSION`). Recorded because "confined to
-/// the plain `+rate`" would understate the change for a hand-built [`OdeSpec`].
+/// the plain `+rate`" would understate the change for a hand-built [`OdeSpec`]. Pinned by
+/// `residual_ss_infusion_window_obeys_the_membership_predicate` (#1236) for the
+/// compartment and forcing tests; the real-infusion test is redundant on that branch
+/// (`ss_residual_infusion_end` returns `None` for a non-infusion itself), so no test of the
+/// residual window can observe it.
 #[inline]
 pub(crate) fn infusion_contributes(
     input_rate: &[crate::pk::absorption::InputRateForcing],

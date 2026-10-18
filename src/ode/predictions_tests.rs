@@ -10777,6 +10777,71 @@ mod break_collision_1186 {
         );
     }
 
+    /// #1236 part 2. The membership predicate also gates `active_infusions`' **second**
+    /// branch — the residual window a seeded `SS=1` infusion keeps delivering on
+    /// `[d.time, ss_residual_infusion_end]` (#1121) — which the test above never reaches:
+    /// its segment sits in each dose's own window. Here `II = 12`, `T_inf = 6`, lag 8: the
+    /// residual window is `[0, 2]` and the dose's own `[8, 14]`, so the segment `[0.5, 1.5]`
+    /// is admitted by the residual branch or not at all.
+    ///
+    /// Unreachable from a validated call (`E_DOSE_CMT_NOT_INFUSABLE`,
+    /// `E_ABSORPTION_SS_INFUSION`); this pins the bound instead of arguing it. The
+    /// `is_real_infusion` leg is not pinned here and cannot be: `ss_residual_infusion_end`
+    /// already returns `None` for a non-infusion, so on this branch the two checks reject the
+    /// same inputs.
+    ///
+    /// Mutation — evaluate `infusion_contributes` only in the dose's-own-window test, leaving
+    /// the residual branch ungated: `CMT = 0` delivers into compartment 1 and `cmt = 7`
+    /// returns an index past `n_states`.
+    #[test]
+    fn residual_ss_infusion_window_obeys_the_membership_predicate() {
+        let n_states = 3;
+        let ir = vec![InputRateForcing {
+            cmt: 2,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![PK_IDX_KA],
+            frac_slot: None,
+            lag_slot: None,
+        }];
+        let residual = |cmt: usize| {
+            let d = DoseEvent::new(0.0, 600.0, cmt, 100.0, true, 12.0);
+            assert_eq!(
+                ss_residual_infusion_end(&d, 8.0, 1.0),
+                Some(2.0),
+                "fixture: the residual window must be [0, 2] for CMT {cmt}"
+            );
+            active_infusions(
+                &ir,
+                &[d],
+                0.5,
+                1.5,
+                &[8.0],
+                &[1.0],
+                f64::NEG_INFINITY,
+                n_states,
+            )
+        };
+        // The control straddles the gate: the same dose into a plain in-range compartment
+        // is admitted, by this branch alone.
+        assert_eq!(
+            residual(1),
+            vec![(0, 100.0)],
+            "CMT 1: residual window delivers"
+        );
+        assert!(
+            residual(0).is_empty(),
+            "CMT 0 must not deliver through the residual window"
+        );
+        assert!(
+            residual(7).is_empty(),
+            "cmt > n_states must not deliver either"
+        );
+        assert!(
+            residual(3).is_empty(),
+            "a forcing-fed compartment receives its mass via R_in"
+        );
+    }
+
     // ── #1189 item 1: a non-finite lag must not panic, and must not be silent ────
 
     /// A `NaN` compartment lag (`ALAG`) or route lag used to **panic** — the objective
