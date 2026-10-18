@@ -474,8 +474,9 @@ across the window, once as the window ran and once with the clock anchored, and
 refuses only if some derivative differs. Nothing is re-solved. Which states it reads,
 and which anchor it uses, depend on how the window ended:
 
-- **The state went non-finite.** The window is judged at once, so the refusal names
-  the clock rather than the diverged state the next decision would see. The check
+- **The state went non-finite.** The window is judged at once, so when the clock's
+  missing value is what made the state diverge, the refusal names the clock rather
+  than the diverged state the next decision would see. The check
   reads the state the window started from and the one it ended at (each only when
   every compartment in it is finite) at every sample time, and anchors the clock at
   the window's end. That is the earliest anchor a schedule can give.
@@ -524,9 +525,17 @@ Not being refused by this check is not the same as being accepted. A model whose
 
 It samples, so a dependence confined between two of its 17 points can slip through.
 A comparison whose threshold lies within the solver's tolerance of the interpolated
-state can come out either way. A window whose state went non-finite is still judged
-on its start and end states at every sample time, so it can in principle be blamed
-on a pairing of state and time the run never reached. No known model shows this.
+state can come out either way.
+
+A window whose state went non-finite is still judged with the clock anchored at the
+window's end. If the state would have stayed finite only under a later anchor, the
+check does not see it: `if (TAD < -20 || TIME > 12)` guarding an otherwise divergent
+compartment, with the first dose at 36, diverges under the window-end anchor too.
+The run is then refused at the next decision for its diverged state, and the clock
+is not named, although `predict()` on the realized schedule stays finite. No number
+is returned either way. Such a window is also judged on its start and end states at
+every sample time, so it can in principle be blamed on a pairing of state and time
+the run never reached. No known model shows that.
 
 Two consequences of judging a finite window at the dose that came:
 

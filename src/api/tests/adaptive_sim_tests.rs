@@ -6548,46 +6548,57 @@ fn adaptive_finite_pre_dose_window_is_judged_at_the_first_realized_dose() {
     // `[50, 27.44, 6.77, 67.95]` against `predict()`'s `[50, 8.26, 0.276, 67.07]`, 23.5× off.
     // The 12 and 36 legs therefore straddle the new gate, and neither was refused under the old.
     //
+    // The table holds for `TAFD` too, which a first dose anchors at the same time, and the
+    // `TAFD` spelling is the only phase-B leg reading that clock (#2119 review, row 2): every
+    // other `TAFD` driver fixture reads it in arithmetic, and so goes to phase A.
+    //
     // Mutations that redden it: judge phase B at the window's end (the 24 and 36 legs run); turn
     // phase B off (likewise); anchor every reachable decision, the issue's proposal (the 12 leg
-    // is refused although it equals predict()).
-    let src = ode_tad_below_minus_20();
+    // is refused although it equals predict()); drop the `TAFD` candidate from the held window
+    // (`tafd: false` — the `TAFD` legs run).
+    let tad_src = ode_tad_below_minus_20();
+    let tafd_src = tad_src.replacen("if (TAD < -20.0)", "if (TAFD < -20.0)", 1);
+    assert_ne!(tafd_src, tad_src, "the `TAFD` twin swaps the clock alone");
     let decisions = [12.0, 24.0, 36.0];
     let obs = [0.0, 6.0, 20.0, 40.0];
 
-    // Measured worst rel 1.6e-15 (dose at 12) and 1.8e-15 (no dose).
-    for (leg, dose_idx) in [("dose at 12", vec![0]), ("no dose", vec![])] {
-        let (adaptive, static_pred) = tad_oracle_cell(&src, &decisions, dose_idx, &obs, vec![]);
-        let vs_static = worst_rel(&adaptive, &static_pred, leg);
-        assert!(
-            vs_static <= 1e-12,
-            "{leg}: `TAD < -20` takes the unanchored (else) arm on the clock predict() gives the \
-             window, so the run must equal predict(): worst rel {vs_static:e} \
-             (adaptive={adaptive:?}, static={static_pred:?})"
-        );
-    }
+    for (clock, src) in [("TAD", &tad_src), ("TAFD", &tafd_src)] {
+        // Measured worst rel 1.6e-15 (dose at 12) and 1.8e-15 (no dose), for either clock.
+        for (leg, dose_idx) in [("dose at 12", vec![0]), ("no dose", vec![])] {
+            let (adaptive, static_pred) = tad_oracle_cell(src, &decisions, dose_idx, &obs, vec![]);
+            let vs_static = worst_rel(&adaptive, &static_pred, leg);
+            assert!(
+                vs_static <= 1e-12,
+                "{clock}, {leg}: `{clock} < -20` takes the unanchored (else) arm on the clock \
+                 predict() gives the window, so the run must equal predict(): worst rel \
+                 {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+            );
+        }
 
-    for (leg, idx, dose_time) in [("dose at 24", 1, "t=24"), ("dose at 36", 2, "t=36")] {
-        let err = tad_refusal(&src, &decisions, vec![idx], &obs, vec![])
-            .unwrap_or_else(|| panic!("{leg}: the window's clock is below -20 — refuse"));
-        assert!(
-            err.contains("`TAD`") && err.contains("(0, 12]"),
-            "{leg}: must name the slot and the first window: {err}"
-        );
-        assert!(
-            err.contains(&format!(
-                "anchored at the first dose this run gave, at {dose_time}"
-            )),
-            "{leg}: must name the dose that anchors it: {err}"
-        );
-        assert!(
-            !err.contains("no dose has been given in this run"),
-            "{leg}: the run did give one: {err}"
-        );
+        for (leg, idx, dose_time) in [("dose at 24", 1, "t=24"), ("dose at 36", 2, "t=36")] {
+            let err = tad_refusal(src, &decisions, vec![idx], &obs, vec![]).unwrap_or_else(|| {
+                panic!("{clock}, {leg}: the window's clock is below -20 — refuse")
+            });
+            assert!(
+                err.contains(&format!("reads `{clock}`, which")) && err.contains("(0, 12]"),
+                "{clock}, {leg}: must name the slot and the first window: {err}"
+            );
+            assert!(
+                err.contains(&format!(
+                    "anchored at the first dose this run gave, at {dose_time}"
+                )),
+                "{clock}, {leg}: must name the dose that anchors it: {err}"
+            );
+            assert!(
+                !err.contains("no dose has been given in this run"),
+                "{clock}, {leg}: the run did give one: {err}"
+            );
+        }
     }
 
     // The default verifier setting gives the same refusal: the driver refuses before the replay.
-    let model = parse_model_string(&src).expect("parse F1");
+    let src = &tad_src;
+    let model = parse_model_string(src).expect("parse F1");
     let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
     let opts = AdaptiveSimulateOptions {
         seed: Some(1),
@@ -6806,6 +6817,66 @@ fn adaptive_diverged_clock_window_is_judged_at_once() {
     assert!(
         !err.contains("the ODE state is non-finite"),
         "refused at the window, not by the state guard at the next decision: {err}"
+    );
+}
+
+#[test]
+fn adaptive_diverged_window_that_only_a_later_anchor_saves_is_named_as_a_divergence() {
+    // #2119 review, row 1: the documented limit of phase A's window-end anchor, pinned so the
+    // docs sentence describing it is a checked claim. `Y' = Y·Y` from `Y(0) = 1` has a pole at
+    // t = 1 unless `TAD < -20 || TIME > 12` holds. With the first dose at 36, `predict()` gives
+    // `(0, 12]` the clock `[-36, -24]`, so `Y` never moves and the run is finite. The reactive
+    // driver integrates `(0, 12]` under the unanchored clock (the else arm, the pole), and the
+    // phase-A probe anchors at 12, where `TAD ∈ [-12, 0]` takes the else arm too: no
+    // dependence. The decision at 12 is then refused for its diverged state, and the clock is
+    // not named. No number is returned.
+    //
+    // The control is the same model under `predict()` on the realized schedule (finite), so the
+    // refusal is the limit, not a model that diverges for every schedule.
+    //
+    // A change that judges a diverged window at the realized dose would redden this test — and
+    // should then rewrite the docs' "What the check cannot see" paragraph with it.
+    let src = ODE_INIT50_AUTONOMOUS
+        .replacen(
+            "ode(states=[central])",
+            "ode(obs_cmt=central, states=[central, Y])",
+            1,
+        )
+        .replacen(
+            "  init(central) = 50.0\n",
+            "  init(central) = 50.0\n  init(Y) = 1.0\n  if (TAD < -20.0 || TIME > 12.0) { d/dt(Y) \
+             = 0.0 } else { d/dt(Y) = Y * Y }\n",
+            1,
+        )
+        .replacen("[scaling]\n  y = central\n", "", 1);
+    assert!(
+        src.contains("d/dt(Y) = Y * Y") && !src.contains("[scaling]"),
+        "the fixture adds the gated pole: {src}"
+    );
+    let model = parse_model_string(&src).expect("parse gated-pole model");
+    let obs = vec![0.0, 6.0, 20.0, 40.0];
+
+    let static_pop = population(vec![subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(36.0, 100.0, 1, 0.0, false, 0.0)],
+    )]);
+    let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite()),
+        "predict() on the realized schedule is finite: {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+
+    let err = tad_refusal(&src, &[12.0, 24.0, 36.0], vec![2], &obs, vec![])
+        .expect("the reactive run diverges on (0, 12] and is refused");
+    assert!(
+        err.contains("decision 0 at t=12: the ODE state is non-finite (central, Y)"),
+        "refused by the state guard, naming the state: {err}"
+    );
+    assert!(
+        !err.contains("no referent"),
+        "the window-end anchor diverges too, so the clock is not named: {err}"
     );
 }
 
