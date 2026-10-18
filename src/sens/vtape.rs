@@ -272,6 +272,8 @@ pub struct DualV<const N: usize, const M: usize, const TH: bool = false> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
+    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualV {
@@ -329,6 +331,21 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     /// taped-Hessian recording stores (its sweep differentiates the taped `h`).
     #[inline(always)]
     fn unary(self, hv: f64, h1: f64, h2: f64, h3: impl FnOnce() -> f64) -> Self {
+        if Self::WIDE {
+            // `φ‴` only matters to a taped-Hessian recording; evaluated eagerly here so
+            // the out-of-line copy is one function, not one per closure type.
+            self.unary_wide(hv, h1, h2, if TH { h3() } else { 0.0 })
+        } else {
+            self.unary_body(hv, h1, h2, h3)
+        }
+    }
+    /// [`Self::unary`]'s body out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn unary_wide(self, hv: f64, h1: f64, h2: f64, h3: f64) -> Self {
+        self.unary_body(hv, h1, h2, || h3)
+    }
+    #[inline(always)]
+    fn unary_body(self, hv: f64, h1: f64, h2: f64, h3: impl FnOnce() -> f64) -> Self {
         let mut g = [0.0; N];
         let mut h = [0.0; M];
         for k in 0..N {
@@ -360,6 +377,19 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     }
     #[inline(always)]
     fn scaled(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
+        if Self::WIDE {
+            self.scaled_wide(c, v, g, h)
+        } else {
+            self.scaled_body(c, v, g, h)
+        }
+    }
+    /// [`Self::scaled`]'s body out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn scaled_wide(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
+        self.scaled_body(c, v, g, h)
+    }
+    #[inline(always)]
+    fn scaled_body(self, c: f64, v: f64, g: [f64; N], h: [f64; M]) -> Self {
         let x = vt().auxf.len() as u32;
         let i = push_cse::<N>(Op::Scale, self.i, NONE, x, v, c, &g, &h);
         if i as usize == vt().nodes.len() - 1 && vt().nodes[i as usize].x == x {
@@ -373,6 +403,17 @@ impl<const N: usize, const M: usize, const TH: bool> Add for DualV<N, M, TH> {
     type Output = Self;
     #[inline(always)]
     fn add(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.add_wide(o)
+        } else {
+            self.add_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    fn add_body(self, o: Self) -> Self {
         let v = self.v + o.v;
         let mut g = [0.0; N];
         let mut h = [0.0; M];
@@ -390,12 +431,28 @@ impl<const N: usize, const M: usize, const TH: bool> Add for DualV<N, M, TH> {
         };
         DualV { v, g, h, i }
     }
+    /// [`Self::add_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn add_wide(self, o: Self) -> Self {
+        self.add_body(o)
+    }
 }
 
 impl<const N: usize, const M: usize, const TH: bool> Sub for DualV<N, M, TH> {
     type Output = Self;
     #[inline(always)]
     fn sub(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.sub_wide(o)
+        } else {
+            self.sub_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    fn sub_body(self, o: Self) -> Self {
         let v = self.v - o.v;
         let mut g = [0.0; N];
         let mut h = [0.0; M];
@@ -413,12 +470,28 @@ impl<const N: usize, const M: usize, const TH: bool> Sub for DualV<N, M, TH> {
         };
         DualV { v, g, h, i }
     }
+    /// [`Self::sub_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn sub_wide(self, o: Self) -> Self {
+        self.sub_body(o)
+    }
 }
 
 impl<const N: usize, const M: usize, const TH: bool> Mul for DualV<N, M, TH> {
     type Output = Self;
     #[inline(always)]
     fn mul(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.mul_wide(o)
+        } else {
+            self.mul_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    fn mul_body(self, o: Self) -> Self {
         let v = self.v * o.v;
         let mut g = [0.0; N];
         let mut h = [0.0; M];
@@ -450,12 +523,28 @@ impl<const N: usize, const M: usize, const TH: bool> Mul for DualV<N, M, TH> {
             }
         }
     }
+    /// [`Self::mul_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn mul_wide(self, o: Self) -> Self {
+        self.mul_body(o)
+    }
 }
 
 impl<const N: usize, const M: usize, const TH: bool> Div for DualV<N, M, TH> {
     type Output = Self;
     #[inline(always)]
     fn div(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.div_wide(o)
+        } else {
+            self.div_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    fn div_body(self, o: Self) -> Self {
         let q = self.v / o.v;
         let ib = 1.0 / o.v;
         let mut g = [0.0; N];
@@ -485,12 +574,28 @@ impl<const N: usize, const M: usize, const TH: bool> Div for DualV<N, M, TH> {
             }
         }
     }
+    /// [`Self::div_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn div_wide(self, o: Self) -> Self {
+        self.div_body(o)
+    }
 }
 
 impl<const N: usize, const M: usize, const TH: bool> Neg for DualV<N, M, TH> {
     type Output = Self;
     #[inline(always)]
     fn neg(self) -> Self {
+        if Self::WIDE {
+            self.neg_wide()
+        } else {
+            self.neg_body()
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    #[inline(always)]
+    fn neg_body(self) -> Self {
         let mut g = [0.0; N];
         let mut h = [0.0; M];
         for k in 0..N {
@@ -510,6 +615,11 @@ impl<const N: usize, const M: usize, const TH: bool> Neg for DualV<N, M, TH> {
             h,
             i,
         }
+    }
+    /// [`Self::neg_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn neg_wide(self) -> Self {
+        self.neg_body()
     }
 }
 

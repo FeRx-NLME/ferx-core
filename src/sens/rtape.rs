@@ -303,6 +303,8 @@ pub struct DualT<const N: usize, B: Copy> {
 }
 
 impl<const N: usize, B: PkNum> DualT<N, B> {
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
+    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualT {
@@ -312,6 +314,19 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     }
     #[inline(always)]
     fn chain(self, hv: B, d: B) -> Self {
+        if Self::WIDE {
+            self.chain_wide(hv, d)
+        } else {
+            self.chain_body(hv, d)
+        }
+    }
+    /// [`Self::chain`]'s body out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn chain_wide(self, hv: B, d: B) -> Self {
+        self.chain_body(hv, d)
+    }
+    #[inline(always)]
+    fn chain_body(self, hv: B, d: B) -> Self {
         let mut g = self.g;
         for k in 0..N {
             g[k] = d * self.g[k];
@@ -324,39 +339,98 @@ impl<const N: usize, B: PkNum> Add for DualT<N, B> {
     type Output = Self;
     #[inline(always)]
     fn add(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.add_wide(o)
+        } else {
+            self.add_body(o)
+        }
+    }
+}
+
+impl<const N: usize, B: PkNum> DualT<N, B> {
+    #[inline(always)]
+    fn add_body(self, o: Self) -> Self {
         let mut g = self.g;
         for k in 0..N {
             g[k] = self.g[k] + o.g[k];
         }
         DualT { v: self.v + o.v, g }
     }
+    /// [`Self::add_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn add_wide(self, o: Self) -> Self {
+        self.add_body(o)
+    }
 }
 impl<const N: usize, B: PkNum> Sub for DualT<N, B> {
     type Output = Self;
     #[inline(always)]
     fn sub(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.sub_wide(o)
+        } else {
+            self.sub_body(o)
+        }
+    }
+}
+
+impl<const N: usize, B: PkNum> DualT<N, B> {
+    #[inline(always)]
+    fn sub_body(self, o: Self) -> Self {
         let mut g = self.g;
         for k in 0..N {
             g[k] = self.g[k] - o.g[k];
         }
         DualT { v: self.v - o.v, g }
     }
+    /// [`Self::sub_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn sub_wide(self, o: Self) -> Self {
+        self.sub_body(o)
+    }
 }
 impl<const N: usize, B: PkNum> Mul for DualT<N, B> {
     type Output = Self;
     #[inline(always)]
     fn mul(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.mul_wide(o)
+        } else {
+            self.mul_body(o)
+        }
+    }
+}
+
+impl<const N: usize, B: PkNum> DualT<N, B> {
+    #[inline(always)]
+    fn mul_body(self, o: Self) -> Self {
         let mut g = self.g;
         for k in 0..N {
             g[k] = self.g[k] * o.v + self.v * o.g[k];
         }
         DualT { v: self.v * o.v, g }
     }
+    /// [`Self::mul_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn mul_wide(self, o: Self) -> Self {
+        self.mul_body(o)
+    }
 }
 impl<const N: usize, B: PkNum> Div for DualT<N, B> {
     type Output = Self;
     #[inline(always)]
     fn div(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.div_wide(o)
+        } else {
+            self.div_body(o)
+        }
+    }
+}
+
+impl<const N: usize, B: PkNum> DualT<N, B> {
+    #[inline(always)]
+    fn div_body(self, o: Self) -> Self {
         let inv = B::from_f64(1.0) / o.v;
         let q = self.v * inv;
         let mut g = self.g;
@@ -365,16 +439,37 @@ impl<const N: usize, B: PkNum> Div for DualT<N, B> {
         }
         DualT { v: q, g }
     }
+    /// [`Self::div_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn div_wide(self, o: Self) -> Self {
+        self.div_body(o)
+    }
 }
 impl<const N: usize, B: PkNum> Neg for DualT<N, B> {
     type Output = Self;
     #[inline(always)]
     fn neg(self) -> Self {
+        if Self::WIDE {
+            self.neg_wide()
+        } else {
+            self.neg_body()
+        }
+    }
+}
+
+impl<const N: usize, B: PkNum> DualT<N, B> {
+    #[inline(always)]
+    fn neg_body(self) -> Self {
         let mut g = self.g;
         for k in 0..N {
             g[k] = -self.g[k];
         }
         DualT { v: -self.v, g }
+    }
+    /// [`Self::neg_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn neg_wide(self) -> Self {
+        self.neg_body()
     }
 }
 
@@ -478,6 +573,8 @@ pub struct DualH<const N: usize, const M: usize, B: Copy, const D: bool = false>
 }
 
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
+    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualH {
@@ -490,6 +587,19 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
     /// `g_k = φ′g_k`, `h_kl = φ′h_kl + φ″g_k g_l`.
     #[inline(always)]
     fn chain2(self, p0: B, p1: B, p2: B) -> Self {
+        if Self::WIDE {
+            self.chain2_wide(p0, p1, p2)
+        } else {
+            self.chain2_body(p0, p1, p2)
+        }
+    }
+    /// [`Self::chain2`]'s body out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn chain2_wide(self, p0: B, p1: B, p2: B) -> Self {
+        self.chain2_body(p0, p1, p2)
+    }
+    #[inline(always)]
+    fn chain2_body(self, p0: B, p1: B, p2: B) -> Self {
         let g = std::array::from_fn(|k| p1 * self.g[k]);
         let mut h = self.h;
         for k in 0..N {
@@ -511,28 +621,71 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> Add for DualH<N, M
     type Output = Self;
     #[inline(always)]
     fn add(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.add_wide(o)
+        } else {
+            self.add_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    #[inline(always)]
+    fn add_body(self, o: Self) -> Self {
         DualH {
             v: self.v + o.v,
             g: std::array::from_fn(|k| self.g[k] + o.g[k]),
             h: std::array::from_fn(|t| self.h[t] + o.h[t]),
         }
     }
+    /// [`Self::add_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn add_wide(self, o: Self) -> Self {
+        self.add_body(o)
+    }
 }
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> Sub for DualH<N, M, B, D> {
     type Output = Self;
     #[inline(always)]
     fn sub(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.sub_wide(o)
+        } else {
+            self.sub_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    #[inline(always)]
+    fn sub_body(self, o: Self) -> Self {
         DualH {
             v: self.v - o.v,
             g: std::array::from_fn(|k| self.g[k] - o.g[k]),
             h: std::array::from_fn(|t| self.h[t] - o.h[t]),
         }
     }
+    /// [`Self::sub_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn sub_wide(self, o: Self) -> Self {
+        self.sub_body(o)
+    }
 }
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> Mul for DualH<N, M, B, D> {
     type Output = Self;
     #[inline(always)]
     fn mul(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.mul_wide(o)
+        } else {
+            self.mul_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    #[inline(always)]
+    fn mul_body(self, o: Self) -> Self {
         let g = std::array::from_fn(|k| self.g[k] * o.v + self.v * o.g[k]);
         let mut h = self.h;
         for k in 0..N {
@@ -547,26 +700,63 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> Mul for DualH<N, M
             h,
         }
     }
+    /// [`Self::mul_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn mul_wide(self, o: Self) -> Self {
+        self.mul_body(o)
+    }
 }
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> Div for DualH<N, M, B, D> {
     type Output = Self;
     #[inline(always)]
     fn div(self, o: Self) -> Self {
+        if Self::WIDE {
+            self.div_wide(o)
+        } else {
+            self.div_body(o)
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    #[inline(always)]
+    fn div_body(self, o: Self) -> Self {
         // a/b = a · (1/b), with 1/x′ = −1/x², 1/x″ = 2/x³.
         let ib = B::from_f64(1.0) / o.v;
         let d1 = -(ib * ib);
         self * o.chain2(ib, d1, B::from_f64(-2.0) * d1 * ib)
+    }
+    /// [`Self::div_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn div_wide(self, o: Self) -> Self {
+        self.div_body(o)
     }
 }
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> Neg for DualH<N, M, B, D> {
     type Output = Self;
     #[inline(always)]
     fn neg(self) -> Self {
+        if Self::WIDE {
+            self.neg_wide()
+        } else {
+            self.neg_body()
+        }
+    }
+}
+
+impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
+    #[inline(always)]
+    fn neg_body(self) -> Self {
         DualH {
             v: -self.v,
             g: std::array::from_fn(|k| -self.g[k]),
             h: std::array::from_fn(|t| -self.h[t]),
         }
+    }
+    /// [`Self::neg_body`] out of line ([`Self::WIDE`]).
+    #[inline(never)]
+    fn neg_wide(self) -> Self {
+        self.neg_body()
     }
 }
 

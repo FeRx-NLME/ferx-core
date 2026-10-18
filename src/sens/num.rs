@@ -7,6 +7,13 @@ use super::dual1::Dual1;
 use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
+/// Size above which a dual's arithmetic is called out of line rather than inlined at every
+/// use. A wide dual's operation is a loop over tens to hundreds of lanes, far more work
+/// than a call, while inlining it into every closed form, event walk and ODE step was most
+/// of the binary (#486); narrow duals — small models' hot path — stay inlined. Decided
+/// per type at compile time from `size_of::<Self>()`, so nested duals are covered too.
+pub(crate) const OUTLINE_BYTES: usize = 256;
+
 pub trait PkNum:
     Copy
     // Every implementor is a plain numeric value type (`f64`, `Dual1`, `Dual2`, `DualMixed`)
