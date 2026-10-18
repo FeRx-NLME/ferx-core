@@ -1,16 +1,19 @@
-# covmuref_power with the weight covariate routed through a conditionally
-# assigned local — the #1415 regression fixture.
+# covmuref_power with the weight covariate routed through a local the
+# covariate mu-reference scan cannot resolve — the #1415 regression fixture.
 #
 # `classify_covariate_mu_ref` rejects a typical value that reads a local the
-# inliner cannot resolve (assigned conditionally or later), so unlike
-# `covmuref_power_saem_fit.ferx` this model has *no* covariate mu-reference
-# group: TVCL keeps its single-anchor mu-reference and TH_WT carries no ETA and
-# rides the eta-frozen numerical M-step. (#1422 tracks inlining an if/else-
-# assigned local; when that lands, this fixture needs a shape that still
-# defeats detection — the test asserts `covariate_mu_refs.is_empty()`.) That is the shape #1415 reports on
-# real models (a CrCL exponent written through an `if`/`else` CRCL, an
-# allometric or maturation exponent, an inter-compartmental clearance) — and
-# the NONMEM SAEM anchor is the same MLE as the grouped model's:
+# inliner cannot resolve, so unlike `covmuref_power_saem_fit.ferx` this model
+# has *no* covariate mu-reference group: TVCL keeps its single-anchor
+# mu-reference and TH_WT carries no ETA and rides the eta-frozen numerical
+# M-step. `WTN` is assigned before an `if` with no `else` and again in its one
+# arm. Until #1422 this fixture wrote the `if`/`else` form, which is now folded
+# into a conditional and detected (that model is
+# `covmuref_power_ifelse_saem_fit.ferx`); this form evaluates to the same values
+# on every row but is still unresolved, and the test asserts
+# `covariate_mu_refs.is_empty()`. That is the shape #1415 reports on real models
+# (a CrCL exponent written through a conditionally assigned CRCL, an allometric
+# or maturation exponent, an inter-compartmental clearance) — and the NONMEM
+# SAEM anchor is the same MLE as the grouped model's:
 # `nonmem_anchor/results/covmuref_power_saem.ext`, TH_WT = 0.921.
 #
 # Data: data/covmuref_power.csv (nonmem_anchor/simulate_covmuref_data.py).
@@ -28,10 +31,9 @@
   sigma PROP_ERR ~ 0.02
 
 [individual_parameters]
+  WTN = 1.0
   if (WT > 0) {
     WTN = WT / 70.0
-  } else {
-    WTN = 1.0
   }
   CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)
   V  = TVV * exp(ETA_V)
