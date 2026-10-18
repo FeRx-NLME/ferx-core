@@ -10536,6 +10536,17 @@ fn test_apply_fit_option_inner_maxiter_and_tol() {
 
     assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
     assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    assert_eq!(
+        apply_fit_option(&mut opts, "inner_newton_polish", "true"),
+        Ok(true)
+    );
+    assert!(opts.inner_newton_polish);
+    assert_eq!(
+        apply_fit_option(&mut opts, "inner_newton_polish", "false"),
+        Ok(true)
+    );
+    assert!(!opts.inner_newton_polish);
+    assert!(apply_fit_option(&mut opts, "inner_newton_polish", "maybe").is_err());
 }
 
 #[test]

@@ -835,6 +835,8 @@ pub(crate) struct InnerSolvePolicy {
     /// outer evaluation seeded from the flat-theta pre-flight's EBEs (#2076); `false`, the
     /// `Default`, otherwise.
     pub(crate) init_is_mode: bool,
+    /// Finish the solve with one exact-Hessian Newton step (`FitOptions::inner_newton_polish`).
+    pub(crate) newton_polish: bool,
 }
 
 impl InnerSolvePolicy {
@@ -851,6 +853,7 @@ impl InnerSolvePolicy {
             accelerate_exact_outer: false,
             screen: options.inner_screen,
             init_is_mode: false,
+            newton_polish: options.inner_newton_polish,
         }
     }
 }
@@ -1717,7 +1720,81 @@ pub(crate) fn build_schedule_cache(
 /// per subject. Only the objective-only Laplace/AGQ evaluation under the exact anchor reads it
 /// (see `outer_optimizer::run_inner_loop_and_nll_prepared`); every other caller leaves it off.
 #[allow(clippy::too_many_arguments)]
+/// [`find_ebe_impl_raw`], finished with one exact-Hessian Newton step when the policy asks
+/// (`FitOptions::inner_newton_polish`). The returned mode `η` misses the true one by roughly
+/// the residual `g = ∇_η l` over the curvature; the step `η − H⁻¹g` with the exact inner
+/// Hessian squares that miss, so the EBE-dependent quantities downstream — the objective,
+/// and the adjoint gradient that assumes `g = 0` — inherit `O(‖g‖²)` errors instead of
+/// `O(‖g‖)`. Applied to conditional-variance, non-IOV solves the recorders serve; accepted
+/// only if it lowers the inner objective, so it can never move the solve uphill.
+#[allow(clippy::too_many_arguments)]
 fn find_ebe_impl(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
+) -> EbeResult {
+    let mut r = find_ebe_impl_raw(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
+    );
+    if !policy.newton_polish
+        || r.hard_reject
+        || model.n_kappa > 0
+        || !matches!(policy.ebe_variance, EbeVariance::Conditional)
+    {
+        return r;
+    }
+    let e = r.eta.as_slice().to_vec();
+    let polished = (|| {
+        use crate::sens::ode_provider::adjoint::{
+            exact_eta_jacobian, exact_inner_gradient, exact_inner_hessian,
+        };
+        let g = exact_inner_gradient(model, subject, params, &e, None)?;
+        let h = exact_inner_hessian(model, subject, params, &e)?;
+        let step = h.cholesky()?.solve(&DVector::from_column_slice(&g));
+        let e_new: Vec<f64> = e.iter().zip(step.iter()).map(|(a, d)| a - d).collect();
+        let nll = |x: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                model,
+                subject,
+                &params.theta,
+                x,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        let (f0, f1) = (nll(&e), nll(&e_new));
+        if !(f1.is_finite() && f1 <= f0) {
+            return None;
+        }
+        let jac = exact_eta_jacobian(model, subject, &params.theta, &e_new)?;
+        let g1 = exact_inner_gradient(model, subject, params, &e_new, None)?;
+        Some((
+            e_new,
+            jac,
+            f1 - f0,
+            g1.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        ))
+    })();
+    if let Some((e_new, jac, decrease, gn)) = polished {
+        r.eta = DVector::from_column_slice(&e_new);
+        r.h_matrix = jac;
+        // Shifted by the measured change, whatever convention the solver's `nll` uses.
+        r.nll += decrease;
+        r.grad_norm = gn;
+        r.terminal_hessian = None;
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_impl_raw(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
