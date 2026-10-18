@@ -4792,14 +4792,6 @@ pub(crate) fn check_ode_method_linear(
         .collect()
 }
 
-/// Model + estimation-option *compatibility* checks that don't depend on data:
-/// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
-/// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
-/// clean `ferx check` and a `fit()` agree on which method/model combinations are
-/// rejected (rather than reporting `valid: true` and then failing at fit time).
-/// `fit_inner` consumes these via [`first_error`](crate::diagnostics::first_error); message text is identical to
-/// the historical inline guards. Check order matches `fit_inner` so the first
-/// error is unchanged.
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
 /// can be fitted with. The profile solve is a least-squares step on the FOCE/FOCEI
 /// objective, so it needs that objective, Gaussian rows, and a residual variance that
@@ -4866,15 +4858,14 @@ pub(crate) fn check_profiled_levels(
     } else if model.has_binary() {
         Some("binary")
     } else if model.has_non_gaussian() {
-        Some("categorical, count or Markov")
+        Some("Markov (CTMM)")
     } else {
         None
     };
     if let Some(kind) = endpoint {
         out.push(refuse(
             format!(
-                "which needs a Gaussian likelihood on every row; this model also has a {kind} \
-                 endpoint."
+                "which needs a Gaussian likelihood on every row; this model has a {kind} endpoint."
             ),
             REMOVE,
         ));
@@ -4956,6 +4947,14 @@ pub(crate) fn check_profiled_levels(
     out
 }
 
+/// Model + estimation-option *compatibility* checks that don't depend on data:
+/// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
+/// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
+/// clean `ferx check` and a `fit()` agree on which method/model combinations are
+/// rejected (rather than reporting `valid: true` and then failing at fit time).
+/// `fit_inner` consumes these via [`first_error`](crate::diagnostics::first_error); message text is identical to
+/// the historical inline guards. Check order matches `fit_inner` so the first
+/// error is unchanged.
 pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
     // #1824: the M3 gates below ask `bloq_in_force`, which `fit()` arms for its own call. A
     // standalone caller of this `pub fn` arms nothing, so arm `options.bloq_method` here —

@@ -33675,7 +33675,7 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
         (
             "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
             "BASE",
-            "an inline `if`",
+            "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)",
             "in `BASE` in [individual_parameters]",
         ),
     ] {
@@ -33727,14 +33727,14 @@ fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
         (
             "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
             "BASE",
-            "Here `PLACEBO` is scaled by a term that reads a parameter or a random effect, not \
-             only data, in `BASE` in [individual_parameters].",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in `BASE` in [individual_parameters].",
         ),
         (
             "  BASE = TVE0 + ETA_E0 + ETA_EM",
             "BASE + PLACEBO[STUDY] / exp(ETA_EM)",
-            "Here `PLACEBO` is scaled by a term that reads a parameter or a random effect, not \
-             only data, in the `y` readout.",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in the `y` readout.",
         ),
         (
             "  BASE = TVE0 + ETA_E0 + ETA_EM",
@@ -33827,4 +33827,126 @@ fn profile_refuses_a_route_through_the_states() {
         ),
         "{msg}"
     );
+}
+
+// ── #2103 review round 1 ────────────────────────────────────────────────────
+
+/// A one-compartment model whose prediction is scaled by `[scaling] <scaling>`;
+/// `SC` is an individual parameter no PK slot reads, so a block in it reaches no
+/// state.
+fn obs_scale_model(sc: &str, scaling: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta PLACEBO[3](0.0) profile
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  SC = {sc}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  {scaling}
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+/// Review #1: a block in an `obs_scale` divisor, directly or through a parameter,
+/// uniform or per-CMT, is a divisor of the prediction and is refused, naming the
+/// key. The control on the same model, `SC = V`, parses: the pair straddles the gate.
+#[test]
+fn profile_refuses_a_block_in_an_obs_scale_divisor() {
+    parse_full_model(&obs_scale_model("V", "obs_scale = SC"))
+        .unwrap_or_else(|e| panic!("control: {e}"));
+    for (sc, scaling, label) in [
+        (
+            "V + PLACEBO[STUDY]",
+            "obs_scale = SC",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale = SC + PLACEBO[STUDY]",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale[CMT=1] = V + PLACEBO[STUDY]",
+            "`[scaling] obs_scale[CMT=1]`",
+        ),
+    ] {
+        let msg = parse_full_model(&obs_scale_model(sc, scaling))
+            .err()
+            .unwrap_or_else(|| panic!("{scaling} with SC = {sc} must be refused"));
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` is a divisor in {label}.");
+        assert!(msg.contains(&here), "{scaling}: missing {here:?} in {msg}");
+    }
+}
+
+/// Review #4: a coefficient chosen by an `if` on data, from literals, is data-only
+/// and accepted; the same shape choosing a θ is refused as a parameter coefficient.
+#[test]
+fn a_coefficient_chosen_by_a_data_condition_is_data_only() {
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data-conditioned literal: {e}"));
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * (if (WPSE > 1) C else 0.5) + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data inline if: {e}"));
+    let msg = route_err(
+        "  C = 1\n  if (DOSE > 70) {\n    C = EMAX\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "{msg}"
+    );
+    let msg = route_err(
+        "  C = 1\n  if (TVE0 > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "a θ in the condition: {msg}"
+    );
+}
+
+/// Review #5: `max` / `min` / `clamp` are named in the construct sentence, since
+/// the parser writes them as an inline `if`.
+#[test]
+fn a_max_on_the_route_is_named_as_such() {
+    for f in ["max(PLACEBO[STUDY], 0)", "min(PLACEBO[STUDY], 0)"] {
+        let msg = route_err(&format!("  BASE = TVE0 + {f} + ETA_E0"), "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` reaches `y` through an inline `if` (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
+            ),
+            "{f}: {msg}"
+        );
+    }
 }

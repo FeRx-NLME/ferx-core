@@ -3959,9 +3959,12 @@ pub(crate) struct ActiveLevels {
 }
 
 /// [`ActiveLevels`] for every profiled block of `model`, in declaration order, on a
-/// population whose level columns are written. A block whose index is not a plain
-/// column (`PLACEBO[K + 1]`) cannot be read off the data, so every subject is given
-/// every level: a superset is safe, it only costs the solve some work.
+/// population whose level columns are written. A block some read of which is not
+/// indexed by the one plain column (`PLACEBO[4 - STUDY]` beside `PLACEBO[STUDY]`,
+/// `PLACEBO[K + 1]`) cannot be read off the data, so every subject is given every
+/// level: a superset is safe, it only costs the solve some work. The parser decides
+/// that over every read (`ThetaBlocks::profiled_index`), not over the plain-column
+/// reads alone, which would name the wrong levels (#2103 review #2).
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "read by the profile solve, #1065 PR2")
@@ -3974,16 +3977,11 @@ pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> V
         .filter(|d| d.profiled)
         .map(|d| {
             let n_levels = d.spec.levels.len();
-            let column = d.index_covariate.clone().or_else(|| {
-                let mut cols = blocks
-                    .index_columns()
-                    .filter(|(b, _, _)| *b == d.name)
-                    .map(|(_, c, _)| c);
-                match (cols.next(), cols.next()) {
-                    (Some(c), None) => Some(c.to_string()),
-                    _ => None,
-                }
-            });
+            let column = blocks
+                .profiled_index
+                .iter()
+                .find(|(b, _)| *b == d.name)
+                .and_then(|(_, c)| c.clone());
             let per_subject = population
                 .subjects
                 .iter()

@@ -426,8 +426,7 @@ fn profile_refuses_a_model_with_a_non_gaussian_endpoint() {
         );
     one_refusal(
         &scope(&model_of(&text), &FitOptions::default()),
-        "which needs a Gaussian likelihood on every row; this model also has a binary \
-         endpoint.",
+        "which needs a Gaussian likelihood on every row; this model has a binary endpoint.",
         REMOVE,
     );
 }
@@ -527,4 +526,84 @@ fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
             "{p_decl}: frozen"
         );
     }
+}
+
+// ── #2103 review round 1 ────────────────────────────────────────────────────
+
+/// Review #2: one read through a computed index (`PLACEBO[4 - STUDY]`) beside a
+/// plain one gives every subject every level — the rows read the reversed level,
+/// so the plain column alone would name the wrong one. The control, both reads
+/// plain, keeps the exact sets.
+#[test]
+fn a_computed_index_read_gives_every_subject_every_level() {
+    let with_d = |read: &str| {
+        mbma("theta PLACEBO[3](0.0) profile", read).replace(
+            "[individual_parameters]\n",
+            "[individual_parameters]\n  D = PLACEBO[STUDY]\n",
+        )
+    };
+    let mut pop = population(3, 2);
+    let model = bind(&with_d("PLACEBO[4 - STUDY]"), &mut pop);
+    assert_eq!(
+        active_levels(&model, &pop)[0].per_subject,
+        vec![vec![0, 1, 2]; 6]
+    );
+
+    let mut pop = population(3, 2);
+    let model = bind(&with_d("PLACEBO[STUDY]"), &mut pop);
+    assert_eq!(
+        active_levels(&model, &pop)[0].per_subject,
+        [vec![0], vec![0], vec![1], vec![1], vec![2], vec![2]]
+    );
+}
+
+/// Review #3b: a defaulted covariance method is not refused, whatever its value —
+/// the gate reads an explicit choice. (Scale routing of a defaulted `r` to `s` is
+/// PR2's: the dimension it routes on is the one PR2 holds.)
+#[test]
+fn a_defaulted_covariance_method_is_not_refused() {
+    let defaulted = FitOptions {
+        run_covariance_step: true,
+        covariance_method: CovarianceMethod::CrossProduct,
+        covariance_method_set: false,
+        ..FitOptions::default()
+    };
+    let msgs = scope(&model_of(&counted()), &defaulted);
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert!(msgs[0].contains(NOT_YET), "{}", msgs[0]);
+}
+
+/// Review #6: the time-to-event arm, named, and no "also".
+#[cfg(feature = "survival")]
+#[test]
+fn profile_refuses_a_model_with_a_time_to_event_endpoint() {
+    let text = counted()
+        .replace("  omega ETA_E0", "  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_E0")
+        .replace(
+            "[error_model]",
+            "[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n\n[error_model]",
+        );
+    let msg = one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        "which needs a Gaussian likelihood on every row; this model has a time-to-event endpoint.",
+        REMOVE,
+    );
+    assert!(!msg.contains("also"), "{msg}");
+}
+
+/// Review #6: the third arm, which only a CTMM endpoint reaches.
+#[cfg(feature = "markov")]
+#[test]
+fn profile_refuses_a_model_with_a_markov_endpoint() {
+    let text = counted()
+        .replace("  omega ETA_E0", "  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  omega ETA_E0")
+        .replace(
+            "[error_model]",
+            "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01)\n  transition asleep -> awake  = exp(LQ10)\n\n[error_model]",
+        );
+    one_refusal(
+        &scope(&model_of(&text), &FitOptions::default()),
+        "which needs a Gaussian likelihood on every row; this model has a Markov (CTMM) endpoint.",
+        REMOVE,
+    );
 }

@@ -4417,6 +4417,8 @@ pub fn parse_full_model_with(
     // with the individual parameters in scope so they can carry a taint: the
     // parsed readout has its θ/η and liftable gathers rewritten into
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
+    // #1065: per profiled block, the one plain column every read indexes it by.
+    let mut profiled_index: Vec<(String, Option<String>)> = Vec::new();
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
         let readout = match blocks.get("scaling") {
             Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
@@ -4472,17 +4474,50 @@ pub fn parse_full_model_with(
             .map(|d| d.name.clone())
             .collect();
         let error_lines = blocks.get("error_model").cloned().unwrap_or_default();
+        // Every prediction the walk judges: the `y` readouts, and each `obs_scale`
+        // divisor as `state / obs_scale` (#2103 review #1). An `obs_scale` is not a
+        // `y` key, so without this a block in it reached no readout at all.
+        let mut readouts: Vec<(String, Expression)> = readout_with_states
+            .iter()
+            .map(|e| (Y_READOUT.to_string(), e.clone()))
+            .collect();
+        if !profiled.is_empty() {
+            if let Some(lines) = blocks.get("scaling") {
+                for (key, e) in scaling_key_exprs(
+                    lines,
+                    "obs_scale",
+                    &theta_names,
+                    &eta_names,
+                    &indiv_var_names,
+                )
+                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
+                {
+                    readouts.push((
+                        format!("`[scaling] {key}`"),
+                        Expression::BinOp(
+                            Box::new(Expression::Covariate(STATE_LEAF.to_string())),
+                            BinOp::Div,
+                            Box::new(e),
+                        ),
+                    ));
+                }
+            }
+        }
         for block in &profiled {
             let others: Vec<String> = profiled.iter().filter(|o| *o != block).cloned().collect();
             profile_route_check(
                 &indiv_stmts,
-                &readout_with_states,
+                &readouts,
                 &error_lines,
                 block,
                 &others,
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
+            profiled_index.push((
+                block.clone(),
+                profiled_index_column(&indiv_stmts, &readouts, block),
+            ));
         }
     }
 
@@ -4517,6 +4552,7 @@ pub fn parse_full_model_with(
         uses: VectorThetaScope::uses(),
         level_blocks: level_block_decls.clone(),
         unbound_level_blocks: unbound_level_blocks.clone(),
+        profiled_index,
     };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
@@ -21102,6 +21138,11 @@ pub struct ThetaBlocks {
     /// data. A model carrying any of these cannot be fit — see
     /// `api::validation::check_unbound_theta_levels`.
     pub(crate) unbound_level_blocks: Vec<String>,
+    /// Per `profile`d block (#1065): the plain data column every read of it is
+    /// indexed by, or `None` when some read indexes it by anything else
+    /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
+    /// `api::levels::active_levels`.
+    pub(crate) profiled_index: Vec<(String, Option<String>)>,
 }
 
 impl ThetaBlocks {
@@ -22602,9 +22643,17 @@ pub(crate) enum ProfileRouteBreak {
     OtherBlock(String),
 }
 
-/// Where a [`ProfileRouteBreak`] was found: the `[individual_parameters]`
-/// assignment, by its left-hand side, or `None` for the `y` readout.
-pub(crate) type ProfileRouteSite = Option<String>;
+/// Where a [`ProfileRouteBreak`] was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileRouteSite {
+    /// A readout, by its label (`the \`y\` readout`, `` `[scaling] obs_scale` ``).
+    Readout(String),
+    /// An `[individual_parameters]` assignment, by its left-hand side.
+    Param(String),
+}
+
+/// The label [`profile_route_check`] gives the `y` readouts.
+pub(crate) const Y_READOUT: &str = "the `y` readout";
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
@@ -22613,23 +22662,28 @@ pub(crate) type ProfileRouteSite = Option<String>;
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
 ///
+/// `readouts` are the predictions, each with the label a refusal names it by: the
+/// `y` readouts, and each `[scaling] obs_scale` divisor as `state / obs_scale`, so a
+/// block in a divisor is refused like one written in `y` (#2103 review #1).
+///
 /// It runs on the walk the binder's identifiability questions use
 /// ([`coupling_defs`], [`CouplingCtx`]), so a name resolves to the same reaching
 /// definitions here as there. `others` names the other profiled blocks, for the
 /// disjointness rule.
 pub(crate) fn profile_route_check(
     stmts: &[Statement],
-    readout: &[Expression],
+    readouts: &[(String, Expression)],
     error_lines: &[String],
     block: &str,
     others: &[String],
     states: &StateInputs,
 ) -> Result<(), (ProfileRouteBreak, ProfileRouteSite)> {
     let (assigns, reach_out) = coupling_defs(stmts);
+    let exprs: Vec<Expression> = readouts.iter().map(|(_, e)| e.clone()).collect();
     let ctx = CouplingCtx {
         assigns: &assigns,
         reach_out: &reach_out,
-        readout,
+        readout: &exprs,
         block,
         states,
         constant: Default::default(),
@@ -22641,8 +22695,9 @@ pub(crate) fn profile_route_check(
         token: states.tokens.contains(block),
     };
     let taint = ctx.taint(&src, &[]);
+    let y = || ProfileRouteSite::Readout(Y_READOUT.to_string());
     if ctx.state_tainted(&src, &taint) {
-        return Err((ProfileRouteBreak::State, None));
+        return Err((ProfileRouteBreak::State, y()));
     }
     // The residual error: a name after an `[error_model]` line's `~` that is the
     // block, or an individual parameter carrying it at the end of the block. The
@@ -22653,18 +22708,19 @@ pub(crate) fn profile_route_check(
             .any(|t| t == block || ctx.var_tainted(t, &taint, ctx.out()))
     });
     if error_reads {
-        return Err((ProfileRouteBreak::Residual, None));
+        return Err((ProfileRouteBreak::Residual, y()));
     }
     let walk = ProfileWalk {
         ctx: &ctx,
         src: &src,
         taint: &taint,
     };
-    for y in readout {
-        if !ctx.expr_reads(y, &src, &taint, ctx.out(), false) {
+    for (label, e) in readouts {
+        if !ctx.expr_reads(e, &src, &taint, ctx.out(), false) {
             continue;
         }
-        walk.affine(y, ctx.out(), &None)?;
+        let site = ProfileRouteSite::Readout(label.clone());
+        walk.affine(e, ctx.out(), &site)?;
         for other in others {
             let is_other = |e: &Expression| matches!(e, Expression::ThetaGather { spec, .. } if spec.name == *other);
             let osrc = Source {
@@ -22672,19 +22728,52 @@ pub(crate) fn profile_route_check(
                 token: false,
             };
             let ot = ctx.taint(&osrc, &[]);
-            if ctx.expr_reads(y, &osrc, &ot, ctx.out(), false) {
-                return Err((ProfileRouteBreak::OtherBlock(other.clone()), None));
+            if ctx.expr_reads(e, &osrc, &ot, ctx.out(), false) {
+                return Err((ProfileRouteBreak::OtherBlock(other.clone()), site));
             }
         }
     }
     Ok(())
 }
 
+/// The one plain data column every read of `block` is indexed by, across the
+/// `[individual_parameters]` statements and the readouts; `None` when two reads
+/// differ or one is indexed by anything but a bare column (#2103 review #2). Only
+/// then can a subject's levels be read off that column; otherwise the caller gives
+/// every subject every level.
+fn profiled_index_column(
+    stmts: &[Statement],
+    readouts: &[(String, Expression)],
+    block: &str,
+) -> Option<String> {
+    let mut cols: Vec<Option<String>> = Vec::new();
+    let mut see = |n: &Expression| {
+        if let Expression::ThetaGather { spec, idx } = n {
+            if spec.name == block {
+                cols.push(match idx.as_ref() {
+                    Expression::Covariate(c) => Some(c.clone()),
+                    _ => None,
+                });
+            }
+        }
+    };
+    visit_stmt_nodes(stmts, &mut see);
+    for (_, e) in readouts {
+        visit_expr_nodes(e, &mut see);
+    }
+    match cols.split_first() {
+        Some((Some(first), rest)) if rest.iter().all(|c| c.as_ref() == Some(first)) => {
+            Some(first.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The `E_PROFILE_NOT_LINEAR` message for a [`profile_route_check`] refusal.
 fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRouteSite) -> String {
     let at = match site {
-        Some(p) => format!("in `{p}` in [individual_parameters]"),
-        None => "in the `y` readout".to_string(),
+        ProfileRouteSite::Param(p) => format!("in `{p}` in [individual_parameters]"),
+        ProfileRouteSite::Readout(label) => format!("in {label}"),
     };
     let here = match why {
         ProfileRouteBreak::Construct(c) => format!("Here `{block}` reaches `y` through {c} {at}."),
@@ -22697,8 +22786,8 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
             format!("Here `{block}` is read twice in one prediction, {at}.")
         }
         ProfileRouteBreak::Coefficient => format!(
-            "Here `{block}` is scaled by a term that reads a parameter or a random effect, \
-             not only data, {at}."
+            "Here `{block}` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, {at}."
         ),
         ProfileRouteBreak::Divisor => format!("Here `{block}` is a divisor {at}."),
         ProfileRouteBreak::State => format!(
@@ -22752,21 +22841,17 @@ impl ProfileWalk<'_, '_> {
                 // Read, so it is an individual parameter the block reaches: one
                 // reaching assignment, walked where it is.
                 let defs = self.ctx.resolve(at, n);
-                let carrying: Vec<usize> = defs
-                    .iter()
-                    .copied()
-                    .filter(|d| self.taint.contains(d))
-                    .collect();
+                let param = ProfileRouteSite::Param(n.clone());
                 // Two reaching definitions mean an `if` chose between them, so the
                 // coefficient depends on the branch taken. The one gate: a single
                 // definition inside a branch cannot be read here, since the parser
                 // refuses a name not assigned on every path. Only a definition on the
                 // route counts; a branch assignment `y` never reads does not.
                 if defs.len() > 1 {
-                    return Err((ProfileRouteBreak::Branch, Some(n.clone())));
+                    return Err((ProfileRouteBreak::Branch, param));
                 }
-                let d = carrying[0];
-                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &Some(n.clone()))
+                let d = defs[0];
+                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)
             }
             Expression::BinOp(_, BinOp::Mod, _) => {
                 fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
@@ -22784,12 +22869,18 @@ impl ProfileWalk<'_, '_> {
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
-            _ => fail(ProfileRouteBreak::Construct("an inline `if`".into())),
+            // `max`, `min` and `clamp` are parsed into this node too, so the message
+            // names them; nothing else reading the block reaches this arm.
+            _ => fail(ProfileRouteBreak::Construct(
+                "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)".into(),
+            )),
         }
     }
 
     /// Whether `e` reads data and literals only: no θ, η, block, state or
-    /// network output, through individual parameters too.
+    /// network output, through individual parameters too. A parameter assigned in
+    /// `if` branches is data-only when every definition reaching the read is, and
+    /// every condition choosing between them reads data only (#2103 review #4).
     fn data_only(&self, e: &Expression, at: At<'_>) -> bool {
         match e {
             Expression::Literal(_) | Expression::Time => true,
@@ -22801,7 +22892,10 @@ impl ProfileWalk<'_, '_> {
                     !defs.is_empty()
                         && defs.iter().all(|&d| {
                             let a = &self.ctx.assigns[d];
-                            a.conds.is_empty() && self.data_only(a.rhs, self.ctx.at(d))
+                            self.data_only(a.rhs, self.ctx.at(d))
+                                && a.conds
+                                    .iter()
+                                    .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
                         })
                 } else {
                     true
@@ -22811,7 +22905,21 @@ impl ProfileWalk<'_, '_> {
                 self.data_only(l, at) && self.data_only(r, at)
             }
             Expression::UnaryFn(_, a) => self.data_only(a, at),
+            Expression::Conditional(c, t, f) => {
+                self.cond_data_only(c, at) && self.data_only(t, at) && self.data_only(f, at)
+            }
             _ => false,
+        }
+    }
+
+    fn cond_data_only(&self, c: &Condition, at: At<'_>) -> bool {
+        match c {
+            Condition::Compare(l, _, r) => self.data_only(l, at) && self.data_only(r, at),
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                self.cond_data_only(l, at) && self.cond_data_only(r, at)
+            }
+            Condition::Not(c) => self.cond_data_only(c, at),
+            Condition::Present(e) => self.data_only(e, at),
         }
     }
 }
@@ -24296,6 +24404,23 @@ fn readout_y_exprs(
     eta_names: &[String],
     defined: &[String],
 ) -> Result<Vec<Expression>, String> {
+    Ok(
+        scaling_key_exprs(scaling_lines, "y", theta_names, eta_names, defined)?
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect(),
+    )
+}
+
+/// Every `[scaling]` entry whose base key is `base` (`y`, `obs_scale`), parsed with
+/// the named intermediates inlined, each with its key as written (`obs_scale[CMT=2]`).
+fn scaling_key_exprs(
+    scaling_lines: &[String],
+    base: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    defined: &[String],
+) -> Result<Vec<(String, Expression)>, String> {
     // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
     // inline them here too, or the desugaring would miss it and drop an otherwise
     // analytic readout to the FD fallback.
@@ -24307,14 +24432,14 @@ fn readout_y_exprs(
             continue;
         }
         let (key, value) = split_scaling_entry(trimmed)?;
-        if parse_scaling_key(key)?.0 != "y" {
+        if parse_scaling_key(key)?.0 != base {
             continue;
         }
         let ctx = ParseCtx::new(theta_names, eta_names, defined);
         let mut expr =
-            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] {base}: {e}"))?;
         inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
-        out.push(expr);
+        out.push((key.trim().to_string(), expr));
     }
     Ok(out)
 }
