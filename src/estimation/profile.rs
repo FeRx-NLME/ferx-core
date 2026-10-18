@@ -677,6 +677,25 @@ pub(crate) fn envelope_gradient(
     for &k in &ctx.layout.coords {
         x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
     }
+    // Off the analytic route, every evaluation's gradient reconverges the EBEs. The FD
+    // route's default is the fixed-EBE gradient, which drops `dη̂/dθ`: an approximation the
+    // unprofiled fit's optimizer tolerates, but the profile's L-BFGS stopped on it 0.42
+    // OFV above the optimum on S1 (#1065, 100 × 8), where the reconverged gradient reaches
+    // it. The envelope theorem removes `dβ̂/dθ`, not `dη̂/dθ`. The analytic gradient is
+    // exact and is left alone (the schedule would replace it), and the IOV FD route
+    // reconverges already.
+    let analytic = crate::sens::provider::analytic_outer_gradient_for_interaction(
+        ctx.model,
+        ctx.options.interaction,
+    );
+    let opts = FitOptions {
+        reconverge_gradient_interval: if analytic {
+            ctx.options.reconverge_gradient_interval
+        } else {
+            1
+        },
+        ..ctx.options.clone()
+    };
     population_gradient(
         &x_hat,
         ctx.population.subjects.len(),
@@ -687,31 +706,28 @@ pub(crate) fn envelope_gradient(
         &solve.h_matrices,
         &solve.kappas,
         bounds,
-        ctx.options,
+        &opts,
         grad_idx,
         OuterTrial::unknown(),
         declines,
     )
 }
 
-/// The outer algorithm of a profiled fit. `auto` follows the unprofiled rule at the
-/// structural dimension — L-BFGS on an analytic outer gradient, BOBYQA on an FD one —
-/// and the explicit NLopt choices are honoured; `check_profiled_levels` refuses the rest.
-fn profiled_algorithm(model: &CompiledModel, options: &FitOptions) -> nlopt::Algorithm {
+/// The outer algorithm of a profiled fit: `auto` is L-BFGS on the envelope gradient,
+/// whichever engine serves it, and the explicit NLopt choices are honoured;
+/// `check_profiled_levels` refuses the rest.
+///
+/// Not the unprofiled rule (BOBYQA when the outer gradient is FD). That rule exists
+/// because an FD gradient through a re-solved inner loop is noisy, and BOBYQA never
+/// differentiates. Here the objective is a smooth, exactly re-solved profile, and its
+/// gradient is checked against FD of that profile (G1, 5.5e-5 relative on the FD
+/// engine). Measured on F2 (#1065): BOBYQA stopped 0.0185 OFV above NONMEM's optimum
+/// after 110 evaluations, L-BFGS 1.5e-8 above it after 26 (7.9 s against 22.9 s).
+fn profiled_algorithm(options: &FitOptions) -> nlopt::Algorithm {
     match options.optimizer {
         Optimizer::Bobyqa => nlopt::Algorithm::Bobyqa,
         Optimizer::Slsqp => nlopt::Algorithm::Slsqp,
-        Optimizer::NloptLbfgs | Optimizer::Lbfgs | Optimizer::Bfgs => nlopt::Algorithm::Lbfgs,
-        _ => {
-            if crate::sens::provider::analytic_outer_gradient_for_interaction(
-                model,
-                options.interaction,
-            ) {
-                nlopt::Algorithm::Lbfgs
-            } else {
-                nlopt::Algorithm::Bobyqa
-            }
-        }
+        _ => nlopt::Algorithm::Lbfgs,
     }
 }
 
@@ -783,7 +799,7 @@ pub(crate) fn optimize_profiled(
 
     let mut converged = false;
     if runs_outer_optimizer(options) && !free.is_empty() {
-        let algo = profiled_algorithm(model, options);
+        let algo = profiled_algorithm(options);
         let lower: Vec<f64> = free.iter().map(|&i| bounds.lower[i]).collect();
         let upper: Vec<f64> = free.iter().map(|&i| bounds.upper[i]).collect();
         let objective = |xs: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {

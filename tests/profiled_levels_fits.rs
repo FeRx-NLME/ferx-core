@@ -8,9 +8,9 @@
 //!   stopping rules, not two objectives. D1 is F1 (linear in η and κ), D2 is F2
 //!   (nonlinear in η).
 //! - **A2 (fit)**: the profiled F2 fit against NONMEM's OFV with every level a `THETA`.
-//! - **S1**: the plan's 100-study × 8-visit measurement — the profiled fit converges,
-//!   its covariance is `r` and succeeds, where the unprofiled one routes to `s` and has
-//!   no standard error at all (705 packed coordinates, 100 subjects).
+//! - **S1**: the plan's 100-study × 8-visit measurement — the profiled fit converges and
+//!   its covariance is `r` and succeeds; unprofiled, the same model is 705 packed
+//!   coordinates, and its covariance routes to `s` and has no standard error at all (M6).
 
 use ferx_core::types::{CovarianceMethod, FitOptions, FitResult, ModelParameters, OmegaMatrix};
 use std::path::PathBuf;
@@ -111,9 +111,12 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
     assert!(worst_se < D_SE, "{worst_se}");
 }
 
-const D_OFV: f64 = 1e-2;
-const D_THETA: f64 = 1e-2;
-const D_SE: f64 = 5e-2;
+/// Realised (macOS arm64): D1 the unprofiled restart improves by 1.7e-6, D2 by −2.6e-7;
+/// the structural θ move 2.6e-4 (D1) and 0 (D2) relative; SEs differ by 7.0e-3 (D1) and
+/// 4.7e-3 (D2). Bands at ≥ 2.9× the worst.
+const D_OFV: f64 = 1e-4;
+const D_THETA: f64 = 1e-3;
+const D_SE: f64 = 2e-2;
 
 #[test]
 #[cfg_attr(
@@ -174,12 +177,17 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
 }
 
-const A2_FIT_OFV: f64 = 1e-2;
+/// Realised 1.5e-8 (macOS arm64), from the model file's inits, 26 evaluations. A
+/// stopping rule, not an engine difference, sets this; 1e-5 leaves room for another
+/// platform's path to the optimum while still failing the 0.0185 BOBYQA stopped at.
+const A2_FIT_OFV: f64 = 1e-5;
 
 /// S1: 100 studies × 8 visits. Profiled: a 5-coordinate search and the `r` covariance
 /// with a standard error for every structural parameter and every level. Unprofiled
-/// (705 packed coordinates): the defaulted covariance routes to `s` past 100
-/// coordinates. The profiled OFV must not be above the unprofiled one.
+/// (705 packed coordinates) it is fitted without its covariance step, which the plan's
+/// M6 measured routing to `s` and failing (S rank-deficient: 100 subjects, 705
+/// coordinates). The profiled OFV must not be above the unprofiled one; measured
+/// (macOS arm64) it is 0.42 below, the unprofiled fit stopping early at `|g|∞` 2.6.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

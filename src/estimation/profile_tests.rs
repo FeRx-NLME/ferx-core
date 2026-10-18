@@ -482,6 +482,24 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_fd_engine() {
     );
 }
 
+/// No kappa and `gradient = fd`: the non-IOV FD route, whose default is the fixed-EBE
+/// gradient (`dη̂/dθ` dropped). The envelope reconverges it; dies when it does not.
+#[test]
+fn the_envelope_gradient_is_the_profile_gradient_on_the_non_iov_fd_engine() {
+    envelope_matches_fd(
+        |t| {
+            t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
+                .replace(" + KAPPA_ARM", "")
+                .replace("  iov_column = OCC\n", "")
+                .replace(
+                    "  method     = focei\n",
+                    "  method     = focei\n  gradient   = fd\n",
+                )
+        },
+        false,
+    );
+}
+
 /// The same with no kappa, so the production gradient is the analytic one.
 #[test]
 fn the_envelope_gradient_is_the_profile_gradient_on_the_analytic_engine() {
@@ -497,9 +515,15 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_analytic_engine() {
 
 // ── Backtracking: a start far from the minimum ─────────────────────────────────────
 
-/// From levels 20 units off (the data's spread is ~1.5), the Newton matrix taken at the
-/// start's η̂ overshoots on F2; the backtracking keeps the solve on the way down and it
-/// lands on the oracle's minimum. Dies when the backtracking is removed.
+/// From levels 20 units off (the data's spread is ~1.5) the solve still lands on the
+/// oracle's minimum: the Newton matrix taken at the start's η̂ is a long way from the
+/// one at the optimum.
+///
+/// It does **not** kill the removal of the backtracking, and no fixture found here does:
+/// on F2 a full Newton step never raised the objective — starts at ±5 … ±3000, Ω_EM up to
+/// 9 and EMAX 40 all converged in 3–4 steps to the same minimum, with or without the
+/// line search (measured on #1065). The backtracking stays as the safeguard the plan
+/// specifies for a model whose GLS matrix is a poorer stand-in for the Hessian.
 #[test]
 fn a_bad_start_still_reaches_the_minimum() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);

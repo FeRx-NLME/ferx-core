@@ -566,8 +566,12 @@ FOCE/FOCEI objective over the block, for the structural parameters being tried. 
 does this by Newton on the **total** gradient: each subject's EBE is re-solved at
 every point, so the levels' effect on η̂ is included. The optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
-parameters becomes a 5-dimensional search, and stays under both switches above:
-`auto` keeps its small-problem optimizer, and the default covariance stays `r`.
+parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
+`optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
+the structural parameters is the ordinary outer gradient with the levels held
+(envelope theorem), and the profile objective is smooth enough for it, where BOBYQA
+stopped early on the test fixture. `bobyqa`, `slsqp` and the L-BFGS spellings can be
+chosen explicitly.
 
 Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so the OFV, the structural estimates and their standard errors are the
