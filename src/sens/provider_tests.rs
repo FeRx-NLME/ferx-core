@@ -1603,6 +1603,67 @@ fn analytical_init_tvcov_subject_matches_fd() {
     );
 }
 
+/// #2121: the dual ODE walk seeds `init(...)` from the subject's first record in file order,
+/// the selector the value path maps too. Fixture: an EVID=2 row (WT 70) and then an
+/// observation (WT 140) at TIME 0 — the tie both paths used to resolve to the observation.
+/// FD parity alone cannot see that: before #2121 the dual and the value path shared the
+/// wrong record and agreed. So the seed is also pinned against its closed form,
+/// `f(0) = TVB·WT·exp(η_B) / V` with the EVID=2 row's WT, and against the WT 140 it must
+/// not be.
+#[test]
+fn ode_init_seed_at_an_evid2_obs_tie_reads_the_first_record_and_matches_fd() {
+    const ODE_TV_INIT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVB(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_B  ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  BASE = TVB * WT * exp(ETA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let m = parse_model_string(ODE_TV_INIT).expect("parse");
+    let s = tvcov_subject(
+        Vec::new(),
+        &[],
+        &[0.0, 2.0, 4.0, 8.0],
+        &[140.0, 140.0, 140.0, 140.0],
+        Vec::new(),
+        vec![0.0],
+        &[70.0],
+    );
+    assert!(s.has_tv_covariates(), "fixture must carry TV covariates");
+    let theta = [5.0, 50.0, 10.0];
+    let eta = [0.15, -0.10];
+    let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("the dual ODE walk serves it");
+    let seed = |wt: f64| 10.0 * wt * (-0.10_f64).exp() / 50.0;
+    assert!(
+        (sens.obs[0].f - seed(70.0)).abs() < 1e-9,
+        "dual f(0) = {} must be the EVID=2 row's seed {} (the observation's would be {})",
+        sens.obs[0].f,
+        seed(70.0),
+        seed(140.0)
+    );
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+}
+
 // 1-cpt IV with `init(central) = TVC0 * V` and a `TVC0` bound that admits zero.
 // At `TVC0 = 0` the baseline amount `A₀` is exactly 0 but `∂A₀/∂TVC0 = V ≠ 0`.
 const ONECPT_IV_INIT_ZERO: &str = r#"

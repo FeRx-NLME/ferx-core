@@ -5694,7 +5694,7 @@ const ONECPT_IV_INIT_WTV_ODE: &str = r#"
 
 /// **`init(...)` + EVID=4 reset+dose at `t = 0` (the reset is the first timeline event)**
 /// (#486 review — Copilot). Production re-applies `init(&last_pk.values)` at the reset with
-/// `last_pk = init_pk` (the first-record snapshot, dose-preferred on ties). The walk seeds
+/// `last_pk = init_pk` (the first-record snapshot, `dosing::first_record`). The walk seeds
 /// `last_params` from the *same* `first_record_pk` selection. Since #1133 the re-seed reads
 /// `pk_at_reset[idx]` on both sides instead, and this subject leaves `reset_covariates`
 /// empty, so `reset_cov(0)` falls back to `subject.covariates` (`WT = 60`) — the same value

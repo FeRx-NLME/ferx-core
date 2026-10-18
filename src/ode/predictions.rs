@@ -350,10 +350,10 @@ pub(crate) fn abandon_non_finite_timeline(
 // `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
-    is_real_infusion, note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles,
-    resolve_subject_doses, resolve_subject_doses_with, ss_equilibrates_at_arrival,
-    ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record, SsStopTracker,
-    SS_EQUILIBRATION_CYCLES,
+    first_record, is_real_infusion, note_ss_nonconvergence_if_capped,
+    record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
+    ss_equilibrates_at_arrival, ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record,
+    FirstRecord, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -4984,32 +4984,34 @@ fn governing_segment_occ_at(
     }
 }
 
-/// PK snapshot to seed the per-event (time-varying) adaptive walk from: the
-/// earliest obs / pk-only record's snapshot, mirroring
-/// [`ode_predictions_event_driven`]'s init so a covariate-dependent
-/// `init(state)=expr` is seeded correctly (#700). Falls back to `fallback` when
-/// the subject carries **no** record (e.g. a `TIME`-in-PK subject driven purely by
-/// decision times) — the caller passes the t=0 baseline PK there, never a
-/// zero-PK default. Shared by the driver and `adaptive_frozen_replay_tv` so the two
-/// seed identically and stay bit-aligned; when at least one record exists the
-/// fallback is unused, so a differing fallback between the two is harmless.
+/// PK snapshot to seed the per-event (time-varying) adaptive walk from: the snapshot of
+/// the subject's first record, [`first_record`] — the selector the dense and dual engines
+/// share, so a covariate-dependent `init(state)=expr` is seeded as `predict()` seeds it
+/// (#700, #2121). Only base-regimen dose rows (`event_pk.dose`) are candidates; the frozen
+/// replay's appended controller doses are not records. Falls back to `fallback` when the
+/// subject carries **no** record (e.g. a `TIME`-in-PK subject driven purely by decision
+/// times) — the caller passes the t=0 baseline PK there, never a zero-PK default.
+///
+/// The driver and `adaptive_frozen_replay_tv` both call this, so the verifier **cannot**
+/// see a wrong seed: both sides read the same snapshot. Before #2121 this scan skipped dose
+/// rows and took an observation over a co-timed EVID=2 row, and `verify` passed on every
+/// one of those subjects. The adaptive leg of `tests/init_seed_tie_nonmem_anchor.rs` checks
+/// the seed against NONMEM for that reason.
+///
+/// Not [`AdaptiveRecordIndex::at`]: that answers "which record at this exact instant",
+/// with resets ranked first, while the seed is the minimum over every record time with
+/// resets excluded (a reset re-seeds from its own row).
 fn earliest_record_pk(
     subject: &Subject,
     event_pk: &crate::pk::EventPkParams,
     fallback: PkParams,
 ) -> PkParams {
-    let mut best: Option<(f64, PkParams)> = None;
-    for (j, &t) in subject.obs_times.iter().enumerate() {
-        if best.map_or(true, |(bt, _)| t < bt) {
-            best = Some((t, event_pk.obs[j]));
-        }
+    match first_record(subject, event_pk.dose.len().min(subject.doses.len())) {
+        Some(FirstRecord::Dose(k)) => event_pk.dose[k],
+        Some(FirstRecord::PkOnly(m)) => event_pk.pk_only[m],
+        Some(FirstRecord::Obs(j)) => event_pk.obs[j],
+        None => fallback,
     }
-    for (m, &t) in subject.pk_only_times.iter().enumerate() {
-        if best.map_or(true, |(bt, _)| t < bt) {
-            best = Some((t, event_pk.pk_only[m]));
-        }
-    }
-    best.map(|(_, p)| p).unwrap_or(fallback)
 }
 
 /// Covariate map a **decision** at time `t` reads on the per-event (time-varying)
@@ -5276,8 +5278,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let n_obs = subject.obs_times.len();
 
     // Per-event PK seed for the TV path (#700): the snapshot at the subject's
-    // earliest record (obs or pk-only), mirroring `ode_predictions_event_driven`'s
-    // init so a covariate-dependent `init(state)=expr` is seeded correctly. A
+    // first record (`earliest_record_pk` → `first_record`, the selector
+    // `ode_predictions_event_driven` shares, #2121) so a covariate-dependent
+    // `init(state)=expr` is seeded correctly. A
     // record-free subject (e.g. a `TIME`-in-PK subject driven purely by decision
     // times) falls back to the t=0 baseline `pk_params_flat`, never a zero-PK
     // default (which would integrate CL=V=0 → NaN). Only read when `tv`; the
@@ -6524,8 +6527,9 @@ fn adaptive_frozen_replay_tv(
     }
     let mut last_occ: Option<usize> = None;
 
-    // Seed PK / state from the earliest record, mirroring the driver's init via the
-    // shared `earliest_record_pk` so the two seed identically. A record-free subject
+    // Seed PK / state from the first record, mirroring the driver's init via the
+    // shared `earliest_record_pk` so the two seed identically — which also means this
+    // replay cannot detect a wrong seed (#2121). A record-free subject
     // yields empty `predictions` here (nothing to verify), so the `default()`
     // fallback — which the driver seeds from the t=0 baseline instead — is moot.
     let init_pk: PkParams = earliest_record_pk(subject, event_pk, PkParams::default());
@@ -7026,29 +7030,15 @@ pub fn ode_predictions_event_driven(
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     // The init expression folds covariates/eta in via the individual-parameter
     // layer, so evaluate it with the snapshot from the subject's *first record*
-    // — the smallest record time across dose / obs / pk-only. Selecting by
-    // event kind would wrongly prefer a later dose over an earlier observation
-    // when covariates are time-varying (e.g. a pre-dose baseline obs at t=0).
+    // (`crate::dosing::first_record`, #2121: NONMEM's first record in file order).
     // Raw record times are used (not lagtime-shifted) since `$PK` order follows
     // the record, not the absorption delay.
-    let init_pk: Option<PkParams> = {
-        let mut best: Option<(f64, PkParams)> = None;
-        let mut consider = |t: f64, p: &PkParams| {
-            if best.map_or(true, |(bt, _)| t < bt) {
-                best = Some((t, *p));
-            }
-        };
-        for (k, d) in subject.doses.iter().enumerate() {
-            consider(d.time, &pk_at_dose[k]);
-        }
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            consider(t, &pk_at_obs[j]);
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            consider(t, &pk_at_pk_only[m]);
-        }
-        best.map(|(_, p)| p)
-    };
+    let init_pk: Option<PkParams> =
+        first_record(subject, subject.doses.len()).map(|rec| match rec {
+            FirstRecord::Dose(k) => pk_at_dose[k],
+            FirstRecord::PkOnly(m) => pk_at_pk_only[m],
+            FirstRecord::Obs(j) => pk_at_obs[j],
+        });
     let mut u = match &init_pk {
         Some(p) => ode.initial_state(&p.values),
         None => vec![0.0_f64; n],

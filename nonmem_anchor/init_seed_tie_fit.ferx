@@ -22,7 +22,7 @@
 [covariates]
   WT continuous
 [scaling]
-  obs_scale = V
+  y = central / V
 [error_model]
   DV ~ proportional(PROP)
 [fit_options]
