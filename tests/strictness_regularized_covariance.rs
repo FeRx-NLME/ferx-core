@@ -38,9 +38,12 @@
 //!   not at 80; at Q₀ = 6, V2 = 2e-5 frozen, 3e-5 not). Here `V2²/Q₀ = 4.2e-10`, more than
 //!   3× inside.
 //! * **Not flat enough, and the floor does not fire.** The floor clips an eigenvalue below
-//!   `1e-10·λ_max = 2.078e-7`. Measured here: min eigenvalue 1.89e-8 (2.57e-8 with the inner
-//!   seed killed), 8–11× inside. Across the window it grew with V2, to 1.33e-7 at V2 = 1e-4
-//!   (still floored) and past the floor by V2 = 2e-4 (nothing floored).
+//!   `1e-10·λ_max = 2.078e-7`. Measured here: min eigenvalue 2.13e-8 on Linux x86_64,
+//!   3.79e-8 on CI x86_64 and 1.89e-8 on macOS arm64 (2.04e-8 and 2.57e-8 with the inner seed
+//!   killed), 5–11× inside.
+//!   Across the window it grew with V2, to 1.1e-7–1.4e-7 at V2 = 1e-4 (still floored) and
+//!   past the floor by V2 = 2e-4 (nothing floored), with both edges at the same cells on both
+//!   platforms.
 //!
 //! # Why FOCEI (#2116)
 //!
@@ -52,8 +55,8 @@
 //! the 2.3e-7 floor, so nothing floored and the test failed with a TVQ RSE of 68 607 %.
 //! Noise of ±7e-7 against a 2.3e-7 clip threshold leaves the window no inside. Under FOCEI
 //! the analytic R-matrix is used and the eigenvalue is the curvature the window above
-//! describes: it moves by ~1e-8 between inner-solve trajectories (1.89e-8 and 2.57e-8
-//! above), well inside the floor.
+//! describes: across three machines and two inner-solve trajectories it stays within
+//! 1.9e-8–3.8e-8 (above), well inside the floor.
 //!
 //! The test asserts the straddle first — the same fit with the floor warning removed *passes*
 //! `Strictness::default()` outright — so the exclusion it then asserts can only come from the
@@ -184,9 +187,10 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
     assert!(r.converged, "{:?}", r.warnings);
 
     // The collapse the fixture exists for: the covariance step floored the flat direction.
-    // The margin is a canary — measured 1.89e-8 against a 2.078e-7 floor, so a drift that
-    // halves it (toward the edge where nothing floors) reddens here, with the numbers, rather
-    // than silently flipping the straddle below.
+    // The margin is a canary — measured 1.89e-8 to 3.79e-8 across macOS arm64, Linux x86_64
+    // and CI x86_64 against a 2.078e-7 floor (canary at 5.2e-8), so a drift toward the edge
+    // where nothing floors reddens here, with the numbers, rather than silently flipping the
+    // straddle below.
     let msg = floor_message(&r)
         .unwrap_or_else(|| panic!("the eigenvalue floor did not fire: {:?}", r.warnings));
     let (min_eig, floor) = (field(msg, "min eig = "), field(msg, "floor = "));
