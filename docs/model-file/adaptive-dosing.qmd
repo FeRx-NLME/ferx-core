@@ -508,15 +508,17 @@ a model that merely mentions `TAD` somewhere — it is not refused, and not blam
 the clock. A RHS that reads only `TIME` / `T` is unaffected in every case, since that
 clock is the integration axis and is anchored everywhere.
 
-Not being refused is not the same as being right, and on one of those shapes it is
-emphatically not: a model whose *other* compartment has run away is left alone here,
-but the run it then returns is wrong for a reason this page cannot fix. When any
-state goes non-finite the solver stops advancing **every** state, so the remaining
-compartments freeze at their last value and come back as ordinary finite predictions
-— from `predict()` as much as from the reactive driver, which is also why the replay
-verifier agrees with them. That is tracked as a separate engine defect. If a
-compartment of your model can diverge, neither this check nor the verifier will tell
-you.
+Not being refused by this check is not the same as being accepted. A model whose
+*other* compartment has run away is caught elsewhere, and named for what it is:
+
+- every prediction past the point where a state went non-finite is `NaN`, never a
+  frozen last value;
+- the solver warning says a state became non-finite, rather than blaming stiffness
+  or the step budget;
+- a decision taken on a non-finite state is refused, naming the compartments that
+  diverged, before the controller sees it;
+- the frozen-schedule replay verifier refuses to certify `NaN` predictions as
+  agreement.
 
 #### What the check cannot see
 
@@ -537,8 +539,8 @@ Two consequences of judging a finite window at the dose that came:
 The **frozen-schedule replay verifier**, on by default, remains the net for what the
 check misses, with two limits of its own:
 it fires only when an effect exceeds its tolerance band — `8 × ode_reltol`, and at
-least `1e-9`, relative — and it compares two engines, so it cannot see a failure they
-share, which is exactly the frozen-state case above.
+least `1e-9`, relative — and the two engines it compares share the ODE solver, so it
+cannot see a failure in the solver itself.
 
 ## Current scope and limits
 
