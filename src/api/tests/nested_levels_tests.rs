@@ -592,8 +592,12 @@ fn only_foce_and_focei_fit_a_nested_model() {
     .is_none());
 }
 
+/// A residual `correlation` line on a nested model is fitted since #1082 PR5: the option
+/// checks no longer refuse it (the retired `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED`, and
+/// the κ branch of `E_RESIDUAL_CORRELATION_SCOPE`). Its numerical checks live in
+/// `nested_correlation_tests.rs`.
 #[test]
-fn a_residual_correlation_is_refused_on_a_nested_model() {
+fn a_residual_correlation_is_accepted_on_a_nested_model() {
     let m = parse_model_string(
         &src_with(
             "  theta RHO(0.3, -0.9, 0.9)\n",
@@ -602,28 +606,18 @@ fn a_residual_correlation_is_refused_on_a_nested_model() {
         )
         .replace(
             "DV ~ additive(ADD)\n",
-            "DV ~ additive(ADD)\n  correlation cs(RHO) by ARM\n",
+            "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
         ),
     )
     .expect("parse");
-    let msg = code_in(
-        &check_model_options(&m, &options(EstimationMethod::FoceI)),
-        "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED",
-    )
-    .expect("refused");
+    assert!(m.residual_serial.is_some() && m.has_nested_levels());
+    let diags = check_model_options(&m, &options(EstimationMethod::FoceI));
     assert!(
-        msg.contains("a residual `correlation … by` line is not yet supported"),
-        "{msg}"
+        diags
+            .iter()
+            .all(|d| d.severity != crate::diagnostics::Severity::Error),
+        "{diags:?}"
     );
-    assert!(
-        msg.contains("Fit the levels without it, or the correlation with a single level."),
-        "{msg}"
-    );
-    assert!(code_in(
-        &check_model_options(&model(), &options(EstimationMethod::FoceI)),
-        "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED"
-    )
-    .is_none());
 }
 
 /// `simulate()` draws a nested model per level since #1082 PR4 (the draw itself is
@@ -638,37 +632,14 @@ fn simulate_runs_a_nested_model() {
 }
 
 /// What simulation still refuses on a nested model, each with the code `fit()` gives
-/// the same input: a residual `correlation` line (#1082 PR5), a derived `iov_occasion`
-/// rule, and a record with no label — and the adaptive-dosing entry points, whose κ
-/// stream has no per-level draw. Each half straddles its gate: the same input without
-/// the trigger simulates.
+/// the same input: a derived `iov_occasion` rule, and a record with no label — and the
+/// adaptive-dosing entry points, whose κ stream has no per-level draw. Each half
+/// straddles its gate: the same input without the trigger simulates. A residual
+/// `correlation` line simulates since #1082 PR5 (`nested_correlation_tests.rs`).
 #[test]
 fn simulate_refuses_what_the_nested_fit_refuses() {
     let m = model();
     let p = full_design();
-
-    let corr = parse_model_string(
-        &src_with(
-            "  theta RHO(0.3, -0.9, 0.9)\n",
-            "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
-            "",
-        )
-        .replace(
-            "DV ~ additive(ADD)\n",
-            "DV ~ additive(ADD)\n  correlation cs(RHO) by ARM\n",
-        ),
-    )
-    .expect("parse");
-    let err = crate::api::simulate_with_seed(&corr, &p, &corr.default_params, 1, 1)
-        .err()
-        .expect("refused");
-    assert_eq!(err.code(), Some("E_NESTED_LEVEL_CORRELATION_UNSUPPORTED"));
-    let msg = err.to_string();
-    assert!(msg.contains("in simulation as in the fit"), "{msg}");
-    assert!(
-        msg.contains("Simulate the levels without it, or the correlation with a single level."),
-        "{msg}"
-    );
 
     let rule = crate::api::SimulateOptions {
         seed: Some(1),

@@ -216,6 +216,9 @@ const OUTPUT_MANDATORY: &[&str] = &[
 mod multistart_prefers_tests;
 
 #[cfg(test)]
+#[path = "tests/nested_correlation_tests.rs"]
+mod nested_correlation_tests;
+#[cfg(test)]
 #[path = "tests/nested_levels_tests.rs"]
 mod nested_levels_tests;
 

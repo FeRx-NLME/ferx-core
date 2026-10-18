@@ -1131,19 +1131,28 @@ fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
 /// The value is the row's own covariate snapshot ([`Subject::obs_cov`]), so a
 /// block is a set of rows, never a time window — the IOV occasion rule does not
 /// enter.
+///
+/// A `by` that names one nested level (#1082 PR5, [`residual_level`]) groups the rows
+/// by that level's groups instead: the key is the row's label path down to the level, so
+/// `by ARM` puts arm 1 of study 1 and arm 1 of study 2 in two blocks, as the level does.
 pub(crate) fn residual_groups(model: &crate::types::CompiledModel, subject: &Subject) -> Vec<u32> {
     let Some(serial) = &model.residual_serial else {
         return Vec::new();
     };
+    let level = residual_level(model);
     let mut keys: Vec<Vec<u64>> = Vec::new();
     (0..subject.obs_times.len())
         .map(|j| {
             let cov = subject.obs_cov(j);
-            let key: Option<Vec<u64>> = serial
-                .by
-                .iter()
-                .map(|col| cov.get(col).filter(|v| !v.is_nan()).map(|v| v.to_bits()))
-                .collect();
+            let key: Option<Vec<u64>> = match level {
+                Some((levels, l)) => crate::stats::nested_levels::label_path(levels, cov)
+                    .map(|path| path[..=l].to_vec()),
+                None => serial
+                    .by
+                    .iter()
+                    .map(|col| cov.get(col).filter(|v| !v.is_nan()).map(|v| v.to_bits()))
+                    .collect(),
+            };
             match key {
                 None => 0,
                 Some(key) => match keys.iter().position(|k| *k == key) {
@@ -1156,6 +1165,25 @@ pub(crate) fn residual_groups(model: &crate::types::CompiledModel, subject: &Sub
             }
         })
         .collect()
+}
+
+/// The nested level a `correlation … by L` line names (#1082 PR5), with the model's
+/// levels: `by` is the one name `L`, and `L` is a declared level of a model with more than
+/// one (an exact, case-sensitive match on the level's name, whatever its `by` column is
+/// called). `None` for every other line, whose `by` names data columns.
+///
+/// A one-level model has no named level here — its level is `iov_column`, whose parent is
+/// `ID`, so the column grouping within `ID` already is the level's grouping.
+pub(crate) fn residual_level(
+    model: &crate::types::CompiledModel,
+) -> Option<(&crate::types::NestedLevels, usize)> {
+    let serial = model.residual_serial.as_ref()?;
+    let levels = model.nested_levels()?;
+    let [name] = serial.by.as_slice() else {
+        return None;
+    };
+    let l = levels.levels.iter().position(|level| level.name == *name)?;
+    Some((levels, l))
 }
 
 /// `population` with its residual blocks assigned — borrowed when the model has no

@@ -1815,6 +1815,7 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));
     diags.extend(check_residual_correlation(model, population, params));
+    diags.extend(residual_correlation_confounded(model, population, iov_rule));
     // Errors only; the within-occasion-variation *warning* is a separate walk,
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
@@ -5330,17 +5331,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if model.residual_serial.is_some() {
-            diags.push(
-                Diagnostic::error(
-                    "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED",
-                    "a residual `correlation … by` line is not yet supported on a model with \
-                     nested levels (more than one `level`). Fit the levels without it, or the \
-                     correlation with a single level.",
-                )
-                .with_block("error_model"),
-            );
-        }
     }
 
     // Rust callers bypass the parser's lower bound. Zero must not disable FOCEI
@@ -5919,17 +5909,16 @@ fn residual_correlation_scope(
     let Some(line) = residual_correlation_line(model) else {
         return Vec::new();
     };
-    let scoped = |what: String, why: &str| {
+    let scope = |what: String| {
         Diagnostic::error(
             "E_RESIDUAL_CORRELATION_SCOPE",
             format!(
                 "`{line}` is not supported with {what}. A residual correlation is fitted by \
-                 method = foce and focei only.{why}"
+                 method = foce and focei only."
             ),
         )
         .with_block("fit_options")
     };
-    let scope = |what: String| scoped(what, "");
     let mut diags = Vec::new();
     if let Some(m) = chain
         .iter()
@@ -5938,14 +5927,6 @@ fn residual_correlation_scope(
         diags.push(scope(format!("method = {}", m.label().to_lowercase())));
     } else if options.n_agq > 1 {
         diags.push(scope(format!("n_agq = {}", options.n_agq)));
-    }
-    if model.n_kappa > 0 {
-        diags.push(scoped(
-            "inter-occasion random effects (kappa)".to_string(),
-            " A kappa intercept loaded by the residual weight on the same grouping is the same \
-             covariance as `cs` with ρ ≥ 0, so the two are not identifiable together; fit one or \
-             the other (#1082).",
-        ));
     }
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         diags.push(scope("bloq_method = m3".to_string()));
@@ -5984,9 +5965,24 @@ fn residual_blocks(model: &CompiledModel, subject: &Subject) -> Vec<Vec<usize>> 
     blocks
 }
 
-/// `COL=value` of a block, from its first row.
+/// `COL=value` of a block, from its first row — or, for a `by` naming a nested level
+/// (#1082 PR5), the block's label path `STUDY=1, ARM=2`, since the level's value alone
+/// names a group in every parent.
 fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> String {
     let cov = subject.obs_cov(row);
+    if let Some((levels, l)) = crate::stats::residual_error::residual_level(model) {
+        return levels.levels[..=l]
+            .iter()
+            .map(|level| {
+                format!(
+                    "{}={}",
+                    level.name,
+                    cov.get(&level.column).copied().unwrap_or(f64::NAN)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
     model
         .residual_serial
         .as_ref()
@@ -6061,11 +6057,14 @@ pub(crate) fn check_residual_correlation_data(
     else {
         return Vec::new();
     };
-    if !matches!(
-        serial.kind,
-        crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
-    ) {
-        return Vec::new();
+    let mut diags = residual_correlation_grouping(model, population, &line);
+    if !diags.is_empty()
+        || !matches!(
+            serial.kind,
+            crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1
+        )
+    {
+        return diags;
     }
     let mut tie: Option<(&Subject, usize, f64)> = None;
     // A block whose rows sit on two TIME clocks: rows `(a, b)` of one subject.
@@ -6095,7 +6094,6 @@ pub(crate) fn check_residual_correlation_data(
         }
     }
 
-    let mut diags = Vec::new();
     if let Some((subject, a, b)) = reset {
         diags.push(Diagnostic::error(
             "E_RESIDUAL_CORRELATION_RESET",
@@ -6132,6 +6130,351 @@ pub(crate) fn check_residual_correlation_data(
         ));
     }
     diags
+}
+
+/// `E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS` (#1082 PR5): on a model with nested levels,
+/// a `correlation … by` line whose grouping a level name and a data column would read two
+/// ways. `by L` naming a level groups by `L`'s groups, nested by key; `by COL` naming a
+/// data column groups by its value within `ID`. The two disagree whenever a label repeats
+/// across the groups of the level's parent, so the line must say which it means:
+///
+/// * a tuple holding a level name — a level is a key path, not one column among others;
+/// * a level name that is also a data column other than the level's own `by` column;
+/// * a level's `by` column written under another name, for a level nested in another
+///   level. A level in `ID` (the first one) is grouped within `ID` either way.
+///
+/// Shared by fit (`check_model_data`) and `simulate()` through
+/// [`check_residual_correlation_data`], since both read the blocks.
+fn residual_correlation_grouping(
+    model: &CompiledModel,
+    population: &Population,
+    line: &str,
+) -> Vec<Diagnostic> {
+    let (Some(serial), Some(levels)) = (&model.residual_serial, model.nested_levels()) else {
+        return Vec::new();
+    };
+    let err = |msg: String| {
+        Diagnostic::error("E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS", msg)
+            .with_block("error_model")
+    };
+    let level_named = |name: &str| levels.levels.iter().find(|l| l.name == name);
+    if serial.by.len() > 1 {
+        // The innermost level the list names: its key path already holds the outer ones,
+        // so `by (STUDY, ARM)` means `by ARM`, not `by STUDY`.
+        let named: Vec<usize> = serial
+            .by
+            .iter()
+            .filter_map(|c| levels.levels.iter().position(|l| l.name == *c))
+            .collect();
+        if let Some(&deepest) = named.iter().max() {
+            let names = named
+                .iter()
+                .map(|&l| format!("`{}`", levels.levels[l].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let level = if named.len() > 1 { "levels" } else { "level" };
+            return vec![err(format!(
+                "`{line}` names the {level} {names} in a list of columns. A level groups rows \
+                 by its whole key path, its parent levels included, so it does not combine \
+                 with other columns. Write `by {name}` alone.",
+                name = levels.levels[deepest].name
+            ))];
+        }
+    }
+    if let [name] = serial.by.as_slice() {
+        if let Some(level) = level_named(name) {
+            let is_column = population
+                .input_columns
+                .iter()
+                .chain(&population.covariate_names)
+                .any(|c| c == name);
+            if level.column != *name && is_column {
+                return vec![err(format!(
+                    "`{line}`: `{name}` is the level `{name}`, grouped by the column `{col}`, \
+                     and also a data column of its own, so `by {name}` could mean either \
+                     grouping. Rename the data column or the level.",
+                    col = level.column
+                ))];
+            }
+            return Vec::new();
+        }
+    }
+    serial
+        .by
+        .iter()
+        .filter_map(|c| {
+            let level = levels
+                .levels
+                .iter()
+                .find(|l| l.column == *c && l.name != *c && !l.parent.eq_ignore_ascii_case("ID"))?;
+            Some(err(format!(
+                "`{line}`: `{c}` is the column of the level `{name}`, which is nested in \
+                 `{parent}`. As a column, `{c}` groups rows by its value within ID, so rows \
+                 with the same value in two groups of `{parent}` share one block, while the \
+                 level keeps them apart. Write `by {name}` to group by the level.",
+                name = level.name,
+                parent = level.parent
+            )))
+        })
+        .collect()
+}
+
+/// `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA` (#1082 PR5, gate B): a `cs` correlation over
+/// exactly the groups of a level that carries a kappa. The kappa already gives the rows of
+/// each group one shared random effect, which is the correlation `cs` adds, so `ρ` and the
+/// kappa variance are not identified together: exactly the same covariance for an additive
+/// kappa (#1081 measured −198.095096 both ways), a near-duplicate for one that enters
+/// multiplicatively.
+///
+/// The test is on the **partition**, not on names: in every subject with an observation,
+/// the `cs` blocks group the observation rows exactly as the level's groups do (a row in no
+/// block is a group of its own). So `cs by ARMID`, a column numbering the arms across the
+/// whole file, is caught next to `kappa … at ARM`. Any level counts — each nested level
+/// carrying a kappa, and the occasions of a one-level model (`iov_column`, or the derived
+/// `iov_occasion` rule, applied here as the fit applies it). `ar1` and `car1` decay with the
+/// lag, so they are never refused, and neither is `cs` over a grouping no kappa is at.
+fn residual_correlation_confounded(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let Some(hit) = kappa_partition_matches(model, population, iov_rule)
+        .into_iter()
+        .find(PartitionMatch::everywhere)
+    else {
+        return Vec::new();
+    };
+    vec![Diagnostic::error(
+        "E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA",
+        format!(
+            "`{line}` correlates the rows in exactly the groups of {grouping}, where the \
+             {kappas_drawn}. A kappa gives every row of a group one shared random effect, \
+             which is the correlation `cs` estimates, so ρ and the kappa variance are not \
+             identified together: the same covariance for an additive kappa, nearly the same \
+             for a multiplicative one. Use `ar1` or `car1`, whose correlation decays with the \
+             lag, or drop the kappa.",
+            grouping = hit.grouping,
+            kappas_drawn = hit.kappas_drawn(),
+        ),
+    )
+    .with_block("error_model")]
+}
+
+/// `W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA` (#1082 PR5): the warning half of
+/// [`residual_correlation_confounded`]. The `cs` blocks coincide with a kappa-carrying
+/// level's groups in **some** subjects but not all. Those subjects carry the same
+/// covariance twice; the rest still separate ρ from the kappa variance, so the model is
+/// identified and fits — possibly weakly, which the covariance step's standard errors
+/// show. Said, not refused: `cs by STUDY` beside a kappa at `ARM` matches in exactly the
+/// subjects whose studies each have one arm, a common MBMA design. And a typo in a `by`
+/// column that splits one group would otherwise switch the refusal off in silence. Not
+/// raised when the refusal fires (every subject matches some grouping).
+fn residual_correlation_partly_confounded(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
+    let Some(line) = residual_correlation_line(model) else {
+        return Vec::new();
+    };
+    let matches = kappa_partition_matches(model, population, iov_rule);
+    if matches.iter().any(PartitionMatch::everywhere) {
+        return Vec::new();
+    }
+    matches
+        .into_iter()
+        .filter(|m| m.matched > 0)
+        .map(|m| {
+            Diagnostic::warning(
+                "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA",
+                &format!(
+                    "`{line}`: in {matched} of {observed} subjects the blocks are exactly the \
+                     groups of {grouping}, where the {kappas_drawn}. In those subjects `cs` and \
+                     the kappa are the same covariance for an additive kappa, nearly the same \
+                     for a multiplicative one, so ρ and the kappa variance are separated only \
+                     by the other {rest}; expect wide standard errors on both. \
+                     If the blocks should differ in every subject, check the `by` column.",
+                    matched = m.matched,
+                    observed = m.observed,
+                    grouping = m.grouping,
+                    kappas_drawn = m.kappas_drawn(),
+                    rest = m.observed - m.matched,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// One kappa-carrying grouping, and in how many subjects a `cs` line's blocks are exactly
+/// its groups.
+struct PartitionMatch {
+    /// "the level `ARM`", or "the occasion grouping" on a one-level model.
+    grouping: String,
+    kappas: Vec<String>,
+    /// Subjects whose blocks partition the rows as the groups do, with a class of two or
+    /// more rows.
+    matched: usize,
+    /// Subjects counted: the matched ones and those whose partitions differ. A subject
+    /// whose partitions agree only trivially (every row its own class) is in neither.
+    observed: usize,
+}
+
+impl PartitionMatch {
+    /// The refusal's case: the partitions agree in every subject (and there is one).
+    fn everywhere(&self) -> bool {
+        self.observed > 0 && self.matched == self.observed
+    }
+
+    /// "kappa K is drawn" / "kappas K, K2 are drawn".
+    fn kappas_drawn(&self) -> String {
+        let (word, verb) = if self.kappas.len() > 1 {
+            ("kappas", "are")
+        } else {
+            ("kappa", "is")
+        };
+        format!("{word} {} {verb} drawn", self.kappas.join(", "))
+    }
+}
+
+/// The one partition count both halves of gate B read (#1082 PR5, decision
+/// 6238324099): for a `cs` line on a model with kappa, per kappa-carrying grouping —
+/// each nested level with a kappa, or the occasions of a one-level model, with a derived
+/// `iov_occasion` rule applied as the fit applies it — the number of subjects whose `cs`
+/// blocks group the observation rows exactly as that grouping's groups do (a row in no
+/// block is a group of its own). Empty for `ar1`, `car1` and models without kappa.
+///
+/// On partitions, not names, so `cs by ARMID`, a column numbering the arms across the
+/// whole file, matches a kappa at `ARM`.
+fn kappa_partition_matches(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<PartitionMatch> {
+    let Some(serial) = &model.residual_serial else {
+        return Vec::new();
+    };
+    if serial.kind != crate::types::ResidualSerialKind::Cs || model.n_kappa == 0 {
+        return Vec::new();
+    }
+    // Each row's class, renumbered from 0 in first-row order; `None` is a class of its own.
+    let canonical = |labels: Vec<Option<u64>>| -> Vec<usize> {
+        let mut seen: Vec<u64> = Vec::new();
+        let mut fresh = labels.len();
+        labels
+            .into_iter()
+            .map(|l| match l {
+                None => {
+                    fresh += 1;
+                    fresh
+                }
+                Some(v) => match seen.iter().position(|s| *s == v) {
+                    Some(i) => i,
+                    None => {
+                        seen.push(v);
+                        seen.len() - 1
+                    }
+                },
+            })
+            .collect()
+    };
+    let blocks = |s: &Subject| {
+        canonical(
+            crate::stats::residual_error::residual_groups(model, s)
+                .into_iter()
+                .map(|g| (g != 0).then_some(u64::from(g)))
+                .collect(),
+        )
+    };
+    let count = |pop: &Population,
+                 grouping: String,
+                 kappas: Vec<String>,
+                 groups: &dyn Fn(&Subject) -> Vec<usize>| {
+        // Per subject: `Some(true)` when the two partitions agree on a class of two or more
+        // rows (an off-diagonal both would add), `Some(false)` when they differ, and `None`
+        // when they agree only trivially — every row its own class (a one-observation
+        // subject, say). `cs` adds no covariance there, so such a subject identifies nothing
+        // either way and is in neither count.
+        let verdicts: Vec<bool> = pop
+            .subjects
+            .iter()
+            .filter_map(|s| {
+                let (g, b) = (groups(s), blocks(s));
+                if g != b {
+                    return Some(false);
+                }
+                let shared_pair = g.iter().enumerate().any(|(j, c)| g[j + 1..].contains(c));
+                shared_pair.then_some(true)
+            })
+            .collect();
+        PartitionMatch {
+            grouping,
+            kappas,
+            matched: verdicts.iter().filter(|&&m| m).count(),
+            observed: verdicts.len(),
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(levels) = model.nested_levels() {
+        for (l, level) in levels.levels.iter().enumerate() {
+            let kappas: Vec<String> = model
+                .kappa_names
+                .iter()
+                .zip(&levels.kappa_level)
+                .filter(|(_, &at)| at == l)
+                .map(|(k, _)| k.clone())
+                .collect();
+            if kappas.is_empty() {
+                continue;
+            }
+            let groups = |s: &Subject| {
+                let mut class = vec![None; s.obs_times.len()];
+                for (g, (_, rows)) in crate::stats::nested_levels::obs_groups_at(levels, s, l)
+                    .into_iter()
+                    .enumerate()
+                {
+                    for j in rows {
+                        class[j] = Some(g as u64);
+                    }
+                }
+                canonical(class)
+            };
+            out.push(count(
+                population,
+                format!("the level `{}`", level.name),
+                kappas,
+                &groups,
+            ));
+        }
+    } else {
+        // The occasions the fit will integrate over: a derived rule labels them only when
+        // the population is prepared, so apply it here as `fit()` does.
+        let derived;
+        let pop = if *iov_rule == IovOccasionRule::Column {
+            population
+        } else {
+            let mut p = population.clone();
+            apply_iov_occasion_rule(&mut p, iov_rule, false, &mut Vec::new());
+            derived = p;
+            &derived
+        };
+        let groups = |s: &Subject| {
+            canonical(
+                (0..s.obs_times.len())
+                    .map(|j| s.occasions.get(j).map(|&o| u64::from(o)))
+                    .collect(),
+            )
+        };
+        out.push(count(
+            pop,
+            "the occasion grouping".to_string(),
+            model.kappa_names.clone(),
+            &groups,
+        ));
+    }
+    out
 }
 
 /// What `residual_correlation_range` checks ρ's range on.
@@ -7542,12 +7885,30 @@ pub fn check_model_data_warnings(
     population: &Population,
     init_params: &ModelParameters,
 ) -> Vec<Diagnostic> {
+    check_model_data_warnings_rule(model, population, init_params, &IovOccasionRule::Column)
+}
+
+/// [`check_model_data_warnings`] aware of the model-side IOV occasion rule, which the one
+/// warning on derived occasions needs (`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`,
+/// #1082 PR5). `ferx check` reads the data as written and passes the fit's
+/// `iov_occasion`, as it does to [`check_model_data_rule`]; `fit()` runs the walk on the
+/// population it has already prepared, whose occasions the rule has labelled, so
+/// [`check_model_data_warnings`] serves it.
+pub(crate) fn check_model_data_warnings_rule(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
     diags.extend(residual_correlation_inert(model, population));
+    diags.extend(residual_correlation_partly_confounded(
+        model, population, iov_rule,
+    ));
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
@@ -8971,10 +9332,11 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                         &parsed.fit_options.iov_occasion,
                     ));
                     let init_params = parsed.model.default_params.clone();
-                    diags.extend(check_model_data_warnings(
+                    diags.extend(check_model_data_warnings_rule(
                         &parsed.model,
                         &population,
                         &init_params,
+                        &parsed.fit_options.iov_occasion,
                     ));
                     // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
                     // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /

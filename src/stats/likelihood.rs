@@ -1164,11 +1164,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if semantics != PredNllSemantics::ConditionalIov
-        && residual_cov.is_dense()
-        && !m3
-        && !has_frem_rows
-    {
+    if residual_cov.is_dense() && !m3 && !has_frem_rows {
         // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
         // for the SAEM M-step, so no EKF process noise enters here.
         match dense_residual_data_term(
@@ -2798,21 +2794,42 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // `block_sigma` + IOV is rejected up front (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so a
+    // dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ.
+    let residual_cov = model.residual_cov_theta(theta);
     if interaction {
-        foce_subject_nll_interaction(
-            subject,
-            &ipreds,
-            &b_hat,
-            &h_full,
-            &sigma_b,
-            sigma_values,
-            &model.error_spec,
-            model.bloq_in_force(),
-            &p_obs_iov,
-            None, // IOV + FREM unsupported (guarded above)
-            model.residual_error_eta,
-            ruv_mult.as_deref(),
-        )
+        // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
+        // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
+        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal.
+        if !residual_cov.is_dense() {
+            foce_subject_nll_interaction(
+                subject,
+                &ipreds,
+                &b_hat,
+                &h_full,
+                &sigma_b,
+                sigma_values,
+                &model.error_spec,
+                model.bloq_in_force(),
+                &p_obs_iov,
+                None, // IOV + FREM unsupported (guarded above)
+                model.residual_error_eta,
+                ruv_mult.as_deref(),
+            )
+        } else {
+            foce_subject_nll_interaction_dense_cov(
+                subject,
+                &ipreds,
+                &b_hat,
+                &h_full,
+                &sigma_b,
+                sigma_values,
+                &model.error_spec,
+                residual_cov,
+                &p_obs_iov,
+                ruv_mult.as_deref(),
+            )
+        }
     } else {
         // FOCE (no interaction): evaluate R at the population prediction with
         // all random effects zero (η=0, κ=0), matching the non-IOV marginal so
@@ -2828,10 +2845,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
             &sigma_b,
             sigma_values,
             &model.error_spec,
-            // `block_sigma` + IOV is rejected up front
-            // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
-            // practice and the estimated-ρ threading (#847) never reaches here.
-            model.residual_cov_theta(theta),
+            residual_cov,
             model.bloq_in_force(),
             &p_obs_iov,
             None,
@@ -3546,24 +3560,47 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
-    for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
-            Some(vv) => vv,
-            None => {
-                model.residual_variance_at_scaled(
-                    err_keys[j],
-                    frozen_var_preds.map_or(f_pred, |f0| f0[j]),
-                    sigma_values,
-                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                ) * ruv_scale
+    // A dense `R` (a `correlation … by` line, #1082 PR5) scores the whole subject with
+    // the non-IOV objective's data term, on the same predicate: `R` at `f₀` for a FOCE
+    // EBE search (`frozen_var_preds`), at the conditional predictions otherwise.
+    let residual_cov = model.residual_cov_theta(theta);
+    let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if residual_cov.is_dense() && !has_censored_m3 && !has_frem_rows {
+        match dense_residual_data_term(
+            model,
+            subject,
+            &preds,
+            frozen_var_preds.unwrap_or(&preds[..]),
+            sigma_values,
+            residual_cov,
+            ruv_scale,
+            &[],
+            ruv_mult.as_deref(),
+        ) {
+            Some(term) => data_ll += term,
+            None => return 1e20,
+        }
+    } else {
+        for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+                Some(vv) => vv,
+                None => {
+                    model.residual_variance_at_scaled(
+                        err_keys[j],
+                        frozen_var_preds.map_or(f_pred, |f0| f0[j]),
+                        sigma_values,
+                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                    ) * ruv_scale
+                }
+            };
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if model.bloq_in_force().is_censored_row(cens) {
+                data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
+            } else {
+                let resid = y - f_pred;
+                data_ll += resid * resid / v + v.ln();
             }
-        };
-        let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if model.bloq_in_force().is_censored_row(cens) {
-            data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
-        } else {
-            let resid = y - f_pred;
-            data_ll += resid * resid / v + v.ln();
         }
     }
 
