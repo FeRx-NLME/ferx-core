@@ -61,7 +61,9 @@ use nalgebra::{DMatrix, DVector};
 /// monomorphisation of the recorder stack, so the ladder trades a little padding at
 /// in-between widths for compile time and binary size; the cap is the η-Hessian payload's
 /// `N(N+1)/2` per operation, not any derivative limit.
-const WIDTH_BUCKETS: [usize; 10] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24];
+/// A model without random effects pads to 1: an inert direction with a unit prior, as
+/// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
+const WIDTH_BUCKETS: [usize; 9] = [1, 2, 3, 4, 6, 8, 12, 16, 24];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -161,6 +163,8 @@ pub(super) struct Scoped<'m> {
     pub width: usize,
     pub bucket: usize,
     pub eta: Vec<f64>,
+    /// The subject's layout under IOV, built once for every recording of the subject.
+    pub layout: Option<crate::stats::stacked_layout::StackedLayout>,
 }
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
@@ -177,7 +181,7 @@ pub(super) fn scope<'m>(
         return None;
     }
     let params = unpack_params(x, template);
-    let (model, width, eta) = resolve(model, subject, &params.theta, eta_hat)?;
+    let (model, width, eta, lay) = resolve(model, subject, &params.theta, eta_hat, None)?;
     if !likelihood_supported(model, subject, &params) {
         return None;
     }
@@ -220,6 +224,7 @@ pub(super) fn scope<'m>(
         width,
         bucket: eta.len(),
         eta,
+        layout: lay.map(std::borrow::Cow::into_owned),
     })
 }
 
@@ -228,8 +233,6 @@ pub(super) fn scope<'m>(
 macro_rules! by_bucket {
     ($w:expr, $f:ident, ($($arg:expr),*)) => {
         match $w {
-            // No random effects: `Ψ = F`, an empty `H`.
-            0 => $f::<0, 0>($($arg),*),
             1 => $f::<1, 1>($($arg),*),
             2 => $f::<2, 3>($($arg),*),
             3 => $f::<3, 6>($($arg),*),
@@ -254,21 +257,48 @@ pub(crate) fn subject_adjoint_gradient(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     let interaction = objective != Objective::Foce;
-    let sc = scope(model, subject, template, x, eta_hat, interaction)?;
+    let mut sc = scope(model, subject, template, x, eta_hat, interaction)?;
+    let objective = match objective {
+        // No random effects: both anchors are the empty `H`, and `Ψ = F`.
+        Objective::Agq { n_agq, exact: true } if sc.width == 0 => Objective::Agq {
+            n_agq,
+            exact: false,
+        },
+        // The exact anchor's recording runs at its own buckets: pad to one.
+        Objective::Agq { exact: true, .. } => {
+            sc.bucket = EXACT_ANCHOR_BUCKETS.into_iter().find(|&b| b >= sc.width)?;
+            sc.eta.resize(sc.bucket, 0.0);
+            objective
+        }
+        objective => objective,
+    };
     fn go<const N: usize, const M: usize>(
         sc: &Scoped,
         subject: &Subject,
         template: &ModelParameters,
         x: &[f64],
         objective: Objective,
-    ) -> Option<Vec<f64>> {
+    ) -> Option<Vec<f64>>
+    where
+        Bucket<N, M>: ExactAnchor<N, M>,
+    {
         match objective {
             Objective::Agq { n_agq, exact } => run_agq::<N, M>(
-                sc.model, subject, template, &sc.params, x, &sc.eta, n_agq, exact, sc.width,
+                sc.model,
+                subject,
+                sc.layout.as_ref(),
+                template,
+                &sc.params,
+                x,
+                &sc.eta,
+                n_agq,
+                exact,
+                sc.width,
             ),
             _ => run::<N, M>(
                 sc.model,
                 subject,
+                sc.layout.as_ref(),
                 template,
                 &sc.params,
                 x,
@@ -468,15 +498,123 @@ fn record_analytic<T: VmNum>(
     let prog = crate::sens::provider::analytic_param_program(model)?;
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
-    let preds = crate::sens::provider::analytic_static_predictions(
-        model,
-        subject,
-        &pk,
-        |slot| by_slot.get(slot).copied().flatten(),
-        th,
-        et,
-    )?;
+    let preds = match pk_space_predictions(model, subject, &pk, &by_slot) {
+        Some(preds) => preds,
+        None => crate::sens::provider::analytic_static_predictions(
+            model,
+            subject,
+            &pk,
+            |slot| by_slot.get(slot).copied().flatten(),
+            th,
+            et,
+        )?,
+    };
     closed_form_finish(model, subject, theta, eta, th, et, prog, preds)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the generic closed form even where the PK-space path applies, for
+    /// the twin that pins the two against each other.
+    pub(super) static PK_SPACE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Recordings the PK-space path served, so a test can see it ran.
+    pub(super) static PK_SPACE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The static closed form in **PK space**: each observation's concentration as a function
+/// of the subject's `P` live PK parameters `p` (the slots `by_slot` tapes), over a tape-free
+/// `P`-direction second-order dual, then lifted onto `T` through its second-order Taylor
+/// polynomial in `δp = p − p₀`, recorded as one node per observation.
+///
+/// The static subject's parameters are one set for every observation, so `f_j(η, θ) =
+/// c_j(p(η, θ))`; the polynomial reproduces every jet of `c_j ∘ p` of total order ≤ 2 —
+/// value, `∂/∂η`, `∂²/∂η²`, and the tape's first θ-derivative of the value and η-tangents —
+/// which is everything a [`PkNum::TAYLOR2_EXACT`] type carries. The generic path instead
+/// runs the closed form itself over `T`: every operation carries the η-Hessian payload and,
+/// where it meets θ, a tape node, so its cost grows with `n_η`; this one's grows with `P`
+/// and writes `n_obs` nodes (#2093 review: the forward provider's PK-space kernels).
+///
+/// `None` — the caller takes the generic path — for a type that is not
+/// [`PkNum::TAYLOR2_EXACT`] (the exact anchor's taped Hessian, the covariance step's nested
+/// duals), for more live slots than the widest small bucket, when an analytic `init(...)`
+/// reads θ and η directly, or outside the static path's scope.
+fn pk_space_predictions<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    by_slot: &[Option<T>],
+) -> Option<Vec<T>> {
+    #[cfg(test)]
+    if PK_SPACE_OFF.with(|c| c.get()) {
+        return None;
+    }
+    if !T::TAYLOR2_EXACT || !model.analytical_init.is_empty() {
+        return None;
+    }
+    let live: Vec<(usize, T)> = by_slot
+        .iter()
+        .enumerate()
+        .filter_map(|(s, d)| d.map(|d| (s, d)))
+        .collect();
+    fn go<const P: usize, const MP: usize, T: VmNum>(
+        model: &CompiledModel,
+        subject: &Subject,
+        pk: &crate::types::PkParams,
+        live: &[(usize, T)],
+    ) -> Option<Vec<T>> {
+        let unit = unit_dirs::<P>();
+        let jets = crate::sens::provider::analytic_static_predictions::<DualV<P, MP>>(
+            model,
+            subject,
+            pk,
+            |slot| {
+                let i = live.iter().position(|&(s, _)| s == slot)?;
+                Some(DualV::free(live[i].1.val(), unit[i], [0.0; MP]))
+            },
+            &[],
+            &[],
+        )?;
+        // The polynomial's basis, once per subject: `δp_i`, then `δp_i·δp_j` (i ≤ j) in the
+        // payload's packed order, each with value 0 and the full jet of its product.
+        let n = live.len();
+        let dp: Vec<T> = live
+            .iter()
+            .map(|&(_, d)| d - T::from_f64(d.val()))
+            .collect();
+        let mut basis = dp.clone();
+        for i in 0..n {
+            for j in 0..=i {
+                basis.push(dp[i] * dp[j]);
+            }
+        }
+        let mut coef = vec![0.0; basis.len()];
+        jets.iter()
+            .map(|q| {
+                coef[..n].copy_from_slice(&q.g[..n]);
+                let mut t = n;
+                for i in 0..n {
+                    for j in 0..=i {
+                        let hij = q.h[crate::sens::vtape::tri(i, j)];
+                        coef[t] = if i == j { 0.5 * hij } else { hij };
+                        t += 1;
+                    }
+                }
+                Some(T::lincomb(T::from_f64(q.v), 1.0, &coef, &basis))
+            })
+            .collect()
+    }
+    #[cfg(test)]
+    PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
+    match live.len() {
+        0 => None,
+        1 => go::<1, 1, T>(model, subject, pk, &live),
+        2 => go::<2, 3, T>(model, subject, pk, &live),
+        3 => go::<3, 6, T>(model, subject, pk, &live),
+        4 => go::<4, 10, T>(model, subject, pk, &live),
+        5 | 6 => go::<6, 21, T>(model, subject, pk, &live),
+        7 | 8 => go::<8, 36, T>(model, subject, pk, &live),
+        _ => None,
+    }
 }
 
 /// ODE IOV engine: the event walk fed per-occasion-group parameter sets
@@ -486,6 +624,7 @@ fn record_analytic<T: VmNum>(
 fn record_ode_iov<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
+    layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     eta: &[f64],
     th: &[T],
@@ -493,7 +632,7 @@ fn record_ode_iov<T: VmNum>(
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
-    let layout = ode_iov_walk_scope(model, subject)?;
+    ode_iov_walk_scope(model, subject, layout)?;
     if layout.n_stacked() > et.len() {
         return None;
     }
@@ -680,6 +819,7 @@ fn closed_form_finish<T: VmNum>(
 fn record_analytic_events<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
     th: &[T],
@@ -708,11 +848,11 @@ fn record_analytic_events<T: VmNum>(
     }
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let n_eta = model.n_eta;
-    let layout = iov.then(|| crate::stats::stacked_layout::StackedLayout::of(model, subject));
+    let layout = if iov { Some(lay?) } else { None };
     // The `[η, κ_g]` a record of occasion `occ` reads (κ = 0 for an ungrouped occasion):
     // values for `pk_param_fn`, tape leaves for the program.
     let combined = |occ: u32| -> (Vec<f64>, Vec<T>) {
-        let Some(l) = layout.as_ref() else {
+        let Some(l) = layout else {
             return (eta.to_vec(), et.to_vec());
         };
         let mut v = eta[..n_eta].to_vec();
@@ -760,7 +900,7 @@ fn record_analytic_events<T: VmNum>(
         if per_record {
             return at(occ, cov, time);
         }
-        let key = layout.as_ref().and_then(|l| l.group_of(occ));
+        let key = layout.and_then(|l| l.group_of(occ));
         shared
             .entry(key)
             .or_insert_with(|| at(occ, cov, time))
@@ -867,7 +1007,7 @@ fn record_analytic_events<T: VmNum>(
         else {
             return None;
         };
-        let l = layout.as_ref()?;
+        let l = layout?;
         let group_scale = |occ: u32| -> T {
             let (_, params) = at(occ, &subject.covariates, 0.0);
             let vars: Vec<T> = sprog
@@ -907,6 +1047,7 @@ fn record_analytic_events<T: VmNum>(
 fn record_algebraic<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
     th: &[T],
@@ -925,7 +1066,7 @@ fn record_algebraic<T: VmNum>(
         .as_ref()
         .filter(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)?;
     let iov = model.n_kappa > 0;
-    let layout = iov.then(|| crate::stats::stacked_layout::StackedLayout::of(model, subject));
+    let layout = if iov { Some(lay?) } else { None };
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let per_obs = iov || subject.has_tv_covariates() || uses_time;
     let n_eta = model.n_eta;
@@ -935,7 +1076,7 @@ fn record_algebraic<T: VmNum>(
             None => (&subject.covariates, 0.0),
         };
         // The row's `[η, κ_g]` (κ = 0 for an unlabelled row): values and tape inputs.
-        let (v, d): (Vec<f64>, Vec<T>) = match (layout.as_ref(), j) {
+        let (v, d): (Vec<f64>, Vec<T>) = match (layout, j) {
             (Some(l), Some(j)) => {
                 let g = match subject.occasions.get(j) {
                     Some(&occ) => Some(l.group_of(occ)?),
@@ -986,43 +1127,58 @@ fn record_algebraic<T: VmNum>(
 }
 
 /// The predictions at `η` over the tape (either engine), from the shared leaves.
+///
+/// `lay` is the subject's layout under IOV
+/// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)): the
+/// caller's, so an EBE search builds it once rather than once per recording (#2037), or
+/// built here when the caller has none.
 fn record<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
     th: &[T],
     et: &[T],
 ) -> Option<Vec<T>> {
-    if let Some((eta, et)) = expand_nested(model, subject, eta, et)? {
-        return record_cells(model, subject, theta, &eta, th, &et);
+    let built;
+    let lay = match lay {
+        None if model.n_kappa > 0 => {
+            built = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+            Some(&built)
+        }
+        lay => lay,
+    };
+    if let Some((eta, et)) = expand_nested(model, lay, eta, et)? {
+        return record_cells(model, subject, lay, theta, &eta, th, &et);
     }
-    record_cells(model, subject, theta, eta, th, et)
+    record_cells(model, subject, lay, theta, eta, th, et)
 }
 
 /// [`record`] on inputs laid out per cell: the engine dispatch.
 fn record_cells<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
     th: &[T],
     et: &[T],
 ) -> Option<Vec<T>> {
     if model.is_algebraic() {
-        return record_algebraic(model, subject, theta, eta, th, et);
+        return record_algebraic(model, subject, lay, theta, eta, th, et);
     }
     match (model.ode_spec.is_some(), model.n_kappa > 0) {
-        (true, true) => record_ode_iov(model, subject, theta, eta, th, et),
+        (true, true) => record_ode_iov(model, subject, lay?, theta, eta, th, et),
         (true, false) => record_ode(model, subject, theta, eta, th, et),
-        (false, true) => record_analytic_events(model, subject, theta, eta, th, et),
+        (false, true) => record_analytic_events(model, subject, lay, theta, eta, th, et),
         // Production's own route: the event walk for TV covariates / `TIME` / oral
         // infusion, the `t = 0` static superposition otherwise.
         (false, false)
             if crate::sens::provider::subject_routes_to_event_walk(model, subject)
                 || closed_form_reshapes_f_window(model, subject) =>
         {
-            record_analytic_events(model, subject, theta, eta, th, et)
+            record_analytic_events(model, subject, None, theta, eta, th, et)
         }
         (false, false) => record_analytic(model, subject, theta, eta, th, et),
     }
@@ -1057,6 +1213,7 @@ fn objective<T: crate::sens::num::PkNum, const N: usize>(
 fn canonical_jets<const N: usize, const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<DualV<N, M>>> {
@@ -1065,7 +1222,8 @@ fn canonical_jets<const N: usize, const M: usize>(
     let th: Vec<DualV<N, M>> = theta.iter().map(|&v| DualV::constant(v)).collect();
     let unit = unit_dirs::<N>();
     let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
-    record(model, subject, theta, eta, &th, &et).filter(|p| p.len() == subject.observations.len())
+    record(model, subject, lay, theta, eta, &th, &et)
+        .filter(|p| p.len() == subject.observations.len())
 }
 
 /// The model the predictor would evaluate for this subject (a closed-form absorption model
@@ -1077,19 +1235,36 @@ fn canonical_jets<const N: usize, const M: usize>(
 /// each derivative is over the vector the EBE search moves. `None` when `eta` is not the
 /// subject's width or a dispatch bucket's, and for a nested-level subject no recording
 /// lays out (see [`nested_levels_outside_scope`]).
-fn resolve<'m>(
+#[allow(clippy::type_complexity)]
+fn resolve<'m, 'l>(
     model: &'m CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-) -> Option<(&'m CompiledModel, usize, Vec<f64>)> {
-    let (eff, w, mut e) = if model.n_kappa > 0 {
+    layout: Option<&'l crate::stats::stacked_layout::StackedLayout>,
+) -> Option<(
+    &'m CompiledModel,
+    usize,
+    Vec<f64>,
+    Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
+)> {
+    let (eff, w, mut e, lay) = if model.n_kappa > 0 {
         if nested_levels_outside_scope(model) {
             return None;
         }
         let eff = crate::pk::effective_model_for_eval_iov(model, subject, theta, eta);
-        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)?;
-        (eff, layout.n_axes(), layout.to_axes(eta)?)
+        // The caller's layout is the subject's under any route: an ODE twin has the
+        // model's `n_eta` / `n_kappa`, and one without the model's levels is declined above.
+        let lay = match layout {
+            Some(l) => std::borrow::Cow::Borrowed(l),
+            None => std::borrow::Cow::Owned(crate::stats::stacked_layout::StackedLayout::sens_of(
+                eff, subject,
+            )?),
+        };
+        if model.has_nested_levels() && lay.nested().is_none() {
+            return None;
+        }
+        (eff, lay.n_axes(), lay.to_axes(eta)?, Some(lay))
     } else {
         if eta.len() != model.n_eta {
             return None;
@@ -1098,10 +1273,21 @@ fn resolve<'m>(
             crate::pk::effective_model_for_eval(model, subject, theta, eta),
             model.n_eta,
             eta.to_vec(),
+            None,
         )
     };
     e.resize(WIDTH_BUCKETS.into_iter().find(|&b| b >= w)?, 0.0);
-    Some((eff, w, e))
+    Some((eff, w, e, lay))
+}
+
+/// The number of random effects a recording of `subject` is over: `n_eta`, the stacked
+/// `[η, κ]` under IOV, or the compact axes under nested levels; `None` for a nested-level
+/// subject never given its cells.
+pub(crate) fn subject_width(model: &CompiledModel, subject: &Subject) -> Option<usize> {
+    if model.n_kappa == 0 {
+        return Some(model.n_eta);
+    }
+    Some(crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?.n_axes())
 }
 
 /// Whether a model carries kappa together with a residual `correlation … by` line (#1082
@@ -1127,14 +1313,15 @@ pub(crate) fn nested_levels_outside_scope(model: &CompiledModel) -> bool {
 /// derivative direction. `None` without nested levels (the inputs are the stack itself).
 fn expand_nested<T: Copy>(
     model: &CompiledModel,
-    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     eta: &[f64],
     et: &[T],
 ) -> Option<Option<(Vec<f64>, Vec<T>)>> {
     if !model.has_nested_levels() {
         return Some(None);
     }
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let layout = lay?;
+    layout.nested()?;
     let n_eta = layout.n_eta();
     if et.len() < layout.n_axes() || eta.len() < layout.n_axes() {
         return None;
@@ -1163,18 +1350,23 @@ pub(crate) fn exact_eta_jacobian(
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
         theta: &[f64],
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, theta, eta)?;
+        let p = canonical_jets::<N, 0>(model, subject, lay, theta, eta)?;
         Some(DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]))
     }
-    let (model, w, eta) = resolve(model, subject, theta, eta)?;
+    let (model, w, eta, lay) = resolve(model, subject, theta, eta, None)?;
     if model.is_sde() {
         return None;
     }
-    by_bucket!(eta.len(), go, (model, subject, theta, &eta, w))
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), theta, &eta, w)
+    )
 }
 
 /// Per observation `(f, ∂f/∂η)` at `eta` (the stacked `[η, κ]` under IOV) from one
@@ -1186,8 +1378,21 @@ pub(crate) fn exact_obs_grads(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    exact_obs_grads_in(model, subject, None, theta, eta)
+}
+
+/// [`exact_obs_grads`] over a caller-built `layout` (the subject's
+/// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of) under
+/// IOV), so an EBE search builds it once rather than once per gradient (#2037).
+pub(crate) fn exact_obs_grads_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<crate::sens::provider::ObsGrad>> {
     let mut rows = Vec::new();
-    exact_obs_grads_into(model, subject, theta, eta, &mut rows).then_some(rows)
+    exact_obs_grads_into(model, subject, layout, theta, eta, &mut rows).then_some(rows)
 }
 
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
@@ -1196,6 +1401,7 @@ pub(crate) fn exact_obs_grads(
 pub(crate) fn exact_obs_grads_into(
     model: &CompiledModel,
     subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
     rows: &mut Vec<crate::sens::provider::ObsGrad>,
@@ -1203,12 +1409,13 @@ pub(crate) fn exact_obs_grads_into(
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
         theta: &[f64],
         eta: &[f64],
         w: usize,
         rows: &mut Vec<crate::sens::provider::ObsGrad>,
     ) -> Option<()> {
-        let p = canonical_jets::<N, 0>(model, subject, theta, eta)?;
+        let p = canonical_jets::<N, 0>(model, subject, lay, theta, eta)?;
         rows.resize_with(p.len(), || crate::sens::provider::ObsGrad {
             f: 0.0,
             df_deta: Vec::new(),
@@ -1223,13 +1430,19 @@ pub(crate) fn exact_obs_grads_into(
         }
         Some(())
     }
-    let Some((model, w, eta_p)) = resolve(model, subject, theta, eta) else {
+    let Some((model, w, eta_p, lay)) = resolve(model, subject, theta, eta, layout) else {
         return false;
     };
     if model.is_sde() {
         return false;
     }
-    if by_bucket!(eta_p.len(), go, (model, subject, theta, &eta_p, w, rows)).is_none() {
+    if by_bucket!(
+        eta_p.len(),
+        go,
+        (model, subject, lay.as_deref(), theta, &eta_p, w, rows)
+    )
+    .is_none()
+    {
         return false;
     }
     // A FREM covariate pseudo-observation predicts `θ_i + η_e`, with `∂f/∂η = e_e`.
@@ -1265,12 +1478,13 @@ pub(crate) fn exact_inner_hessian(
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
         params: &ModelParameters,
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
         use crate::sens::rtape::DualH;
-        let p = canonical_jets::<N, M>(model, subject, &params.theta, eta)?;
+        let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -1304,11 +1518,15 @@ pub(crate) fn exact_inner_hessian(
         let h = DMatrix::from_fn(w, w, |a, b| l.hess(a, b));
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
-    let (model, w, eta) = resolve(model, subject, &params.theta, eta)?;
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
     if !likelihood_supported(model, subject, params) {
         return None;
     }
-    by_bucket!(eta.len(), go, (model, subject, params, &eta, w))
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), params, &eta, w)
+    )
 }
 
 /// FOCEI's Gauss–Newton `H̃` at `eta` (the stacked `[η, κ]` under IOV), the kernel's on
@@ -1322,11 +1540,12 @@ pub(crate) fn exact_htilde(
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
         params: &ModelParameters,
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, &params.theta, eta)?;
+        let p = canonical_jets::<N, 0>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -1339,7 +1558,7 @@ pub(crate) fn exact_htilde(
         let h = DMatrix::from_fn(w, w, |a, b| ht[a][b]);
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
-    let (model, w, eta) = resolve(model, subject, &params.theta, eta)?;
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
     let iov_mismatch = model.n_kappa > 0
         && (subject.fremtype.iter().any(|&ft| ft > 0)
             || model
@@ -1348,7 +1567,11 @@ pub(crate) fn exact_htilde(
     if iov_mismatch || !likelihood_supported(model, subject, params) {
         return None;
     }
-    by_bucket!(eta.len(), go, (model, subject, params, &eta, w))
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), params, &eta, w)
+    )
 }
 
 /// The exact inner gradient `∇_η l` at `eta` (the stacked `[η, κ]` under IOV): the
@@ -1363,15 +1586,28 @@ pub(crate) fn exact_inner_gradient(
     eta: &[f64],
     frozen: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    exact_inner_gradient_in(model, subject, None, params, eta, frozen)
+}
+
+/// [`exact_inner_gradient`] over a caller-built `layout`, as [`exact_obs_grads_in`].
+pub(crate) fn exact_inner_gradient_in(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    params: &ModelParameters,
+    eta: &[f64],
+    frozen: Option<&[f64]>,
+) -> Option<Vec<f64>> {
     fn go<const N: usize, const M: usize>(
         model: &CompiledModel,
         subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
         params: &ModelParameters,
         eta: &[f64],
         frozen: Option<&[f64]>,
         w: usize,
     ) -> Option<Vec<f64>> {
-        let p = canonical_jets::<N, 0>(model, subject, &params.theta, eta)?;
+        let p = canonical_jets::<N, 0>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
@@ -1383,7 +1619,7 @@ pub(crate) fn exact_inner_gradient(
         let gr = inner_grad(&ctx, &f, &g, &e, &pv, frozen)?;
         gr.iter().all(|v| v.is_finite()).then(|| gr[..w].to_vec())
     }
-    let (model, w, eta) = resolve(model, subject, &params.theta, eta)?;
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, layout)?;
     // IOV scores FREM rows by a sentinel and a coupled residual row-wise; neither is the
     // kernel's `l`.
     let iov_mismatch = model.n_kappa > 0
@@ -1394,7 +1630,11 @@ pub(crate) fn exact_inner_gradient(
     if iov_mismatch || !likelihood_supported(model, subject, params) {
         return None;
     }
-    by_bucket!(eta.len(), go, (model, subject, params, &eta, frozen, w))
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), params, &eta, frozen, w)
+    )
 }
 
 /// How many leading θ the recordings take as leaves: those the parameter program reads,
@@ -1606,6 +1846,7 @@ fn packed_gradient(
 fn run<const N: usize, const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     template: &ModelParameters,
     params: &ModelParameters,
     x: &[f64],
@@ -1622,7 +1863,7 @@ fn run<const N: usize, const M: usize>(
     let th = theta_leaves::<N, M, false>(theta_axis(model)?, theta);
     let unit = unit_dirs::<N>();
     let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
-    let preds = record(model, subject, theta, eta, &th, &et)?;
+    let preds = record(model, subject, lay, theta, eta, &th, &et)?;
     let n_obs = preds.len();
     if n_obs != subject.observations.len() {
         return None;
@@ -1634,6 +1875,7 @@ fn run<const N: usize, const M: usize>(
         let p0 = record(
             model,
             subject,
+            lay,
             theta,
             &zeros,
             &th,
@@ -1814,6 +2056,7 @@ fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
 fn run_agq<const N: usize, const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     template: &ModelParameters,
     params: &ModelParameters,
     x: &[f64],
@@ -1821,7 +2064,10 @@ fn run_agq<const N: usize, const M: usize>(
     n_agq: usize,
     exact: bool,
     active: usize,
-) -> Option<Vec<f64>> {
+) -> Option<Vec<f64>>
+where
+    Bucket<N, M>: ExactAnchor<N, M>,
+{
     use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let ctx = LikCtx::new(model, subject, params);
@@ -1832,7 +2078,7 @@ fn run_agq<const N: usize, const M: usize>(
     let eta_a: [f64; N] = std::array::from_fn(|k| eta[k]);
 
     // ---- 1. values at η̂ (an untaped canonical pass): f, G, Q; the exact H and the anchor
-    let p1 = canonical_jets::<N, M>(model, subject, theta, eta)?;
+    let p1 = canonical_jets::<N, M>(model, subject, lay, theta, eta)?;
     let lift_h = |x: f64| DualH {
         v: x,
         g: [0.0; N],
@@ -1909,17 +2155,105 @@ fn run_agq<const N: usize, const M: usize>(
         }
     }
     if exact {
-        agq_taped::<N, M, N, true>(
-            model, subject, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner, exact,
+        <Bucket<N, M> as ExactAnchor<N, M>>::taped(
+            model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
             active,
         )
     } else {
         agq_taped::<N, M, M, false>(
-            model, subject, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner, exact,
-            active,
+            model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
+            exact, active,
         )
     }
 }
+
+/// The exact anchor's dispatch widths: its own, shorter ladder. Its recording carries `1 + 2N`
+/// components per scalar on a taped Hessian sweep, its own dual family (`DualV<N, N, true>`)
+/// that every width instantiates in full — so it pads to these rather than to every
+/// [`WIDTH_BUCKETS`] entry (#2093 review), at the cost of a few inert directions on the
+/// widths between.
+const EXACT_ANCHOR_BUCKETS: [usize; 4] = [2, 4, 8, 24];
+
+/// A [`WIDTH_BUCKETS`] width as a type, so whether the exact anchor's taped recording is
+/// instantiated at it is decided at compile time ([`ExactAnchor`]).
+struct Bucket<const N: usize, const M: usize>;
+
+/// The exact anchor's taped half ([`agq_taped`] in its directional second-order mode) at
+/// one bucket: the recording at an [`EXACT_ANCHOR_BUCKETS`] width, `None` at any other —
+/// which [`subject_adjoint_gradient`] never reaches, since it pads an exact-anchor subject
+/// to an exact-anchor bucket first.
+trait ExactAnchor<const N: usize, const M: usize> {
+    #[allow(clippy::too_many_arguments)]
+    fn taped(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        template: &ModelParameters,
+        params: &ModelParameters,
+        x: &[f64],
+        eta: &[f64],
+        ctx: &LikCtx,
+        so: &StackedOmega,
+        pv: &ParT<f64>,
+        p1: &[DualV<N, M>],
+        grid: &[([f64; N], f64, [f64; N])],
+        h_inner: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+        active: usize,
+    ) -> Option<Vec<f64>>;
+}
+
+macro_rules! exact_anchor_buckets {
+    (taped: $(($n:literal, $m:literal)),*; declined: $(($dn:literal, $dm:literal)),*) => {
+        $(impl ExactAnchor<$n, $m> for Bucket<$n, $m> {
+            fn taped(
+                model: &CompiledModel,
+                subject: &Subject,
+                lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+                template: &ModelParameters,
+                params: &ModelParameters,
+                x: &[f64],
+                eta: &[f64],
+                ctx: &LikCtx,
+                so: &StackedOmega,
+                pv: &ParT<f64>,
+                p1: &[DualV<$n, $m>],
+                grid: &[([f64; $n], f64, [f64; $n])],
+                h_inner: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+                active: usize,
+            ) -> Option<Vec<f64>> {
+                agq_taped::<$n, $m, $n, true>(
+                    model, subject, lay, template, params, x, eta, ctx, so, pv, p1, grid,
+                    h_inner, true, active,
+                )
+            }
+        })*
+        $(impl ExactAnchor<$dn, $dm> for Bucket<$dn, $dm> {
+            fn taped(
+                _: &CompiledModel,
+                _: &Subject,
+                _: Option<&crate::stats::stacked_layout::StackedLayout>,
+                _: &ModelParameters,
+                _: &ModelParameters,
+                _: &[f64],
+                _: &[f64],
+                _: &LikCtx,
+                _: &StackedOmega,
+                _: &ParT<f64>,
+                _: &[DualV<$dn, $dm>],
+                _: &[([f64; $dn], f64, [f64; $dn])],
+                _: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+                _: usize,
+            ) -> Option<Vec<f64>> {
+                None
+            }
+        })*
+    };
+}
+
+exact_anchor_buckets!(
+    taped: (2, 3), (4, 10), (8, 36), (24, 300);
+    declined: (1, 1), (3, 6), (6, 21), (12, 78), (16, 136)
+);
 
 /// The taped half of [`run_agq`]: the node recordings, the scalar-tape objective, the
 /// recording at `η̂` along the seed directions, and the two sweeps. `M2`/`TH` is the
@@ -1928,6 +2262,7 @@ fn run_agq<const N: usize, const M: usize>(
 fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     model: &CompiledModel,
     subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     template: &ModelParameters,
     params: &ModelParameters,
     x: &[f64],
@@ -1962,6 +2297,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             record(
                 model,
                 subject,
+                lay,
                 theta,
                 b,
                 &th,
@@ -2085,7 +2421,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     };
     // The recording at η̂, along `dirs` (tangent m is the derivative along column m).
     let et = eta_leaves::<N, M2, TH>(eta, &dirs);
-    let p2 = record(model, subject, theta, eta, &th, &et)?;
+    let p2 = record(model, subject, lay, theta, eta, &th, &et)?;
     if p2.len() != n_obs {
         return None;
     }
@@ -2163,7 +2499,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
 
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
-pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};
+pub(crate) use hessian::{cov_width_declines, subject_adjoint_cov_hessian, subject_adjoint_eta_dx};
 
 #[cfg(test)]
 #[path = "ode_adjoint_tests.rs"]

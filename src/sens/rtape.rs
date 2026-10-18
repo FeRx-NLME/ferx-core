@@ -268,6 +268,10 @@ impl PkNum for R {
     fn jets_finite(self) -> bool {
         true
     }
+    /// A reverse-only scalar carries no local jet: its derivative is the tape's.
+    fn jet_max_abs(self) -> f64 {
+        0.0
+    }
     fn lift2(self, v: f64, d1: f64, _d2: f64) -> Self {
         R::n1(v, self, d1)
     }
@@ -303,8 +307,8 @@ pub struct DualT<const N: usize, B: Copy> {
 }
 
 impl<const N: usize, B: PkNum> DualT<N, B> {
-    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
-    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
+    const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualT {
@@ -549,11 +553,29 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     fn jets_finite(self) -> bool {
         self.g.iter().all(|x| x.val().is_finite())
     }
+    /// The tangents, and the base's own jets of the value and of each tangent.
+    fn jet_max_abs(self) -> f64 {
+        crate::sens::num::nan_max_abs(
+            std::iter::once(self.v.jet_max_abs())
+                .chain(self.g.iter().flat_map(|x| [x.val(), x.jet_max_abs()])),
+        )
+    }
     /// `φ(self)` with `φ = v`, `φ′ = d1`, `φ″ = d2`: the tangent factor `φ′(x)` is lifted
     /// on the base with derivative `φ″`, so a reverse sweep over the tangents is exact.
     fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
         let d = self.v.lift2(d1, d2, 0.0);
         self.chain(self.v.lift2(v, d1, d2), d)
+    }
+    /// The value lifted on the base with the derivatives it tracks, and the tangent factor
+    /// `φ′` with one order fewer each — so a base carrying orders of its own is exact.
+    fn lift3(self, v: f64, d1: f64, d2: f64, d3: f64) -> Self {
+        self.chain(self.v.lift3(v, d1, d2, d3), self.v.lift2(d1, d2, d3))
+    }
+    fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> Self {
+        self.chain(
+            self.v.lift4(v, d1, d2, d3, d4),
+            self.v.lift3(d1, d2, d3, d4),
+        )
     }
 }
 
@@ -573,8 +595,8 @@ pub struct DualH<const N: usize, const M: usize, B: Copy, const D: bool = false>
 }
 
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
-    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
-    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
+    const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualH {
@@ -839,16 +861,35 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
     fn jets_finite(self) -> bool {
         self.g.iter().all(|x| x.val().is_finite()) && self.h.iter().all(|x| x.val().is_finite())
     }
+    /// The gradient and Hessian, and the base's own jets of the value and of each entry.
+    fn jet_max_abs(self) -> f64 {
+        crate::sens::num::nan_max_abs(
+            std::iter::once(self.v.jet_max_abs()).chain(
+                self.g
+                    .iter()
+                    .chain(&self.h)
+                    .flat_map(|x| [x.val(), x.jet_max_abs()]),
+            ),
+        )
+    }
     /// Without `φ‴` the base cannot differentiate the Hessian's `φ″` factor; exact only
     /// for an affine lift (`φ″ = 0`), else the jet is poisoned with NaN rather than
     /// silently truncated. Callers with a curved `φ` use [`PkNum::lift3`].
     fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
         self.lift3(v, d1, d2, if d2 == 0.0 { 0.0 } else { f64::NAN })
     }
+    /// Without `φ⁗` the base cannot differentiate the `φ‴` its `φ″` factor needs: exact
+    /// only over a first-order base. Over the covariance step's `DualT` base that is `NaN`,
+    /// as in [`Self::lift2`]; callers with a known `φ⁗` use [`PkNum::lift4`].
     fn lift3(self, v: f64, d1: f64, d2: f64, d3: f64) -> Self {
-        let p1 = self.v.lift2(d1, d2, d3);
-        let p2 = self.v.lift2(d2, d3, f64::NAN);
-        self.chain2(self.v.lift2(v, d1, d2), p1, p2)
+        self.lift4(v, d1, d2, d3, f64::NAN)
+    }
+    /// The value, `φ′` and `φ″` factors lifted on the base, each with the derivatives
+    /// after it.
+    fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> Self {
+        let p1 = self.v.lift3(d1, d2, d3, d4);
+        let p2 = self.v.lift2(d2, d3, d4);
+        self.chain2(self.v.lift4(v, d1, d2, d3, d4), p1, p2)
     }
 }
 

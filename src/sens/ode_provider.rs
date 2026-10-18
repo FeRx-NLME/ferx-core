@@ -1423,12 +1423,14 @@ fn seed_tvcov_snapshots<T: Clone>(
     Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
 }
 
-/// The IOV event walk's structural scope (its layout), without the forward provider's
-/// dual-width cap: the adjoint gradient's width is the stacked η alone.
+/// The IOV event walk's structural scope for `subject` (whose `layout` the caller built),
+/// without the forward provider's dual-width cap: the adjoint gradient's width is the
+/// stacked η alone.
 pub(crate) fn ode_iov_walk_scope(
     model: &CompiledModel,
     subject: &Subject,
-) -> Option<crate::stats::stacked_layout::StackedLayout> {
+    layout: &crate::stats::stacked_layout::StackedLayout,
+) -> Option<()> {
     if !ode_iov_model_scope(model) {
         return None;
     }
@@ -1501,11 +1503,7 @@ pub(crate) fn ode_iov_walk_scope(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
-    if layout.n_groups() == 0 {
-        return None;
-    }
-    Some(layout)
+    (layout.n_groups() > 0).then_some(())
 }
 
 /// Whether the IOV ODE walk must seed each event individually (its own occasion ×

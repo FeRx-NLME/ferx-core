@@ -12,7 +12,33 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 /// than a call, while inlining it into every closed form, event walk and ODE step was most
 /// of the binary (#486); narrow duals — small models' hot path — stay inlined. Decided
 /// per type at compile time from `size_of::<Self>()`, so nested duals are covered too.
-pub(crate) const OUTLINE_BYTES: usize = 256;
+/// 192 rather than 256 takes the 6-direction gradient dual (`DualV<6, 21>`, 228 B, 8 MB of
+/// inlined code) out of line; every narrower width stays inlined.
+pub(crate) const OUTLINE_BYTES: usize = 192;
+
+/// Direction count from which a dual is outlined whatever its size: every `N ≥ 8` bucket
+/// serves a rare wide fit, and inlining its lane loops cost 4–7 MB of binary per
+/// instantiation where the outlined copy costs ~0.5 MB (measured on the release binary,
+/// #2093 review). Below it, [`OUTLINE_BYTES`] decides.
+pub(crate) const OUTLINE_DIRECTIONS: usize = 8;
+
+/// Whether a dual with `n` directions and `size` bytes runs its arithmetic out of line.
+pub(crate) const fn outlined(n: usize, size: usize) -> bool {
+    n >= OUTLINE_DIRECTIONS || size > OUTLINE_BYTES
+}
+
+/// The largest `|x|` over `xs`, or `NaN` when any is `NaN` — the fold behind every
+/// [`PkNum::jet_max_abs`] override, so a `NaN` jet fails the comparison it feeds rather than
+/// being discarded by `f64::max`.
+pub(crate) fn nan_max_abs(xs: impl IntoIterator<Item = f64>) -> f64 {
+    xs.into_iter().fold(0.0_f64, |m, x| {
+        if x.is_nan() || m.is_nan() {
+            f64::NAN
+        } else {
+            m.max(x.abs())
+        }
+    })
+}
 
 pub trait PkNum:
     Copy
@@ -31,6 +57,12 @@ pub trait PkNum:
     /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
     /// skip building a Hessian it would discard (e.g. `tvcov_init_state` on the inner walk).
     const SECOND_ORDER: bool;
+    /// Whether every derivative this type carries is of total order ≤ 2 in its inputs, so a
+    /// function of a few intermediates may be replaced by its second-order Taylor polynomial
+    /// in them without changing any jet (the adjoint's PK-space closed form,
+    /// `sens::ode_adjoint`). `false` unless an implementor opts in; a type whose taped or
+    /// nested parts differentiate a second-order jet again must not.
+    const TAYLOR2_EXACT: bool = false;
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -111,6 +143,15 @@ pub trait PkNum:
     #[inline]
     fn lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self {
         self.lift2(v, d1, d2)
+    }
+
+    /// [`Self::lift3`] with the fourth derivative `d4 = φ⁗` too, for the covariance step's
+    /// nested dual (`sens::rtape::DualH` over `DualT` over the reverse tape), which carries
+    /// four orders: a Laplace exact-anchor R-matrix differentiates `∂²f/∂η²` twice more.
+    /// The default drops `d4`, which is exact for every type tracking fewer orders.
+    #[inline]
+    fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self {
+        self.lift3(v, d1, d2, d3)
     }
 
     /// `u + h·(c₀k₀ + c₁k₁ + …)` with exactly this association (left-to-right sum,

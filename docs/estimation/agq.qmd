@@ -370,7 +370,7 @@ subject.
 
 The analytic route is taken for every subject a recorder serves with a Gaussian
 likelihood, including IOV (correlated blocks shared across occasions), LTBS and
-observation scaling. The exact anchor is served up to four random effects (stacked under
+observation scaling. The exact anchor is served up to eight random effects (stacked under
 IOV) and the Gauss–Newton anchor up to 24. A subject outside the scope is
 finite-differenced on its own, and a mixture or `gradient = fd` keeps the whole-population
 stencil. The anchor must be positive-definite at the subject's **mode**. At a quadrature

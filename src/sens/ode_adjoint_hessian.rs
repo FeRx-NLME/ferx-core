@@ -59,11 +59,7 @@ pub(crate) fn subject_adjoint_cov_hessian(
         eta_hat,
         objective != Objective::Foce,
     )?;
-    // Its own, shorter bucket ladder (the covariance step runs once per fit, so padding is
-    // cheap while every bucket instantiates the recorders over a nested dual). The inner
-    // η-dual carries `(f, G)`; only the exact anchor, which differentiates `Q` as well,
-    // carries it too, and only up to width 4 so a value stays a few kilobytes.
-    let bucket = HESSIAN_BUCKETS.into_iter().find(|&b| b >= sc.width)?;
+    let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
     let exact = matches!(objective, Objective::Agq { exact: true, .. });
@@ -72,16 +68,54 @@ pub(crate) fn subject_adjoint_cov_hessian(
     // thread so every fit-scoped override (`bloq_method`, …) it reads is the fit's.
     match (bucket, exact) {
         (4, true) => hessian_with::<4, 10, DualH<4, 10, f64>>(&sc, subject, template, x, objective),
-        (_, true) => None,
+        (8, true) => hessian_with::<8, 36, DualH<8, 36, f64>>(&sc, subject, template, x, objective),
         (4, _) => hessian_with::<4, 10, DualT<4, f64>>(&sc, subject, template, x, objective),
+        (6, _) => hessian_with::<6, 21, DualT<6, f64>>(&sc, subject, template, x, objective),
         (8, _) => hessian_with::<8, 36, DualT<8, f64>>(&sc, subject, template, x, objective),
         (24, _) => hessian_with::<24, 300, DualT<24, f64>>(&sc, subject, template, x, objective),
         _ => None,
     }
 }
 
-/// The Hessian's dispatch widths (see [`subject_adjoint_cov_hessian`]).
-const HESSIAN_BUCKETS: [usize; 3] = [4, 8, 24];
+/// The Hessian's dispatch widths: its own, shorter ladder (the covariance step runs once per
+/// fit, so padding is cheap while every bucket instantiates the recorders over a nested
+/// dual).
+const HESSIAN_BUCKETS: [usize; 4] = [4, 6, 8, 24];
+
+/// The exact anchor's Hessian widths. Its inner η-dual carries `Q` as well as `(f, G)`, so
+/// a value is `(1 + K + K(K+1)/2) · (1 + N + N(N+1)/2)` f64: ~5 kB at `N = 4`, ~16 kB at
+/// `N = 8`, within the fit pool's worker stacks (`FIT_RAYON_STACK_SIZE`); ~117 kB at 24 is
+/// not, so it stops at 8 (a 5- or 6-effect subject pads to 8).
+const EXACT_ANCHOR_HESSIAN_BUCKETS: [usize; 2] = [4, 8];
+
+/// The widest subject the exact anchor's Hessian serves.
+pub(crate) const EXACT_ANCHOR_HESSIAN_WIDTH: usize =
+    EXACT_ANCHOR_HESSIAN_BUCKETS[EXACT_ANCHOR_HESSIAN_BUCKETS.len() - 1];
+
+/// The Hessian dispatch bucket for a subject `width` random effects wide (the stacked or
+/// compact `[η, κ]` under IOV) under `objective`, or `None` when none serves it: past the
+/// widest bucket, or past [`EXACT_ANCHOR_HESSIAN_WIDTH`] under the exact anchor. The one
+/// width rule the dispatch runs on and [`cov_width_declines`] reports, so the covariance
+/// step's decline diagnostics cannot promise a route the dispatch refuses.
+pub(crate) fn hessian_bucket(width: usize, objective: Objective) -> Option<usize> {
+    let ladder: &[usize] = if matches!(objective, Objective::Agq { exact: true, .. }) {
+        &EXACT_ANCHOR_HESSIAN_BUCKETS
+    } else {
+        &HESSIAN_BUCKETS
+    };
+    ladder.iter().copied().find(|&b| b >= width)
+}
+
+/// Whether `subject` is too wide for any Hessian bucket under `objective`
+/// ([`hessian_bucket`]); `false` when its width is not known (an unprepared nested-level
+/// subject, which the model-level and per-subject declines report).
+pub(crate) fn cov_width_declines(
+    model: &CompiledModel,
+    subject: &Subject,
+    objective: Objective,
+) -> bool {
+    super::subject_width(model, subject).is_some_and(|w| hessian_bucket(w, objective).is_none())
+}
 
 /// The exact mode response `dη̂/dx` (one `n_eta`-vector, stacked `[η, κ]` under IOV, per
 /// packed coordinate) at the EBE `eta_hat` of `unpack_params(x)`: the EBE warm-start
@@ -100,7 +134,7 @@ pub(crate) fn subject_adjoint_eta_dx(
         Objective::Foce
     };
     let mut sc = scope(model, subject, template, x, eta_hat, interaction)?;
-    let bucket = HESSIAN_BUCKETS.into_iter().find(|&b| b >= sc.width)?;
+    let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
     fn go<const N: usize, const M: usize, J: Jet<N>>(
@@ -305,7 +339,15 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             h: zero_h(),
         })
         .collect();
-    let preds = record(model, subject, &params.theta, eta, &th, &et)?;
+    let preds = record(
+        model,
+        subject,
+        sc.layout.as_ref(),
+        &params.theta,
+        eta,
+        &th,
+        &et,
+    )?;
     if preds.len() != n_obs {
         return None;
     }
@@ -345,7 +387,15 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             let fpop: Option<Vec<Out>> =
                 if !interaction && model.error_spec.has_f_dependent_variance() {
                     let et0 = vec![Out::<J>::constant(0.0); N];
-                    let p0 = record(model, subject, &params.theta, &[0.0; N], &th, &et0)?;
+                    let p0 = record(
+                        model,
+                        subject,
+                        sc.layout.as_ref(),
+                        &params.theta,
+                        &[0.0; N],
+                        &th,
+                        &et0,
+                    )?;
                     (p0.len() == n_obs).then(|| p0.iter().map(|y| comp(y, 0)).collect())
                 } else {
                     None
@@ -415,8 +465,16 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         eo[k] + Out::constant(std::f64::consts::SQRT_2) * step[k]
                     });
                     let bv: Vec<f64> = b.iter().map(|v| v.v).collect();
-                    let fb = record(model, subject, &params.theta, &bv, &th_o, &b)
-                        .filter(|q| q.len() == n_obs)?;
+                    let fb = record(
+                        model,
+                        subject,
+                        sc.layout.as_ref(),
+                        &params.theta,
+                        &bv,
+                        &th_o,
+                        &b,
+                    )
+                    .filter(|q| q.len() == n_obs)?;
                     terms.push(Out::constant(c) - inner_l(ctx, &fb, &b, &p, None)?);
                 }
                 let mx = terms.iter().map(|t| t.v).fold(f64::NEG_INFINITY, f64::max);

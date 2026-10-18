@@ -932,6 +932,108 @@ fn ode_steady_state_dose_matches_reconverged_fd() {
     assert!(worst < 1e-5, "worst relative difference {worst:.2e}");
 }
 
+/// A certified-linear `[odes]` model (#852): `ode_method = auto` resolves to the exact
+/// matrix-exponential path, with an estimated lagtime and a peripheral compartment.
+const TWOCPT_DEPOT_LINEAR_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  theta TVKA(1.3,  0.01, 50.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_KA ~ 0.10
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central, peripheral])
+[odes]
+  d/dt(depot)      = -KA * depot
+  d/dt(central)    =  KA * depot - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The adjoint on the exact linear path (#852, Teun on #2093): its recordings run the
+/// matrix exponential over the tape types, whose derivative self-check reads
+/// `jet_max_abs`. Each subject's gradient must match reconverged FD, and the recording
+/// must have taken the exact path: no integrator step and no declined segment. Its rk45
+/// twin is the straddle — the same recording, stepped — so a fixture that silently
+/// integrated would be seen.
+#[test]
+fn adjoint_on_the_exact_linear_path_matches_reconverged_fd() {
+    use crate::ode::solver::SolverStatsScope;
+    let model = parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).unwrap();
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    let mut rk45 = parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).unwrap();
+    rk45.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::OdeMethod::Rk45;
+    let eta_ref = [0.1, -0.05, 0.08];
+    let multidose = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let infusion = vec![
+        DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 2, 25.0, false, 0.0),
+    ];
+    let steady = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    for (label, doses, times) in [
+        (
+            "multidose",
+            multidose,
+            &[0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0][..],
+        ),
+        ("infusion", infusion, &[1.0, 3.0, 5.0, 9.0, 16.0][..]),
+        ("steady state", steady, &[0.6, 2.0, 6.0, 11.5][..]),
+    ] {
+        let s = subject(&model, doses, times, &eta_ref);
+        let steps = |m: &CompiledModel| {
+            let params = moved_params(m);
+            let x = pack_params(&params);
+            let eta = ebe_for(m, &s, &params, 1e-10, true);
+            let scope = SolverStatsScope::enter();
+            subject_adjoint_packed_gradient(m, &s, &params, &x, eta.as_slice(), true)
+                .expect("in scope");
+            let st = scope.collected();
+            (st.attempted_steps, st.linear_declined_segments)
+        };
+        assert_eq!(
+            steps(&model),
+            (0, 0),
+            "{label}: the exact path stepped or declined"
+        );
+        assert!(steps(&rk45).0 > 0, "{label}: the rk45 twin must step");
+        let worst = parity(&model, &s);
+        eprintln!("linear exact path, {label}: worst {worst:.2e}");
+        // Measured 2.3e-6 / 1.9e-6 / 5.3e-7 (multidose / infusion / SS) vs reconverged FD;
+        // 4× headroom over the worst.
+        assert!(
+            worst < 1e-5,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
 /// A subject skeleton with the given doses and observation times (no DV yet).
 fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
     let n = times.len();
@@ -1895,7 +1997,7 @@ fn laplace_kernel<const N: usize, const M: usize>(
     eta: &[f64],
 ) -> f64 {
     use crate::sens::rtape::DualH;
-    let jets = canonical_jets::<N, M>(model, s, &params.theta, eta).expect("recorded η-jets");
+    let jets = canonical_jets::<N, M>(model, s, None, &params.theta, eta).expect("recorded η-jets");
     let fh: Vec<DualH<N, M, f64>> = jets
         .iter()
         .map(|p| DualH {
@@ -2543,6 +2645,225 @@ fn hessian_gaps_for(model: &CompiledModel, s: &Subject, objective: Objective) ->
     (vs_fd, f64::NAN)
 }
 
+/// [`ONE_CPT_ORAL`] with `n` random effects (`n ≥ 3`): the extra ones add to CL, V and KA's
+/// exponents in turn, each with its own variance, so every effect is identifiable.
+fn one_cpt_oral_n_eta(n: usize) -> String {
+    let mut omegas = String::new();
+    let mut sums = [String::new(), String::new(), String::new()];
+    for k in 0..n {
+        omegas.push_str(&format!("  omega E{k} ~ {:.3}\n", 0.02 + 0.01 * k as f64));
+        sums[k % 3].push_str(&format!(" + E{k}"));
+    }
+    format!(
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n{omegas}  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(0{})\n  V = TVV * exp(0{})\n  \
+         KA = TVKA * exp(0{})\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        sums[0], sums[1], sums[2]
+    )
+    .replace("exp(0 + ", "exp(")
+}
+
+/// The width rule the covariance diagnostics report (`cov_width_declines`) is the one the
+/// Hessian dispatch runs on: a nine-effect subject is declined under the exact anchor and
+/// served under FOCEI, and each answer is checked against the dispatch itself, so the
+/// regularization warning cannot promise a route the dispatch refuses (Copilot on #2093).
+/// The PK-space closed form (`pk_space_predictions`) against the generic one it replaces on
+/// static closed-form subjects: the FOCEI and FOCE gradients, the η-Jacobian and the exact
+/// inner Hessian agree to rounding, on 1-/2-compartment fixtures with 2 to 5 live PK
+/// parameters (block Ω, combined error, lag + LTBS, infusions). A Taylor term dropped or
+/// misweighted is a gap of order the term itself, far above this bound; the hit counter
+/// shows the fast path ran, and the Laplace exact anchor (order 3) shows it stood aside.
+#[test]
+fn the_pk_space_closed_form_is_the_generic_one() {
+    use super::{PK_SPACE_HITS, PK_SPACE_OFF};
+    let two_doses = |rate: f64| {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, rate, false, 0.0),
+        ]
+    };
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
+        (
+            "1-cpt oral",
+            parse_model_string(ONE_CPT_ORAL).unwrap(),
+            two_doses(0.0),
+            vec![0.1, -0.05, 0.2],
+        ),
+        (
+            "2-cpt iv infusion, block Ω, combined",
+            parse_model_string(TWO_CPT_IV_COMBINED).unwrap(),
+            two_doses(50.0),
+            vec![0.1, -0.05],
+        ),
+        (
+            "1-cpt oral, lag + LTBS",
+            parse_model_string(ONE_CPT_ORAL_LAG_LTBS).unwrap(),
+            two_doses(0.0),
+            vec![0.1, -0.05, 0.1],
+        ),
+        (
+            "1-cpt oral, 5 η",
+            parse_model_string(&one_cpt_oral_n_eta(5)).unwrap(),
+            two_doses(0.0),
+            vec![0.1, -0.05, 0.2, 0.03, -0.02],
+        ),
+    ];
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let mut worst = 0.0f64;
+    for (label, model, doses, eta_ref) in &cases {
+        let s = subject(model, doses.clone(), &TIMES, eta_ref);
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, &s, &params, 1e-10, interaction);
+            let both = |off: bool| {
+                PK_SPACE_OFF.with(|c| c.set(off));
+                PK_SPACE_HITS.with(|c| c.set(0));
+                let g = subject_adjoint_packed_gradient(
+                    model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    interaction,
+                )
+                .expect("in scope");
+                let j =
+                    exact_eta_jacobian(model, &s, &params.theta, eta.as_slice()).expect("jacobian");
+                let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
+                let hits = PK_SPACE_HITS.with(|c| c.get());
+                PK_SPACE_OFF.with(|c| c.set(false));
+                (g, j, h, hits)
+            };
+            let (g0, j0, h0, off_hits) = both(true);
+            let (g1, j1, h1, hits) = both(false);
+            assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
+            assert!(
+                hits >= 3,
+                "{label}: the PK-space path did not run ({hits} hits)"
+            );
+            for (a, b) in g1
+                .iter()
+                .zip(&g0)
+                .chain(j1.iter().zip(j0.iter()))
+                .chain(h1.iter().zip(h0.iter()))
+            {
+                assert!(a.is_finite() && b.is_finite(), "{label}");
+                worst = worst.max(rel(*a, *b));
+            }
+            assert!(
+                g0.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
+                "{label}: a vanishing gradient tests nothing"
+            );
+        }
+    }
+    eprintln!("PK-space vs generic closed form: worst relative gap {worst:.2e}");
+    // Measured 9.6e-15: rounding (the polynomial and the closed form associate
+    // differently); 100× headroom, still ten orders below a misweighted Taylor term.
+    assert!(worst < 1e-12, "PK-space vs generic: {worst:.2e}");
+    // The exact anchor's recording tapes the η-Hessian (order 3): the fast path stands aside.
+    let (_, model, doses, eta_ref) = &cases[0];
+    let s = subject(model, doses.clone(), &TIMES, eta_ref);
+    let params = moved_params(model);
+    let x = pack_params(&params);
+    let eta = ebe_for(model, &s, &params, 1e-10, true);
+    PK_SPACE_HITS.with(|c| c.set(0));
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    subject_adjoint_gradient(model, &s, &params, &x, eta.as_slice(), laplace).expect("in scope");
+    let taped_hits = PK_SPACE_HITS.with(|c| c.get());
+    let canonical = 1; // the untaped canonical pass at η̂ (`canonical_jets`) is order 2
+    assert_eq!(
+        taped_hits, canonical,
+        "the taped exact-anchor recording must take the generic path"
+    );
+}
+
+#[test]
+fn the_covariance_width_rule_is_the_dispatchs() {
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let doses = || {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ]
+    };
+    let three = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let nine = parse_model_string(&one_cpt_oral_n_eta(9)).unwrap();
+    assert_eq!(nine.n_eta, 9);
+    let s3 = subject(&three, doses(), &TIMES, &[0.1, -0.05, 0.2]);
+    let s9 = subject(&nine, doses(), &TIMES, &[0.05; 9]);
+    let served = |m: &CompiledModel, s: &Subject, objective: Objective| {
+        let params = moved_params(m);
+        let x = pack_params(&params);
+        let eta = ebe_for(m, s, &params, 1e-10, true);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    subject_adjoint_cov_hessian(m, s, &params, &x, eta.as_slice(), objective)
+                        .is_some()
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+    };
+    for (label, m, s, objective, declines) in [
+        ("3 η, Laplace", &three, &s3, laplace, false),
+        ("9 η, Laplace", &nine, &s9, laplace, true),
+        ("9 η, FOCEI", &nine, &s9, Objective::Focei, false),
+    ] {
+        assert_eq!(cov_width_declines(m, s, objective), declines, "{label}");
+        assert_eq!(
+            served(m, s, objective),
+            !declines,
+            "{label}: the dispatch disagrees"
+        );
+    }
+    assert_eq!(super::hessian::EXACT_ANCHOR_HESSIAN_WIDTH, 8);
+}
+
+/// The Hessian buckets past the first: a five-effect subject runs FOCEI / FOCE on the
+/// 6-wide bucket and Laplace's exact anchor on its 8-wide one (padded), each against the
+/// reconverged FD of the adjoint gradient.
+#[test]
+fn cov_hessian_matches_profile_fd_on_the_wider_buckets() {
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    assert_eq!(five.n_eta, 5);
+    let s = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    for (objective, name) in [
+        (Objective::Focei, "FOCEI (bucket 6)"),
+        (Objective::Foce, "FOCE (bucket 6)"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            "Laplace (bucket 8)",
+        ),
+    ] {
+        let (fd, _) = hessian_gaps_for(&five, &s, objective);
+        // Measured 2.0e-8 / 9.6e-8 / 6.6e-8 (FOCEI / FOCE / Laplace); 10× headroom.
+        assert!(fd < 1e-6, "{name} vs FD {fd:.2e}");
+    }
+}
+
 #[test]
 fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
@@ -2736,9 +3057,10 @@ fn mixture_class_gradient_matches_reconverged_fd_under_the_class_guard() {
     );
 }
 
+/// A two-η covariate-NN model (`tanh` hidden layer, `softplus` output) off its `init`
+/// symmetric point, and a two-dose subject on its predictions with residuals of both signs.
 #[cfg(feature = "nn")]
-#[test]
-fn covariate_nn_matches_reconverged_fd() {
+fn covariate_nn_fixture() -> (CompiledModel, Subject) {
     let src = r#"
 [parameters]
   theta TVQ(6.0, 0.1, 50.0)
@@ -2799,9 +3121,45 @@ fn covariate_nn_matches_reconverged_fd() {
         in_scope(&model, &s),
         "the recorders must serve a covariate-NN subject"
     );
+    (model, s)
+}
+
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_matches_reconverged_fd() {
+    let (model, s) = covariate_nn_fixture();
     let fd = fd_oracle(&model, &s, true);
     eprintln!("covariate NN FOCEI vs reconverged FD {fd:.2e}");
     assert!(fd < 1e-5, "covariate NN FOCEI vs FD {fd:.2e}");
+}
+
+/// The exact anchor through a `tanh` network: its taped-Hessian sweep differentiates the
+/// activation's `φ″` (`DualV::lift3`), and the covariance step's nested dual its `φ‴`
+/// (`DualH::lift4`). With either order missing the sweep records `NaN` and the subject
+/// declines to finite differences, which `fd_oracle_agq` / `hessian_gaps_for` refuse
+/// (they `expect` the adjoint), so each order has its own failing assertion here.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_exact_anchor_gradient_and_hessian_match_fd() {
+    let (model, s) = covariate_nn_fixture();
+    for (n_agq, name) in [(1, "Laplace"), (3, "AGQ-3 exact")] {
+        let worst = fd_oracle_agq(&model, &s, n_agq, true);
+        eprintln!("covariate NN {name} gradient vs reconverged FD {worst:.2e}");
+        assert!(
+            worst < 1e-5,
+            "covariate NN {name} gradient vs FD {worst:.2e}"
+        );
+    }
+    let (fd, _) = hessian_gaps_for(
+        &model,
+        &s,
+        Objective::Agq {
+            n_agq: 1,
+            exact: true,
+        },
+    );
+    eprintln!("covariate NN Laplace Hessian vs reconverged FD {fd:.2e}");
+    assert!(fd < 1e-5, "covariate NN Laplace Hessian vs FD {fd:.2e}");
 }
 
 #[test]

@@ -238,6 +238,16 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
     }
+    // A nested-level subject never given its cells has no compact axes (#1082): every
+    // recording declines it (`StackedLayout::sens_of` is `None`), on every model class.
+    if crate::stats::nested_levels::unprepared(model, subject) {
+        return "nested-level subject without level cells";
+    }
+    if crate::sens::ode_provider::adjoint::subject_width(model, subject)
+        .is_some_and(|w| w > crate::sens::ode_provider::adjoint::MAX_WIDTH)
+    {
+        return "stacked [η, κ] past the widest dispatch bucket";
+    }
     // Reached only for an FD subject (the caller invokes this after
     // `iov_inner_subject_route(..).is_none()`): a shape no recorder serves.
     "subject outside IOV analytic scope"
@@ -2528,9 +2538,10 @@ fn find_ebe_iov(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        crate::sens::ode_provider::adjoint::exact_inner_gradient(
+        crate::sens::ode_provider::adjoint::exact_inner_gradient_in(
             model,
             subject,
+            layout.as_ref(),
             params,
             &stacked_true,
             frozen,
@@ -3564,7 +3575,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let _ = cached_schedule;
     let mut sens = std::mem::take(obs_grad_recycle);
     if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
-        model, subject, theta, eta, &mut sens,
+        model, subject, None, theta, eta, &mut sens,
     ) {
         *obs_grad_recycle = sens;
         return None;
@@ -3883,8 +3894,13 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // otherwise — so the gradient below is over the vector the EBE search moves.
     let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens =
-        crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, stacked_true)?;
+    let sens = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+        model,
+        subject,
+        Some(layout),
+        theta,
+        stacked_true,
+    )?;
     let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),

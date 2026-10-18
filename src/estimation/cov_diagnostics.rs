@@ -84,8 +84,10 @@ impl CovHessianSource {
 /// Why the exact analytic covariance R-matrix was not used, named at the clause that declined
 /// it (#520 C2).
 ///
-/// The variants are in one-to-one correspondence with the clauses of the scope gate in
-/// [`crate::sens::provider`] plus the three gates
+/// The variants are in one-to-one correspondence with the clauses that keep a fit off the
+/// adjoint's profile Hessian: the recorders' model scope
+/// (`sens::ode_provider::adjoint::recorder_in_scope`), its width rule
+/// (`adjoint::cov_width_declines`), and the gates
 /// [`crate::estimation::covariance::compute_covariance`] applies before it. There is exactly
 /// one implementation: the gate itself returns these values and the routing decision tests
 /// whether the first one exists, so the clauses a user is told about cannot drift from the
@@ -102,6 +104,9 @@ pub(crate) enum CovScopeDecline {
     GradientFd,
     /// A non-Gaussian data term (`[event_model]` TTE, `[binary_model]`, CTMM).
     NonGaussianEndpoint,
+    /// A subject has more random effects than the analytic R-matrix's widest bucket serves
+    /// under the fit's objective (`sens::ode_provider::adjoint::cov_width_declines`).
+    TooManyRandomEffects,
     /// Every model-level clause passed but the per-subject assembly still bailed (a per-point
     /// provider decline, a non-finite block, an occasion/κ length mismatch, …).
     PerSubjectBail,
@@ -114,12 +119,13 @@ impl CovScopeDecline {
     /// in production enumerates the enum — without it the lib target reports it dead and
     /// `preflight.sh`'s `-Dunused` turns that into a hard error.
     #[cfg(test)]
-    pub(crate) const ALL: [CovScopeDecline; 6] = [
+    pub(crate) const ALL: [CovScopeDecline; 7] = [
         CovScopeDecline::Disabled,
         CovScopeDecline::Mixture,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::GradientFd,
         CovScopeDecline::NonGaussianEndpoint,
+        CovScopeDecline::TooManyRandomEffects,
         CovScopeDecline::PerSubjectBail,
     ];
 
@@ -134,6 +140,10 @@ impl CovScopeDecline {
             CovScopeDecline::GradientFd => "gradient = fd",
             CovScopeDecline::NonGaussianEndpoint => {
                 "the model has a non-Gaussian endpoint ([event_model] / [binary_model])"
+            }
+            CovScopeDecline::TooManyRandomEffects => {
+                "a subject has more random effects than the analytic R-matrix serves \
+                 (8 under Laplace's exact anchor, 24 otherwise)"
             }
             CovScopeDecline::PerSubjectBail => {
                 "at least one subject fell outside the analytic assembly"

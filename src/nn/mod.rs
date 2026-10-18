@@ -166,7 +166,14 @@ impl Activation {
             Activation::Tanh => {
                 let t = v.tanh();
                 let d1 = 1.0 - t * t;
-                x.lift3(t, d1, -2.0 * t * d1, -2.0 * d1 * (1.0 - 3.0 * t * t))
+                // tanh⁽ⁿ⁾ through n = 4: the covariance step's nested dual reads all four.
+                x.lift4(
+                    t,
+                    d1,
+                    -2.0 * t * d1,
+                    -2.0 * d1 * (1.0 - 3.0 * t * t),
+                    8.0 * t * d1 * (2.0 - 3.0 * t * t),
+                )
             }
             Activation::Sigmoid => {
                 if v >= 0.0 {

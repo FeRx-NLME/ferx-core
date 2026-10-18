@@ -370,12 +370,15 @@ fn log_phi<T: PkNum>(z: T) -> T {
     let h = crate::stats::special::inv_mills(zv);
     let h1 = -h * (zv + h);
     // (log Φ)‴ = h″ = −h′(z + h) − h(1 + h′): the Laplace kernel's second-order dual
-    // differentiates the `(log Φ)″` factor.
-    z.lift3(
+    // differentiates the `(log Φ)″` factor; (log Φ)⁗ = h‴ = −h″(z + 2h) − 2h′(1 + h′), for
+    // the covariance step's nested dual.
+    let h2 = -h1 * (zv + h) - h * (1.0 + h1);
+    z.lift4(
         crate::stats::special::log_normal_cdf(zv),
         h,
         h1,
-        -h1 * (zv + h) - h * (1.0 + h1),
+        h2,
+        -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1),
     )
 }
 

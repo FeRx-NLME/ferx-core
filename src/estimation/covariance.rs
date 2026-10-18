@@ -761,6 +761,20 @@ pub(crate) fn fixed_ebe_subject_score(
     gi
 }
 
+/// The objective the analytic R-matrix differentiates: the one the fit minimised (see
+/// `analytic_cov_hessian`).
+fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
+    use crate::sens::ode_provider::adjoint::Objective;
+    match options.agq_nodes() {
+        Some(n_agq) => Objective::Agq {
+            n_agq,
+            exact: options.hessian_anchor() != HessianAnchor::GaussNewton,
+        },
+        None if options.interaction => Objective::Focei,
+        None => Objective::Foce,
+    }
+}
+
 /// **Every** clause that kept this fit off the exact analytic covariance R-matrix (#520 C2).
 ///
 /// All of them, not the first: the remedy sentence promises that an action "moves the fit onto
@@ -768,9 +782,10 @@ pub(crate) fn fixed_ebe_subject_score(
 /// declined. Dropping `gradient = fd` does not move a non-Gaussian model, and enabling
 /// `analytic_cov_hessian` does not move a mixture — both were promised unconditionally before
 /// (#1508 review §3). The three model-level gates are therefore collected side by side rather
-/// than short-circuited, and the per-subject walk uses
-/// [`crate::sens::provider::covariance_scope_declines`], the exhaustive half of the same gate
-/// the routing decision runs.
+/// than short-circuited, and the per-subject width clause asks
+/// `sens::ode_provider::adjoint::cov_width_declines`, the rule the Hessian dispatch itself
+/// runs on — so a five-effect Laplace fit with `analytic_cov_hessian = false` is told that
+/// enabling the flag would not move it (Copilot review on #2093).
 ///
 /// Returns an empty vec only when the analytic route was in fact taken — so a caller that has
 /// already observed `analytic_cov_hessian(..) == None` and still finds nothing here has found a
@@ -796,9 +811,8 @@ fn analytic_cov_declines(
         out.push(CovScopeDecline::Mixture);
     }
     // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
-    // the model (a shape no recorder serves, a non-Gaussian endpoint) or the user's
-    // `gradient = fd` opt-out from analytic derivatives.
-    let _ = population;
+    // the model (a shape no recorder serves, a non-Gaussian endpoint), a subject wider than
+    // its buckets, or the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -807,6 +821,14 @@ fn analytic_cov_declines(
     }
     if model.has_non_gaussian() {
         out.push(CovScopeDecline::NonGaussianEndpoint);
+    }
+    let objective = cov_objective(options);
+    if population
+        .subjects
+        .iter()
+        .any(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
+    {
+        out.push(CovScopeDecline::TooManyRandomEffects);
     }
     if out.is_empty() {
         out.push(CovScopeDecline::PerSubjectBail);
@@ -935,15 +957,8 @@ pub(super) fn analytic_cov_assembly(
     // differentiates every one of these objectives — FOCE (its frozen-variance mode
     // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
     // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian, Objective};
-    let objective = match options.agq_nodes() {
-        Some(n_agq) => Objective::Agq {
-            n_agq,
-            exact: options.hessian_anchor() != HessianAnchor::GaussNewton,
-        },
-        None if options.interaction => Objective::Focei,
-        None => Objective::Foce,
-    };
+    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian;
+    let objective = cov_objective(options);
     let n = x_hat.len();
     let per_subject: Vec<Option<DMatrix<f64>>> = population
         .subjects
@@ -2802,6 +2817,63 @@ mod tests {
     };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
+
+    /// Copilot on #2093: a nine-effect Laplace fit with `analytic_cov_hessian = false` is
+    /// told about the width clause too, so the remedy sentence (gated on the flag clearing
+    /// *every* clause) no longer promises the analytic route. Three effects, the flag alone.
+    #[test]
+    fn analytic_cov_declines_names_a_subject_too_wide_for_the_exact_anchor() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::types::{EstimationMethod, FitOptions, Population, Subject};
+        let model = |n_extra: usize| {
+            let extra: String = (0..n_extra)
+                .map(|k| format!("  omega ETA_X{k} ~ 0.02\n"))
+                .collect();
+            let sum: String = (0..n_extra).map(|k| format!(" + ETA_X{k}")).collect();
+            crate::parser::model_parser::parse_model_string(&format!(
+                "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+                 theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n\
+                 omega ETA_KA ~ 0.3\n{extra}  sigma PROP_ERR ~ 0.04\n\
+                 [individual_parameters]\n  CL = TVCL * exp(ETA_CL{sum})\n\
+                 V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n\
+                 [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            ))
+            .unwrap()
+        };
+        let population = Population {
+            subjects: vec![Subject::default()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let options = FitOptions {
+            method: EstimationMethod::Laplace,
+            analytic_cov_hessian: false,
+            ..FitOptions::default()
+        };
+        for (n_extra, want) in [
+            (0, vec![CovScopeDecline::Disabled]),
+            (
+                6,
+                vec![
+                    CovScopeDecline::Disabled,
+                    CovScopeDecline::TooManyRandomEffects,
+                ],
+            ),
+        ] {
+            let m = model(n_extra);
+            assert_eq!(m.n_eta, 3 + n_extra);
+            assert_eq!(
+                super::analytic_cov_declines(&m, &population, &options, false),
+                want,
+                "{} η",
+                m.n_eta
+            );
+        }
+    }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
 

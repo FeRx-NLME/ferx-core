@@ -272,8 +272,8 @@ pub struct DualV<const N: usize, const M: usize, const TH: bool = false> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
-    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::OUTLINE_BYTES`]).
-    const WIDE: bool = std::mem::size_of::<Self>() > crate::sens::num::OUTLINE_BYTES;
+    /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
+    const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline(always)]
     pub fn constant(v: f64) -> Self {
         DualV {
@@ -625,6 +625,10 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
 
 impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     const SECOND_ORDER: bool = true;
+    /// The tape differentiates the value and the η-tangents once in θ, and the η-Hessian
+    /// payload is untaped: order ≤ 2 throughout. The exact-anchor mode (`TH`) tapes the
+    /// payload too, which is order 3.
+    const TAYLOR2_EXACT: bool = !TH;
     fn from_f64(x: f64) -> Self {
         DualV::constant(x)
     }
@@ -719,11 +723,22 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     fn jets_finite(self) -> bool {
         self.g.iter().all(|x| x.is_finite()) && self.h.iter().all(|x| x.is_finite())
     }
+    /// The η-tangents and their Hessian payload. The θ side lives on the tape and has no
+    /// local jet; the linear propagator's self-check sees the η side only.
+    fn jet_max_abs(self) -> f64 {
+        crate::sens::num::nan_max_abs(self.g.iter().chain(&self.h).copied())
+    }
     fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
         // `lift2` carries no `φ‴`: a taped-Hessian sweep through it would be wrong, so it
         // poisons that sweep with NaN (non-finite → the caller's finiteness backstop)
-        // rather than silently differentiate a truncated rule. No recording calls it.
+        // rather than silently differentiate a truncated rule. A curved `φ` with a known
+        // `φ‴` goes through `lift3`.
         self.unary(v, d1, d2, || f64::NAN)
+    }
+    /// Exact on every `DualV` mode: the exact-anchor sweep (`TH`) records `φ‴` for the
+    /// Hessian payload's own derivative.
+    fn lift3(self, v: f64, d1: f64, d2: f64, d3: f64) -> Self {
+        self.unary(v, d1, d2, || d3)
     }
     fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
         // Same association as the default (`u + h·Σ cⱼkⱼ`), so values stay bit-identical

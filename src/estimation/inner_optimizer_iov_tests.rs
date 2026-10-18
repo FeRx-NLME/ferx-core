@@ -313,7 +313,7 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
         .expect("all-FD population under an analytic label must warn");
     assert!(warning.contains("2 of 2"), "got: {warning}");
     assert!(
-        warning.contains("ODE IOV stacked axis cap"),
+        warning.contains("stacked [η, κ] past the widest dispatch bucket"),
         "got: {warning}"
     );
 
