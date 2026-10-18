@@ -164,7 +164,19 @@ subject's **first record**. If a covariate that feeds the `init` expression
 changes later in the record, the initial amount is *not* re-evaluated — the
 later covariate values affect `d/dt(...)` going forward (the system evolves
 from the baseline), but the t=0 starting point is fixed by the first record's
-covariates. For most models this is exactly what you want, since the baseline
+covariates.
+
+The first record is the subject's first row **in file order, of any kind**: a
+scored observation, an `EVID=2` (or `EVID=0, MDV=1`) row, or a dose — what
+NONMEM uses for `A_0`. When several rows share the subject's first `TIME`, the
+one written first supplies the covariates. A covariate-marker `EVID=2` row
+written before a baseline sample at `TIME 0` therefore seeds the `init` with
+*its* values, not the sample's. `predict()`, `fit()` (both its value and its
+gradient path) and adaptive simulation all apply this one rule; before #2121
+they took the observation in that case, which moved the objective by 49.6 on
+`nonmem_anchor/init_seed_tie_ofv_a`.
+
+For most models this is exactly what you want, since the baseline
 represents the pre-dose steady state. If you need the starting amount to track
 a covariate value observed mid-record, model it as a state driven by `d/dt`
 rather than as an `init`.
