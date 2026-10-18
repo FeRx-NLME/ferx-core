@@ -22815,6 +22815,9 @@ pub(crate) enum ProfileRouteBreak {
     Residual,
     /// The same prediction reads another profiled block too.
     OtherBlock(String),
+    /// No prediction reads the block, so its levels have nothing to be solved from
+    /// (#2103 review #8).
+    Unread,
 }
 
 /// Where a [`ProfileRouteBreak`] was found.
@@ -22889,10 +22892,12 @@ pub(crate) fn profile_route_check(
         src: &src,
         taint: &taint,
     };
+    let mut read = false;
     for (label, e) in readouts {
         if !ctx.expr_reads(e, &src, &taint, ctx.out(), false) {
             continue;
         }
+        read = true;
         let site = ProfileRouteSite::Readout(label.clone());
         walk.affine(e, ctx.out(), &site)?;
         for other in others {
@@ -22906,6 +22911,9 @@ pub(crate) fn profile_route_check(
                 return Err((ProfileRouteBreak::OtherBlock(other.clone()), site));
             }
         }
+    }
+    if !read {
+        return Err((ProfileRouteBreak::Unread, y()));
     }
     Ok(())
 }
@@ -22945,6 +22953,13 @@ fn profiled_index_column(
 
 /// The `E_PROFILE_NOT_LINEAR` message for a [`profile_route_check`] refusal.
 fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRouteSite) -> String {
+    if *why == ProfileRouteBreak::Unread {
+        return format!(
+            "{PROFILE_NOT_LINEAR}[parameters] theta {block}[...] is `profile`d, but no \
+             prediction reads it, so the data say nothing about its levels. Read it in `y`, or \
+             remove the block."
+        );
+    }
     let at = match site {
         ProfileRouteSite::Param(p) => format!("in `{p}` in [individual_parameters]"),
         ProfileRouteSite::Readout(label) => format!("in {label}"),
@@ -22976,6 +22991,7 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
             "Here one prediction reads `{block}` and `{o}`, which is profiled too; a \
              prediction may read only one profiled block."
         ),
+        ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
     format!(
         "{PROFILE_NOT_LINEAR}[parameters] theta {block}[...] is `profile`d, so each \

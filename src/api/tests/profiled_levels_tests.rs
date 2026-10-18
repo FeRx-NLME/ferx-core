@@ -139,8 +139,6 @@ use crate::types::{CovarianceMethod, EstimationMethod, FitOptions};
 
 const FRAME: &str = "theta PLACEBO[...] is `profile`d, ";
 const REMOVE: &str = "Remove `profile` to estimate the levels as ordinary θ.";
-const NOT_YET: &str = "but profiled estimation is not implemented yet (#1065): this release \
-                       checks the declaration and nothing more.";
 
 fn counted() -> String {
     mbma("theta PLACEBO[3](0.0) profile", "PLACEBO[STUDY]")
@@ -164,27 +162,23 @@ fn scope(model: &CompiledModel, options: &FitOptions) -> Vec<String> {
         .collect()
 }
 
-/// Exactly one class refusal besides the PR1 `not implemented` one, framed, with
-/// `must` and its fix sentence; returns it for the must-not-say checks.
+/// Exactly one refusal, framed, with `must` and its fix sentence; returns it for the
+/// must-not-say checks.
 fn one_refusal(msgs: &[String], must: &str, fix: &str) -> String {
-    let hits: Vec<&String> = msgs.iter().filter(|m| !m.contains(NOT_YET)).collect();
-    assert_eq!(hits.len(), 1, "{msgs:#?}");
-    let m = hits[0];
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    let m = &msgs[0];
     for s in [FRAME, must, fix] {
         assert!(m.contains(s), "missing {s:?} in {m}");
     }
     m.clone()
 }
 
-/// The control: a profiled block in scope gets the PR1 refusal alone, framed, and an
-/// unprofiled model gets nothing.
+/// The control: a profiled block in scope is not refused (#1065 PR2 lifted PR1's
+/// `not implemented` refusal), and neither is an unprofiled model.
 #[test]
-fn an_in_scope_profiled_block_gets_only_the_not_yet_implemented_refusal() {
+fn an_in_scope_profiled_block_is_not_refused() {
     let msgs = scope(&model_of(&counted()), &FitOptions::default());
-    assert_eq!(msgs.len(), 1, "{msgs:#?}");
-    for s in [FRAME, NOT_YET, REMOVE] {
-        assert!(msgs[0].contains(s), "missing {s:?} in {}", msgs[0]);
-    }
+    assert!(msgs.is_empty(), "{msgs:#?}");
     let plain = model_of(&mbma("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]"));
     assert!(scope(&plain, &FitOptions::default()).is_empty());
 }
@@ -225,7 +219,7 @@ fn profile_refuses_every_method_outside_foce_and_focei() {
             method: ok,
             ..FitOptions::default()
         };
-        assert_eq!(scope(&model_of(&counted()), &opts).len(), 1, "{ok:?}");
+        assert!(scope(&model_of(&counted()), &opts).is_empty(), "{ok:?}");
     }
     let agq = FitOptions {
         method: EstimationMethod::FoceI,
@@ -386,7 +380,7 @@ fn profile_refuses_an_s_or_sandwich_covariance() {
             covariance_method_set: true,
             ..FitOptions::default()
         };
-        assert_eq!(scope(&model_of(&counted()), &off).len(), 1, "no step");
+        assert!(scope(&model_of(&counted()), &off).is_empty(), "no step");
     }
 }
 
@@ -401,9 +395,19 @@ fn every_profiled_block_is_named() {
         .replace(
             "  STUDY categorical",
             "  STUDY categorical\n  ARM categorical",
+        )
+        // Each block read by its own prediction: one may read only one profiled block,
+        // and since #2103 review #8 a profiled block must be read by some prediction.
+        .replace(
+            "  y = BASE",
+            "  y[CMT=1] = BASE\n  y[CMT=2] = TVE0 + ARMFX[ARM]",
         );
     let model = model_of(&text);
-    let msgs = scope(&model, &FitOptions::default());
+    let saem = FitOptions {
+        method: EstimationMethod::Saem,
+        ..FitOptions::default()
+    };
+    let msgs = scope(&model, &saem);
     assert!(
         msgs[0].starts_with("theta PLACEBO[...] and ARMFX[...] are `profile`d, "),
         "{}",
@@ -569,8 +573,70 @@ fn a_defaulted_covariance_method_is_not_refused() {
         ..FitOptions::default()
     };
     let msgs = scope(&model_of(&counted()), &defaulted);
-    assert_eq!(msgs.len(), 1, "{msgs:#?}");
-    assert!(msgs[0].contains(NOT_YET), "{}", msgs[0]);
+    assert!(msgs.is_empty(), "{msgs:#?}");
+}
+
+// ── PR2: what the profiled outer loop does not run ──────────────────────────
+
+/// The profiled outer loop has no trust-region or MMA arm: each is refused, naming the
+/// optimizer it saw and the four it runs. The L-BFGS spellings and BOBYQA/SLSQP are
+/// not.
+#[test]
+fn profile_refuses_an_optimizer_its_outer_loop_does_not_run() {
+    use crate::types::Optimizer;
+    for opt in [Optimizer::TrustRegion, Optimizer::Mma] {
+        let o = FitOptions {
+            optimizer: opt,
+            ..FitOptions::default()
+        };
+        one_refusal(
+            &scope(&model_of(&counted()), &o),
+            &format!(
+                "whose outer loop runs `auto`, `bobyqa`, `slsqp` or an L-BFGS; this fit asks \
+                 for `optimizer = {}`.",
+                opt.label()
+            ),
+            "Choose one of those, or remove `profile`.",
+        );
+    }
+    for opt in [
+        Optimizer::Auto,
+        Optimizer::Bobyqa,
+        Optimizer::Slsqp,
+        Optimizer::NloptLbfgs,
+        Optimizer::Lbfgs,
+        Optimizer::Bfgs,
+    ] {
+        let o = FitOptions {
+            optimizer: opt,
+            ..FitOptions::default()
+        };
+        assert!(scope(&model_of(&counted()), &o).is_empty(), "{opt:?}");
+    }
+}
+
+/// `global_search` and a parameter prior: neither is applied by the profiled outer
+/// loop, so each is refused rather than silently dropped.
+#[test]
+fn profile_refuses_a_global_search_and_a_prior() {
+    let o = FitOptions {
+        global_search: true,
+        ..FitOptions::default()
+    };
+    one_refusal(
+        &scope(&model_of(&counted()), &o),
+        "which does not yet run a `global_search` pre-search.",
+        "Set `global_search = false`, or remove `profile`.",
+    );
+    let priored = counted().replace(
+        "theta TVE0(45.0, 0.0, 200.0)",
+        "theta TVE0(45.0, 0.0, 200.0) prior(45.0, rse = 25%)",
+    );
+    one_refusal(
+        &scope(&model_of(&priored), &FitOptions::default()),
+        "which does not yet combine with a parameter prior.",
+        "Remove the prior, or remove `profile`.",
+    );
 }
 
 /// Review #6: the time-to-event arm, named, and no "also".

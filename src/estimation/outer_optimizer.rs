@@ -897,8 +897,9 @@ pub(crate) fn pop_nll(
     per_subject.iter().sum()
 }
 
-/// Shared subject dispatch for separate and fused population evaluations.
-fn subject_nll(
+/// Shared subject dispatch for separate and fused population evaluations, and the
+/// per-subject term the profile solve (#1065) differentiates.
+pub(crate) fn subject_nll(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
