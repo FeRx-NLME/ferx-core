@@ -9,10 +9,14 @@
 //!
 //! * `init_seed_tie` (14 subjects): `A_0(1) = 10·WT`, CL/V fixed, η = 0. WT reaches the
 //!   prediction only through the seed, so `IPRED(0)` reads it directly: 14 for WT = 70, 28
-//!   for WT = 140. Every pair of kinds at the first instant, both file orders; a dose at 0
-//!   with no tie (ID 7); time-varying WT later (IDs 9, 10); co-timed resets (IDs 12–14).
-//! * `init_seed_tie_cells`: an EVID=3 row tied with the first observation (IDs 16, 17) and
-//!   an SS=1 dose at the first instant (ID 18).
+//!   for WT = 140. At the first instant: obs/obs, EVID=2/obs and dose/obs, each in both
+//!   file orders; a dose at 0 with no tie (ID 7); time-varying WT later (IDs 9, 10);
+//!   co-timed resets (IDs 12–14).
+//! * `init_seed_tie_cells`: an EVID=3 row tied with the first observation (IDs 16, 17), an
+//!   SS=1 dose at the first instant (ID 18), and the dose/EVID=2 pair in both file orders
+//!   (IDs 19, 20; both read the WT = 70 seed at t = 2, 13.0997, and the dose-first scan
+//!   took WT = 140 on ID 20). With these, every pair of the three record kinds is anchored
+//!   in both orders.
 //! * `init_seed_tie_ofv_{a,b}`: 20 subjects in the EVID=2-then-observation shape with η on
 //!   the seed, `METHOD=1 INTER MAXEVAL=0 POSTHOC`. Arm b is the control: both rows carry the
 //!   observation's WT, so it reads the same under either rule.
@@ -194,8 +198,11 @@ fn via_adaptive(m: &CompiledModel, pop: &Population, skip: &[&str]) -> Vec<(Stri
     out
 }
 
-// Bound for the closed-form seed cells: the measured worst is printed by each leg; see the
-// constant's value note at the bottom of the file.
+// Bound for the closed-form seed cells. Measured worst |ferx − NONMEM| on Linux aarch64
+// (review round 1 of #2128): 2.56e-8 on `init_seed_tie` (predict, dual and adaptive) and
+// 8.2e-9 on `init_seed_tie_cells`, so 39× headroom. The `.tab` prints 11 significant
+// figures at values ≈ 14, so its own rounding is ~1e-9; the rest is the ODE solve. The
+// smallest defect it guards is 14.
 const IPRED_BOUND: f64 = 1e-6;
 
 /// #2126: an observation listed before a co-timed SS=1 dose reads post-SS in ferx (2.862)
@@ -229,6 +236,20 @@ fn dual_walk_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
         &via_dual(&m, &data("init_seed_tie")),
         &nonmem_ipred("init_seed_tie"),
         &[],
+        IPRED_BOUND,
+    );
+    // The cells' EVID=3 ties and the dose/EVID=2 pair (IDs 16, 17, 19, 20). ID 15 is #2126,
+    // and ID 18's SS=1 dose replaces the state, so its seed is not observable.
+    let mut cells = data("init_seed_tie_cells");
+    cells
+        .subjects
+        .retain(|s| !["15", "18"].contains(&s.id.as_str()));
+    assert_eq!(cells.subjects.len(), 4, "cells subjects on the dual leg");
+    assert_matches(
+        "dual, init_seed_tie_cells",
+        &via_dual(&m, &cells),
+        &nonmem_ipred("init_seed_tie_cells"),
+        &["15", "18"],
         IPRED_BOUND,
     );
 }
@@ -284,6 +305,7 @@ fn fit_objective_at_an_evid2_obs_tie_matches_nonmem() {
     }
 }
 
-// The smallest defect each bound guards: a wrong seed moves IPRED(0) by 14 (a factor 2 in
-// WT) and arm a's OFV by 27.3 (dual seed alone) — both orders of magnitude above the bound.
+// Measured |ferx − NONMEM #OBJV| on Linux aarch64, same run: 1.07e-6 (arm a) and 1.37e-6
+// (arm b), so 7× headroom. The smallest defect it guards is arm a's OFV moving by 27.3 (the
+// dual seed alone wrong).
 const OFV_BOUND: f64 = 1e-5;

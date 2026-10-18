@@ -1,4 +1,4 @@
-Sun Oct 18 03:49:43 PM UTC 2026
+Sun Oct 18 05:59:46 PM UTC 2026
 $PROBLEM ferx #2121 init_seed_tie_cells -- A_0 seed at a tied earliest instant: which co-timed record's $PK?
 $INPUT ID TIME DV MDV EVID AMT CMT SS II WT
 $DATA init_seed_tie_cells.csv IGNORE=@
@@ -57,7 +57,7 @@ Days until program expires : 301
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
  CREATE/ADD TO FDATA.csv:        YES
- NO. OF DATA RECS IN DATA SET:       12
+ NO. OF DATA RECS IN DATA SET:       18
  NO. OF DATA ITEMS IN DATA SET:  10
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -71,8 +71,8 @@ Days until program expires : 301
 0FORMAT FOR DATA:
  (10E4.0)
 
- TOT. NO. OF OBS RECS:        8
- TOT. NO. OF INDIVIDUALS:        4
+ TOT. NO. OF OBS RECS:       10
+ TOT. NO. OF INDIVIDUALS:        6
 0LENGTH OF THETA:   3
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -214,8 +214,8 @@ Days until program expires : 301
  IPRD=IPREDI
  IRS=IRESI
 
- Elapsed evaluation time in seconds:     0.03
- Elapsed postprocess time in seconds:     0.01
+ Elapsed evaluation time in seconds:     0.02
+ Elapsed postprocess time in seconds:     0.00
 1
  
  
@@ -249,7 +249,7 @@ Days until program expires : 301
 
 
 
- #OBJV:********************************************           543.898       *********************************************
+ #OBJV:********************************************           715.608       *********************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -308,7 +308,7 @@ Days until program expires : 301
  EPS1
 +        1.00E-01
  
- Elapsed finaloutput time in seconds:     0.01
- #CPUT: Total CPU Time in Seconds,        0.066
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.043
 Stop Time:
-Sun Oct 18 03:49:51 PM UTC 2026
+Sun Oct 18 05:59:49 PM UTC 2026
