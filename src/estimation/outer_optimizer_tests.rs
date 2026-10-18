@@ -7555,18 +7555,13 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
     }
 }
 
-/// #1082 PR5, V6: on an IOV model with a residual `correlation` line, the outer gradient
-/// handed to the optimizer is central differences of the (reconverged) OFV, on FOCE and on
-/// FOCEI. The IOV outer assemblies score a diagonal `R`: FOCEI's declines per subject, but
-/// FOCE's (`subject_packed_gradient_foce_iov`) would differentiate the diagonal `R⁰`, with
-/// no `∂/∂ρ` at all. So the one gate is the structural decline in
-/// `analytic_outer_gradient_in_scope`; the model without the line keeps the analytic
-/// gradient (the straddle, asserted).
-///
-/// Mutation: delete that decline → the FOCE gradient is the diagonal-`R⁰` analytic one, and
-/// its ρ component is 0 against a finite difference of 20.73 (measured). FOCE and FOCEI
-/// give the same number here: with additive error the Gauss–Newton Laplace marginal is the
-/// Sheiner–Beal one (Woodbury), so the two paths differ only in which assembly would run.
+/// #1082 PR5 / #2101: on a nested-level model with a residual `correlation ar1(RHO) by
+/// ARM` line, the outer gradient handed to the optimizer is the adjoint's — every subject
+/// served by it, no FD salvage — and matches central differences of the reconverged OFV on
+/// FOCE and FOCEI, ρ included (∂OFV/∂ρ ≈ 20.7, so a gradient that ignored the dense `R`'s
+/// off-diagonal, as the diagonal IOV assemblies would, is far off). FOCE and FOCEI give the
+/// same number here: with additive error the Gauss–Newton Laplace marginal is the
+/// Sheiner–Beal one (Woodbury).
 #[test]
 fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     use crate::stats::nested_levels::test_helpers as fx;
@@ -7583,9 +7578,7 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let (m, mut pop) = fx::prepared(&src, 1);
     crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
     let (m_plain, _) = fx::prepared(&plain, 1);
-    assert!(!crate::sens::provider::analytic_outer_gradient_available(
-        &m
-    ));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert!(crate::sens::provider::analytic_outer_gradient_available(
         &m_plain
     ));
@@ -7597,10 +7590,17 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let rho = params.theta.len() - 1;
     assert_eq!(m.residual_serial.as_ref().unwrap().rho_theta, rho);
     let n = pop.subjects.len();
+    // At the default `inner_tol` the gap measured 4.5e-6 (FOCE = FOCEI here). It does not
+    // shrink at 1e-8 or 1e-10 (1.2e-5, 5.3e-6): it is the stencil's truncation, as the
+    // Richardson oracle on the same subject without the line shows (#2101,
+    // `cov_hessian_matches_profile_fd_nested_residual_correlation`). Bound: ~2× the worst.
+    let inner_tol = FitOptions::default().inner_tol;
     for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
         let opts = FitOptions {
             method,
             interaction: method == EstimationMethod::FoceI,
+            inner_tol,
+            inner_maxiter: 2000,
             ..FitOptions::default()
         };
         let (ehs, hms, _, kappas) = run_inner_loop_warm(
@@ -7629,6 +7629,26 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             OuterTrial::unknown(),
             &OuterFdDeclineLog::new(n),
         );
+        // Every subject on the adjoint, so the comparison below is of its gradient.
+        for (i, s) in pop.subjects.iter().enumerate() {
+            let mut b = ehs[i].as_slice().to_vec();
+            for k in &kappas[i] {
+                b.extend(k.iter());
+            }
+            assert!(
+                crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+                    &m,
+                    s,
+                    params,
+                    &x,
+                    &b,
+                    opts.interaction,
+                )
+                .is_some(),
+                "{method:?}: subject {} declined the adjoint",
+                s.id
+            );
+        }
         let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
         assert_eq!(g.len(), fd.len());
         eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
@@ -7636,12 +7656,15 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             fd[rho].is_finite() && fd[rho].abs() > 0.1,
             "{method:?}: ρ is live"
         );
+        let mut worst = 0.0f64;
         for (k, (a, b)) in g.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && b.is_finite(), "{method:?}[{k}]");
-            assert!(
-                (a - b).abs() <= 1e-6 * (1.0 + b.abs()),
-                "{method:?}[{k}]: handed {a} vs FD of the OFV {b}"
-            );
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
         }
+        eprintln!("{method:?}: worst {worst:.2e} at inner_tol {inner_tol:e}");
+        assert!(
+            worst <= 1e-5,
+            "{method:?}: handed vs FD of the OFV {worst:.2e}"
+        );
     }
 }

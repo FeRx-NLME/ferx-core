@@ -51,14 +51,7 @@ pub(crate) fn subject_adjoint_cov_hessian(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
-    let mut sc = scope(
-        model,
-        subject,
-        template,
-        x,
-        eta_hat,
-        objective != Objective::Foce,
-    )?;
+    let mut sc = scope(model, subject, template, x, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -134,7 +127,7 @@ pub(crate) fn subject_adjoint_eta_dx(
     } else {
         Objective::Foce
     };
-    let mut sc = scope(model, subject, template, x, eta_hat, interaction)?;
+    let mut sc = scope(model, subject, template, x, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;

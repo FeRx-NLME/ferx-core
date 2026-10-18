@@ -189,7 +189,6 @@ fn iov_inner_subject_route(
     if model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
         || subject_has_survival_records(subject)
-        || iov_inner_residual_correlation(model, subject)
     {
         return None;
     }
@@ -199,11 +198,11 @@ fn iov_inner_subject_route(
 }
 
 /// Whether an IOV subject's residuals are correlated across rows by a `correlation … by`
-/// line (#1082 PR5). The analytic IOV inner gradient
-/// (`analytic_eta_nll_gradient_iov_frozen`) differentiates the per-row diagonal data term
-/// and has no dense-`R` form, so such a subject's EBE search runs on central differences
-/// of its (dense) objective. A subject whose blocks are all singletons has a diagonal `R`
-/// and keeps the analytic gradient. Value-free, like `has_cross_observation_residual`: a
+/// line (#1082 PR5). The per-row IOV inner gradient (`analytic_eta_nll_gradient_iov_frozen`)
+/// differentiates the diagonal data term and has no dense-`R` form, so such a subject's EBE
+/// search takes the adjoint kernel's exact inner gradient instead (`exact_inner_gradient`,
+/// whose `l` carries the dense `R`; #2101). A subject whose blocks are all singletons
+/// has a diagonal `R` and keeps the per-row gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
     model.n_kappa > 0
@@ -231,9 +230,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     }
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
-    }
-    if iov_inner_residual_correlation(model, subject) {
-        return "residual correlation";
     }
     if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
@@ -2552,7 +2548,11 @@ fn find_ebe_iov(
             // The kernel's exact gradient where it serves the subject; it declines a
             // dense IOV residual (#1082 PR5), whose search runs on central differences.
             return match exact(p) {
-                Some(g) => g,
+                Some(g) => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
                 None => {
                     #[cfg(test)]
                     IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));

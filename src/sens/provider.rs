@@ -535,11 +535,9 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// copy of the scope list that would drift from it.
 pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
     // The adjoint gradient's model scope: it carries none of the forward provider's width
-    // or slot limits. A residual `correlation … by` line with kappa (#1082 PR5) is the one
-    // exclusion: its IOV marginal scores a dense `R`, which the adjoint's IOV objective does
-    // not yet carry (`adjoint::kappa_with_residual_correlation`).
+    // or slot limits, and serves kappa with a residual `correlation … by` line (#1082 PR5,
+    // #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
     crate::sens::ode_provider::adjoint::model_in_scope(model)
-        && !crate::sens::ode_provider::adjoint::kappa_with_residual_correlation(model)
 }
 
 /// `analytic_outer_gradient_available`, kept as the shared entry point that

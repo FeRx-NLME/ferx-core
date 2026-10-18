@@ -2909,6 +2909,53 @@ fn cov_hessian_matches_profile_fd_ode_block_omega_combined() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
+/// #2101: the exact R-matrix of a nested-level subject whose residuals a `correlation
+/// ar1(RHO) by ARM` line couples across rows (#1082 PR5), FOCEI and FOCE, against the
+/// reconverged FD of the adjoint gradient. ρ is a θ, so its row and column are in the
+/// matrix; the subject's blocks are cross-row (asserted), so the dense `R` is live.
+///
+/// FOCE and FOCEI coincide on this additive-error fixture (Woodbury), so one stage runs.
+/// Slow (≈4 min: the Richardson oracles re-solve the nested EBE at every stencil point).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn cov_hessian_matches_profile_fd_nested_residual_correlation() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    let src = fx::algebraic()
+        .replace(
+            "  sigma ADD ~ 0.5\n",
+            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
+        )
+        .replace(
+            "  DV ~ additive(ADD)\n",
+            "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
+        );
+    let (m, mut pop) = fx::prepared(&src, 1);
+    crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
+    let s = &pop.subjects[0];
+    assert!(crate::estimation::inner_optimizer::iov_inner_residual_correlation(&m, s));
+    for interaction in [true] {
+        // The gradient first, against the Richardson oracle (EBE re-solved to 1e-12).
+        let g = fd_oracle(&m, s, interaction);
+        eprintln!("nested + ar1, interaction = {interaction}: gradient vs FD {g:.2e}");
+        let (fd, _) = hessian_gaps(&m, s, interaction);
+        eprintln!("nested + ar1, interaction = {interaction}: Hessian vs FD {fd:.2e}");
+        // Measured (FOCEI): gradient 3.5e-6, Hessian 1.9e-5. That is the oracles' floor on
+        // this nested fixture, not the correlation's: the same subject without the line —
+        // a path NONMEM anchors — measures 1.6e-6 and 1.65e-5. ~3× headroom on each.
+        assert!(
+            g < 1e-5,
+            "interaction = {interaction}: gradient vs FD {g:.2e}"
+        );
+        assert!(
+            fd < 5e-5,
+            "interaction = {interaction}: Hessian vs FD {fd:.2e}"
+        );
+    }
+}
+
 #[test]
 fn cov_hessian_matches_profile_fd_iov() {
     let model = tight(parse_model_string(ODE_IOV).unwrap());

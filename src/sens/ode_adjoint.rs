@@ -175,11 +175,7 @@ pub(super) fn scope<'m>(
     template: &ModelParameters,
     x: &[f64],
     eta_hat: &[f64],
-    interaction: bool,
 ) -> Option<Scoped<'m>> {
-    if kappa_with_residual_correlation(model) {
-        return None;
-    }
     let params = unpack_params(x, template);
     let (model, width, eta, lay) = resolve(model, subject, &params.theta, eta_hat, None)?;
     if !likelihood_supported(model, subject, &params) {
@@ -187,14 +183,10 @@ pub(super) fn scope<'m>(
     }
     let seg = crate::estimation::parameterization::packed_segments(template);
     let n_iov_packed = if model.n_kappa > 0 {
-        // IOV + FREM is scored by a sentinel, and an IOV FOCEI subject row-wise on the
-        // diagonal (`foce_subject_nll_iov_linearized`): neither is the kernel's objective.
-        if subject.fremtype.iter().any(|&ft| ft > 0)
-            || (interaction
-                && model
-                    .residual_cov_with(&params.residual_correlations, &params.theta)
-                    .is_dense())
-        {
+        // IOV + FREM is scored by a sentinel, not the kernel's objective. A dense residual
+        // (a `correlation … by` line, #1082 PR5) is: the IOV marginal is the non-IOV dense
+        // one over the stacked `[η, κ]` system, on the same row-wise predicate.
+        if subject.fremtype.iter().any(|&ft| ft > 0) {
             return None;
         }
         lower_tri_entries(model.n_kappa, params.omega_iov.as_ref()?.diagonal).len()
@@ -256,8 +248,7 @@ pub(crate) fn subject_adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
-    let interaction = objective != Objective::Foce;
-    let mut sc = scope(model, subject, template, x, eta_hat, interaction)?;
+    let mut sc = scope(model, subject, template, x, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
         Objective::Agq { n_agq, exact: true } if sc.width == 0 => Objective::Agq {
@@ -1310,14 +1301,6 @@ pub(crate) fn subject_width(model: &CompiledModel, subject: &Subject) -> Option<
     Some(crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?.n_axes())
 }
 
-/// Whether a model carries kappa together with a residual `correlation … by` line (#1082
-/// PR5). Its IOV marginal is `R̃ = H Σ_b Hᵀ + R` with the line's dense `R`, which the
-/// adjoint's IOV objective does not carry, so the outer gradient and the covariance R-matrix
-/// decline (FOCE and FOCEI alike) and the fit takes central differences of the OFV.
-pub(crate) fn kappa_with_residual_correlation(model: &CompiledModel) -> bool {
-    model.n_kappa > 0 && model.residual_serial.is_some()
-}
-
 /// Whether a model with nested levels (#1082) lies outside the recordings: one whose IOV
 /// subjects may run on a closed-form transit/IG model's ODE twin
 /// (`absorption_ode_equivalent`), a separate `CompiledModel` parsed from emitted source
@@ -1579,11 +1562,8 @@ pub(crate) fn exact_htilde(
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
-    let iov_mismatch = model.n_kappa > 0
-        && (subject.fremtype.iter().any(|&ft| ft > 0)
-            || model
-                .residual_cov_with(&params.residual_correlations, &params.theta)
-                .is_dense());
+    // IOV scores FREM rows by a sentinel, not the kernel's `l`.
+    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
     if iov_mismatch || !likelihood_supported(model, subject, params) {
         return None;
     }
@@ -1640,13 +1620,8 @@ pub(crate) fn exact_inner_gradient_in(
         gr.iter().all(|v| v.is_finite()).then(|| gr[..w].to_vec())
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, layout)?;
-    // IOV scores FREM rows by a sentinel and a coupled residual row-wise; neither is the
-    // kernel's `l`.
-    let iov_mismatch = model.n_kappa > 0
-        && (subject.fremtype.iter().any(|&ft| ft > 0)
-            || model
-                .residual_cov_with(&params.residual_correlations, &params.theta)
-                .is_dense());
+    // IOV scores FREM rows by a sentinel, not the kernel's `l`.
+    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
     if iov_mismatch || !likelihood_supported(model, subject, params) {
         return None;
     }

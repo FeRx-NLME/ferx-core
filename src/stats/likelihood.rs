@@ -1146,6 +1146,10 @@ pub(crate) fn obs_nll_subject_from_preds(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+// The conditional semantics are constructed only by `conditional_obs_nll_from_preds`, a
+// test oracle since the AGQ path it served moved to the adjoint (#486); the shared body
+// below still branches on them.
+#[cfg_attr(not(test), allow(dead_code))]
 enum PredNllSemantics {
     Marginal,
     Conditional,
@@ -2890,8 +2894,12 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     if interaction {
         // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
         // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
-        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal.
-        if !residual_cov.is_dense() {
+        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal —
+        // except a subject with censored rows, which that dispatcher and the IOV EBE search
+        // (`individual_nll_iov_frozen_in`) both score row-wise; the marginal must too, or
+        // the objective is not the one its EBE minimised.
+        let rowwise = model.bloq_in_force().has_censored_row(&subject.cens);
+        if !residual_cov.is_dense() || rowwise {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,

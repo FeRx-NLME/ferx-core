@@ -3381,18 +3381,18 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     }
 }
 
-/// #1082 PR5: an IOV subject whose residuals a `correlation … by` line couples across rows
-/// runs its EBE search on central differences of its (dense) objective, named "residual
-/// correlation"; a subject of the same model whose blocks are all singletons keeps the
-/// analytic gradient. Both sides in one test, read off `agrad` itself.
+/// #1082 PR5 / #2101: an IOV subject whose residuals a `correlation … by` line couples
+/// across rows runs its EBE search on the adjoint kernel's exact gradient of its (dense)
+/// objective; a subject of the same model whose blocks are all singletons keeps the per-row
+/// analytic gradient. Both take no FD step, read off `agrad` itself.
 ///
-/// The cross-row subject's EBE is also checked for stationarity on its own objective: the
-/// analytic IOV gradient differentiates the diagonal data term, so routing it there (the
-/// mutation: drop `iov_inner_residual_correlation` from the `analytic_iov_inner` gate)
-/// both flips the counter and leaves the search at a point that is not a mode of the
-/// objective it scores.
+/// Each EBE is checked for stationarity on its own objective by central differences, an
+/// oracle outside both gradients: the per-row gradient differentiates the diagonal data
+/// term, so routing the cross-row subject there (the mutation: drop
+/// `iov_inner_residual_correlation` from the `analytic_iov_inner` gate) leaves the search
+/// at a point that is not a mode of the objective it scores.
 #[test]
-fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
+fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() {
     use crate::stats::nested_levels::test_helpers as fx;
     let src = fx::algebraic()
         .replace(
@@ -3440,15 +3440,11 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
             "{}",
             s.id
         );
-        assert_eq!(
-            iov_inner_subject_route(&m, s, &p.theta).is_none(),
-            correlated,
+        assert!(
+            iov_inner_subject_route(&m, s, &p.theta).is_some(),
             "{}: the reported route",
             s.id
         );
-        if correlated {
-            assert_eq!(iov_fd_reason(&m, s), "residual correlation");
-        }
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
         let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
@@ -3458,19 +3454,11 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
             s.id,
             ebe.nll
         );
-        if correlated {
-            assert!(
-                analytic == 0 && fd >= 3,
-                "{}: {analytic} analytic / {fd} FD",
-                s.id
-            );
-        } else {
-            assert!(
-                analytic >= 3 && fd == 0,
-                "{}: {analytic} analytic / {fd} FD",
-                s.id
-            );
-        }
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{}: {analytic} analytic / {fd} FD",
+            s.id
+        );
         // Stationarity of the objective the search scored, over the compact vector.
         let layout = crate::stats::nested_levels::NestedLayout::of(&m, s).unwrap();
         let b = layout.compact(ebe.eta.as_slice(), &ebe.kappas).unwrap();
