@@ -994,8 +994,9 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
     for sentence in [
         "`correlation cs(RHO) by STUDY`: in 3 of 12 subjects the blocks are exactly the \
          groups of the level `ARM`, where the kappa K_ARM is drawn.",
-        "In those subjects `cs` and the kappa are the same covariance, so ρ and the kappa \
-         variance are separated only by the other 9; expect wide standard errors on both.",
+        "In those subjects `cs` and the kappa are the same covariance for an additive kappa, \
+         nearly the same for a multiplicative one, so ρ and the kappa variance are separated \
+         only by the other 9; expect wide standard errors on both.",
         "If the blocks should differ in every subject, check the `by` column.",
     ] {
         assert!(w[0].contains(sentence), "missing {sentence:?} in {}", w[0]);
@@ -1013,4 +1014,39 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
     let (e, w) = at(&single_armed(12));
     assert_eq!(e.len(), 1, "12 of 12 is the refusal");
     assert!(w.is_empty(), "the refusal is not also a warning: {w:?}");
+
+    // 5′ of review round 2: a subject whose partitions agree only trivially — one
+    // observation, so every row its own class — carries no `cs` pair and is in neither
+    // count. Mutation: count any equal partition as a match → the first cell warns "1 of
+    // 12", the third refuses.
+    let one_obs = |p: &Population, n: usize| {
+        let mut p = p.clone();
+        for s in p.subjects.iter_mut().take(n) {
+            s.obs_times.truncate(1);
+            s.observations.truncate(1);
+            s.obs_cmts.truncate(1);
+            s.cens.truncate(1);
+            s.obs_covariates.truncate(1);
+            if !s.obs_raw_times.is_empty() {
+                s.obs_raw_times.truncate(1);
+            }
+        }
+        p
+    };
+    let (e, w) = at(&one_obs(&pop, 1));
+    assert!(
+        e.is_empty() && w.is_empty(),
+        "a one-observation sponsor matches nothing: {e:?} {w:?}"
+    );
+    // Among real matches it changes the count, not the verdict: 11 of 11 is still the
+    // refusal.
+    let (e, w) = at(&one_obs(&single_armed(12), 1));
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(w.is_empty(), "{w:?}");
+    // Every subject trivial: `cs` couples nothing, so there is nothing to refuse.
+    let (e, w) = at(&one_obs(&pop, 12));
+    assert!(
+        e.is_empty() && w.is_empty(),
+        "every sponsor trivial: {e:?} {w:?}"
+    );
 }

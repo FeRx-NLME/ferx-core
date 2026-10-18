@@ -165,7 +165,9 @@ ferx says how many matched, with
 are then separated by the other subjects alone. `cs by STUDY` next to a kappa at
 `ARM` is the usual case: the two coincide in every subject whose studies each
 have one arm. A `by` column with a typo that splits one group would otherwise
-switch the refusal off without a word.
+switch the refusal off without a word. A subject where the two agree only
+trivially (one observation, or every row its own block) couples no rows under
+`cs` and counts on neither side.
 
 **Validation.** ferx scores NONMEM's own `exact3` optimum
 (`nonmem_anchor/nested_levels_3_ar1/`, sponsor → study → arm, `ARM` repeating

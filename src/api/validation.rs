@@ -6137,8 +6137,9 @@ fn residual_correlation_partly_confounded(
                 &format!(
                     "`{line}`: in {matched} of {observed} subjects the blocks are exactly the \
                      groups of {grouping}, where the {kappas_drawn}. In those subjects `cs` and \
-                     the kappa are the same covariance, so ρ and the kappa variance are \
-                     separated only by the other {rest}; expect wide standard errors on both. \
+                     the kappa are the same covariance for an additive kappa, nearly the same \
+                     for a multiplicative one, so ρ and the kappa variance are separated only \
+                     by the other {rest}; expect wide standard errors on both. \
                      If the blocks should differ in every subject, check the `by` column.",
                     matched = m.matched,
                     observed = m.observed,
@@ -6157,9 +6158,11 @@ struct PartitionMatch {
     /// "the level `ARM`", or "the occasion grouping" on a one-level model.
     grouping: String,
     kappas: Vec<String>,
-    /// Subjects with an observation whose blocks partition the rows as the groups do.
+    /// Subjects whose blocks partition the rows as the groups do, with a class of two or
+    /// more rows.
     matched: usize,
-    /// Subjects with an observation.
+    /// Subjects counted: the matched ones and those whose partitions differ. A subject
+    /// whose partitions agree only trivially (every row its own class) is in neither.
     observed: usize,
 }
 
@@ -6233,16 +6236,28 @@ fn kappa_partition_matches(
                  grouping: String,
                  kappas: Vec<String>,
                  groups: &dyn Fn(&Subject) -> Vec<usize>| {
-        let observed: Vec<&Subject> = pop
+        // Per subject: `Some(true)` when the two partitions agree on a class of two or more
+        // rows (an off-diagonal both would add), `Some(false)` when they differ, and `None`
+        // when they agree only trivially — every row its own class (a one-observation
+        // subject, say). `cs` adds no covariance there, so such a subject identifies nothing
+        // either way and is in neither count.
+        let verdicts: Vec<bool> = pop
             .subjects
             .iter()
-            .filter(|s| !s.obs_times.is_empty())
+            .filter_map(|s| {
+                let (g, b) = (groups(s), blocks(s));
+                if g != b {
+                    return Some(false);
+                }
+                let shared_pair = g.iter().enumerate().any(|(j, c)| g[j + 1..].contains(c));
+                shared_pair.then_some(true)
+            })
             .collect();
         PartitionMatch {
             grouping,
             kappas,
-            matched: observed.iter().filter(|s| groups(s) == blocks(s)).count(),
-            observed: observed.len(),
+            matched: verdicts.iter().filter(|&&m| m).count(),
+            observed: verdicts.len(),
         }
     };
     let mut out = Vec::new();
