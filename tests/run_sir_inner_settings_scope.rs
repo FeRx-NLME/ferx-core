@@ -65,9 +65,13 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     );
 
     // ── 2. A default-options covariance step reads the default, whatever ran before ─
+    // On the finite-difference stencil, which re-solves the EBEs and so reads the inner
+    // solver; the exact R-matrix (#486) differentiates at the fit's EBEs and solves nothing,
+    // so it could not see a leak.
     let fit_opts = |mode| FitOptions {
         verbose: false,
         run_covariance_step: true,
+        analytic_cov_hessian: false,
         sir: false,
         inner_optimizer: mode,
         ..prep.parsed.fit_options.clone()
@@ -81,6 +85,7 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     .expect("fit");
     let quiet = |mode| FitOptions {
         verbose: false,
+        analytic_cov_hessian: false,
         inner_optimizer: mode,
         ..FitOptions::default()
     };
