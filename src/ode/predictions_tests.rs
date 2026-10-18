@@ -1499,6 +1499,46 @@ fn earliest_record_pk_seeds_earliest_else_fallback() {
         PkParams::default().cl(),
         "must NOT be the zero-PK default"
     );
+
+    // #2121: a dose row is a record, and the first record is NONMEM's file order — at a tie
+    // the walk's kind order (dose < pk-only < obs). A dose at 0 ahead of an obs at 1 (no
+    // tie) seeds from the dose; at a pk-only / obs tie the pk-only row wins.
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(3.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0)],
+        pk_only: vec![pk_one(9.0, 10.0)],
+        reset: Vec::new(),
+    };
+    let mut s = make_subject(vec![], vec![1.0]);
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    s.pk_only_times = vec![2.0];
+    assert_eq!(
+        earliest_record_pk(&s, &event_pk, pk_one(5.0, 5.0)).cl(),
+        3.0,
+        "dose at 0"
+    );
+    let mut tie = make_subject(vec![], vec![0.0]);
+    tie.pk_only_times = vec![0.0];
+    assert_eq!(
+        earliest_record_pk(&tie, &event_pk, pk_one(5.0, 5.0)).cl(),
+        9.0,
+        "pk-only / obs tie at 0: the pk-only row"
+    );
+
+    // The frozen replay appends the ledger's controller doses after the base regimen; they
+    // have no `event_pk.dose` slot and are not records. One injected at 0.5, before the
+    // first record, must not be selected (it would index past `event_pk.dose`).
+    let base_only = crate::pk::EventPkParams {
+        dose: Vec::new(),
+        ..event_pk.clone()
+    };
+    let mut replay = make_subject(vec![], vec![1.0]);
+    replay.doses = vec![crate::types::DoseEvent::new(0.5, 100.0, 1, 0.0, false, 0.0)];
+    assert_eq!(
+        earliest_record_pk(&replay, &base_only, pk_one(5.0, 5.0)).cl(),
+        1.0,
+        "an appended controller dose is not a record"
+    );
 }
 
 #[test]

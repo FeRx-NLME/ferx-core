@@ -1878,11 +1878,12 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
     init_taylor_seed_at::<T>(init_fn, snap, pk_indices, n_states)
 }
 
-/// The PK-param snapshot at the subject's **first record** (smallest record time), matching
-/// production's `init_pk` selection (`ode/predictions.rs`) and its `last_pk` seed for a reset
-/// that is itself the first event. Doses / obs / pk-only are scanned in that order under a
-/// strict `t < best_t`, so at an exact tie the earliest-considered snapshot wins — dose over
-/// obs over pk-only, identical to production's `consider`. `None` when the subject has no
+/// The PK-param snapshot at the subject's **first record**, [`crate::dosing::first_record`]
+/// — the one selector production's `init_pk` (`ode/predictions.rs`) also maps, so the dual
+/// seed cannot pick a different record from the value path (#2121: before it, both scanned
+/// observations ahead of a co-timed EVID=2 row, and fixing only the value path moved
+/// `init_seed_tie_ofv_a`'s objective 222.41 → 200.17 against NONMEM's 172.84). Also the
+/// `last_pk` seed for a reset that is itself the first event. `None` when the subject has no
 /// records. Shared by [`tvcov_init_state`] (the initial `init` seed) and the event-driven
 /// walk's `last_params` seed (#486 review) so the two can't drift. Since #1133 the reset
 /// re-seed does NOT read `last_params` — it reads the reset row's own `pk_at_reset[idx]`.
@@ -1892,27 +1893,12 @@ fn first_record_pk<'a, T: crate::sens::num::PkNum>(
     pk_at_obs: &'a [Vec<T>],
     pk_at_pk_only: &'a [Vec<T>],
 ) -> Option<&'a [T]> {
-    let mut best_t = f64::INFINITY;
-    let mut best: Option<&[T]> = None;
-    for (k, d) in subject.doses.iter().enumerate() {
-        if d.time < best_t {
-            best_t = d.time;
-            best = Some(&pk_at_dose[k]);
-        }
-    }
-    for (j, &t) in subject.obs_times.iter().enumerate() {
-        if t < best_t {
-            best_t = t;
-            best = Some(&pk_at_obs[j]);
-        }
-    }
-    for (m, &t) in subject.pk_only_times.iter().enumerate() {
-        if t < best_t {
-            best_t = t;
-            best = Some(&pk_at_pk_only[m]);
-        }
-    }
-    best
+    use crate::dosing::FirstRecord;
+    crate::dosing::first_record(subject, subject.doses.len()).map(|rec| match rec {
+        FirstRecord::Dose(k) => pk_at_dose[k].as_slice(),
+        FirstRecord::PkOnly(m) => pk_at_pk_only[m].as_slice(),
+        FirstRecord::Obs(j) => pk_at_obs[j].as_slice(),
+    })
 }
 
 /// Seed the ODE `init(...)` state on the walk's own dual basis from a **given** PK-param
@@ -5471,12 +5457,12 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
 
     // Most-recent record's params, used to integrate a segment ending at a **reset** or
     // infusion-end (neither carries a PK record — mirrors production's `last_pk`). Seeded with
-    // the **first-record** snapshot (production's `init_pk`, dose-preferred on ties), not an
+    // the **first-record** snapshot (production's `init_pk`, `dosing::first_record`), not an
     // arbitrary array-first slice: a reset that is itself the first event (an EVID=4 reset+dose
     // at `t = 0`) is the one case where the two could diverge on the seed, and since #1133 the
     // `K_RESET` branch reads `pk_at_reset[idx]` — the reset row's own snapshot — on both sides,
     // so `last_params` no longer feeds the re-seed at all. It still seeds the walk's carry, and
-    // is still taken from `first_record_pk` (production's `init_pk`, dose-preferred on ties)
+    // is still taken from `first_record_pk` (production's `init_pk`, `dosing::first_record`)
     // rather than an arbitrary array-first slice (#486 review — Copilot). For every later
     // record `last_params` is overwritten, exactly as production updates `last_pk` (#486).
     let mut last_params: &[T] =
