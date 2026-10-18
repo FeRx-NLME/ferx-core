@@ -1032,8 +1032,9 @@ where
 /// #748 names. It **independently re-derives** `eta_occ`, `decision_pk`, and `event_pk`
 /// from the run's *primitive* inputs — θ, the drawn BSV η (`eta_slice`), the subject's
 /// covariates, the decision schedule, and (re-drawn here) the per-occasion κ substream
-/// — by calling the **leaf** rules directly (`pk_param_fn`, `locf_decision_cov`,
-/// `occasion_of`, `subject_kappa_base_seed` / `kappa_standard_normal`), NOT by
+/// — by calling the **leaf** rules directly (`pk_param_fn`, `occasion_of`,
+/// `subject_kappa_base_seed` / `kappa_standard_normal`; the decision's covariate row comes
+/// from [`decision_covs_by_scan`], see below), NOT by
 /// re-invoking the build loop's composite assembler. In particular `event_pk` is
 /// rebuilt record-by-record inline (occasion via `occasion_of`, PK via `pk_param_fn`
 /// at the record's own covariate) rather than through `compute_event_pk_params_iov`,
@@ -1046,8 +1047,9 @@ where
 /// The teeth come from this being a **second orchestration over the same leaves**: it
 /// **must not** be refactored to call the build loop's composite assembler, or a defect
 /// edited into that assembler would be mirrored on both sides and slip through again.
-/// The leaf rules themselves (the covariate LOCF rule, the occasion map, the κ draw)
-/// are the single source of truth and are unit-tested in isolation; θ and `eta_slice`
+/// The occasion map and the κ draw are the single source of truth and are unit-tested in
+/// isolation; the covariate row a decision reads is the exception, derived twice on
+/// purpose (next paragraph); θ and `eta_slice`
 /// are trusted primitive draws (not "built" snapshots) so — like the seed and Ω — they
 /// are consumed, not re-derived.
 ///
