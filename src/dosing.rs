@@ -169,9 +169,13 @@ pub(crate) enum FirstRecord {
 /// (#1133), so a reset at or before the first other record overwrites whatever this seed
 /// put there before anything reads it.
 ///
-/// Every engine resolves the seed through this one function — the dense event-driven
-/// engine, the dual (`sens/ode_provider`) walk, and the adaptive driver with its frozen
-/// replay. They used to carry three scans that disagreed with each other and with the walk.
+/// The prediction engines resolve the seed through this one function — the dense
+/// event-driven engine, the dual (`sens/ode_provider`) walk, and the adaptive driver with
+/// its frozen replay. They used to carry three scans that disagreed with each other and
+/// with the walk. **One exception remains:** the compartment-state pass behind
+/// `pk::compute_predictions_with_states` (sdtab states, `[derived]`), in
+/// `ode_predictions_event_driven_with_states`, seeds `init()` from the first
+/// *observation's* snapshot, not from this record (#2133).
 pub(crate) fn first_record(subject: &Subject, n_doses: usize) -> Option<FirstRecord> {
     let mut best: Option<(f64, FirstRecord)> = None;
     // Kinds in walk order under a strict `<`, so a co-timed record of an earlier kind, and
