@@ -137,6 +137,62 @@ pub(crate) fn governing_record_indices(
     acc
 }
 
+/// One of a subject's records, by kind and index into that kind's vector: `subject.doses`,
+/// `subject.pk_only_times`, `subject.obs_times`. What [`first_record`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstRecord {
+    Dose(usize),
+    PkOnly(usize),
+    Obs(usize),
+}
+
+/// The subject's **first record**, whose `$PK` snapshot seeds `init(state) = expr` (#2121).
+/// `None` when the subject has no dose, EVID=2 or observation record.
+///
+/// NONMEM evaluates `A_0` from the `$PK` of the subject's first data record **in file
+/// order, of any kind** — an observation, an EVID=2 row or a dose
+/// (`nonmem_anchor/init_seed_tie`). ferx keeps no file order across kinds, so the order
+/// here is the walk's: smallest time, then the walk's kind order at an instant (dose record
+/// < pk-only < observation, `ode_predictions_event_driven`'s `kind_order`), then index
+/// within a kind (each vector is in file order). The reader's #614/#1810 moves make that
+/// the file order: a record listed first in a tie whose kind the walk would process late is
+/// moved one ULP earlier. The seed must follow the **same** kind order as the walk —
+/// scanning observations before pk-only rows, as every engine did before #2121, seeded an
+/// EVID=2-then-observation tie from the observation, the second record (49.6 OFV on
+/// `init_seed_tie_ofv_a`).
+///
+/// Only `subject.doses[..n_doses]` are candidates: the adaptive frozen replay appends the
+/// controller's injected doses after the base regimen, and those are not data records.
+/// Every other caller passes `subject.doses.len()`.
+///
+/// Resets are not candidates. An EVID=3/4 row re-seeds the state from its **own** row
+/// (#1133), so a reset at or before the first other record overwrites whatever this seed
+/// put there before anything reads it.
+///
+/// Every engine resolves the seed through this one function — the dense event-driven
+/// engine, the dual (`sens/ode_provider`) walk, and the adaptive driver with its frozen
+/// replay. They used to carry three scans that disagreed with each other and with the walk.
+pub(crate) fn first_record(subject: &Subject, n_doses: usize) -> Option<FirstRecord> {
+    let mut best: Option<(f64, FirstRecord)> = None;
+    // Kinds in walk order under a strict `<`, so a co-timed record of an earlier kind, and
+    // the first row of a kind, wins the tie.
+    let mut consider = |t: f64, rec: FirstRecord| {
+        if best.is_none_or(|(bt, _)| t < bt) {
+            best = Some((t, rec));
+        }
+    };
+    for (k, d) in subject.doses.iter().take(n_doses).enumerate() {
+        consider(d.time, FirstRecord::Dose(k));
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        consider(t, FirstRecord::PkOnly(m));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        consider(t, FirstRecord::Obs(j));
+    }
+    best.map(|(_, rec)| rec)
+}
+
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
@@ -1235,6 +1291,124 @@ pub(crate) fn ss_reset_live(doses: &[DoseEvent], cutoff: Option<usize>, k: usize
 #[inline]
 pub(crate) fn evid_reset_live(record: f64, reset_floor: f64) -> bool {
     record >= reset_floor
+}
+
+#[cfg(test)]
+mod first_record_tests {
+    use super::{first_record, FirstRecord};
+    use crate::types::Subject;
+    use std::io::Write;
+
+    /// Each subject is a tie at TIME 0 between two records of the kinds in its name, in
+    /// the file order its name gives, followed by an observation at TIME 2. The first row
+    /// of every tie carries WT = 70 and the second WT = 140, so the first record in file
+    /// order — NONMEM's `A_0` seed (`nonmem_anchor/init_seed_tie`) — is the one with
+    /// WT = 70.
+    const TIES: &str = "\
+ID,TIME,DV,MDV,EVID,AMT,CMT,WT
+1,0,1,0,0,0,1,70
+1,0,1,0,0,0,1,140
+1,2,1,0,0,0,1,140
+2,0,0,1,2,0,1,70
+2,0,0,1,2,0,1,140
+2,2,1,0,0,0,1,140
+3,0,0,1,1,100,1,70
+3,0,0,1,1,100,1,140
+3,2,1,0,0,0,1,140
+4,0,0,1,2,0,1,70
+4,0,1,0,0,0,1,140
+4,2,1,0,0,0,1,140
+5,0,1,0,0,0,1,70
+5,0,0,1,2,0,1,140
+5,2,1,0,0,0,1,140
+6,0,0,1,1,100,1,70
+6,0,1,0,0,0,1,140
+6,2,1,0,0,0,1,140
+7,0,1,0,0,0,1,70
+7,0,0,1,1,100,1,140
+7,2,1,0,0,0,1,140
+8,0,0,1,1,100,1,70
+8,0,0,1,2,0,1,140
+8,2,1,0,0,0,1,140
+9,0,0,1,2,0,1,70
+9,0,0,1,1,100,1,140
+9,2,1,0,0,0,1,140
+";
+
+    fn wt(s: &Subject, rec: FirstRecord) -> f64 {
+        let cov = match rec {
+            FirstRecord::Dose(k) => s.dose_cov(k),
+            FirstRecord::PkOnly(m) => s.pk_only_cov(m),
+            FirstRecord::Obs(j) => s.obs_cov(j),
+        };
+        cov["WT"]
+    }
+
+    fn kind(rec: FirstRecord) -> &'static str {
+        match rec {
+            FirstRecord::Dose(_) => "dose",
+            FirstRecord::PkOnly(_) => "pk-only",
+            FirstRecord::Obs(_) => "obs",
+        }
+    }
+
+    /// #2121: the selector returns the first record in file order for every pair of kinds
+    /// and both file orders, on the reader's own output (so after its #614/#1810 ULP
+    /// moves, which are what turn file order into the walk's order).
+    #[test]
+    fn first_record_is_first_in_file_order_for_every_kind_pair() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(TIES.as_bytes()).unwrap();
+        let pop = crate::read_nonmem_csv(f.path(), None, None).unwrap();
+        // (ID, kind of the first row in file order).
+        let want = [
+            ("1", "obs"),
+            ("2", "pk-only"),
+            ("3", "dose"),
+            ("4", "pk-only"),
+            ("5", "obs"),
+            ("6", "dose"),
+            ("7", "obs"),
+            ("8", "dose"),
+            ("9", "pk-only"),
+        ];
+        for (id, want_kind) in want {
+            let s = pop.subjects.iter().find(|s| s.id == id).expect(id);
+            let rec = first_record(s, s.doses.len()).expect("records");
+            assert_eq!(
+                (kind(rec), wt(s, rec)),
+                (want_kind, 70.0),
+                "ID {id}: the seed must be the tie's first row in file order"
+            );
+        }
+        // The straddle: each mixed pair is in the file in both orders, and the two orders
+        // pick records of different kinds. A rule that ignored file order (a fixed kind
+        // preference, or last-wins) cannot satisfy both halves of a pair.
+        for (a, b) in [("4", "5"), ("6", "7"), ("8", "9")] {
+            let k = |id: &str| {
+                let s = pop.subjects.iter().find(|s| s.id == id).unwrap();
+                kind(first_record(s, s.doses.len()).unwrap())
+            };
+            assert_ne!(k(a), k(b), "IDs {a}/{b}: the two file orders pick one kind");
+        }
+    }
+
+    /// `n_doses` caps the dose candidates (the adaptive replay's appended controller doses
+    /// are not records), and a subject with no record has no seed.
+    #[test]
+    fn first_record_skips_doses_past_n_doses_and_is_none_without_records() {
+        let mut s = Subject {
+            id: "1".into(),
+            obs_times: vec![1.0],
+            ..Default::default()
+        };
+        s.doses
+            .push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
+        assert_eq!(first_record(&s, 1), Some(FirstRecord::Dose(0)));
+        assert_eq!(first_record(&s, 0), Some(FirstRecord::Obs(0)));
+        let empty = Subject::default();
+        assert_eq!(first_record(&empty, 0), None);
+    }
 }
 
 #[cfg(test)]
