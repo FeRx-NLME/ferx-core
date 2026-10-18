@@ -1682,7 +1682,9 @@ impl<const N: usize> core::ops::arith::Sub for ferx_core::sens::dual1::Dual1<N>
 pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
 pub fn ferx_core::sens::dual1::Dual1<N>::sub(self, rhs: Self) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
+pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
@@ -1690,10 +1692,12 @@ pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::is_taped(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
@@ -1754,7 +1758,9 @@ impl<const NA: usize, const N: usize> core::ops::arith::Sub for ferx_core::sens:
 pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sub(self, rhs: Self) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
@@ -1762,10 +1768,12 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_taped(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
@@ -1783,7 +1791,9 @@ pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(
 pub mod ferx_core::sens::jet
 pub mod ferx_core::sens::num
 pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
+pub const ferx_core::sens::num::PkNum::ETA_HESSIAN: bool
 pub const ferx_core::sens::num::PkNum::SECOND_ORDER: bool
+pub const ferx_core::sens::num::PkNum::TAYLOR2_EXACT: bool
 pub fn ferx_core::sens::num::PkNum::abs(self) -> Self
 pub fn ferx_core::sens::num::PkNum::acos(self) -> Self
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
@@ -1791,10 +1801,12 @@ pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::inv_logit(self) -> Self
+pub fn ferx_core::sens::num::PkNum::is_taped(self) -> bool
 pub fn ferx_core::sens::num::PkNum::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::num::PkNum::jets_finite(self) -> bool
 pub fn ferx_core::sens::num::PkNum::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::num::PkNum::ln(self) -> Self
 pub fn ferx_core::sens::num::PkNum::ln_gamma(self) -> Self
@@ -1809,7 +1821,9 @@ pub fn ferx_core::sens::num::PkNum::val(self) -> f64
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::num::PkNum::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl ferx_core::sens::num::PkNum for f64
+pub const f64::ETA_HESSIAN: bool
 pub const f64::SECOND_ORDER: bool
+pub const f64::TAYLOR2_EXACT: bool
 pub fn f64::abs(self) -> Self
 pub fn f64::acos(self) -> Self
 pub fn f64::cos(self) -> Self
@@ -1817,10 +1831,12 @@ pub fn f64::exp(self) -> Self
 pub fn f64::from_f64(x: f64) -> Self
 pub fn f64::guard_floor(self, lo: f64) -> Self
 pub fn f64::inv_logit(self) -> Self
+pub fn f64::is_taped(self) -> bool
 pub fn f64::jet_max_abs(self) -> f64
 pub fn f64::jets_finite(self) -> bool
 pub fn f64::lift2(self, v: f64, _d1: f64, _d2: f64) -> Self
 pub fn f64::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn f64::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn f64::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn f64::ln(self) -> Self
 pub fn f64::ln_gamma(self) -> Self
@@ -1835,7 +1851,9 @@ pub fn f64::val(self) -> f64
 pub fn f64::var(x: f64, _dim: usize) -> Self
 pub fn f64::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
+pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
@@ -1843,10 +1861,12 @@ pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::is_taped(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
@@ -1861,7 +1881,9 @@ pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
@@ -1869,10 +1891,12 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_taped(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
