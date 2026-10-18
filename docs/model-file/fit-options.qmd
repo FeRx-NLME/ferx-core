@@ -788,7 +788,8 @@ Notes:
   sensitivity provider's scope and `gradient` is not forced to `fd`) it uses the
   gradient-based `nlopt_lbfgs`; otherwise — a model outside the analytic scope,
   or `gradient = fd`, where the outer loop runs on finite differences — it falls
-  back to the derivative-free `bobyqa`. Models with more than 64 free parameters
+  back to the derivative-free `bobyqa`. Models with more than 64 free parameters,
+  and models with a residual `correlation` line together with `kappa` (#2122),
   take `nlopt_lbfgs` regardless, and mixture models take `bobyqa` regardless (see
   [the `auto` default](../estimation/optimizers.qmd#the-auto-default)). Benchmarking across ~10 real FOCEI datasets
   (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem

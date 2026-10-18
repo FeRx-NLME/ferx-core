@@ -212,8 +212,7 @@ fn iov_inner_subject_route(
 /// and keeps the analytic gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
-    model.n_kappa > 0
-        && model.residual_serial.is_some()
+    crate::sens::provider::kappa_residual_correlation_fd_route(model)
         && crate::stats::residual_error::has_cross_observation_residual(
             &model.error_spec,
             subject,

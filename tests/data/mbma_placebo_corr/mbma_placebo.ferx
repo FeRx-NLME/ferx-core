@@ -1,0 +1,66 @@
+# Model-based meta-analysis (MBMA) of arm-level summary data, with a
+# study-by-visit placebo time course.
+#
+# Open the example script to step through it:
+#   file.edit(system.file("examples", "ex_mbma_placebo.R", package = "ferx"))
+# or run it in one go, printing as it goes:
+#   source(system.file("examples", "ex_mbma_placebo.R", package = "ferx"), echo = TRUE)
+#
+# Data: one row per study arm and visit, built by ferx_mbma_data() (columns
+# ID, STUDY, OCC, TIME, DV, MDV, NARM, SE, DOSE). DV is the reported arm mean,
+# SE its standard error, NARM the arm size. The data are synthetic; the
+# generator and the truth are in
+#   system.file("examples", "mbma_placebo", "simulate_dataset.R", package = "ferx")
+#
+# The pieces:
+#
+#   PLACEBO[STUDY, TIME]   a level block: one placebo level per (study, visit)
+#       cell in the data. With contrast = sum_to_zero_within (the default for
+#       this shape, written out here) the levels sum to zero within each study,
+#       so TVE0 + ETA_E0 is each study's MEAN placebo level over its own visits
+#       and the levels are deviations from it. One level per study is derived
+#       (minus the sum of the others) rather than estimated.
+#
+#   weight = SE with sigma FIX 1   inverse-variance weighting: each arm mean
+#       counts 1 / SE^2. DV, PRED and simulations stay on the natural scale.
+#
+#   kappa ... weight = NARM   between-arm variability (BTAV), scaled by arm
+#       size. The estimate is the unweighted gamma^2: an arm of NARM patients
+#       has between-arm SD sqrt(gamma^2 / NARM).
+#
+# The fitted levels exist only for the (study, visit) cells in the fit data.
+# Simulate or predict on that same grid; a new study or a visit the fit never
+# saw is refused, by design, rather than given a level of 0.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)      # mean placebo level over a study's visits
+  theta EMAX(8.0, 0.0, 100.0)       # maximum drug effect (score points)
+  theta ED50(20.0, 0.1, 1000.0)     # dose at half-maximal effect (mg)
+  theta ET50(2.0, 0.01, 100.0)      # time to half-maximal drug effect (weeks)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)
+
+  omega ETA_E0 ~ 4.0 (sd)           # between-study variability on TVE0
+  kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  STUDY categorical
+  NARM  continuous
+  SE    continuous
+  DOSE  continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = true

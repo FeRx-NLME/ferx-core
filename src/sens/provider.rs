@@ -1046,17 +1046,26 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
-        // A residual `correlation … by` line with kappa (#1082 PR5): the IOV outer
-        // assemblies score a diagonal `R` — FOCEI declines per subject through
-        // `corr_residual_diag`, while FOCE's (`subject_packed_gradient_foce_iov`) would
-        // silently differentiate the diagonal `R⁰`. Neither has a dense-`R` form, so the
-        // outer gradient is central differences of the OFV, on FOCE and FOCEI alike. The
-        // analytic IOV + dense-`R` gradient is a follow-up.
-        && !(model.n_kappa > 0 && model.residual_serial.is_some())
+        && !kappa_residual_correlation_fd_route(model)
     // IIV on residual error (#474) needs no gate here: the analytic gradient (inner η-column +
     // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves every `iiv_on_ruv`
     // combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
     // (#474/#4b/#591/#623/#677) — with no FD carve-out.
+}
+
+/// A residual `correlation … by` line with kappa (#1082 PR5): the IOV outer
+/// assemblies score a diagonal `R` — FOCEI declines per subject through
+/// `corr_residual_diag`, while FOCE's (`subject_packed_gradient_foce_iov`) would
+/// silently differentiate the diagonal `R⁰`. Neither has a dense-`R` form, so the
+/// outer gradient is central differences of the OFV, on FOCE and FOCEI alike. The
+/// analytic IOV + dense-`R` gradient is a follow-up (#2101).
+///
+/// One predicate for the three things that key on this route: the scope gate in
+/// [`analytic_outer_gradient_in_scope`], `auto`'s L-BFGS pick
+/// (`Optimizer::resolve_auto_given_analytic`, #2122) and the parse-time warning that
+/// names the route.
+pub(crate) fn kappa_residual_correlation_fd_route(model: &CompiledModel) -> bool {
+    model.n_kappa > 0 && model.residual_serial.is_some()
 }
 
 /// [`analytic_outer_gradient_available`], kept as the shared entry point that

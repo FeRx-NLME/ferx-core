@@ -9710,7 +9710,9 @@ impl Optimizer {
     /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
     /// available — the model is in the sensitivity provider's scope and the user
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
-    /// otherwise. This mirrors the analytic-vs-FD predicate the outer loop uses
+    /// otherwise, with two exceptions that take L-BFGS on a finite-difference
+    /// gradient: more than [`BOBYQA_MAX_DIM`] free parameters (#1064), and a
+    /// residual `correlation` line together with kappa (#2122). This mirrors the analytic-vs-FD predicate the outer loop uses
     /// (see `build_info::gradient_method_outer`), so `auto` lands on the
     /// gradient-based optimizer exactly when there is an exact gradient to feed
     /// it (#490).
@@ -9757,6 +9759,14 @@ impl Optimizer {
         // though the gradient is finite-difference, because O(n) FD passes beat
         // O(n²) interpolation.
         if model.free_packed_dim() > BOBYQA_MAX_DIM {
+            return Optimizer::NloptLbfgs;
+        }
+        // #2122: a residual `correlation` line with kappa is FD-only (#2101), and on it
+        // BOBYQA's `FtolReached` stopped mbma_placebo + car1 at a different OFV per start
+        // ρ (106.55 / 114.34 / 95.08), two of them above the nested kappa-only optimum
+        // (97.07); L-BFGS on the same FD gradient reached 89.45 from all three. Only this
+        // route: other FD → BOBYQA routes (#1782, #2048, #2031) are unmeasured here.
+        if crate::sens::provider::kappa_residual_correlation_fd_route(model) {
             return Optimizer::NloptLbfgs;
         }
         // Use the single shared predicate so `auto` can never disagree with the
