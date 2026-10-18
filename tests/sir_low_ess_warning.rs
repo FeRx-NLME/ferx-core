@@ -139,7 +139,15 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     // than keeping it beside the new ESS.
     let nat = rerun(&f, &opts, &prep, SirScale::Natural);
     report(&[("FOCEI packed", f.sir_ess), ("FOCEI natural", nat.sir_ess)]);
-    assert_ess(f.sir_ess, 3.548_442_767_315_493, "FOCEI packed");
+    // #2039 moved both FOCEI literals (from 3.548_442_767_315_493 and
+    // 139.787_472_872_506_02, 7.3e-7 and 3.6e-7 relative): a few inner trials with
+    // V at 1e-93 or 1e169 overflow the closed form to a NaN amount, which the readout
+    // used to serve as 0 and now serves as NaN, so those trials score differently.
+    // Those NaN amounts are the only readouts that changed, and swapping
+    // the old readout back in on one build moves the ESS by the same order (macOS
+    // arm64: 3.548458 new, 3.548303 old). The new literals are the CI x86_64
+    // `slow-tests.yml` value, identical in all printed digits in the core and nn jobs.
+    assert_ess(f.sir_ess, 3.548_440_171_697_213, "FOCEI packed");
     let w = low_ess(&f).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", f.warnings));
     assert_eq!(
         f.warnings
@@ -169,7 +177,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
 
     assert_structured_sir(&f);
 
-    assert_ess(nat.sir_ess, 139.787_472_872_506_02, "FOCEI natural");
+    assert_ess(nat.sir_ess, 139.787_422_216_222_47, "FOCEI natural");
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
