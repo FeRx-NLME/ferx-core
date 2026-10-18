@@ -1876,12 +1876,16 @@ mod tests {
     /// a `NaN` volume failed its `v > 0` test and read 0, while the production walk
     /// served the `NaN` once #2039 fixed it.
     ///
+    /// The fixture reaches all three ways the dual walk reads an observation: the IV
+    /// bolus state (slot 0), the oral central slot (slot 1), and the stepped-back copy
+    /// `obs_boundary_correction` builds when a record sits on a lagged arrival.
+    ///
     /// Mutation (run): restore this walk's inline `if v.val() > 0.0 { .. } else { 0 }`
     /// readout → the `V` rows here die, and the production walk's tests stay green.
     #[test]
     fn dual_walk_serves_a_nan_volume_as_nan_where_production_does() {
         use crate::pk::event_driven::EventSchedule;
-        use crate::types::DoseEvent;
+        use crate::types::{DoseEvent, PK_IDX_LAGTIME};
 
         let doses = vec![
             DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
@@ -1897,44 +1901,90 @@ mod tests {
             ..Default::default()
         };
         let bad_from = 2;
-        for (label, cl, v) in [("V", 5.0, f64::NAN), ("CL", f64::NAN, 80.0)] {
-            let pk_obs: Vec<PkParams> = (0..6)
-                .map(|j| {
-                    if j < bad_from {
-                        pk_of(5.0, 80.0, 0.0)
-                    } else {
-                        pk_of(cl, v, 0.0)
-                    }
+        // `lag = 1` puts the second dose's arrival on the t = 13 record, inside the
+        // `NaN` span.
+        for (route, model, ka, lag) in [
+            ("IV bolus", PkModel::OneCptIv, 0.0, 0.0),
+            ("oral", PkModel::OneCptOral, 1.2, 0.0),
+            (
+                "IV, record on a lagged arrival",
+                PkModel::OneCptIv,
+                0.0,
+                1.0,
+            ),
+        ] {
+            let lagtimes = [0.0, lag];
+            let lag_dual: Vec<Dual2<1>> = if lag > 0.0 {
+                lagtimes.iter().map(|&l| Dual2::constant(l)).collect()
+            } else {
+                Vec::new()
+            };
+            // Each route must reach the read it is here for, or the row tests nothing.
+            assert_eq!(
+                obs_boundary_correction::<Dual2<1>>(&doses, &lagtimes, &lag_dual, &[], 0.0, 13.0)
+                    .is_some(),
+                lag > 0.0,
+                "{route}: the t = 13 record does not take the read this row is for"
+            );
+            let pk_dose: Vec<PkParams> = lagtimes
+                .iter()
+                .map(|&l| {
+                    let mut p = pk_of(5.0, 80.0, ka);
+                    p.values[PK_IDX_LAGTIME] = l;
+                    p
                 })
                 .collect();
-            let production = event_driven_predictions(
-                PkModel::OneCptIv,
-                &subject,
-                &[pk_of(5.0, 80.0, 0.0); 2],
-                &pk_obs,
-                &[],
-            );
-            let schedule = EventSchedule::for_subject(&subject, PkModel::OneCptIv, &doses, &[]);
-            let pk_at_obs: Vec<PkDual<Dual2<1>>> = pk_obs
-                .iter()
-                .map(|p| pk_dual_cl_var(p.values[PK_IDX_CL], p.values[PK_IDX_V], true))
-                .collect();
-            let dual: Vec<Dual2<1>> = event_driven_sens_g(
-                PkModel::OneCptIv,
-                &subject,
-                &schedule,
-                &[pk_dual_cl_var(5.0, 80.0, false); 2],
-                &pk_at_obs,
-                &[],
-            );
-            for (j, (d, p)) in dual.iter().zip(production.iter()).enumerate() {
-                assert_eq!(
-                    (j >= bad_from, j >= bad_from),
-                    (d.value.is_nan(), p.is_nan()),
-                    "{label} = NaN from record {bad_from} on, record {j}: dual {} vs \
-                     production {p}",
-                    d.value
+            let schedule = EventSchedule::for_subject(&subject, model, &doses, &lagtimes);
+            let with_ka = |p: PkDual<Dual2<1>>| PkDual {
+                ka: Dual2::constant(ka),
+                ..p
+            };
+            for (label, cl, v) in [("V", 5.0, f64::NAN), ("CL", f64::NAN, 80.0)] {
+                let pk_obs: Vec<PkParams> = (0..6)
+                    .map(|j| {
+                        if j < bad_from {
+                            pk_of(5.0, 80.0, ka)
+                        } else {
+                            pk_of(cl, v, ka)
+                        }
+                    })
+                    .collect();
+                let production = event_driven_predictions(model, &subject, &pk_dose, &pk_obs, &[]);
+                let pk_at_obs: Vec<PkDual<Dual2<1>>> = pk_obs
+                    .iter()
+                    .map(|p| {
+                        with_ka(pk_dual_cl_var(
+                            p.values[PK_IDX_CL],
+                            p.values[PK_IDX_V],
+                            true,
+                        ))
+                    })
+                    .collect();
+                let dual: Vec<Dual2<1>> = event_driven_sens_with_doses_g(
+                    model,
+                    &subject,
+                    &schedule,
+                    &doses,
+                    &lag_dual,
+                    &[],
+                    &[with_ka(pk_dual_cl_var(5.0, 80.0, false)); 2],
+                    &pk_at_obs,
+                    &[],
                 );
+                assert!(
+                    production[..bad_from].iter().all(|&p| p > 0.0),
+                    "{route}: the records before the NaN read 0, so the fixture is inert: \
+                     {production:?}"
+                );
+                for (j, (d, p)) in dual.iter().zip(production.iter()).enumerate() {
+                    assert_eq!(
+                        (j >= bad_from, j >= bad_from),
+                        (d.value.is_nan(), p.is_nan()),
+                        "{route}, {label} = NaN from record {bad_from} on, record {j}: dual {} \
+                         vs production {p}",
+                        d.value
+                    );
+                }
             }
         }
     }
