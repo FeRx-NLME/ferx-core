@@ -185,8 +185,19 @@ fn mode_response<const N: usize>(
             }
         }
     }
-    let hc = h.symmetric_part().cholesky()?;
-    let wv = hc.solve(&grad_f);
+    // Nonsingular, not necessarily definite: see `mode_solve`.
+    let hs = h.symmetric_part();
+    let solve: Box<dyn Fn(&DMatrix<f64>) -> Option<DMatrix<f64>>> = match hs.clone().cholesky() {
+        Some(c) => Box::new(move |b| Some(c.solve(b))),
+        None => {
+            let lu = hs.full_piv_lu();
+            if !lu.is_invertible() {
+                return None;
+            }
+            Box::new(move |b| lu.solve(b))
+        }
+    };
+    let wv = solve(&DMatrix::from_column_slice(N, 1, grad_f.as_slice()))?;
     // ∂ₓg along the x axes.
     let mut gx = DMatrix::<f64>::zeros(N, n);
     for block in (0..n).collect::<Vec<_>>().chunks(K) {
@@ -198,7 +209,9 @@ fn mode_response<const N: usize>(
             }
         }
     }
-    Some((std::array::from_fn(|k| wv[k]), -hc.solve(&gx)))
+    let eta_x = -solve(&gx)?;
+    (wv.iter().chain(eta_x.iter()).all(|v| v.is_finite()))
+        .then(|| (std::array::from_fn(|k| wv[k]), eta_x))
 }
 
 fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(

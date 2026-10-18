@@ -2048,6 +2048,65 @@ fn laplace_kernel<const N: usize, const M: usize>(
             .sum::<f64>()
 }
 
+/// Where the regularised exact anchor is not positive-definite, production's Laplace
+/// objective falls back to the prior precision `Ω⁻¹` (`build_proposal`) and stays finite;
+/// the adjoint must serve that objective's gradient there rather than decline (a decline
+/// costs the reconverged FD score: on a 141-weight covariate network, most of the fit). The
+/// fixture point is found on a fixed grid of η where `H` is indefinite, which is asserted —
+/// the straddle — so the check cannot pass on a point that never reaches the fallback.
+#[test]
+fn laplace_serves_the_prior_precision_anchor_fallback() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let indefinite = |eta: &[f64]| {
+        let h = exact_inner_hessian(&one, &s, params, eta).expect("recorded");
+        let reg = DMatrix::from_fn(3, 3, |a, b| {
+            h[(a, b)]
+                + if a == b {
+                    (1e-6 * h[(a, a)].abs()).max(1e-10)
+                } else {
+                    0.0
+                }
+        });
+        reg.cholesky().is_none()
+    };
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| indefinite(e))
+        .expect("a point where the exact anchor is indefinite");
+    let prod = laplace_prod(&one, &s, params, &eta);
+    assert!(
+        prod.is_finite() && prod < 1e19,
+        "production falls back: {prod}"
+    );
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let g = subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace)
+        .expect("the adjoint serves the fallback anchor");
+    assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+}
+
 #[test]
 fn laplace_kernel_is_the_production_objective() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
@@ -3715,4 +3774,30 @@ fn unread_theta_dependent_parameters_are_bit_inert() {
         })
         .fold(0.0, f64::max);
     assert!(dx_same, "EBE response differs by {dx_gap:.2e}");
+}
+
+/// `mode_solve` serves an indefinite but nonsingular exact Hessian (an EBE the inner
+/// search's fallback left at a stationary point that is not a strict minimum) exactly, and
+/// declines a singular one. Before it, a Cholesky failure here sent the subject to the
+/// reconverged finite-difference score: on a 141-weight covariate network under Laplace,
+/// 43 of 3030 subject scores, and most of the fit's time.
+#[test]
+fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
+    // Eigenvalues 3 and −1: nonsingular, not definite.
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    assert!(
+        h.clone().cholesky().is_none(),
+        "the fixture must be indefinite"
+    );
+    let b = DVector::from_column_slice(&[1.0, -3.0]);
+    let w = super::mode_solve(&h, &b).expect("nonsingular");
+    let r = &h * &w - &b;
+    assert!(r.norm() < 1e-14, "residual {:.2e}", r.norm());
+    // A strict mode keeps the Cholesky solve.
+    let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+    let w = super::mode_solve(&spd, &b).expect("definite");
+    assert!((&spd * &w - &b).norm() < 1e-14);
+    // Singular: declined, not a non-finite `w`.
+    let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
+    assert!(super::mode_solve(&sing, &b).is_none());
 }

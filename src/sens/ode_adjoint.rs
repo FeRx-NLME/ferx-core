@@ -302,6 +302,21 @@ pub(crate) fn subject_adjoint_gradient(
     by_bucket!(sc.bucket, go, (&sc, subject, template, x, objective))
 }
 
+/// `H⁻¹b` for the mode system `H w = ∇_η F` (`H` the exact inner Hessian at `η̂`): a
+/// Cholesky solve at a strict mode, else a pivoted LU. The identity `Ψ = F − wᵀ∇_η l` needs
+/// `η̂` stationary and `H` nonsingular, not definite, and an EBE that the inner search's
+/// fallback left at a stationary point whose exact `H` is indefinite is still one: declining
+/// it sent the subject to the reconverged finite-difference score, `2·n_x` EBE re-solves (on
+/// a 141-weight covariate network under Laplace, 43 such subject-iterations were most of the
+/// fit). `None` when `H` is singular or the solve is not finite.
+fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
+    if let Some(c) = h.clone().cholesky() {
+        return Some(c.solve(b));
+    }
+    let w = h.clone().full_piv_lu().solve(b)?;
+    w.iter().all(|v| v.is_finite()).then_some(w)
+}
+
 /// The θ leaves of a recording (value leaves, no tangent) for each θ the parameter
 /// program reads; shared by every recording on one tape.
 fn theta_leaves<const N: usize, const M: usize, const TH: bool>(
@@ -1893,7 +1908,7 @@ fn run<const N: usize, const M: usize>(
         .as_ref()
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| p.v).collect());
     let (grad_f, h) = eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
-    let w = h.cholesky()?.solve(&grad_f);
+    let w = mode_solve(&h, &grad_f)?;
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -2096,7 +2111,7 @@ where
         let l = inner_l(&ctx, &fh, &eh, &pv.map(lift_h), None)?;
         DMatrix::from_fn(N, N, |a, b| l.hess(a, b))
     };
-    let h_inner = h_exact.clone().cholesky()?;
+    let h_inner = h_exact.clone();
     let mut h_a: Vec<Vec<f64>> = if exact {
         (0..N)
             .map(|a| (0..N).map(|b| h_exact[(a, b)]).collect())
@@ -2107,7 +2122,12 @@ where
         crate::sens::focei_kernel::focei_htilde(&ctx, &f, &g, &eta_a, &pv)?
     };
     regularise(&mut h_a);
-    let lh = crate::sens::focei_kernel::chol(&h_a)?;
+    // Production's fallback when the regularised anchor is not positive-definite (a mode
+    // the inner search left loosely converged, a flat direction): the prior precision `Ω⁻¹`
+    // scales the grid and its log-determinant enters `F` (`build_proposal`). It is part of
+    // the objective, so the gradient follows it rather than declining.
+    let lh = crate::sens::focei_kernel::chol(&h_a)
+        .or_else(|| crate::sens::focei_kernel::chol(&pv.omega.inv))?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let (gh_nodes, _, gh_logw) = crate::estimation::agq::cached_gauss_hermite(n_agq);
     let one_point = n_agq == 1;
@@ -2192,7 +2212,7 @@ trait ExactAnchor<const N: usize, const M: usize> {
         pv: &ParT<f64>,
         p1: &[DualV<N, M>],
         grid: &[([f64; N], f64, [f64; N])],
-        h_inner: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+        h_inner: DMatrix<f64>,
         active: usize,
     ) -> Option<Vec<f64>>;
 }
@@ -2213,7 +2233,7 @@ macro_rules! exact_anchor_buckets {
                 pv: &ParT<f64>,
                 p1: &[DualV<$n, $m>],
                 grid: &[([f64; $n], f64, [f64; $n])],
-                h_inner: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+                h_inner: DMatrix<f64>,
                 active: usize,
             ) -> Option<Vec<f64>> {
                 agq_taped::<$n, $m, $n, true>(
@@ -2236,7 +2256,7 @@ macro_rules! exact_anchor_buckets {
                 _: &ParT<f64>,
                 _: &[DualV<$dn, $dm>],
                 _: &[([f64; $dn], f64, [f64; $dn])],
-                _: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+                _: DMatrix<f64>,
                 _: usize,
             ) -> Option<Vec<f64>> {
                 None
@@ -2267,7 +2287,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     pv: &ParT<f64>,
     p1: &[DualV<N, M>],
     grid: &[([f64; N], f64, [f64; N])],
-    h_inner: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+    h_inner: DMatrix<f64>,
     exact: bool,
     active: usize,
 ) -> Option<Vec<f64>> {
@@ -2349,7 +2369,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
     };
     regularise(&mut h_a);
-    let lh = crate::sens::focei_kernel::chol(&h_a)?;
+    // The same anchor fallback as `run_agq`, on the tape (both see the same values, so
+    // both take the same branch).
+    let lh = crate::sens::focei_kernel::chol(&h_a)
+        .or_else(|| crate::sens::focei_kernel::chol(&pr.omega.inv))?;
     let half_logdet = R::c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
     // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
     let node_fr: Vec<Vec<R>> = node_preds
@@ -2470,7 +2493,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         )
     };
     let (grad_eta, _) = sweep(&s1);
-    let w = h_inner.solve(&DVector::from_column_slice(&grad_eta));
+    let w = mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta))?;
 
     // ---- sweep 2: Ψ = A − wᵀ∇_η l(η̂) ----------------------------------------------
     let psi =
