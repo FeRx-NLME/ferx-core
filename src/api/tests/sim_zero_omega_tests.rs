@@ -92,13 +92,16 @@ fn population(name: &str, nid: usize, with_doses: bool, dv: impl Fn(f64) -> f64)
         rows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         rows.into_iter().for_each(|r| s.push_str(&r.2));
     }
-    let path = std::env::temp_dir().join(format!("ferx_1605_{name}_{}.csv", std::process::id()));
-    std::fs::File::create(&path)
-        .and_then(|mut f| f.write_all(s.as_bytes()))
-        .expect("write #1605 fixture csv");
-    let pop = crate::read_nonmem_csv(&path, None, Some("OCC")).expect("read #1605 fixture csv");
-    let _ = std::fs::remove_file(&path);
-    pop
+    // A unique file per call (#2090): tests in this binary share one PID and some pass
+    // the same `name`, so a fixed `{name}_{pid}` path raced under the parallel runner.
+    let mut f = tempfile::Builder::new()
+        .prefix(&format!("ferx_1605_{name}_"))
+        .suffix(".csv")
+        .tempfile()
+        .expect("create #1605 fixture csv");
+    f.write_all(s.as_bytes()).expect("write #1605 fixture csv");
+    f.flush().expect("flush #1605 fixture csv");
+    crate::read_nonmem_csv(f.path(), None, Some("OCC")).expect("read #1605 fixture csv")
 }
 
 /// `predict` at η = 0, keyed by (id, time bits).
