@@ -145,10 +145,11 @@ fn check(
     }
 }
 
-/// Linux aarch64, `auto` → L-BFGS: OFV 89.4512783684 / 89.4512784177 / 89.4512784903 from
-/// ρ₀ = 0.01 / 0.3 / 0.6 (ρ̂ = 0.7598), spread 1.219e-7. `1e-5` is 82× above it. Under
-/// BOBYQA (explicit, same platform) the three stop at 104.7159 / 111.6049 / 98.3146: spread
-/// 13.29, 1.3e6× this bound.
+/// Linux aarch64 (`tools/linux-test.sh`) and x86_64 (`slow-tests.yml` run 39152008553), the
+/// same in every printed digit, `auto` → L-BFGS: OFV 89.4512783684 / 89.4512784177 /
+/// 89.4512784903 from ρ₀ = 0.01 / 0.3 / 0.6 (ρ̂ = 0.7598), spread 1.219e-7. `1e-5` is 82×
+/// above it. Under BOBYQA (explicit, Linux aarch64) the three stop at 104.7159 / 111.6049 /
+/// 98.3146: spread 13.29, 1.3e6× this bound.
 const MBMA_SPREAD_TOL: f64 = 1e-5;
 /// The nested kappa-only fit is 97.0700361594 on Linux; the L-BFGS worst is 7.619 below it.
 /// No slack: the car1 model contains it at ρ = 0. All three BOBYQA stops end above it, the
@@ -175,9 +176,10 @@ fn mbma_placebo_car1_reaches_one_optimum_from_every_start() {
     );
 }
 
-/// Linux aarch64, `auto` → L-BFGS: OFV 105.6397483118 / 105.6397790273 from ρ₀ = −0.3 /
-/// 0.5 (ρ̂ = 0.1152), spread 3.072e-5. `1e-3` is 33× above it. Under BOBYQA the two stop at
-/// 105.7361 / 105.6736: spread 0.0625, 62× this bound. That spread is the only check here
+/// Linux aarch64 and x86_64 (`slow-tests.yml` run 39152008553), the same in every printed
+/// digit, `auto` → L-BFGS: OFV 105.6397483118 / 105.6397790273 from ρ₀ = −0.3 / 0.5
+/// (ρ̂ = 0.1152), spread 3.072e-5. `1e-3` is 33× above it. Under BOBYQA (Linux aarch64) the
+/// two stop at 105.7361 / 105.6736: spread 0.0625, 62× this bound. That spread is the only check here
 /// a BOBYQA revert reaches: both BOBYQA stops are still below the nested optimum.
 const EXACT3_SPREAD_TOL: f64 = 1e-3;
 /// The nested kappa-only fit is 107.0435709196 on Linux (NONMEM's optimum, the start of
