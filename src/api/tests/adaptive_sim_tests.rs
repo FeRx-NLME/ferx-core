@@ -1623,6 +1623,93 @@ fn adaptive_base_infusion_under_tv_covariate_matches_closed_form() {
 }
 
 #[test]
+fn adaptive_base_infusion_end_colliding_with_a_decision_dose_applies_it_once() {
+    // #1236 part 1. Both the reactive driver and its frozen replay (`adaptive_frozen_replay_tv`)
+    // break at every base infusion's end, so a derived end landing within `EVENT_MATCH_TOL` of
+    // a controller dose — but past the 1e-15 dedup — is a second break where that dose
+    // matches. Only the apply-once masks stop it applying twice (#1186).
+    //
+    // Two geometries, because the two sides are reachable from opposite sides of the gap:
+    //  - the infusion ends 3.55e-15 BEFORE the decision (0.2 + 239/10 = 24.099999999999998
+    //    vs 24.1): the replay, whose ledger already holds the bolus, meets it at the earlier
+    //    break; the driver has not injected it yet, so only the replay's mask is live;
+    //  - it ends 3.55e-15 AFTER (0.1 + 103/5 = 20.700000000000003 vs 20.7): the driver has
+    //    injected and applied the bolus, then meets it again; both masks are live.
+    // Measured with each mask deleted on its own: replay → "diverges from the frozen-schedule
+    // replay" `Err` on both geometries; driver → the same `Err` on the second. With both
+    // deleted the two sides agree on the doubled bolus, which the `predict()` comparison
+    // catches. The run needs the time-varying path (CRCL changes): the replay runs only there.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    for (label, infusion, decision, ends_after) in [
+        (
+            "ends after",
+            DoseEvent::new(0.1, 103.0, 1, 5.0, false, 0.0),
+            20.7,
+            true,
+        ),
+        (
+            "ends before",
+            DoseEvent::new(0.2, 239.0, 1, 10.0, false, 0.0),
+            24.1,
+            false,
+        ),
+    ] {
+        let end = infusion.time + infusion.bioavailable_infusion(1.0).1;
+        let gap = end - decision;
+        assert!(
+            gap.abs() > 1e-15
+                && gap.abs() < crate::ode::predictions::EVENT_MATCH_TOL
+                && (gap > 0.0) == ends_after,
+            "{label}: the infusion end must sit past the dedup, inside the match, on the \
+             intended side: end {end:?}, decision {decision}"
+        );
+
+        let mut s = subj("1", vec![12.0, 30.0], vec![infusion.clone()]);
+        s.covariates = crcl_1148(100.0);
+        s.dose_covariates = vec![crcl_1148(100.0)];
+        s.obs_covariates = vec![crcl_1148(100.0), crcl_1148(60.0)];
+        let mut pop = population(vec![s.clone()]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1236),
+            decision_times: vec![decision],
+            ..Default::default() // verify = true
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .unwrap_or_else(|e| panic!("{label}: the colliding bolus must apply once: {e:?}"));
+        assert_eq!(res.ledger.len(), 1, "{label}: one controller bolus");
+
+        // `predict()` on base ∪ ledger. The bolus row is a record there and governs
+        // (12, decision], which on the adaptive walk obs@30 governs — so it carries obs@30's
+        // CRCL; that restates the governing rule, it is not what this test is about.
+        let mut realized = s;
+        realized.doses = vec![
+            infusion,
+            DoseEvent::new(decision, 100.0, 1, 0.0, false, 0.0),
+        ];
+        realized.dose_covariates = vec![crcl_1148(100.0), crcl_1148(60.0)];
+        realized.dose_occasions = vec![1; 2];
+        let mut pop = population(vec![realized]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        let want = predict(&model, &pop, &model.default_params).unwrap();
+        let got = ipred_at_1148(&res, 30.0);
+        let p30 = want
+            .iter()
+            .find(|p| (p.time - 30.0).abs() < 1e-9)
+            .unwrap()
+            .pred;
+        assert!(got.is_finite() && p30.is_finite(), "{label}: {got} / {p30}");
+        // Measured: bit-identical on both geometries. The 1e-9 band is this file's
+        // degenerate-oracle convention; a doubled bolus is ≥ 57 away.
+        assert!(
+            (got - p30).abs() <= 1e-9 * p30.abs(),
+            "{label}: IPRED@30 = {got} vs predict() {p30}; a doubled bolus adds {:.4}",
+            100.0 * (-0.06f64 * (30.0 - decision)).exp()
+        );
+    }
+}
+
+#[test]
 fn adaptive_base_loading_plus_titration_under_tv_covariate_passes_verifier() {
     // #930: a base loading dose augmented by a controller under a time-varying covariate. The
     // controller doses at every decision (state-independent), so base ∪ realized ledger
