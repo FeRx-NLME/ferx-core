@@ -2521,7 +2521,11 @@ fn fit_inner(
     }
 
     let n_obs = population.n_obs();
-    let n_params = n_params_pre;
+    // #1065: a profiled block's levels are held from the optimizer but estimated from
+    // the data, so they count — the profiled and unprofiled fits of one model report one
+    // `n_parameters` and one BIC.
+    let counted_mask = crate::model_selection::counted_held_mask(model, init_params, &held_mask);
+    let n_params = counted_mask.iter().filter(|&&b| !b).count();
 
     // Parameter priors (#254). `result.ofv` is the clean −2LL that every
     // optimizer reports (the penalty is excluded from it by construction), so
@@ -2564,7 +2568,7 @@ fn fit_inner(
     // Delattre class tally behind the BIC variants (#1177): the same packed
     // held mask `n_params` was counted from, split by segment.
     let bic_inputs =
-        crate::model_selection::bic_inputs_for(model, init_params, &held_mask, n_for_bic);
+        crate::model_selection::bic_inputs_for(model, init_params, &counted_mask, n_for_bic);
     debug_assert_eq!(
         bic_inputs.n_free(),
         n_params,
@@ -3160,6 +3164,7 @@ fn fit_inner(
         cov_eigenvalues,
         cov_condition_number,
         bic_inputs,
+        profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,

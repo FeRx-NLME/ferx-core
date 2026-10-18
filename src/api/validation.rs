@@ -4792,6 +4792,161 @@ pub(crate) fn check_ode_method_linear(
         .collect()
 }
 
+/// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
+/// can be fitted with. The profile solve is a least-squares step on the FOCE/FOCEI
+/// objective, so it needs that objective, Gaussian rows, and a residual variance that
+/// does not read the prediction. Each refusal names the block and what it saw; none
+/// falls back to fitting the levels another way, since the user asked for `profile`.
+///
+/// The declaration half (bounds, `FIX`, a single θ) and the route
+/// (`E_PROFILE_NOT_LINEAR`) are the parser's.
+pub(crate) fn check_profiled_levels(
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    let blocks: Vec<&str> = model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .filter(|d| d.profiled)
+        .map(|d| d.name.as_str())
+        .collect();
+    let subject = match blocks.as_slice() {
+        [] => return Vec::new(),
+        [one] => format!("theta {one}[...] is"),
+        [init @ .., last] => format!(
+            "theta {} and {last}[...] are",
+            init.iter()
+                .map(|b| format!("{b}[...]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    const REMOVE: &str = "Remove `profile` to estimate the levels as ordinary θ.";
+    let refuse = |what: String, fix: &str| {
+        Diagnostic::error(
+            "E_PROFILE_SCOPE",
+            format!("{subject} `profile`d, {what} {fix}"),
+        )
+        .with_block("parameters")
+    };
+    let mut out = Vec::new();
+    for m in options.method_chain() {
+        if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+            out.push(refuse(
+                format!(
+                    "which only `foce` and `focei` estimate; this fit runs `{}`.",
+                    m.label()
+                ),
+                REMOVE,
+            ));
+        }
+    }
+    if options.n_agq > 1 {
+        out.push(refuse(
+            format!(
+                "which only `foce` and `focei` estimate, at `n_agq = 1`; this fit asks for \
+                 `n_agq = {}` quadrature.",
+                options.n_agq
+            ),
+            REMOVE,
+        ));
+    }
+    let endpoint = if model.has_tte() {
+        Some("time-to-event")
+    } else if model.has_binary() {
+        Some("binary")
+    } else if model.has_non_gaussian() {
+        Some("Markov (CTMM)")
+    } else {
+        None
+    };
+    if let Some(kind) = endpoint {
+        out.push(refuse(
+            format!(
+                "which needs a Gaussian likelihood on every row; this model has a {kind} endpoint."
+            ),
+            REMOVE,
+        ));
+    }
+    let models: Vec<ErrorModel> = match &model.error_spec {
+        ErrorSpec::Single(em) => vec![*em],
+        ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+            m.values().map(|e| e.error_model).collect()
+        }
+    };
+    if let Some(em) = models.iter().find(|e| !matches!(e, ErrorModel::Additive)) {
+        let name = match em {
+            ErrorModel::Proportional => "proportional (or power)",
+            _ => "combined",
+        };
+        out.push(refuse(
+            format!(
+                "which needs an additive residual error; this model's is {name}, whose \
+                 variance reads the prediction."
+            ),
+            REMOVE,
+        ));
+    }
+    if model.log_transform {
+        out.push(refuse(
+            "which needs an additive residual error on the data's own scale; this model \
+             transforms both sides by a log, so the levels enter through `log(...)`."
+                .to_string(),
+            REMOVE,
+        ));
+    }
+    if model.bloq_in_force() == crate::types::BloqMethod::M3 {
+        out.push(refuse(
+            "which needs a Gaussian likelihood on every row; this fit scores censored rows \
+             by M3, a normal-tail probability."
+                .to_string(),
+            REMOVE,
+        ));
+    }
+    if model.residual_serial.is_some() {
+        out.push(refuse(
+            "and a `correlation` line is not yet supported together with `profile` (#1082)."
+                .to_string(),
+            "Remove one of the two for now.",
+        ));
+    }
+    for (present, what) in [
+        (model.mixture.is_some(), "a `[mixture]`"),
+        (model.is_sde(), "a `[diffusion]` block"),
+        (model.frem_config.is_some(), "a FREM covariate model"),
+    ] {
+        if present {
+            out.push(refuse(
+                format!("which does not yet combine with {what}."),
+                REMOVE,
+            ));
+        }
+    }
+    if options.run_covariance_step
+        && options.covariance_method_set
+        && options.covariance_method != crate::types::CovarianceMethod::Hessian
+    {
+        out.push(refuse(
+            format!(
+                "whose covariance step computes `r` only for now; this fit asks for \
+                 `covariance_method = {}`.",
+                options.covariance_method.label()
+            ),
+            "Use `covariance_method = r`, or remove `profile`.",
+        ));
+    }
+    // PR1 of #1065 parses, checks and reports a profiled block; the solve is PR2.
+    out.push(refuse(
+        "but profiled estimation is not implemented yet (#1065): this release checks the \
+         declaration and nothing more."
+            .to_string(),
+        REMOVE,
+    ));
+    out
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
@@ -4809,6 +4964,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let mut diags = Vec::new();
 
     diags.extend(check_ode_method_linear(model, options));
+    diags.extend(check_profiled_levels(model, options));
 
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
     // variable to integrate over, so every estimator whose objective *is* an
@@ -8368,17 +8524,24 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
 /// catch-all.
-fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
+pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // #1082: a `level` declaration beside `iov_column` / `iov_occasion`, or a kappa with
     // no `at` once levels are declared. The parser writes the code as the message's
     // prefix; the diagnostic carries it as its code and keeps the rest as the message.
+    // #1065: the declaration and route halves of a `profile`d θ level block, same shape.
     const MIXED: &str = "E_LEVEL_MIXED_WITH_IOV_COLUMN: ";
-    if let Some(at) = err.find(MIXED) {
-        return Diagnostic::error(
-            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
-            err[at + MIXED.len()..].to_string(),
-        )
-        .with_block("parameters");
+    for prefix in [
+        MIXED,
+        crate::parser::model_parser::PROFILE_SCOPE,
+        crate::parser::model_parser::PROFILE_NOT_LINEAR,
+    ] {
+        if let Some(at) = err.find(prefix) {
+            return Diagnostic::error(
+                prefix.trim_end_matches(": "),
+                err[at + prefix.len()..].to_string(),
+            )
+            .with_block("parameters");
+        }
     }
     if let Some(rest) = err.strip_prefix("Missing [") {
         if let Some(end) = rest.find(']') {

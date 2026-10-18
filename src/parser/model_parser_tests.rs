@@ -28733,6 +28733,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         name: "KM".to_string(),
         spec,
         index_covariate: None,
+        profiled: false,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
         .unwrap()
@@ -33716,5 +33717,591 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             })
             .collect();
         run_g::<D2>(name, lean, full, &seq, tafd_of, |t| D2::constant(t - last));
+    }
+}
+
+// ── #1065: `profile` on a θ level block ─────────────────────────────────────
+
+/// An algebraic MBMA model whose placebo block is declared by `decl` and read
+/// as `read` in `BASE`.
+fn profile_model(decl: &str, read: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  {decl}
+  omega ETA_E0 ~ 4.0
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  BASE = TVE0 + {read} + ETA_E0
+
+[structural_model]
+  y = BASE
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+fn profiled_decls(parsed: &ParsedModel) -> Vec<(String, bool)> {
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .map(|d| (d.name.clone(), d.profiled))
+        .collect()
+}
+
+/// Every accepted form parses and marks the block profiled: the column form under
+/// each contrast, the counted form, and any case. An unmarked block is the control.
+#[test]
+fn profile_is_accepted_on_every_level_block_form() {
+    for contrast in [
+        "",
+        ", contrast = none",
+        ", contrast = ref",
+        ", contrast = sum_to_zero_within",
+        ", contrast = sum_to_zero",
+    ] {
+        let text = profile_model(
+            &format!("theta PLACEBO[STUDY, TIME{contrast}](0.0) profile"),
+            "PLACEBO",
+        );
+        let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{contrast}: {e}"));
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{contrast}"
+        );
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0) profile",
+        "theta PLACEBO[3](0.0)   PROFILE",
+    ] {
+        let parsed = parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{decl}"
+        );
+    }
+    let control =
+        parse_full_model(&profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")).unwrap();
+    assert_eq!(profiled_decls(&control), [("PLACEBO".to_string(), false)]);
+}
+
+/// A profiled block's levels are unbounded, so a `lower ≥ 0` default can never
+/// select log-packing; an unprofiled block keeps the `1e-9 … 1e9` default box.
+#[test]
+fn a_profiled_block_is_unbounded_and_never_log_packed() {
+    let p = parse_full_model(&profile_model(
+        "theta PLACEBO[3](0.5) profile",
+        "PLACEBO[STUDY]",
+    ))
+    .unwrap()
+    .model;
+    let u = parse_full_model(&profile_model("theta PLACEBO[3](0.5)", "PLACEBO[STUDY]"))
+        .unwrap()
+        .model;
+    // θ 0 is TVE0; the three levels follow.
+    for l in 1..=3 {
+        assert_eq!(
+            p.default_params.theta_lower[l],
+            f64::NEG_INFINITY,
+            "level {l}"
+        );
+        assert_eq!(p.default_params.theta_upper[l], f64::INFINITY, "level {l}");
+        assert!(!crate::estimation::parameterization::theta_packs_log(
+            p.default_params.theta_lower[l]
+        ));
+        assert_eq!(u.default_params.theta_lower[l], 1e-9, "control level {l}");
+        assert_eq!(u.default_params.theta_upper[l], 1e9, "control level {l}");
+    }
+}
+
+/// The three declaration refusals, each sentence asserted: a single θ, `FIX`
+/// (inside or after the parentheses, `profile` before or after it), and bounds
+/// (lower only, or both). Every message carries the code prefix and the name.
+#[test]
+fn profile_refuses_a_single_theta_fix_and_bounds() {
+    let err = |decl: &str, read: &str| {
+        parse_full_model(&profile_model(decl, read))
+            .err()
+            .expect("refused")
+    };
+    let single = err("theta PLACEBO(0.0) profile", "PLACEBO");
+    for must in [
+        "E_PROFILE_SCOPE: [parameters] theta PLACEBO: `profile` applies only to a θ level \
+         block (`theta PLACEBO[...]`)",
+        "whose levels are solved for at every step.",
+        "A single θ is searched by the optimizer, so remove `profile`.",
+    ] {
+        assert!(single.contains(must), "missing {must:?} in {single}");
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, FIX) profile",
+        "theta PLACEBO[3](0.0) FIX profile",
+        "theta PLACEBO[3](0.0) profile FIX",
+    ] {
+        let fix = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] is both FIX and `profile`.",
+            "A fixed block has nothing to solve for, so remove one of the two.",
+        ] {
+            assert!(fix.contains(must), "{decl}: missing {must:?} in {fix}");
+        }
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, -5.0) profile",
+        "theta PLACEBO[3](0.0, -5.0, 5.0) profile",
+    ] {
+        let bounds = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has bounds and `profile`.",
+            "A profiled block is solved without constraints, so it takes none: write \
+             `theta PLACEBO[...](init) profile`.",
+        ] {
+            assert!(
+                bounds.contains(must),
+                "{decl}: missing {must:?} in {bounds}"
+            );
+        }
+    }
+}
+
+/// `profile` is peeled off a `theta` line only: on any other declaration it is an
+/// unrecognised word, not a silently accepted one.
+#[test]
+fn profile_is_peeled_off_a_theta_line_only() {
+    assert_eq!(
+        split_profile_modifier("omega ETA ~ 0.1 (variance) profile"),
+        ("omega ETA ~ 0.1 (variance) profile".to_string(), false)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile"),
+        ("theta A[3](0.0)".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile FIX"),
+        ("theta A[3](0.0) FIX".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0)"),
+        ("theta A[3](0.0)".to_string(), false)
+    );
+    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]").replace(
+        "omega ETA_E0 ~ 4.0",
+        "omega ETA_E0 ~ 4.0 (variance) profile",
+    );
+    assert!(parse_full_model(&text).is_err());
+}
+
+// ── #1065: the route of a `profile`d block (E_PROFILE_NOT_LINEAR) ───────────
+
+/// An algebraic model with a counted `profile` block `PLACEBO[3]` and, optionally,
+/// a second one `ARMFX[3]`. `indiv` is the `[individual_parameters]` body, `y` the
+/// readout, `error` the `[error_model]` line.
+fn route_model(indiv: &str, y: &str, error: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta PLACEBO[3](0.0) profile
+  theta ARMFX[3](0.0) profile
+  omega ETA_E0 ~ 4.0
+  omega ETA_EM ~ 0.1
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+  ARM categorical
+  WPSE continuous
+  DOSE continuous
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  y = {y}
+
+[error_model]
+  {error}
+"#
+    )
+}
+
+const ADD: &str = "DV ~ additive(ADD_ERR)";
+
+fn route_err(indiv: &str, y: &str, error: &str) -> String {
+    parse_full_model(&route_model(indiv, y, error))
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal for y = {y}"))
+}
+
+/// The two sentences every route refusal carries, around the class sentence.
+fn assert_route_frame(msg: &str) {
+    for must in [
+        "E_PROFILE_NOT_LINEAR: [parameters] theta PLACEBO[...] is `profile`d, so each \
+         prediction must read it as `c × PLACEBO` plus terms that do not read it, with `c` \
+         taken from the data alone.",
+        "Remove `profile` to estimate the levels as ordinary θ.",
+    ] {
+        assert!(msg.contains(must), "missing {must:?} in {msg}");
+    }
+}
+
+/// Every accepted route: a plain sum (F1), a data coefficient (`× DOSE`, `/ WPSE`,
+/// a literal), through a chain of parameters, and a model nonlinear in η but affine
+/// in the block (F2). `ARMFX` is profiled too and read nowhere, which is allowed.
+#[test]
+fn profile_accepts_every_affine_route_with_a_data_coefficient() {
+    for (indiv, y) in [
+        ("  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0", "BASE"),
+        ("  BASE = (TVE0 + PLACEBO[STUDY]) / WPSE + ETA_E0", "BASE"),
+        (
+            "  BASE = TVE0 + 2.0 * DOSE * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  PL = 0 - PLACEBO[STUDY] / 2\n  BASE = TVE0 + PL + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  EM = EMAX * exp(ETA_EM)",
+            "BASE - EM * DOSE / (DOSE + 10)",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] * WPSE",
+        ),
+        // A branch assignment the block reaches but `y` never reads is off the route.
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    Z = PLACEBO[STUDY] * \
+             EMAX\n  } else {\n    Z = 0\n  }",
+            "BASE",
+        ),
+    ] {
+        parse_full_model(&route_model(indiv, y, ADD))
+            .unwrap_or_else(|e| panic!("{indiv} / y = {y}: {e}"));
+    }
+    // F1 itself: η and a BTAV κ on `BASE`, `weight = SE`, a `[structural_model]`
+    // intermediate on the readout.
+    let f1 = std::fs::read_to_string("tests/data/mbma_placebo/mbma_placebo.ferx").unwrap();
+    let decl = "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)";
+    assert!(f1.contains(decl), "fixture moved");
+    let f1 = f1.replace(
+        decl,
+        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
+    );
+    parse_full_model(&f1).unwrap_or_else(|e| panic!("F1: {e}"));
+}
+
+/// Through a function, a power, a remainder or an inline `if`: the construct and
+/// the site are named.
+#[test]
+fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
+    for (indiv, y, construct, at) in [
+        (
+            "  BASE = TVE0 * exp(PLACEBO[STUDY]) + ETA_E0",
+            "BASE",
+            "`exp(...)`",
+            "in `BASE` in [individual_parameters]",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY]^2",
+            "a power (`^`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] mod 2",
+            "a remainder (`mod`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
+            "BASE",
+            "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)",
+            "in `BASE` in [individual_parameters]",
+        ),
+    ] {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through {construct} {at}.");
+        assert!(msg.contains(&here), "missing {here:?} in {msg}");
+    }
+}
+
+/// A parameter on the route assigned inside an `if` branch, whether one branch or
+/// both assign it.
+#[test]
+fn profile_refuses_a_route_through_an_if_branch() {
+    for indiv in [
+        "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        // The carrying assignment sits outside the `if`; a branch overwrites it, so
+        // two definitions reach the read — the gate the case above does not need.
+        "  PL = PLACEBO[STUDY]\n  if (DOSE > 0) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+    ] {
+        let msg = route_err(indiv, "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch, in `PL` \
+                 in [individual_parameters]."
+            ),
+            "{indiv}: {msg}"
+        );
+    }
+}
+
+/// Twice in one prediction (a sum, a product of two reads), scaled by a parameter
+/// or a random effect, or as a divisor.
+#[test]
+fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "BASE + PLACEBO[STUDY]",
+            "Here `PLACEBO` is read twice in one prediction, in the `y` readout.",
+        ),
+        (
+            "  PL = PLACEBO[STUDY]\n  BASE = TVE0 + PL * PL + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is read twice in one prediction, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] / exp(ETA_EM)",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in the `y` readout.",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + 1 / PLACEBO[STUDY]",
+            "Here `PLACEBO` is a divisor in the `y` readout.",
+        ),
+    ];
+    for (indiv, y, here) in cases {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        assert!(msg.contains(here), "y = {y}: missing {here:?} in {msg}");
+    }
+}
+
+/// The residual error reads the block, through `weight =` directly or through a
+/// parameter carrying it. The message says *residual error*, never "nonlinear".
+#[test]
+fn profile_refuses_a_residual_error_that_reads_the_block() {
+    for (indiv, error) in [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "DV ~ additive(ADD_ERR) weight = 1 + PLACEBO[STUDY] * 0",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  W = WPSE + BASE",
+            "DV ~ additive(ADD_ERR) weight = W",
+        ),
+    ] {
+        let msg = route_err(indiv, "BASE", error);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here the residual error reads `PLACEBO`, so its variance would depend on the \
+                 levels."
+            ),
+            "{error}: {msg}"
+        );
+        assert!(!msg.to_lowercase().contains("nonlinear"), "{msg}");
+    }
+}
+
+/// One prediction reading two profiled blocks names both.
+#[test]
+fn profile_refuses_a_prediction_reading_two_profiled_blocks() {
+    let msg = route_err(
+        "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+        "BASE + ARMFX[ARM]",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here one prediction reads `PLACEBO` and `ARMFX`, which is profiled too; a \
+             prediction may read only one profiled block."
+        ),
+        "{msg}"
+    );
+}
+
+/// A block reaching `y` through the states of a compartment model.
+#[test]
+fn profile_refuses_a_route_through_the_states() {
+    let text = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[3](0.0) profile
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) + PLACEBO[STUDY]
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+    let msg = parse_full_model(text).err().expect("refused");
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here `PLACEBO` reaches `y` through the model's states (a compartment or an \
+             `[odes]` equation)."
+        ),
+        "{msg}"
+    );
+}
+
+// ── #2103 review round 1 ────────────────────────────────────────────────────
+
+/// A one-compartment model whose prediction is scaled by `[scaling] <scaling>`;
+/// `SC` is an individual parameter no PK slot reads, so a block in it reaches no
+/// state.
+fn obs_scale_model(sc: &str, scaling: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta PLACEBO[3](0.0) profile
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  SC = {sc}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  {scaling}
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+/// Review #1: a block in an `obs_scale` divisor, directly or through a parameter,
+/// uniform or per-CMT, is a divisor of the prediction and is refused, naming the
+/// key. The control on the same model, `SC = V`, parses: the pair straddles the gate.
+#[test]
+fn profile_refuses_a_block_in_an_obs_scale_divisor() {
+    parse_full_model(&obs_scale_model("V", "obs_scale = SC"))
+        .unwrap_or_else(|e| panic!("control: {e}"));
+    for (sc, scaling, label) in [
+        (
+            "V + PLACEBO[STUDY]",
+            "obs_scale = SC",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale = SC + PLACEBO[STUDY]",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale[CMT=1] = V + PLACEBO[STUDY]",
+            "`[scaling] obs_scale[CMT=1]`",
+        ),
+    ] {
+        let msg = parse_full_model(&obs_scale_model(sc, scaling))
+            .err()
+            .unwrap_or_else(|| panic!("{scaling} with SC = {sc} must be refused"));
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` is a divisor in {label}.");
+        assert!(msg.contains(&here), "{scaling}: missing {here:?} in {msg}");
+    }
+}
+
+/// Review #4: a coefficient chosen by an `if` on data, from literals, is data-only
+/// and accepted; the same shape choosing a θ is refused as a parameter coefficient.
+#[test]
+fn a_coefficient_chosen_by_a_data_condition_is_data_only() {
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data-conditioned literal: {e}"));
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * (if (WPSE > 1) C else 0.5) + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data inline if: {e}"));
+    let msg = route_err(
+        "  C = 1\n  if (DOSE > 70) {\n    C = EMAX\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "{msg}"
+    );
+    let msg = route_err(
+        "  C = 1\n  if (TVE0 > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "a θ in the condition: {msg}"
+    );
+}
+
+/// Review #5: `max` / `min` / `clamp` are named in the construct sentence, since
+/// the parser writes them as an inline `if`.
+#[test]
+fn a_max_on_the_route_is_named_as_such() {
+    for f in ["max(PLACEBO[STUDY], 0)", "min(PLACEBO[STUDY], 0)"] {
+        let msg = route_err(&format!("  BASE = TVE0 + {f} + ETA_E0"), "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` reaches `y` through an inline `if` (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
+            ),
+            "{f}: {msg}"
+        );
     }
 }

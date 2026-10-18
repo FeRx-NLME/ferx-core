@@ -934,9 +934,15 @@ fn format_theta_blocks_section(
     let mut out = String::from("\n--- THETA BLOCKS ---\n");
     for (block, range) in theta_blocks {
         let s = theta_block_summary(result, range.clone());
+        // #1065: a profiled block's levels are solved for, not searched.
+        let profiled = if result.profiled_blocks.contains(block) {
+            ", profiled (not searched)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "{indent}{}  {}   min {:.4}  median {:.4}  max {:.4}",
+            "{indent}{}  {}{profiled}   min {:.4}  median {:.4}  max {:.4}",
             block,
             s.count_label(),
             s.min,
@@ -2751,6 +2757,15 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // #1065: every profiled block, compacted below or not.
+    if !result.profiled_blocks.is_empty() {
+        writeln!(
+            f,
+            "\nprofiled_blocks: [{}]",
+            result.profiled_blocks.join(", ")
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if !theta_blocks.is_empty() {
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
@@ -2758,6 +2773,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
             writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
             writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
+            if result.profiled_blocks.contains(block) {
+                writeln!(f, "    profiled: true").map_err(|e| e.to_string())?;
+            }
             writeln!(f, "    min: {:.6}", s.min).map_err(|e| e.to_string())?;
             writeln!(f, "    median: {:.6}", s.median).map_err(|e| e.to_string())?;
             writeln!(f, "    max: {:.6}", s.max).map_err(|e| e.to_string())?;
@@ -3773,6 +3791,7 @@ mod tests {
             cov_eigenvalues: None,
             cov_condition_number: None,
             bic_inputs: Default::default(),
+            profiled_blocks: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -4137,6 +4156,48 @@ mod tests {
         assert!(yaml.contains("n_free_coefficients: 21"));
         assert!(yaml.contains("coefficients:"));
         assert!(!yaml.contains("n_levels:"));
+    }
+
+    /// #1065: a profiled block says so on its console line and in the YAML, both
+    /// as a list (which also covers a block too small to compact) and on its compact
+    /// entry. An unprofiled block, beside it, says nothing of the kind.
+    #[test]
+    fn a_profiled_block_is_reported_as_profiled_in_the_console_and_yaml() {
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = (1..=2 * n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n)
+            .map(|i| format!("PLACEBO[L={i}]"))
+            .chain((1..=n).map(|i| format!("ARMFX[L={i}]")))
+            .collect();
+        r.theta_fixed = vec![false; 2 * n];
+        r.se_theta = None;
+        r.profiled_blocks = vec!["PLACEBO".to_string()];
+
+        let blocks = compact_theta_blocks(&r.theta_names);
+        let console = format_theta_blocks_section(&r, &blocks, "");
+        assert!(
+            console.contains("PLACEBO  21 free coefficients, profiled (not searched)   min"),
+            "{console}"
+        );
+        assert!(
+            console.contains("ARMFX  21 free coefficients   min"),
+            "{console}"
+        );
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(yaml.contains("\nprofiled_blocks: [PLACEBO]\n"), "{yaml}");
+        assert_eq!(yaml.matches("    profiled: true\n").count(), 1, "{yaml}");
+        let placebo = &yaml[yaml.find("  PLACEBO:").unwrap()..yaml.find("  ARMFX:").unwrap()];
+        assert!(placebo.contains("    profiled: true\n"), "{placebo}");
+
+        r.profiled_blocks.clear();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(!yaml.contains("profiled"), "{yaml}");
     }
 
     #[test]
@@ -4833,6 +4894,7 @@ mod tests {
             cov_eigenvalues: None,
             cov_condition_number: None,
             bic_inputs: Default::default(),
+            profiled_blocks: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,

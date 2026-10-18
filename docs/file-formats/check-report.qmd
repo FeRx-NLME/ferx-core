@@ -99,6 +99,15 @@ A `[parameters]` line must also be consumed end to end by exactly one declaratio
 | `E_THETA_LEVEL_BINDING` | error | A `theta NAME[COL, ...]` level block could not be bound to the data's levels: a level column missing or non-finite, no observation rows, or a contrast the data cannot carry. Block `parameters`. The binders return the same code from a running program, where it also covers binding to a fit's level layout (a level the fit estimated no θ for), which `ferx check` cannot reach. |
 | `E_COVARIATE_STATS_BINDING` | error | A `[covariate_model]` statistic could not be bound to the data: a `levels = auto` relation whose data carry one level, or a covariate with no non-missing value. Block `covariate_model`. The binders return the same code, including for a fit's statistics that do not match the model. |
 
+#### Profiled level blocks
+
+A level block declared `profile` ([#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065)) has its levels solved for at every outer step rather than searched by the optimizer. That needs a linear route to the prediction and a least-squares objective, so the check refuses anything else; nothing falls back to ordinary estimation.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_PROFILE_SCOPE` | error | A profiled block that cannot be fitted that way: `profile` on a single θ, with `FIX` or with bounds; a method other than `foce` / `focei`, or `n_agq > 1`; a non-Gaussian endpoint; a residual error that is not additive, or log-transformed; M3 censoring; a `correlation` line (not yet); a `[mixture]`, `[diffusion]` or FREM model; `covariance_method = s` or `rsr`. Profiled estimation itself is not implemented yet, so every profiled block is also refused with that reason. Block `parameters`. |
+| `E_PROFILE_NOT_LINEAR` | error | A profiled block that a prediction does not read as `c × block` plus terms that do not read it, with `c` from the data alone. The message names the construct (a function, power, remainder or inline `if`, an `if` branch, a second read, a parameter coefficient, a divisor, the states, the residual error, a second profiled block) and where it is. Block `parameters`. |
+
 #### Nested variability levels
 
 A model that declares `level` lines ([nested levels](../model-file/iov.qmd#nested-levels), [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082)) is checked for how its levels are declared and whether the data can identify them.
