@@ -1320,3 +1320,11 @@ gap is the profile's. The level SEs are compared with the `SIGL=12` `$COV`.
 ΔOFV < 2e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 2e-2. Its
 `profiled_levels_fits.rs` twin (`slow-tests`) fits from the model file's inits and lands
 on NONMEM's OBJ.
+
+**A1, the level-SE anchor profiled.** The same file also evaluates
+`level_se_mbma_fit.ferx` (#1890, above) with its block declared `profile`, at
+`level_se_a`'s structural optimum, its 18 free levels solved by ferx: ΔOFV −1.1e-6 (ferx
+below, NONMEM's levels being the end of a three-significant-digit fit), free-level SEs
+within 2.2e-3 of (a), dependent ones within 2.8e-3 of (b) — inside the 3.4e-3 / 4.2e-3
+the unprofiled anchor shows at the same point. Dropping the covariance step's
+`D⁻¹BᵀCov(θ)BD⁻¹` term fails it.
