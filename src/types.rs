@@ -9712,10 +9712,13 @@ impl Optimizer {
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
     /// otherwise, with two exceptions that take L-BFGS on a finite-difference
     /// gradient: more than [`BOBYQA_MAX_DIM`] free parameters (#1064), and a
-    /// residual `correlation` line together with kappa (#2122). This mirrors the analytic-vs-FD predicate the outer loop uses
-    /// (see `build_info::gradient_method_outer`), so `auto` lands on the
-    /// gradient-based optimizer exactly when there is an exact gradient to feed
-    /// it (#490).
+    /// residual `correlation` line together with kappa (#2122). Outside those two
+    /// exceptions this mirrors the analytic-vs-FD predicate the outer loop uses
+    /// (see `build_info::gradient_method_outer`): `auto` takes the
+    /// gradient-based optimizer when there is an exact gradient to feed it, and
+    /// BOBYQA on a finite-difference one, where #490 found it fastest and most
+    /// reliable. #2122 is one FD route where that finding reverses; whether it
+    /// reverses on others is open (#1782, #2048, #2031).
     ///
     /// `interaction` is `options.interaction` (`true` for `method = focei`,
     /// `false` for plain `method = foce`) — a custom residual-magnitude model's
@@ -9763,9 +9766,11 @@ impl Optimizer {
         }
         // #2122: a residual `correlation` line with kappa is FD-only (#2101), and on it
         // BOBYQA's `FtolReached` stopped mbma_placebo + car1 at a different OFV per start
-        // ρ (106.55 / 114.34 / 95.08), two of them above the nested kappa-only optimum
-        // (97.07); L-BFGS on the same FD gradient reached 89.45 from all three. Only this
-        // route: other FD → BOBYQA routes (#1782, #2048, #2031) are unmeasured here.
+        // ρ (104.72 / 111.60 / 98.31 for ρ₀ = 0.01 / 0.3 / 0.6, Linux aarch64), all three
+        // above the nested kappa-only optimum (97.07); L-BFGS on the same FD gradient
+        // reached 89.4513 from all three (`tests/kappa_correlation_auto_lbfgs_fits.rs`).
+        // Only this route: other FD → BOBYQA routes (#1782, #2048, #2031) are unmeasured
+        // here.
         if crate::sens::provider::kappa_residual_correlation_fd_route(model) {
             return Optimizer::NloptLbfgs;
         }
