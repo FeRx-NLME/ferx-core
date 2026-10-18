@@ -386,6 +386,98 @@ fn run_covariance_replays_the_profiled_step() {
 /// optimum, so only the re-solved EBEs differ; 18× headroom.
 const REPLAY_BOUND: f64 = 1e-4;
 
+// ── A1: the existing level-SE anchor, profiled (#2130 review #8) ───────────────────
+
+/// The plan's A1: `nonmem_anchor/level_se_mbma_fit.ferx` (#1890's anchor, linear in its
+/// one η, no κ) with its block declared `profile`, evaluated at NONMEM (a)'s structural
+/// optimum only, the 18 free levels solved by ferx. Checked against the same NONMEM runs
+/// and bounds as the unprofiled `tests/level_se_nonmem_anchor.rs`: the OFV, the free-level
+/// SEs against (a)'s `THETA`s, and the 6 dependent levels against (b)'s, where each is a
+/// `THETA` of its own.
+#[test]
+fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
+    let (est_a, se_a) = ext("level_se_a.ext");
+    let (_, se_b) = ext("level_se_b.ext");
+    let text =
+        std::fs::read_to_string(root().join("nonmem_anchor/level_se_mbma_fit.ferx")).unwrap();
+    assert!(text.contains(UNPROFILED), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_profiled_levels_{}_a1.ferx",
+        std::process::id()
+    ));
+    std::fs::write(&path, text.replace(UNPROFILED, PROFILED)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root()
+                .join("tests/data/mbma_placebo/mbma_placebo.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let model = &p.parsed.model;
+    assert_eq!(model.n_theta, 22, "4 structural θ and 18 free levels");
+    let mut params = p.init_params.clone();
+    for k in 0..4 {
+        params.theta[k] = est_a[&format!("THETA{}", k + 1)];
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[est_a["OMEGA(1,1)"]], vec!["ETA_E0".into()]);
+    let opts = FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    };
+    let f = ferx_core::fit(model, &p.population, &params, &opts).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(f.profiled_blocks, ["PLACEBO"]);
+    let d_ofv = f.ofv - est_a["OBJ"];
+    let cov = f
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let levels =
+        &ferx_core::theta_level_values(model, &f.theta, Some(cov), None).unwrap()["PLACEBO"];
+    assert_eq!(levels.len(), 24);
+    let (mut worst_free, mut worst_dep, mut n_dep) = (0.0_f64, 0.0_f64, 0);
+    for (i, l) in levels.iter().enumerate() {
+        let got = l.se.unwrap_or_else(|| panic!("{}: no SE", l.label));
+        let want = match l.theta_index {
+            Some(k) => se_a[&format!("THETA{}", k + 1)],
+            None => {
+                n_dep += 1;
+                se_b[&format!("THETA{}", 7 + 3 * (i / 4))]
+            }
+        };
+        let rel = (got - want).abs() / want;
+        assert!(rel.is_finite(), "{}: {got} vs {want}", l.label);
+        if l.theta_index.is_some() {
+            worst_free = worst_free.max(rel);
+        } else {
+            worst_dep = worst_dep.max(rel);
+        }
+    }
+    assert_eq!(n_dep, 6);
+    eprintln!(
+        "A1: ΔOFV {d_ofv:.3e}, free-level SE {worst_free:.3e}, dependent-level SE {worst_dep:.3e}"
+    );
+    assert!(
+        d_ofv.abs() < A1_OFV,
+        "ferx {} vs NONMEM {}",
+        f.ofv,
+        est_a["OBJ"]
+    );
+    assert!(worst_free < A1_SE, "{worst_free}");
+    assert!(worst_dep < A1_SE, "{worst_dep}");
+}
+
+/// Realised (macOS arm64): ΔOFV −1.1e-6 — ferx below NONMEM, its levels solved exactly
+/// where NONMEM's are the end of a three-significant-digit fit — and level SEs within
+/// 2.2e-3 (free) / 2.8e-3 (dependent), against 3.4e-3 / 4.2e-3 for the unprofiled anchor
+/// at the same point. 9× and 3.6× headroom.
+const A1_OFV: f64 = 1e-5;
+const A1_SE: f64 = 1e-2;
+
 // ── EBE convergence: counted and guarded, as unprofiled (#2130 review #2) ──────────
 
 /// A starved inner solve (`inner_maxiter = 12` on F1: 4 subjects unconverged, 11 Nelder–Mead
