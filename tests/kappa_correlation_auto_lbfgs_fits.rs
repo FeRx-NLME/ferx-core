@@ -1,8 +1,8 @@
 //! Tier 3 for #2122: on a model with a kappa and a residual `correlation` line, both
 //! gradients are finite differences (#2101), and `optimizer = auto` used to resolve to
 //! BOBYQA, whose `FtolReached` stopped the fit at a different optimum for each starting
-//! value of ρ — two of three above the optimum of the nested kappa-only model, which the
-//! correlated model contains at ρ = 0. `auto` now takes L-BFGS on that route.
+//! value of ρ — on Linux all three above the optimum of the nested kappa-only model, which
+//! the correlated model contains at ρ = 0. `auto` now takes L-BFGS on that route.
 //!
 //! Each fixture is fitted from several starting values of ρ under the default `auto`.
 //! The fits must agree with each other, and none may end above the nested kappa-only fit.
