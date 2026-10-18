@@ -2674,7 +2674,8 @@ fn one_cpt_oral_n_eta(n: usize) -> String {
 /// inner Hessian agree to rounding, on 1-/2-compartment fixtures with 2 to 5 live PK
 /// parameters (block Ω, combined error, lag + LTBS, infusions). A Taylor term dropped or
 /// misweighted is a gap of order the term itself, far above this bound; the hit counter
-/// shows the fast path ran, and the Laplace exact anchor (order 3) shows it stood aside.
+/// shows the fast path ran where it applies (second order, or taped), and the Laplace
+/// exact anchor (order 3) shows it stood aside.
 #[test]
 fn the_pk_space_closed_form_is_the_generic_one() {
     use super::{PK_SPACE_HITS, PK_SPACE_OFF};
@@ -2740,8 +2741,11 @@ fn the_pk_space_closed_form_is_the_generic_one() {
             let (g0, j0, h0, off_hits) = both(true);
             let (g1, j1, h1, hits) = both(false);
             assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
+            // The taped gradient recording and the inner Hessian's second-order one take
+            // the PK-space path; the η-Jacobian (first order, tape-free) keeps the generic
+            // path by design, so it is compared here but not counted.
             assert!(
-                hits >= 3,
+                hits >= 2,
                 "{label}: the PK-space path did not run ({hits} hits)"
             );
             for (a, b) in g1

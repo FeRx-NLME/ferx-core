@@ -4045,3 +4045,58 @@ pub(crate) fn residual_rd2(
         ),
     }
 }
+
+/// Does this subject's residual covariance `R` couple two different observation rows?
+///
+/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
+/// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
+/// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
+/// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found
+/// by the same function, so the predicate cannot disagree with the `R` the objective uses.
+///
+/// The answer depends on the **data and the correlation structure only**, never on `f` or
+/// θ: pairing is decided by the rows' residual block and by which sigma slots they occupy
+/// ([`loadings_share_correlation`]), and slot presence does not depend on the prediction —
+/// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
+/// off-diagonal `R` at every parameter point of a fit (#1536).
+pub(crate) fn has_cross_observation_residual(
+    error_spec: &ErrorSpec,
+    subject: &Subject,
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+) -> bool {
+    if !cov.is_dense() {
+        return false;
+    }
+    let loadings: Vec<Vec<(usize, f64)>> = error_spec
+        .obs_keys(subject)
+        .iter()
+        .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
+        .collect();
+    // A `correlation` line couples any two rows of one block (#1081). Value-free
+    // like the `block_sigma` arm below: `ρ` does not enter, so a fit whose `ρ`
+    // starts at 0 still routes the subject the way it will need at `ρ ≠ 0`. A
+    // population without its residual blocks answers `true` too — its `R` is NaN.
+    if cov.serial.is_some() {
+        let g = &subject.obs_rgroup;
+        if g.len() != loadings.len() {
+            return !loadings.is_empty();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (j, &k) in g.iter().enumerate() {
+            if k != 0 && !loadings[j].is_empty() && !seen.insert(k) {
+                return true;
+            }
+        }
+    }
+    !match_partners(
+        &loadings,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma_values,
+        cov.pairs,
+    )
+    .is_empty()
+}

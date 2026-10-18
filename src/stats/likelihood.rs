@@ -2918,6 +2918,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 residual_cov,
                 &p_obs_iov,
                 ruv_mult.as_deref(),
+                model.residual_error_eta,
             )
         }
     } else {
@@ -6928,4 +6929,43 @@ DV ~ proportional(PROP_ERR)
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
     }
+}
+
+/// Conditional observation NLL from precomputed predictions, using the exact
+/// raw-prediction semantics of the inner/IOV likelihoods.
+///
+/// Unlike [`obs_nll_subject_from_preds`] (the SAEM/IS observation objective), this
+/// does not floor ordinary predictions or clamp residual variances. AGQ integrates
+/// the conditional likelihood used by the inner problem, so its fused value/score
+/// path must preserve those semantics exactly. Kept as the tests' independent
+/// conditional objective (`nested_correlation_tests`) since the AGQ path it served moved to
+/// the adjoint (#486).
+#[cfg(test)]
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conditional_obs_nll_from_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    eta: &[f64],
+    iov: bool,
+) -> f64 {
+    let semantics = if iov {
+        PredNllSemantics::ConditionalIov
+    } else {
+        PredNllSemantics::Conditional
+    };
+    obs_nll_subject_from_preds_with_semantics(
+        model,
+        subject,
+        preds,
+        theta,
+        sigma_values,
+        residual_cov,
+        eta,
+        semantics,
+    )
 }

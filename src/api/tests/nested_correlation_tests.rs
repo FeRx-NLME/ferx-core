@@ -313,6 +313,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
                     m.residual_cov_theta(&p.theta),
                     &[],
                     None,
+                    m.residual_error_eta,
                 )
             } else {
                 crate::stats::likelihood::foce_subject_nll_interaction(
