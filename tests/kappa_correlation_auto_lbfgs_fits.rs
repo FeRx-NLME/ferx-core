@@ -45,32 +45,43 @@ fn run(src: &str, data: &str) -> FitResult {
     fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs")
 }
 
+/// Insert `line` after `anchor`, which must occur exactly once. A bare `replacen` is a
+/// silent no-op when the anchor text moves (`nested_levels_3.ferx` is a shared anchor
+/// file): without the correlation line the fixture is the kappa-only model, both bounds
+/// pass, and the test no longer tests the route (#2127 review finding 4).
+fn insert_after(src: &str, anchor: &str, line: &str) -> String {
+    assert_eq!(
+        src.matches(anchor).count(),
+        1,
+        "anchor {anchor:?} must occur once"
+    );
+    src.replacen(anchor, &format!("{anchor}{line}"), 1)
+}
+
 fn mbma_car1(rho0: f64) -> String {
-    MBMA_MODEL
-        .replacen(
-            "[parameters]\n",
-            &format!("[parameters]\n  theta RHO({rho0}, 0.0, 0.95)\n"),
-            1,
-        )
-        .replacen(
-            "  DV ~ additive(ADD_ERR) weight = SE\n",
-            "  DV ~ additive(ADD_ERR) weight = SE\n  correlation car1(RHO) by OCC\n",
-            1,
-        )
+    let src = insert_after(
+        MBMA_MODEL,
+        "[parameters]\n",
+        &format!("  theta RHO({rho0}, 0.0, 0.95)\n"),
+    );
+    insert_after(
+        &src,
+        "  DV ~ additive(ADD_ERR) weight = SE\n",
+        "  correlation car1(RHO) by OCC\n",
+    )
 }
 
 fn exact3_ar1(rho0: f64) -> String {
-    EXACT3_MODEL
-        .replacen(
-            "  sigma ADD ~ 0.255164\n",
-            &format!("  sigma ADD ~ 0.255164\n  theta RHO({rho0}, -0.99, 0.99)\n"),
-            1,
-        )
-        .replacen(
-            "  DV ~ additive(ADD)\n",
-            "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
-            1,
-        )
+    let src = insert_after(
+        EXACT3_MODEL,
+        "  sigma ADD ~ 0.255164\n",
+        &format!("  theta RHO({rho0}, -0.99, 0.99)\n"),
+    );
+    insert_after(
+        &src,
+        "  DV ~ additive(ADD)\n",
+        "  correlation ar1(RHO) by ARM\n",
+    )
 }
 
 fn rho_hat(r: &FitResult) -> f64 {
