@@ -7734,8 +7734,8 @@ pub struct FitResult {
     /// `R⁻¹SR⁻¹` sandwich (#1382).
     ///
     /// **Not a copy of [`FitOptions::covariance_method`].** Above
-    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` is routed onto
-    /// the cross-product (#1064), so the estimator that ran is not always the
+    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` off the analytic
+    /// R-matrix is routed onto the cross-product (#1064), so the estimator that ran is not always the
     /// one that was asked for; this field is the one that ran, carried up from
     /// the covariance step rather than re-derived.
     ///
@@ -9826,9 +9826,10 @@ impl Optimizer {
 pub const BOBYQA_MAX_DIM: usize = 64;
 
 /// Free packed dimension above which a *defaulted* `covariance_method = r`
-/// routes to the cross-product (#1064).
+/// routes to the cross-product (#1064), when its `R` would be the stencil — a fit
+/// the analytic R-matrix serves keeps `r` at any size.
 ///
-/// The `R` matrix is a finite-difference Hessian of the objective that
+/// The stencil `R` matrix is a finite-difference Hessian of the objective that
 /// reconverges every subject's EBEs at each of `2·n²` objective
 /// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
 /// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`

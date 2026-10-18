@@ -803,6 +803,36 @@ fn analytic_cov_declines(
     options: &FitOptions,
     is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
+    let mut out = analytic_cov_scope_declines(model, population, options, is_mixture);
+    if out.is_empty() {
+        out.push(CovScopeDecline::PerSubjectBail);
+    }
+    out
+}
+
+/// Whether the covariance step is expected to take the analytic R-matrix: no clause of
+/// [`analytic_cov_declines`]'s walk fires. A subject can still bail at run time (a trial point
+/// the recorder cannot form), and then only that subject takes the stencil (the hybrid route).
+///
+/// What this decides is the *cost* of `R`: one profile-Hessian pass per subject instead of
+/// `fd_r_objective_evals(n)` reconverged population objectives, so the large-problem reroute to
+/// `S` and the pre-fit cost note, both written for the stencil, do not apply.
+pub(crate) fn analytic_r_expected(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> bool {
+    analytic_cov_scope_declines(model, population, options, is_mixture).is_empty()
+}
+
+/// The clauses of [`analytic_cov_declines`], empty when none fires.
+fn analytic_cov_scope_declines(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> Vec<CovScopeDecline> {
     let mut out: Vec<CovScopeDecline> = Vec::new();
     if !options.analytic_cov_hessian {
         out.push(CovScopeDecline::Disabled);
@@ -829,9 +859,6 @@ fn analytic_cov_declines(
         .any(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
     {
         out.push(CovScopeDecline::TooManyRandomEffects);
-    }
-    if out.is_empty() {
-        out.push(CovScopeDecline::PerSubjectBail);
     }
     out
 }
@@ -2608,6 +2635,26 @@ pub(crate) fn scale_routed_covariance_method(
     }
 }
 
+/// [`scale_routed_covariance_method`] for a step whose `R` is the stencil; on the analytic
+/// R-matrix (`analytic_r`, see [`analytic_r_expected`]) `R` costs one pass per subject, so the
+/// request is kept and nothing is said about a stencil that will not run.
+pub(crate) fn routed_covariance_method(
+    n: usize,
+    options: &FitOptions,
+    has_priors: bool,
+    analytic_r: bool,
+) -> (CovarianceMethod, Option<String>) {
+    if analytic_r {
+        return (options.covariance_method, None);
+    }
+    scale_routed_covariance_method(
+        n,
+        options.covariance_method,
+        options.covariance_method_set,
+        has_priors,
+    )
+}
+
 /// The count for `fit()`'s pre-fit covariance cost note, at `n` free coordinates: `None` when
 /// no note is due — the step is off, `n ≤ 30`, or the estimator the step will actually run
 /// (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
@@ -2617,16 +2664,12 @@ pub(crate) fn pre_fit_covariance_cost(
     n: usize,
     options: &FitOptions,
     has_priors: bool,
+    analytic_r: bool,
 ) -> Option<Option<usize>> {
-    if !options.run_covariance_step || n <= 30 {
+    if !options.run_covariance_step || n <= 30 || analytic_r {
         return None;
     }
-    let (routed, _) = scale_routed_covariance_method(
-        n,
-        options.covariance_method,
-        options.covariance_method_set,
-        has_priors,
-    );
+    let (routed, _) = routed_covariance_method(n, options, has_priors, false);
     needs_r(routed).then(|| fd_r_objective_evals(n))
 }
 
@@ -2678,11 +2721,11 @@ pub(crate) fn run_covariance_step_inner(
     // large for it. The decision is a pure function so it can be unit-tested
     // without standing up a several-hundred-parameter fit.
     let scaled_options;
-    let (routed, scale_warning) = scale_routed_covariance_method(
+    let (routed, scale_warning) = routed_covariance_method(
         model.free_packed_dim(),
-        options.covariance_method,
-        options.covariance_method_set,
+        options,
         !model.priors.is_empty(),
+        analytic_r_expected(model, population, options, template.mixture.is_some()),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -2873,6 +2916,78 @@ mod tests {
                 m.n_eta
             );
         }
+    }
+
+    /// On the analytic R-matrix a defaulted `r` above `COV_HESSIAN_MAX_DIM` is not rerouted to
+    /// `S`, and neither it nor the pre-fit note quotes the stencil's `2·n²` (warfarin_dcm, 147
+    /// free parameters, was told 43218 reconverged objectives for a ~15 s analytic step). The
+    /// straddle is `analytic_r` alone; the predicate itself is the declines walk, straddled on
+    /// a mixture and on `analytic_cov_hessian`.
+    #[test]
+    fn the_analytic_r_matrix_is_not_rerouted_or_costed_as_a_stencil() {
+        use crate::types::{FitOptions, Population, Subject};
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        let defaulted = FitOptions {
+            run_covariance_step: true,
+            covariance_method: CovarianceMethod::Hessian,
+            covariance_method_set: false,
+            ..FitOptions::default()
+        };
+        assert_eq!(
+            super::routed_covariance_method(n, &defaulted, false, true),
+            (CovarianceMethod::Hessian, None)
+        );
+        let (stencil, warning) = super::routed_covariance_method(n, &defaulted, false, false);
+        assert_eq!(stencil, CovarianceMethod::CrossProduct);
+        assert!(warning.is_some());
+        let explicit = FitOptions {
+            covariance_method_set: true,
+            ..defaulted.clone()
+        };
+        assert_eq!(
+            super::pre_fit_covariance_cost(n, &explicit, false, true),
+            None
+        );
+        assert_eq!(
+            super::pre_fit_covariance_cost(n, &explicit, false, false),
+            Some(Some(20_402))
+        );
+
+        let m = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
+             pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .unwrap();
+        let population = Population {
+            subjects: vec![Subject::default()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        assert!(super::analytic_r_expected(
+            &m,
+            &population,
+            &defaulted,
+            false
+        ));
+        assert!(
+            !super::analytic_r_expected(&m, &population, &defaulted, true),
+            "a mixture takes the stencil"
+        );
+        let disabled = FitOptions {
+            analytic_cov_hessian: false,
+            ..defaulted
+        };
+        assert!(!super::analytic_r_expected(
+            &m,
+            &population,
+            &disabled,
+            false
+        ));
     }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
@@ -3374,7 +3489,8 @@ mod tests {
     /// which is what decides if the step runs `R` or the routed `S⁻¹`.
     #[test]
     fn the_pre_fit_cost_note_counts_r_only_when_the_step_builds_r() {
-        use super::pre_fit_covariance_cost as cost;
+        let cost =
+            |n, o: &crate::types::FitOptions, p| super::pre_fit_covariance_cost(n, o, p, false);
         let opts = |method: CovarianceMethod, set: bool| crate::types::FitOptions {
             run_covariance_step: true,
             covariance_method: method,

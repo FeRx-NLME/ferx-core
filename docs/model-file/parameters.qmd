@@ -522,12 +522,15 @@ this engine is, and switch automatically once a block makes the problem large:
   its model grows quadratically in the parameter count; above 64 free
   coordinates `auto` takes `nlopt_lbfgs` instead, whose finite-difference cost
   is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
-- **Covariance.** The default `covariance_method = r` builds a
-  finite-difference Hessian that re-converges every subject's EBEs at each of
-  `2n²` objective evaluations — around 1.3 million population objectives at 800
-  parameters. Above 100 free coordinates a *defaulted* covariance method routes
-  to the score cross-product (`covariance_method = s`, one pass) with a warning.
-  Setting `covariance_method = r` explicitly forces it, and says what it costs.
+- **Covariance.** The default `covariance_method = r` builds the exact analytic
+  R-matrix, one pass per subject, wherever it is in scope (see
+  [Covariance step warnings](../warnings.qmd#codes-covariance)), and keeps it at any parameter
+  count. Outside that scope `R` is a finite-difference Hessian that re-converges
+  every subject's EBEs at each of `2n²` objective evaluations — around 1.3
+  million population objectives at 800 parameters — so above 100 free
+  coordinates a *defaulted* covariance method routes to the score cross-product
+  (`covariance_method = s`, one pass) with a warning. Setting
+  `covariance_method = r` explicitly forces it, and says what it costs.
 
 A block of 20 or more coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console.

@@ -519,9 +519,10 @@ describe and the field is `None` (and the YAML key is omitted, never `null`).
 
 **It is the estimator that ran, not the one requested.** Above 100 free
 parameters a *defaulted* `covariance_method = r` is routed onto the
-cross-product, because the `R` matrix would need `2n²` re-converged
-objective evaluations; the substitution is reported as a warning and this field
-reports `s`. Reading `covariance_method` back off `[fit_options]` would report
+cross-product when its `R` matrix would be the finite-difference stencil, which
+needs `2n²` re-converged objective evaluations; the substitution is reported as
+a warning and this field reports `s`. A fit the analytic R-matrix serves keeps
+`r` at any size. Reading `covariance_method` back off `[fit_options]` would report
 `r` for standard errors that came out of `S⁻¹`.
 
 Where it appears:

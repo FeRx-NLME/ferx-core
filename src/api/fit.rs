@@ -1501,6 +1501,12 @@ fn fit_inner(
         n_params_pre,
         options,
         !model.priors.is_empty(),
+        crate::estimation::covariance::analytic_r_expected(
+            model,
+            population,
+            options,
+            init_params.mixture.is_some(),
+        ),
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
