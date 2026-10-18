@@ -4221,4 +4221,53 @@ mod kappa_correlation_auto_route {
             assert_eq!(has(&m, ROUTE_ADVICE), route, "route advice, {cell}");
         }
     }
+
+    /// A closed-form PK and an ODE model with IOV: the route warning is not tied to the
+    /// compartment-free cap block (#2127 review finding 1, killed by moving the push
+    /// inside `if is_algebraic`). Each structure is checked on the route and off it.
+    #[test]
+    fn the_route_warning_fires_on_compartment_models_too() {
+        let structures = [
+            (
+                "pk one_cpt_iv",
+                "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n",
+            ),
+            (
+                "ode",
+                "[structural_model]\n  ode(states=[central])\n\
+                 [odes]\n  d/dt(central) = -(CL/V) * central\n\
+                 [scaling]\n  y = central / V\n",
+            ),
+        ];
+        for (name, structure) in structures {
+            for corr in [true, false] {
+                let src = format!(
+                    "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
+                     theta RHO(0.3, 0.0, 0.9)\n  omega ETA_CL ~ 0.09\n  kappa K_CL ~ 0.04\n  \
+                     sigma ADD ~ 0.25\n\
+                     [individual_parameters]\n  CL = TVCL * exp(ETA_CL + K_CL)\n  V = TVV\n\
+                     {structure}\
+                     [error_model]\n  DV ~ additive(ADD)\n{}\
+                     [fit_options]\n  iov_column = OCC\n",
+                    if corr {
+                        "  correlation car1(RHO) by OCC\n"
+                    } else {
+                        ""
+                    },
+                );
+                let m = crate::parser::model_parser::parse_full_model(&src)
+                    .unwrap()
+                    .model;
+                assert!(!m.is_algebraic(), "{name}: has compartments");
+                assert_eq!(kappa_residual_correlation_fd_route(&m), corr, "{name}");
+                let cell = format!("{name} corr={corr}: {:#?}", m.parse_warnings);
+                assert_eq!(has(&m, ROUTE_REASON), corr, "route reason, {cell}");
+                assert_eq!(has(&m, ROUTE_ADVICE), corr, "route advice, {cell}");
+                assert!(
+                    !has(&m, CAP_HEAD),
+                    "no cap warning off the algebraic path, {cell}"
+                );
+            }
+        }
+    }
 }
