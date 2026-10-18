@@ -8,10 +8,9 @@
   theta TVCL(5.0, 0.0, 1e15)
   theta TVV(50.0, 0.0, 1e15)
   theta TVBASE(10.0, 0.0, 1e15)
-  omega ETA_CL ~ 0.0
   sigma PROP ~ 0.01
 [individual_parameters]
-  CL   = TVCL * exp(ETA_CL)
+  CL   = TVCL
   V    = TVV
   BASE = TVBASE * WT
 [structural_model]
