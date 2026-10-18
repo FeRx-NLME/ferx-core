@@ -170,6 +170,8 @@ bioavailability `F` of any dose it issues there. That record is the **latest dat
 record at or before `t`**: an observation, an EVID=2 row, a pre-scheduled dose row
 or an EVID=3/4 reset row. When several records share that time, the observation
 wins over an EVID=2 row, which wins over a dose row, which wins over a reset row.
+Among several rows of the same kind at that time, the one listed last in the file
+wins.
 
 | Decision at `t` | Reads |
 |---|---|
