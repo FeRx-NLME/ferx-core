@@ -186,8 +186,8 @@ subject whose blocks are all single rows keeps the scalar analytic one (for it
 finite-difference outer gradient throughout, as any weighted model with a dense
 `R` does. So does a model with `kappa` (one level or nested): the IOV gradient
 assemblies score a diagonal `R`, so the outer gradient is central differences of
-the OFV and `optimizer = auto` picks BOBYQA (L-BFGS on that gradient above 64
-free parameters). Its EBE search runs on central
+the OFV, and `optimizer = auto` runs L-BFGS on that gradient rather than
+BOBYQA, which stopped short of the optimum on this route (#2122). Its EBE search runs on central
 differences too, for each subject with a block of two or more rows; the fit's
 warnings say how many ("… use finite-difference inner gradients in the IOV loop
 (residual correlation: N)"). The covariance step uses the finite-difference

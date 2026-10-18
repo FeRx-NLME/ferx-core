@@ -5915,19 +5915,42 @@ pub fn parse_full_model_with(
     // tells the user, and "my fit got sluggish when I added a covariate effect" is
     // not a debuggable symptom. Name both numbers so the cause is visible, and say
     // which direction to move.
+    //
+    // A residual `correlation` line with kappa is a second, independent FD route
+    // (#2101). On it the cap warning's advice is wrong — shrinking the parameter count
+    // leaves the gradient FD — and so is "only slower" (#2122: BOBYQA stopped at a
+    // different OFV per start ρ), so that cell names the cap alone and defers to the
+    // route's own warning, which also covers a model under the cap or with ODEs.
+    let kappa_corr_fd = crate::sens::provider::kappa_residual_correlation_fd_route(&model);
     if is_algebraic {
         let axes = model.n_theta + model.n_eta + model.n_kappa;
         let cap = crate::sens::algebraic::MAX_ALGEBRAIC_AXES;
         if axes > cap {
+            let tail = if kappa_corr_fd {
+                "Reducing the number of estimated parameters would not restore the analytic \
+                 gradient: the residual correlation line with kappa is finite-difference only \
+                 as well (see the [error_model] warning)."
+            } else {
+                "The fit is correct, only slower. Reduce the number of simultaneously \
+                 estimated parameters, or FIX the ones you are not estimating."
+            };
             model.parse_warnings.push(format!(
                 "[structural_model]: this model estimates {axes} parameters (theta + eta{}), \
                  past the {cap}-axis cap of the analytic gradient path, so it falls back to \
-                 finite differences. The fit is correct, only slower. Reduce the number of \
-                 simultaneously estimated parameters, or FIX the ones you are not estimating. \
-                 See issue #811.",
+                 finite differences. {tail} See issue #811.",
                 if model.n_kappa > 0 { " + kappa" } else { "" },
             ));
         }
+    }
+    if kappa_corr_fd {
+        model.parse_warnings.push(
+            "[error_model]: a residual `correlation` line together with kappa has no analytic \
+             gradient yet, so the FOCE/FOCEI outer gradient uses finite differences (#2101). \
+             Avoid `optimizer = bobyqa` on this route: on an MBMA model it stopped short of the \
+             optimum, at a different objective for each starting value of the correlation \
+             (#2122)."
+                .to_string(),
+        );
     }
 
     // Covariate-selected [error_model] (issue #658): the selector's covariates

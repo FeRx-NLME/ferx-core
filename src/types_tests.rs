@@ -4069,3 +4069,205 @@ fn pk_slot_rows_keeps_its_range_guard() {
         "pk_slot_rows must keep the range condition the assert and the filter share"
     );
 }
+
+// ── #2122: `auto` on the kappa + residual-correlation FD route ───────────────
+mod kappa_correlation_auto_route {
+    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::sens::provider::{
+        analytic_outer_gradient_in_scope, kappa_residual_correlation_fd_route,
+    };
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    /// A one-level compartment-free model, optionally with a kappa, a
+    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ to push the
+    /// axis count (`n_theta + n_eta + n_kappa`) past the 24-axis cap.
+    fn src(kappa: bool, corr: bool, extra: usize) -> String {
+        let extras: String = (0..extra)
+            .map(|i| format!("  theta X{i}(1.0, 0.0, 10.0)\n"))
+            .collect();
+        format!(
+            "[parameters]\n  theta TVE0(10.0)\n  theta TVEMAX(20.0)\n  theta RHO(0.3, 0.0, 0.9)\n\
+             {extras}  omega ETA_SP ~ 0.09\n{}  sigma ADD ~ 0.25\n\
+             [individual_parameters]\n  EMAX = TVEMAX * exp(ETA_SP{})\n\
+             [structural_model]\n  y = TVE0 + EMAX * TIME / (TIME + 3)\n\
+             [error_model]\n  DV ~ additive(ADD)\n{}\
+             [fit_options]\n  iov_column = ARMID\n",
+            if kappa { "  kappa K_OC ~ 0.04\n" } else { "" },
+            if kappa { " + K_OC" } else { "" },
+            if corr {
+                "  correlation car1(RHO) by ARMID\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn model(kappa: bool, corr: bool, extra: usize) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_full_model(&src(kappa, corr, extra))
+            .unwrap()
+            .model
+    }
+
+    /// Both sides of the predicate in one test. The counterfactual
+    /// `resolve_auto_given_analytic(m, false)` is "what does `auto` pick on an FD
+    /// gradient": BOBYQA off the route, L-BFGS on it. Every fixture is under
+    /// `BOBYQA_MAX_DIM`, so the #1064 arm cannot be what supplies L-BFGS.
+    #[test]
+    fn auto_takes_lbfgs_on_the_kappa_correlation_route_and_nowhere_else() {
+        let on = model(true, true, 0);
+        let kappa_only = model(true, false, 0);
+        let corr_only = model(false, true, 0);
+        for m in [&on, &kappa_only, &corr_only] {
+            assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
+        }
+        // The straddle itself: exactly one fixture is on the route.
+        assert!(kappa_residual_correlation_fd_route(&on));
+        assert!(!kappa_residual_correlation_fd_route(&kappa_only));
+        assert!(!kappa_residual_correlation_fd_route(&corr_only));
+        // The route is FD (the scope gate reads the same predicate); the other two
+        // keep the analytic gradient and with it L-BFGS.
+        assert!(!analytic_outer_gradient_in_scope(&on));
+        assert!(analytic_outer_gradient_in_scope(&kappa_only));
+        assert!(analytic_outer_gradient_in_scope(&corr_only));
+        for m in [&on, &kappa_only, &corr_only] {
+            assert_eq!(Optimizer::Auto.resolve_auto(m, true), Optimizer::NloptLbfgs);
+        }
+        // On an FD gradient the two off-route models still get BOBYQA.
+        assert_eq!(
+            Optimizer::Auto.resolve_auto_given_analytic(&on, false),
+            Optimizer::NloptLbfgs,
+            "kappa + correlation on FD must take L-BFGS (#2122)"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto_given_analytic(&kappa_only, false),
+            Optimizer::Bobyqa,
+            "kappa without a correlation line: unchanged"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto_given_analytic(&corr_only, false),
+            Optimizer::Bobyqa,
+            "a correlation line without kappa: unchanged"
+        );
+        // The outer loop's own resolver agrees (no mixture).
+        assert_eq!(
+            resolve_outer_optimizer(Optimizer::Auto, &on, false, false).0,
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    #[test]
+    fn an_explicit_optimizer_is_honoured_on_the_route() {
+        let on = model(true, true, 0);
+        for opt in [
+            Optimizer::Bobyqa,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+            Optimizer::Bfgs,
+        ] {
+            assert_eq!(opt.resolve_auto(&on, true), opt);
+            assert_eq!(resolve_outer_optimizer(opt, &on, false, false), (opt, None));
+        }
+    }
+
+    const CAP_HEAD: &str = "past the 24-axis cap of the analytic gradient path, so it falls \
+                            back to finite differences.";
+    const CAP_SLOWER: &str = "The fit is correct, only slower.";
+    const CAP_REDUCE: &str = "Reduce the number of simultaneously estimated parameters, or FIX \
+                              the ones you are not estimating.";
+    const CAP_NOT_RESTORE: &str = "Reducing the number of estimated parameters would not \
+                                   restore the analytic gradient: the residual correlation \
+                                   line with kappa is finite-difference only as well (see the \
+                                   [error_model] warning).";
+    const ROUTE_REASON: &str = "[error_model]: a residual `correlation` line together with \
+                                kappa has no analytic gradient yet, so the FOCE/FOCEI outer \
+                                gradient uses finite differences (#2101).";
+    const ROUTE_ADVICE: &str = "Avoid `optimizer = bobyqa` on this route: on an MBMA model it \
+                                stopped short of the optimum, at a different objective for \
+                                each starting value of the correlation (#2122).";
+
+    fn has(m: &crate::types::CompiledModel, s: &str) -> bool {
+        m.parse_warnings.iter().any(|w| w.contains(s))
+    }
+
+    /// The warnings' input space is (over the axis cap?) × (kappa?) × (correlation?).
+    /// Each sentence is asserted on its own, present where it is true and absent
+    /// where it is not, so deleting or mis-gating any one sentence reddens a cell.
+    #[test]
+    fn fd_route_warnings_name_the_reason_in_every_cell() {
+        // 22 extra θ: 25 θ + 1 η (+ 1 κ), past the cap with or without the κ.
+        let over = 22;
+        // ((kappa, corr, extra), cap, slower + reduce, would-not-restore, route)
+        let cells = [
+            ((true, true, over), true, false, true, true),
+            ((true, false, over), true, true, false, false),
+            ((false, true, over), true, true, false, false),
+            ((true, true, 0), false, false, false, true),
+            ((true, false, 0), false, false, false, false),
+            ((false, true, 0), false, false, false, false),
+        ];
+        for ((k, c, e), cap, old_tail, not_restore, route) in cells {
+            let m = model(k, c, e);
+            let cell = format!("kappa={k} corr={c} extra={e}: {:#?}", m.parse_warnings);
+            assert_eq!(has(&m, CAP_HEAD), cap, "cap sentence, {cell}");
+            assert_eq!(has(&m, CAP_SLOWER), old_tail, "'only slower', {cell}");
+            assert_eq!(has(&m, CAP_REDUCE), old_tail, "'reduce', {cell}");
+            assert_eq!(
+                has(&m, CAP_NOT_RESTORE),
+                not_restore,
+                "'would not restore', {cell}"
+            );
+            assert_eq!(has(&m, ROUTE_REASON), route, "route reason, {cell}");
+            assert_eq!(has(&m, ROUTE_ADVICE), route, "route advice, {cell}");
+        }
+    }
+
+    /// A closed-form PK and an ODE model with IOV: the route warning is not tied to the
+    /// compartment-free cap block (#2127 review finding 1, killed by moving the push
+    /// inside `if is_algebraic`). Each structure is checked on the route and off it.
+    #[test]
+    fn the_route_warning_fires_on_compartment_models_too() {
+        let structures = [
+            (
+                "pk one_cpt_iv",
+                "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n",
+            ),
+            (
+                "ode",
+                "[structural_model]\n  ode(states=[central])\n\
+                 [odes]\n  d/dt(central) = -(CL/V) * central\n\
+                 [scaling]\n  y = central / V\n",
+            ),
+        ];
+        for (name, structure) in structures {
+            for corr in [true, false] {
+                let src = format!(
+                    "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
+                     theta RHO(0.3, 0.0, 0.9)\n  omega ETA_CL ~ 0.09\n  kappa K_CL ~ 0.04\n  \
+                     sigma ADD ~ 0.25\n\
+                     [individual_parameters]\n  CL = TVCL * exp(ETA_CL + K_CL)\n  V = TVV\n\
+                     {structure}\
+                     [error_model]\n  DV ~ additive(ADD)\n{}\
+                     [fit_options]\n  iov_column = OCC\n",
+                    if corr {
+                        "  correlation car1(RHO) by OCC\n"
+                    } else {
+                        ""
+                    },
+                );
+                let m = crate::parser::model_parser::parse_full_model(&src)
+                    .unwrap()
+                    .model;
+                assert!(!m.is_algebraic(), "{name}: has compartments");
+                assert_eq!(kappa_residual_correlation_fd_route(&m), corr, "{name}");
+                let cell = format!("{name} corr={corr}: {:#?}", m.parse_warnings);
+                assert_eq!(has(&m, ROUTE_REASON), corr, "route reason, {cell}");
+                assert_eq!(has(&m, ROUTE_ADVICE), corr, "route advice, {cell}");
+                assert!(
+                    !has(&m, CAP_HEAD),
+                    "no cap warning off the algebraic path, {cell}"
+                );
+            }
+        }
+    }
+}
