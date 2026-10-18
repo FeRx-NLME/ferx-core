@@ -35,28 +35,29 @@
 //!   whose initial gradient is below `1e-8` (`[parameters] … has no effect on the objective`),
 //!   and a frozen `Q` leaves no flat direction to floor. Measured: frozen whenever
 //!   `V2²/Q ≲ 1e-10` (V2 = 5e-5 frozen at Q₀ = 30, not at 20; V2 = 1e-4 frozen at Q₀ = 120,
-//!   not at 80; at Q₀ = 6, V2 = 2e-5 frozen, 3e-5 not). Here `V2²/Q₀ = 4.2e-10`, more than
-//!   3× inside.
+//!   not at 80; at Q₀ = 6, V2 = 2e-5 frozen, 3e-5 not; the same cells on Linux x86_64 and
+//!   macOS arm64). Here `V2²/Q₀ = 4.2e-10`, more than 3× inside.
 //! * **Not flat enough, and the floor does not fire.** The floor clips an eigenvalue below
 //!   `1e-10·λ_max = 2.078e-7`. Measured here: min eigenvalue 2.13e-8 on Linux x86_64,
-//!   3.79e-8 on CI x86_64 and 1.89e-8 on macOS arm64 (2.04e-8 and 2.57e-8 with the inner seed
-//!   killed), 5–11× inside.
-//!   Across the window it grew with V2, to 1.1e-7–1.4e-7 at V2 = 1e-4 (still floored) and
-//!   past the floor by V2 = 2e-4 (nothing floored), with both edges at the same cells on both
-//!   platforms.
+//!   3.79e-8 on CI x86_64 and 1.89e-8 on macOS arm64 (2.04e-8 on Linux and 2.57e-8 on macOS
+//!   with the inner seed killed), 5–11× inside. Across the window it grew with V2, to
+//!   1.1e-7–1.4e-7 at V2 = 1e-4 (still floored) and past the floor by V2 = 2e-4 (nothing
+//!   floored), at the same cells on Linux x86_64 and macOS arm64.
 //!
 //! # Why FOCEI (#2116)
 //!
 //! The fixture used to fit non-interaction FOCE. With a proportional error model that route
 //! declines the analytic R-matrix, so the covariance step took an FD Hessian, and the flat
 //! `Q` direction's eigenvalue was FD noise rather than curvature. On one landing point (θ and
-//! OFV agreeing to 9–11 digits) it measured +2.5e-8 and +3.2e-8 on macOS arm64 and −7.2e-7
-//! and −5.0e-7 on Linux x86_64 (two commits each), and on CI x86_64 it once came out above
-//! the 2.3e-7 floor, so nothing floored and the test failed with a TVQ RSE of 68 607 %.
-//! Noise of ±7e-7 against a 2.3e-7 clip threshold leaves the window no inside. Under FOCEI
+//! OFV agreeing to 9–11 digits) it measured +3.2e-8 on macOS arm64 (`98377a30`) and −7.2e-7
+//! and −5.0e-7 on Linux x86_64 (`e9d47120` and `98377a30`), and on CI x86_64 (`98377a30`) it
+//! came out above the 2.3e-7 floor, so nothing floored and the test failed with a TVQ RSE of
+//! 68 607 %. Noise of ±7e-7 against a 2.3e-7 clip threshold leaves no window. Under FOCEI
 //! the analytic R-matrix is used and the eigenvalue is the curvature the window above
 //! describes: across three machines and two inner-solve trajectories it stays within
-//! 1.9e-8–3.8e-8 (above), well inside the floor.
+//! 1.9e-8–3.8e-8 (above), well inside the floor. The first test asserts the route, so a
+//! change that sends this fit back to the FD Hessian fails by name rather than on whichever
+//! platform its noise next lands wrong.
 //!
 //! The test asserts the straddle first — the same fit with the floor warning removed *passes*
 //! `Strictness::default()` outright — so the exclusion it then asserts can only come from the
@@ -186,13 +187,19 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
     );
     assert!(r.converged, "{:?}", r.warnings);
 
-    // The collapse the fixture exists for: the covariance step floored the flat direction.
+    // The collapse the fixture exists for: the covariance step floored the flat direction,
+    // on the analytic R-matrix — on the FD Hessian the eigenvalue is stencil noise (#2116).
     // The margin is a canary — measured 1.89e-8 to 3.79e-8 across macOS arm64, Linux x86_64
-    // and CI x86_64 against a 2.078e-7 floor (canary at 5.2e-8), so a drift toward the edge
-    // where nothing floors reddens here, with the numbers, rather than silently flipping the
+    // and CI x86_64 against a 2.078e-7 floor, so a drift that brings it within 4× of the floor
+    // (min eig ≳ 5.2e-8) reddens here, with the numbers, rather than silently flipping the
     // straddle below.
     let msg = floor_message(&r)
         .unwrap_or_else(|| panic!("the eigenvalue floor did not fire: {:?}", r.warnings));
+    assert!(
+        msg.contains("applied to the analytic R-matrix"),
+        "the covariance step left the analytic R-matrix, so the floored eigenvalue is FD \
+         noise again (#2116): {msg}"
+    );
     let (min_eig, floor) = (field(msg, "min eig = "), field(msg, "floor = "));
     assert!(
         min_eig.is_finite() && floor.is_finite() && min_eig < floor / 4.0,
@@ -231,12 +238,13 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
 /// The second leg is `run_covariance` re-running the `r` fit under `s`: the incoming fit
 /// carries the floor warning, and a re-run that kept it would have the gate exclude the fit
 /// over a step that no longer exists. On this fixture the `s` step itself *fails* ("the score
-/// cross-product matrix S is singular or rank-deficient", measured), so the re-run stores no
-/// matrix. That is why there is no
-/// fresh-`s`-fit leg here: it would pass by skipping (no matrix, nothing to read), whatever
-/// the estimator gating did — measured, making the floor warning fire under `s` too left such
-/// a leg green. The re-run leg is live regardless, since the stale warning is carried in on
-/// `r`: dropping `CovarianceRegularized` from `run_covariance`'s superseded set reddens it.
+/// cross-product matrix S is singular or rank-deficient", measured under FOCE and again under
+/// FOCEI), so the re-run stores no matrix. That is why there is no fresh-`s`-fit leg here: it
+/// would pass by skipping (no matrix, nothing to read), whatever the estimator gating did —
+/// measured under FOCE, making the floor warning fire under `s` too left such a leg green.
+/// The re-run leg is live regardless, since the stale warning is carried in on `r`: dropping
+/// `CovarianceRegularized` from `run_covariance`'s superseded set reddens it (re-run under
+/// FOCEI).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
