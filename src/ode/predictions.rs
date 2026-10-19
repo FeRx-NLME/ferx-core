@@ -5141,6 +5141,7 @@ pub(crate) fn ode_predictions_adaptive(
         .map(|spec| AdaptiveMonitor {
             spec,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let mut decide = |ctx: &ControllerCtx| ControllerDecision {
@@ -5775,6 +5776,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             t_start,
                         ),
                     };
+                    // The model's readout includes its `[scaling]` Form A/B divisor, so the
+                    // controller reads what an observation on `m.cmt` would (#2129) — and,
+                    // under `Dv`, so does the σ drawn from it below. The caller sets
+                    // `obs_scale` only on a monitor with no `observe` expression, so this is
+                    // the identity on the `Some(f)` arm.
+                    let latent = am.scale_readout(latent, readout_eta);
                     // A finite state (guarded above) that reads out non-finite is a readout
                     // defect, not a divergence (#1578): a `[scaling]` readout or an `observe`
                     // expression that divides by zero, say. The `Dv` clamp below cannot
