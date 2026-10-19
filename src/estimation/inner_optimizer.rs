@@ -971,7 +971,7 @@ impl FallbackCertifier<'_> {
         if gnorm.is_finite() && gnorm < self.tol {
             return true;
         }
-        if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g) {
+        if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g, admissible) {
             return true;
         }
         // A gradient driver, whatever `inner_optimizer` selects: under `nelder_mead` the
@@ -1020,14 +1020,98 @@ impl FallbackCertifier<'_> {
     }
 
     /// Test 2 of [`Self::certify`]: the Hessian of `grad` at `x` (symmetrised central
-    /// differences, `2n` gradient evaluations) is positive definite, and either the Newton
-    /// step `‖H⁻¹g‖₂` is below `tol` or the decrease it predicts, `½gᵀH⁻¹g`, is at or below
-    /// the objective's resolution `INNER_FTOL_REL·(1 + |f|)`. Any non-finite entry, or a
+    /// differences, `2n` gradient evaluations) is positive definite, and the point is within
+    /// `tol` of its mode by the Newton step `‖H⁻¹g‖₂`, by the gradient norm after the step, or
+    /// by the resolution arm (`½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`). Any non-finite entry, or a
     /// failed Cholesky, is "not certified".
-    fn newton_certifies(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64], g: &[f64]) -> bool {
+    ///
+    /// **Takes the Newton step it computes** (up to [`NEWTON_CERT_STEPS`]), keeping each only
+    /// when it is admissible and either lowers the objective or, within the objective's
+    /// rounding, lowers the gradient norm — so `x` is never made worse beyond rounding. The
+    /// resolution arm alone used to certify a point without moving it: at curvature ~100 it
+    /// admits `‖∇l‖ ~ 1e-4`, so a fallback EBE asked for `tol = 1e-12` came back ~1e-6 from its
+    /// mode (measured `‖∇l‖` up to 3e-7 on a one-compartment oral fixture). The FOCEI objective
+    /// is not stationary in η, so that miss enters the marginal to first order. The step
+    /// converges quadratically from there, so the requested `tol` is met wherever the
+    /// objective can resolve it, and the resolution arm still certifies the rest.
+    fn newton_certifies(
+        &self,
+        obj: &dyn Fn(&[f64]) -> f64,
+        x: &mut Vec<f64>,
+        g: &[f64],
+        admissible: &dyn Fn(&[f64]) -> bool,
+    ) -> bool {
+        let n = x.len();
+        let mut g = g.to_vec();
+        for _ in 0..NEWTON_CERT_STEPS.min(self.max_iter) {
+            let Some(newton) = self.pd_newton_step(x, &g) else {
+                return false;
+            };
+            let step_norm = newton.norm();
+            if !step_norm.is_finite() {
+                return false;
+            }
+            if step_norm < self.tol {
+                return true;
+            }
+            let f = obj(x);
+            let cand: Vec<f64> = (0..n).map(|i| x[i] - newton[i]).collect();
+            // Kept when the objective falls, or — once the step's predicted gain is below what
+            // the objective can resolve — when it stays within its rounding and the gradient
+            // norm falls: there the exact gradient is the only instrument that can still see
+            // the mode, and a PD Newton step that shrinks it is moving toward it.
+            let accepted = if cand.iter().all(|v| v.is_finite()) && admissible(&cand) {
+                let fc = obj(&cand);
+                let rounding = 8.0 * f64::EPSILON * (1.0 + f.abs());
+                if fc <= f {
+                    Some((self.grad)(&cand))
+                } else if fc <= f + rounding {
+                    let gc = (self.grad)(&cand);
+                    (grad_norm_metric(&gc, self.stop_precond)
+                        < grad_norm_metric(&g, self.stop_precond))
+                    .then_some(gc)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(gc) = accepted else {
+                // The resolution arm. `½gᵀH⁻¹g` is what a full Newton step would still gain;
+                // when it is no larger than the relative change the objective-stall stop
+                // already treats as *flat* (`INNER_FTOL_REL`, #555), no step from here is
+                // distinguishable from rounding in the objective, and the point is a mode to
+                // the precision the objective defines. This is what makes the certificate
+                // independent of `tol`: at `inner_tol = 1e-8` a well-curved η sits ~1e-7 from
+                // its mode before the line search can no longer resolve a decrease, so a step
+                // test alone reported the converged subjects of the Schnider NONMEM anchor fit
+                // unconverged and the EBE guard rejected its start (#1527).
+                let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+                return f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs());
+            };
+            *x = cand;
+            g = gc;
+            let gnorm = grad_norm_metric(&g, self.stop_precond);
+            if gnorm.is_finite() && gnorm < self.tol {
+                return true;
+            }
+        }
+        // Still short of `tol` after the steps: certified by the resolution arm at the point
+        // they reached, as before.
+        let Some(newton) = self.pd_newton_step(x, &g) else {
+            return false;
+        };
+        let f = obj(x);
+        let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+        newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
+    }
+
+    /// `H⁻¹g` for the central-difference Hessian of `grad` at `x`, or `None` when `g` or `H`
+    /// is non-finite or `H` is not positive definite.
+    fn pd_newton_step(&self, x: &[f64], g: &[f64]) -> Option<DVector<f64>> {
         let n = x.len();
         if n == 0 || !g.iter().all(|v| v.is_finite()) {
-            return false;
+            return None;
         }
         let mut h = DMatrix::<f64>::zeros(n, n);
         let mut probe = x.to_vec();
@@ -1044,33 +1128,19 @@ impl FallbackCertifier<'_> {
         }
         let h = (&h + h.transpose()) * 0.5;
         if !h.iter().all(|v| v.is_finite()) {
-            return false;
+            return None;
         }
-        let Some(chol) = h.cholesky() else {
-            return false;
-        };
-        let gv = DVector::from_column_slice(g);
-        let newton = chol.solve(&gv);
-        let step_norm = newton.norm();
-        if !step_norm.is_finite() {
-            return false;
-        }
-        if step_norm < self.tol {
-            return true;
-        }
-        // The resolution arm. `½gᵀH⁻¹g` is what a full Newton step would still gain; when it
-        // is no larger than the relative change the objective-stall stop already treats as
-        // *flat* (`INNER_FTOL_REL`, #555), no step from here is distinguishable from rounding
-        // in the objective, and the point is a mode to the precision the objective defines.
-        // This is what makes the certificate independent of `tol`: at `inner_tol = 1e-8` a
-        // well-curved η sits ~1e-7 from its mode before the line search can no longer resolve
-        // a decrease, so a step test alone reported the converged subjects of the Schnider
-        // NONMEM anchor fit unconverged and the EBE guard rejected its start (#1527).
-        let f = obj(x);
-        let decrement = 0.5 * gv.dot(&newton);
-        f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs())
+        let chol = h.cholesky()?;
+        Some(chol.solve(&DVector::from_column_slice(g)))
     }
 }
+
+/// Newton steps the fallback certificate may take ([`FallbackCertifier::newton_certifies`]),
+/// and never more than the caller's iteration budget (`max_iter`). From a point the resolution
+/// arm would have certified the step converges quadratically, so two or three reach the
+/// requested `tol`; the bound keeps a step that cannot (a noisy or barely-convex objective)
+/// from costing more than a few Hessians.
+const NEWTON_CERT_STEPS: usize = 3;
 
 /// Relative central-difference step for the Hessian in the fallback's Newton-step certificate
 /// ([`FallbackCertifier`] test 2): `h_j = NEWTON_CERT_FD_STEP·(1 + |η_j|)`. The certificate needs
@@ -2930,8 +3000,9 @@ pub(crate) fn overwrite_frem_pseudo_obs_rows(
 /// L-BFGS two-loop recursion: the search direction `d = −H·g` from the bounded
 /// `(s, y, ρ)` history, with implicit initial Hessian `H₀ = γI`,
 /// `γ = sᵀy / yᵀy` of the most recent pair (Nocedal & Wright, Alg. 7.4). With an
-/// empty history this returns `−g` (steepest descent), so the first step matches
-/// the old dense-BFGS start. A diagonal `precond` (FREM, issue #406) replaces the
+/// empty history this returns `−H₀·g` (steepest descent) unscaled; `lbfgs_core` bounds it as
+/// dense BFGS bounds its first step ([`h0_step_scale`] on the identity,
+/// [`cap_curvature_free_step`] under a preconditioner), so the two starts match. A diagonal `precond` (FREM, issue #406) replaces the
 /// scalar `γ` initial Hessian with `H₀ = diag(precond)`, so the central scaling
 /// step is per-dimension instead of a single ill-scaled `γ`.
 fn lbfgs_direction(
@@ -4161,6 +4232,51 @@ fn seed_h_inv(n: usize, hessian_seed: Option<&DMatrix<f64>>) -> Option<DMatrix<f
     solved.iter().all(|v| v.is_finite()).then_some(solved)
 }
 
+/// The factor that brings a step from the **identity** `H₀` to O(1) length: `1/‖g‖` when
+/// `gnorm > 1`, else 1 (below that, `1/‖g‖` would *lengthen* the step). Dense BFGS's first
+/// iterate has applied it since #406; since #2093 L-BFGS's empty-history direction and its
+/// steepest-descent fallback do too (#2099). A preconditioned start is bounded by
+/// [`cap_curvature_free_step`] instead: a scalar rescaling of `diag(Ω)` keeps its length
+/// right only along the axis that dominates ‖g‖ and shrinks every other one.
+fn h0_step_scale(gnorm: f64) -> f64 {
+    if gnorm > 1.0 {
+        1.0 / gnorm
+    } else {
+        1.0
+    }
+}
+
+/// Bounds a step taken from the **preconditioned** curvature-free metric (`d = −diag(p)·g`,
+/// or its L-BFGS / steepest-descent-reset equivalents) to the runaway region's radius in
+/// that metric: `√(Σ dᵢ²/pᵢ) ≤ √(RUNAWAY_EBE_MAHA_PER_ETA · n)`, which with `p = diag(Ω)`
+/// is 10√n prior SDs — the ball outside which the #958 guard already treats an EBE as a
+/// runaway. The step's per-axis shape, which the preconditioner gets right, is kept; only
+/// its length is shortened, and only when it would leave that ball, so an ordinary start is
+/// untouched.
+///
+/// Why: since #464 every FOCE/FOCEI inner solve is Ω-preconditioned, and the first step
+/// `−Ω·g` has the gradient's magnitude (#2080). On a steep start — an observation on the
+/// proportional-variance floor, ‖g‖ ~ 1e12 — it lands thousands of prior SDs out:
+/// `examples/warfarin_ode_lagtime.ferx` put η_LAG at −800, and #2093's exact gradient then
+/// followed a real descent to `KA = e^42`, where every ODE solve is stiff (1.0–1.7 s per
+/// subject). Rescaling the whole metric by `1/‖g‖` fixed that but shrank a stiff second
+/// axis 20× too small on a flip-flop subject, which then stalled at ‖∇‖ = 1.1.
+fn cap_curvature_free_step(d: &mut [f64], precond: Option<&[f64]>) {
+    let Some(p) = precond else {
+        return;
+    };
+    let m: f64 = d
+        .iter()
+        .zip(p)
+        .map(|(di, pi)| if *pi > 0.0 { di * di / pi } else { 0.0 })
+        .sum();
+    let r2 = RUNAWAY_EBE_MAHA_PER_ETA * d.len() as f64;
+    if m.is_finite() && m > r2 {
+        let k = (r2 / m).sqrt();
+        d.iter_mut().for_each(|di| *di *= k);
+    }
+}
+
 /// Initial inverse-Hessian for the inner BFGS: the accepted analytic seed inverse when
 /// [`seed_h_inv`] produced one, else `diag(precond)` when a preconditioner is supplied,
 /// else identity.
@@ -4329,14 +4445,27 @@ fn lbfgs_core(
         }
 
         let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n, precond);
+        // With no curvature pair yet the direction is `−H₀·g` alone: bound it like any
+        // curvature-free start (#2099).
+        let bound_curvature_free = |d: &mut Vec<f64>| match precond {
+            Some(_) => cap_curvature_free_step(d, precond),
+            None => {
+                let k = h0_step_scale(gnorm);
+                d.iter_mut().for_each(|di| *di *= k);
+            }
+        };
+        if s_hist.is_empty() {
+            bound_curvature_free(&mut d);
+        }
         // Guard against a non-descent direction (e.g. after a bad curvature
-        // pair) by falling back to (preconditioned) steepest descent.
+        // pair) by falling back to (preconditioned) steepest descent, bounded the same way.
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
             d = match precond {
                 Some(p) => g.iter().zip(p).map(|(gi, pi)| -gi * pi).collect(),
                 None => g.iter().map(|gi| -gi).collect(),
             };
+            bound_curvature_free(&mut d);
         }
 
         let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
@@ -4350,10 +4479,16 @@ fn lbfgs_core(
             short_line_search,
             floor,
         );
-        // At the noise floor an unverifiable step is convergence, not a failure.
-        if alpha == 0.0 && floor {
-            return true;
-        }
+        // At the noise floor an unverifiable step is convergence, not a failure — unless the
+        // gradient verifies it ([`gradient_verified_step`]).
+        let (alpha, f_new) = if alpha == 0.0 && floor {
+            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                Some(fc) => (1.0, fc),
+                None => return true,
+            }
+        } else {
+            (alpha, f_new)
+        };
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -4468,16 +4603,21 @@ fn dense_bfgs_core(
             best_gnorm = gnorm;
         }
 
-        // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
-        // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
-        // `None`, so `gnorm` here is the raw L2 norm; a diagonal preconditioner
-        // already sets the per-dim scale.
-        // An accepted analytic seed already carries the scale, so it skips this; a
-        // *rejected* one (`seed_inv.is_none()`) takes the historical path unchanged.
-        if precond.is_none() && seed_inv.is_none() && first_step && gnorm > 1.0 {
-            h_inv *= 1.0 / gnorm;
-            first_step = false;
+        // Scale the initial metric so the first step is O(1) not O(gnorm). Only for the
+        // identity-H0 path (`precond.is_none()`); a preconditioned first step is bounded
+        // below instead ([`cap_curvature_free_step`]), which keeps `diag(Ω)`'s per-axis
+        // shape. An accepted analytic seed already carries the scale, so it skips both; a
+        // *rejected* one (`seed_inv.is_none()`) takes the curvature-free path.
+        //
+        // Decided once, at the first iterate (#2093): a later `gnorm > 1` must not rescale an
+        // `h_inv` that BFGS updates have already shaped. The flag used to clear only when
+        // the scaling fired, so a search starting at `gnorm ≤ 1` could have its learned
+        // curvature divided by ‖g‖ mid-search.
+        let curvature_free_step = seed_inv.is_none() && first_step;
+        if curvature_free_step && precond.is_none() {
+            h_inv *= h0_step_scale(gnorm);
         }
+        first_step = false;
         if gnorm < tol {
             return true;
         }
@@ -4485,6 +4625,9 @@ fn dense_bfgs_core(
         g_vec.as_mut_slice().copy_from_slice(&g);
         d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
         d.copy_from_slice(d_vec.as_slice());
+        if curvature_free_step {
+            cap_curvature_free_step(&mut d, precond);
+        }
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
@@ -4494,6 +4637,10 @@ fn dense_bfgs_core(
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
+            // A curvature-free step like the first one: bounded the same way (#2099).
+            if seed_inv.is_none() {
+                cap_curvature_free_step(&mut d, precond);
+            }
             let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
             let (alpha, f_new) = backtracking_line_search(
                 obj,
@@ -4505,10 +4652,16 @@ fn dense_bfgs_core(
                 short_line_search,
                 floor,
             );
-            // At the noise floor an unverifiable step is convergence, not a failure.
-            if alpha == 0.0 && floor {
-                return true;
-            }
+            // At the noise floor an unverifiable step is convergence, not a failure — unless
+            // the gradient verifies it ([`gradient_verified_step`]).
+            let (alpha, f_new) = if alpha == 0.0 && floor {
+                match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                    Some(fc) => (1.0, fc),
+                    None => return true,
+                }
+            } else {
+                (alpha, f_new)
+            };
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -4538,10 +4691,16 @@ fn dense_bfgs_core(
             short_line_search,
             floor,
         );
-        // At the noise floor an unverifiable step is convergence, not a failure.
-        if alpha == 0.0 && floor {
-            return true;
-        }
+        // At the noise floor an unverifiable step is convergence, not a failure — unless the
+        // gradient verifies it ([`gradient_verified_step`]).
+        let (alpha, f_new) = if alpha == 0.0 && floor {
+            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                Some(fc) => (1.0, fc),
+                None => return true,
+            }
+        } else {
+            (alpha, f_new)
+        };
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -4859,6 +5018,37 @@ fn step_below_noise_floor(enable_stall: bool, d: &[f64], g: &[f64], f: f64) -> b
     }
     let dg: f64 = d.iter().zip(g).map(|(di, gi)| di * gi).sum();
     dg < 0.0 && -dg <= INNER_FTOL_REL * (1.0 + f.abs())
+}
+
+/// At the noise floor, whether the full step `x + d` that the objective could not verify is
+/// verified by the **gradient** instead: the objective stays within its resolution
+/// (`INNER_FTOL_REL·(1 + |f|)`, the flat-step threshold) and the gradient norm at least
+/// halves. Returns the objective there when it is.
+///
+/// The objective-based stop treats "no resolvable decrease" as convergence, which is right
+/// when the gradient carries the same noise. When the ODE is integrated tightly enough for
+/// the gradient to stay accurate, it is not: measured on a route-lag fixture at
+/// `reltol = 1e-12`, solves stopped this way at `‖∇l‖` up to 1.8e-6 against `tol = 1e-12`,
+/// though the gradient there is good to ~1e-10 (#2093). The FOCEI marginal is not stationary
+/// in η, so the miss enters the objective to first order. A gradient that halves is moving
+/// toward the mode; noise does not halve it repeatedly, so on a noise-floored gradient this
+/// returns `None` and the stop is unchanged. Costs one objective and one gradient.
+fn gradient_verified_step(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    f: f64,
+    g: &[f64],
+    stop_precond: Option<&[f64]>,
+) -> Option<f64> {
+    let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
+    let fc = obj(&cand);
+    if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
+        return None;
+    }
+    let gc = grad_norm_metric(&grad(&cand), stop_precond);
+    (gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond)).then_some(fc)
 }
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`

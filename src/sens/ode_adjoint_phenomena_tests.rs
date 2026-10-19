@@ -1203,9 +1203,15 @@ fn per_route_lag_matches_reconverged_fd() {
         assert!(m.has_route_absorption_lag());
         let s = subject(&m, doses.clone(), &times, &[0.1, 0.05]);
         let (jac, grad) = measure(&m, &s, live, label);
-        // Measured worst jac 6.6e-10, grad 1.05e-6 (single route) on Linux; ~10× headroom.
+        // Measured worst jac 6.6e-10 on Linux; ~10× headroom. The gradient bound is set by the
+        // reconverged-FD reference's own accuracy, which is the stationarity of its EBE
+        // re-solves: 1.05e-6 before #2093, when a tightly integrated ODE solve stopped on the
+        // objective's resolution; 5.4e-8 (route lag) and 6.5e-9 (two routes) since the
+        // noise-floor exit takes a step the exact gradient verifies (`gradient_verified_step`).
+        // Without that verification (run): 4.2e-6 and 1.5e-6. The bound is ~9× over the fix
+        // and ~8× under the mutant.
         assert!(jac < 7e-9, "{label} ∂f/∂η: {jac:.2e}");
-        assert!(grad < 1.1e-5, "{label} gradient: {grad:.2e}");
+        assert!(grad < 5e-7, "{label} gradient: {grad:.2e}");
     }
 }
 

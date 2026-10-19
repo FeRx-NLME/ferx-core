@@ -3894,8 +3894,13 @@ fn dense_residual_agq_gradient_and_hessians_match_fd() {
     // Measured 1.4e-7; 5×.
     let (h, _) = hessian_gaps(&block, &sb, true);
     assert!(h < 7e-7, "block_sigma FOCEI hessian {h:.2e}");
-    // Measured cs 6.1e-9, ar1 4.9e-8, car1 6.2e-8; 5×.
-    for (kind, bound) in [("cs", 3e-8), ("ar1", 2.5e-7), ("car1", 3e-7)] {
+    // Measured cs 6.1e-9 before #2093's inner-solver changes and 9.7e-8 after, with the
+    // analytic Hessian unchanged to 1e-10 and the reference EBEs agreeing to 1e-15 in the
+    // objective: the spread is the reconverged-FD reference's own floor on this fixture
+    // (block_sigma 1.4e-7 / 8.4e-8 on the same two builds; ar1 4.9e-8, car1 6.2e-8). So `cs`
+    // takes its siblings' bound, ~3× over the larger reading. The defect it guards — the
+    // dense R lifting `∂²C/∂ρ²` as zero — gave gaps of 0.47 and 0.30.
+    for (kind, bound) in [("cs", 3e-7), ("ar1", 2.5e-7), ("car1", 3e-7)] {
         let m = parse_model_string(&dense_src(
             &format!("  correlation {kind}(RHO) by ARM\n"),
             false,

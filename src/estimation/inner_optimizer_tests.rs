@@ -1695,13 +1695,17 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
 ///
 /// | θ | subject | unseeded | seeded | kept |
 /// |---|---|---|---|---|
-/// | initial | ID 6 | −29.134 | −35.915 | seeded (6.78 lower) |
+/// | `TVCL × 5` | ID 9 | −18.608 | −27.055 | seeded (8.45 lower) |
 /// | `TVV2 × 5` | ID 11 | −24.772 | −12.653 | unseeded (12.1 lower) |
 ///
+/// The case this was found on was ID 6 at the initial θ (unseeded −29.134, seeded −35.915).
 /// Under the warm-only gate this replaced, ID 6 took the worse mode on the first outer
 /// evaluation and every warm solve stayed there: the L-BFGS fit converged at −1185.250,
-/// 3.3 OFV above the seeded-everywhere −1188.527. Each case asserts its own straddle, so a
-/// policy that always keeps one side reddens exactly one of them.
+/// 3.3 OFV above the seeded-everywhere −1188.527. Since #2093 bounds a curvature-free first
+/// step (`cap_curvature_free_step`) the *unseeded* solve reaches −35.915 there too, so ID 6
+/// no longer straddles; ID 9 at `TVCL × 5` does, with the same values on both sides of that
+/// change. Each case asserts its own straddle, so a policy that always keeps one side
+/// reddens exactly one of them.
 #[test]
 fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
     use std::path::Path;
@@ -1722,7 +1726,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
-        ("6", 0, 1.0, true),
+        ("9", 0, 5.0, true),
         ("11", 3, 5.0, false),
     ];
     for (id, k, factor, seeded_wins) in cases {
@@ -1770,7 +1774,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         assert!(
             if seeded_wins { gap < -1.0 } else { gap > 1.0 },
             "premise, ID {id}: seeded − unseeded cold −log L = {gap:.4} \
-             (realised −6.781 for ID 6, +12.119 for ID 11)"
+             (realised −8.447 for ID 9, +12.119 for ID 11)"
         );
         let expected = if seeded_wins { &forced } else { &unseeded };
         for (label, eta_init) in [("None", None), ("zero placeholder", Some(&[0.0; 5][..]))] {
@@ -4385,5 +4389,328 @@ fn gradient_fd_keeps_the_inner_search_and_h_off_the_exact_routes() {
     assert!(
         gap < 1e-4,
         "the FD H must still be the same matrix: gap {gap:.2e}"
+    );
+}
+
+/// A cold start on a steep objective takes a bounded first step (`cap_curvature_free_step`).
+///
+/// `examples/warfarin_ode_lagtime.ferx`, subject 3: the 0.5 h observation coincides with the
+/// lagged arrival at the default `TVLAG = 0.5`, so at η = 0 its prediction is 0, its
+/// proportional variance sits on the floor, the objective is 1.2e12 and ‖g‖ is 9.5e12.
+/// Unbounded, the Ω-preconditioned first step `−Ω·g` put η_LAG at −800; the exact gradient
+/// then followed a genuine descent to `KA = e^42`, where every ODE solve is stiff, and the
+/// runaway guard's Nelder–Mead found the mode at the end anyway (0.96 s for this subject).
+/// Measured in ODE stepper attempts across the whole solve: 311 bounded, with no fallback;
+/// 2,038,257 with the cap removed (run), through the Nelder–Mead fallback. The mode is the
+/// same either way, so this pins the cost: the bound of 20,000 is ~64× over the fix and
+/// ~100× under the mutant.
+#[test]
+fn a_cold_start_on_a_variance_floor_takes_a_bounded_first_step() {
+    use std::path::Path;
+    let parsed = crate::parse_full_model_file(Path::new("examples/warfarin_ode_lagtime.ferx"))
+        .expect("warfarin_ode_lagtime parses");
+    let mut model = parsed.model;
+    model.sync_ode_solver_opts(&parsed.fit_options);
+    let pop = crate::io::datareader::read_nonmem_csv(
+        Path::new("data/warfarin_ode_lagtime.csv"),
+        None,
+        None,
+    )
+    .expect("warfarin_ode_lagtime data loads");
+    let subject = pop
+        .subjects
+        .iter()
+        .find(|s| s.id == "3")
+        .expect("subject 3");
+    let params = model.default_params.clone();
+
+    // Precondition: at η = 0 the first observation is on the variance floor.
+    let preds = crate::pk::compute_predictions_with_tv(&model, subject, &params.theta, &[0.0; 4]);
+    assert_eq!(
+        preds[0], 0.0,
+        "the 0.5 h observation must sit at the lagged arrival"
+    );
+
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let r = find_ebe(
+        &model,
+        subject,
+        &params,
+        parsed.fit_options.inner_maxiter,
+        parsed.fit_options.inner_tol,
+        None,
+        None,
+        0,
+    );
+    let attempts = scope.collected().attempted_steps;
+    drop(scope);
+    assert!(
+        (r.nll - (-16.751285)).abs() < 1e-5,
+        "EBE objective {} is not the mode",
+        r.nll
+    );
+    assert!(
+        ebe_prior_maha(r.eta.as_slice(), &params.omega) < RUNAWAY_EBE_MAHA_PER_ETA * 4.0,
+        "EBE {:?} is a runaway",
+        r.eta.as_slice()
+    );
+    assert!(
+        !r.used_fallback,
+        "the bounded first step should reach the mode without the Nelder–Mead fallback"
+    );
+    assert!(
+        attempts < 20_000,
+        "{attempts} ODE step attempts: the first step left the plausible region and the \
+         search marched into a stiff one"
+    );
+}
+
+/// `cap_curvature_free_step` leaves a step inside the runaway radius bit-identical and
+/// shortens one outside it to exactly that radius, along the same direction. Radius for
+/// `n = 2`: `√(RUNAWAY_EBE_MAHA_PER_ETA·2)` in the `diag(p)` metric.
+#[test]
+fn the_curvature_free_step_cap_keeps_shape_and_bounds_length() {
+    let p = [0.09, 1e-4];
+    let r2 = RUNAWAY_EBE_MAHA_PER_ETA * 2.0;
+    let metric = |d: &[f64]| d.iter().zip(&p).map(|(di, pi)| di * di / pi).sum::<f64>();
+
+    let inside = vec![0.5, 0.01];
+    assert!(metric(&inside) < r2);
+    let mut d = inside.clone();
+    cap_curvature_free_step(&mut d, Some(&p));
+    assert_eq!(d, inside, "a step inside the radius is untouched");
+
+    let outside = vec![-0.09 * 9.5e12, 1e-4 * 2.7];
+    let mut d = outside.clone();
+    cap_curvature_free_step(&mut d, Some(&p));
+    assert!(
+        (metric(&d) - r2).abs() < 1e-9 * r2,
+        "capped to the radius: {}",
+        metric(&d)
+    );
+    assert!(
+        ((d[0] / d[1]) - (outside[0] / outside[1])).abs() < 1e-9 * (outside[0] / outside[1]).abs(),
+        "the direction is kept"
+    );
+
+    let mut d = outside.clone();
+    cap_curvature_free_step(&mut d, None);
+    assert_eq!(
+        d, outside,
+        "the identity path is bounded by `h0_step_scale`, not here"
+    );
+}
+
+/// Both drivers' first trial point from a steep, Ω-preconditioned start lies within the
+/// runaway radius (#2080, #2099). Fixture: `f = ½·1e12·(x₀ − 1)² + ½x₁²` from 0, so
+/// ‖g‖ ≈ 1e12 and the unbounded first step `−diag(p)·g` is ~3e12 prior SDs long.
+/// Mutation: removing the cap from `dense_bfgs_core`'s first iterate reddens the dense half;
+/// removing it from `lbfgs_core`'s empty-history direction reddens the L-BFGS half.
+#[test]
+fn a_steep_preconditioned_start_takes_a_bounded_first_trial() {
+    use std::cell::RefCell;
+    let p = [0.09, 0.04];
+    let r2 = RUNAWAY_EBE_MAHA_PER_ETA * 2.0;
+    let never = |_: &[f64]| false;
+    for dense in [true, false] {
+        let first: RefCell<Option<Vec<f64>>> = RefCell::new(None);
+        let calls = RefCell::new(0usize);
+        let obj = |x: &[f64]| {
+            let mut c = calls.borrow_mut();
+            *c += 1;
+            if *c == 2 {
+                *first.borrow_mut() = Some(x.to_vec());
+            }
+            0.5e12 * (x[0] - 1.0).powi(2) + 0.5 * x[1] * x[1]
+        };
+        let grad = |x: &[f64]| vec![1e12 * (x[0] - 1.0), x[1]];
+        let mut x = vec![0.0, 0.0];
+        if dense {
+            dense_bfgs_core(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                3,
+                1e-8,
+                Some(&p),
+                None,
+                None,
+                &never,
+                false,
+            );
+        } else {
+            lbfgs_core(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                3,
+                1e-8,
+                Some(&p),
+                None,
+                &never,
+                false,
+            );
+        }
+        let t = first.borrow().clone().expect("a first trial was evaluated");
+        let m: f64 = t.iter().zip(&p).map(|(ti, pi)| ti * ti / pi).sum();
+        assert!(
+            m <= r2 * (1.0 + 1e-9),
+            "{}: first trial {t:?} is {m:.3e} in the prior metric, radius² {r2}",
+            if dense { "dense BFGS" } else { "L-BFGS" }
+        );
+    }
+}
+
+// ---- #2080 / #2091 outcome fixtures, ported from @carldelfin's #2091 ---------------------
+//
+// #2091 fixes the far-seed case with a rescaled retry on a failed first line search; #2093
+// bounds every curvature-free first step instead (`cap_curvature_free_step`). These are
+// #2091's outcome assertions — the deeper mode is reached from the seed, by BFGS, and the
+// cold multi-start keeps it — without its retry counter, which pins #2091's mechanism.
+
+fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
+    use crate::types::{DoseEvent, Subject};
+    let times = [
+        0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0,
+    ];
+    let (cl, ka) = (1.0f64, 0.02f64);
+    let k = cl / v;
+    let observations: Vec<f64> = times
+        .iter()
+        .map(|&t| {
+            let c = 100.0 * ka / (v * (ka - k)) * ((-k * t).exp() - (-ka * t).exp());
+            format!("{c:.10e}").parse().unwrap()
+        })
+        .collect();
+    let model = crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100)\n  theta TVV(10.0, 0.1, 1000)\n  theta TVKA(1.0, 0.001, 100)\n  omega ETA_CL ~ {}\n  omega ETA_V ~ {}\n  omega ETA_KA ~ {}\n  sigma PROP_ERR ~ 0.05 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+        omega[0], omega[1], omega[2]
+    ))
+    .expect("parse the flip-flop model");
+    let n = times.len();
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: times.to_vec(),
+        obs_raw_times: Vec::new(),
+        observations,
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    (model, subject)
+}
+
+/// Solve from η = 0, then again from that η̂ with η_V moved to −2 sd (the seed
+/// `inner_restarts = 1` tries). Returns `(from η = 0, from the seed)`.
+fn flip_flop_eta_v_minus_2sd(v: f64, omega: [f64; 3]) -> (EbeResult, EbeResult) {
+    let (model, subject) = flip_flop_oral_fixture(v, omega);
+    let params = &model.default_params;
+    let trapped = find_ebe(
+        &model,
+        &subject,
+        params,
+        200,
+        1e-5,
+        Some(&[0.0; 3]),
+        None,
+        0,
+    );
+    let mut seed = trapped.eta.as_slice().to_vec();
+    seed[1] = -2.0 * omega[1].sqrt();
+    let from_seed = find_ebe(&model, &subject, params, 200, 1e-5, Some(&seed), None, 0);
+    (trapped, from_seed)
+}
+
+/// #2080. On config 2 (V = 5, Ω = diag(0.04, 0.04, 2.0)) the η_V −2 sd seed starts at an
+/// objective of ~1.3e10 with ‖g‖ ~ 3.8e11. The Ω-preconditioned path skips the first-step
+/// scaling, so the first step is ~1.6e11 long and 30 halvings never bring a trial back
+/// below the start: BFGS failed, the fallback restarted from η = 0, and the solve returned
+/// the trapped mode. With the first step bounded, BFGS reaches the deeper mode from the seed.
+#[test]
+fn far_seed_reaches_the_deeper_mode_from_a_bounded_first_step() {
+    let (trapped, r) = flip_flop_eta_v_minus_2sd(5.0, [0.04, 0.04, 2.0]);
+    eprintln!(
+        "config 2: trapped {:.6}, from seed {:.6}, fallback {}",
+        trapped.nll, r.nll, r.used_fallback
+    );
+    assert!(trapped.nll.is_finite() && r.nll.is_finite());
+    assert!(
+        !r.used_fallback,
+        "BFGS must converge from the seed itself, not through the Nelder–Mead fallback"
+    );
+    assert!(
+        r.nll < trapped.nll - 1.0,
+        "the seed must reach the deeper mode: {} vs trapped {}",
+        r.nll,
+        trapped.nll
+    );
+}
+
+/// The symptom #2080 was filed for: the cold multi-start drops that seed. The multi-start has
+/// no Nelder–Mead fallback of its own, so on `main` config 2 at `inner_restarts = 1` kept the
+/// twin at −21.073865. A per-row covariate the model never reads puts the subject on the
+/// scan-all arm (`has_tv_covariates`), which tries the η_V −2 sd seed; the predictions do
+/// not depend on it.
+#[test]
+fn cold_multi_start_keeps_the_far_seed() {
+    let (model, mut subject) = flip_flop_oral_fixture(5.0, [0.04, 0.04, 2.0]);
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|i| HashMap::from([("WT".to_string(), 70.0 + i as f64)]))
+        .collect();
+    assert!(
+        subject.has_tv_covariates() && !subject.has_resets(),
+        "test premise: the subject is on the scan-all arm through its covariates"
+    );
+    let params = &model.default_params;
+    let single = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 0);
+    let multi = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 1);
+    eprintln!(
+        "config 2 multi-start: r=0 {:.6}, r=1 {:.6}",
+        single.nll, multi.nll
+    );
+    assert!(single.nll.is_finite() && multi.nll.is_finite());
+    assert!(
+        multi.nll < single.nll - 1.0,
+        "inner_restarts = 1 must keep the deeper mode: {} vs r = 0 {}",
+        multi.nll,
+        single.nll
+    );
+}
+
+/// The control: on config 1 (V = 10, Ω = diag(0.04, 0.1, 1.0)) the same seed's first line
+/// search already succeeded before #2080, and the solve still reaches the deeper mode.
+#[test]
+fn far_seed_on_config_1_still_reaches_the_deeper_mode() {
+    let (trapped, r) = flip_flop_eta_v_minus_2sd(10.0, [0.04, 0.1, 1.0]);
+    eprintln!(
+        "config 1: trapped {:.6}, from seed {:.6}, fallback {}",
+        trapped.nll, r.nll, r.used_fallback
+    );
+    assert!(trapped.nll.is_finite() && r.nll.is_finite());
+    assert!(!r.used_fallback);
+    assert!(
+        r.nll < trapped.nll - 1.0,
+        "{} vs trapped {}",
+        r.nll,
+        trapped.nll
     );
 }

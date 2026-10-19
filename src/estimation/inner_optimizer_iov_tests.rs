@@ -2578,27 +2578,45 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
 /// * with a normal budget the polish reaches the deep mode and reports `true` — the flag is
 ///   earned by the returned point, not inherited.
 ///
-/// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). Budgets:
+/// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). The deep well
+/// carries a quartic term, `d² + d⁴` with `d = x + 2`: since #2093 the certificate takes its own
+/// Newton step (within the same `max_iter` budget), and on a pure quadratic one step is exact,
+/// so the "budget too small to reach the mode" half would be vacuous. From `d = 0.5` one step
+/// reaches `d = 0.2`, `|g| ≈ 0.43`, far above `tol`. Budgets:
 /// `max_iter = 1` gives each NM 5 iterations — enough for a restart seeded on the shallow
-/// minimum to collapse its 0.1-wide simplex under `tol = 1e-3`, not enough for a polish
-/// from x = −1.5 to reach x = −2 within `tol` — and gives the stationarity certifier's
-/// gradient polish (#1527) one BFGS iteration, which ends before its next `gnorm < tol`
-/// test. Verified by mutation: returning the restart's flag turns the first half red.
+/// minimum to collapse its 0.1-wide simplex under `tol = 1e-6`, not enough for a polish
+/// from x = −1.5 to reach x = −2 within `tol` (it ends at x = −2.025) — one certificate
+/// Newton step, which lands at `|g| = 1.2e-4` (measured; at the earlier `tol = 1e-3` that
+/// step certified the point, correctly), and the stationarity certifier's gradient polish
+/// (#1527) one BFGS iteration, which ends before its next `gnorm < tol` test. Verified by
+/// mutation: returning the restart's flag turns the first half red.
 #[test]
 fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
-    let obj = bimodal_obj;
+    let obj = |x: &[f64]| {
+        let v = x[0];
+        if v < 0.0 {
+            let d = v + 2.0;
+            d * d + d.powi(4) - 10.0
+        } else {
+            (v - 2.0).powi(2) - 1.0
+        }
+    };
+    let grad = |x: &[f64]| {
+        let v = x[0];
+        vec![if v < 0.0 {
+            let d = v + 2.0;
+            2.0 * d + 4.0 * d.powi(3)
+        } else {
+            2.0 * (v - 2.0)
+        }]
+    };
     let _cold = arm_inner_settings(InnerSettings::default());
     let partial = [-1.5];
     let f_partial = obj(&partial);
 
     // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
     // polish cannot certify it.
-    let (eta, ok) = argmin_inner_fallback(
-        &obj,
-        &partial,
-        &[2.0],
-        &exact_cert(&bimodal_grad, 1, 1, 1e-3),
-    );
+    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], &exact_cert(&grad, 1, 1, 1e-6));
     assert!(eta[0] < 0.0, "must stay in the deep well, got {eta:?}");
     assert!(
         obj(&eta) <= f_partial,
@@ -2612,21 +2630,17 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     );
 
     // Normal budget: the polish reaches the deep mode and earns the flag.
-    let (eta2, ok2) = argmin_inner_fallback(
-        &obj,
-        &partial,
-        &[2.0],
-        &exact_cert(&bimodal_grad, 1, 200, 1e-8),
-    );
+    let (eta2, ok2) =
+        argmin_inner_fallback(&obj, &partial, &[2.0], &exact_cert(&grad, 1, 200, 1e-8));
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "polish must reach the deep mode, got {eta2:?}"
     );
     assert!(ok2, "a stationary returned point is certified");
     assert!(
-        bimodal_grad(&eta2)[0].abs() < 1e-8,
+        grad(&eta2)[0].abs() < 1e-8,
         "`converged` must mean stationary at the returned point (#1527), got |g| = {:.3e}",
-        bimodal_grad(&eta2)[0].abs()
+        grad(&eta2)[0].abs()
     );
 }
 
@@ -2802,43 +2816,57 @@ fn nelder_mead_recover_is_certified_and_honours_admissibility() {
     assert_eq!(y, nm_end, "the NM end point is returned unchanged");
 }
 
-/// The Newton test's **resolution arm** (#1527): a point whose remaining Newton decrease
-/// `½∇ᵀH⁻¹∇` is at or below `INNER_FTOL_REL·(1 + |f|)` is a mode to the objective's precision
-/// and is certified in place, whatever `tol` says. It is what keeps tight `inner_tol` fits —
-/// Schnider at 1e-8, the AGQ score fixtures at 1e-11 — from reporting their converged
-/// subjects unconverged. Straddle, one fixture, `f = 100 + ½(x − 1)²`, `tol = 1e-5`,
-/// threshold `1e-11·101 ≈ 1.0e-9`:
+/// The Newton test's two outcomes on one exact fixture, `f = 100 + ½(x − 1)²`, `tol = 1e-5`,
+/// resolution threshold `INNER_FTOL_REL·(1 + |f|) = 1e-11·101 ≈ 1.0e-9`.
 ///
-/// * `x = 1 + 3e-5`: `‖∇‖ = 3e-5` and Newton step `3e-5`, both above `tol`, but the decrease
-///   left is `4.5e-10` — certified, returned **unmoved**;
-/// * `x = 1 + 1e-4`: decrease `5e-9`, above the threshold — not certified in place; the
-///   polish certifies it at the mode instead, so the point **moves**.
+/// **It takes the Newton step it computes** (#2093). From `x = 1 + 3e-5` (`‖∇‖ = 3e-5`,
+/// above `tol`) the step lands on the mode, so the point is certified there rather than in
+/// place. Before #2093 the resolution arm certified it unmoved, 3e-5 from the mode; on a
+/// FOCEI marginal, which is not stationary in η, that miss enters the objective to first
+/// order — it was the noise floor of every reconverged-FD oracle. Mutation: dropping the
+/// step leaves `x` at `1 + 3e-5` and the first assertion reddens.
 ///
-/// Mutation: deleting the resolution arm sends the first case to the polish, which moves
-/// it, and the `assert_eq!` reddens.
+/// **The resolution arm (#1527) still certifies what no step can improve.** With the mode
+/// itself excluded (`admissible` rejects `|x − 1| < 1e-6`, so the step is refused), the
+/// straddle is the arm's threshold:
+///
+/// * `x = 1 + 3e-5`: decrease left `4.5e-10`, under the threshold — certified, **unmoved**;
+/// * `x = 1 + 1e-4`: decrease `5e-9`, over it — not certified (the polish reaches only the
+///   excluded mode), and returned unchanged.
+///
+/// Mutation: deleting the resolution arm reddens the first case.
 #[test]
 fn fallback_certifier_certifies_a_mode_resolved_to_the_objectives_precision() {
     let _cold = arm_inner_settings(InnerSettings::default());
     let tol = 1e-5;
     let f = |x: &[f64]| 100.0 + 0.5 * (x[0] - 1.0).powi(2);
     let g = |x: &[f64]| vec![x[0] - 1.0];
+    let cert = exact_cert(&g, 1, 50, tol);
 
+    let mut x = vec![1.0 + 3e-5];
+    assert!(cert.certify(&f, &mut x));
+    assert!(
+        (x[0] - 1.0).abs() < 1e-12,
+        "the certificate takes its Newton step to the mode, got {x:?}"
+    );
+
+    let off_mode = |e: &[f64]| (e[0] - 1.0).abs() >= 1e-6;
     let inside = vec![1.0 + 3e-5];
     let mut x = inside.clone();
-    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut x));
+    assert!(cert.certify_within(&f, &mut x, &off_mode));
     assert_eq!(
         x, inside,
-        "a decrease below the objective's resolution is certified in place"
+        "a decrease below the objective's resolution is certified in place when no step is \
+         admissible"
     );
 
     let outside = vec![1.0 + 1e-4];
     let mut y = outside.clone();
-    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut y));
-    assert_ne!(
-        y, outside,
-        "a resolvable decrease is not certified in place — the polish takes it to the mode"
+    assert!(
+        !cert.certify_within(&f, &mut y, &off_mode),
+        "a resolvable decrease the certificate may not take is not certified, ended at {y:?}"
     );
-    assert!((y[0] - 1.0).abs() < tol, "polished to the mode, got {y:?}");
+    assert_eq!(y, outside, "an uncertified point is returned unchanged");
 }
 
 /// On a numerical objective (`stall_at` true) the certificate skips the Newton-step test —
@@ -2943,9 +2971,9 @@ fn hash_noise(x: f64) -> f64 {
 /// `1e-11·(1 + |f|) ≈ 1e-8` flatness threshold) and whose gradient carries `±1e-4` (ten
 /// times `tol`), so no point can pass `gnorm < tol` and the Newton-step test is skipped.
 ///
-/// Both sides of the gate, one fixture: with `stall_at = true` the certificate holds and the
-/// returned point is the mode to the floor's resolution; with `stall_at = false` (the
-/// exact-objective criterion) the same start is **not** certified. Mutation: handing the
+/// With `stall_at = true` the certificate holds and the returned point is the mode to the
+/// floor's resolution, and the fixture's gradient is asserted floored above `tol` around the
+/// mode, so that certificate can only be the stall stop's. Mutation: handing the
 /// polish a constant-`false` stall predicate instead of the certifier's reddens the first
 /// half; deleting the "skip test 2 on a numerical objective" guard does not (the Newton step
 /// from this start is ~3e-3, far above `tol`), which is stated rather than claimed.
@@ -2975,13 +3003,19 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
         "the stall-certified point must be the mode to the floor's resolution, got {x:?}"
     );
 
-    let mut y = start.clone();
-    assert!(
-        !exact_cert(&floored, 1, 200, tol).certify(&noisy, &mut y),
-        "without the stall stop a floor above `tol` cannot be certified — if this passes, the \
-         fixture no longer models a noise floor and the first half proves nothing"
-    );
-    assert_eq!(y, start, "an uncertified point is returned unchanged");
+    // Non-degeneracy: the fixture's gradient really is floored above `tol` across the
+    // neighbourhood of the mode, so no point can pass `gnorm < tol` and the first half's
+    // certificate can only have come from the stall stop. (Asserted on the gradient itself:
+    // since #2093 the exact path's Newton steps walk down to the floor and its resolution
+    // arm certifies the point there, so "the exact path does not certify" is no longer the
+    // floor's signature.)
+    for k in -200..=200 {
+        let e = [1.0 + f64::from(k) * 1e-7];
+        assert!(
+            floored(&e)[0].abs() > tol,
+            "the fixture's gradient must be floored above tol at {e:?}"
+        );
+    }
 }
 
 /// The behavioural side of `inner_stall_enabled_at_iov_tracks_the_effective_model`: a
