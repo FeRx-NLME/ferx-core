@@ -89,19 +89,28 @@ fn fit_source_reconverging(
 /// FD fit (`reconverge_gradient_interval = 0`) is not a valid reference — it omits the
 /// EBE-response term (#1552; Codex review on #1556).
 ///
-/// Measured on this fixture (Linux, `RAYON_NUM_THREADS=1`): analytic OFV 17.630655452624,
-/// reconverged 17.630655451731, |Δ| = 8.9e-10; worst θ relative difference 1.5e-7; ω²
-/// identical (both fits park it on the 6.1e-6 guard). The held-EBE fit lands at
-/// 17.630655604168. Bounds: 1e-7 on the OFV (110× headroom) and 1e-5 on θ (65×).
+/// Measured on this fixture (Linux): analytic OFV 17.630655436615, reconverged
+/// 17.630655456710, |Δ| = 2.0e-8 with the analytic fit the lower; worst θ relative
+/// difference 2.3e-5 (θ[1], along a flat ridge); ω² on the 6.1e-6 guard in both. Before
+/// #2093's inner-solver changes the pair stopped at 17.630655452624 / 17.630655451731 and
+/// 1.5e-7 in θ — the analytic fit now goes 1.6e-8 lower than either did. The held-EBE fit
+/// lands at 17.630655604168. Bounds: 1e-7 on the OFV (5× headroom) and 1e-4 on θ (4.3×).
+/// The FD reference's stopping point sets that gap, not the analytic gradient: NLopt
+/// L-BFGS ignores `outer_gtol` (1e-6, 1e-7 and 1e-8 give the same bits, measured), so it
+/// cannot be tightened from here. The sweep below was measured against the earlier 1e-5 θ
+/// bound; at 1e-4 the θ₁ × 1.5 row still fails both bounds (θ 1.5e-4, |Δ| 1.7e-6).
 ///
 /// Mutation sweep on `subject_packed_gradient`, each against these bounds:
 /// - θ₀ gradient sign-flipped → |Δ| = 0.56, θ 7.0e-2 (both bounds fail; so did the old check);
 /// - ω gradient zeroed → |Δ| = 0.75, θ 2.2e-2 (both fail; so did the old check);
 /// - θ₁ gradient × 1.5 → |Δ| = 1.7e-6, θ 1.5e-4 — **passed the old one-sided check**, fails
 ///   both bounds here;
-/// - ω gradient × 0.5 → |Δ| = 2.7e-10, θ 2.9e-5 — only the θ bound sees it (3× margin): ω² has
-///   collapsed onto its guard, so its gradient is nearly unobservable on this 3-subject
-///   fixture. A better-conditioned convergence fixture is a follow-up, not this test.
+/// - ω gradient × 0.5 → |Δ| = 2.7e-10, θ 2.9e-5 — only the 1e-5 θ bound saw it, and the
+///   1e-4 bound does **not**: ω² has collapsed onto its guard, so its gradient is nearly
+///   unobservable on this 3-subject fixture, and the ridge gap (2.3e-5) is now the same size
+///   as the mutation's. The dense-R gradient is pinned coordinate by coordinate against the
+///   reconverged FD gradient at Tier 1 (e.g. `kernel_block_sigma_matches_reconverged_fd`
+///   in `sens/ode_adjoint_tests.rs`); this convergence fixture cannot see an ω error.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -119,7 +128,7 @@ fn dense_residual_analytic_and_fd_fits_agree() {
     );
     assert!(analytic.converged, "analytic fit did not converge");
     assert!(reconverged.converged, "reconverged-FD fit did not converge");
-    // Two-sided: measured |Δ| = 8.9e-10, bound 1e-7 (any comparison against NaN is
+    // Two-sided: measured |Δ| = 2.0e-8 (#2093; 8.9e-10 before), bound 1e-7 (any comparison against NaN is
     // false, so a NaN OFV fails here too).
     assert!(
         (analytic.ofv - reconverged.ofv).abs() < 1e-7,
@@ -128,11 +137,24 @@ fn dense_residual_analytic_and_fd_fits_agree() {
         reconverged.ofv,
         (analytic.ofv - reconverged.ofv).abs()
     );
-    // Same optimum, not just the same objective value: measured worst θ 1.5e-7, bound 1e-5.
+    // The analytic fit is at least as low as the FD reference, to the reference's own
+    // resolution: measured analytic − FD = −2.0e-8 (#2093; before it, on #2094's tree, +8.9e-10).
+    assert!(
+        analytic.ofv <= reconverged.ofv + 1e-9,
+        "analytic OFV {} stops above the reconverged-FD OFV {}",
+        analytic.ofv,
+        reconverged.ofv
+    );
+    // Same optimum, not just the same objective value. The optimum sits on a flat ridge
+    // along θ[1]: the two fits stop 2.0e-8 OFV apart and 2.3e-5 apart in θ[1] (measured on
+    // #2093, worst θ; the FD reference is the higher of the two, so the gap is its stopping
+    // point, not the analytic gradient's). A 2.0e-8 objective gap resolves θ only to
+    // √(2·2e-8 / curvature) along a ridge this flat, so the bound is 1e-4 — 4.3× the measured
+    // worst.
     let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
     for k in 0..analytic.theta.len() {
         assert!(
-            rel(analytic.theta[k], reconverged.theta[k]) < 1e-5,
+            rel(analytic.theta[k], reconverged.theta[k]) < 1e-4,
             "theta[{k}] analytic {} vs reconverged FD {}",
             analytic.theta[k],
             reconverged.theta[k]

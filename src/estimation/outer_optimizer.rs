@@ -4312,6 +4312,7 @@ fn optimize_nlopt_once(
         // that check's own margin ([`cold_solve_beats_best_seen`]), the leg stops through
         // the stagnation early-return and the end-of-leg check files the basin-shift
         // restart. A leg whose probe finds nothing continues on a bit-identical trajectory.
+        let mut basin_probe_stopped = false;
         if !state.stagnation_stopped && !guarded && init_params.mixture.is_none() {
             let feasible = plateau_tracker_cl.lock().unwrap().2;
             if basin_probe_due(feasible) {
@@ -4342,6 +4343,7 @@ fn optimize_nlopt_once(
                         2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
                         state.stagnation_stopped = true;
+                        basin_probe_stopped = true;
                         if verbose {
                             eprintln!(
                                 "Eval {:>4}: basin probe — a cold re-solve at the best point \
@@ -4354,7 +4356,8 @@ fn optimize_nlopt_once(
                 }
             }
         }
-        if state.stagnation_stopped && verbose {
+        // The basin probe prints its own reason; this one would misstate it.
+        if state.stagnation_stopped && verbose && !basin_probe_stopped {
             eprintln!(
                 "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
                  last window. Whether this is convergence is decided after the \

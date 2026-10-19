@@ -561,16 +561,21 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
             rel_errs[k]
         );
     }
-    // …and it sharpens as the quadrature does — the signature of the grid-response term doing
-    // its job rather than agreeing by coincidence.
-    assert!(
-        rel_errs[3] < rel_errs[0],
-        "accuracy should improve with node count: {rel_errs:?}"
-    );
-    // A second, tighter bound at n = 1 that the **pre-analytic** path could not have met: it
-    // measured 2.0e-5 there, 300x above this. Deliberately left ~15x above the 6.5e-8 actually
-    // observed, so it pins the analytic anchor + analytic node response against silent
-    // regression to an FD-of-an-FD without being tight enough to flake on reference noise.
+    // …and to the reference's own floor at every node count. This used to assert that the
+    // error *shrinks* with the node count (6.5e-8 at n = 1 down to 1.8e-9 at n = 7) as the
+    // signature of the grid-response term. That shrink was the reference's: since #2093 the
+    // fallback EBEs it re-solves meet `inner_tol` (the certificate takes its Newton step), and
+    // every node count reads 1.74e-9, the FD stencil's own truncation. The grid-response term is
+    // pinned by this bound instead — without it n = 1 is 26% off — at ~11× the measured value.
+    for (k, &n) in [1usize, 3, 5, 7].iter().enumerate() {
+        assert!(
+            rel_errs[k] < 2e-8,
+            "n_agq={n}: {:.3e} is above the FD reference's floor (all: {rel_errs:?})",
+            rel_errs[k]
+        );
+    }
+    // The bound the **pre-analytic** path could not have met at n = 1 (it measured 2.0e-5
+    // there), kept to name that regression in its message; the floor bound above is tighter.
     assert!(
         rel_errs[0] < 1e-6,
         "n_agq=1 must stay at analytic-anchor accuracy (was 2.0e-5 on the FD path), \
