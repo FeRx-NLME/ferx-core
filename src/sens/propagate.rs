@@ -805,7 +805,8 @@ fn record_pk_at_g<T: PkNum>(
 /// quiet sub-intervals with the exact **dual** window lengths, so the
 /// moving-boundary sensitivity flows through the closed-form flow to all orders —
 /// no explicit saltation is needed (the closed-form analogue of the ODE path's
-/// `inject_rate_saltation`). Under bioavailability every infusion carries such a pair,
+/// `cross_rate_switch`, which gets the same all-orders exactness from an `rk4_dual` flow over
+/// the dual boundary shift). Under bioavailability every infusion carries such a pair,
 /// with its dose-time `F` already applied as production applies it
 /// ([`crate::types::DoseEvent::bioavailable_infusion`], #419): a rate-defined window
 /// stretched to `F·dur` (so its end moves with `F`), a duration-defined rate scaled. The

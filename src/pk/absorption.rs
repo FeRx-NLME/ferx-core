@@ -836,15 +836,58 @@ impl<T: PkNum> PreparedInputRate<T> {
         (g_hi - g_lo) * dose / t_inf
     }
 
+    /// `R_in(τ)` just after onset, for a `τ` of **value zero** whose jet is the onset's own
+    /// shift: the kernel's right-hand continuation through `τ = 0`, which [`Self::rate`]'s
+    /// `tad ≤ 0` guard cannot give. The moving-boundary flows of the analytic ODE walk
+    /// (`sens/ode_provider.rs`) integrate the post-onset side over that jet-only interval.
+    ///
+    /// Exact to every order where the kernel is analytic at the onset: `FirstOrder`, the pure
+    /// first-order `Transit n = 0` and `Weibull β = 1` arms (fixed shape), and the onsets that
+    /// vanish to fourth order (`Transit n ≥ 4`, `Weibull β ≥ 5`, `InverseGaussian`). Elsewhere
+    /// the kernel is `∝ τ^p` with a non-integer or estimated `p`, so its onset has no Taylor
+    /// series; the value and slope ([`Self::rate_at_zero`], [`Self::rate_dtad_at_zero`]) are
+    /// exact through second order, and a type carrying higher derivatives
+    /// (`!PkNum::TAYLOR2_EXACT`) gets `NaN` there, so its recording declines rather than
+    /// truncating.
+    pub(crate) fn rate_onset_continued(&self, tau: T, dose: T) -> T {
+        if dose.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        let exp_decay = |k: T| dose * k * (-(k * tau)).exp();
+        match *self {
+            PreparedInputRate::FirstOrder { ka } => return exp_decay(ka),
+            PreparedInputRate::Transit { ktr, n, .. } if n.val() <= 0.0 && n.is_constant() => {
+                return exp_decay(ktr);
+            }
+            PreparedInputRate::Transit { n, .. } if n.val() >= 4.0 => return T::from_f64(0.0),
+            PreparedInputRate::Weibull { beta, c0, .. }
+                if beta.val() == 1.0 && beta.is_constant() =>
+            {
+                return exp_decay(c0.exp());
+            }
+            PreparedInputRate::Weibull { beta, .. } if beta.val() >= 5.0 => {
+                return T::from_f64(0.0);
+            }
+            PreparedInputRate::InverseGaussian { .. } | PreparedInputRate::ZeroOrder { .. } => {
+                return T::from_f64(0.0);
+            }
+            _ => {}
+        }
+        if !T::TAYLOR2_EXACT && !tau.is_constant() {
+            return T::from_f64(f64::NAN);
+        }
+        self.rate_at_zero(dose) + self.rate_dtad_at_zero(dose) * tau
+    }
+
     /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
-    /// value, needed by the event-driven ODE sensitivity walk to inject an exact
-    /// rate-on **saltation** when a dose's own arrival is a moving boundary (an
-    /// estimated lagtime, #486): [`Self::rate`]'s domain guard returns a flat zero
-    /// *at* `tad = 0` by convention ("not yet started"), so the jump at onset is
-    /// computed here, separately, and injected once at the dose event (see
-    /// `inject_rate_saltation` in `sens/ode_provider.rs`) — the continuous
-    /// `∂R_in/∂lag` for `tad > 0` still flows through [`Self::rate`] itself when
-    /// `tad` carries the lag sensitivity.
+    /// value. [`Self::rate`]'s domain guard returns a flat zero *at* `tad = 0` by
+    /// convention ("not yet started"), so the onset is computed here, separately. The
+    /// event-driven ODE sensitivity walk crosses a dose's moving arrival (an estimated
+    /// lagtime, #486) with the all-orders continuation [`Self::rate_onset_continued`],
+    /// which falls back to this value plus [`Self::rate_dtad_at_zero`]'s slope where the
+    /// kernel has no Taylor series at the onset — the continuous `∂R_in/∂lag` for
+    /// `tad > 0` still flows through [`Self::rate`] itself when `tad` carries the lag
+    /// sensitivity.
     ///
     /// `Transit` vanishes at onset for any `n > 0` (the Γ-density `n·ln(tad) → −∞`
     /// dominates) and degenerates to `ktr·dose` at `n = 0` (pure first-order);
@@ -890,11 +933,11 @@ impl<T: PkNum> PreparedInputRate<T> {
     }
 
     /// The right-hand limit `lim_{tad→0⁺} ∂R_in/∂tad(tad, dose)` — the forcing's
-    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value).
-    /// Needed by the rate-on saltation's second-order (curvature) term: a moving
-    /// absorption boundary (estimated lagtime, #486) that carries IIV lands the
-    /// δ²-in-`δlag` correction in the checked `d²f/∂η²` Hessian block, and that
-    /// coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
+    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value). Together
+    /// they are [`Self::rate_onset_continued`]'s second-order fallback where the kernel has
+    /// no Taylor series at the onset. A moving absorption boundary (estimated lagtime, #486)
+    /// that carries IIV lands a δ²-in-`δlag` term in the checked `d²f/∂η²` Hessian block,
+    /// whose coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
     /// **plus** the forcing's own explicit time-variation at the onset (#880). For a
     /// **constant**-rate forcing (infusion, zero-order window) this slope is zero, so
     /// the old `½·jg`-only coefficient was already exact there; it is the decaying
@@ -902,8 +945,8 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// analytic Hessian (near sign-mirror of FD).
     ///
     /// This is the companion to the jump in the **second** time-derivative `ẍ` at the
-    /// onset, which the saltation's `δlag²` term needs — NOT only to a jump in the onset
-    /// **value** `ẋ`. So it is non-zero in two cases:
+    /// onset, which a boundary crossing's second-order (`δlag²`) term needs — NOT only to a
+    /// jump in the onset **value** `ẋ`. So it is non-zero in two cases:
     /// - a **finite-value-jump** onset (`rate_at_zero ≠ 0`): `FirstOrder` (`−dose·ka²`),
     ///   the degenerate `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull`
     ///   `β = 1` (`−dose/Td²`); and
@@ -2218,11 +2261,12 @@ mod tests {
     }
 
     /// Direct Tier-1 coverage of every `rate_at_zero` match arm (#486 review): the
-    /// function's only caller (the event-driven walk's onset saltation, gated on
-    /// `has_lagtime`) currently reaches just `Transit`/`InverseGaussian`/`FirstOrder`
-    /// (`ode_walk_model_scope`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
-    /// that combination), so the `Weibull` and `ZeroOrder` arms — and `Transit`'s
-    /// degenerate `n ≤ 0` case — are otherwise never exercised, direct or indirect.
+    /// function's only caller (`rate_onset_continued`'s fallback, read by the event-driven
+    /// walk's onset crossing, gated on `has_lagtime`) currently reaches just
+    /// `Transit`/`InverseGaussian`/`FirstOrder` (`ode_walk_model_scope`'s lagtime gate
+    /// excludes `Weibull`/`ZeroOrder` from that combination), so the `Weibull` and
+    /// `ZeroOrder` arms — and `Transit`'s degenerate `n ≤ 0` case — are otherwise never
+    /// exercised, direct or indirect.
     /// Pinning them here means a future gate relaxation that makes one of them live
     /// inherits a regression test instead of shipping untested.
     #[test]
@@ -2308,7 +2352,8 @@ mod tests {
     }
 
     /// #880: `rate_dtad_at_zero` is the onset **slope** companion to `rate_at_zero`,
-    /// feeding the rate-on saltation's δlag² (curvature) term. For the finite-jump
+    /// feeding `rate_onset_continued`'s second-order fallback (the rate-on crossing's δlag²
+    /// curvature term). For the finite-jump
     /// (first-order-like) arms it must equal the one-sided derivative of [`Self::rate`]
     /// at `tad → 0⁺`; for the vanishing-onset arms it is 0. Cross-checked against a
     /// forward difference of `rate` at a small `tad` so the closed forms can't drift

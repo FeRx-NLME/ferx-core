@@ -14486,6 +14486,8 @@ fn build_ode_spec(
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
     let rhs_reads_time_builtin = stmts_read_time_builtin(&stmts_owned);
+    let reads_absolute_time =
+        rhs_reads_time_builtin || stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot]);
     // The no-feedback precondition the narrow flag below rests on, established by
     // rejection rather than by detect-and-widen (#1166). Reading the cumulative
     // hazard back into the dynamics — from a PK derivative, an intermediate, an
@@ -14704,6 +14706,7 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
         uses_time_vars,
+        reads_absolute_time,
         reads_time_builtin: rhs_reads_time_builtin,
         pk_reads_model_time,
         pk_reads_tafd,
@@ -26418,8 +26421,6 @@ fn eval_bytecode(
 /// ([`eval_bytecode_lanes`]). Every operation applies the scalar `f64` expression lane by lane,
 /// so a lane's result is bit-identical to the scalar evaluation of the same inputs.
 pub(crate) trait Lane: Copy {
-    /// Lane count.
-    const K: usize;
     fn splat(x: f64) -> Self;
     fn map(self, f: impl Fn(f64) -> f64) -> Self;
     fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self;
@@ -26428,7 +26429,6 @@ pub(crate) trait Lane: Copy {
 }
 
 impl Lane for f64 {
-    const K: usize = 1;
     #[inline(always)]
     fn splat(x: f64) -> Self {
         x
@@ -26448,7 +26448,6 @@ impl Lane for f64 {
 }
 
 impl<const N: usize> Lane for [f64; N] {
-    const K: usize = N;
     #[inline(always)]
     fn splat(x: f64) -> Self {
         [x; N]
@@ -28023,6 +28022,11 @@ pub struct OdeRhsProgram {
     /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
     /// the gate routes SS subjects on a non-autonomous RHS to FD (#473 review #1).
     uses_time_vars: bool,
+    /// Whether the RHS reads an **absolute** clock — `TIME`, `T`/`t` or `TAFD` — rather than
+    /// only `TAD`. `TAD` is carried by the dual anchor, so a moving-boundary flow can shift it
+    /// exactly; the absolute clocks enter the evaluator as `f64` and cannot be shifted
+    /// (`sens::ode_provider::boundary_velocity`'s time offset).
+    reads_absolute_time: bool,
     /// Does the RHS read the bare `TIME` built-in? Disjoint from
     /// [`Self::uses_time_vars`], which covers the slot-backed `T`/`t`/`TAFD`/`TAD`
     /// and is `false` for a `TIME`-only RHS — see [`stmts_read_time_builtin`]
@@ -28116,6 +28120,11 @@ impl OdeRhsProgram {
             out[*idx] = prog.eval_output_g(&zeros, params, &empty, &mut vars, &mut stack);
         }
         Some(out)
+    }
+
+    /// See [`OdeRhsProgram::reads_absolute_time`].
+    pub(crate) fn reads_absolute_time(&self) -> bool {
+        self.reads_absolute_time
     }
 
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.

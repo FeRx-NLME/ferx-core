@@ -1318,48 +1318,30 @@ fn cov_hessian_matches_profile_fd_on_a_lagged_closed_form_and_its_unlagged_ode_t
     }
 }
 
-/// A third-order recording across a *moving* ODE event boundary declines (#2093 finding 6).
+/// Third-order derivatives across a *moving* `[odes]` event boundary (#2093 finding 6): an
+/// estimated depot or central `LAGTIME`, a per-route `lag=`, a modeled `D1`.
 ///
-/// The event walk's saltations expand the boundary shift `δ` to `δ²` with an f64 `δ²`
-/// coefficient: exact through second order in `(θ, η)`, not beyond. Before the guard in
-/// `ode_provider::jet_only`, the FOCEI R-matrix (`∂²(∂f/∂η)/∂θ²`) on these subjects missed
-/// reconverged FD of the exact gradient by, measured on Linux: depot `LAGTIME` 3.2e-1,
-/// per-route lag 1.7e-1, central `LAGTIME` 1.6e-3, modeled `D1` 2.4e-3 — against 5.1e-7 on the
-/// same subject with the lag removed. Laplace's exact-anchor gradient (`∂²f/∂η²` once more in
-/// θ) missed by 6.6e-3 (`ODE_LAG`) and 1.5e-2 (route lag), against 3.3e-7 unlagged.
+/// The event walk used to cross such a boundary with a δ²-truncated saltation (an `f64` δ²
+/// coefficient and no δ³ term), exact through second order only. Measured before the
+/// moving-boundary flows (`cross_moving_boundary`): the FOCEI R-matrix (`∂²(∂f/∂η)/∂θ²`)
+/// was off FD of the exact gradient by 3.2e-1 (depot `LAGTIME`), 1.7e-1 (route lag), 1.6e-3
+/// (central `LAGTIME`) and 2.4e-3 (`D1`); Laplace's exact-anchor gradient off reconverged FD
+/// by 6.6e-3 (`ODE_LAG`) and 1.5e-2 (route lag). The unlagged control measures 5.1e-7.
 ///
-/// So the third-order recordings now decline — the covariance step salvages the subject,
-/// Laplace scores it by reconverged FD — while every second-order consumer on the same
-/// subject (FOCEI gradient, inner η-Hessian, the Gauss–Newton AGQ gradient) stays served:
-/// those are exact here (≤ 1e-6, the tests above).
+/// The route lag is checked against its **closed-form twin** instead (the route lag is the
+/// depot dose's `lagtime`; the closed form evaluates the shifted time exactly): the FD of the
+/// gradient is noise-limited on that fixture — 3.9e-5 at the default step, 3.3e-4 at a tenth
+/// of it, 1.6e-5 at four times it, while the twin agrees to 9.5e-8.
 #[test]
-fn third_order_recordings_decline_across_an_ode_moving_boundary() {
-    use super::subject_adjoint_cov_hessian;
-    let big_stack = |f: &(dyn Fn() -> bool + Sync)| {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(crate::FIT_RAYON_STACK_SIZE)
-                .spawn_scoped(scope, f)
-                .expect("spawn")
-                .join()
-                .expect("join")
-        })
-    };
-    let unlagged = ODE_LAG
-        .replace("TVLAG * exp(ETA_LAG)", "TVLAG")
-        .replace("omega ETA_LAG ~ 0.1", "omega ETA_V ~ 0.1")
-        .replace("V = TVV", "V = TVV * exp(ETA_V)")
-        .replace("  LAGTIME = TVLAG\n", "");
-    let mut cases: Vec<(CompiledModel, Subject, &str, bool)> = Vec::new();
-    for (src, label, moving) in [
-        (ODE_LAG, "depot LAGTIME", true),
-        (ROUTE_LAG_ODE, "route lag", true),
-        (IV_LAG_INF_ODE, "central LAGTIME", true),
-        (unlagged.as_str(), "no lag (control)", false),
+fn third_order_derivatives_across_an_ode_moving_boundary_are_exact() {
+    let mut cases: Vec<(CompiledModel, Subject, &str)> = Vec::new();
+    for (src, label) in [
+        (ODE_LAG, "depot LAGTIME"),
+        (IV_LAG_INF_ODE, "central LAGTIME"),
     ] {
         let m = tight(parse_model_string(src).unwrap());
         let s = two_dose_subject(&m);
-        cases.push((m, s, label, moving));
+        cases.push((m, s, label));
     }
     let m = tight(parse_model_string(MODELED_DUR_ODE).unwrap());
     let s = modeled_subject(
@@ -1367,75 +1349,73 @@ fn third_order_recordings_decline_across_an_ode_moving_boundary() {
         RateMode::ModeledDuration,
         &[1.0, 3.0, 6.0, 7.5, 9.0, 12.0, 14.0, 20.0],
     );
-    cases.push((m, s, "modeled D1", true));
-    // Served = a finite gradient, the test production's score applies (`accept`).
-    let finite = |g: Option<Vec<f64>>| g.is_some_and(|g| g.iter().all(|v| v.is_finite()));
-    for (m, s, label, moving) in &cases {
-        let params = moved_params(m);
-        let x = pack_params(&params);
-        let eta = ebe_for(m, s, &params, 1e-12, true);
-        let e = eta.as_slice();
-        // Second order: served everywhere.
+    cases.push((m, s, "modeled D1"));
+    for (m, s, label) in &cases {
+        let (fd, _) = hessian_gaps(m, s, true);
+        eprintln!("{label}: R-matrix FOCEI vs FD {fd:.2e}");
         assert!(
-            finite(subject_adjoint_gradient(
-                m,
-                s,
-                &params,
-                &x,
-                e,
-                Objective::Focei
-            )),
-            "{label}: the FOCEI gradient must stay served"
-        );
-        let gn = Objective::Agq {
-            n_agq: 2,
-            exact: false,
-        };
-        assert!(
-            finite(subject_adjoint_gradient(m, s, &params, &x, e, gn)),
-            "{label}: the Gauss–Newton AGQ gradient must stay served"
-        );
-        // Third order: declines exactly when the boundary moves (the control straddles).
-        let cov = big_stack(&|| {
-            subject_adjoint_cov_hessian(m, s, &params, &x, e, Objective::Focei).is_some()
-        });
-        assert_eq!(cov, !moving, "{label}: R-matrix served = {cov}");
-        let laplace = Objective::Agq {
-            n_agq: 1,
-            exact: true,
-        };
-        let lap = finite(subject_adjoint_gradient(m, s, &params, &x, e, laplace));
-        assert_eq!(
-            lap, !moving,
-            "{label}: Laplace exact-anchor gradient served = {lap}"
+            fd.is_finite() && fd < 1e-5,
+            "{label}: R-matrix vs FD {fd:.2e}"
         );
     }
-}
-
-/// Production's Laplace score on a lagged `[odes]` subject: the exact score declines (see
-/// [`third_order_recordings_decline_across_an_ode_moving_boundary`]), so the subject is scored
-/// by reconverged finite differences — not by the held-EBE salvage, which records the same
-/// third-order jets and declines with it.
-#[test]
-fn laplace_on_an_ode_lag_takes_the_reconverged_score() {
-    use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
-    use crate::types::{EstimationMethod, FitOptions};
     let m = tight(parse_model_string(ODE_LAG).unwrap());
-    let s = two_dose_subject(&m);
-    let params = moved_params(&m);
+    let g = super::tests::fd_oracle_agq(&m, &two_dose_subject(&m), 1, true);
+    eprintln!("depot LAGTIME: Laplace gradient vs FD {g:.2e}");
+    assert!(g.is_finite() && g < 1e-5, "Laplace gradient vs FD {g:.2e}");
+
+    // Route lag vs the closed-form twin, R-matrix and Laplace gradient.
+    let scaled =
+        ROUTE_LAG_ODE.replace("[error_model]", "[scaling]\n  obs_scale = V\n[error_model]");
+    let ode = tight(parse_model_string(&scaled).unwrap());
+    let cf = parse_model_string(ROUTE_LAG_CF).unwrap();
+    let (s_ode, s_cf) = (two_dose_subject(&ode), two_dose_subject(&cf));
+    let params = moved_params(&ode);
     let x = pack_params(&params);
-    let eta = ebe_for(&m, &s, &params, 1e-12, true);
-    let options = FitOptions {
-        method: EstimationMethod::Laplace,
-        ..FitOptions::default()
+    let e_ode = ebe_for(&ode, &s_ode, &params, 1e-12, true);
+    let e_cf = ebe_for(&cf, &s_cf, &params, 1e-12, true);
+    let rel = |a: &[f64], b: &[f64]| {
+        let mut worst = 0.0f64;
+        for (u, v) in a.iter().zip(b) {
+            assert!(u.is_finite() && v.is_finite(), "{u} vs {v}");
+            worst = worst.max((u - v).abs() / (1.0 + v.abs()));
+        }
+        worst
     };
-    let bounds = crate::estimation::parameterization::compute_bounds(&params);
-    let ctx = SubjectScoreContext::new(&m, &params, &x, &options, &bounds, false);
-    let (g, route) = ctx
-        .score_routed(&s, eta.as_slice(), &[], true)
-        .expect("a reconverged score");
-    assert_eq!(route, ScoreRoute::Reconverged);
-    assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+    let hess = |m: &CompiledModel, s: &Subject, e: &[f64]| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    super::subject_adjoint_cov_hessian(m, s, &params, &x, e, Objective::Focei)
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+        .expect("served")
+    };
+    let r = rel(
+        hess(&ode, &s_ode, e_ode.as_slice()).as_slice(),
+        hess(&cf, &s_cf, e_cf.as_slice()).as_slice(),
+    );
+    eprintln!("route lag: R-matrix vs closed-form twin {r:.2e}");
+    assert!(r < 1e-6, "route lag R-matrix vs closed-form twin {r:.2e}");
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let lap = |m: &CompiledModel, s: &Subject, e: &[f64]| {
+        subject_adjoint_gradient(m, s, &params, &x, e, laplace).expect("served")
+    };
+    let l = rel(
+        &lap(&ode, &s_ode, e_ode.as_slice()),
+        &lap(&cf, &s_cf, e_cf.as_slice()),
+    );
+    eprintln!("route lag: Laplace gradient vs closed-form twin {l:.2e}");
+    assert!(
+        l < 1e-6,
+        "route lag Laplace gradient vs closed-form twin {l:.2e}"
+    );
 }
 
 /// The FOCEI R-matrix on M3-censored rows (the inverse Mills ratio's second derivative),
@@ -1873,8 +1853,9 @@ fn inner_hessian_gap(m: &CompiledModel, s: &Subject, eta: &[f64]) -> f64 {
 /// #880 / #883: the lag curvature — the exact inner η-Hessian (Laplace's anchor, the EBE
 /// search's metric) on a depot `LAGTIME` and a per-route `lag=`, η on the lag, two doses,
 /// against a Richardson difference of the production individual objective. This is the
-/// second-order lag term the δ² saltation coefficient exists for (#880's sign-mirrored
-/// `∂²f/∂η²`), and it is exact; contrast the third-order quantities above.
+/// second-order lag term the old δ² saltation coefficient existed for (#880's sign-mirrored
+/// `∂²f/∂η²`), now one order of the `cross_moving_boundary` flow; it was exact even before
+/// #2093, unlike the third-order quantities above.
 #[test]
 fn inner_eta_hessian_on_an_ode_lag_matches_fd_of_the_production_objective() {
     // Measured 2.8e-10 (depot) / 8.4e-8 (route lag) on Linux; ~10× headroom each.
@@ -1888,4 +1869,57 @@ fn inner_eta_hessian_on_an_ode_lag_matches_fd_of_the_production_objective() {
         eprintln!("{label}: inner η-Hessian vs FD {w:.2e}");
         assert!(w < bound, "{label}: inner η-Hessian vs FD {w:.2e}");
     }
+}
+
+/// [`ROUTE_LAG_ODE`]'s closed-form twin: the route lag is the depot dose's `lagtime`.
+const ROUTE_LAG_CF: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  LAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1075: a `TAD`-reading RHS across an estimated lag. `TAD` is anchored at the previous
+/// arrival before the moving boundary and at this one after it, so the field's explicit time
+/// dependence differs between the two sides and does not cancel at second order — the term
+/// the δ²-truncated saltation omitted (it held `J·g` only). The moving-boundary flows shift the
+/// `TAD` anchor with the flow's offset.
+///
+/// Measured on Linux, FOCEI gradient vs reconverged FD: 1.33e-4 before the flows (#2093 commit
+/// `50194698`), 8.8e-6 after — and the residual is the oracle's: the `Ω_LAG` component it sits
+/// in moved by 1.4e-5 *in the reference* between those two builds while the new adjoint lands
+/// on the old reference to 2e-8. The bound sits between, at 4e-5. The R-matrix vs FD of the
+/// gradient measures 1.2e-5–3.0e-5 across FD steps of 2.5e-4–4e-3 (the same noise), bound 1e-4;
+/// its moving-boundary exactness is pinned more tightly by
+/// [`third_order_derivatives_across_an_ode_moving_boundary_are_exact`].
+#[test]
+fn tad_reading_rhs_across_an_estimated_lag_matches_fd() {
+    let src = ODE_LAG.replace(
+        "d/dt(central) = KA * depot - (CL/V) * central",
+        "d/dt(central) = KA * depot - (CL/V) * central * (1 + 0.3 * exp(-0.5 * TAD))",
+    );
+    let m = tight(parse_model_string(&src).unwrap());
+    let prog = m.ode_spec.as_ref().unwrap().rhs_program.as_ref().unwrap();
+    assert!(prog.uses_time_vars() && !prog.reads_absolute_time());
+    let s = two_dose_subject(&m);
+    assert!(served(&m, &s));
+    let g = parity(&m, &s);
+    eprintln!("TAD RHS, lag: FOCEI gradient vs reconverged FD {g:.2e}");
+    assert!(g.is_finite() && g < 4e-5, "gradient {g:.2e}");
+    let (h, _) = hessian_gaps(&m, &s, true);
+    eprintln!("TAD RHS, lag: R-matrix vs FD {h:.2e}");
+    assert!(h.is_finite() && h < 1e-4, "R-matrix {h:.2e}");
 }
