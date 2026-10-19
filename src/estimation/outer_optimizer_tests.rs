@@ -7660,6 +7660,98 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
     );
 }
 
+/// #2143 review: which solver counters disqualify a subject's integration from backing a
+/// decrement — one cell per counter, and the discarded-and-re-solved stop that does not.
+#[test]
+fn integration_backs_a_decrement_only_when_every_segment_was_solved() {
+    use crate::ode::solver::OdeSolverStats;
+    let clean = OdeSolverStats::default();
+    assert!(integration_backs_a_decrement(&clean), "no counters");
+    let cells = [
+        (
+            "kept unfinished",
+            OdeSolverStats {
+                unfinished_segments: 1,
+                ..clean
+            },
+            false,
+        ),
+        (
+            "unfinished, discarded and re-solved",
+            OdeSolverStats {
+                unfinished_segments: 1,
+                discarded_unfinished_segments: 1,
+                ..clean
+            },
+            true,
+        ),
+        (
+            "diverged",
+            OdeSolverStats {
+                diverged_segments: 1,
+                ..clean
+            },
+            false,
+        ),
+        (
+            "linear segment declined",
+            OdeSolverStats {
+                linear_declined_segments: 1,
+                ..clean
+            },
+            false,
+        ),
+    ];
+    for (label, st, want) in cells {
+        assert_eq!(integration_backs_a_decrement(&st), want, "{label}");
+    }
+}
+
+/// #2143 review: an exact-path ODE decrement is formed through the integration check (so a
+/// segment the matrix exponential declines withholds it), a closed form's is not (it has no
+/// integrations to count). The #1934 model and its exact ODE twin, at the false stop.
+#[test]
+fn predicted_remaining_gain_checks_the_exact_paths_integrations() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let point = (
+        6.735588,
+        16.155540,
+        0.011638,
+        23.488333,
+        [0.061883, -0.018713, 0.101651],
+        0.043717,
+    );
+    let (cl, v1, q, v2, om, sig) = point;
+    let passes = || super::CHECKED_EXACT_PASSES.with(|n| n.get());
+    for (label, src, checked) in [
+        (
+            "closed form",
+            issue_1934_model(cl, v1, q, v2, om, sig),
+            false,
+        ),
+        (
+            "exact ODE",
+            issue_1934_ode_model(cl, v1, q, v2, om, sig, "auto"),
+            true,
+        ),
+    ] {
+        let m = parse_model_string(&src).expect("fixture parses");
+        let before = passes();
+        let got = gain_at(&m, &pop, &opts);
+        assert!(got.is_some(), "{label}: {got:?}");
+        assert_eq!(
+            passes() - before,
+            usize::from(checked),
+            "{label}: checked passes"
+        );
+    }
+}
+
 /// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve
 /// instead of paying for it (up to a 100× step budget) and then returning `None`. Both
 /// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI starts one

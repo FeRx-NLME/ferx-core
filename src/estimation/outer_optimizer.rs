@@ -2533,6 +2533,10 @@ fn per_subject_outer_gradients_in_scope(model: &CompiledModel, options: &FitOpti
 /// (#1934). `None` whenever any subject has no analytic gradient — an AGQ or mixture
 /// objective, a model outside the analytic outer scope, or one subject the provider
 /// declines — so the decrement is never formed from a mix of exact and salvaged rows.
+///
+/// Production reads it through [`per_subject_outer_gradients_checked`], which also asks
+/// whether each subject's integration backs a decrement; this unchecked form is the tests'.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn per_subject_outer_gradients(
     model: &CompiledModel,
@@ -2553,6 +2557,18 @@ fn per_subject_outer_gradients(
         options,
         false,
     )
+}
+
+/// Did one subject's integrations solve the trajectory the decrement assumes (#2143 review)?
+/// Not when a segment stopped short and kept its padded tail (a stop the driver discarded
+/// and re-solved does not count, as in the post-fit `kept_unfinished_segments`), diverged, or
+/// — on a model routed to the exact path — was declined by the matrix exponential and
+/// integrated instead, at the fit's tolerance and outside the tight re-solve.
+fn integration_backs_a_decrement(st: &crate::ode::solver::OdeSolverStats) -> bool {
+    let kept_unfinished = st
+        .unfinished_segments
+        .saturating_sub(st.discarded_unfinished_segments);
+    kept_unfinished == 0 && st.diverged_segments == 0 && st.linear_declined_segments == 0
 }
 
 /// [`per_subject_outer_gradients`], and with `require_complete` also `None` when any
@@ -2606,14 +2622,8 @@ fn per_subject_outer_gradients_checked(
                     options.interaction,
                 )
             };
-            if let Some(scope) = scope {
-                let st = scope.collected();
-                let kept_unfinished = st
-                    .unfinished_segments
-                    .saturating_sub(st.discarded_unfinished_segments);
-                if kept_unfinished > 0 || st.diverged_segments > 0 {
-                    return None;
-                }
+            if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
+                return None;
             }
             gradient
         })
@@ -2831,7 +2841,23 @@ fn predicted_remaining_gain(
     }
     let per_subject = match decrement_ode_override(model, options) {
         None => {
-            per_subject_outer_gradients(model, population, init_params, x, ehs, kappas, options)?
+            // A model routed to the exact path is checked too: a segment the matrix
+            // exponential declines is integrated at the fit's tolerance (#2143 review).
+            let checked = model.honors_ode_solver_opts();
+            #[cfg(test)]
+            if checked {
+                CHECKED_EXACT_PASSES.with(|n| n.set(n.get() + 1));
+            }
+            per_subject_outer_gradients_checked(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+                kappas,
+                options,
+                checked,
+            )?
         }
         Some(ode) => {
             #[cfg(test)]
@@ -2923,6 +2949,8 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many exact-path decrements were formed through the integration check.
+    static CHECKED_EXACT_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
