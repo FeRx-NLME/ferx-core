@@ -822,6 +822,7 @@ fn propagate_bounds_g<T: PkNum>(
     dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
+    start: Option<T>,
 ) {
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
@@ -893,11 +894,18 @@ fn propagate_bounds_g<T: PkNum>(
         }
         T::from_f64(w)
     };
-    for w in bounds.windows(2) {
+    // `start` overrides the dual position of the interval's own start when the event it starts
+    // at is a fixed record whose time a moving boundary merely shares (see the walk): the
+    // value lookup would hand that record the boundary's jet.
+    for (j, w) in bounds.windows(2).enumerate() {
         if w[1] - w[0] <= 0.0 {
             continue;
         }
-        let dt = dual_pos(w[1]) - dual_pos(w[0]);
+        let from = match start {
+            Some(s) if j == 0 => s,
+            _ => dual_pos(w[0]),
+        };
+        let dt = dual_pos(w[1]) - from;
         let mid = 0.5 * (w[0] + w[1]);
         let rates = active_rates_g(
             doses,
@@ -1285,6 +1293,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             inf_dual,
             f64::NEG_INFINITY,
+            None,
         );
         Some(s)
     };
@@ -1324,6 +1333,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
+            None,
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev) {
@@ -1491,6 +1501,21 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let mut state = vec![T::from_f64(0.0); n_states];
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
+    // A covariate-change record (`PkOnly`) whose time a moving boundary shares — a lagged
+    // arrival or a moving infusion end, equal at the current parameters — is a fixed time that
+    // the boundary's jet must not move (#2093 follow-up). Production orders the arrival
+    // *before* the record and the infusion end *after* it, so the zero-length sliver between
+    // them belongs to the record's snapshot for an arrival and to the next record's for an end.
+    // `start_fixed`: the interval about to be propagated starts at such a record, so its start
+    // is the record's fixed time, not the boundary's dual. `pending_end`: an end's sliver
+    // `Δ = end(p) − t`, to be flowed at the start of the next interval under that interval's
+    // snapshot with the infusion still running.
+    let mut start_fixed = false;
+    let mut pending_end: Option<T> = None;
+    // The time at which a `PkOnly` record already stepped the main state back to its fixed
+    // time: an observation at the same instant (it sorts after the record) reads that state
+    // as it is, rather than correcting it a second time.
+    let mut corrected_at: Option<f64> = None;
 
     // Same resolution as the value walk, from the same shared helper: a record
     // governs itself, a non-record takes the next record ahead, and the trailing
@@ -1519,6 +1544,19 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
         );
 
         if ev.time > cur_t {
+            if let Some(delta) = pending_end.take() {
+                let rates = active_rates_g(
+                    eff_doses,
+                    &schedule.dose_lagtimes,
+                    dose_inf_dual,
+                    &pk_now,
+                    pk_model,
+                    reset_floor,
+                    cur_t,
+                    true,
+                );
+                apply_step_g(&mut state, delta, &pk_now, pk_model, rates);
+            }
             let bounds = &schedule.bounds_per_interval[i - 1];
             propagate_bounds_g(
                 &mut state,
@@ -1530,7 +1568,9 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 dose_lag_dual,
                 dose_inf_dual,
                 reset_floor,
+                start_fixed.then(|| T::from_f64(cur_t)),
             );
+            start_fixed = false;
             cur_t = ev.time;
         }
 
@@ -1623,14 +1663,20 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // before the step and put back after: it does not decay across a zero-length
                 // window.
                 let mut obs_state;
-                let read = match obs_boundary_correction(
-                    eff_doses,
-                    &schedule.dose_lagtimes,
-                    dose_lag_dual,
-                    dose_inf_dual,
-                    reset_floor,
-                    ev.time,
-                ) {
+                let already = corrected_at == Some(ev.time);
+                let correction = if already {
+                    None
+                } else {
+                    obs_boundary_correction(
+                        eff_doses,
+                        &schedule.dose_lagtimes,
+                        dose_lag_dual,
+                        dose_inf_dual,
+                        reset_floor,
+                        ev.time,
+                    )
+                };
+                let read = match correction {
                     Some((delta, strict_start)) => {
                         obs_state = state.clone();
                         let rates = active_rates_g(
@@ -1656,7 +1702,49 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 };
                 preds[ev.orig_idx] = central_concentration_g(read[central_slot], pk_now.v);
             }
-            EventKind::PkOnly => {}
+            EventKind::PkOnly => {
+                // A moving boundary on this record's time (see `start_fixed` above). The walk
+                // reached the boundary's dual position `t + Δ`; step back over `−Δ` under the
+                // rates of the side that precedes the record — exactly the observation
+                // correction below this arm, applied to the main state, since this record's
+                // time does not move either.
+                if let Some((delta, strict_start)) = obs_boundary_correction(
+                    eff_doses,
+                    &schedule.dose_lagtimes,
+                    dose_lag_dual,
+                    dose_inf_dual,
+                    reset_floor,
+                    ev.time,
+                ) {
+                    let rates = active_rates_g(
+                        eff_doses,
+                        &schedule.dose_lagtimes,
+                        dose_inf_dual,
+                        &pk_now,
+                        pk_model,
+                        reset_floor,
+                        ev.time,
+                        strict_start,
+                    );
+                    apply_step_g(
+                        &mut state,
+                        T::from_f64(0.0) - delta,
+                        &pk_now,
+                        pk_model,
+                        rates,
+                    );
+                    corrected_at = Some(ev.time);
+                    if strict_start {
+                        // An infusion end, which sorts after the record: its sliver runs in
+                        // the next interval, on that interval's snapshot.
+                        pending_end = Some(delta);
+                    } else {
+                        // An arrival, which sorts before it: the sliver is done, and the next
+                        // interval starts at the record's fixed time.
+                        start_fixed = true;
+                    }
+                }
+            }
             EventKind::Reset => unreachable!("Reset handled before pk_for_g above"),
         }
     }

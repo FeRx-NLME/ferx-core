@@ -1093,16 +1093,20 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
 ///    jet. The duals themselves are not comparable here (this runs on `f64` times, before any is
 ///    built), so coincidence alone is the decline.
 ///
-/// 2. a moving break coincides with a **fixed** break — a reset, a covariate-change (`PkOnly`), or,
-///    when the model has no lagtime, a **dose event time** (with a lagtime every arrival is itself a
-///    moving break, so those are covered by (1) instead). Those times do not move with `(θ, η)`, but
-///    the walk resolves one dual position per break, so it would drag the fixed event along with the
-///    moving one.
+/// 2. a moving break coincides with a fixed **dose event time**, when the model has no lagtime
+///    (with a lagtime every arrival is itself a moving break, so those are covered by (1)
+///    instead). A dose record sorts *before* a co-timed arrival, the opposite side from the
+///    records the walk corrects, so it would drag the fixed event along with the moving one.
 ///
-///    **Observations are exempt**: the walk *corrects* them instead of declining, stepping the
-///    read-out state back across the sliver between the sample and the boundary
-///    (`crate::sens::propagate::event_driven_sens_with_doses_g`). An observation landing on *two*
-///    moving breaks is still declined — by (1), since those two breaks coincide with each other.
+///    **Observations, covariate changes and resets are exempt.** The walk *corrects* an
+///    observation or a covariate change (`PkOnly`) on a moving boundary, stepping the state back
+///    across the zero-length sliver to the record's fixed time under the side production orders
+///    first — an arrival before the record, an infusion end after it, whose sliver then runs in
+///    the next interval on that interval's snapshot
+///    (`crate::sens::propagate::event_driven_sens_with_doses_g`). A reset needs nothing: a dose
+///    recorded before it is cancelled whichever side of it its arrival lands. A record landing on
+///    *two* moving breaks is still declined — by (1), since those two breaks coincide with each
+///    other.
 ///
 /// Both are degenerate, measure-zero coincidences. `eff` are the resolved doses the walk sees.
 fn moving_bounds_separable(
@@ -1138,13 +1142,11 @@ fn moving_bounds_separable(
             return false;
         }
     }
-    // (2) A moving break may not land on a fixed one. Observations are corrected, not declined.
-    let mut fixed: Vec<f64> = subject
-        .pk_only_times
-        .iter()
-        .chain(subject.reset_times.iter())
-        .copied()
-        .collect();
+    // (2) A moving break may not land on a fixed *dose record*. Observations and covariate
+    // changes (`PkOnly`) are corrected by the walk instead of declined, and a reset needs
+    // nothing: a dose recorded before it is cancelled whichever side of it its arrival lands,
+    // so both one-sided derivatives are those of the reset state.
+    let mut fixed: Vec<f64> = Vec::new();
     if !has_lag {
         // Without a lagtime a dose lands at its record time, which is a fixed break the walk must
         // not drag along with someone else's moving infusion end.

@@ -2430,3 +2430,191 @@ fn tad_reading_rhs_under_steady_state_is_analytic() {
         );
     }
 }
+
+// ---- a record exactly on a moving boundary, on the closed-form walk ------------------------
+
+const LAG_WT_CF: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVLAG(1.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_LAG ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT / 70) ^ 0.75
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+  ALAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const DUR_WT_CF: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT / 70) ^ 0.75
+  V  = TVV * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+fn wt_row(w: f64) -> HashMap<String, f64> {
+    HashMap::from([("WT".to_string(), w)])
+}
+
+/// Two doses and a covariate-change row (`PkOnly`) at `t_pk`; `WT` is 70 up to it, `w_pk` on
+/// the row itself and 95 after, so the record's snapshot differs from both neighbours'.
+fn coincident_subject(
+    doses: Vec<DoseEvent>,
+    times: &[f64],
+    t_pk: f64,
+    w_pk: f64,
+    resets: Vec<f64>,
+) -> Subject {
+    let n = times.len();
+    Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        dose_covariates: doses.iter().map(|_| wt_row(70.0)).collect(),
+        doses,
+        obs_times: times.to_vec(),
+        obs_raw_times: vec![],
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        covariates: wt_row(70.0),
+        obs_covariates: times
+            .iter()
+            .map(|&t| wt_row(if t < t_pk { 70.0 } else { 95.0 }))
+            .collect(),
+        pk_only_times: vec![t_pk],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: vec![wt_row(w_pk)],
+        reset_covariates: resets.iter().map(|_| wt_row(70.0)).collect(),
+        reset_times: resets,
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: vec![],
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: vec![],
+        obs_records: vec![],
+    }
+}
+
+/// The worst relative gap between the walk's exact `∂f/∂η` and finite differences of the
+/// production predictor, one-sided along `kink` in the direction `side` (−1 backward, +1
+/// forward; second-order stencil, both points on that side) and central elsewhere.
+fn one_sided_jacobian_gap(
+    m: &CompiledModel,
+    s: &Subject,
+    eta: &[f64],
+    kink: usize,
+    side: f64,
+) -> f64 {
+    let theta = &m.default_params.theta;
+    let jac = crate::sens::ode_provider::adjoint::exact_eta_jacobian(m, s, theta, eta)
+        .expect("the walk serves a record on a moving boundary");
+    let f = |e: &[f64]| crate::pk::compute_predictions_with_tv(m, s, theta, e);
+    let h = 1e-5;
+    let mut worst = 0.0f64;
+    for k in 0..eta.len() {
+        let at = |d: f64| {
+            let mut e = eta.to_vec();
+            e[k] += d;
+            f(&e)
+        };
+        let col: Vec<f64> = if k == kink {
+            let (f0, f1, f2) = (f(eta), at(side * h), at(2.0 * side * h));
+            (0..f0.len())
+                .map(|j| side * (-3.0 * f0[j] + 4.0 * f1[j] - f2[j]) / (2.0 * h))
+                .collect()
+        } else {
+            let (fp, fm) = (at(h), at(-h));
+            (0..fp.len()).map(|j| (fp[j] - fm[j]) / (2.0 * h)).collect()
+        };
+        for (j, c) in col.iter().enumerate() {
+            assert!(
+                jac[(j, k)].is_finite() && c.is_finite(),
+                "non-finite at ({j}, {k})"
+            );
+            worst = worst.max((jac[(j, k)] - c).abs() / (1.0 + c.abs()));
+        }
+    }
+    worst
+}
+
+/// A covariate change exactly on a lagged arrival (`t_pk = 12 + ALAG` at `η_LAG = 0`):
+/// production orders the arrival before the record, so the derivative is the one-sided one
+/// from below in the lag. Second dose on residual drug; the record's snapshot (WT 80) differs
+/// from the next one's (WT 95), so a misattributed sliver would show.
+#[test]
+fn a_covariate_change_on_a_lagged_arrival_is_exact() {
+    let m = parse_model_string(LAG_WT_CF).unwrap();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    // An observation on the record too (it sorts after it), so the walk must not correct the
+    // same instant twice.
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 13.5, 14.0, 16.0, 20.0, 24.0];
+    let s = coincident_subject(doses, &times, 13.5, 80.0, vec![]);
+    let gap = one_sided_jacobian_gap(&m, &s, &[0.1, -0.05, 0.0], 2, -1.0);
+    eprintln!("PkOnly on a lagged arrival: ∂f/∂η vs one-sided FD {gap:.2e}");
+    // Measured 3.62e-10, the one-sided stencil's O(h²) floor; bound 1e-8 (28×).
+    assert!(gap < 1e-8, "{gap:.2e}");
+}
+
+/// A covariate change exactly on a modeled infusion end (`t_pk = D1` at `η_D1 = 0`):
+/// production orders the end after the record, so the derivative is the one-sided one from
+/// above in the duration.
+#[test]
+fn a_covariate_change_on_a_modeled_infusion_end_is_exact() {
+    let m = parse_model_string(DUR_WT_CF).unwrap();
+    let doses = vec![
+        DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+        DoseEvent::modeled(8.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+    ];
+    // An observation on the record too, as in the arrival case.
+    let times = [0.5, 1.0, 1.5, 2.0, 3.0, 6.0, 8.5, 9.5, 12.0, 24.0];
+    let s = coincident_subject(doses, &times, 2.0, 80.0, vec![]);
+    let gap = one_sided_jacobian_gap(&m, &s, &[0.1, -0.05, 0.0], 2, 1.0);
+    eprintln!("PkOnly on a modeled infusion end: ∂f/∂η vs one-sided FD {gap:.2e}");
+    // Measured 2.70e-10; bound 1e-8 (37×).
+    assert!(gap < 1e-8, "{gap:.2e}");
+}
+
+/// A reset exactly on a lagged arrival: the dose is recorded before the reset, so it is
+/// cancelled whichever side of the reset its arrival lands, and the two one-sided derivatives
+/// agree — central FD.
+#[test]
+fn a_reset_on_a_lagged_arrival_is_exact() {
+    let m = parse_model_string(LAG_WT_CF).unwrap();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(16.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 2.0, 8.0, 12.5, 14.0, 18.0, 20.0, 24.0];
+    let s = coincident_subject(doses, &times, 30.0, 70.0, vec![13.5]);
+    let gap = one_sided_jacobian_gap(&m, &s, &[0.1, -0.05, 0.0], usize::MAX, 0.0);
+    eprintln!("reset on a lagged arrival: ∂f/∂η vs FD {gap:.2e}");
+    // Measured 1.32e-10; bound 1e-8 (76×).
+    assert!(gap < 1e-8, "{gap:.2e}");
+}
