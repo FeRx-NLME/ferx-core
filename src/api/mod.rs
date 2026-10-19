@@ -459,6 +459,10 @@ mod tests_derived_iov_kappa;
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
 
+#[cfg(test)]
+#[path = "tests/adaptive_obs_scale_tests.rs"]
+mod adaptive_obs_scale_tests;
+
 // ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
 //
 // The frozen-replay verifier reuses the precomputed snapshots (`eta_occ`,

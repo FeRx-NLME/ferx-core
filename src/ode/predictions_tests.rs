@@ -1244,6 +1244,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
         .map(|s| AdaptiveMonitor {
             spec: s,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let base = make_subject(vec![], obs_times.to_vec());
@@ -1674,6 +1675,7 @@ fn adaptive_tv_decision_between_records_reads_locf_covariate() {
     let mons = vec![AdaptiveMonitor {
         spec: &spec,
         observe: Some(&obs_fn),
+        obs_scale: None,
     }];
     // Hold every decision — we only care about the monitored signal it recorded.
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
@@ -1982,6 +1984,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         .map(|s| AdaptiveMonitor {
             spec: s,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let base = make_subject(vec![], obs_times.to_vec());
@@ -2090,6 +2093,7 @@ fn adaptive_iov_threads_occasion_eta_into_readout() {
     let mons = vec![AdaptiveMonitor {
         spec: &spec,
         observe: Some(&obs_fn),
+        obs_scale: None,
     }];
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
         actions: vec![DoseAction::Hold],
@@ -8045,6 +8049,7 @@ fn adaptive_observe_expression_flows_through_driver() {
     let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
         spec: &compiled.monitors[0],
         observe: compiled.observe.as_ref(),
+        obs_scale: None,
     }];
     let run = ode_predictions_adaptive_impl(
         model.ode_spec.as_ref().unwrap(),

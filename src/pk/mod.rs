@@ -437,6 +437,27 @@ pub fn apply_scaling(
     if matches!(model.scaling, ScalingSpec::None) {
         return;
     }
+    let scales = obs_scale_divisors(model, subject, theta, eta, &subject.obs_cmts);
+    for (i, pred) in preds.iter_mut().enumerate() {
+        *pred = divide_by_obs_scale(*pred, scales.get(i).copied().unwrap_or(f64::NAN));
+    }
+}
+
+/// The `[scaling]` Form A/B divisor for each entry of `cmts`, under the
+/// subject-static snapshot [`apply_scaling`] divides by: `pk_param_fn` at the
+/// subject's baseline covariates and `t = 0`, evaluated with `eta`.
+///
+/// Shared with the adaptive driver (#2129), which reads one compartment at a time —
+/// a monitor's signal at a decision, or one trajectory row under the η of its
+/// decision window — and must divide by exactly what `predict()` / `simulate()`
+/// would. Invalid scales come back `NaN` (see [`ScalingSpec::build_obs_scale_array`]).
+pub(crate) fn obs_scale_divisors(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cmts: &[usize],
+) -> Vec<f64> {
     // Materialise per-observation scales via the shared
     // `ScalingSpec::build_obs_scale_array` helper so the FD path here
     // and the AD path in `inner_optimizer.rs` see identical semantics.
@@ -459,22 +480,20 @@ pub fn apply_scaling(
         };
         &DEFAULT_PK
     };
-    let scales = model.scaling.build_obs_scale_array(
-        theta,
-        eta,
-        &subject.covariates,
-        pk_ref,
-        &subject.obs_cmts,
-    );
-    for (i, pred) in preds.iter_mut().enumerate() {
-        // build_obs_scale_array already encodes invalid scales as NaN,
-        // so this is purely a divide (no extra positivity check needed).
-        let s = scales.get(i).copied().unwrap_or(f64::NAN);
-        if s.is_finite() && s > 0.0 {
-            *pred /= s;
-        } else {
-            *pred = f64::NAN;
-        }
+    model
+        .scaling
+        .build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, cmts)
+}
+
+/// Divide one prediction by its `[scaling]` divisor, or `NaN` when the divisor is
+/// not a finite positive number. [`ScalingSpec::build_obs_scale_array`] already
+/// encodes invalid scales as `NaN`; the check here also covers a missing entry.
+#[inline]
+pub(crate) fn divide_by_obs_scale(pred: f64, scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        pred / scale
+    } else {
+        f64::NAN
     }
 }
 
