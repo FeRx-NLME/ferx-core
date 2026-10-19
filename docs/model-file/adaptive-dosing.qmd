@@ -149,8 +149,17 @@ The simulation runs on whatever parameters you pass. `parsed.model.default_param
 are the **initial estimates** from `[parameters]`, not a fit's; passing them
 simulates the model as written before estimation. To simulate a fitted model, pass
 `fitted_params_from_result(&fit, &model)`. It takes a `FitResult` from
-[`load_fit`](../file-formats/fitrx.qmd#loading-a-bundle) or straight from `fit()`,
-and returns an error (`E_PARAM_SHAPE`) when the fit's Ω or σ does not match the model.
+[`load_fit`](../file-formats/fitrx.qmd#loading-a-bundle) or straight from `fit()`.
+It returns an error when the fit does not match the model: an Ω, σ or Ω_IOV of
+the wrong shape (`E_PARAM_SHAPE`), or, on a `[mixture]` model with class
+overrides, a fit that does not carry its packed estimate.
+
+On a model with a `theta NAME[...]` level block, or a `[covariate_model]` centre
+taken from the data (`center = median`), first bind the model and the simulated
+population to the fit with `bind_from_fit` and the fit's `data_bindings`.
+Otherwise the fitted θ is read at the wrong level positions, or each covariate is
+centred on the simulated population's statistic instead of the fit's. See
+[Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
 Each subject's η is still drawn from the fitted Ω; the run does not reuse a fit's
 per-subject EBEs.
