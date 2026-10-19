@@ -366,7 +366,7 @@ The analytic R-matrix supports every quadrature fit, under either anchor:
 | `method = laplace`, any `n_agq` | the quadrature marginal under the exact anchor |
 
 It is the gradient's identity one order up: `Uᵀ∇²Ψ U`, with `U = [I; dη̂/dx]` the mode's
-tangent, from forward second-order passes through the same recorder and kernel
+tangent, by reverse over forward through the same recorder and kernel
 ([the R-matrix](foce.qmd#sensitivity-assembly)). Under the exact anchor the predictions
 carry `∂²f/∂η²` on an inner η-dual, so the fourth derivative `∂²H/∂x²` needs is exact too.
 That case is what used to keep `method = laplace` on the finite-difference stencil.
@@ -434,7 +434,7 @@ own quadrature objective:
   equality and confirms that the old inverse round trip changes the fixture's entries.
 
 Since #486 the assembly differences nothing: the R-matrix is `Uᵀ∇²Ψ U` at the mode,
-from forward second-order passes through the same recorder and quadrature kernel the
+by reverse over forward through the same recorder and quadrature kernel the
 adjoint gradient uses, the grid's dependence on the anchor included (see
 [FOCE / FOCEI](foce.qmd) for the identity).
 

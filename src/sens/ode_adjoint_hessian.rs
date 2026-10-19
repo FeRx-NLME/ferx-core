@@ -13,13 +13,23 @@
 //! mode's tangent directions `u_a = (e_a, η′e_a)`.
 //!
 //! Everything comes from one primitive, a `pass`: the objective `F` (FOCE, FOCEI, or the
-//! AGQ marginal under either anchor) and `g`, over a forward second-order dual along up to
-//! `K` directions in `(x, η)`, through the same recorders and kernel as the gradient. The
+//! AGQ marginal under either anchor) and `g`, through the same recorders and kernel as the
+//! gradient, over a forward **first-order** dual along up to `K` directions in `(x, η)`
+//! whose components are scalars on the reverse tape ([`R`]) — the packed coordinates and η
+//! (and, under [`NnReduction`], the networks' raw outputs) are the tape's leaves. The
 //! predictions carry an inner η-dual, so `G` (and under the exact anchor `Q`) are
-//! differentiated with them. Passes along the η axes give `∇_η F` and `H`; along the x
-//! axes, `∂ₓg`; along pairs of the `u_a`, `Uᵀ∇²Ψ_w U`. There are no third-order
-//! sensitivity tables and no finite differences, and FOCE's frozen-variance mode (whose
-//! `R⁰` moves with θ through `f(η = 0)`) is just another term of `g`.
+//! differentiated with them.
+//!
+//! - One pass along no direction, swept once per output, gives the gradients of `F` and
+//!   of every `g_k` with respect to every leaf: `∇_η F`, `H` and `∂g` along any direction
+//!   at once (`mode_response`).
+//! - A pass along `u_1 … u_K`, swept once per tangent component `∂Ψ_w/∂u_a`, gives the
+//!   `K` Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted with every `u_b`
+//!   (`psi_along`): reverse over forward, so the Hessian costs `⌈n/K⌉` passes.
+//!
+//! There are no third-order sensitivity tables and no finite differences, and FOCE's
+//! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
+//! of `g`.
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
@@ -27,13 +37,54 @@ use crate::estimation::parameterization::{packed_segments, rho_packed_start, the
 use crate::sens::focei_kernel::{chol, chol_logdet, focei_htilde, OmegaT};
 use crate::sens::rtape::DualH;
 
-/// Directions per pass: the outer dual's width. A pass carries `K(K+1)/2` second-order
-/// entries per value, so the Hessian is assembled from passes over pairs of `K/2`-blocks.
+/// Directions per pass: the outer dual's width, and the lanes of each reverse sweep.
 const K: usize = 8;
-const MK: usize = K * (K + 1) / 2;
 
-/// Second order along the pass's directions, over `B`.
-type Out<B = f64> = DualH<K, MK, B>;
+/// First order along the pass's directions, over `B` (taped: `R` at the bottom).
+type Out<B = R> = DualT<K, B>;
+
+/// The tape nodes a pass along `K` directions may grow to before `psi_along` spends its
+/// directions over more, narrower passes (a node costs ~`20 + 8K` bytes with the sweep's
+/// adjoints): ~350 MB per worker thread.
+pub(super) const TAPE_NODE_BUDGET: usize = 4 << 20;
+
+/// The leaves of a pass's tape: each packed coordinate, each `[covariate_nn]` raw output
+/// of the reduced basis, each η.
+struct Leaves<const N: usize> {
+    x: Vec<u32>,
+    z: Vec<u32>,
+    eta: [u32; N],
+}
+
+impl<const N: usize> Leaves<N> {
+    /// `∇_v s · d`: lane `lane` of a sweep's adjoints `adj` (node-major, `K` lanes) along
+    /// the direction `d`.
+    fn along(&self, adj: &[f64], lane: usize, d: &Dir<N>) -> f64 {
+        let at = |i: u32| adj[i as usize * K + lane];
+        let mut s = 0.0;
+        if let Some(i) = d.x {
+            s += at(self.x[i]);
+        }
+        if let Some(k) = d.z {
+            s += at(self.z[k]);
+        }
+        for k in 0..N {
+            if d.eta[k] != 0.0 {
+                s += d.eta[k] * at(self.eta[k]);
+            }
+        }
+        s
+    }
+}
+
+/// A recorded pass: `F`, `g = ∇_η l`, the leaves they were taped from, and the tape's
+/// length.
+struct Pass<const N: usize> {
+    f: Out,
+    g: [Out; N],
+    leaves: Leaves<N>,
+    nodes: usize,
+}
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent.
@@ -88,18 +139,20 @@ pub(crate) fn subject_adjoint_cov_hessian(
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
     let exact = matches!(objective, Objective::Agq { exact: true, .. });
-    // A nested dual value is up to ~10 kB and the solvers keep several per state on the
+    // A nested dual value is up to ~6 kB and the solvers keep several per state on the
     // stack: this runs on the fit pool's workers (`FIT_RAYON_STACK_SIZE`), on the caller's
     // thread so every fit-scoped override (`bloq_method`, …) it reads is the fit's.
-    match (bucket, exact) {
-        (4, true) => hessian_with::<4, 10, DualH<4, 10, f64>>(&sc, subject, template, x, objective),
-        (8, true) => hessian_with::<8, 36, DualH<8, 36, f64>>(&sc, subject, template, x, objective),
-        (4, _) => hessian_with::<4, 10, DualT<4, f64>>(&sc, subject, template, x, objective),
-        (6, _) => hessian_with::<6, 21, DualT<6, f64>>(&sc, subject, template, x, objective),
-        (8, _) => hessian_with::<8, 36, DualT<8, f64>>(&sc, subject, template, x, objective),
-        (24, _) => hessian_with::<24, 300, DualT<24, f64>>(&sc, subject, template, x, objective),
+    let h = match (bucket, exact) {
+        (4, true) => hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective),
+        (8, true) => hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective),
+        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
+        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
+        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
+        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
         _ => None,
-    }
+    };
+    crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
+    h
 }
 
 /// The Hessian's dispatch widths: its own, shorter ladder (the covariance step runs once per
@@ -108,9 +161,9 @@ pub(crate) fn subject_adjoint_cov_hessian(
 const HESSIAN_BUCKETS: [usize; 4] = [4, 6, 8, 24];
 
 /// The exact anchor's Hessian widths. Its inner η-dual carries `Q` as well as `(f, G)`, so
-/// a value is `(1 + K + K(K+1)/2) · (1 + N + N(N+1)/2)` f64: ~5 kB at `N = 4`, ~16 kB at
-/// `N = 8`, within the fit pool's worker stacks (`FIT_RAYON_STACK_SIZE`); ~117 kB at 24 is
-/// not, so it stops at 8 (a 5- or 6-effect subject pads to 8).
+/// a value is `(1 + K) · (1 + N + N(N+1)/2)` taped scalars (16 bytes): ~2 kB at `N = 4`,
+/// ~6.5 kB at `N = 8`; it stops at 8 (a 5- or 6-effect subject pads to 8), as the inner
+/// recordings' `Q` payload is quadratic in the width.
 const EXACT_ANCHOR_HESSIAN_BUCKETS: [usize; 2] = [4, 8];
 
 /// The widest subject the exact anchor's Hessian serves (pinned by the width-rule test).
@@ -175,7 +228,7 @@ pub(crate) fn subject_adjoint_eta_dx(
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
         };
-        let (_, eta_x) = mode_response::<N>(&pass, &x_dirs(x.len()))?;
+        let (_, eta_x, _) = mode_response::<N>(&pass, &x_dirs(x.len()))?;
         let cols: Vec<DVector<f64>> = (0..x.len())
             .map(|i| DVector::from_fn(sc.width, |k, _| eta_x[(k, i)]))
             .collect();
@@ -183,13 +236,15 @@ pub(crate) fn subject_adjoint_eta_dx(
             .all(|c| c.iter().all(|v| v.is_finite()))
             .then_some(cols)
     }
-    match bucket {
-        4 => go::<4, 10, DualT<4, f64>>(&sc, subject, template, x, objective),
-        6 => go::<6, 21, DualT<6, f64>>(&sc, subject, template, x, objective),
-        8 => go::<8, 36, DualT<8, f64>>(&sc, subject, template, x, objective),
-        24 => go::<24, 300, DualT<24, f64>>(&sc, subject, template, x, objective),
+    let r = match bucket {
+        4 => go::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
+        6 => go::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
+        8 => go::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
+        24 => go::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
         _ => None,
-    }
+    };
+    crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
+    r
 }
 
 /// The packed axes as pass directions, without an η tangent.
@@ -199,21 +254,35 @@ fn x_dirs<const N: usize>(n: usize) -> Vec<Dir<N>> {
 
 /// The mode's first-order response at the scoped point: `w = H⁻¹∇_η F` and the mode's
 /// response `−H⁻¹∂g` along each of `along` (`N × along.len()`; `η′ = dη̂/dx` along the
-/// packed axes), from passes along the η axes and `along`.
+/// packed axes), from one pass along no direction swept once per output (`F`, `g_k`), and
+/// that pass's tape length.
 fn mode_response<const N: usize>(
-    pass: &impl Fn(&[Dir<N>]) -> Option<(Out, [Out; N])>,
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
     along: &[Dir<N>],
-) -> Option<([f64; N], DMatrix<f64>)> {
-    // ∇_η F and H = ∂g/∂η, along the η axes.
+) -> Option<([f64; N], DMatrix<f64>, usize)> {
+    let p = pass(&[])?;
+    let outs: Vec<R> = std::iter::once(p.f.v)
+        .chain(p.g.iter().map(|g| g.v))
+        .collect();
+    // ∇_η F, H = ∂g/∂η and ∂g along `along`, from the leaves' adjoints.
     let mut grad_f = DVector::<f64>::zeros(N);
     let mut h = DMatrix::<f64>::zeros(N, N);
-    for block in (0..N).collect::<Vec<_>>().chunks(K) {
-        let dirs: Vec<Dir<N>> = block.iter().map(|&k| Dir::eta(k)).collect();
-        let (fv, lg) = pass(&dirs)?;
-        for (a, &k) in block.iter().enumerate() {
-            grad_f[k] = fv.g[a];
-            for i in 0..N {
-                h[(i, k)] = lg[i].g[a];
+    let mut gx = DMatrix::<f64>::zeros(N, along.len());
+    for (c, chunk) in outs.chunks(K).enumerate() {
+        let lanes: [R; K] = std::array::from_fn(|l| chunk.get(l).copied().unwrap_or(R::c(0.0)));
+        let adj = rsweep::<K>(&lanes);
+        for l in 0..chunk.len() {
+            let at_eta = |k: usize| adj[p.leaves.eta[k] as usize * K + l];
+            match c * K + l {
+                0 => (0..N).for_each(|k| grad_f[k] = at_eta(k)),
+                o => {
+                    for k in 0..N {
+                        h[(o - 1, k)] = at_eta(k);
+                    }
+                    for (j, d) in along.iter().enumerate() {
+                        gx[(o - 1, j)] = p.leaves.along(adj, l, d);
+                    }
+                }
             }
         }
     }
@@ -230,20 +299,26 @@ fn mode_response<const N: usize>(
         }
     };
     let wv = solve(&DMatrix::from_column_slice(N, 1, grad_f.as_slice()))?;
-    // ∂g along `along`.
-    let mut gx = DMatrix::<f64>::zeros(N, along.len());
-    for block in (0..along.len()).collect::<Vec<_>>().chunks(K) {
-        let dirs: Vec<Dir<N>> = block.iter().map(|&i| along[i]).collect();
-        let (_, lg) = pass(&dirs)?;
-        for (a, &i) in block.iter().enumerate() {
-            for k in 0..N {
-                gx[(k, i)] = lg[k].g[a];
-            }
-        }
-    }
     let eta_x = -solve(&gx)?;
     (wv.iter().chain(eta_x.iter()).all(|v| v.is_finite()))
-        .then(|| (std::array::from_fn(|k| wv[k]), eta_x))
+        .then(|| (std::array::from_fn(|k| wv[k]), eta_x, p.nodes))
+}
+
+/// Directions per `psi_along` pass: `K`, or fewer when a pass along `K` would outgrow
+/// [`TAPE_NODE_BUDGET`]: a pass along `m` directions tapes up to `1 + 1.25m` times the
+/// `nodes` of one along none (measured 5.4–10.5× at `m = 8` on the covariance fixtures).
+pub(super) fn pass_width(nodes: usize) -> usize {
+    let w = ((TAPE_NODE_BUDGET / nodes.max(1)).saturating_sub(1) * 4 / 5).clamp(1, K);
+    #[cfg(test)]
+    return PASS_WIDTH_CAP.with(|c| c.get()).map_or(w, |cap| w.min(cap));
+    #[cfg(not(test))]
+    w
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: cap `psi_along`'s directions per pass, as a large tape would.
+    pub(crate) static PASS_WIDTH_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
@@ -283,56 +358,45 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let pass = |dirs: &[Dir<N>]| {
         pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
     };
-    let (w, eta_x) = mode_response::<N>(&pass, &x_dirs(n))?;
+    let (w, eta_x, nodes) = mode_response::<N>(&pass, &x_dirs(n))?;
     // Uᵀ∇²Ψ U along u_a = (e_a, η′e_a).
     let dirs: Vec<Dir<N>> = (0..n)
         .map(|i| Dir::x(i, std::array::from_fn(|k| eta_x[(k, i)])))
         .collect();
-    let (_, hess) = psi_along(&pass, &w, &dirs)?;
+    let (_, hess) = psi_along(&pass, &w, &dirs, pass_width(nodes))?;
     hess.iter().all(|v| v.is_finite()).then_some(hess)
 }
 
-/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`: one pass when they all fit, else one
-/// per pair of `K/2`-blocks.
+/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by reverse over forward: per pass,
+/// `width` (≤ `K`) of the directions as the forward tangents, and one sweep whose lane `a`
+/// is `∂Ψ_w/∂u_a`, so its leaf adjoints are the column `∇²Ψ_w u_a`, read along every
+/// direction. Symmetrised: the two triangles agree to rounding.
 fn psi_along<const N: usize>(
-    pass: &impl Fn(&[Dir<N>]) -> Option<(Out, [Out; N])>,
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
     w: &[f64; N],
     dirs: &[Dir<N>],
+    width: usize,
 ) -> Option<(DVector<f64>, DMatrix<f64>)> {
     let n = dirs.len();
-    let blocks: Vec<Vec<usize>> = if n <= K {
-        vec![(0..n).collect()]
-    } else {
-        (0..n)
-            .collect::<Vec<_>>()
-            .chunks(K / 2)
-            .map(<[usize]>::to_vec)
-            .collect()
-    };
     let mut grad = DVector::<f64>::zeros(n);
     let mut hess = DMatrix::<f64>::zeros(n, n);
-    for (bi, a) in blocks.iter().enumerate() {
-        for b in &blocks[bi..] {
-            let idx: Vec<usize> = if std::ptr::eq(a, b) {
-                a.clone()
-            } else {
-                a.iter().chain(b).copied().collect()
-            };
-            let (fv, lg) = pass(&idx.iter().map(|&i| dirs[i]).collect::<Vec<_>>())?;
-            let psi = fv
-                - <Out as PkNum>::wsum3(
-                    0.0,
-                    (0..N).map(|k| (Out::constant(w[k]), lg[k], Out::constant(1.0))),
-                );
-            for (p, &i) in idx.iter().enumerate() {
-                grad[i] = psi.g[p];
-                for (q, &j) in idx.iter().enumerate() {
-                    hess[(i, j)] = psi.h[crate::sens::vtape::tri(p, q)];
-                }
+    for (c, chunk) in dirs.chunks(width.clamp(1, K)).enumerate() {
+        let p = pass(chunk)?;
+        let psi = p.f
+            - <Out as PkNum>::wsum3(
+                0.0,
+                (0..N).map(|k| (Out::constant(w[k]), p.g[k], Out::constant(1.0))),
+            );
+        let adj = rsweep::<K>(&psi.g);
+        for a in 0..chunk.len() {
+            let i = c * width.clamp(1, K) + a;
+            grad[i] = psi.g[a].v;
+            for (j, d) in dirs.iter().enumerate() {
+                hess[(j, i)] = p.leaves.along(adj, a, d);
             }
         }
     }
-    Some((grad, hess))
+    Some((grad, hess.symmetric_part()))
 }
 
 #[cfg(all(test, feature = "nn"))]
@@ -419,7 +483,7 @@ impl NnReduction {
     fn hessian<const N: usize>(
         &self,
         model: &CompiledModel,
-        pass: &impl Fn(&[Dir<N>]) -> Option<(Out, [Out; N])>,
+        pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
         template: &ModelParameters,
         x: &[f64],
         width: usize,
@@ -440,7 +504,7 @@ impl NnReduction {
             .map(|&i| Dir::x(i, [0.0; N]))
             .chain((0..n_z).map(Dir::z))
             .collect();
-        let (w, resp) = mode_response::<N>(pass, &along)?;
+        let (w, resp, nodes) = mode_response::<N>(pass, &along)?;
         // The bucket's padding is inert: no packed axis or output moves it, so the basis
         // spans the active effects only.
         if (width..N).any(|j| resp.row(j).iter().any(|&v| v != 0.0)) {
@@ -453,7 +517,7 @@ impl NnReduction {
             .chain((0..n_z).map(Dir::z))
             .chain((0..width).map(Dir::eta))
             .collect();
-        let (gb, hb) = psi_along(pass, &w, &basis)?;
+        let (gb, hb) = psi_along(pass, &w, &basis, pass_width(nodes))?;
 
         // C: each packed axis in the basis.
         let (nr, nb) = (rest.len(), basis.len());
@@ -476,6 +540,7 @@ impl NnReduction {
                 hess[(a, b)] += gk * v;
             }
         }
+        let hess = hess.symmetric_part();
         hess.iter().all(|v| v.is_finite()).then_some(hess)
     }
 
@@ -495,45 +560,37 @@ impl NnReduction {
         for (net, &(off, n_w, ref cov)) in self.nets.iter().enumerate() {
             let nn = &self.z[net];
             let mlp_out = nn.len();
-            let blocks: Vec<Vec<usize>> = (off..off + n_w)
-                .collect::<Vec<_>>()
-                .chunks(K / 2)
-                .map(<[usize]>::to_vec)
-                .collect();
             let mut jcols: Vec<Vec<f64>> = vec![vec![0.0; n_z]; n_w];
-            for (bi, a) in blocks.iter().enumerate() {
-                for b in &blocks[bi..] {
-                    let idx: Vec<usize> = if std::ptr::eq(a, b) {
-                        a.clone()
-                    } else {
-                        a.iter().chain(b).copied().collect()
-                    };
-                    let th = unpack_theta(template, |m| DualH {
-                        v: x[m],
-                        g: std::array::from_fn(|p| if idx.get(p) == Some(&m) { 1.0 } else { 0.0 }),
-                        h: [0.0; MK],
-                    });
-                    let out: Vec<Out> = model.covariate_nns[net]
-                        .mapper
-                        .forward_raw_g(&th[off..off + n_w], cov);
-                    if out.len() != mlp_out {
-                        return None;
+            // Reverse over forward, as `psi_along`: the weights in blocks of `K` as the
+            // tangents, and per output one sweep whose lane `p` is `∂z_o/∂x_{blk[p]}`.
+            for blk in (off..off + n_w).collect::<Vec<_>>().chunks(K) {
+                rtape_reset();
+                let leaves: Vec<R> = x[..template.theta.len()]
+                    .iter()
+                    .map(|&v| rinput(v))
+                    .collect();
+                let th = unpack_theta(template, |m| DualT {
+                    v: leaves[m],
+                    g: std::array::from_fn(|p| {
+                        R::c(if blk.get(p) == Some(&m) { 1.0 } else { 0.0 })
+                    }),
+                });
+                let out: Vec<Out> = model.covariate_nns[net]
+                    .mapper
+                    .forward_raw_g(&th[off..off + n_w], cov);
+                if out.len() != mlp_out {
+                    return None;
+                }
+                for (o, y) in out.iter().enumerate() {
+                    for (p, &i) in blk.iter().enumerate() {
+                        jcols[i - off][z0 + o] = y.g[p].v;
                     }
-                    for (o, y) in out.iter().enumerate() {
-                        for (p, &i) in idx.iter().enumerate() {
-                            if std::ptr::eq(a, b) {
-                                jcols[i - off][z0 + o] = y.g[p];
-                            }
-                            for (q, &j) in idx.iter().enumerate().skip(p) {
-                                let v = y.h[crate::sens::vtape::tri(p, q)];
-                                if v != 0.0
-                                    && (std::ptr::eq(a, b) || (p < a.len()) != (q < a.len()))
-                                {
-                                    hz[z0 + o].push(((i, j), v));
-                                    if i != j {
-                                        hz[z0 + o].push(((j, i), v));
-                                    }
-                                }
+                    let adj = rsweep::<K>(&y.g);
+                    for (p, &i) in blk.iter().enumerate() {
+                        for j in off..off + n_w {
+                            let v = adj[leaves[j].i as usize * K + p];
+                            if v != 0.0 {
+                                hz[z0 + o].push(((i, j), v));
                             }
                         }
                     }
@@ -545,22 +602,30 @@ impl NnReduction {
         Some((jz, hz))
     }
 }
-/// The inner η-dual the predictions carry: `(f, G)` (`DualT`) or `(f, G, Q)`
-/// (`DualH`, the exact anchor's).
+/// The inner η-dual the predictions carry, over the tape: `(f, G)` (`DualT`) or
+/// `(f, G, Q)` (`DualH`, the exact anchor's).
 trait Jet<const N: usize>: crate::sens::num::vm::VmNum {
-    /// `η_k`'s value with its unit tangent.
-    fn eta(v: f64, k: usize) -> Self;
+    /// `η_k`'s value (a leaf) with its unit tangent.
+    fn eta(v: R, k: usize) -> Self;
+    /// A taped scalar with no η-dependence of its own.
+    fn lift(v: R) -> Self;
     /// Component `c`: the value (0), `∂/∂η_k` (`1 + k`), packed `∂²/∂η_k∂η_l` (`1 + N + tri(k, l)`).
-    fn part(&self, c: usize) -> f64;
+    fn part(&self, c: usize) -> R;
 }
 
-impl<const N: usize> Jet<N> for DualT<N, f64> {
-    fn eta(v: f64, k: usize) -> Self {
-        let mut g = [0.0; N];
-        g[k] = 1.0;
+impl<const N: usize> Jet<N> for DualT<N, R> {
+    fn eta(v: R, k: usize) -> Self {
+        let mut g = [R::c(0.0); N];
+        g[k] = R::c(1.0);
         DualT { v, g }
     }
-    fn part(&self, c: usize) -> f64 {
+    fn lift(v: R) -> Self {
+        DualT {
+            v,
+            g: [R::c(0.0); N],
+        }
+    }
+    fn part(&self, c: usize) -> R {
         if c == 0 {
             self.v
         } else {
@@ -569,13 +634,24 @@ impl<const N: usize> Jet<N> for DualT<N, f64> {
     }
 }
 
-impl<const N: usize, const M: usize> Jet<N> for DualH<N, M, f64> {
-    fn eta(v: f64, k: usize) -> Self {
-        let mut g = [0.0; N];
-        g[k] = 1.0;
-        DualH { v, g, h: [0.0; M] }
+impl<const N: usize, const M: usize> Jet<N> for DualH<N, M, R> {
+    fn eta(v: R, k: usize) -> Self {
+        let mut g = [R::c(0.0); N];
+        g[k] = R::c(1.0);
+        DualH {
+            v,
+            g,
+            h: [R::c(0.0); M],
+        }
     }
-    fn part(&self, c: usize) -> f64 {
+    fn lift(v: R) -> Self {
+        DualH {
+            v,
+            g: [R::c(0.0); N],
+            h: [R::c(0.0); M],
+        }
+    }
+    fn part(&self, c: usize) -> R {
         match c {
             0 => self.v,
             c if c <= N => self.g[c - 1],
@@ -584,7 +660,8 @@ impl<const N: usize, const M: usize> Jet<N> for DualH<N, M, f64> {
     }
 }
 
-/// The objective `F` and `g = ∇_η l` at the mode, second order along `dirs`.
+/// The objective `F` and `g = ∇_η l` at the mode, first order along `dirs` over a fresh
+/// reverse tape whose leaves are the packed coordinates, the reduced basis's outputs and η.
 #[allow(clippy::too_many_arguments)]
 fn pass<const N: usize, const M: usize, J: Jet<N>>(
     ctx: &LikCtx,
@@ -596,47 +673,54 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     so: &StackedOmega,
     nn_z: Option<&[Vec<f64>]>,
     dirs: &[Dir<N>],
-) -> Option<(Out, [Out; N])> {
+) -> Option<Pass<N>> {
     debug_assert!(dirs.len() <= K);
     let (model, params, eta) = (sc.model, &sc.params, &sc.eta[..]);
     let n_obs = subject.observations.len();
-    let seed = |i: usize| -> [f64; K] {
+    let seed = |i: usize| -> [R; K] {
         std::array::from_fn(|a| {
-            if dirs.get(a).is_some_and(|d| d.x == Some(i)) {
+            R::c(if dirs.get(a).is_some_and(|d| d.x == Some(i)) {
                 1.0
             } else {
                 0.0
-            }
+            })
         })
     };
-    let tan =
-        |k: usize| -> [f64; K] { std::array::from_fn(|a| dirs.get(a).map_or(0.0, |d| d.eta[k])) };
-    let zero_h = || [J::from_f64(0.0); MK];
+    let tan = |k: usize| -> [R; K] {
+        std::array::from_fn(|a| R::c(dirs.get(a).map_or(0.0, |d| d.eta[k])))
+    };
+    let lift_g = |g: [R; K]| -> [J; K] { g.map(J::lift) };
 
-    // The reduced basis (`NnReduction`): the networks' raw outputs as their own directions,
-    // read by every recording below on both of its number types.
+    rtape_reset();
+    let xl: Vec<R> = x.iter().map(|&v| rinput(v)).collect();
+    let el: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
+
+    // The reduced basis (`NnReduction`): the networks' raw outputs as leaves and as their
+    // own directions, read by every recording below on both of its number types.
+    #[cfg(feature = "nn")]
+    let mut zl: Vec<R> = Vec::new();
     #[cfg(feature = "nn")]
     let preset = nn_z.map(|z| {
-        let mut flat = 0;
         let mut outer: Vec<Vec<Out<J>>> = Vec::with_capacity(z.len());
         let mut plain: Vec<Vec<Out>> = Vec::with_capacity(z.len());
         for net in z {
             let (mut o, mut p) = (Vec::with_capacity(net.len()), Vec::with_capacity(net.len()));
             for &v in net {
-                let g: [f64; K] = std::array::from_fn(|a| {
-                    if dirs.get(a).is_some_and(|d| d.z == Some(flat)) {
+                let flat = zl.len();
+                let leaf = rinput(v);
+                zl.push(leaf);
+                let g: [R; K] = std::array::from_fn(|a| {
+                    R::c(if dirs.get(a).is_some_and(|d| d.z == Some(flat)) {
                         1.0
                     } else {
                         0.0
-                    }
+                    })
                 });
-                flat += 1;
-                o.push(DualH {
-                    v: J::from_f64(v),
-                    g: g.map(J::from_f64),
-                    h: zero_h(),
+                o.push(DualT {
+                    v: J::lift(leaf),
+                    g: lift_g(g),
                 });
-                p.push(DualH { v, g, h: [0.0; MK] });
+                p.push(DualT { v: leaf, g });
             }
             outer.push(o);
             plain.push(p);
@@ -645,19 +729,19 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     });
     #[cfg(not(feature = "nn"))]
     let _ = nn_z;
+    #[cfg(not(feature = "nn"))]
+    let zl: Vec<R> = Vec::new();
 
     // The predictions over the outer dual, θ through its packing chain and η along its
     // tangent, each η also carrying its inner unit tangent.
-    let th: Vec<Out<J>> = unpack_theta(template, |i| DualH {
-        v: J::from_f64(x[i]),
-        g: seed(i).map(J::from_f64),
-        h: zero_h(),
+    let th: Vec<Out<J>> = unpack_theta(template, |i| DualT {
+        v: J::lift(xl[i]),
+        g: lift_g(seed(i)),
     });
     let et: Vec<Out<J>> = (0..N)
-        .map(|k| DualH {
-            v: J::eta(eta[k], k),
-            g: tan(k).map(J::from_f64),
-            h: zero_h(),
+        .map(|k| DualT {
+            v: J::eta(el[k], k),
+            g: lift_g(tan(k)),
         })
         .collect();
     let preds = record(
@@ -673,10 +757,9 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
         return None;
     }
     let comp = |y: &Out<J>, c: usize| -> Out {
-        DualH {
+        DualT {
             v: y.v.part(c),
             g: y.g.map(|d| d.part(c)),
-            h: y.h.map(|d| d.part(c)),
         }
     };
     let f: Vec<Out> = preds.iter().map(|y| comp(y, 0)).collect();
@@ -687,18 +770,16 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
 
     // The population parameters along the same directions, each through its packing chain.
     let xo = |i: usize| -> Out {
-        DualH {
-            v: x[i],
+        DualT {
+            v: xl[i],
             g: seed(i),
-            h: [0.0; MK],
         }
     };
     let theta = unpack_theta(template, xo);
     let p = population_params(model, subject, template, params, so, &theta, xo)?;
-    let eo: [Out; N] = std::array::from_fn(|k| DualH {
-        v: eta[k],
+    let eo: [Out; N] = std::array::from_fn(|k| DualT {
+        v: el[k],
         g: tan(k),
-        h: [0.0; MK],
     });
 
     let out = match objective {
@@ -788,7 +869,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                     let b: [Out; N] = std::array::from_fn(|k| {
                         eo[k] + Out::constant(std::f64::consts::SQRT_2) * step[k]
                     });
-                    let bv: Vec<f64> = b.iter().map(|v| v.v).collect();
+                    let bv: Vec<f64> = b.iter().map(|v| v.val()).collect();
                     let fb = record(
                         model,
                         subject,
@@ -801,7 +882,10 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                     .filter(|q| q.len() == n_obs)?;
                     terms.push(Out::constant(c) - inner_l(ctx, &fb, &b, &p, None)?);
                 }
-                let mx = terms.iter().map(|t| t.v).fold(f64::NEG_INFINITY, f64::max);
+                let mx = terms
+                    .iter()
+                    .map(|t| t.val())
+                    .fold(f64::NEG_INFINITY, f64::max);
                 let one = Out::constant(1.0);
                 let sum = <Out as PkNum>::wsum3(
                     0.0,
@@ -819,7 +903,19 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     if preset.as_ref().is_some_and(NnPresetGuard::missed) {
         return None;
     }
-    out
+    #[cfg(feature = "nn")]
+    drop(preset);
+    let (f, g) = out?;
+    Some(Pass {
+        f,
+        g,
+        leaves: Leaves {
+            x: xl.iter().map(|r| r.i).collect(),
+            z: zl.iter().map(|r| r.i).collect(),
+            eta: el.map(|r| r.i),
+        },
+        nodes: crate::sens::rtape::rtape_len(),
+    })
 }
 
 /// `(F, ∇_η l)` for FOCE / FOCEI (`objective`).

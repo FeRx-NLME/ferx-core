@@ -3127,6 +3127,84 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
+/// `psi_along` under a tape budget spends its directions over narrower passes
+/// (`PASS_WIDTH_CAP` stands in for a large tape). Each column must still land on its own
+/// direction: width 3 over 7 packed axes leaves a ragged last pass, so an offset taken from
+/// the pass's own width rather than the planned one misplaces columns. Measured: bit-identical
+/// at widths 1 and 3 (a column's arithmetic does not see the other tangents); a misplaced
+/// column moves the matrix by O(1) of its largest entry.
+#[test]
+fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
+    use super::hessian::PASS_WIDTH_CAP;
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    assert_eq!(
+        x.len(),
+        7,
+        "the fixture must leave a ragged last pass at width 3"
+    );
+    let eta = ebe_for(&one, &s, &params, 1e-12, true);
+    let run = |cap: Option<usize>| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    PASS_WIDTH_CAP.with(|c| c.set(cap));
+                    subject_adjoint_cov_hessian(
+                        &one,
+                        &s,
+                        &params,
+                        &x,
+                        eta.as_slice(),
+                        Objective::Focei,
+                    )
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+        .expect("in scope")
+    };
+    let full = run(None);
+    for cap in [1, 3] {
+        let narrow = run(Some(cap));
+        let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let mut worst = 0.0f64;
+        for (a, b) in narrow.iter().zip(full.iter()) {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "width {cap}: non-finite entry"
+            );
+            worst = worst.max((a - b).abs() / scale);
+        }
+        eprintln!("cov Hessian at width {cap} vs 8: {worst:.2e}");
+        assert!(worst < 1e-12, "width {cap} vs 8: {worst:.2e}");
+    }
+}
+
+/// The tape budget's width rule: the full `K` on a small tape, fewer as one pass along none
+/// approaches the budget, never zero.
+#[test]
+fn cov_hessian_pass_width_follows_the_tape_budget() {
+    use super::hessian::{pass_width, TAPE_NODE_BUDGET};
+    assert_eq!(pass_width(0), 8);
+    assert_eq!(pass_width(1000), 8);
+    // 5 → (5 − 1)·4/5 = 3 directions: ~1 + 1.25·3 ≈ 4.75 × nodes, inside the budget.
+    assert_eq!(pass_width(TAPE_NODE_BUDGET / 5), 3);
+    assert_eq!(pass_width(TAPE_NODE_BUDGET), 1);
+    assert_eq!(pass_width(usize::MAX), 1);
+}
+
 #[test]
 fn cov_hessian_matches_profile_fd_ode_block_omega_combined() {
     let ode = with_tol(

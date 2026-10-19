@@ -61,6 +61,25 @@ pub(crate) fn rtape_reset() {
     t.off.push(0);
 }
 
+/// Nodes on the current recording.
+pub(crate) fn rtape_len() -> usize {
+    rt().off.len().saturating_sub(1)
+}
+
+/// Release the tape's buffers when they hold more than `nodes` nodes' worth: a one-off
+/// large recording (the covariance Hessian's) need not pin its peak on every worker.
+pub(crate) fn rtape_trim(nodes: usize) {
+    let t = rt();
+    if t.off.capacity() > nodes || t.ent.capacity() > 2 * nodes || t.adj.capacity() > 8 * nodes {
+        *t = RTape {
+            off: Vec::new(),
+            ent: Vec::new(),
+            adj: Vec::new(),
+        };
+        t.off.push(0);
+    }
+}
+
 /// A new independent input.
 pub(crate) fn rinput(v: f64) -> R {
     let t = rt();
@@ -942,6 +961,30 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rtape_trim` releases a tape grown past its bound, leaves a small one alone, and the
+    /// released tape records and sweeps as a fresh one.
+    #[test]
+    fn rtape_trim_releases_a_large_tape_and_keeps_a_small_one() {
+        rtape_reset();
+        let mut x = rinput(1.5);
+        for _ in 0..1000 {
+            x = x * R::c(1.0001);
+        }
+        assert_eq!(rtape_len(), 1001);
+        let _ = rsweep::<1>(&[x]);
+        rtape_trim(1 << 20);
+        assert!(
+            rt().off.capacity() >= 1001,
+            "a small tape must keep its buffers"
+        );
+        rtape_trim(100);
+        assert_eq!(rtape_len(), 0);
+        assert!(rt().off.capacity() < 1001 && rt().adj.capacity() == 0);
+        let y = rinput(2.0);
+        let z = y * y;
+        assert_eq!(rsweep::<1>(&[z])[y.i as usize], 4.0);
+    }
 
     /// #2093 review (round 2, finding 12): a constant exponent is the power rule, finite at a
     /// negative base where `exp(e·ln x)` is NaN (`(AGE − 40)^2` at AGE = 30). `x = −2 + t₀`,
