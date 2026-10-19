@@ -4,7 +4,7 @@
 # `classify_covariate_mu_ref` rejects a typical value that reads a local the
 # inliner cannot resolve, so unlike `covmuref_power_saem_fit.ferx` this model
 # has *no* covariate mu-reference group: TVCL keeps its single-anchor
-# mu-reference and TH_WT carries no ETA and rides the eta-frozen numerical
+# mu-reference and TH_WT anchors none and rides the eta-frozen numerical
 # M-step. `WTN` is assigned before an `if` with no `else` and again in its one
 # arm. Until #1422 this fixture wrote the `if`/`else` form, which is now folded
 # into a conditional and detected (that model is

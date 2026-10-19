@@ -367,6 +367,17 @@ Otherwise cross-check against [FOCEI](foce.qmd) or [IMPMAP](impmap.qmd), which
 do not depend on this channel.
 :::
 
+##### A theta whose eta the shift cannot use
+
+The "NO associated ETA" advisory above lists only thetas that appear in no
+statement with an eta. A theta that *does* share a parameter with an eta in a
+form the shift cannot use, such as a Box-Cox
+`CL = TVCL * exp((exp(ETA_CL)^LAMBDA - 1) / LAMBDA)` (`log CL` is not linear in
+the eta) or a covariate coefficient no group owns, rides the same numerical
+M-step but gets its own message (#1715): it "carries an ETA, but not as a
+mu-referenced typical value". Keep the transform. Cross-check against
+FOCEI/IMPMAP, or hold it `FIX`. IMP/IMPMAP and FREM conversion split the same way.
+
 ### Averaging a maximiser is not maximising the average {#saem-mstep-jensen}
 
 The numerical M-step re-maximises the frozen-η objective against **one** draw and
@@ -484,7 +495,7 @@ is why `tests/saem_combined_error.rs` scores it against **simulation truth** rat
 against another estimator.
 
 **Against — the θ half, still open (#1480).** On the #619 `covmuref_power` anchor, whose
-`TH_WT` carries no ETA and therefore moves only through this channel, `score_sa` at the
+`TH_WT` anchors no mu-reference and therefore moves only through this channel, `score_sa` at the
 default 150/250 schedule reaches **0.746** against NONMEM SAEM's 0.921 — outside the
 0.12 window the default solver satisfies. It is slow rather than wrong: at 300/700 it
 lands at **0.9845** (|Δ| 0.063) while `bobyqa` at that same schedule *overshoots* to
