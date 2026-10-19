@@ -3999,7 +3999,7 @@ mod frozen_ebe_variance {
 /// say so: on that file's model it reads `analytic (Dual2)` while the per-subject route (and
 /// the run banner) is FD.
 ///
-/// The control is the same subject without its event record, which the analytic provider
+/// The control is the same subject without its event record, which the analytic recorder
 /// does serve — so the FD half is the survival record's doing, not the model's.
 #[cfg(feature = "survival")]
 #[test]
@@ -4292,8 +4292,8 @@ fn ebe_h_matrices_at_rebuilds_the_inner_loops_h() {
         }
         let rebuilt = ebe_h_matrices_at(&model, &population, &params, &etas, &kappas);
         if capture {
-            // The captured Jacobian comes out of the full `subject_sensitivities` pass, the
-            // rebuild out of the light `subject_eta_jacobian` one: the same `∂f/∂η`, not the
+            // The captured Jacobian comes out of the terminal `exact_eta_jacobian` recording,
+            // the rebuild out of `exact_obs_grads`: the same `∂f/∂η`, not the
             // same rounding. Measured on macOS arm64: 4.8e-16 relative (5.3e-15 absolute),
             // one ULP; the bound leaves 20× headroom.
             let mut worst = 0.0f64;

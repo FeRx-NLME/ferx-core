@@ -110,7 +110,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
 /// analytic-supported model (previously the executor ignored
 /// `model.gradient_method`, so the option silently ran the Dual2 path while
 /// `build_info` reported FD). Uses the bundled warfarin model, which is in the
-/// analytic provider's scope (1-cpt oral, no LTBS / TV-cov / SDE).
+/// analytic (adjoint) scope (1-cpt oral, no LTBS / TV-cov / SDE).
 #[test]
 fn gradient_fd_forces_fd_inner_route() {
     use std::path::Path;
@@ -483,8 +483,9 @@ fn iov_fd_reason_names_the_calls_gradient_fd() {
 /// (`effective_for`, #719/#814); the twin carries a `transit()` forcing, which #835 admits, so
 /// the subject now routes to the analytic ODE-IOV inner gradient rather than FD. (Pre-#835 it
 /// declined with "steady-state dose + built-in absorption forcing"; the still-FD combinations —
-/// SS into a `zero_order` window, SS + absorption lagtime — remain covered by
-/// `iov_fd_reason_attributes_ss_input_rate`.)
+/// SS into a `zero_order` window, SS + absorption lagtime — are rejected upstream
+/// (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`); the pre-#2093
+/// `iov_fd_reason_attributes_ss_input_rate` that pinned their FD reason is retired.)
 #[test]
 fn transit_twin_ss_forcing_is_analytic_under_iov() {
     let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
@@ -3659,8 +3660,8 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
 
 /// **ODE** M3 BLOQ + IOV (#486): the ODE counterpart of
 /// [`iov_m3_inner_grad_matches_fd`]. The analytic stacked-η inner gradient produced
-/// via the **event-driven ODE sensitivity walk** (`ode_subject_eta_grad_iov`, not the
-/// closed-form Dual1 walk) must match Richardson central FD of `individual_nll_iov`
+/// via the **event-driven ODE walk** (`adjoint::exact_obs_grads_in` → `record_ode_iov`, not
+/// the closed-form event recorder) must match Richardson central FD of `individual_nll_iov`
 /// over `[η_bsv, κ₁, κ₂]` on a censored subject. Censoring is provider-agnostic —
 /// the `−logΦ` coefficient rides the same `residual_inner_obs` path keyed on
 /// `subject.cens[j]` whether the walk was closed-form or ODE — so removing the gate
@@ -3870,10 +3871,10 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
 
 /// Closed-form twin of [`analytic_iov_inner_grad_matches_fd_of_nll`] with an η-dependent
 /// `ExpressionScale` `obs_scale = V` divisor (#486): the analytic IOV inner gradient
-/// (`analytic_eta_nll_gradient_iov`, now fed the scaled `subject_eta_grad_iov`) must match
-/// central FD of the same objective `individual_nll_iov` (which applies `obs_scale`) over
-/// the stacked `[η_bsv, κ]` vector — the gradient that drives `find_ebe_iov` for a scaled
-/// closed-form IOV model.
+/// (`analytic_eta_nll_gradient_iov`, fed the scaled jet of `adjoint::exact_obs_grads_in`) must
+/// match central FD of the same objective `individual_nll_iov` (which applies `obs_scale`) over the
+/// stacked `[η_bsv, κ]` vector — the gradient that drives `find_ebe_iov` for a scaled closed-form
+/// IOV model.
 #[test]
 fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
     use crate::parser::model_parser::parse_model_string;
@@ -3963,8 +3964,9 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
 ///
 /// This is the cell that closed the last inner/outer scope split: the outer IOV gradient has
 /// served LTBS since #677, but the `Dual1` inner walk had no `ln` jet, so `find_ebe_iov`
-/// reconverged on finite differences. `run_obs_iov_eta` now applies the shared
-/// `apply_ltbs_transform_inner` last — after the per-occasion scale quotient — so the EBE
+/// reconverged on finite differences. The adjoint's closed-form event recorder
+/// (`record_analytic_events`) now applies the LTBS log (`ltbs_log_g`) last — after the
+/// per-occasion scale quotient — so the EBE
 /// gradient differentiates the same `ln(f/s)` the objective scores.
 ///
 /// Run over BOTH fixtures because the ordering is the part that can silently go wrong:
@@ -4104,7 +4106,8 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
 /// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
 /// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` — including the `η_ruv` column
 /// (`Σ_j 1 − ε²/v`) and the `exp(2·η_ruv)` residual-variance scaling now woven into
-/// the IOV inner gradient. Proves the gate flip (`iov_analytical_supported`) ships a
+/// the IOV inner gradient. Proves the gate flip (then `iov_analytical_supported`, now
+/// the adjoint's `model_in_scope`) ships a
 /// *correct* gradient, not just an enabled one.
 #[test]
 fn iov_iiv_on_ruv_inner_grad_matches_fd() {
@@ -4319,7 +4322,8 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
 /// rows (data term `−logΦ(z)`, matching `individual_nll_iov`'s `−2·m3_logcdf`). The
 /// censored `h·m` f-coefficient rides the stacked Jacobian (κ columns included), so
 /// the EBE minimises the same censored objective. Proves the gate flip
-/// (`iov_analytical_supported` now admits M3) ships a *correct* censored gradient over
+/// (then `iov_analytical_supported`, now the adjoint's `model_in_scope`, admits M3)
+/// ships a *correct* censored gradient over
 /// the stacked layout, not just an enabled one.
 #[test]
 fn iov_m3_inner_grad_matches_fd() {
@@ -4330,8 +4334,8 @@ fn iov_m3_inner_grad_matches_fd() {
         .expect("parse closed-form IOV + M3");
     model.bloq_method = crate::types::BloqMethod::M3;
     // Gate: M3 + IOV is now analytic on both loops (no `iiv_on_ruv`, so not the
-    // FD-only triple). `residual_error_eta` is `None`, so `iov_analytical_supported`
-    // does not early-return on M3.
+    // FD-only triple). `residual_error_eta` is `None`, so the scope check
+    // (`model_in_scope`; pre-#2093 `iov_analytical_supported`) does not early-return on M3.
     assert_eq!(model.residual_error_eta, None);
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));

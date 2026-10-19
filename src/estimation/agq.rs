@@ -228,6 +228,35 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 pub(crate) struct PopulationEvaluation {
     pub(crate) nll: f64,
     gradient: Option<Vec<f64>>,
+    /// How each subject's score was formed, in subject order (for the outer FD-fallback
+    /// warning).
+    routes: Vec<ScoreRoute>,
+}
+
+/// How [`SubjectScoreContext::score_routed`] formed a subject's score.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScoreRoute {
+    /// The adjoint's exact `dFᵢ/dx`.
+    Exact,
+    /// The adjoint's held-EBE score (no EBE response):
+    /// `adjoint::subject_adjoint_held_ebe_score`.
+    HeldEbe,
+    /// The reconverged finite-difference score.
+    Reconverged,
+}
+
+impl ScoreRoute {
+    /// Record a non-exact route for subject `i` in the outer FD-fallback log.
+    fn record(self, log: &crate::estimation::outer_optimizer::OuterFdDeclineLog, i: usize) {
+        match self {
+            ScoreRoute::Exact => {}
+            ScoreRoute::HeldEbe => log.record(i),
+            ScoreRoute::Reconverged => {
+                log.record(i);
+                log.record_structural(i);
+            }
+        }
+    }
 }
 
 impl Stack {
@@ -325,8 +354,8 @@ impl Stack {
 
     /// Same dispatch as [`Stack::nll_at`], but takes the `err_keys`/`ruv_mult`/scratch as
     /// caller-hoisted arguments instead of computing or allocating them per call. The hot
-    /// per-node sweep in [`agq_terms`] hoists these once for the whole grid (the
-    /// same hoist `node_nll_gradient` gets); routing both call shapes through this one
+    /// per-node sweep in [`agq_terms`] hoists these once for the whole grid; routing both
+    /// call shapes through this one
     /// IOV/non-IOV branch keeps a single copy of the dispatch instead of two that must be
     /// kept in sync.
     #[allow(clippy::too_many_arguments)]
@@ -476,7 +505,8 @@ fn fd_posterior_hessian(
 ///   refinement of FOCEI.
 ///
 /// **The two anchors stay different matrices — that is the estimator distinction.** Sharing
-/// `score_core` unifies the *computation*, not the result: `laplace, n_agq = 1` is NONMEM
+/// one recorder (the adjoint's `run_agq`, `Objective::Agq { exact }`) unifies the
+/// *computation*, not the result: `laplace, n_agq = 1` is NONMEM
 /// `LAPLACIAN INTER` and `focei, n_agq = 1` is plain FOCEI, and it is exactly the anchor that
 /// separates them. Reading `htilde` here for `Exact` would silently turn Laplace into FOCEI
 /// while it kept reporting Laplace OFVs.
@@ -728,7 +758,7 @@ fn agq_terms(
     }
 }
 
-/// [`agq_subject_objective`] under a chosen Hessian anchor (`Exact` is Laplace's).
+/// [`agq_subject_nll`] under a chosen Hessian anchor (`Exact` is Laplace's).
 #[cfg(test)]
 pub(crate) fn agq_subject_objective_anchored(
     model: &CompiledModel,
@@ -937,7 +967,7 @@ fn agq_population_evaluate_impl(
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
-    let per_subject: Vec<(f64, Option<Vec<f64>>)> = population
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>)> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -965,7 +995,7 @@ fn agq_population_evaluate_impl(
                 None,
                 terminal_work.map(|all| all[i].1),
             );
-            let score = context.score(subject, eta_hats[i].as_slice(), subj_kappas);
+            let score = context.score_routed(subject, eta_hats[i].as_slice(), subj_kappas, true);
             (nll, score)
         })
         .collect();
@@ -973,13 +1003,21 @@ fn agq_population_evaluate_impl(
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
         |mut result, (_, score)| -> Option<Vec<f64>> {
-            for (out, g) in result.iter_mut().zip(score.as_ref()?) {
+            for (out, g) in result.iter_mut().zip(&score.as_ref()?.0) {
                 *out += 2.0 * g;
             }
             Some(result)
         },
     );
-    PopulationEvaluation { nll, gradient }
+    let routes = per_subject
+        .iter()
+        .map(|(_, s)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
+        .collect();
+    PopulationEvaluation {
+        nll,
+        gradient,
+        routes,
+    }
 }
 
 /// Assemble the stacked mode `b̂ = [η̂, κ̂₁ … κ̂_K]` from what the shared inner loop already
@@ -1032,9 +1070,9 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
 }
 
 /// Analytic packed gradient of the AGQ objective for one subject: the posterior-weighted
-/// average of fixed-η scores over the quadrature nodes, **plus** the grid-response term
-/// [`grid_response_correction`] that makes it the exact total derivative at every `n_agq`
-/// (see the module note above).
+/// average of fixed-η scores over the quadrature nodes, **plus** the grid-response term that
+/// makes it the exact total derivative at every `n_agq` — both recorded on the adjoint's
+/// tape (`adjoint::run_agq`, see the module note above).
 ///
 /// `out` is the population accumulator; this adds `∂F_i/∂x` into it.
 fn agq_subject_packed_gradient(
@@ -1101,43 +1139,71 @@ impl<'a> SubjectScoreContext<'a> {
         }
     }
 
-    /// Negative-log-likelihood score, with per-subject numerical salvage.
+    /// Negative-log-likelihood score: the exact `dFᵢ/dx`, else the reconverged
+    /// finite-difference score. The covariance step's form, which never takes a held-EBE
+    /// score into `S`.
     pub(crate) fn score(
         &self,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
     ) -> Option<Vec<f64>> {
+        self.score_routed(subject, eta, kappas, false)
+            .map(|(g, _)| g)
+    }
+
+    /// [`Self::score`], and with `held_ok` the optimizer's salvage between the two: a
+    /// subject whose mode identity the adjoint declines takes the held-EBE score
+    /// ([`ScoreRoute::HeldEbe`]) rather than `2·n_x` EBE re-solves — what FOCE/FOCEI do with
+    /// the same subject. Not under IOV, whose FOCEI salvage is the reconverged one.
+    pub(crate) fn score_routed(
+        &self,
+        subject: &Subject,
+        eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>],
+        held_ok: bool,
+    ) -> Option<(Vec<f64>, ScoreRoute)> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
         }
+        let joint_warm = stack_mode(eta, kappas);
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
-            use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient, Objective};
+            use crate::sens::ode_provider::adjoint::{
+                subject_adjoint_gradient, subject_adjoint_held_ebe_score, Objective,
+            };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
                 exact: matches!(self.options.hessian_anchor(), HessianAnchor::Exact),
             };
-            if let Some(mut g) = subject_adjoint_gradient(
-                self.model,
-                subject,
-                self.template,
-                self.x,
-                &stack_mode(eta, kappas),
-                objective,
-            ) {
-                if g.len() == self.x.len() && g.iter().all(|v| v.is_finite()) {
-                    for (v, fixed) in g.iter_mut().zip(&self.fixed) {
-                        if *fixed {
-                            *v = 0.0;
-                        }
+            let accept = |g: Option<Vec<f64>>| {
+                let mut g = g?;
+                if g.len() != self.x.len() || !g.iter().all(|v| v.is_finite()) {
+                    return None;
+                }
+                for (v, fixed) in g.iter_mut().zip(&self.fixed) {
+                    if *fixed {
+                        *v = 0.0;
                     }
-                    return Some(g);
+                }
+                Some(g)
+            };
+            let args = (self.model, subject, self.template, self.x, &joint_warm[..]);
+            if let Some(g) = accept(subject_adjoint_gradient(
+                args.0, args.1, args.2, args.3, args.4, objective,
+            )) {
+                return Some((g, ScoreRoute::Exact));
+            }
+            if held_ok && self.model.n_kappa == 0 {
+                if let Some(g) = accept(subject_adjoint_held_ebe_score(
+                    args.0, args.1, args.2, args.3, args.4, objective,
+                )) {
+                    return Some((g, ScoreRoute::HeldEbe));
                 }
             }
         }
-        let joint_warm = stack_mode(eta, kappas);
         self.finite_difference_score(subject, &joint_warm)
+            .map(|g| (g, ScoreRoute::Reconverged))
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -1216,8 +1282,14 @@ pub(crate) fn population_gradient_mixed(
     options: &crate::types::FitOptions,
     force_fd: bool,
     evaluation: Option<PopulationEvaluation>,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> Option<Vec<f64>> {
     if let Some(evaluation) = evaluation {
+        if let Some(log) = declines {
+            for (i, route) in evaluation.routes.iter().enumerate() {
+                route.record(log, i);
+            }
+        }
         return evaluation.gradient;
     }
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
@@ -1226,16 +1298,21 @@ pub(crate) fn population_gradient_mixed(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            context.score(
+            context.score_routed(
                 subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                true,
             )
         })
         .collect();
     let mut result = vec![0.0; x.len()];
-    for score in scores {
-        for (out, g) in result.iter_mut().zip(score?) {
+    for (i, score) in scores.into_iter().enumerate() {
+        let (score, route) = score?;
+        if let Some(log) = declines {
+            route.record(log, i);
+        }
+        for (out, g) in result.iter_mut().zip(score) {
             *out += 2.0 * g;
         }
     }
@@ -1341,8 +1418,8 @@ mod tests {
     // AGQ's score used to hand-roll a *Gaussian-only* residual chain, so five endpoint
     // families that FOCE/FOCEI already handled analytically (M3-BLOQ, `iiv_on_ruv`, a
     // custom sigma magnitude, LTBS, correlated residual) fell back to the fixed-b FD score.
-    // It now shares `sens_outer_gradient::score_core`, so the chain is the SAME one
-    // FOCE/FOCEI uses and the per-family gates are gone.
+    // It now shares the adjoint recorder (`sens::ode_provider::adjoint`), so the chain is the
+    // SAME one FOCE/FOCEI uses and the per-family gates are gone.
     //
     // The reference below is a central difference of `Stack::nll_at` at a **fixed, non-mode
     // b**. That matters: it differences the exact conditional NLL the AGQ objective
@@ -1515,6 +1592,7 @@ mod tests {
                 &options,
                 false,
                 None,
+                None,
             )
             .expect("uncached gradient");
             let fused = population_gradient_mixed(
@@ -1528,6 +1606,7 @@ mod tests {
                 &options,
                 false,
                 Some(evaluation),
+                None,
             )
             .expect("fused gradient");
             assert_eq!(fused.len(), uncached.len());

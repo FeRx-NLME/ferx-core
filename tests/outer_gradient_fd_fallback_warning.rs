@@ -1,6 +1,6 @@
 //! #1154 — a runtime analytic-sensitivity decline must reach `FitResult::warnings`.
 //!
-//! A subject whose data shape falls out of the outer sensitivity provider's scope is
+//! A subject whose data shape falls out of the analytic outer gradient's scope is
 //! salvaged onto a per-subject gradient (held-EBE since #1529; reconverged FD under IOV).
 //! Before #1154 that was invisible: no warning code, no count, and
 //! `FitResult::gradient_method_outer` keeps reporting `analytic (Dual2)` because it reads a

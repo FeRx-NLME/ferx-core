@@ -40,7 +40,7 @@ const ANALYTICAL_SRC: &str = r"
 ";
 
 /// Hand-transcribed ODE twin of the same model. Uses the **Form-C readout**
-/// (`y = central / V`), which the ODE sensitivity provider supports — *not* the
+/// (`y = central / V`), which the analytic (adjoint) ODE gradient supports — *not* the
 /// `obs_scale = V` divisor form (out of scope), so the fit genuinely exercises the
 /// armed analytic ODE gradient. Tight ODE tolerances so the integrated solution
 /// (and its propagated sensitivities) reproduce the closed form to estimate level.

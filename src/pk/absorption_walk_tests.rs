@@ -788,3 +788,144 @@ fn nonmem_anchor_populations_route_to_the_walk_at_nonmem_ebes() {
         assert_eq!(walked, want_walked, "{name}: subjects on the walk");
     }
 }
+
+/// 1-cpt transit, IOV on `CL` only (`KTR = 3/4 = 0.75`, `ke = 0.12·e^κ`). WT on `CL` too, so
+/// the non-IOV route can be pushed across the same boundary by the covariate.
+const TRANSIT_IOV_CL: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(25.0, 1.0, 500.0)
+  theta TVN(2.0, 0.0, 30.0)
+  theta TVMTT(4.0, 0.05, 24.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^3 * exp(KAPPA_CL)
+  V   = TVV * exp(ETA_V)
+  NTR = TVN
+  MTT = TVMTT
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// T6 (#1560): the route is decided per subject **at its parameters**, on both sides of the
+/// flip-flop gate, and every consumer takes the same one.
+///
+/// Occasion 2 opens at `t = 5` while dose 1 (`KTR = 0.75`) is still absorbing. `κ_CL(occ 2)`
+/// sets that occasion's `ke`: at `ln(0.9/0.12)` it is `0.9 ≥ KTR` → the **twin**; at
+/// `ln(0.5/0.12)` it is `0.5 < KTR` → the **walk**. Occasion 1's `ke` is `0.12` in both, so a
+/// router that looked only at `t = 0` / η (the pre-#1560 `absorption_flip_flop_at`) or ignored
+/// κ would call both "walk". For each side, three consumers must agree: the router
+/// (`effective_model_for_eval_iov`), the value path (`predict_iov`, bit-identical to the
+/// chosen engine) and the adjoint's recording (walk counter). The non-IOV route is then pushed
+/// across the same boundary by a covariate instead: `WT` on `CL` to the third power.
+/// Finally the structural exclusions — SS, infusion — never reach the walk.
+#[test]
+fn route_is_decided_per_subject_at_its_parameters_on_both_sides_of_flip_flop() {
+    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
+    let tw = twin(&model);
+    let theta = model.default_params.theta.clone();
+    let subject = subject_from(
+        &[(0.0, 1, 70.0), (6.0, 2, 70.0)],
+        &[
+            (1.0, 1, 70.0),
+            (3.0, 1, 70.0),
+            (5.0, 2, 70.0),
+            (7.0, 2, 70.0),
+            (9.0, 2, 70.0),
+        ],
+    );
+    assert!(walk_eligible(&model, &subject));
+    for (ke2, want_walk) in [(0.9, false), (0.5, true)] {
+        let kappas = vec![vec![0.0], vec![(ke2 / 0.12_f64).ln()]];
+        let stacked = [ETA_V, kappas[0][0], kappas[1][0]];
+        let route = crate::pk::effective_model_for_eval_iov(&model, &subject, &theta, &stacked);
+        assert_eq!(
+            std::ptr::eq(route, &model),
+            want_walk,
+            "ke₂ = {ke2}: router says {}",
+            if std::ptr::eq(route, &model) {
+                "walk"
+            } else {
+                "twin"
+            }
+        );
+        let got = crate::pk::predict_iov(&model, &subject, &theta, &[ETA_V], &kappas);
+        let engine = if want_walk {
+            let (d, o, p) = iov_event_params(&model, &subject, &theta, &[ETA_V], &kappas);
+            absorption_walk_predictions(model.pk_model, &subject, &d, &o, &p, None)
+                .expect("in domain")
+        } else {
+            crate::pk::predict_iov(tw, &subject, &theta, &[ETA_V], &kappas)
+        };
+        for (a, b) in got.iter().zip(&engine) {
+            assert!(
+                a.is_finite() && a.to_bits() == b.to_bits(),
+                "ke₂ = {ke2}: {a} vs {b}"
+            );
+        }
+        use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
+        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
+        crate::sens::ode_provider::adjoint::exact_eta_jacobian(&model, &subject, &theta, &stacked)
+            .expect("the adjoint's recording is analytic on either route");
+        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs > 0,
+            want_walk,
+            "ke₂ = {ke2}: sens walk ran {runs} times"
+        );
+    }
+
+    // Non-IOV: the same boundary crossed by WT (CL ∝ WT³), κ = 0.
+    for (wt2, want_walk) in [(137.0, false), (112.0, true)] {
+        let mut tv = subject_from(
+            &[(0.0, 1, 70.0), (6.0, 2, wt2)],
+            &[
+                (1.0, 1, 70.0),
+                (3.0, 1, 70.0),
+                (5.0, 2, wt2),
+                (7.0, 2, wt2),
+                (9.0, 2, wt2),
+            ],
+        );
+        tv.occasions.clear();
+        tv.dose_occasions.clear();
+        let eta = [ETA_V, 0.0];
+        // ke = 0.12·(WT/70)³: 0.90 at 137 kg, 0.52 at 112 kg, against KTR = 0.75.
+        let route = crate::pk::effective_model_for_eval(&model, &tv, &theta, &eta);
+        assert_eq!(std::ptr::eq(route, &model), want_walk, "WT₂ = {wt2}");
+        let got = crate::pk::compute_predictions_with_tv(&model, &tv, &theta, &eta);
+        let want = if want_walk {
+            let mut ev = crate::pk::EventPkParams::default();
+            crate::pk::compute_event_pk_params_into(&model, &tv, &theta, &eta, &mut ev);
+            absorption_walk_predictions(model.pk_model, &tv, &ev.dose, &ev.obs, &ev.pk_only, None)
+                .expect("in domain")
+        } else {
+            crate::pk::compute_predictions_with_tv(tw, &tv, &theta, &eta)
+        };
+        for (a, b) in got.iter().zip(&want) {
+            assert!(a.is_finite() && a.to_bits() == b.to_bits(), "WT₂ = {wt2}");
+        }
+    }
+
+    // Structural exclusions: an SS dose or an infusion is never walk-eligible.
+    let mut ss = subject.clone();
+    ss.doses[1] = DoseEvent::new(6.0, 100.0, 1, 0.0, true, 12.0);
+    let mut inf = subject.clone();
+    inf.doses[1] = DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0);
+    for (name, s) in [("SS", &ss), ("infusion", &inf)] {
+        assert!(!walk_eligible(&model, s), "{name}");
+        assert!(
+            std::ptr::eq(
+                crate::pk::effective_model_for_eval_iov(&model, s, &theta, &[ETA_V, 0.0, 0.0]),
+                tw
+            ),
+            "{name}: the twin"
+        );
+    }
+}

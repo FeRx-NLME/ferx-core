@@ -147,7 +147,7 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
                         s.id
                     );
                 }
-                // The dual inner gradient ran, so the analytic provider is what was anchored.
+                // The analytic inner gradient ran, so the exact (adjoint) path is what was anchored.
                 if let Some(w) = fit
                     .warnings
                     .iter()

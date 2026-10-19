@@ -252,7 +252,7 @@ fn via_with_states(model: &CompiledModel, pop: &Population) -> Vec<(String, f64,
     with_raw(model, pop, out)
 }
 
-/// A dual walk's value (`o.f`). Every subject must stay on the analytic provider: an
+/// A dual walk's value (`o.f`). Every subject must stay on `subject_eta_grad`'s dual walk: an
 /// FD-routed subject would make this leg FD-of-f64 and blind to the dual walk (T3).
 fn via_dual(
     model: &CompiledModel,

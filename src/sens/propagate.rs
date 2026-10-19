@@ -746,7 +746,7 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
 }
 
 /// True when the generic walk implements this model — all six analytical 1-/2-/3-
-/// cpt models. Callers (`subject_sensitivities_iov`) screen earlier; this is the
+/// cpt models. Callers screen earlier; this is the
 /// defensive backstop.
 #[inline]
 fn walk_supports(pk_model: PkModel) -> bool {
@@ -1161,8 +1161,9 @@ fn obs_boundary_correction<T: PkNum>(
 /// value: `grad = ∂(truncated value)/∂θ`, with no value/gradient mismatch to stall the outer
 /// line search. The variational recursion shares the value iteration's monodromy, so the
 /// derivative tails contract at the same geometric rate — but they lag the value by a constant
-/// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, see
-/// `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`) survives the value stop.
+/// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, measured by the
+/// pre-#2093 `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`, retired in
+/// #2093) survives the value stop.
 /// That residual is
 /// 3–4 orders below the `1e-3` gradient-validation tolerance and NONMEM's SE-matching precision,
 /// so the surviving gradient is faithful for every reported purpose; chasing it to zero would
@@ -1358,9 +1359,10 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     // peak — production's clamped value — and drops the `−d(lag)` jet with it, since the jet
     // reaches the state only through `apply_step_g`. Writing the clamp a second time into
     // `phase` itself would reject exactly these inputs, so neither copy could fail on its own
-    // (#1229, "two redundant gates cover for each other"). Measured: with the single gate
-    // below removed, `ss_bolus_lag_at_least_interval_matches_production` fails; with the
-    // clamp *also* written into `phase`, it passed.
+    // (#1229, "two redundant gates cover for each other"). Measured before #2093: with the
+    // single gate below removed, the retired `ss_bolus_lag_at_least_interval_matches_production`
+    // failed; with the clamp *also* written into `phase`, it passed. Its adjoint successor is
+    // `ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd`.
     //
     // Past `lag >= II` the clamped phase is locally constant, so keeping `−d(lag)` would
     // differentiate a function production does not predict, and the negative step would

@@ -709,7 +709,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 if !interaction && model.error_spec.has_f_dependent_variance() {
                     let et0 = vec![Out::<J>::constant(0.0); N];
                     let p0 = record(
-                        model,
+                        sc.pop_model,
                         subject,
                         sc.layout.as_ref(),
                         &params.theta,
@@ -765,7 +765,10 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 focei_htilde(ctx, &f, &g, &eo, &p)?
             };
             regularise(&mut h_a);
-            let lh = chol(&h_a)?;
+            // Production's (and the gradient's) fallback when the regularised anchor is not
+            // positive-definite: the prior precision `Ω⁻¹` scales the grid and enters `½log|·|`
+            // (`build_proposal`), so the R-matrix differentiates that objective too.
+            let lh = chol(&h_a).or_else(|| chol(&p.omega.inv))?;
             let half_logdet = Out::constant(0.5) * chol_logdet(&lh);
             let a = if n_agq == 1 {
                 inner_l(ctx, &f, &eo, &p, None)? + half_logdet

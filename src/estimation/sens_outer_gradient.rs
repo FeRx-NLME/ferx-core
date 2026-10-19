@@ -153,13 +153,15 @@ pub(crate) fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize
 
 /// Per-subject `dη̂/dx` Jacobians (one `n_eta`-vector per packed coordinate) for the whole
 /// population, or `None` if any subject is unsupported: the exact mode response
-/// (`adjoint::subject_adjoint_eta_dx`).
+/// (`adjoint::subject_adjoint_eta_dx`) of the fit's own inner problem — FOCEI's conditional
+/// mode when `interaction`, FOCE's frozen-variance mode otherwise (#2093 review).
 pub fn population_eta_dx(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
     x: &[f64],
     eta_hats: &[DVector<f64>],
+    interaction: bool,
 ) -> Option<Vec<Vec<DVector<f64>>>> {
     population
         .subjects
@@ -172,7 +174,7 @@ pub fn population_eta_dx(
                 template,
                 x,
                 eta_hats[i].as_slice(),
-                true,
+                interaction,
             )
         })
         .collect()

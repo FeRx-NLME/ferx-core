@@ -13,8 +13,11 @@
 //! NONMEM equivalent: the quantity is which gradient row a PK slot maps to for a
 //! name that influences no prediction, and NONMEM's `$PK` has no slot map — every
 //! `$PK` variable is just a variable, so there is no control stream that spells the
-//! difference. The exact-derivative oracle (central FD of the production predictor)
-//! lives in the Tier-1 `an_unbound_lognormal_parameter_does_not_steal_cls_gradient_row`.
+//! difference. The exact-derivative oracle (central FD of the production predictor) lived
+//! in the Tier-1 `an_unbound_lognormal_parameter_does_not_steal_cls_gradient_row`, retired in
+//! #2093; the recorder side is pinned by
+//! `unbound_parameter_and_literal_pk_argument_stay_in_recorder_scope`
+//! (`sens/ode_adjoint_tests.rs`).
 //!
 //! Eval-only (`outer_maxiter = 0`), so this returns immediately.
 

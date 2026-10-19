@@ -156,7 +156,7 @@ Internally the exponent travels on the residual-magnitude channel — the same
 per-observation plumbing `weight =` and the magnitude expressions use — so
 every estimator, IWRES, CWRES and the simulated draw see it, and the analytic
 FOCE/FOCEI gradients carry `∂R/∂P` exactly (pinned against finite differences
-in `sens_outer_gradient_tests.rs`). One consequence worth knowing: because the
+in `sens/ode_adjoint_tests.rs`, `custom_residual_magnitude_objective_and_gradients`). One consequence worth knowing: because the
 magnitude path assembles the variance as `((f·f)·σ)·σ` where the bare
 proportional path uses `(f·σ)·(f·σ)`, a `power(σ, 1)` fit agrees with the
 plain proportional one to about one ULP, not bit for bit.
@@ -349,10 +349,10 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   term in `∂R/∂θ`, since `mult(θ)` enters the residual variance independent of
   the prediction). For plain (non-interaction) **FOCE** the same magnitude enters
   the Sheiner–Beal marginal through its typical-value residual variance `R⁰`
-  (value and direct-θ derivative), on both the non-IOV and IOV paths. A few
-  combinations still fall back to finite differences (which remain
-  magnitude-aware, so fits stay correct, just slower): `block_sigma` correlated
-  residual error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas.
+  (value and direct-θ derivative), on both the non-IOV and IOV paths. Since #2093
+  the outer gradient is exact under FOCE, FOCEI and Laplace with any number of θ.
+  With a correlated residual (`block_sigma`, `correlation`) the inner EBE gradient
+  takes magnitude-aware finite differences.
 - **The direct-θ channel and the other estimators.** When the magnitude
   expression names a θ, that θ moves the residual variance *directly* as well as
   through the prediction. SAEM's M-step carries both (it differences the whole
@@ -1076,7 +1076,9 @@ Notes and constraints:
   `exp(2·ETA_RUV)`, contributing the Almquist interaction column to `H̃` and the
   matching `∂NLL/∂η_ruv = Σ(1−ε²/v)` data term. The inner EBE gradient is analytic
   too except under LTBS, where it keeps finite differences (the established LTBS
-  choice). IOV and M3-BLOQ `iiv_on_ruv` models keep the finite-difference gradient.
+  choice). Since #2093 IOV and M3-BLOQ `iiv_on_ruv` models are exact too: the
+  adjoint serves their outer gradient, and their inner gradient is the analytic
+  stacked one (pinned against FD, M3 × IOV × `iiv_on_ruv` included).
 
 **Identifiability.** A residual-error random effect is a *variance-of-variance*
 term and is only weakly identified when the data carry little per-subject

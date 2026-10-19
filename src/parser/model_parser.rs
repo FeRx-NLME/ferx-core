@@ -2541,10 +2541,10 @@ fn classify_indiv_params(
                 // must not produce an `EtaParamInfo`. `__ferx_ro_eta{k} = ETA(k)` is a bare
                 // `Expression::Eta`, which `classify_expr` has no pattern for, so it would fall
                 // to the `Custom` arm below and surface in `FitResult.eta_param_info` (hence
-                // ferx-r's parameter table) under a name the user never wrote. Worse, a single
-                // `Custom` entry flips `resolve_param_derivs` / `subject_eta_grad`'s
+                // ferx-r's parameter table) under a name the user never wrote. Worse (before
+                // #2093), a single `Custom` entry flipped the retired `resolve_param_derivs`
                 // "all LogNormal" fallback to `None`, dropping the whole model to FD whenever
-                // the program path is unavailable. Applies to both engines: the ODE half of
+                // the program path was unavailable. Applies to both engines: the ODE half of
                 // this desugaring has appended such statements since #631, and
                 // `classify_indiv_params` runs after both append sites (PR #950 review #4).
                 if is_synthetic_readout_param(param_name) {
@@ -3045,10 +3045,10 @@ fn leaf_scales(
     out
 }
 
-/// Whether the closed-form log-normal η chain the sensitivity providers fall
-/// back to is **exact** for this model (#1669 review finding 1).
+/// Whether the closed-form log-normal η chain the pre-#2093 forward sensitivity
+/// providers fell back to is **exact** for this model (#1669 review finding 1).
 ///
-/// That chain (`lognormal_param_derivatives`) computes `∂p_i/∂η_k =
+/// That chain (the retired `lognormal_param_derivatives`) computed `∂p_i/∂η_k =
 /// p_i · sel_flat[i, k]`, i.e. it assumes every individual parameter is
 /// `g(θ, cov) · exp(η)` with its one BSV η written directly in its own
 /// assignment and recorded in `eta_map`. It used to be gated on "every
@@ -4276,7 +4276,7 @@ pub fn parse_full_model_with(
     // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
     // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
     // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
-    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // mapped PK slot out of the individual-parameter program's `pk_slots_ref`, so
     // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
     // follow-up). Rewriting the binding to reference the synthetic parameter makes the
     // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
@@ -5036,8 +5036,8 @@ pub fn parse_full_model_with(
         // their allocated slot instead of aliasing `CL` via the `unwrap_or(0)`.
         // The modeled-dose `D{cmt}`/`R{cmt}` pairs (#324) are skipped: they were
         // never in `pk_param_map`, so this vector has always given them `0`, and
-        // `analytical_supported` keys its FD routing on the slots it sees here —
-        // keeping them out keeps that routing exactly as it was.
+        // the pre-#2093 `analytical_supported` predicate keyed its FD routing on the
+        // slots it saw here — keeping them out keeps this vector exactly as it was.
         let modeled: Vec<usize> = analytical_modeled_slots.iter().map(|(_, s)| *s).collect();
         (0..indiv_var_names.len())
             .map(|var_slot| {
@@ -5847,7 +5847,7 @@ pub fn parse_full_model_with(
         // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the user
         // omitted `obs_cmt=`) with the parsed Single/PerCmt readout. Analytic
         // (#650): store the readout on `model.analytic_readout`, where the
-        // closed-form predictor and the analytic sensitivity provider pick it up
+        // closed-form predictor and the adjoint gradient pick it up
         // (analytical models have `ode_spec == None`).
         if let Some(new_readout) = output_fn {
             if is_ode_model {
@@ -10993,7 +10993,7 @@ fn parse_scaling_key(key: &str) -> Result<(&str, Option<usize>), String> {
 ///
 /// Single source of truth for the `obs_scale` (issue #367) and `init` amount
 /// (issue #524) programs — they share the same axis layout, so they must lower
-/// identically or the analytic provider would differentiate the two on
+/// identically or the analytic gradient would differentiate the two on
 /// inconsistent ABIs. A `Variable(name)` (an individual parameter) → var slot `i`
 /// (flat PK slot `pk_indices[i]`); covariates → sorted cov slots; θ/η are read
 /// directly from the seed duals. The input `expr` is cloned, so the caller keeps
@@ -11142,7 +11142,7 @@ fn build_obs_scale_spec(
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
     // Differentiable scale program (issue #367): compile the same expression to
-    // bytecode so the analytic sensitivity provider can differentiate `f / scale`
+    // bytecode so the analytic (adjoint) gradient can differentiate `f / scale`
     // exactly instead of finite-differencing the opaque closure. Shared lowering
     // with the `init` amount program (issue #524) — see `compile_scale_deriv_program`.
     let deriv = Some(compile_scale_deriv_program(
@@ -11294,7 +11294,7 @@ fn build_init_amount_fn(
     // Build the differentiable `A₀` program from a (possibly resolved) expression
     // AST. Shares the `obs_scale` lowering (`compile_scale_deriv_program`) so the
     // init impulse and the scale divisor differentiate on the same ABI; this lets
-    // the analytic sensitivity provider differentiate the init impulse exactly
+    // the analytic (adjoint) gradient differentiate the init impulse exactly
     // (issue #524) instead of finite-differencing `amount_fn`.
     let build_deriv = |expr: &Expression| -> ScaleDerivProgram {
         compile_scale_deriv_program(expr, theta_names, eta_names, indiv_var_names, pk_indices)
@@ -11652,7 +11652,7 @@ pub(crate) fn build_y_output_fn(
     // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
     // back to `Variable(synthetic_name)`. The readout then compiles to `Op::PushVar`
     // and its θ/η dependence rides the individual-parameter sensitivity chain — so the
-    // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
+    // analytic gradient serves it instead of dropping the subject to FD. Any θ/η left
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
     visit_expr_nodes(&expr, &mut |e| {
@@ -11915,7 +11915,7 @@ fn parse_scaling_block(
     let mut y_per_cmt: HashMap<usize, crate::ode::PerCmtReadout> = HashMap::new();
     // Sensitivity program for the uniform `y = <expr>` readout (issue #367). The
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
-    // so the analytic-sensitivity provider can differentiate each endpoint.
+    // so the analytic (adjoint) gradient can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
     let mut scaling_covariates: Vec<String> = Vec::new();
     // Synthetic readout parameters the `y` lines read after the #486/#1636 rewrite.
@@ -19794,7 +19794,7 @@ fn compile_ruv_mag_deriv_program(
     // front — so without a reserved slot here, `resolve_expr_indices` would map
     // `MACHEPS` to `VariableIdx(usize::MAX)`, which silently evaluates to `0.0`
     // instead of `f64::EPSILON` (mirrors the ODE var builder's `macheps_slot`).
-    // Slot 2 = `TAD` (#1182), fed per observation by `theta_grad`.
+    // Slot 2 = `TAD` (#1182), fed per observation through `eval_g`'s `tad` argument.
     let mut var_idx: HashMap<String, usize> = [
         ("MACHEPS".to_string(), 1),
         ("macheps".to_string(), 1),
@@ -20327,7 +20327,7 @@ fn build_pk_param_fn(
     // #650: merge readout-referenced non-structural individual parameters into the
     // structural mapping, so they are written by the closure below AND land in the
     // program's `pk_var_slots` (line 9142 clones `pk_assignment_mapping`) — giving
-    // the analytic sensitivity provider their exact `∂/∂(θ,η)` for the readout.
+    // the analytic (adjoint) gradient their exact `∂/∂(θ,η)` for the readout.
     for (var_name, pk_slot) in readout_extra_slots {
         if let Some(var_slot) = var_idx
             .get(var_name)
@@ -20398,7 +20398,7 @@ fn build_pk_param_fn(
         // slots (#486). The latter are not read by the closed-form kernels, but the
         // analytic-sensitivity chain needs their `∂/∂(θ,η)` (+ 2nd order) rows so the
         // event-driven walk can seed the modeled infusion rate/window dual
-        // (`pk_slot_dual_outer` looks the slot up in `pk_slots`). Appended after the
+        // (the adjoint's `taped_params` maps the slot through `pk_var_slots`). Appended after the
         // structural slots so the row order stays stable; empty for a model with no
         // modeled dose, so this is a no-op there. A fixed-dose subject of such a model
         // routes to superposition, where the extra slot is seeded but unread (its
@@ -21502,7 +21502,9 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
 
 thread_local! {
     /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
-    /// evaluator. See [`ModelNnGuard`].
+    /// evaluator. Its installer (`ModelNnGuard`) was retired with the forward provider
+    /// (#2093), so it is empty in practice; the adjoint supplies NN outputs on its own
+    /// number type through `ModelNnDualGuard`.
     static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -21522,7 +21524,8 @@ fn current_nn_axis_base() -> Option<usize> {
 /// RAII guard that makes the generic evaluator seed every `[covariate_nn]` output as an
 /// **independent dual variable**: output `flat` (networks in `covariate_nns` order, each
 /// network's outputs in declaration order) lands on axis `base + flat`. Pair it with a
-/// [`ModelNnGuard`] supplying the outputs' values at the same covariate snapshot.
+/// source of the outputs' values at the same covariate snapshot (the retired
+/// `ModelNnGuard` before #2093).
 ///
 /// This is how the FOCE/FOCEI TV-cov walk gets an exact `∂p/∂z` (and the mixed
 /// `∂²p/∂η∂z`) from one `Dual2` program evaluation, to be chained to the weight thetas
@@ -21573,7 +21576,8 @@ fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
 
 /// RAII guard installing `[covariate_nn]` outputs computed on the evaluator's own number
 /// type — the network evaluated over taped weights — so the generic evaluator reads them
-/// with their derivatives, in place of [`ModelNnGuard`]'s `f64` constants.
+/// with their derivatives, in place of the `f64` constants the retired `ModelNnGuard`
+/// installed before #2093.
 #[cfg(feature = "nn")]
 pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
 
@@ -21591,8 +21595,8 @@ impl Drop for ModelNnDualGuard {
     }
 }
 
-/// Run `f` with the ambient NN outputs borrowed. Empty unless a [`ModelNnGuard`] is
-/// live on this thread.
+/// Run `f` with the ambient NN outputs borrowed. Empty unless something has filled
+/// `MODEL_NN_OUTPUTS` on this thread (its installer, `ModelNnGuard`, was retired in #2093).
 fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
     MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
 }
@@ -26739,7 +26743,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                 // A live [`ModelNnAxisGuard`] seeds every network output on its own dual
                 // axis (`base + flat output index`), so `∂p/∂z` comes out of the same walk
                 // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
-                // always was (exact for `∂/∂η` — see `ModelNnGuard`).
+                // always was (exact for `∂/∂η`).
                 match current_nn_axis_base() {
                     Some(base) => {
                         let flat: usize = nn_outputs
@@ -26748,8 +26752,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                             .map(Vec::len)
                             .sum::<usize>()
                             + out_i as usize;
-                        // The caller owns the width budget (`nn_param_derivatives_at_cov`
-                        // dispatches on exactly `n_base + n_eta + n_z`); an axis past the jet
+                        // The caller owns the width budget (the pre-#2093
+                        // `nn_param_derivatives_at_cov`, retired in #2093, dispatched on exactly
+                        // `n_base + n_eta + n_z`); an axis past the jet
                         // is a wiring bug, and `var`'s bounds check fails it loudly rather
                         // than lifting the output to a constant, which would report a zero
                         // `∂/∂z` as analytic. The zero-width cov-static value pass runs with
@@ -27076,17 +27081,16 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
 ) {
-    // `[covariate_nn]` outputs come from the ambient `ModelNnGuard`, not from a
-    // parameter — see that type for why, and for the invariant that they are lifted as
-    // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
+    // `[covariate_nn]` outputs come from the ambient `MODEL_NN_OUTPUTS` thread-local, not
+    // from a parameter, and are lifted as constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
     // Empty when no guard is live, which is correct for every model without a network.
     //
     // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
     // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
     // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
     // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
-    // `ModelNnGuard` may be entered or dropped beneath it; none is (guards are installed by
-    // the sensitivity provider, outside this call).
+    // NN guard may be entered or dropped beneath it; none is (the adjoint installs its
+    // `ModelNnDualGuard` outside this call).
     with_nn_outputs(|nn| {
         eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
     })
@@ -27995,11 +27999,10 @@ impl OdeRhsProgram {
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
-    /// [`Self::reads_model_time`] instead: neither this flag nor
-    /// [`Self::uses_time_vars`] alone covers all four spellings, and pairing them
-    /// by hand at each call site is how #1124's gap survived (`ode_tvcov_supported`
-    /// paired them; the SS gate did not, and its own test worked *around* the gap
-    /// by spelling the term `T`).
+    /// [`Self::reads_model_time`] instead: neither this flag nor [`Self::uses_time_vars`] alone
+    /// covers all four spellings, and pairing them by hand at each call site is how #1124's gap
+    /// survived (the pre-#2093 `ode_tvcov_supported` paired them; the SS gate did not, and its own
+    /// test worked *around* the gap by spelling the term `T`).
     pub(crate) fn reads_time_builtin(&self) -> bool {
         self.reads_time_builtin
     }
@@ -28435,7 +28438,7 @@ impl OdeRhsProgram {
 }
 
 /// Does this compiled expression's value vary across the dual axes the
-/// sensitivity providers differentiate — i.e. does it read η, *any* θ, an NN
+/// analytic gradient differentiates — i.e. does it read η, *any* θ, an NN
 /// output, or a variable already known to be dynamic? Reading only covariates,
 /// literals, and other cov-static variables makes it cov-static (foldable to a
 /// constant). See [`compute_cov_static_mask`] (#485).
@@ -28535,8 +28538,8 @@ fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
 }
 
 /// Classify each individual-parameter var slot as **cov-static** (`true`): its
-/// value is constant across every (θ, η) axis the analytic sensitivity providers
-/// differentiate, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
+/// value is constant across every (θ, η) axis the analytic gradient
+/// differentiates, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
 /// computed once in plain `f64` instead of carrying it through dual arithmetic
 /// (#485). A slot is cov-static iff every assignment to it reads only covariates,
 /// literals, and other cov-static slots, AND it is never assigned under an `if`
@@ -28951,17 +28954,16 @@ fn build_ctmm_generator_program(
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
-/// analytic-sensitivity provider can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
-/// **analytically** — by evaluating the same statements over `Dual2<M>` seeded on
-/// (θ, η) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
+/// analytic gradient can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
+/// **analytically** — by evaluating the same statements over a dual or tape type
+/// seeded on (θ, η) (`eval_params_g`) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
 /// f64 binding in the `pk_param_fn` closure.
 #[derive(Debug, Clone)]
 pub struct IndivParamProgram {
     stmts: Vec<Statement>,
     n_vars: usize,
     /// Per var-slot mask: `true` = the slot is cov-static (constant across every
-    /// θ / η dual axis), so [`eval_param_duals`](Self::eval_param_duals) and
-    /// [`eval_param_eta_grad`](Self::eval_param_eta_grad) compute it once in `f64`
+    /// θ / η dual axis), so [`eval_params_g`](Self::eval_params_g) computes it once in `f64`
     /// and seed it as a dual constant instead of re-running the (often pow/exp/log
     /// heavy) covariate kernel under dual arithmetic every call (#485). Empty when
     /// no slot is foldable, in which case both paths run exactly as before.
@@ -28969,10 +28971,9 @@ pub struct IndivParamProgram {
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
-    /// `pk_var_slots` projected to just the PK slots — the [`pk_slots`](Self::pk_slots)
-    /// value, cached at construction so the hot analytic paths borrow it via
-    /// [`pk_slots_ref`](Self::pk_slots_ref) instead of re-collecting a `Vec` on every
-    /// per-gradient evaluation (#534 review #2).
+    /// `pk_var_slots` projected to just the PK slots, cached at construction so the hot
+    /// analytic paths borrow it via [`pk_slots_ref`](Self::pk_slots_ref) instead of
+    /// re-collecting a `Vec` on every per-gradient evaluation (#534 review #2).
     pk_slot_indices: Vec<usize>,
     /// User-declared θ count the individual parameters can reference.
     n_theta: usize,
@@ -29007,9 +29008,8 @@ impl IndivParamProgram {
         self.n_eta
     }
 
-    /// Borrowing form of [`pk_slots`](Self::pk_slots): the PK-slot list cached at
-    /// construction, for hot paths that only read it (no per-call `Vec`). Identical
-    /// contents to `pk_slots()` (#534 review #2).
+    /// The PK-slot list cached at construction (`pk_var_slots` projected to its PK slots),
+    /// for hot paths that only read it (no per-call `Vec`, #534 review #2).
     pub(crate) fn pk_slots_ref(&self) -> &[usize] {
         &self.pk_slot_indices
     }
@@ -29036,7 +29036,7 @@ impl IndivParamProgram {
             .collect()
     }
 
-    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots`](Self::pk_slots),
+    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots_ref`](Self::pk_slots_ref),
     /// in the same order. **One entry per resolved slot, not per parameter**: the
     /// `pk(...)` role bindings, the spare slots the readout / `obs_scale` / `init`
     /// readers draw (#650, #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on
@@ -29057,8 +29057,7 @@ impl IndivParamProgram {
     /// Evaluate the individual parameters over any VM number type, from θ and η already
     /// seeded by the caller (a forward dual's axes, or tape leaves). Returns one value
     /// per [`pk_var_slots`](Self::pk_var_slots) entry, in that order. The single
-    /// evaluator behind [`eval_param_duals`](Self::eval_param_duals) and the adjoint
-    /// gradient's taped parameters.
+    /// evaluator behind the adjoint gradient's taped parameters.
     pub(crate) fn eval_params_g<T: crate::sens::num::vm::VmNum>(
         &self,
         theta: &[T],
@@ -29192,8 +29191,8 @@ impl IndivParamProgram {
 }
 
 /// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
-/// exposed so the analytic-sensitivity provider can evaluate the readout
-/// (e.g. `central / V1`) over `Dual2<N>` — turning the integrated dual state and
+/// exposed so the analytic (adjoint) gradient can evaluate the readout
+/// (e.g. `central / V1`) over a dual or tape type — turning the integrated dual state and
 /// the dual PK parameters into the scaled observable with exact derivatives
 /// (issue #367, Option A). Mirrors the f64 readout closure in `build_y_output_fn`.
 pub struct OdeOutputProgram {
@@ -29306,7 +29305,7 @@ impl OdeOutputProgram {
 /// over `Dual2<M>` seeded on (θ, η): θ/η references read the seed duals directly;
 /// individual-parameter references read `vars[i]`, where var slot `i` is fed by
 /// the provider as a dual for flat PK slot `var_to_pk_slot[i]` (value + ∂p/∂(θ,η));
-/// covariates are constants. This lets the analytic sensitivity provider
+/// covariates are constants. This lets the analytic (adjoint) gradient
 /// differentiate the scaled prediction `f / scale` exactly instead of falling back
 /// to finite differences for `ExpressionScale` models. Mirrors [`OdeOutputProgram`].
 pub struct ScaleDerivProgram {
@@ -29334,8 +29333,8 @@ impl ScaleDerivProgram {
 
     /// Evaluate the scale over any VM number type, from caller-seeded θ, η and
     /// individual-parameter values (`var_vals[i]` for var slot `i`, as in
-    /// [`eval_scale_dual`](Self::eval_scale_dual)). The single evaluator behind the
-    /// `Dual2` entry points and the adjoint gradient's taped scale.
+    /// the pre-#2093 `eval_scale_dual`). The single evaluator behind the
+    /// adjoint gradient's taped scale.
     pub(crate) fn eval_scale_g<T: crate::sens::num::vm::VmNum>(
         &self,
         theta: &[T],
@@ -29415,113 +29414,6 @@ impl RuvMagDerivProgram {
                 &mut stack,
             )
         }))
-    }
-
-    /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
-    /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
-    /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match
-    /// the program's own `n_theta` (caller falls back to FD).
-    pub(crate) fn theta_grad(
-        &self,
-        theta: &[f64],
-        cov: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
-    ) -> Option<Vec<f64>> {
-        use crate::sens::dual1::Dual1;
-        if theta.len() != self.n_theta {
-            return None;
-        }
-        if theta.is_empty() {
-            return Some(Vec::new());
-        }
-        // Mirror the runtime `RuvMagFn` closure's `TIME`/`time` covariate-map
-        // injection: a legacy pre-built expression may still carry `TIME` as an
-        // `Expression::Covariate` node (parsed models use the `Expression::Time`
-        // built-in, read directly from `time` via `Op::PushTime`, and never reach
-        // this branch) — without it, such a `cov_name` would look up the
-        // observation's covariate map (which never carries a literal "TIME" key)
-        // and silently default to `0.0` instead of the actual observation time.
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| {
-                if n.eq_ignore_ascii_case("TIME") {
-                    time
-                } else {
-                    cov.get(n).copied().unwrap_or(0.0)
-                }
-            })
-            .collect();
-        // `theta_d`/`prog_vars` are exactly `$n`-sized at each dispatch arm (unlike
-        // `ScaleDerivProgram::eval_scale_dual1`'s padded-to-N buffers), so a plain
-        // stack array avoids the sibling's per-call heap `Vec` for the axis-bounded
-        // pieces (#486 review); `cov_vec`/`stack` stay on the heap, matching that
-        // sibling's own precedent — they are not axis-bounded.
-        macro_rules! run {
-            ($n:literal) => {{
-                let mut theta_d = [Dual1::<$n>::constant(0.0); $n];
-                for (m, d) in theta_d.iter_mut().enumerate() {
-                    *d = Dual1::var(theta[m], m);
-                }
-                // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS;
-                // slot 2 = TAD (#1182). All θ-constant.
-                let prog_vars = [
-                    Dual1::<$n>::constant(1.0),
-                    Dual1::<$n>::constant(f64::EPSILON),
-                    Dual1::<$n>::constant(tad),
-                ];
-                let empty_nn: Vec<Vec<f64>> = Vec::new();
-                let mut stack: Vec<Dual1<$n>> = Vec::new();
-                let d = with_model_time(time, || {
-                    eval_bytecode_g::<Dual1<$n>>(
-                        &self.bc,
-                        &theta_d,
-                        &[],
-                        &cov_vec,
-                        &prog_vars,
-                        &empty_nn,
-                        &mut stack,
-                    )
-                });
-                d.grad.to_vec()
-            }};
-        }
-        Some(match theta.len() {
-            1 => run!(1),
-            2 => run!(2),
-            3 => run!(3),
-            4 => run!(4),
-            5 => run!(5),
-            6 => run!(6),
-            7 => run!(7),
-            8 => run!(8),
-            9 => run!(9),
-            10 => run!(10),
-            11 => run!(11),
-            12 => run!(12),
-            13 => run!(13),
-            14 => run!(14),
-            15 => run!(15),
-            16 => run!(16),
-            17 => run!(17),
-            18 => run!(18),
-            19 => run!(19),
-            20 => run!(20),
-            21 => run!(21),
-            22 => run!(22),
-            23 => run!(23),
-            24 => run!(24),
-            25 => run!(25),
-            26 => run!(26),
-            27 => run!(27),
-            28 => run!(28),
-            29 => run!(29),
-            30 => run!(30),
-            31 => run!(31),
-            32 => run!(32),
-            _ => return None,
-        })
     }
 }
 
@@ -30103,12 +29995,12 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
-    /// The compiled individual-parameter program, so the analytical PK
-    /// sensitivity provider can obtain exact `∂p/∂(θ,η)` by evaluating it over
-    /// `Dual2` seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
+    /// The compiled individual-parameter program, so the analytic (adjoint)
+    /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
+    /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
     /// θ chain and the log-normal-only `sel` η chain (issue #367). Unlike the
     /// `d_d_theta`/`d_d_eta` symbolic partials (reserved, no runtime consumer),
-    /// this field IS consumed at runtime by `sens::provider`. `None` for
+    /// this field IS consumed at runtime by `sens::provider` and the adjoint. `None` for
     /// hand-built fixtures and when no `[individual_parameters]` block exists;
     /// the ODE provider reads its own copy from `ode_spec`.
     pub(crate) indiv_param_program: Option<IndivParamProgram>,
@@ -30120,7 +30012,7 @@ pub struct IndivParamPartials {
     /// variable, so nothing in `pk_indices` records it — the model-level
     /// predicates ([`crate::CompiledModel::has_lagtime`]) read it from here
     /// (#1359 follow-up: with a literal lag `has_lagtime()` was `false`, and the
-    /// analytic sensitivity provider ran the lag-free walk against a production
+    /// pre-#2093 analytic sensitivity provider ran the lag-free walk against a production
     /// predictor that applied the lag — measured 120 % apart at the first
     /// post-dose sample). Empty for ODE / compartment-free models and for
     /// hand-built fixtures.
@@ -30138,8 +30030,9 @@ pub struct IndivParamPartials {
     pub(crate) bound_from_fit: bool,
     /// Whether the closed-form log-normal η chain (`pk · sel_flat`) is exact
     /// for this model, computed by `lognormal_eta_chain_exact`. `None` for
-    /// hand-built fixtures, which have no statements to measure: the providers
-    /// then keep the older rule, "every `eta_param_info` entry is `LogNormal`".
+    /// hand-built fixtures, which have no statements to measure: the pre-#2093
+    /// forward providers then kept the older rule, "every `eta_param_info` entry is
+    /// `LogNormal`". No reader remains since the adjoint replaced them.
     pub(crate) lognormal_eta_chain: Option<bool>,
     /// The nested variability levels (#1082), read through
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most

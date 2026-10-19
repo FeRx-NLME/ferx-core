@@ -535,7 +535,8 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     }
 
     // The gradient must be exact at EVERY node count — n = 1 included. There is no node
-    // gate: `grid_response_correction` supplies the `∂Φ/∂H·dH/dx` term that the fixed-node
+    // gate: the adjoint's taped grid response (`adjoint::run_agq`) supplies the `∂Φ/∂H·dH/dx`
+    // term that the fixed-node
     // score omits, and at n = 1 that term is the entire difference (a 26% error without it).
     //
     // Measured: 6.5e-8 at n = 1, 2.8e-9 at n = 3, 1.8e-9 at n = 7 — the gradient is exact well
@@ -545,10 +546,9 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     //
     // Those numbers were 2.0e-5 / 1.5e-6 / 2.1e-7 before the anchor and the grid-response term
     // went analytic: the old path finite-differenced `Φ` in `x` while `H` was *itself* a finite
-    // difference, so an FD-of-an-FD sat under every value. Both layers are gone — `H` is
-    // `score_core`'s exact `h_inner`, and the node response contracts each node's analytic
-    // `∂nll/∂b` against a displacement differenced from the cheap *exact* `x ↦ (log|Σ⁻¹|, bⱼ)`
-    // map — leaving ~2-3 orders of magnitude.
+    // difference, so an FD-of-an-FD sat under every value. Both layers are gone — `H` is the
+    // exact `h_inner`, and since #2093 the node displacement `bⱼ` and the anchor sit on the
+    // adjoint's reverse tape (`adjoint::run_agq`) — leaving ~2-3 orders of magnitude.
     //
     // The 1e-4 bound also pins `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright, because
     // the grid-response term is truncation-dominated and a "safe" large step puts the θ
@@ -1235,8 +1235,11 @@ fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
 /// Analytic arm only: the FD-stencil comparison is the expensive half and lives in
 /// [`focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes`] behind
 /// `slow-tests`. What this test cannot see on its own, a regression to ≥ half declines (which
-/// takes the whole-population stencil with no note), is pinned per PR at Tier 1 by
-/// `sens_cov_hessian::tests::the_population_assembly_is_fully_analytic_at_an_indefinite_node`.
+/// takes the whole-population stencil with no note), is pinned per PR by this test's own
+/// salvage count, and the adjoint's AGQ R-matrix itself against the profile FD at Tier 1 by
+/// `sens::ode_provider::adjoint::tests::cov_hessian_matches_profile_fd_laplace_and_agq`. Since
+/// #2093 the R-matrix never inverts a node's `H_j` (a node contracts the recorded jets), so an
+/// indefinite tail node has nothing to refuse.
 #[test]
 fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
     let analytic = two_cpt_oral_cov_agq3(true);
@@ -1267,14 +1270,10 @@ fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
 /// Gated on measured CI cost (AGENTS.md, Tier 3 "the gate marks…"): in `Tests + coverage
 /// (core)` the `agq` binary went from 86.50 s on `main` (run 37985481657) to 300.06 s with this
 /// test ungated (run 37988181162), its FD arm being the expensive one. The per-PR tests that die
-/// on the same mutations:
-///
-/// * `node_jet` back on the mode's preparation: T1 `node_jet_serves_an_indefinite_quadrature_node`,
-///   T2 `agq_cov_hessian_matches_fd_at_an_indefinite_quadrature_node`, T5
-///   `the_population_assembly_is_fully_analytic_at_an_indefinite_node`, and the per-PR T4 above
-///   (its "14 of 30" salvage note);
-/// * a fallback to the whole-population stencil, the one failure only `worst > 0` sees here:
-///   T5, which asserts the assembly is `Full`.
+/// on the same mutations (since #2093, when the forward provider's `node_jet` tests went with
+/// it): the per-PR T4 above (its salvage note, which a node refusal would bring back), and the
+/// adjoint's AGQ R-matrix against the profile FD at Tier 1
+/// (`sens::ode_provider::adjoint::tests::cov_hessian_matches_profile_fd_laplace_and_agq`).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -1318,7 +1317,7 @@ const T4_SE_BOUND: f64 = 1e-3;
 /// other test in this file (all Gaussian warfarin PK) leaves unexercised (review #821, point 3).
 ///
 /// The likelihood integrated here is a mixed-effects **binary / logistic** model, which sits
-/// entirely outside the `Dual2` sensitivity provider — so it drives AGQ's fixed-η FD score path
+/// entirely outside the analytic (adjoint) gradient's scope — so it drives AGQ's fixed-η FD score path
 /// (the one that also serves TTE, categorical, ODE, M3), not the analytic-provider path the
 /// Gaussian tests take. The independent truth is ferx's importance sampler evaluating the same
 /// marginal by a completely different route (Student-t / prior proposal, self-normalised
@@ -1465,7 +1464,8 @@ mod non_gaussian {
     /// A fixed-effects binary model has no random effect, so the marginal is a point mass and AGQ
     /// degenerates to the conditional likelihood — the node count cannot matter, and the OFV must
     /// equal FOCEI's exactly. The short optimising fit then drives the gradient's own `d == 0`
-    /// branch (`accumulate_fixed_eta_packed_gradient`).
+    /// case (the adjoint pads a model without random effects to one inert η direction,
+    /// `WIDTH_BUCKETS`).
     #[test]
     fn agq_with_no_random_effects_is_the_conditional_likelihood() {
         let model =
@@ -1638,7 +1638,7 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     let agq3 = iov_ofv(EstimationMethod::Laplace, 3);
     let focei = iov_ofv(EstimationMethod::FoceI, 1);
     // The Gauss-Newton-anchored quadrature under IOV: exercises `anchor_hessian`'s stacked
-    // (η, κ) `subject_sensitivities_iov` branch.
+    // (η, κ) branch (the adjoint's `exact_inner_hessian` over the stacked system).
     let focei3 = iov_ofv(EstimationMethod::FoceI, 3);
 
     // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
@@ -1660,12 +1660,13 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     );
 }
 
-/// **End-to-end**: the Gauss-Newton-anchored analytic grid response
-/// (`focei_htilde_dx::subject_htilde_dx_iov`, wired into `agq.rs`'s `analytic_grid_response`)
-/// must match FD of the actual IOV population objective — not just the isolated unit-level
-/// FD-parity in `focei_htilde_dx::tests`, which pins the derivative formula but never
-/// exercises the `agq.rs` dispatch (`stack.is_iov()`, the joint `omega_joint_inv`, the
-/// `subject_eta_dx_iov`-sourced `db_dx`) that a real fit actually uses.
+/// **End-to-end**: the Gauss-Newton-anchored analytic grid response (taped by the adjoint,
+/// `adjoint::run_agq` under `Objective::Agq { exact: false }`; before #2093
+/// `focei_htilde_dx::subject_htilde_dx_iov`) must match FD of the actual IOV population
+/// objective — not just the unit-level FD parity in `sens/ode_adjoint_tests.rs`
+/// (`agq_adjoint_matches_reconverged_fd_both_anchors`), which pins the derivative but never
+/// exercises the `agq.rs` dispatch (`stack.is_iov()`, the joint `omega_joint_inv`) that a
+/// real fit actually uses.
 #[test]
 fn iov_gauss_newton_anchored_gradient_matches_fd() {
     use ferx_core::estimation::agq;
@@ -1767,8 +1768,8 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
 
 /// **The analytic gradient must be exact under IOV too.**
 ///
-/// Under IOV the θ/σ score comes from the *stacked* sensitivity provider
-/// (`subject_sensitivities_iov`, which walks (θ, η, κ) duals), the Ω block from the η-prior,
+/// Under IOV the θ/σ score comes from the adjoint over the *stacked* `[η, κ]` system
+/// (before #2093, the forward provider's (θ, η, κ) dual walk), the Ω block from the η-prior,
 /// and — the only genuinely new piece — the **Ω_iov block** from the κ prior
 /// `½(Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov|)`, whose derivative is
 /// `½(−Σ_k z_k z_kᵀ + K·Ω_iov⁻¹)` summed over the K occasions that *share* one Ω_iov.

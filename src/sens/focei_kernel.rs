@@ -386,15 +386,20 @@ fn log_phi<T: PkNum>(z: T) -> T {
     )
 }
 
-/// Inverse Mills ratio `h(z) = φ/Φ` with `h′ = −h(z + h)`.
+/// Inverse Mills ratio `h(z) = φ/Φ` with `h′ = −h(z + h)`, lifted to fourth order so the
+/// exact anchor's nested covariance dual differentiates it rather than poisoning (`lift2` left
+/// `h‴` unknown, #2093 review).
 #[inline]
 fn inv_mills<T: PkNum>(z: T) -> T {
     let zv = z.val();
     let h = crate::stats::special::inv_mills(zv);
     let h1 = -h * (zv + h);
-    // h″ = −h′(z + h) − h(1 + h′)
+    // h″ = −h′(z + h) − h(1 + h′); h‴ = −h″(z + 2h) − 2h′(1 + h′);
+    // h⁗ = −h‴(z + 2h) − 3h″(1 + 2h′).
     let h2 = -h1 * (zv + h) - h * (1.0 + h1);
-    z.lift2(h, h1, h2)
+    let h3 = -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1);
+    let h4 = -h3 * (zv + 2.0 * h) - 3.0 * h2 * (1.0 + 2.0 * h1);
+    z.lift4(h, h1, h2, h3, h4)
 }
 
 /// One censored row's `−2·log Φ(z)` and the `H̃` coefficients `(g2, cz, cm)` of

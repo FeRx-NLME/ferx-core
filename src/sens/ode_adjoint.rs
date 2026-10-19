@@ -160,6 +160,10 @@ pub(crate) fn subject_adjoint_packed_gradient(
 /// IOV), the dispatch bucket and `η̂` padded to it.
 pub(super) struct Scoped<'m> {
     pub model: &'m CompiledModel,
+    /// The engine production evaluates FOCE's typical-value variance `R⁰ = f(η = 0)` on: the
+    /// model resolved at `η = 0`, which a closed-form absorption model near its flip-flop switch
+    /// may route differently from `model` (resolved at `η̂`).
+    pub pop_model: &'m CompiledModel,
     pub params: ModelParameters,
     pub width: usize,
     pub bucket: usize,
@@ -178,6 +182,16 @@ pub(super) fn scope<'m>(
     eta_hat: &[f64],
 ) -> Option<Scoped<'m>> {
     let params = unpack_params(x, template);
+    let pop_model = if model.n_kappa > 0 {
+        crate::pk::effective_model_for_eval_iov(
+            model,
+            subject,
+            &params.theta,
+            &vec![0.0; eta_hat.len()],
+        )
+    } else {
+        crate::pk::effective_model_for_eval(model, subject, &params.theta, &vec![0.0; model.n_eta])
+    };
     let (model, width, eta, lay) = resolve(model, subject, &params.theta, eta_hat, None)?;
     if !likelihood_supported(model, subject, &params) {
         return None;
@@ -213,6 +227,7 @@ pub(super) fn scope<'m>(
     // `eta` is in the smallest bucket that holds the width, padded with inert directions.
     Some(Scoped {
         model,
+        pop_model,
         params,
         width,
         bucket: eta.len(),
@@ -249,6 +264,40 @@ pub(crate) fn subject_adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
+    adjoint_gradient(model, subject, template, x, eta_hat, objective, false)
+}
+
+/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
+/// identity [`subject_adjoint_gradient`] declines — an indefinite exact `H` at an `η̂` the
+/// inner search's fallback left short of stationary ([`mode_solve`]). Without the identity
+/// the EBE response is not available exactly, and the alternative is the reconverged
+/// finite-difference score, `2·n_x` EBE re-solves per subject: on a 147-weight covariate
+/// network under Laplace that turned a 7.5 s fit into a 90 s one. This is the AGQ twin of
+/// FOCE/FOCEI's held-EBE salvage, omits the same EBE-response term, and is reported by the
+/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient`] declines for
+/// any other reason (scope, a non-finite recording) and for the FOCE/FOCEI objectives,
+/// whose salvage lives in the outer optimizer.
+pub(crate) fn subject_adjoint_held_ebe_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<Vec<f64>> {
+    matches!(objective, Objective::Agq { .. })
+        .then(|| adjoint_gradient(model, subject, template, x, eta_hat, objective, true))?
+}
+
+fn adjoint_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    objective: Objective,
+    held: bool,
+) -> Option<Vec<f64>> {
     let mut sc = scope(model, subject, template, x, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
@@ -270,6 +319,7 @@ pub(crate) fn subject_adjoint_gradient(
         template: &ModelParameters,
         x: &[f64],
         objective: Objective,
+        held: bool,
     ) -> Option<Vec<f64>>
     where
         Bucket<N, M>: ExactAnchor<N, M>,
@@ -286,9 +336,11 @@ pub(crate) fn subject_adjoint_gradient(
                 n_agq,
                 exact,
                 sc.width,
+                held,
             ),
             _ => run::<N, M>(
                 sc.model,
+                sc.pop_model,
                 subject,
                 sc.layout.as_ref(),
                 template,
@@ -300,7 +352,7 @@ pub(crate) fn subject_adjoint_gradient(
             ),
         }
     }
-    by_bucket!(sc.bucket, go, (&sc, subject, template, x, objective))
+    by_bucket!(sc.bucket, go, (&sc, subject, template, x, objective, held))
 }
 
 /// `H⁻¹b` for the mode system `H w = ∇_η F` (`H` the exact inner Hessian at `η̂`): a
@@ -314,7 +366,8 @@ pub(crate) fn subject_adjoint_gradient(
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
 /// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
 /// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
-/// [`MODE_STATIONARY_TOL`] the subject declines to the reconverged score (#2093 review).
+/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
+/// score ([`subject_adjoint_held_ebe_score`]), not the reconverged one.
 fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVector<f64>> {
     if let Some(c) = h.clone().cholesky() {
         return Some(c.solve(b));
@@ -561,8 +614,8 @@ fn record_ode<T: VmNum>(
     ) {
         return Some(preds);
     }
-    // The scale is subject-static even under TV covariates
-    // (`apply_event_walk_expression_scale_outer`): its parameters are at the subject covariates.
+    // The scale is subject-static even under TV covariates (production's `apply_scaling`
+    // reads `subject.covariates`): its parameters are at the subject covariates.
     let n_slots = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0)
         .values
         .len();
@@ -706,20 +759,15 @@ fn pk_space_predictions<T: VmNum>(
     }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    match (live.len(), second) {
-        (0, _) => None,
-        (1, true) => go::<1, 1, T>(model, subject, pk, &live),
-        (2, true) => go::<2, 3, T>(model, subject, pk, &live),
-        (3, true) => go::<3, 6, T>(model, subject, pk, &live),
-        (4, true) => go::<4, 10, T>(model, subject, pk, &live),
-        (5 | 6, true) => go::<6, 21, T>(model, subject, pk, &live),
-        (7 | 8, true) => go::<8, 36, T>(model, subject, pk, &live),
-        (1, false) => go::<1, 0, T>(model, subject, pk, &live),
-        (2, false) => go::<2, 0, T>(model, subject, pk, &live),
-        (3, false) => go::<3, 0, T>(model, subject, pk, &live),
-        (4, false) => go::<4, 0, T>(model, subject, pk, &live),
-        (5 | 6, false) => go::<6, 0, T>(model, subject, pk, &live),
-        (7 | 8, false) => go::<8, 0, T>(model, subject, pk, &live),
+    // Second order only: the `!second` return above already sent a first-order recording
+    // to the generic path, so no `go::<P, 0>` is instantiated.
+    match live.len() {
+        1 => go::<1, 1, T>(model, subject, pk, &live),
+        2 => go::<2, 3, T>(model, subject, pk, &live),
+        3 => go::<3, 6, T>(model, subject, pk, &live),
+        4 => go::<4, 10, T>(model, subject, pk, &live),
+        5 | 6 => go::<6, 21, T>(model, subject, pk, &live),
+        7 | 8 => go::<8, 36, T>(model, subject, pk, &live),
         _ => None,
     }
 }
@@ -1636,7 +1684,10 @@ pub(crate) fn exact_inner_hessian(
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
-    if !likelihood_supported(model, subject, params) {
+    // IOV scores FREM rows by a sentinel, not the kernel's `l` (as `exact_htilde` and
+    // `exact_inner_gradient_in` decline).
+    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
+    if iov_mismatch || !likelihood_supported(model, subject, params) {
         return None;
     }
     by_bucket!(
@@ -1954,6 +2005,7 @@ fn packed_gradient(
 #[allow(clippy::too_many_arguments)]
 fn run<const N: usize, const M: usize>(
     model: &CompiledModel,
+    pop_model: &CompiledModel,
     subject: &Subject,
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     template: &ModelParameters,
@@ -1982,7 +2034,7 @@ fn run<const N: usize, const M: usize>(
     let pop = if !interaction && model.error_spec.has_f_dependent_variance() {
         let zeros = [0.0; N];
         let p0 = record(
-            model,
+            pop_model,
             subject,
             lay,
             theta,
@@ -2174,6 +2226,7 @@ fn run_agq<const N: usize, const M: usize>(
     n_agq: usize,
     exact: bool,
     active: usize,
+    held: bool,
 ) -> Option<Vec<f64>>
 where
     Bucket<N, M>: ExactAnchor<N, M>,
@@ -2272,12 +2325,12 @@ where
     if exact {
         <Bucket<N, M> as ExactAnchor<N, M>>::taped(
             model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
-            active,
+            active, held,
         )
     } else {
         agq_taped::<N, M, M, false>(
             model, subject, lay, template, params, x, eta, &ctx, &so, &pv, &p1, &grid, h_inner,
-            exact, active,
+            exact, active, held,
         )
     }
 }
@@ -2314,6 +2367,7 @@ trait ExactAnchor<const N: usize, const M: usize> {
         grid: &[([f64; N], f64, [f64; N])],
         h_inner: DMatrix<f64>,
         active: usize,
+        held: bool,
     ) -> Option<Vec<f64>>;
 }
 
@@ -2335,10 +2389,11 @@ macro_rules! exact_anchor_buckets {
                 grid: &[([f64; $n], f64, [f64; $n])],
                 h_inner: DMatrix<f64>,
                 active: usize,
+                held: bool,
             ) -> Option<Vec<f64>> {
                 agq_taped::<$n, $m, $n, true>(
                     model, subject, lay, template, params, x, eta, ctx, so, pv, p1, grid,
-                    h_inner, true, active,
+                    h_inner, true, active, held,
                 )
             }
         })*
@@ -2358,6 +2413,7 @@ macro_rules! exact_anchor_buckets {
                 _: &[([f64; $dn], f64, [f64; $dn])],
                 _: DMatrix<f64>,
                 _: usize,
+                _: bool,
             ) -> Option<Vec<f64>> {
                 None
             }
@@ -2390,6 +2446,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     h_inner: DMatrix<f64>,
     exact: bool,
     active: usize,
+    held: bool,
 ) -> Option<Vec<f64>> {
     use crate::sens::rtape::DualH;
     let theta = &params.theta;
@@ -2531,9 +2588,15 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 }
             })
         };
-        let j_max = (0..n_obs).max_by(|&a, &b| adj_q(a).norm().total_cmp(&adj_q(b).norm()))?;
-        let eig = adj_q(j_max).symmetric_eigen();
-        std::array::from_fn(|k| std::array::from_fn(|m| eig.eigenvectors[(k, m)]))
+        // A subject with no observation rows has no Q-adjoint at all (its objective is the
+        // prior alone), so any basis is exact; the unit one is taken rather than declining.
+        match (0..n_obs).max_by(|&a, &b| adj_q(a).norm().total_cmp(&adj_q(b).norm())) {
+            Some(j_max) => {
+                let eig = adj_q(j_max).symmetric_eigen();
+                std::array::from_fn(|k| std::array::from_fn(|m| eig.eigenvectors[(k, m)]))
+            }
+            None => unit,
+        }
     } else {
         unit
     };
@@ -2594,7 +2657,13 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     };
     let (grad_eta, _) = sweep(&s1);
     let grad_l: Vec<f64> = lg.iter().map(|l| l.v).collect();
-    let w = mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta), &grad_l)?;
+    // `held`: past a declined mode solve, `w = 0` makes `Ψ = A`, the held-EBE score
+    // (`subject_adjoint_held_ebe_score`).
+    let w = match mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta), &grad_l) {
+        Some(w) => w,
+        None if held => DVector::zeros(N),
+        None => return None,
+    };
 
     // ---- sweep 2: Ψ = A − wᵀ∇_η l(η̂) ----------------------------------------------
     let psi =

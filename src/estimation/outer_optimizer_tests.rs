@@ -5551,7 +5551,7 @@ mod outer_fd_fallback {
 
     /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
     /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
-    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// so the adjoint outer gradient (`subject_adjoint_packed_gradient`) declines that subject while every bolus-dosed one stays
     /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
     /// a property of the records — which is what makes it a stable fixture.
     const WARFARIN_F: &str = r#"

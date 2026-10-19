@@ -5018,6 +5018,7 @@ fn optimize_bfgs(
             init_params,
             &x_anchor_real,
             &cached_etas,
+            options.interaction,
         )
     } else {
         None
@@ -5136,6 +5137,7 @@ fn optimize_bfgs(
                 init_params,
                 &x_new_real,
                 &cached_etas,
+                options.interaction,
             );
             x_anchor_real = x_new_real;
         }
@@ -5870,8 +5872,8 @@ fn subject_reconverged_fd_gradient_iov(
 }
 
 /// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or
-/// `None` when this subject does not get one — either because the sensitivity provider
-/// (or the `prepare` assembly behind it) declined the subject's data shape at runtime,
+/// `None` when this subject does not get one — either because the adjoint
+/// (`subject_adjoint_packed_gradient`) declined the subject's data shape at runtime,
 /// or because a component came back non-finite. Both cases route the subject to
 /// [`subject_fixed_ebe_gradient`], so they are one gate, not two.
 ///
@@ -6230,16 +6232,16 @@ fn declined_subject_gradient(
 ///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
 ///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
 /// - **The outer *assembly* declines away from the mode for a second reason.**
-///   `prepare_stacked` needs the true inner Hessian `H` to be positive-definite
-///   (`invert_inner_hessian`), which holds at the EBE and routinely fails elsewhere:
-///   measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10
-///   subjects (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider
-///   serves all 10 and all 10 are analytic at their EBEs. That gate is a *precondition*
-///   detector rather than a matrix-shape check — see `invert_inner_hessian` for why
-///   widening it to nonsingular (#1513) is wrong and what it measures — but for this
-///   function's purposes the consequence is the same: a zero-η probe would announce four
-///   fallbacks that a fit serving these subjects at their EBEs never takes. Pinned by
-///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`.
+///   The adjoint's `mode_solve` needs `η̂` stationary and the exact inner Hessian `H`
+///   nonsingular (an indefinite `H` only within `MODE_STATIONARY_TOL` of stationarity),
+///   which holds at the EBE and routinely fails elsewhere. Measured before #2093 on the
+///   bundled `examples/warfarin.ferx` + `data/warfarin.csv` against the forward provider's
+///   positive-definite gate, 4 of the 10 subjects (ids 2, 4, 7, 10) failed it at `η = 0`
+///   while all 10 were analytic at their EBEs (the retired
+///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`).
+///   For this function's purposes the consequence is the same: a zero-η probe would announce
+///   fallbacks that a fit serving these subjects at their EBEs never takes. The off-mode
+///   decline is pinned by `mode_solve_declines_an_indefinite_hessian_off_the_mode`.
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
@@ -6277,7 +6279,7 @@ impl OuterFdDeclineLog {
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
     /// Called from the rayon workers, hence `Relaxed` — the log is read once, after
     /// every gradient evaluation has been joined.
-    fn record(&self, i: usize) {
+    pub(crate) fn record(&self, i: usize) {
         if let Some(flag) = self.declined.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -6285,7 +6287,7 @@ impl OuterFdDeclineLog {
 
     /// Mark declined subject `i` as a structural decline (#1536). Rayon workers,
     /// `Relaxed`, as above.
-    fn record_structural(&self, i: usize) {
+    pub(crate) fn record_structural(&self, i: usize) {
         if let Some(flag) = self.structural.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -6335,7 +6337,7 @@ impl OuterFdDeclineLog {
 /// too: an IOV subject is reconverged (correct, slower); a non-IOV subject takes the
 /// held-EBE gradient (cheap, omits the EBE-response term), and the remedy is
 /// `reconverge_gradient_interval`, which the IOV route ignores. The route is read from the
-/// model here — `n_kappa > 0` is exactly when `iov_sens_supported` sends the gradient to
+/// model here — `n_kappa > 0` is exactly when the dispatch sends the gradient to
 /// `population_gradient_sens_iov_mixed` — rather than passed in, so no caller can pair a
 /// log with the wrong sentence.
 ///
@@ -6398,8 +6400,8 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a data shape outside the sensitivity provider's \
-         scope, or a trial point where it could not be formed) and {consequence} The reported \
+         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
+         point where it could not be formed) and {consequence} The reported \
          outer gradient method is the model-level route, not the per-subject one.{skipped}"
     ))
 }
@@ -6408,8 +6410,8 @@ pub(crate) fn outer_fd_fallback_warning(
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
 /// every subject inside the provider's scope, and a per-subject
 /// [`subject_fixed_ebe_gradient`] for each subject outside it (or whose analytic
-/// gradient came back non-finite). This replaces the all-or-nothing
-/// [`population_gradient_sens`]: previously a single out-of-scope subject forced
+/// gradient came back non-finite). This replaced the all-or-nothing
+/// `population_gradient_sens` (since retired): previously a single out-of-scope subject forced
 /// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block left the variance components pinned at their start and stalled
 /// SLSQP/L-BFGS/MMA above the derivative-free optimum
@@ -6778,6 +6780,7 @@ fn population_gradient_with_agq_evaluation(
             options,
             reconverge,
             agq_evaluation,
+            Some(declines),
         ) {
             return g;
         }
@@ -6791,12 +6794,12 @@ fn population_gradient_with_agq_evaluation(
     // (`subject_packed_gradient_foce`, censored rows excluded from R̃ and added as
     // `−logΦ`) paths, so M3 takes the analytic path like any other fit.
     let force_reconverge = reconverge;
-    // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
-    // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
+    // Analytic gradient (Almquist 2015 Eq. 23, via the adjoint
+    // `subject_adjoint_packed_gradient`): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
-    // supersedes both branches below where it applies. Gated to the supported
-    // analytical PK scope (1-/2-/3-cpt); `population_gradient_sens` returns `None`
-    // (→ the existing FD/Laplace path) if any subject is outside provider scope.
+    // supersedes both branches below where it applies. Gated on
+    // `analytic_outer_gradient_available`; a subject the adjoint declines takes a
+    // per-subject salvage inside the mixed assembly (#466, #1529).
     // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
     // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
     // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
@@ -6810,10 +6813,10 @@ fn population_gradient_with_agq_evaluation(
     // IOV-analytical models route to the dedicated stacked-η / block-Ω assembly
     // (both FOCEI and FOCE — see the interaction branch below). Their gradient
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
-    // separately from the non-IOV `sens_supported` path.
-    // Covers both the closed-form analytical IOV provider and the ODE IOV provider
-    // (RHS-program models); both produce the stacked-η / block-Ω assembly the IOV
-    // gradient entry points consume (#439 ODE IOV).
+    // separately from the non-IOV path.
+    // The adjoint serves both closed-form analytical and ODE (RHS-program) IOV models
+    // on the stacked `[η, κ]` width (`subject_width`); both feed the stacked-η /
+    // block-Ω assembly the IOV gradient entry points consume (#439 ODE IOV).
     let iov_analytic = model.n_kappa > 0;
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option

@@ -2589,7 +2589,7 @@ pub(crate) fn with_solver_stats<T>(
 /// integration deposits in the scope.
 ///
 /// It must be the **same** provider the fit ran, for two reasons. The scope gates differ:
-/// `ode_inner_grad_supported_model` describes the ODE provider's analytical reach and says
+/// the adjoint's `recorder_in_scope` describes the ODE recorder's analytical reach and says
 /// nothing about `gradient_method = fd`, SDE, or the other escape hatches, so it alone would
 /// sweep a dual solve for a fit that computed every gradient by finite differences and report
 /// counters from a code path that fit never took. `analytic_inner_common_bail` is the
@@ -2604,8 +2604,7 @@ pub(crate) fn with_solver_stats<T>(
 /// `adjoint::exact_obs_grads`, which is all that fit computes.
 ///
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
-/// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
-/// observe.
+/// a model outside the adjoint's `recorder_in_scope` has no dual ODE solve to observe.
 ///
 /// Like [`compute_subject_results`], this runs one independent task per subject on the fit's
 /// own pool and **returns** its counters rather than depositing them in a scope the caller

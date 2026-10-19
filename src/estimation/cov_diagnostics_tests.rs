@@ -1468,3 +1468,201 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
         inv.n_clipped
     );
 }
+
+// ---- #2093 review round 2 (finding 7): the decline/remedy sentence cells, rebuilt on the
+// adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy; `Mixture`,
+// `NonGaussianEndpoint`, `ModelOutOfScope`, `TooManyRandomEffects` and `PerSubjectBail` do not.
+
+#[test]
+fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
+    let mut with = measured_severe_facts();
+    with.declines = &[CovScopeDecline::GradientFd];
+    let m = format_regularized_warning(&with);
+    assert!(m.contains("declined because gradient = fd."), "{m}");
+    assert!(
+        m.contains("Dropping gradient = fd moves the fit onto the analytic route."),
+        "{m}"
+    );
+
+    let mut without = measured_severe_facts();
+    without.declines = &[CovScopeDecline::Mixture];
+    let m = format_regularized_warning(&without);
+    assert!(
+        m.contains("declined because the model is a mixture model."),
+        "{m}"
+    );
+    // No invented advice: the FD stencil is the correct route for a mixture.
+    assert!(!m.contains("moves the fit onto the analytic route"), "{m}");
+    assert!(!m.contains("stays on the finite-difference route"), "{m}");
+}
+
+#[test]
+fn several_unremediable_clauses_invent_no_advice() {
+    let mut facts = measured_severe_facts();
+    facts.declines = &[
+        CovScopeDecline::Mixture,
+        CovScopeDecline::ModelOutOfScope,
+        CovScopeDecline::NonGaussianEndpoint,
+    ];
+    let m = format_regularized_warning(&facts);
+    assert!(
+        m.contains(
+            "the model is a mixture model, the model is outside the analytic recorders' scope \
+             and the model has a non-Gaussian endpoint ([event_model] / [binary_model])."
+        ),
+        "{m}"
+    );
+    assert!(!m.contains("moves the fit onto the analytic route"), "{m}");
+    assert!(!m.contains("one-line remedy"), "{m}");
+}
+
+#[test]
+fn the_declined_clause_sentence_is_fd_route_only() {
+    let mut fd = measured_severe_facts();
+    fd.declines = &[CovScopeDecline::GradientFd];
+    let mut analytic = fd;
+    analytic.source = CovHessianSource::AnalyticRMatrix;
+    assert!(format_regularized_warning(&fd).contains("declined because"));
+    assert!(!format_regularized_warning(&analytic).contains("declined because"));
+}
+
+#[test]
+fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
+    // #1516 review §2, on the adjoint's width clause: on the hybrid route only the salvaged
+    // minority declined, so the sentence's subject is those subjects.
+    let mut fd = measured_severe_facts();
+    fd.declines = &[CovScopeDecline::TooManyRandomEffects];
+    fd.source = CovHessianSource::FdStencil;
+    let mut hybrid = fd;
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    let (m_fd, m_hybrid) = (
+        format_regularized_warning(&fd),
+        format_regularized_warning(&hybrid),
+    );
+    let clause = CovScopeDecline::TooManyRandomEffects.clause();
+    assert!(
+        m_fd.contains(&format!(
+            "The exact analytic covariance R-matrix was declined because {clause}."
+        )),
+        "{m_fd}"
+    );
+    assert!(
+        m_hybrid.contains(&format!(
+            "The finite-differenced subjects declined the exact analytic covariance R-matrix \
+             because {clause}."
+        )),
+        "{m_hybrid}"
+    );
+    assert!(!m_hybrid.contains("R-matrix was declined"), "{m_hybrid}");
+    assert!(
+        !m_fd.contains("The finite-differenced subjects declined"),
+        "{m_fd}"
+    );
+}
+
+#[test]
+fn the_message_names_the_hybrid_route_and_keeps_its_stencil_guidance() {
+    let mut analytic = measured_severe_facts();
+    analytic.declines = &[CovScopeDecline::GradientFd];
+    let mut fd = analytic;
+    fd.source = CovHessianSource::FdStencil;
+    let mut hybrid = analytic;
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    analytic.source = CovHessianSource::AnalyticRMatrix;
+    let (m_analytic, m_fd, m_hybrid) = (
+        format_regularized_warning(&analytic),
+        format_regularized_warning(&fd),
+        format_regularized_warning(&hybrid),
+    );
+    assert!(
+        m_hybrid.contains("the hybrid analytic/FD R-matrix"),
+        "{m_hybrid}"
+    );
+    assert!(!m_analytic.contains("hybrid"), "{m_analytic}");
+    assert!(!m_fd.contains("hybrid"), "{m_fd}");
+    let clause = "because gradient = fd";
+    assert!(m_fd.contains("declined because"), "{m_fd}");
+    assert!(m_fd.contains(clause), "{m_fd}");
+    assert!(m_hybrid.contains(clause), "{m_hybrid}");
+    assert!(!m_analytic.contains(clause), "{m_analytic}");
+    assert!(!m_analytic.contains("declined"), "{m_analytic}");
+}
+
+#[test]
+fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
+    let mut hybrid = measured_severe_facts();
+    hybrid.declines = &[CovScopeDecline::GradientFd];
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    let mut fd = hybrid;
+    fd.source = CovHessianSource::FdStencil;
+    let (m_hybrid, m_fd) = (
+        format_regularized_warning(&hybrid),
+        format_regularized_warning(&fd),
+    );
+    assert!(
+        m_hybrid.contains("Dropping gradient = fd moves those subjects onto the analytic route."),
+        "{m_hybrid}"
+    );
+    assert!(
+        m_fd.contains("Dropping gradient = fd moves the fit onto the analytic route."),
+        "{m_fd}"
+    );
+    // One action, one blocker without one.
+    let mut hybrid_mixed = hybrid;
+    hybrid_mixed.declines = &[
+        CovScopeDecline::GradientFd,
+        CovScopeDecline::TooManyRandomEffects,
+    ];
+    let mut fd_mixed = hybrid_mixed;
+    fd_mixed.source = CovHessianSource::FdStencil;
+    assert!(
+        format_regularized_warning(&hybrid_mixed).contains(
+            "so those subjects stay on the finite-difference route until all of them are cleared"
+        ),
+        "{}",
+        format_regularized_warning(&hybrid_mixed)
+    );
+    assert!(
+        format_regularized_warning(&fd_mixed).contains(
+            "so the fit stays on the finite-difference route until all of them are cleared"
+        ),
+        "{}",
+        format_regularized_warning(&fd_mixed)
+    );
+}
+
+#[test]
+fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
+    let mut facts = measured_severe_facts();
+    facts.declines = &[
+        CovScopeDecline::Disabled,
+        CovScopeDecline::GradientFd,
+        CovScopeDecline::Mixture,
+    ];
+    let m = format_regularized_warning(&facts);
+    assert!(
+        m.contains(
+            "Setting analytic_cov_hessian = true and dropping gradient = fd clear those clauses"
+        ),
+        "{m}"
+    );
+    assert!(
+        m.contains("the remaining clause has no one-line remedy"),
+        "{m}"
+    );
+    let mut two_left = measured_severe_facts();
+    two_left.declines = &[
+        CovScopeDecline::GradientFd,
+        CovScopeDecline::Mixture,
+        CovScopeDecline::NonGaussianEndpoint,
+    ];
+    let m = format_regularized_warning(&two_left);
+    assert!(
+        m.contains("Dropping gradient = fd clears that clause"),
+        "{m}"
+    );
+    assert!(
+        m.contains("the remaining clauses have no one-line remedy"),
+        "{m}"
+    );
+}

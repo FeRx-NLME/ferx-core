@@ -932,6 +932,39 @@ fn ode_steady_state_dose_matches_reconverged_fd() {
     assert!(worst < 1e-5, "worst relative difference {worst:.2e}");
 }
 
+/// A steady-state dose under an estimated lag, on both sides of `lag ≥ II` (#1121, #1311): past
+/// the interval the walk clamps the seed phase, and the derivative has to follow it. The
+/// forward provider's per-PR pin (`ode_provider_ss_lagtime_at_or_past_the_interval_matches_
+/// production`) went with it in #2093; this is its adjoint successor, and what lets the two
+/// `ss_lagtime_edge` NONMEM objective anchors stay nightly. Same model, same subject times,
+/// only `II` moves: 4 h (lag 0.36 h < II) and 0.3 h (lag > II).
+#[test]
+fn ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd() {
+    let model = tight(parse_model_string(ODE_LAG).unwrap());
+    let lag = moved_params(&model).theta[3];
+    let times = [0.5, 1.0, 2.0, 3.0, 5.0, 7.0];
+    for (ii, label) in [(4.0, "lag < II"), (0.3, "lag ≥ II")] {
+        assert_eq!(
+            lag >= ii,
+            label == "lag ≥ II",
+            "{label}: the straddle (lag {lag})"
+        );
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, ii)];
+        let s = subject(&model, doses, &times, &[0.1, -0.05]);
+        assert!(
+            in_scope(&model, &s),
+            "{label}: SS under a lag must be served"
+        );
+        let worst = parity(&model, &s);
+        eprintln!("SS under a lag, {label}: worst {worst:.2e}");
+        // Measured 1.9e-7 (lag < II) and 1.4e-8 (lag ≥ II) on Linux; ~10× headroom.
+        assert!(
+            worst < 2e-6,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
 /// A certified-linear `[odes]` model (#852): `ode_method = auto` resolves to the exact
 /// matrix-exponential path, with an estimated lagtime and a peripheral compartment.
 const TWOCPT_DEPOT_LINEAR_ODE: &str = r#"
@@ -1067,7 +1100,8 @@ fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
 
 /// Dense residual covariance through the generic kernel: a serial `correlation` (ρ a θ,
 /// entering `R` directly) and a `block_sigma` pair.
-/// Same fixture as `dense_r_serial_correlation_gradient_matches_fd`.
+/// Same fixture as the pre-#2093 `dense_r_serial_correlation_gradient_matches_fd` (retired in
+/// #2093).
 fn dense_src(corr: &str, block: bool) -> String {
     let sig = if block {
         "  block_sigma (PROP_ERR, ADD_ERR) = [0.0225, 0.01, 0.09]\n"
@@ -2124,6 +2158,76 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace).is_none(),
         "off the mode, an indefinite H must decline rather than drop wᵀ∇_η l"
     );
+    // The optimizer's salvage for that subject: the held-EBE score, `∂A/∂x` at this fixed
+    // `η` — FD of production's objective with `η` held, not reconverged.
+    let held = subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, laplace)
+        .expect("the held-EBE score serves the declined subject");
+    let mut worst = 0.0f64;
+    for k in 0..x.len() {
+        let h = 1e-5 * (1.0 + x[k].abs());
+        let at = |d: f64| {
+            let mut xv = x.clone();
+            xv[k] += d;
+            let p = crate::estimation::parameterization::unpack_params(&xv, params);
+            laplace_prod(&one, &s, &p, &eta)
+        };
+        let fd = (at(h) - at(-h)) / (2.0 * h);
+        assert!(
+            held[k].is_finite() && fd.is_finite(),
+            "x[{k}]: {} vs {fd}",
+            held[k]
+        );
+        worst = worst.max((held[k] - fd).abs() / (1.0 + fd.abs()));
+    }
+    eprintln!("held-EBE score vs fixed-η FD: worst rel {worst:.3e}");
+    // Measured 4.794e-10 (central FD, h = 1e-5); ~10× headroom.
+    assert!(
+        worst < 5e-9,
+        "held-EBE score off the fixed-η FD by {worst:.3e}"
+    );
+    // FOCE/FOCEI have their own salvage in the outer optimizer: no held route here.
+    assert!(subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, Objective::Focei).is_none());
+
+    // The population gradient takes that route for the optimizer — the held score, not
+    // `2·n_x` reconverged ones — and says so in the outer FD-fallback warning.
+    use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+    use crate::types::{EstimationMethod, FitOptions, Population};
+    let population = Population {
+        subjects: vec![s.clone()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options = FitOptions {
+        method: EstimationMethod::Laplace,
+        ..FitOptions::default()
+    };
+    let log = OuterFdDeclineLog::new(1);
+    let g = crate::estimation::agq::population_gradient_mixed(
+        &one,
+        &population,
+        params,
+        &x,
+        &[DVector::from_column_slice(&eta)],
+        &[Vec::new()],
+        &crate::estimation::parameterization::compute_bounds(params),
+        &options,
+        false,
+        None,
+        Some(&log),
+    )
+    .expect("population gradient");
+    for (k, (&gk, &hk)) in g.iter().zip(&held).enumerate() {
+        assert_eq!(
+            gk.to_bits(),
+            (2.0 * hk).to_bits(),
+            "x[{k}]: OFV = 2·F of the held score"
+        );
+    }
+    let w = outer_fd_fallback_warning(&one, &population, &log).expect("the salvage is reported");
+    assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
 
 #[test]
@@ -3993,36 +4097,46 @@ fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
     );
     let params = moved_params(&model);
     let x = pack_params(&params);
-    let eta = ebe_for(&model, &s, &params, 1e-12, true);
-    let dx = std::thread::scope(|sc| {
-        std::thread::Builder::new()
-            .stack_size(crate::FIT_RAYON_STACK_SIZE)
-            .spawn_scoped(sc, || {
-                subject_adjoint_eta_dx(&model, &s, &params, &x, eta.as_slice(), true)
-            })
-            .unwrap()
-            .join()
-            .unwrap()
-    })
-    .expect("a five-effect subject must be served (width-6 bucket)");
-    let mut worst = 0.0f64;
-    for k in 0..x.len() {
-        let h = 1e-4 * (1.0 + x[k].abs());
-        let at = |d: f64| {
-            let mut xp = x.clone();
-            xp[k] += d;
-            ebe_for(&model, &s, &unpack_params(&xp, &params), 1e-12, true)
-        };
-        let (ep, em) = (at(h), at(-h));
-        for j in 0..5 {
-            let fd = (ep[j] - em[j]) / (2.0 * h);
-            assert!(fd.is_finite() && dx[k][j].is_finite(), "x[{k}] η[{j}]");
-            worst = worst.max((dx[k][j] - fd).abs() / (1.0 + fd.abs()));
+    // FOCEI's conditional mode and FOCE's frozen-variance one each respond on their own
+    // inner problem (`population_eta_dx` passes the fit's `interaction`).
+    for interaction in [true, false] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let dx = std::thread::scope(|sc| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(sc, || {
+                    subject_adjoint_eta_dx(&model, &s, &params, &x, eta.as_slice(), interaction)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+        .expect("a five-effect subject must be served (width-6 bucket)");
+        let mut worst = 0.0f64;
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let at = |d: f64| {
+                let mut xp = x.clone();
+                xp[k] += d;
+                ebe_for(&model, &s, &unpack_params(&xp, &params), 1e-12, interaction)
+            };
+            let (ep, em) = (at(h), at(-h));
+            for j in 0..5 {
+                let fd = (ep[j] - em[j]) / (2.0 * h);
+                assert!(fd.is_finite() && dx[k][j].is_finite(), "x[{k}] η[{j}]");
+                worst = worst.max((dx[k][j] - fd).abs() / (1.0 + fd.abs()));
+            }
         }
+        eprintln!("eta_dx (5 η, interaction = {interaction}) vs re-solved EBE {worst:.2e}");
+        // Measured on Linux: 1.8e-7 (FOCEI), 1.6e-5 (FOCE); ~10× headroom each. FOCE's
+        // response taken on FOCEI's conditional mode (the old hard-coded `interaction = true`
+        // in `population_eta_dx`) misses it by 6.1e-2, so the FOCE bound straddles that defect.
+        let bound = if interaction { 2e-6 } else { 2e-4 };
+        assert!(
+            worst < bound,
+            "eta_dx (interaction = {interaction}) vs re-solved EBE {worst:.2e}"
+        );
     }
-    eprintln!("eta_dx (5 η) vs re-solved EBE {worst:.2e}");
-    // Measured worst 1.8e-7 on Linux; ~10× headroom.
-    assert!(worst < 2e-6, "eta_dx vs re-solved EBE {worst:.2e}");
 }
 
 /// The `tests/ss_fit_smoke.rs` model, subject 3 of `data/ss_oral_q24.csv` (#1498).
@@ -4094,4 +4208,75 @@ fn foce_kernel_declines_woodbury_on_a_variance_floored_row() {
         "gated FOCE F vs production: {:.2e}",
         gated.0
     );
+}
+
+/// #2093 review (round 2, finding 17): a subject with no observation rows (a dose-only record,
+/// contributing its prior alone) is served under Laplace's exact anchor as under every other
+/// objective. The taped-Hessian sweep chose its directions from the largest row's `Q`-adjoint
+/// and declined when there was no row; with none, any basis is exact.
+#[test]
+fn a_subject_without_observations_is_served_under_the_exact_anchor() {
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let mut s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    s.obs_times.clear();
+    s.observations.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    s.occasions.clear();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let g = subject_adjoint_gradient(&model, &s, &params, &x, &[0.0; 3], laplace)
+        .expect("a dose-only subject must be served under the exact anchor");
+    let focei = subject_adjoint_gradient(&model, &s, &params, &x, &[0.0; 3], Objective::Focei)
+        .expect("and under FOCEI");
+    // With no rows the objective is the prior's alone, `½ηᵀΩ⁻¹η + ½log|Ω| + ½log|H|` with
+    // `H = Ω⁻¹` exactly, which is identically 0 at the mode `η̂ = 0` whatever the parameters:
+    // the exact gradient is zero on every coordinate, under either objective.
+    for (k, (a, b)) in g.iter().zip(&focei).enumerate() {
+        assert!(
+            a.is_finite() && a.abs() < 1e-12 && b.abs() < 1e-12,
+            "x[{k}]: Laplace {a}, FOCEI {b}"
+        );
+    }
+}
+
+/// #2093 review (round 2, finding 17): the exact anchor's covariance nested dual differentiates
+/// the inverse Mills ratio (M3 rows) and a serial residual correlation instead of poisoning to
+/// `NaN` and declining the subject to the stencil. Both against the reconverged FD of the
+/// production gradient.
+#[test]
+fn exact_anchor_r_matrix_serves_m3_rows_and_a_serial_correlation() {
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let mut m3 = parse_model_string(ONE_CPT_ORAL).unwrap();
+    m3.bloq_method = crate::types::BloqMethod::M3;
+    let s3 = censor(
+        subject(
+            &m3,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &TIMES,
+            &[0.1, -0.05, 0.2],
+        ),
+        &[0, 8],
+    );
+    let (fd, _) = hessian_gaps_for(&m3, &s3, laplace);
+    eprintln!("exact-anchor R-matrix, M3 rows: {fd:.2e}");
+    // Measured 7.8e-7 (M3) and 7.7e-8 (ar1) on Linux; ~10× headroom.
+    assert!(fd < 8e-6, "M3 rows: {fd:.2e}");
+    let serial = parse_model_string(&dense_src("  correlation ar1(RHO) by ARM\n", false)).unwrap();
+    let ss = dense_subject(&serial);
+    let (fd, _) = hessian_gaps_for(&serial, &ss, laplace);
+    eprintln!("exact-anchor R-matrix, serial ar1: {fd:.2e}");
+    assert!(fd < 8e-7, "serial ar1: {fd:.2e}");
 }

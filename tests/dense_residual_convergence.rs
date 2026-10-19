@@ -5,9 +5,10 @@
 //! models — previously both loops ran finite differences (#620 scoped the dense
 //! `R` to the marginal objective only). Per-coordinate agreement with central FD
 //! is pinned by the fast unit tests
-//! (`population_packed_gradient_block_sigma_matches_fd`,
-//! `dense_residual_inner_grad_matches_fd`, and the FOCE / ExpressionScale
-//! variants). This slow test pins the *fit*: the analytic-gradient path must
+//! (`kernel_block_sigma_matches_reconverged_fd` and
+//! `kernel_serial_residual_correlation_matches_reconverged_fd` in
+//! `sens/ode_adjoint_tests.rs`, `dense_residual_inner_grad_matches_fd`, and the FOCE /
+//! ExpressionScale variants). This slow test pins the *fit*: the analytic-gradient path must
 //! converge to the **same** optimum (OFV + estimates) as the finite-difference
 //! path, i.e. swapping in the analytic gradient does not move the minimum.
 //!
@@ -152,8 +153,9 @@ fn dense_residual_analytic_and_fd_fits_agree() {
 /// reconverged-FD gradient reaches from the same start (#1552).
 ///
 /// This is the convergence-level companion to the per-coordinate parity tests
-/// (`population_packed_gradient_block_sigma_matches_fd` and siblings), which pin
-/// the rho gradient itself against Richardson reconverged FD.
+/// (`kernel_block_sigma_matches_reconverged_fd` and siblings in
+/// `sens/ode_adjoint_tests.rs`), which pin the rho gradient itself against Richardson
+/// reconverged FD.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

@@ -1553,7 +1553,7 @@ fn fit_inner(
     );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
-    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // (but not all) subjects fall outside the analytic (adjoint) scope, surface
     // it through warnings (not just the startup banner) per the AGENTS.md rule.
     if chain.iter().any(|m| {
         matches!(

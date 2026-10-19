@@ -7,7 +7,8 @@ pub(crate) const MIN_VARIANCE: f64 = 1e-12;
 /// (#1182), or `None` when the row carries none. An exponent of exactly `1`
 /// *is* returned: it is the proportional loading, and the value functions take
 /// the legacy arithmetic for it bit for bit (`scaled_loadings`), but the
-/// direct-θ derivative ([`magnitude_dvar_dtheta`]) still owes `∂R/∂p` there —
+/// direct-θ derivative (taped by the adjoint through `RuvMagDerivProgram::eval_g` into
+/// `focei_kernel`'s loadings) still owes `∂R/∂p` there —
 /// a search starts every power candidate at `p = 1`, and a gradient that read
 /// `0` on the exponent axis at that point would never move it.
 ///
@@ -544,13 +545,12 @@ impl ErrorSpec {
     /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
     ///
     /// The proportional loading carries the multiplier `m_prop`, so the variance's
-    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
-    /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
-    /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
-    /// the M3 censored curvature (which differentiates the same `v(f)`) stay
-    /// internally consistent under a custom RUV magnitude, and the FOCEI outer
-    /// θ/σ gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`)
-    /// consume the same magnitude-scaled second derivative. A `mult` of all ones
+    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`, i.e. [`d2var_df2`]
+    /// scaled by `m_prop²` — exactly the `m²` factor [`dvar_df_scaled`] applies to `dvar_df`.
+    /// Keeping the same scaling here lets the M3 censored curvature (which differentiates the same
+    /// `v(f)`) stay internally consistent under a custom RUV magnitude, and the Gauss-Newton
+    /// gradient (`gauss_newton.rs`) consume the same magnitude-scaled second derivative (as did,
+    /// before #2093, the retired `sens_outer_gradient::prepare_stacked`). A `mult` of all ones
     /// reproduces [`d2var_df2`].
     ///
     /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
@@ -1052,10 +1052,12 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
             n,
         ) {
             Some(pairs) => {
-                for (j, k, [c, dc, d2c]) in pairs {
-                    // C_jk(ρ) with both ρ-derivatives, so the serial ρ is differentiated
-                    // exactly to the second order the R-matrix reads.
-                    let v = rho_t.lift2(c, dc, d2c) * same_slot_covariance(&lt[j], &lt[k], sigma);
+                for (j, k, [c, d1, d2, d3, d4]) in pairs {
+                    // C_jk(ρ) with four ρ-derivatives, so the serial ρ is differentiated
+                    // exactly to every order a recording reads (the exact anchor's covariance
+                    // nested dual reads the fourth).
+                    let v = rho_t.lift4(c, d1, d2, d3, d4)
+                        * same_slot_covariance(&lt[j], &lt[k], sigma);
                     r[j][k] = r[j][k] + v;
                     r[k][j] = r[k][j] + v;
                 }
@@ -1375,9 +1377,10 @@ fn serial_pairs(
     )
 }
 
-/// Each serial pair's coefficient `C_jk(ρ)` with its first and second ρ-derivatives
-/// (`[C, ∂C/∂ρ, ∂²C/∂ρ²]`): `[ρ, 1, 0]` under `cs`, `[ρⁿ, n·ρⁿ⁻¹, n(n−1)·ρⁿ⁻²]` under `ar1`
-/// (`n = |p_j − p_k| ≥ 1`) and the same in `Δ = |t_j − t_k|` under `car1` (#1960). All three
+/// Each serial pair's coefficient `C_jk(ρ)` with its first four ρ-derivatives
+/// (`[C, ∂C/∂ρ, …, ∂⁴C/∂ρ⁴]`): `[ρ, 1, 0, 0, 0]` under `cs`, the power rule
+/// `n(n−1)…(n−k+1)·ρⁿ⁻ᵏ` under `ar1` (`n = |p_j − p_k| ≥ 1`) and the same in
+/// `Δ = |t_j − t_k|` under `car1` (#1960). All three
 /// come from one pass over one pairing, so a derivative can never be paired with another
 /// pair's value, and a pair is kept when any of the three is non-zero — at `ρ = 0` the
 /// value vanishes but its derivative does not.
@@ -1387,7 +1390,7 @@ fn serial_pairs_jet(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     n: usize,
-) -> Option<Vec<(usize, usize, [f64; 3])>> {
+) -> Option<Vec<(usize, usize, [f64; 5])>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1426,28 +1429,32 @@ fn serial_pairs_jet(
                 continue;
             }
             let rho = serial.rho;
-            // `ρᵉ` and its two ρ-derivatives, each term written so a zero coefficient
-            // (`e = 1` in the second) never multiplies a pole at `ρ = 0`.
-            let power = |e: f64| {
-                let d1 = if e == 0.0 { 0.0 } else { e * rho.powf(e - 1.0) };
-                let d2 = if e == 0.0 || e == 1.0 {
-                    0.0
-                } else {
-                    e * (e - 1.0) * rho.powf(e - 2.0)
-                };
-                [rho.powf(e), d1, d2]
-            };
-            let c = match serial.kind {
-                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0],
-                crate::types::ResidualSerialKind::Ar1 => {
-                    let lag = pos[j].abs_diff(pos[k]) as i32;
-                    let d1 = lag as f64 * rho.powi(lag - 1);
-                    let d2 = if lag < 2 {
+            // `ρᵉ` and its first four ρ-derivatives (the exact anchor's covariance nested dual
+            // reads all four), each term written so a zero falling-factorial coefficient
+            // (`e ∈ {0, 1, 2, 3}`) never multiplies a pole at `ρ = 0`.
+            let power = |e: f64| -> [f64; 5] {
+                std::array::from_fn(|order| {
+                    let coef: f64 = (0..order).map(|i| e - i as f64).product();
+                    if coef == 0.0 {
                         0.0
                     } else {
-                        (lag * (lag - 1)) as f64 * rho.powi(lag - 2)
-                    };
-                    [rho.powi(lag), d1, d2]
+                        coef * rho.powf(e - order as f64)
+                    }
+                })
+            };
+            let c = match serial.kind {
+                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0, 0.0, 0.0],
+                crate::types::ResidualSerialKind::Ar1 => {
+                    let lag = pos[j].abs_diff(pos[k]) as i32;
+                    std::array::from_fn(|order| {
+                        let order = order as i32;
+                        if lag < order {
+                            0.0
+                        } else {
+                            let coef: i32 = (0..order).map(|i| lag - i).product();
+                            coef as f64 * rho.powi(lag - order)
+                        }
+                    })
                 }
                 crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
             };
@@ -1856,8 +1863,8 @@ pub(crate) fn compute_dr_df_matrices_cov(
 /// Every nonzero entry of the `∂R/∂f_m` family, as `sink(m, i, j, v)`: add `v` at
 /// `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂R/∂f_m`. One of `i`, `j` is always `m`.
 /// Returns `false` when the residual blocks of a `correlation` line are missing (the
-/// builders then fill NaN). The single home of the formulas both
-/// [`compute_dr_df_matrices_cov`] and [`compute_dr_df_columns_cov`] store.
+/// builders then fill NaN). The single home of the formulas
+/// [`compute_dr_df_matrices_cov`] stores.
 #[allow(clippy::too_many_arguments)]
 fn visit_dr_df_cov(
     error_spec: &ErrorSpec,
@@ -2158,8 +2165,8 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
 /// Every nonzero entry of the `∂²R/∂f_a∂f_b` tensor, as `sink(a, b, i, j, v)`: add `v`
 /// at `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂²R/∂f_a∂f_b`. For `a ≠ b`, `{i, j} =
 /// {a, b}`; for `a = b`, one of `i`, `j` is `a`. Returns `false` when a `correlation`
-/// line's residual blocks are missing. The single home of the formulas both
-/// [`compute_d2r_df2_matrices_cov`] and [`compute_d2r_df2_compact_cov`] store.
+/// line's residual blocks are missing. The single home of the formulas
+/// [`compute_d2r_df2_matrices_cov`] stores.
 #[allow(clippy::too_many_arguments)]
 fn visit_d2r_df2_cov(
     error_spec: &ErrorSpec,

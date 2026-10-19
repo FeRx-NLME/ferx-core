@@ -5,16 +5,17 @@
 //! lagged infusion. This file carries it to every other way a lagged dose reaches the
 //! state, with an oracle that needs no second engine: after the reset, a subject whose
 //! pending lagged dose was recorded before the reset must read exactly like the same
-//! subject with that dose deleted — the prediction, and every `∂f/∂η` / `∂f/∂θ` of the dual
-//! walk, since a cancelled dose has no derivative either. Every form puts the cancelled
+//! subject with that dose deleted — the prediction, every `∂f/∂η` of the dual walk and the
+//! exact outer gradient, since a cancelled dose has no derivative either. Every form puts the cancelled
 //! dose's lagged arrival *after* the reset (asserted), and two live doses around it, the
 //! second landing on residual drug from the first, so neither side is degenerate.
 //!
 //! Per form, four assertions:
 //! 1. **cancel ≡ delete** on the production value (`predict`), the with-states engine and
 //!    the dual walk's value;
-//! 2. **the derivatives agree** between the two subjects on the dual walk — first order and
-//!    both second-order blocks;
+//! 2. **the derivatives agree** between the two subjects: the per-observation `∂f/∂η` of the
+//!    dual walk, and the adjoint's exact FOCEI outer gradient, which carries `∂f/∂θ` and both
+//!    second-order blocks (`∂²f/∂η²`, `∂²f/∂η∂θ`) through `H̃` and the Ψ identity (#2093);
 //! 3. **Dual2 vs FD**: the dual `∂f/∂η` of the cancelling subject against central FD of
 //!    the production predictor;
 //! 4. **the straddle**: the same subject with the reset moved *before* the dose record
@@ -34,8 +35,11 @@
 //! A third live dose (record 11.15) arrives, in `Residual` / `At obs`, *inside* the cancelled
 //! dose's would-be absorption or infusion window, where the dual walk's saltation velocities
 //! would carry the cancelled window if it leaked — a second-order effect, which is why (2)
-//! compares the second-order blocks too.
+//! compares the second-order blocks too (through the outer gradient).
 
+use ferx_core::estimation::inner_optimizer::find_ebe;
+use ferx_core::estimation::parameterization::pack_params;
+use ferx_core::estimation::sens_outer_gradient::subject_packed_gradient;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::compute_predictions_with_states;
 use ferx_core::sens::provider::{subject_eta_grad, ObsGrad};
@@ -366,6 +370,45 @@ fn check(form: &Form, v: Variant) {
             SAME_TOL,
         ));
     }
+    // θ and the second-order blocks, since #2093 through the adjoint's exact FOCEI outer
+    // gradient at the same η: it carries ∂f/∂θ directly, and ∂²f/∂η² and ∂²f/∂η∂θ through
+    // H̃ and the Ψ identity's w, so a leaked window anywhere in those blocks moves it.
+    // At the EBE, where the Ψ identity holds (off the mode an indefinite exact H declines),
+    // the cancelling subject's: the two subjects share their objective, hence their mode.
+    let x = pack_params(&m.default_params);
+    // The placeholder `DV = 1` on rows the drug has not reached (f = 0, variance on the floor)
+    // would make the objective ~1e12 and its EBE a rounding artifact, so both twins get the
+    // deleted twin's own predictions, wobbled ±10%, as data.
+    let with_data = |s: &Subject| {
+        let f = production(&m, sd, &e);
+        let mut out = s.clone();
+        out.observations = f
+            .iter()
+            .enumerate()
+            .map(|(j, p)| p * (1.0 + 0.1 * (1.7 * j as f64).sin()))
+            .collect();
+        out
+    };
+    let (gc, gd) = (with_data(sc), with_data(sd));
+    let eta_hat: Vec<f64> = find_ebe(&m, &gc, &m.default_params, 500, 1e-12, None, None, 0)
+        .eta
+        .iter()
+        .copied()
+        .collect();
+    let ga = subject_packed_gradient(&m, &gc, &m.default_params, &x, &eta_hat)
+        .unwrap_or_else(|| panic!("{label}: the cancelling subject's outer gradient is analytic"));
+    let gb = subject_packed_gradient(&m, &gd, &m.default_params, &x, &eta_hat)
+        .unwrap_or_else(|| panic!("{label}: the deleted twin's outer gradient is analytic"));
+    w_grad = w_grad.max(close(
+        &format!("{label}: exact outer gradient (θ, ∂²f/∂η², ∂²f/∂η∂θ)"),
+        &ga,
+        &gb,
+        SAME_TOL,
+    ));
+    assert!(
+        gb.iter().any(|g| g.abs() > 1e-3),
+        "{label}: the outer gradient must be live: {gb:?}"
+    );
     // The lag axis is live on the live doses, so (2) is not comparing zeros.
     assert!(
         b.iter().any(|o| o.df_deta[1].abs() > 1e-3),

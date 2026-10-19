@@ -1135,8 +1135,8 @@ fn test_check_model_options_flags_trust_region_iov() {
 }
 
 // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
-// `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
+// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via the adjoint kernel's
+// `block_sigma` loadings variance, `focei_kernel::loadings_variance`, #251); the Gauss-Newton (gn / gn_hybrid) methods still
 // use diagonal residual-error derivatives and must be rejected up front.
 #[test]
 fn test_check_model_options_block_sigma_rejects_unsupported_methods() {

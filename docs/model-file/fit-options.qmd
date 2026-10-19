@@ -785,7 +785,7 @@ NONMEM comparison.
 Notes:
 - `auto` (the default) chooses between `nlopt_lbfgs` and `bobyqa` from the model:
   when the exact analytic FOCE/FOCEI gradient is available (the model is in the
-  sensitivity provider's scope and `gradient` is not forced to `fd`) it uses the
+  adjoint's scope and `gradient` is not forced to `fd`) it uses the
   gradient-based `nlopt_lbfgs`; otherwise — a model outside the analytic scope,
   or `gradient = fd`, where the outer loop runs on finite differences — it falls
   back to the derivative-free `bobyqa`. Models with more than 64 free parameters

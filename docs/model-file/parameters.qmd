@@ -549,10 +549,11 @@ when ferx freezes a θ with no effect on the objective), so a block can also be 
 To read a dependent level's value, standard error or SIR interval, use
 `theta_level_values` ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
-Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
-the dual-number path — so a *small* level block keeps the analytic gradient.
-Past the engine's 24-axis dual dispatch, a large block falls back to finite
-differences per subject, which is why the guards above matter.
+Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact on the
+adjoint's tape — and the adjoint's cost does not grow with the number of θ, so a
+level block of any size keeps the exact gradient (#2093). Before that, a block past
+the forward provider's 24-axis dual dispatch fell back to finite differences per
+subject; the guards above still matter for the size of the estimation problem.
 
 ## Omega (Between-Subject Variability)
 

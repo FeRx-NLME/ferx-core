@@ -267,20 +267,20 @@ where
 /// state (#519), which keeps its stop cycle identical to the f64 path's, so the truncated
 /// gradient is the exact derivative of the truncated value (see [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
 ///
-/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment
-/// is converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag`
-/// — negligible both relative to itself and relative to the dominant compartment. Testing the
+/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment is
+/// converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag` —
+/// negligible both relative to itself and relative to the dominant compartment. Testing the
 /// *increment* (not the magnitude) is what makes this safe in a scale-separated model: a small
-/// compartment still in transit (effect-site / metabolite many orders below central) keeps the
-/// loop running until it too stops moving, rather than being declared converged merely for
-/// being small. The `tol·max_mag` term is the absolute floor that lets a genuinely-settled
-/// near-zero compartment — where the pure relative test is ill-conditioned — pass; without it
-/// the loop could never stop. Because the stop only fires once every compartment's increment
-/// is below f64-relative precision, the value has reached its fixed point and the elided cycles
-/// do not move it — predictions are unchanged to f64 precision, and gradients match a full
-/// budget to `< 1e-6` (see `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`;
-/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on
-/// the nonlinear fallback).
+/// compartment still in transit (effect-site / metabolite many orders below central) keeps the loop
+/// running until it too stops moving, rather than being declared converged merely for being small.
+/// The `tol·max_mag` term is the absolute floor that lets a genuinely-settled near-zero compartment
+/// — where the pure relative test is ill-conditioned — pass; without it the loop could never stop.
+/// Because the stop only fires once every compartment's increment is below f64-relative precision,
+/// the value has reached its fixed point and the elided cycles do not move it — predictions are
+/// unchanged to f64 precision, and gradients match a full budget to `< 1e-6` (measured by the
+/// pre-#2093 `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`, retired in #2093;
+/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on the
+/// nonlinear fallback).
 ///
 /// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
 /// convergence — don't early-exit and silently return a poisoned state; run the full cycle
@@ -458,7 +458,7 @@ pub(crate) fn record_ss_equilibration_cycles(n: usize) {
 /// **One cell per thread, shared across numeric types.** The recording sites live in
 /// helpers that are generic over `T: PkNum` (`equilibrate_ss_input_rate_g`,
 /// `anderson_ss_fixed_point_g`), and `sens::ode_provider` instantiates them with a dual
-/// `T`. So a test that drives a `fit()` or the analytic provider observes whichever walk
+/// `T`. So a test that drives a `fit()` or an analytic dual walk observes whichever walk
 /// ran *last*, f64 or dual — not necessarily the value-path run-in it means to pin. Assert
 /// this only from a test that calls the f64 helpers directly, as the #1139 tests do. The
 /// neighbouring cycle counter has the same property and the same caveat.
@@ -919,7 +919,8 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
 /// timeline break fires on exactly the doses production seeds. A twin that seeded
 /// on a wider or narrower set would disagree with production in *value*, which is
-/// the one thing the `check_vs_production` parity tests cannot forgive.
+/// the one thing the `fd_oracle` / `parity` tests (`sens/ode_adjoint_tests.rs`), which
+/// difference the production objective, cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
 }

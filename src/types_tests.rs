@@ -3039,8 +3039,9 @@ mod theta_block_scale_guards {
     use crate::io::output::compact_theta_blocks;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
 
-    /// A gather model with `len` levels — an FD-gradient model by construction
-    /// (the analytic provider caps at `MAX_SCALE_AXES` axes).
+    /// A gather model with `len` levels. (Written when a wide one was an
+    /// FD-gradient model by construction — the pre-#2093 forward provider capped
+    /// at `MAX_SCALE_AXES` axes; the adjoint has no θ-count cap.)
     fn wide_model(len: usize) -> crate::types::CompiledModel {
         let content = format!(
             r#"
@@ -3750,8 +3751,9 @@ fn pk_slot_rows_omit_an_unbound_individual_parameter() {
             !rows.iter().any(|&(_, i)| i == s_pos),
             "{label}: S owns no slot, so it must contribute no row: {rows:?}"
         );
-        // One row per slot — what `seed_dim_from_slots` (last row per slot wins)
-        // needs to be unambiguous.
+        // One row per slot — what `indiv_param_for_pk_slot`'s `find` by slot needs to
+        // be unambiguous (and what the pre-#2093 `seed_dim_from_slots`, last row per
+        // slot wins, needed).
         let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
         let n = slots.len();
         slots.sort_unstable();
@@ -3803,8 +3805,8 @@ fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
 /// `PK_IDX_LAGTIME` that `pk_indices` records as the placeholder `0` — CL's slot —
 /// so it is the same defect as an unbound intermediate's, on a parameter that
 /// drives the infusion window. Pins that the rows give it its own slot and leave
-/// `CL`'s to `CL`. The gradient consequence is asserted against FD in
-/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row`.
+/// `CL`'s to `CL`. The gradient consequence was asserted against FD in the pre-#2093
+/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row` (retired in #2093).
 #[test]
 fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
     let m = crate::parser::model_parser::parse_model_string(
@@ -3852,9 +3854,9 @@ fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
 ///
 /// This is the **only** check on the slot-9 row (review r4 #2): the companion
 /// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
-/// asserts FD parity for the `cl` row, but on the plain bolus it runs that row is
-/// the only one `η_D1` reaches the prediction through, so zeroing the slot-9
-/// derivative alone would leave its parity unchanged.
+/// (retired in #2093) asserted FD parity for the `cl` row, but on the plain bolus it ran
+/// that row is the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would have left its parity unchanged.
 #[test]
 fn pk_slot_rows_give_one_name_both_of_its_slots() {
     let m = crate::parser::model_parser::parse_model_string(

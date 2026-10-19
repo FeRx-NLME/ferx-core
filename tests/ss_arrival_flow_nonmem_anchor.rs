@@ -343,7 +343,7 @@ fn via_dense_states(model: &CompiledModel, pop: &Population) -> Vec<(String, f64
 }
 
 /// The dual ODE walk's value (`integrate_tvcov_g`) on every subject but ID 5, asserting each
-/// one stays on the analytic provider: an FD-routed subject would make this leg FD-of-f64 and
+/// one stays on `subject_eta_grad`'s dual walk: an FD-routed subject would make this leg FD-of-f64 and
 /// blind to the dual walk. ID 5 (`SS` infusion × lag) is declined to FD by design (#1128).
 fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let eta = vec![0.0; model.n_eta];

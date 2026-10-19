@@ -258,7 +258,7 @@ pub enum InputRateKind {
 
 impl InputRateKind {
     /// Whether this kind's input-rate forcing has been lifted to `PkNum`/`Dual2`
-    /// so the analytic ODE sensitivity provider (`sens/ode_provider.rs`) can
+    /// so the analytic ODE walks (`sens/ode_provider.rs`, recorded by the adjoint) can
     /// evaluate it over dual numbers; otherwise a model using it stays on the FD
     /// fallback. Inverse-Gaussian (#430 slice 1), transit (#430 slice 2, via the
     /// `ln_gamma` `Dual2` rule = digamma/trigamma), and Weibull (Phase 2 — its
@@ -366,7 +366,7 @@ impl InputRateForcing {
     /// Read this forcing's argument `i` from the flat individual-parameter
     /// vector `params`, falling back to `dflt` if the slot is absent. Generic
     /// over `T: PkNum` so the same reader serves the `f64` prediction path and
-    /// the `Dual2<N>` sensitivity provider (`params` is then the dual
+    /// the dual-number gradient path (`params` is then the dual
     /// individual-parameter vector).
     #[inline]
     fn arg<T: PkNum>(&self, params: &[T], i: usize, dflt: f64) -> T {
@@ -468,7 +468,7 @@ impl InputRateForcing {
     }
 
     /// Build the prepared input-rate constants over `T: PkNum` (e.g.
-    /// `T = Dual2<N>` for the analytic ODE sensitivity provider, #430) from the
+    /// a dual type for the analytic ODE walks, #430) from the
     /// individual-parameter vector `params` — laid out identically to the `f64`
     /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
     /// per-kind argument defaults match `prepare`, so the lifted constants
@@ -476,7 +476,7 @@ impl InputRateForcing {
     /// return `Some`: the smooth densities (inverse-Gaussian, transit, Weibull,
     /// first-order) pointwise, and [`InputRateKind::ZeroOrder`] via its `dur` jet —
     /// its moving-boundary `∂/∂dur` is delivered as a rate-off saltation by the
-    /// analytic provider (#530), not FD. [`InputRateKind::supported_over_dual`] gates which kinds
+    /// analytic ODE walk (#530), not FD. [`InputRateKind::supported_over_dual`] gates which kinds
     /// reach here and is pinned consistent with this `match` by
     /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
@@ -494,7 +494,7 @@ impl InputRateForcing {
                 self.arg(params, 1, 1.0),
             )),
             // Lifted (#530): the pointwise `dur` jet carries the smooth magnitude
-            // term; the analytic provider's `integrate_g` delivers the window as a
+            // term; the analytic ODE walk's `integrate_g` delivers the window as a
             // per-segment constant and injects the rate-off saltation at the cutoff
             // for the moving-boundary term. The `dur` field threads `∂/∂dur` into both.
             InputRateKind::ZeroOrder => {
@@ -512,7 +512,7 @@ impl InputRateForcing {
 /// ODE hot path. Built once per dose record by [`InputRateForcing::prepare`];
 /// [`Self::rate`] then costs only the `tad`/`dose`-dependent arithmetic per dose.
 /// Generic over the numeric type `T`: `T = f64` for predictions, `T = Dual2<N>`
-/// for the analytic ODE sensitivity provider (#430). The default `T = f64` keeps
+/// (or another dual type) for the analytic ODE walks (#430). The default `T = f64` keeps
 /// every existing scalar call site (`PreparedInputRate`) unchanged.
 #[derive(Debug, Clone, Copy)]
 pub enum PreparedInputRate<T = f64> {
@@ -651,7 +651,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// Generic over `T` (the `sens/` `*_g<T>` convention). The pointwise `rate`
     /// below carries the smooth *magnitude* part of `∂R_in/∂dur` via the `dur`/
     /// `inv_dur` jets; the moving-boundary part at the `tad = dur` cutoff is supplied
-    /// separately by the analytic provider's rate-off saltation (`integrate_g`, #530),
+    /// separately by the analytic ODE walk's rate-off saltation (`integrate_g`, #530),
     /// so a `zero_order()` model is now served analytically
     /// ([`InputRateKind::supported_over_dual`] = `true`).
     #[inline]
@@ -853,7 +853,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
     /// for shape `β < 1` (an integrable spike, not a finite jump) — callers must
     /// exclude that combination rather than call this (see
-    /// `ode_analytical_supported`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
+    /// `ode_walk_model_scope`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
     /// handled entirely by its separate moving-window mechanism (#530), not this
     /// path.
     #[inline]
@@ -916,7 +916,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// limitation, leaving those Hessians on FD — for the **singular** `Transit`
     /// `0 < n < 1` (slope →`+∞`, no finite companion). `Weibull` `β < 1` diverges
     /// (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
-    /// (`ode_analytical_supported`) keeps `Weibull` on the FD fallback. The `Transit`
+    /// (`ode_walk_model_scope`) keeps `Weibull` on the FD fallback. The `Transit`
     /// `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64` equality
     /// (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
@@ -1940,9 +1940,9 @@ mod tests {
     /// Drift tripwire: `InputRateKind::supported_over_dual` (the gate the ODE
     /// provider reads) must agree with whether `prepare_dual` actually lifts the
     /// kind. A kind marked supported but returning `None` would let
-    /// `ode_analytical_supported` admit the model, then the `?` in
-    /// `integrate_subject_duals` silently bails the whole subject to FD with no
-    /// error. Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
+    /// `ode_walk_model_scope` admit the model, then the `prepare_dual` call in the
+    /// ODE walk (`prepare_dual_forcing`) would panic on a subject the gate promised it could serve (before
+    /// #2093 the `?` in `integrate_subject_duals` silently bailed it to FD). Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
     #[test]
     fn supported_over_dual_agrees_with_prepare_dual() {
         const ALL_KINDS: &[InputRateKind] = &[
@@ -2220,7 +2220,7 @@ mod tests {
     /// Direct Tier-1 coverage of every `rate_at_zero` match arm (#486 review): the
     /// function's only caller (the event-driven walk's onset saltation, gated on
     /// `has_lagtime`) currently reaches just `Transit`/`InverseGaussian`/`FirstOrder`
-    /// (`ode_analytical_supported`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
+    /// (`ode_walk_model_scope`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
     /// that combination), so the `Weibull` and `ZeroOrder` arms — and `Transit`'s
     /// degenerate `n ≤ 0` case — are otherwise never exercised, direct or indirect.
     /// Pinning them here means a future gate relaxation that makes one of them live

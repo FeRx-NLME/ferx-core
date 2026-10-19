@@ -454,6 +454,41 @@ pub(crate) fn tetragamma(x: f64) -> f64 {
         - 2.0 * r * (dda / a - r * r)
 }
 
+/// Pentagamma ψ‴(x) = d⁴/dx⁴ ln Γ(x) — the exact derivative of [`tetragamma`]'s Lanczos form,
+/// for the covariance step's nested dual over `ln Γ` (its `φ⁗`). Reflection, from
+/// `ψ‴(x) + ψ‴(1 − x) = −π·d³cot(πx)/dx³`: ψ‴(x) = −ψ‴(1 − x) + 2π⁴(1 + 2cos²πx)/sin⁴πx.
+pub(crate) fn pentagamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        let (s, c) = ((pi * x).sin(), (pi * x).cos());
+        return -pentagamma(1.0 - x) + 2.0 * pi.powi(4) * (1.0 + 2.0 * c * c) / s.powi(4);
+    }
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    let mut dda = 0.0;
+    let mut ddda = 0.0;
+    let mut dddda = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+        dda += 2.0 * c / (d * d * d);
+        ddda -= 6.0 * c / (d * d * d * d);
+        dddda += 24.0 * c / (d * d * d * d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    // tetragamma = −3/t² + 2(y + ½)/t³ + ddda/a − dda·da/a² − 2r·q, r = da/a, q = r′ = dda/a − r².
+    let r = da / a;
+    let q = dda / a - r * r;
+    let dq = ddda / a - dda * da / (a * a) - 2.0 * r * q;
+    8.0 / (t * t * t) - 6.0 * (y + 0.5) / (t * t * t * t) + dddda / a
+        - ddda * da / (a * a)
+        - (ddda * da + dda * dda) / (a * a)
+        + 2.0 * dda * da * da / (a * a * a)
+        - 2.0 * (q * q + r * dq)
+}
+
 /// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
 /// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
 /// `x ≥ 0` (returns `0` for `x ≤ 0`).
@@ -696,6 +731,27 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
 
 #[cfg(test)]
 mod tests {
+    /// `pentagamma` is `tetragamma`'s derivative (central FD, both sides of the reflection) and
+    /// hits ψ‴(1) = π⁴/15.
+    #[test]
+    fn pentagamma_is_the_derivative_of_tetragamma_and_hits_its_known_value() {
+        let want = std::f64::consts::PI.powi(4) / 15.0;
+        assert!(
+            (pentagamma(1.0) - want).abs() < 1e-9 * want,
+            "{}",
+            pentagamma(1.0)
+        );
+        for x in [-1.3, -0.4, 0.2, 0.7, 1.0, 2.5, 7.0, 31.0] {
+            let h = 1e-4 * (1.0 + f64::abs(x));
+            let fd = (tetragamma(x + h) - tetragamma(x - h)) / (2.0 * h);
+            let got = pentagamma(x);
+            assert!(
+                got.is_finite() && (got - fd).abs() < 1e-5 * (1.0 + fd.abs()),
+                "x = {x}: pentagamma {got} vs FD {fd}"
+            );
+        }
+    }
+
     use super::*;
     use approx::assert_relative_eq;
 

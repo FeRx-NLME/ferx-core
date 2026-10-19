@@ -519,7 +519,7 @@ pub fn ferx_core::estimation::saem_conddist::run_conditional_distribution(model:
 pub mod ferx_core::estimation::sens_outer_gradient
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], interaction: bool) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
-pub fn ferx_core::estimation::sens_outer_gradient::population_eta_dx(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>>
+pub fn ferx_core::estimation::sens_outer_gradient::population_eta_dx(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>>
 pub fn ferx_core::estimation::sens_outer_gradient::predict_warm_etas(prev_etas: &[nalgebra::base::alias::DVector<f64>], jacs: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], x_prev: &[f64], x_new: &[f64]) -> alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_foce(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
@@ -2793,7 +2793,6 @@ pub fn ferx_core::CompiledModel::residual_var_scale(&self, eta: &[f64]) -> f64
 pub fn ferx_core::CompiledModel::residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64
 pub fn ferx_core::CompiledModel::residual_variance_at_scaled(&self, cmt: usize, f_pred: f64, sigma: &[f64], mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::ruv_obs_mult(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
-pub fn ferx_core::CompiledModel::ruv_obs_mult_theta_grad(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<alloc::vec::Vec<f64>>>>
 pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], correlations: &[ferx_core::ResidualCorrelation], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::sync_ode_solver_opts(&mut self, opts: &ferx_core::FitOptions)
 pub fn ferx_core::CompiledModel::theta_blocks(&self) -> &ferx_core::parser::model_parser::ThetaBlocks
@@ -3442,7 +3441,6 @@ pub ferx_core::types::RuvMagnitude::per_sigma_exponent_deriv: alloc::vec::Vec<co
 pub ferx_core::types::RuvMagnitude::theta_dependent: bool
 impl ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> alloc::vec::Vec<f64>
-pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
@@ -4242,7 +4240,6 @@ pub fn ferx_core::CompiledModel::residual_var_scale(&self, eta: &[f64]) -> f64
 pub fn ferx_core::CompiledModel::residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64
 pub fn ferx_core::CompiledModel::residual_variance_at_scaled(&self, cmt: usize, f_pred: f64, sigma: &[f64], mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::ruv_obs_mult(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
-pub fn ferx_core::CompiledModel::ruv_obs_mult_theta_grad(&self, subject: &ferx_core::Subject, theta: &[f64]) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<alloc::vec::Vec<f64>>>>
 pub fn ferx_core::CompiledModel::sim_residual_variance(&self, subject: &ferx_core::Subject, j: usize, f_pred: f64, sigma: &[f64], correlations: &[ferx_core::ResidualCorrelation], ruv_scale: f64, mult: core::option::Option<&[f64]>) -> f64
 pub fn ferx_core::CompiledModel::sync_ode_solver_opts(&mut self, opts: &ferx_core::FitOptions)
 pub fn ferx_core::CompiledModel::theta_blocks(&self) -> &ferx_core::parser::model_parser::ThetaBlocks
@@ -5032,7 +5029,6 @@ pub ferx_core::RuvMagnitude::per_sigma_exponent_deriv: alloc::vec::Vec<core::opt
 pub ferx_core::RuvMagnitude::theta_dependent: bool
 impl ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> alloc::vec::Vec<f64>
-pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude

@@ -9318,6 +9318,23 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
     );
 }
 
+/// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
+/// the one the adjoint tape records), seeded with `Dual1` θ leaves.
+fn deriv_theta_grad<const N: usize>(
+    p: &RuvMagDerivProgram,
+    theta: &[f64; N],
+    cov: &std::collections::HashMap<String, f64>,
+    time: f64,
+    tad: f64,
+) -> Vec<f64> {
+    use crate::sens::dual1::Dual1;
+    let th: Vec<Dual1<N>> = (0..N).map(|m| Dual1::var(theta[m], m)).collect();
+    p.eval_g(&th, cov, time, tad)
+        .expect("θ count matches")
+        .grad
+        .to_vec()
+}
+
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
 /// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
 /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
@@ -9350,11 +9367,8 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
         .as_ref()
         .expect("prop slot has a deriv program");
 
-    let theta = vec![0.2, 10.0, 1.5];
     let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
-    let grad = deriv
-        .theta_grad(&theta, &cov_zero, 10.0, 10.0)
-        .expect("theta_grad supported");
+    let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov_zero, 10.0, 10.0);
     assert!(
         grad.iter().all(|g| g.is_finite()),
         "MACHEPS must guard the WT=0 denominator, got {:?}",
@@ -9367,7 +9381,7 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
 /// xhigh review: a *legacy* pre-built magnitude expression that still
 /// represents `TIME` as an `Expression::Covariate("TIME")` node (rather than
 /// the `Expression::Time` built-in every parsed `.ferx` model produces) must
-/// still resolve `TIME` to the observation time in `theta_grad`, mirroring the
+/// still resolve `TIME` to the observation time in `eval_g`, mirroring the
 /// runtime `RuvMagFn` closure's `cov.insert("TIME", time)` injection. Without
 /// it, `cov_vec` would look up "TIME" in the (never-populated) observation
 /// covariate map and silently default to `0.0`.
@@ -9382,9 +9396,7 @@ fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
     );
     let deriv = compile_ruv_mag_deriv_program(&expr, Some("UNUSED_SIGMA"), 1);
     let empty_cov = std::collections::HashMap::new();
-    let grad = deriv
-        .theta_grad(&[2.0], &empty_cov, 10.0, 10.0)
-        .expect("theta_grad supported");
+    let grad = deriv_theta_grad(&deriv, &[2.0], &empty_cov, 10.0, 10.0);
     // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
     approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
 }
@@ -20187,8 +20199,8 @@ fn test_apply_fit_option_frem_sigma() {
     assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
 }
 
-/// #485: the cov-static constant fold in `eval_param_duals` /
-/// `eval_param_eta_grad` must be bit-identical to the unfolded path. The
+/// #485: the cov-static constant fold in `eval_params_g` must be
+/// bit-identical to the unfolded path; the tests below pin its classifier. The
 /// model below has a covariate + FIXED-θ kernel (`FMAT`, `FAC` — foldable)
 /// and a dynamic tail (`CL = free-θ × … × exp(η)` — not foldable).
 const COV_STATIC_FOLD_MODEL: &str = r#"
@@ -24807,15 +24819,14 @@ fn power_form_parses_as_proportional_with_an_exponent_slot() {
     let cov = std::collections::HashMap::new();
     let row = rm.eval_obs(&theta, &cov, 1.0, 1.0);
     assert_eq!(row, vec![1.0, 1.3], "multiplier half then exponent half");
-    let grad = rm.eval_obs_theta_grad(&theta, &cov, 1.0, 1.0).unwrap();
-    assert_eq!(grad.len(), 2);
-    assert_eq!(
-        grad[0],
-        vec![0.0; 3],
-        "the bare multiplier has no θ derivative"
+    let th = [0.2, 10.0, 1.3];
+    assert!(
+        rm.per_sigma_deriv[0].is_none(),
+        "the bare multiplier has no θ-derivative program"
     );
+    let p = rm.per_sigma_exponent_deriv[0].as_ref().unwrap();
     assert_eq!(
-        grad[1],
+        deriv_theta_grad(p, &th, &cov, 1.0, 1.0),
         vec![0.0, 0.0, 1.0],
         "∂p/∂θ is the unit vector on RUV_POW"
     );
@@ -24890,10 +24901,16 @@ fn magnitude_expression_reads_tad() {
     // TIME is 100 on both records; only TAD tells them apart.
     assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 5.0), vec![1.5]);
     assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 20.0), vec![1.0]);
-    let early = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 5.0).unwrap();
-    let late = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 20.0).unwrap();
-    assert_eq!(early[0], vec![0.0, 0.0, 1.0]);
-    assert_eq!(late[0], vec![0.0, 0.0, 0.0]);
+    let p = rm.per_sigma_deriv[0].as_ref().unwrap();
+    let th = [0.2, 10.0, 1.5];
+    assert_eq!(
+        deriv_theta_grad(p, &th, &cov, 100.0, 5.0),
+        vec![0.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        deriv_theta_grad(p, &th, &cov, 100.0, 20.0),
+        vec![0.0, 0.0, 0.0]
+    );
 }
 
 /// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
@@ -27530,7 +27547,8 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
 
 /// The synth names: θ then η keep their #486 names and order, gathers follow, a
 /// repeated gather is lifted once and two indices of one block are two synths.
-/// Pins the names `provider_tests.rs` / `ode_provider_tests.rs` grep.
+/// Pins the synth names (the retired pre-#2093 `provider_tests.rs` /
+/// `ode_provider_tests.rs` grepped them).
 #[test]
 fn readout_gather_synths_follow_the_theta_eta_synths() {
     let m = parse_model_string(&gather_readout_model(
@@ -33626,6 +33644,162 @@ fn a_max_on_the_route_is_named_as_such() {
                  `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
             ),
             "{f}: {msg}"
+        );
+    }
+}
+
+/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
+/// the parser appends a synthetic individual parameter and rewrites the reference
+/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
+///
+/// The synthetics are appended on the ODE-layout path (which a compartment-free
+/// model takes), but the *acceptance list* was then overwritten with the analytical
+/// allocator's empty result — so the reference was never rewritten, the readout
+/// reported `dual_evaluable = false`, and the model silently dropped to finite
+/// differences while carrying a warning blaming the readout's shape.
+#[test]
+fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
+        [structural_model]\n\
+        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n";
+    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
+    assert!(model.is_algebraic());
+    let program = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref())
+        .expect("the equation compiles to a readout program");
+    assert!(
+        program.is_dual_evaluable(),
+        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
+         model loses its analytic gradient"
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "no FD-fallback warning should be emitted, got {:?}",
+        model.parse_warnings
+    );
+    assert!(
+        crate::sens::ode_provider::adjoint::model_in_scope(&model),
+        "and the adjoint's recorders must actually serve it"
+    );
+    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
+    // path a compartment-free model takes; a second append from the analytical
+    // allocator would double them and silently consume two PK slots each.
+    let synths: Vec<&String> = model
+        .indiv_param_names
+        .iter()
+        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
+        .collect();
+    assert_eq!(
+        synths.len(),
+        2,
+        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
+    );
+}
+
+/// An all-arm name read only by an analytical `[initial_conditions]` is
+/// promoted, and predicts like its top-level ternary twin. Before, it was read
+/// as a data column ("S not found in data"); it was held back from #1900 because
+/// an init then read a non-`pk(...)` parameter through CL's placeholder slot,
+/// which #1898 fixed. Two subjects straddle the condition (WT 60 / 80), so both
+/// arms are live; the promoted name takes a free differentiable slot, so the
+/// model stays analytic.
+#[test]
+fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
+    let all_arm = "  if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }";
+    let ternary = "  S = if (WT > 70) 50 else 100";
+    let init = "[initial_conditions]\n  init(central) = S\n";
+    let m = parse_model_string(&unbound_reader_model(all_arm, init)).expect("parses");
+    assert!(
+        m.indiv_param_names.iter().any(|n| n == "S"),
+        "{:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        !m.referenced_covariates.iter().any(|c| c == "S"),
+        "S is no longer a required data column: {:?}",
+        m.referenced_covariates
+    );
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&m));
+    let got = unbound_reader_preds(all_arm, init);
+    assert_eq!(
+        got,
+        unbound_reader_preds(ternary, init),
+        "all-arm == ternary"
+    );
+    assert!((got[0] - got[1]).abs() > 1e-3, "both arms live: {got:?}");
+}
+
+/// A modeled-dose `D{n}` / `R{n}` read by `init` or `obs_scale` reads its own
+/// value, like any other parameter no `pk(...)` role binds (#1901 review r1).
+/// It keeps its modeled-dose value slot too; this only adds the read slot, as a
+/// Form C `y` already did. Four cells: D and R × init and obs_scale, each via
+/// the name against the same read written inline.
+#[test]
+fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
+    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
+    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
+    for name in ["D1", "R1"] {
+        for (label, block) in [
+            ("init", &init as &dyn Fn(&str) -> String),
+            ("obs_scale", &scale),
+        ] {
+            let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
+            let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
+            assert_eq!(via_name, inline, "{name} read by {label}");
+            let m = parse_model_string(&unbound_reader_model(
+                &format!("  {name} = 2"),
+                &block(name),
+            ))
+            .unwrap();
+            assert!(
+                crate::sens::ode_provider::adjoint::model_in_scope(&m),
+                "{name} read by {label}: the read slot keeps the analytic path"
+            );
+        }
+    }
+}
+
+/// The slot itself: `S` gets a free differentiable slot of its own — not CL's
+/// placeholder `0`, and not a slot the closed form consumes — so the analytic
+/// provider keeps serving the model.
+#[test]
+fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
+    for extra in [
+        "[initial_conditions]\n  init(central) = S\n",
+        "[scaling]\n  obs_scale = S\n",
+    ] {
+        let m = parse_model_string(&unbound_reader_model("  S = 2", extra)).unwrap();
+        let i = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
+        let slot = m.pk_indices[i];
+        assert_ne!(
+            slot,
+            crate::types::PK_IDX_CL,
+            "{extra}: S must not alias CL"
+        );
+        assert!(
+            slot <= crate::types::PK_IDX_MTT,
+            "{extra}: slot {slot} differentiable"
+        );
+        assert!(
+            !m.pk_model.consumes_pk_slot(slot),
+            "{extra}: slot {slot} is read by the closed form"
+        );
+        assert!(
+            crate::sens::ode_provider::adjoint::model_in_scope(&m),
+            "{extra}"
         );
     }
 }

@@ -641,10 +641,10 @@ pub(crate) struct MrScope<'a> {
     pub pk: crate::types::PkParams,
 }
 
-/// The single closed-form MR scope gate, shared by the value path
-/// ([`mr_predictions`]) and the gradient path (`mr_subject_sensitivities` /
-/// `mr_subject_eta_grad`) so the two can never admit a different set of
-/// subjects — a value/gradient scope drift is exactly the silent-wrong class
+/// The single closed-form MR scope gate for the value path ([`mr_predictions`]).
+/// Before #2093 it was shared with a closed-form gradient path
+/// (`mr_subject_sensitivities` / `mr_subject_eta_grad`, since deleted) so the two
+/// could never admit a different set of subjects — a value/gradient scope drift is exactly the silent-wrong class
 /// the reduction-to-ODE tests guard against, and it can only be prevented by
 /// having one gate, not two independently-maintained copies.
 ///
@@ -693,10 +693,10 @@ pub(crate) fn mr_scope<'a>(
     //
     // This is the **gradient-side** half of the fix. The value path does not reach
     // here at all — the routing site sends these models to the event-driven
-    // predictor first — but `mr_subject_sensitivities` / `mr_subject_eta_grad` are
-    // called from `sens/provider.rs` and never pass through that routing. Without
-    // this gate the value would carry `TAD` while the gradient dropped it: a
-    // value/gradient mismatch worse than either alone.
+    // predictor first — but the (pre-#2093, since deleted) `mr_subject_sensitivities` /
+    // `mr_subject_eta_grad` were called from `sens/provider.rs` and never passed through
+    // that routing. Without this gate the value would have carried `TAD` while the
+    // gradient dropped it: a value/gradient mismatch worse than either alone.
     //
     // Over-declines only where a time variable provably cancels (`T − TAFD` is the
     // first dose time, a constant). Correct, just slower.
@@ -728,10 +728,10 @@ pub(crate) fn mr_scope<'a>(
     // variance `p_obs`), so the closed form would give the correct mean. For the
     // *gradient* it is not: the analytic jet of the drift omits `∂p_obs/∂θ`, which the
     // FD gradient of the full OFV carries — so an SDE must take FD, exactly as
-    // `ode_analytical_supported` enforces (`!diffusion_var.is_empty() → false`). Higher
-    // gates (`sens_supported` / `analytic_inner_grad_supported_model`) already route SDE
-    // to FD before either provider is reached, so this is the same defensive re-check
-    // `ode_subject_sensitivities` keeps (fail loudly to FD, never a silent wrong jet;
+    // `ode_walk_model_scope` enforces (`!diffusion_var.is_empty() → false`). Higher
+    // gates (`adjoint::model_in_scope` / `analytic_inner_grad_supported_model`) already
+    // route SDE to FD before any gradient path is reached, so this is a defensive re-check
+    // (fail loudly to FD, never a silent wrong jet;
     // the #637 layering principle) — placed in the shared gate so value and gradient
     // stay on one scope.
     if !spec.diffusion_var.is_empty() {
@@ -1039,10 +1039,10 @@ fn verify_against_ode_twin(
 /// ([`crate::stats`]'s `model_predictions` →
 /// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the
 /// gradient finite-differences these same values, so it is fully
-/// self-consistent. For an analytic-sensitivity fit the gradient comes from
-/// [`mr_subject_sensitivities`]/[`mr_subject_eta_grad`] when in scope
-/// (identical `mr_scope`, so never a different subject set), else the ODE
-/// provider — either way value and gradient **agree to solver tolerance** (the
+/// self-consistent. For an analytic-gradient fit the gradient comes from the
+/// adjoint over the ODE walk (before #2093, from the closed-form
+/// `mr_subject_sensitivities`/`mr_subject_eta_grad` under the identical `mr_scope`)
+/// — either way value and gradient **agree to solver tolerance** (the
 /// closed form reduces to the same integrated twin), so the objective stays
 /// consistent to far within `inner_tol`.
 pub(crate) fn mr_predictions(
@@ -3477,5 +3477,172 @@ mod tests {
                 mr_predictions(&model, &subject, theta, eta).expect("zoo model must stay in scope");
             assert!(preds.iter().all(|p| p.is_finite()));
         }
+    }
+
+    #[test]
+    fn declines_sde_diffusion() {
+        // A parsed SDE model always uses an `ObsCmt` readout (Form-C `y = <expr>`
+        // is rejected on SDE at parse), and `ObsCmt` has no `readout_program`, so
+        // `identify_disposition` already declines it at its `readout_program.as_ref()?`
+        // — the `diffusion_var` guard can't be reached through the normal parse path
+        // *today*. It is forward-defensive: were `ObsCmt` (or a future readout) ever
+        // made MR-identifiable, an SDE's linear *drift* would identify and the guard
+        // is the only thing keeping the stochastic model off the deterministic closed
+        // form. Exercise it directly by injecting a diffusion term into a model
+        // `mr_scope` otherwise admits, proving the guard is load-bearing.
+        let mut model = parse(REDUCE_1CPT);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        // Baseline: this model IS admitted (sanity — else the test proves nothing).
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the diffusion injection"
+        );
+        // Inject a state diffusion term without touching the (still canonical-linear)
+        // drift RHS the disposition probe reads. The guard keys on `diffusion_var` (not
+        // `is_sde()`'s `diffusion_theta_start`), so setting this one field is what
+        // exercises the guard.
+        let spec = model.ode_spec.as_mut().unwrap();
+        spec.diffusion_var = vec![0.01; spec.n_states];
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "an SDE (diffusion term) must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "an SDE must decline the MR value path"
+        );
+    }
+
+    #[test]
+    fn declines_time_dependent_readout() {
+        // #1028: the Form C readout resolves `TIME` per observation, so a readout with
+        // an additive time term is no longer a function of the state alone. The MR fast
+        // path reads the observable as `m·amount`, with `m` recovered by a linearity
+        // probe (`readout(0) ≈ 0`, `readout(2·e_c) ≈ 2·readout(e_c)`) evaluated under
+        // the *ambient* model-time thread-local — `0.0` here — so the time term
+        // evaluates to zero at the probe, `y0 == 0` passes, and the closed form would
+        // then silently serve predictions with the whole term missing. Decline instead.
+        let src = REDUCE_1CPT.replace("y = central / V", "y = central / V + 0.5 * TIME");
+        let model = parse(&src);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+
+        // Baseline: the same model *without* the time term is MR-admitted, so the
+        // decline below is attributable to the readout and nothing else.
+        assert!(
+            mr_scope(&parse(REDUCE_1CPT), &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the TIME term is added"
+        );
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "a TIME-reading Form C readout must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "…and the MR value path with it"
+        );
+
+        // The term is real on the path that now serves this model: the ODE readout
+        // (which enters the per-observation guard) differs from the time-free twin by
+        // exactly `0.5·t`. Had the fast path stayed in scope it would have returned the
+        // time-free values — which is the silent-wrong this decline prevents.
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let p = flat_params(&model, &theta, &eta);
+        let with_time = crate::ode::ode_predictions(spec, &p, &theta, &eta, &subject);
+        let base_model = parse(REDUCE_1CPT);
+        let base_spec = base_model.ode_spec.as_ref().expect("ode model");
+        let base_p = flat_params(&base_model, &theta, &eta);
+        let without_time = crate::ode::ode_predictions(base_spec, &base_p, &theta, &eta, &subject);
+        for (i, t) in subject.obs_times.iter().enumerate() {
+            let delta = with_time[i] - without_time[i];
+            assert!(
+                (delta - 0.5 * t).abs() < 1e-6,
+                "obs {i} t={t}: readout time term is {delta}, expected {}",
+                0.5 * t
+            );
+        }
+    }
+
+    /// All four closed-form entry points share `mr_scope`, so none may serve a
+    /// `TAD`-reading `[odes]` RHS the closed form cannot evaluate (#1124). The
+    /// spelling matters: an *indexed* `ALAG1` populates `dose_attr_map`, which
+    /// `mr_scope` rejects for an unrelated reason, so it cannot demonstrate this.
+    /// A bare `ALAG` leaves that map empty and reaches the closed form — which is
+    /// how the fast path originally bypassed #1070's FD gate.
+    ///
+    /// That bypass framing is now historical: #1136 deleted the FD gate in favour
+    /// of a real dual, so there is no upstream decline left to inherit and
+    /// `mr_scope` must refuse this model on `model_uses_time_anywhere` alone. Both
+    /// premises are asserted below so the test cannot pass for the old reason.
+    #[test]
+    fn mr_declines_what_the_ode_analytic_gate_declines() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(4.0, 0.1, 24.0)
+  theta TVLAG(0.5, 0.001, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+  ALAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central*(1.0 + 0.3*TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.4, 1.0, 4.0, 0.5];
+        let eta = [0.0];
+
+        // Pin the premise: this really is the bypass shape, not an unrelated decline.
+        assert!(model.has_lagtime());
+        assert!(
+            spec.dose_attr_map.is_empty(),
+            "a bare `ALAG` must leave `dose_attr_map` empty — otherwise `mr_scope` \
+             declines for that reason and the gate bypass is not exercised"
+        );
+        // The ODE gate now *admits* this model: #1136 replaced #1070's FD gate with
+        // a real `∂TAD/∂ALAG = −1` dual, so `TAD` + an estimated lagtime is analytic
+        // there. That makes this case sharper than when it was written — the closed
+        // form must decline on its own predicate, with no upstream gate behind it.
+        assert!(
+            crate::sens::ode_provider::adjoint::model_in_scope(&model),
+            "premise: the adjoint's ODE recorder serves this model, so the decline below \
+             cannot be inherited from it"
+        );
+        assert!(
+            crate::pk::model_uses_time_anywhere(&model),
+            "premise: the RHS reads `TAD`, which is the predicate #1124 made `mr_scope` ask"
+        );
+
+        assert!(mr_scope(&model, &subject, &theta, &eta).is_none());
+        assert!(mr_predictions(&model, &subject, &theta, &eta).is_none());
     }
 }

@@ -761,6 +761,25 @@ pub(crate) fn fixed_ebe_subject_score(
     gi
 }
 
+/// Test hook: subject ids whose analytic covariance term declines, so a test can reach the
+/// #1514 salvage (`AnalyticCovAssembly::Partial`) without changing any prediction. Global, not
+/// thread-local: the assembly runs on the rayon workers. Ids are test-unique by convention.
+#[cfg(test)]
+pub(super) mod forced_cov_decline {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    static IDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    pub(in crate::estimation) fn decline(id: &str) {
+        IDS.lock().unwrap().insert(id.to_string());
+    }
+
+    pub(in crate::estimation) fn declines(id: &str) -> bool {
+        IDS.lock().unwrap().contains(id)
+    }
+}
+
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
 /// `analytic_cov_hessian`).
 fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
@@ -1020,6 +1039,10 @@ pub(super) fn analytic_cov_assembly(
             if crate::cancel::is_cancelled(&options.cancel) {
                 return None;
             }
+            #[cfg(test)]
+            if forced_cov_decline::declines(&subject.id) {
+                return None;
+            }
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
             let h = subject_adjoint_cov_hessian(model, subject, template, x_hat, &b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
@@ -1027,8 +1050,8 @@ pub(super) fn analytic_cov_assembly(
             }
             // ×2 — the OFV convention, and the one place this can be silently wrong.
             //
-            // `subject_packed_cov_hessian` is the second derivative of `subject_packed_gradient`,
-            // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens`'s
+            // `subject_adjoint_cov_hessian` is the second derivative of `subject_packed_gradient`,
+            // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens_mixed`'s
             // `grad[k] += 2.0 * gi[k]`). The stencil this replaces differences `2·pop_nll`, so
             // `hess` here must be `∂²OFV/∂x²`, and the caller's `covariance = 2·H⁻¹` assumes it.
             // Summing the per-subject Hessians unscaled yields exactly half of that, which inflates
@@ -1097,10 +1120,10 @@ pub(super) fn subset_population(
 
 /// The output of one reconverged-OFV second-difference stencil.
 ///
-/// `pub(super)` so `sens_cov_hessian`'s tests can run the *production* stencil over an
-/// arbitrary subject set and check that the population's equals the sum of the per-subject
-/// ones — the premise #1514 rests on. A test that rebuilt the difference formulas to do that
-/// would be comparing two copies rather than one formula on two inputs.
+/// `pub(super)` so `salvage_tests` (`covariance_salvage_tests.rs`) can run the *production* stencil
+/// over an arbitrary subject set and check that the population's equals the sum of the per-subject
+/// ones — the premise #1514 rests on. A test that rebuilt the difference formulas to do that would
+/// be comparing two copies rather than one formula on two inputs.
 pub(super) struct FdStencil {
     /// `n`×`n`, zero outside the `free_idx` block and at every entry whose stencil was
     /// non-finite (those are reported through the two sets instead, because a stored zero is
@@ -1329,6 +1352,14 @@ pub(super) mod reconverge_log {
 
     pub(in crate::estimation) fn record_fd_hessian(initial_eps: f64) {
         FD_HESSIAN_CALLS.lock().unwrap().push(initial_eps);
+    }
+
+    /// Remove and count the `fd_ofv_hessian` calls made with exactly `initial_eps`.
+    pub(in crate::estimation) fn take_fd_hessian(initial_eps: f64) -> usize {
+        let mut calls = FD_HESSIAN_CALLS.lock().unwrap();
+        let before = calls.len();
+        calls.retain(|&e| e != initial_eps);
+        before - calls.len()
     }
 
     /// Remove and return `(subject count, parallel_subjects)` for every call whose first
@@ -1595,8 +1626,9 @@ pub(crate) fn compute_covariance_for(
     // for the FD stencil, and — as of #953 review finding 8 — the analytic path's η̂.
     //
     // The analytic assembly is derived under stationarity (`∂lᵢ/∂η|_η̂ = 0`): both the M2
-    // envelope term `−M_ξᵀH⁻¹M_ζ` and the `inner_eta_responses` chain assume it. Feeding it
-    // the modes converged during the fit at `inner_tol` would make `cov_inner_tol` a silent
+    // envelope term `−M_ξᵀH⁻¹M_ζ` and the adjoint's mode response (`η′ = −H⁻¹∂ₓg`) assume
+    // it. Feeding it the modes converged during the fit at `inner_tol` would make
+    // `cov_inner_tol` a silent
     // no-op on this path, so a user who fits loose and then sets `cov_inner_tol = 1e-10`
     // for trustworthy SEs would get bit-identical contaminated numbers with no diagnostic.
     // Reconverging here costs one population inner solve — the thing the FD stencil pays
@@ -2135,7 +2167,7 @@ pub(crate) fn compute_covariance_for(
     // is not decoration: the label is only *observable* on a fit whose eigenvalue floor fired,
     // so a mutation of the three-way derivation above went undetected by the whole suite until
     // the note was routed through it (measured — the `M5` cell of this PR's mutation sweep
-    // killed nothing before this line, and kills `one_declining_subject_reproduces_the_pure_
+    // killed nothing before this line, and kills `salvage_tests::one_declining_subject_reproduces_the_pure_
     // analytic_covariance` after). `format_salvage_note`'s own emptiness guard is what makes
     // it total for the two non-hybrid arms, not a second gate on the same fact.
     //
@@ -2849,6 +2881,10 @@ pub(crate) fn run_covariance_step(
 }
 
 #[cfg(test)]
+#[path = "covariance_salvage_tests.rs"]
+mod salvage_tests;
+
+#[cfg(test)]
 mod tests {
     // The moved cov-specific unit tests remain in `outer_optimizer`'s test module
     // (they reach the moved symbols via the cross-module import added there). The
@@ -2916,6 +2952,119 @@ mod tests {
                 m.n_eta
             );
         }
+    }
+
+    /// #2093 review round 2 (finding 7): the R-matrix scope walk reports **every** clause that
+    /// fired, in gate order, and the routing predicate (`analytic_r_expected`) agrees with it —
+    /// the pair base's `covariance_scope_declines` / `covariance_scope_decline` pinned. A model
+    /// carrying three clauses at once against the in-scope control on the same model, whose
+    /// walk can only name the per-subject bail.
+    #[test]
+    fn the_scope_walk_reports_every_clause_and_the_routing_predicate_agrees() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+                   omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
+                   CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
+                   pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let population = Population {
+            subjects: vec![Subject::default()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let on = FitOptions::default();
+        assert_eq!(
+            super::analytic_cov_declines(&in_scope, &population, &on, false),
+            vec![CovScopeDecline::PerSubjectBail]
+        );
+        assert!(super::analytic_r_expected(
+            &in_scope,
+            &population,
+            &on,
+            false
+        ));
+
+        let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
+        fd.gradient_method = GradientMethod::Fd;
+        let off = FitOptions {
+            analytic_cov_hessian: false,
+            ..FitOptions::default()
+        };
+        assert_eq!(
+            super::analytic_cov_declines(&fd, &population, &off, true),
+            vec![
+                CovScopeDecline::Disabled,
+                CovScopeDecline::Mixture,
+                CovScopeDecline::GradientFd
+            ],
+            "every clause, in gate order"
+        );
+        assert!(!super::analytic_r_expected(&fd, &population, &off, true));
+        // Each clause alone moves the predicate.
+        assert!(
+            !super::analytic_r_expected(&fd, &population, &on, false),
+            "gradient = fd"
+        );
+        assert!(
+            !super::analytic_r_expected(&in_scope, &population, &off, false),
+            "disabled"
+        );
+    }
+
+    /// #1613 G4 on the adjoint: the R-matrix scope reads the **call's** `gradient = fd`, not
+    /// only the model's — `fit`'s guard (`arm_forced_fd`) and `run_covariance`'s scope
+    /// (`with_fit_scope`) — against the unarmed control on the same model.
+    #[test]
+    fn the_scope_walk_reads_the_calls_gradient_fd() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
+             pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .unwrap();
+        assert_eq!(model.gradient_method, GradientMethod::Auto);
+        let population = Population {
+            subjects: vec![Subject::default()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let opts = FitOptions::default();
+        let has_fd = || {
+            super::analytic_cov_declines(&model, &population, &opts, false)
+                .contains(&CovScopeDecline::GradientFd)
+        };
+        assert!(!has_fd(), "control: unarmed, no gradient = fd clause");
+        {
+            let _fd = crate::types::arm_forced_fd(true);
+            assert!(
+                has_fd(),
+                "fit's guard: the call's gradient = fd declines the R-matrix"
+            );
+            assert!(!super::analytic_r_expected(
+                &model,
+                &population,
+                &opts,
+                false
+            ));
+        }
+        let fd_opts = FitOptions {
+            gradient_method: GradientMethod::Fd,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        let posthoc = crate::api::with_fit_scope(&fd_opts, has_fd).expect("scope");
+        assert!(posthoc, "run_covariance's scope must carry gradient = fd");
+        assert!(!has_fd(), "the guard and the scope disarm on exit");
     }
 
     /// On the analytic R-matrix a defaulted `r` above `COV_HESSIAN_MAX_DIM` is not rerouted to
@@ -4610,9 +4759,9 @@ mod tests {
     /// a #1781-routed SAEM estimate is scored on — differing only in the estimate's method, so
     /// the gate is the one thing that changes. `S` is made to fail by an exhausted inner budget
     /// (`inner_maxiter = 0` with per-evaluation reconvergence — the fixture of
-    /// `sens_cov_hessian`'s quadrature-score test), which the quadrature score refuses to square,
-    /// while `R`'s stencil differences the objective at the warm-started modes, so `r` still
-    /// succeeds on the same inputs.
+    /// the forward provider's quadrature-score test, retired in #2093), which the quadrature
+    /// score refuses to square, while `R`'s stencil differences the objective at the
+    /// warm-started modes, so `r` still succeeds on the same inputs.
     #[cfg(feature = "survival")]
     #[test]
     fn rsr_stops_on_a_failed_s_before_the_stencil_where_the_estimate_is_stationary() {

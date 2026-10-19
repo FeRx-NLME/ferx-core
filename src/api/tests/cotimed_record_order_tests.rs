@@ -12,7 +12,7 @@
 //! interval ending at a record runs on that record's `X`. The closed form is in turn pinned
 //! to the values NONMEM 7.6.0 printed in the #1809/#1810 triage (`MAXEVAL=0`, `PRED`), so
 //! the reference itself cannot drift. No test here compares two engines: the f64
-//! predictors, the analytic sensitivity providers and their FD reference all read the order
+//! predictors, the analytic (adjoint) gradient and its FD reference all read the order
 //! from the same `Subject`, so a parity test agreed with the wrong order before the fix.
 //!
 //! Before the fix, cases 1, 4 and 6 failed on both models. Cases 2, 3, 5 and 7 are the

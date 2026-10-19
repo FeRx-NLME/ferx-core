@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// differences. The choice is [`analytic_inner_grad_supported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InnerGradientMethod {
-    /// Exact analytic η-gradient from the `Dual2` sensitivity provider — one
-    /// provider evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
+    /// Exact analytic η-gradient from the adjoint's unified recorder
+    /// (`exact_obs_grads_into` / `exact_inner_gradient`) — one
+    /// recorder evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
     /// Central finite differences. Used when the provider can't serve the model
     /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
@@ -66,7 +67,8 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     // Eta-dependent `[scaling] obs_scale`. VESTIGIAL: the retired Enzyme-AD path froze the
     // scale subject-static and dropped `d obs_scale / d eta`, so it routed here to FD. The
     // LIVE inner path now serves a differentiable `ExpressionScale` analytically via the
-    // η-quotient rule (#486, `provider::apply_expression_scale_inner`), and
+    // η-quotient rule (#486; since #2093 the adjoint recorder's on-tape quotient,
+    // `apply_expression_scale` / `closed_form_finish` in `sens/ode_adjoint.rs`), and
     // `analytic_inner_grad_supported_model` does NOT bail on it. This branch is retained
     // only as the historical named reason (this whole fn is dead — see the header); it no
     // longer reflects routing. The divergence is pinned by `analytical_ad_unsupported_flags_each_class`.
@@ -250,7 +252,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
 }
 
 /// Warning when *some but not all* subjects fall back to the FD inner gradient
-/// (outside the analytic provider's scope — SS+reset, time-varying covariates,
+/// (a shape no analytic recorder serves — formerly SS+reset, time-varying covariates,
 /// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
 /// population: all-analytic needs no warning, and all-FD is a model-level property
 /// already obvious from the banner and the model itself. Surfaced into
@@ -306,9 +308,9 @@ pub(crate) fn fd_fallback_warning(
                 .unwrap_or_default();
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
-             (outside the analytic provider's scope, e.g. steady-state + reset, \
-             time-varying covariates + LTBS, or modeled-duration doses); their \
-             results are correct but slower.{tolerance_note}"
+             (a shape no analytic recorder serves, e.g. an SDE, a per-CMT \
+             `obs_scale`, or more than 24 random effects); their results are correct \
+             but slower.{tolerance_note}"
         ))
     } else {
         None
@@ -432,9 +434,9 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
-    /// Exact conditional eta Hessian at the returned mode when the second-order
-    /// sensitivity provider can produce it.  Laplace/AGQ may reuse this instead
-    /// of immediately repeating the same `Dual2` evaluation.
+    /// Exact conditional eta Hessian at the returned mode when the adjoint
+    /// (`exact_inner_hessian`) can produce it.  Laplace/AGQ may reuse this instead
+    /// of immediately repeating the same evaluation.
     pub(crate) terminal_hessian: Option<DMatrix<f64>>,
     /// True when the returned η̂ is certified stationary: BFGS met `gnorm < tol` (or its
     /// objective-stall stop on a noise-floored objective), or a Nelder–Mead fallback result
@@ -487,7 +489,7 @@ fn analytic_inner_seed_hessian(
     }
     // The seed is a provider product like the fused gradient, so it honours the same escape
     // hatches (`gradient = fd`, `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop
-    // to FD because the analytic provider misbehaves on their model must get the historical
+    // to FD because the analytic gradient misbehaves on their model must get the historical
     // unseeded solve back, not FD gradients against a provider-built metric.
     if analytic_inner_common_bail(model) {
         return None;
@@ -1777,7 +1779,7 @@ fn find_ebe_solve(
     // Per-subject `ObsGrad` buffer, reused across every inner BFGS step the same
     // way `pk_scratch_cell` is: `analytic_eta_nll_gradient_with_schedule` takes its
     // previous contents as a reuse hint and stores the fresh result back, so the
-    // light sensitivity provider's closed-form path overwrites its `ObsGrad`s'
+    // unified recorder (`exact_obs_grads_into`) overwrites its `ObsGrad`s'
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
@@ -1834,8 +1836,8 @@ fn find_ebe_solve(
         )
     };
 
-    // BFGS with the exact analytic η-gradient from the sensitivity provider when
-    // in scope (Almquist et al. 2015): one provider evaluation per inner step
+    // BFGS with the exact analytic η-gradient from the adjoint's recorder when
+    // in scope (Almquist et al. 2015): one recorder evaluation per inner step
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
     // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
     //
@@ -2498,26 +2500,28 @@ fn find_ebe_iov(
     // analytic stacked-η gradient when the ODE IOV provider serves this model (one
     // provider eval per inner step vs ~2·n_flat+1 predictions for FD, and exact → fewer
     // steps); per-step FD fallback if a given (θ, stacked-η) is out of provider scope.
-    // Covers both the ODE IOV provider (RHS-program models) and the closed-form
-    // analytical IOV provider — both now expose an analytic stacked-η inner gradient
-    // via `subject_eta_grad_iov`.
+    // Covers both the ODE (RHS-program models) and the closed-form engines — both
+    // expose the exact stacked-η inner gradient through the adjoint recorder
+    // (`adjoint::exact_obs_grads_in`, called by `analytic_eta_nll_gradient_iov_frozen`).
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
     // hits a common bail (escape hatch, `gradient = fd`, SDE, or magnitude × correlated
     // residual) or the subject carries survival/TTE records (whose hazard term the analytic
     // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
     // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
-    // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
-    // `ExpressionScale` divisor, so `iov_sens_supported` is `true` and the
-    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient
-    // (`apply_expression_scale_iov`). A constant `ScalarScale` divisor is now analytic under
-    // IOV on both engines (#486 parity — closed-form `run_obs_iov{,_eta}` divide the jet by
-    // `k`; the ODE readout `apply_output_transform` already divides `p/k` in-walk over the
-    // stacked dual). **LTBS × IOV is analytic here too as of #486** — `run_obs_iov_eta`
-    // applies the shared `ln` jet last over the stacked axes, so `log_transform` is no
-    // longer a common bail at any κ count. ODE-IOV × LTBS still routes to FD, but via
-    // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
-    // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
+    // now served analytically too (#575): the IOV scope (pre-#2093 `ode_iov_supported` /
+    // `iov_sens_supported`, now the adjoint's `recorder_in_scope`) admits a non-LTBS
+    // `ExpressionScale` divisor, so the
+    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient (the
+    // recorders' per-group scale in `record_ode_iov` / `record_analytic_events`). A constant
+    // `ScalarScale` divisor is now analytic under IOV on both engines (#486 parity — the
+    // closed-form `closed_form_finish` divides the taped prediction by `k`; the ODE readout
+    // `apply_output_transform` already divides `p/k` in-walk over the stacked dual).
+    // **LTBS × IOV is analytic here too as of #486** — the closed-form event recorder applies
+    // `ltbs_log_g` last over the stacked axes, so `log_transform` is no
+    // longer a common bail at any κ count. (Before #2093, ODE-IOV × LTBS still routed to
+    // FD, via the retired `iov_sens_supported` / `ode_iov_supported` scope, not via the
+    // bail.) Without these guards a joint IOV + TTE / `gradient = fd` fit would
     // converge EBEs against an incomplete gradient.
     // The `H` Jacobian (`iov_ebe_h_matrix`) stays analytic under a residual correlation:
     // it is `∂f/∂η`, which `R` does not enter. Only the gradient of the (dense) objective
@@ -3122,33 +3126,34 @@ pub fn profile_report() {
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
 ///
-/// LTBS is **no longer** a blanket common bail. The plain closed-form inner provider applies
-/// the `g = ln(f)` jet transform (`subject_eta_grad` → `run_obs_eta`), so it serves plain LTBS
+/// LTBS is **no longer** a blanket common bail. The adjoint recorder applies the `g = ln(f)`
+/// transform on the tape (`subject_eta_grad` → `adjoint::exact_obs_grads`; closed form in
+/// `closed_form_finish`, ODE in `apply_output_transform`), so it serves plain LTBS
 /// analytically; the covariance step reconverges those EBEs at the tighter `cov_inner_tol`
 /// ([`FitOptions::effective_cov_inner_tol`]) so the `ln`-amplified EBE noise no longer corrupts
 /// the SEs. LTBS + η-dependent `ExpressionScale` is served analytically on the inner too now
-/// (the η-quotient then the `ln f` jet, `subject_eta_grad`; validated by
-/// `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov (the event-driven
-/// inner walk applies the same jet last). **LTBS × IOV** is analytic on the inner too as of
-/// #486: `run_obs_iov_eta` applies the same shared `apply_ltbs_transform_inner` jet last, after
-/// the per-occasion scale quotient — the transform is a per-observation scalar quotient
-/// (`∂g/∂x = (∂f/∂x)/f`) identical on every stacked axis, so the κ columns need nothing the
-/// η_bsv columns do not. So `log_transform` is no longer a common bail at any κ count, and the
+/// on the closed form (the η-quotient then the `ln f`, `closed_form_finish`; validated before
+/// #2093 by the retired `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov
+/// (the event-driven walk applies the same transform last). **LTBS × IOV** is analytic on the inner
+/// too as of #486: the closed-form event recorder (`record_analytic_events`) applies `ltbs_log_g`
+/// last, after the per-occasion scale quotient — the transform is a per-observation scalar quotient
+/// (`∂g/∂x = (∂f/∂x)/f`) identical on every stacked axis, so the κ columns need nothing the η_bsv
+/// columns do not. So `log_transform` is no longer a common bail at any κ count, and the
 /// closed-form inner and outer IOV loops now differentiate the same `ln(f/s)`.
 ///
-/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
-/// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
-/// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
-/// walk *and* the TV-cov event-driven walk (#534/#486 — the scale is subject-static even
-/// under time-varying covariates, so one post-walk quotient covers both), so both run
-/// analytically. The **IOV** inner path serves it too (#486): both the closed-form
-/// (`subject_eta_grad_iov_analytical` → `run_obs_iov_eta`) and the ODE
-/// (`ode_subject_eta_grad_iov`) IOV inner walks apply a per-occasion-group post-walk
-/// quotient, so `iov_analytical_supported` / `ode_iov_supported` now admit `ExpressionScale`
-/// and the inner and outer loops stay matched. The **ODE** inner path does not consult this
-/// common bail at all — it has its own inline bail list in [`analytic_inner_grad_supported`]
-/// and its own per-subject scope (`ode_inner_grad_supported`, which admits exactly the
-/// static-walk and TV-cov-walk `ExpressionScale` that the ODE provider actually applies).
+/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the adjoint recorder
+/// (`subject_eta_grad` → `adjoint::exact_obs_grads`) applies the quotient on the tape —
+/// `closed_form_finish` on the closed form, `apply_expression_scale` on the ODE static walk *and*
+/// the TV-cov event-driven walk (#534/#486 — the scale is subject-static even under time-varying
+/// covariates, so one post-walk quotient covers both), so both run analytically. The **IOV** inner
+/// path serves it too (#486): both the closed-form (`record_analytic_events`) and the ODE
+/// (`record_ode_iov`) IOV recorders, reached through `adjoint::exact_obs_grads_in`, apply a
+/// per-occasion-group post-walk quotient, so the IOV scope (pre-#2093 `iov_analytical_supported` /
+/// `ode_iov_supported`, now the adjoint's `recorder_in_scope`) admits `ExpressionScale` and the
+/// inner and outer loops stay matched. Since #2093 the **ODE** inner path consults this common
+/// bail too (via [`analytic_inner_grad_supported_model`]); its per-subject scope is the
+/// recorder's own (`static_walk_subject_supported` / `event_walk_subject_supported`, which
+/// admit exactly the static-walk and event-walk `ExpressionScale` that `record_ode` applies).
 /// Whether the user switched the inner loop off analytic derivatives: `gradient = fd` or
 /// `FERX_NO_ANALYTIC_INNER=1`. Every exact route of the inner loop (the adjoint kernel's
 /// inner gradient, its η-Jacobian for `H`) honours it, so the search runs on the finite
@@ -3162,9 +3167,10 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         || GradientMethod::forced_fd(model)
         || model.is_sde()
         // LTBS is served analytically on the inner loop for every combination now — plain,
-        // × `ExpressionScale` (the η-quotient then the `ln f` jet, `subject_eta_grad`),
-        // × TV-cov (the event-driven inner walk applies the same jet LAST), and × IOV
-        // (`run_obs_iov_eta` applies it last over the stacked axes, #486). So there is no
+        // × `ExpressionScale` on the closed form (the η-quotient then the `ln f`,
+        // `closed_form_finish`), × TV-cov (the event-driven walk applies the same transform
+        // LAST), and × IOV (`record_analytic_events` applies `ltbs_log_g` last over the
+        // stacked axes, #486). So there is no
         // `log_transform` clause here: the closed-form inner and outer IOV gradients now
         // differentiate the same `ln(f/s)`, closing the last inner/outer scope split.
         // Correlated residual error (`block_sigma`) is now served analytically by the
@@ -3276,7 +3282,8 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
     // would be a pure misreport.
     //
-    // `analytical_supported` below does **not** catch this, which is the trap: an
+    // `recorder_in_scope` below does **not** catch this (nor did the retired
+    // `analytical_supported` it replaced), which is the trap: an
     // endpoint-only model (a `[markov_model]` with no `[structural_model]`) is *still* given
     // a default `pk_model` and a vacuous `tv_fn` (`model_parser.rs`, `tv_fn = Some(..)` for
     // any non-ODE model), and its `pk_indices` are empty so the per-slot check passes
@@ -3323,12 +3330,12 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
 /// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the model must
 /// be in scope ([`analytic_inner_grad_supported_model`]) and the *subject* must
 /// not carry features the light inner provider can't serve. Survival obs records
-/// decline; time-varying covariates / oral infusion are served by the event-driven
-/// inner walk (`subject_eta_grad_tvcov`, #447) when `tvcov_analytical_supported`.
+/// decline; time-varying covariates / oral infusion are served by the adjoint recorder's
+/// event-driven walks (#447; `record_analytic_events` / `record_ode`).
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // Survival/TTE observation records carry a likelihood term that neither inner
-    // provider models — the analytical path declines below, and the light ODE walk
-    // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
+    // provider models — the analytical path declines below, and the recorder's walks
+    // (`adjoint::exact_obs_grads`) iterate only `subject.obs_times`, so they would silently
     // omit the survival term. Guard both routes up front.
     //
     // CTMM is the exception since #759: its transition likelihood *does* have an exact
@@ -3343,7 +3350,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     }
     // No Gaussian observations ⇒ no Gaussian data term, hence nothing for the PK provider
     // to serve: an **endpoint-only** fit (a `[markov_model]` with no `[structural_model]`,
-    // which the parser admits) has no PK model at all, and `analytical_supported` below
+    // which the parser admits) has no PK model at all, and `recorder_in_scope` below
     // would reject it on that basis alone. Its inner gradient is the prior plus the
     // non-Gaussian term, both of which we have exactly, so only the global escape hatches
     // apply. (`analytic_eta_nll_gradient_with_schedule` mirrors this by skipping the
@@ -3366,10 +3373,10 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
 }
 
 /// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`
-/// from the analytic sensitivity provider — the closed-form analog of the
-/// sensitivity-equation gradient (Almquist, Leander & Jirstrand 2015). Replaces
-/// the FD gradient's `~2·n_eta+1` predictions per inner step with one provider
-/// evaluation. `None` when the provider can't serve this `(θ, η)` (degenerate
+/// from the adjoint's unified recorder (`exact_obs_grads_into`) — the closed-form analog
+/// of the sensitivity-equation gradient (Almquist, Leander & Jirstrand 2015). Replaces
+/// the FD gradient's `~2·n_eta+1` predictions per inner step with one recorder
+/// evaluation. `None` when the recorder can't serve this `(θ, η)` (degenerate
 /// params / out of scope), so the caller falls back to FD for that point.
 ///
 /// Per observation `j`, with `f = f_j(η)`, `ε = y_j − f`, `v = R(f)` the residual
@@ -3423,7 +3430,8 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
 /// `None` reproducing the legacy unscaled variance. The magnitude is
 /// η-independent, so this is the *entire* inner-loop change it needs: no new η
 /// term, just the scale on `v`/`dv_df` (the direct-θ dependence is a separate,
-/// outer-only gradient channel — see `sens_outer_gradient::prepare_stacked`).
+/// outer-only gradient channel, recorded on the adjoint tape via
+/// `RuvMagDerivProgram::eval_g`).
 ///
 /// `f_frozen = Some(f₀)` is the non-interaction FOCE objective (#1722): the variance is
 /// taken at `f₀` and is a constant of the search, so `dv_df = 0` and the coefficient
@@ -3486,13 +3494,12 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
     h * m
 }
 
-/// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
-/// `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the model is in the
-/// provider's scope (returns `None` for ODE / TV-cov / oral-infusion / SS+reset /
-/// LTBS subjects). A η-dependent `ExpressionScale` `obs_scale` is in scope as of
-/// #486 (the quotient rule is applied to the η-block), except when combined with
-/// LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
-/// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
+/// Exact analytic `∂NLL_i/∂η` from the adjoint's unified recorder
+/// (`exact_obs_grads_into`): `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the
+/// recorder serves the subject (`None` otherwise, so the caller falls back to FD). A
+/// η-dependent `ExpressionScale` `obs_scale` is in scope as of #486 (the quotient rule is
+/// applied to the η-block), except when combined with LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
+/// both estimators use the same analytic gradient (replacing the retired Enzyme path).
 /// `residual_correlations` carries the live `block_sigma` off-diagonals,
 /// parallel to `sigma` (#847). The inner EBE search has to see the ρ the outer
 /// loop is proposing, or it converges to the mode of a different objective than
@@ -3549,7 +3556,7 @@ pub(crate) fn analytic_eta_nll_gradient(
 ///
 /// `obs_grad_recycle` is a per-subject scratch slot, owned by the caller and
 /// reused across every inner BFGS step: this function hands its previous
-/// contents in as [`subject_eta_grad_with_schedule`]'s reuse hint, then stores
+/// contents in as `exact_obs_grads_into`'s reuse buffer, then stores
 /// the freshly computed `Vec<ObsGrad>` back before returning, so the next call
 /// for the same subject can overwrite its `ObsGrad`s in place instead of
 /// allocating a fresh one per observation (mirrors the `pk_scratch_cell`
@@ -3609,8 +3616,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         return Some(grad);
     }
 
-    // Light first-order provider (value + ∂f/∂η only); the inner gradient never
-    // needs the second-order / θ blocks the full `subject_sensitivities` carries.
+    // First-order recorder (value + ∂f/∂η only); the inner gradient never
+    // needs second-order or θ blocks.
     // The recorder fills the caller's buffer in place (one per subject, reused across
     // iterations), handed back below on every exit.
     let _ = cached_schedule;
@@ -3680,7 +3687,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let mut ruv_grad = 0.0_f64;
     // FREM covariate pseudo-observations: the objective scores these rows against the
     // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
-    // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
+    // already corrected their `f` and `∂f/∂η` (`adjoint::exact_obs_grads_into`); this is the
     // variance half. `R` is η-independent on such a row, so `∂R/∂f = 0` and the whole
     // residual chain collapses to `∂L/∂η_k = (−ε/R)·δ_{k,ei}`. `None` on a non-FREM model.
     let frem_ov = crate::stats::likelihood::build_frem_r_override(

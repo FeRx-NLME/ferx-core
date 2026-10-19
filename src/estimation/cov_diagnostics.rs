@@ -33,13 +33,13 @@ use crate::types::{CompiledModel, CovarianceMethod, EstimationMethod, FitOptions
 /// true on the first and false on the second, and before #520 the message said "eigenvalue
 /// floor applied to FD Hessian" on both.
 ///
-/// The analytic route is not step-free everywhere — `third_order_fd_step` finite-differences
-/// the `Dual2` jet to assemble the third-order blocks, which is a step across a *smooth*
-/// sensitivity rather than across the objective, and #1505 measured the one case where that
-/// distinction bit (a lagged-dose arrival kink), which the sweep now bounds its step around
-/// (`kink_step_bound`). What the label asserts is narrower and
-/// stays true: this route never second-differences the objective, so neither `fd_hessian_step`
-/// nor a looser `ode_reltol` reaches it through the `1/h²` mechanism.
+/// Since #2093 the analytic route is step-free: the adjoint's profile Hessian
+/// (`subject_adjoint_cov_hessian`) is a forward second-order dual pass with no finite differences.
+/// (The retired forward provider finite-differenced its `Dual2` jet for the third-order blocks, a
+/// step across a *smooth* sensitivity that #1505 measured biting at a lagged-dose arrival kink.)
+/// What the label asserts is narrower and stays true: this route never second-differences the
+/// objective, so neither `fd_hessian_step` nor a looser `ode_reltol` reaches it through the `1/h²`
+/// mechanism.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CovHessianSource {
     /// Exact analytic R-matrix assembled from third-order sensitivities (#436, extended to

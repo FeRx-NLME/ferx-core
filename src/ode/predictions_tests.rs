@@ -6928,7 +6928,8 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
     // full-budget truncation was ~30% low). The fast case is deliberately not *extreme*
     // (ke·II ≫ 6): a near-total between-dose decay drives the trough toward the RK45 `abstol`
     // floor, where relative precision is lost — an integration-noise artifact, not the fixed
-    // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
+    // point being wrong (`ode_steady_state_dose_matches_reconverged_fd` in
+    // `sens/ode_adjoint_tests.rs` checks the gradient too).
     for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
         let pk = pk_one(cl, v);
         let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
@@ -10961,9 +10962,9 @@ mod break_collision_1186 {
         }
 
         // The analytic-sensitivity static walk carries the same timeline and was one of
-        // the `unwrap_or(Equal)` sites; its twin lives in `sens/provider_tests.rs`
-        // (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`), where the provider can be
-        // driven directly.
+        // the `unwrap_or(Equal)` sites; its twin lived in the since-deleted (#2093)
+        // `sens/provider_tests.rs` (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`),
+        // where the forward provider could be driven directly.
     }
 
     /// **The CHZ event-time search must report a non-finite timeline as `SolveFailed`.**
@@ -11772,8 +11773,8 @@ mod lag_arrival_read_1226 {
     /// doses at 17511.8 and 17520, sample at 17520) and tables
     /// `PRED = 1.4404316545059672E+02`. That run does double duty — it is also a *dose
     /// landing on the same time as an observation*, so it pins the ordering convention that
-    /// `provider_reads_a_dose_landing_on_the_last_observation` checks the sensitivity walk
-    /// against.
+    /// the pre-#2093 `provider_reads_a_dose_landing_on_the_last_observation` (retired in #2093)
+    /// checked the sensitivity walk against.
     ///
     /// Mutation: write either predicate in the sum form and `ode_predictions` reads the
     /// pre-dose 44.04 here while the event-driven control still reads 144.04.

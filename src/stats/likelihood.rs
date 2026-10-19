@@ -3373,8 +3373,8 @@ pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<
 }
 
 /// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
-/// returns). Shared by the closed-form (`build_iov_sources`) and ODE (`run_subject_iov` /
-/// `run_subject_iov_eta`) IOV providers so the occasion→group mapping is defined once
+/// returns). Shared by every IOV path through `StackedLayout` (`stats/stacked_layout.rs`),
+/// which the closed-form and ODE recorders both read, so the occasion→group mapping is defined once
 /// (#466 review round 2).
 pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashMap<u32, usize> {
     occ_groups

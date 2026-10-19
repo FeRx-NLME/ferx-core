@@ -2412,7 +2412,7 @@ impl ResetGate {
 ///
 /// Generic over the numeric type `T: PkNum` so the **single** superposition loop
 /// serves both the production `f64` predictor (`T = f64`, byte-identical to the
-/// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
+/// original) and the analytic ODE dual walk (`T = Dual*`, recorded by the adjoint),
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
 /// #4 / #451). The two dual callers each feed one branch live: the TV-cov
 /// event-driven walk (`integrate_tvcov_g`) passes the tracked dual `dose_lagtimes`
@@ -2632,9 +2632,9 @@ pub enum OdeReadout {
 
 /// One per-CMT Form-C readout (`y[CMT=N] = <expr>`): the f64 closure the production
 /// predictor calls, plus the optional `PkNum`-differentiable program the analytic
-/// sensitivity provider evaluates over `Dual2`/`Dual1` (issue #439). `program` is
+/// gradient path evaluates over a dual number type (issue #439). `program` is
 /// `None` for hand-constructed readouts that bypass the parser — those keep the f64
-/// FD path (the dual provider declines them).
+/// FD path (the dual walks decline them).
 pub struct PerCmtReadout {
     pub out_fn: OdeOutputFn,
     pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
@@ -3384,8 +3384,8 @@ pub struct OdeSpec {
     /// `transit()`/etc. input-rate term (the historical default).
     pub input_rate: Vec<crate::pk::absorption::InputRateForcing>,
     /// Compiled RHS program for the analytic-sensitivity path (issue #367,
-    /// Option A): lets the sensitivity provider evaluate the same RHS over
-    /// `Dual2<N>` to obtain exact PK-parameter derivatives. `None` for
+    /// Option A): lets the analytic gradient path evaluate the same RHS over
+    /// a dual type to obtain exact PK-parameter derivatives. `None` for
     /// hand-built specs (tests, EKF) and any model outside the ODE-sensitivity
     /// scope gate; those fall back to the gradient-free path.
     pub rhs_program: Option<crate::parser::model_parser::OdeRhsProgram>,
@@ -3498,9 +3498,8 @@ impl OdeSpec {
     }
 
     /// True when any built-in absorption input-rate forcing carries a per-route
-    /// lag (`fn(..., lag=L)`, #859). The single predicate shared by the sensitivity
-    /// gates (`ode_analytical_supported`'s subject variants), the IOV gate
-    /// (`ode_iov_supported`), the event-driven walk (`integrate_tvcov_g`), the
+    /// lag (`fn(..., lag=L)`, #859). The single predicate shared by the ODE walks'
+    /// scope gates (`sens/ode_provider.rs`), the event-driven walk (`integrate_tvcov_g`), the
     /// initial-point diagnostics (`api::check_absorption_dosing`), and
     /// `crate::types::CompiledModel::has_route_absorption_lag` — so the "does this
     /// model have a route lag?" test cannot drift between them.
@@ -3846,9 +3845,10 @@ pub(crate) fn ode_predictions_with_extra_breaks(
 ///
 /// `pk_for_dose(k)` is the PK snapshot dose `k`'s route lag and zero-order window are read
 /// from. Every prediction engine that calls this has one subject-wide snapshot and passes
-/// `|_| pk_params_flat`; the covariance step's kink bound ([`dose_break_times_per_dose`],
-/// #1505) passes the per-record snapshot so a time-varying-covariate subject's events land
-/// where its own event-driven walk puts them.
+/// `|_| pk_params_flat`. The per-dose form was for the covariance step's kink bound
+/// (`dose_break_times_per_dose`, #1505, retired in #2093), which passed the per-record
+/// snapshot so a time-varying-covariate subject's events landed where its own event-driven
+/// walk put them.
 fn collect_dose_break_times<'a>(
     break_times: &mut Vec<f64>,
     ode: &OdeSpec,

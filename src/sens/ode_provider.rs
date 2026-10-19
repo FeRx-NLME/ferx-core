@@ -20,6 +20,16 @@
 //! combined with a time-dependent (`TIME`/`TAD`) RHS, and IOV combined with FREM. Steady state
 //! into a `zero_order` window, or steady state with an absorption lagtime, are rejected
 //! upstream rather than routed here.
+//!
+//! **Historical names.** Before #2093 these walks also fed a forward sensitivity provider
+//! (`ode_subject_sensitivities`) behind the predicates `ode_analytical_supported`,
+//! `ode_subject_supported`, `ode_tvcov_supported` and `ode_iov_supported`, with their own
+//! `MAX_ODE_*` dual-width caps, and were tested in `ode_provider_tests.rs` (the
+//! `ode_provider_*` / `check_full_provider_vs_fd` fixtures). All of that is retired; the
+//! rationale comments below still cite those names as history. The scope gates the adjoint
+//! uses are `ode_walk_model_scope`, `static_walk_subject_supported`,
+//! `event_walk_subject_supported`, `ode_iov_model_scope` and `ode_iov_walk_scope`, and FD
+//! parity is pinned by `fd_oracle` / `parity` in `src/sens/ode_adjoint_tests.rs`.
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -29,17 +39,17 @@ use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
 
-/// The ODE walks' model-level scope, shared by the forward provider and the adjoint
-/// gradient: what the dual integrator can carry — a dual-evaluable RHS and readout, the
-/// input-rate and lag kinds it propagates, no diffusion — with a parameter program over
-/// the combined `[η, κ]`. `ode_analytical_supported` and `ode_iov_supported` add the
-/// forward provider's own limits (its `(θ, η)` width, scaling it can differentiate).
+/// The ODE walks' model-level scope as the adjoint gradient sees it: what the dual
+/// integrator can carry — a dual-evaluable RHS and readout, the input-rate and lag kinds it
+/// propagates, no diffusion — with a parameter program over the combined `[η, κ]`. (Before
+/// #2093 the retired `ode_analytical_supported` / `ode_iov_supported` layered the forward
+/// provider's own `(θ, η)` width and scaling limits on top.)
 pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
-    // A `TIME`-built-in structural parameter is served analytically on the ODE path
-    // too: the subject routes through the event-driven TV-cov walk (`ode_tvcov_supported`
-    // admits `uses_time_builtin`), which seeds each event's PK-param duals at that
-    // event's time (#486). The RHS-clock `TIME` (`rhs_program.uses_time_vars`) was
-    // already analytic; this covers `TIME` read in `[individual_parameters]`.
+    // A `TIME`-built-in structural parameter is served analytically on the ODE path too: the
+    // subject routes through the event-driven TV-cov walk (`event_walk_subject_supported` admits
+    // `uses_time_builtin`), which seeds each event's PK-param duals at that event's time (#486).
+    // The RHS-clock `TIME` (`rhs_program.uses_time_vars`) was already analytic; this covers `TIME`
+    // read in `[individual_parameters]`.
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
@@ -47,7 +57,8 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
         return false;
     }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
-    // (`ode_subject_supported` declines it so it can't take the static superposition path).
+    // (`static_walk_subject_supported` declines it so it can't take the static superposition
+    // path).
     // A `TIME`-built-in model routes to the event-driven walk (`integrate_tvcov_g`), which now
     // carries BOTH a built-in absorption input-rate forcing (`R_in`, #643) and a seeded
     // `init(...)` state (#662) alongside the per-event `TIME` seeding (#637) — so a
@@ -104,7 +115,8 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     //     `weibull` + a compartment lagtime does below.
     // IOV (`n_kappa != 0`) route lag is declined *here* by the `n_kappa != 0` clause below (an IOV
     // model is off the non-IOV analytic gate outright), but IS analytic on the IOV path since #877
-    // — `ode_iov_supported` admits it via this same per-kernel `route_lag_analytic()` classifier.
+    // — the IOV scope (`ode_iov_model_scope`) admits it via this same per-kernel
+    // `route_lag_analytic()` classifier.
     if ode
         .input_rate
         .iter()
@@ -112,14 +124,14 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     {
         return false;
     }
-    // Output transforms applied over the dual prediction in `run_subject`: `None`, a
+    // Output transforms applied over the dual prediction in the adjoint's `record_ode`: `None`, a
     // constant `ScalarScale` divisor (`f/k`), and the LTBS log (`ln f`). An η-dependent
     // `ExpressionScale` divisor (`obs_scale = expr(θ,η)`) is ALSO analytic now (#486):
-    // it is applied on the final `(θ,η)`-space `SubjectSens` via the shared
-    // `apply_expression_scale_outer` (the closed-form provider's quotient rule), on the
+    // it is applied post-walk on the tape via the adjoint's `apply_expression_scale` (the
+    // quotient rule), on the
     // **static** walk AND the **TV-cov event-driven** walk — the scale is subject-static
     // even under time-varying covariates (production `apply_scaling` reads
-    // `subject.covariates`, not a per-event snapshot), so `ode_tvcov_supported` admits it
+    // `subject.covariates`, not a per-event snapshot), so `event_walk_subject_supported` admits it
     // and applies one subject-static quotient post-walk (#486). It still requires
     // `!log_transform` (the walk applies LTBS in PK-param space *before* the η/θ chain, so
     // the production scale-then-log order can't be reproduced by a post-walk quotient —
@@ -127,12 +139,12 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     // other supported route. Allowlist (not denylist) so a future scaling variant can only
     // *narrow* the analytic scope, never silently admit an unhandled one.
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
-    // η = 0 instead; see `run_subject`.)
+    // η = 0 instead; see `record_ode`.)
     // Estimated lagtime — bare `LAGTIME`/`ALAG` and compartment-indexed `ALAG{n}` (#369)
     // — IS supported: lagtime is an *event-time* sensitivity (the dose arrives at
     // `t_dose + lag`), handled on the event-driven walk via the per-dose shift and the
     // event-time saltation, with the indexed slot resolved through `DoseAttrMap::lag_slot`
-    // (so per-compartment / non-uniform lags are exact); `ode_subject_supported` routes any
+    // (so per-compartment / non-uniform lags are exact); `static_walk_subject_supported` routes any
     // lagtime subject to that walk rather than the static superposition walk (#439/#472).
     // Per-compartment bioavailability (`F1`/`F2`, #369/#486) is ALSO supported: both the
     // static `integrate_g` and the TV-cov walk resolve `F` per dose compartment via
@@ -200,9 +212,9 @@ pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subj
             .any(|d| d.is_infusion() && ode.input_rate.iter().any(|f| f.cmt == d.cmt_idx()))
 }
 
-/// The static (superposition) walk's subject scope **without** the forward provider's
-/// individual-parameter cap: everything `ode_subject_supported` checks after
-/// `static_walk_dim_supported`. The adjoint gradient (`adjoint`) seeds only the `nη`
+/// The static (superposition) walk's subject scope **without** the retired forward
+/// provider's individual-parameter cap: everything the pre-#2093 `ode_subject_supported`
+/// checked after its `static_walk_dim_supported` width clause. The adjoint gradient (`adjoint`) seeds only the `nη`
 /// η-directions, so it has no `MAX_ODE_SENS_DIM` table to overflow and shares this gate
 /// instead of a copy of it.
 pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
@@ -222,28 +234,29 @@ pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Sub
     // params constant across the integration). A `TIME`-built-in structural parameter
     // is per-event dynamic for the same reason a TV covariate is, so the static walk
     // cannot serve it — decline here (it routes to the event-driven TV walk via
-    // `ode_tvcov_supported`, or to FD if that also declines) (#486).
+    // `event_walk_subject_supported`, or to FD if that also declines) (#486).
     //
     // The model-time clause here stays **narrow**, deliberately, and does *not* mirror
-    // `ode_tvcov_supported`'s wide one. Recorded at length because widening it looks
+    // `event_walk_scope`'s wide one. Recorded at length because widening it looks
     // obviously right and is wrong.
     //
     // The static superposition walk serves a `TAD`-reading RHS whenever every observation
     // follows a dose: `integrate_g`'s anchor is a per-segment fold over unlagged `d.time`,
-    // the same quantity production folds. Widening this clause turns
+    // the same quantity production folds. Widening this clause turned the pre-#2093
     // `ode_tad_rhs_without_lagtime_static_walk_stays_analytic` red — such models would
     // lose an analytic route and fall to FD for nothing.
     //
-    // Precisely what that test does and does not establish: it asserts two booleans
-    // (`ode_analytical_supported` and `ode_subject_supported`), so it pins the *wiring*.
+    // Precisely what that (pre-#2093, since-deleted) test did and did not establish: it
+    // asserted two booleans (`ode_analytical_supported` and `ode_subject_supported`), so it
+    // pinned the *wiring*.
     // It does not call `check_vs_production`, unlike both its siblings, so it does not
     // measure exactness on the static walk. No committed test does — see the note at
-    // `ode_tvcov_supported` below, which says the same thing about the same walk.
+    // `event_walk_scope` below, which says the same thing about the same walk.
     //
     // The pre-arrival window is the case that genuinely breaks the static walk (no dose at
     // or before the segment start leaves the fold at `-inf`, so the RHS sees `TAD = NaN`).
     // That is a *subject*-level property, not a model-level one, and it is already closed
-    // upstream: `ode_tvcov_supported` now admits every model-time model, so the dispatcher
+    // upstream: `event_walk_subject_supported` now admits every model-time model, so the dispatcher
     // routes them to the event-driven walk and never consults this gate for them.
     //
     // A narrower clause keyed on the pre-arrival window was considered and is not needed —
@@ -266,7 +279,7 @@ pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Sub
         return false;
     }
     // More individual parameters than the static walk's dual tables cover (#1661). Not
-    // an FD route: `ode_tvcov_supported` admits exactly these subjects, and the
+    // an FD route: `event_walk_subject_supported` admits exactly these subjects, and the
     // dispatchers consult it first. Kept here as well so the static walk can never be
     // entered past its `[_; MAX_ODE_SENS_DIM]` stack buffers.
 
@@ -300,10 +313,11 @@ pub(crate) fn static_walk_subject_supported(model: &CompiledModel, subject: &Sub
     // like production's `active_infusions` (#486) — so this combination is analytic
     // on both the outer θ-sensitivities and the inner η-gradient (the shared scope
     // gate keeps the two in lockstep, #430 review #1).
-    // Estimated lagtime always routes to the **event-driven** walk (`ode_tvcov_supported`
-    // / `run_subject_tvcov`), where the per-dose event-time saltation handles it exactly
-    // (uniform or per-compartment lags). The static superposition walk here assumes a
-    // single param set with no event-time shift, so it never serves a lagtime subject.
+    // Estimated lagtime always routes to the **event-driven** walk
+    // (`event_walk_subject_supported` / `integrate_tvcov_readout`), where the per-dose
+    // event-time saltation handles it exactly (uniform or per-compartment lags). The static
+    // superposition walk here assumes a single param set with no event-time shift, so it
+    // never serves a lagtime subject.
     // A per-route absorption lag (`fn(..., lag=L)`, #859) is the same kind of event-time
     // shift — the route's onset is a moving boundary carrying a rate-on saltation — so it
     // too routes to the event-driven walk, never the static one. (A *pure* route lag has
@@ -393,19 +407,19 @@ fn prepare_dual_forcing<T: crate::sens::num::PkNum>(
     )
 }
 
-/// True when the time-varying-covariate ODE walk (`run_subject_tvcov` /
-/// `run_subject_tvcov_eta`) can serve this `(model, subject)`: an in-scope analytic
+/// True when the time-varying-covariate ODE walk (`integrate_tvcov_readout`, which the
+/// adjoint's `record_ode` calls) can serve this `(model, subject)`: an in-scope analytic
 /// ODE model whose subject carries TV covariates and uses the **bolus** dose subset.
 /// Non-IOV EVID=2 covariate breakpoints (#636) are analytic; `init(...)` is analytic for the
 /// **plain-bolus** subset (seeded at the first-record snapshot, #486) and routes to FD when
 /// combined with a reset / lagtime / finite infusion / input-rate forcing / steady-state /
-/// modeled-dose (see `ode_tvcov_supported`). The IOV dual walk carries EVID=2 breakpoints
+/// modeled-dose (see `event_walk_scope`). The IOV dual walk carries EVID=2 breakpoints
 /// separately since #590. Checked by *both* the outer and inner entry points so the analytic
 /// scope stays matched (#439).
 /// Resolve a dose's modeled `RATE` to its PK slot (#530). A `RATE=-2` (`D{cmt}`) dose reads
 /// its duration slot, a `RATE=-1` (`R{cmt}`) dose its rate slot; a `Fixed` dose — or a modeled
 /// dose whose `D{cmt}`/`R{cmt}` slot is undeclared — returns `None`. Single-sourced so the
-/// `ode_tvcov_supported` slot-presence gate and the `integrate_tvcov_readout` jet resolution
+/// `event_walk_scope` slot-presence gate and the `integrate_tvcov_readout` jet resolution
 /// can never resolve the same dose differently if a new `RateMode` / `DoseAttr` mapping lands
 /// (#530 review finding 5).
 pub(crate) fn modeled_slot_for(
@@ -441,15 +455,15 @@ pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject:
         && subject.has_ss_doses()
 }
 
-/// `ode_tvcov_supported` without the forward provider's `(θ, η)` dual-width cap
-/// (`MAX_ODE_AXES`): the event-driven walk's subject scope as the adjoint gradient sees
-/// it. The adjoint seeds only the `nη` η-directions, so the cap does not apply to it.
+/// The pre-#2093 `ode_tvcov_supported` without the retired forward provider's `(θ, η)`
+/// dual-width cap (`MAX_ODE_AXES`): the event-driven walk's subject scope as the adjoint
+/// gradient sees it. The adjoint seeds only the `nη` η-directions, so the cap does not apply.
 pub(crate) fn event_walk_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
     event_walk_scope(model, subject)
 }
 
-/// The one event-driven-walk scope gate behind `ode_tvcov_supported` (`forward_cap`)
-/// and `event_walk_subject_supported`.
+/// The one event-driven-walk scope gate behind `event_walk_subject_supported` (and, before
+/// #2093, the retired `ode_tvcov_supported`).
 fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (the f64
     // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
@@ -482,11 +496,12 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // rate/window from a PK slot, so the infusion *end* is a moving boundary in that
     // parameter — the event-driven walk carries it via the rate-off saltation exactly as
     // lagtime carries the moving *start*. The static superposition walk can't, so route
-    // these subjects here (`ode_subject_supported` keeps gating them off the static walk).
+    // these subjects here (`static_walk_subject_supported` keeps gating them off the static walk).
     let has_modeled_dose = !subject.all_doses_fixed();
     // A `TIME`-built-in structural parameter is per-event dynamic (the switch fires at
     // event times), so it routes through the event-driven walk even with no TV
-    // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
+    // covariates — mirroring the closed-form event walk (`subject_routes_to_event_walk`,
+    // #486).
     //
     // The **wide** predicate, matching the value path's routing
     // (`pk::model_uses_time_anywhere`). A non-autonomous `[odes]` RHS is as much a
@@ -512,13 +527,14 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // the FOCEI objective instead of falling back to FD. The event-driven walk seeds the
     // same variable at the first arrival (#1073's pre-arrival anchor, which the static walk
     // never received), and the same fixture then comes back fully finite and FD-parity
-    // clean. Pinned by `a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities`.
+    // clean. Pinned before #2093 by the retired
+    // `a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities`.
     //
     // One thing this clause is **not** justified by, recorded because it was the first
     // reason given and it does not survive measurement: `subject.has_resets()` is absent
     // from the trigger list while present in the value path's condition, which looked like
     // the same class of split. It is not — a reset + `TAD` subject on the static walk
-    // passes `check_full_provider_vs_fd`. The reason is *not* that the static walk
+    // passed the (pre-#2093) `check_full_provider_vs_fd` parity harness. The reason is *not* that the static walk
     // re-anchors `TAD` across a reset: **neither walk re-anchors**. Both fold over dose
     // times only (this file's `filter(|dt| dt <= t_start)` fold, and `predictions.rs`'s
     // `tad_anchor` fold over `d.time + lag`), and neither consults `reset_floor`, which
@@ -533,9 +549,9 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // fold is well-defined once a dose has landed, so its jet is FD-parity clean there too.
     //
     // That statement is about the *fold*, not about any test: no committed test measures
-    // the static walk on this fixture, because
-    // `tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` asserts
-    // `ode_tvcov_supported` as a precondition and so panics under the narrow predicate
+    // the static walk on this fixture, because the (pre-#2093, retired)
+    // `tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` asserted
+    // `ode_tvcov_supported` as a precondition and so panicked under the narrow predicate
     // rather than exercising the static walk. Establishing it would take a test that
     // calls `integrate_g` directly. Recorded this way because an earlier revision of this
     // comment claimed that test "passes under either predicate" — it cannot, and that was
@@ -570,11 +586,11 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     }
     // An η-dependent `ExpressionScale` `obs_scale` divisor IS served on this non-IOV TV-cov
     // walk now (#486): the scale is **subject-static even for TV-cov subjects** (production
-    // `apply_scaling` reads `subject.covariates`), so `run_subject_tvcov` /
-    // `run_subject_tvcov_eta` apply it as a single subject-static post-walk quotient — the
+    // `apply_scaling` reads `subject.covariates`), so the adjoint's `record_ode` applies it
+    // as a single subject-static post-walk quotient (`apply_expression_scale`) — the
     // IOV per-occasion-group machinery (#590) collapses to one jet because there is no κ.
-    // Admissibility (`!log_transform`, axis counts, axis cap) is already enforced upstream
-    // by `ode_analytical_supported`'s scaling allowlist (only `None`/`ScalarScale`/an
+    // Admissibility (`!log_transform`, axis counts, axis cap) was enforced upstream by the
+    // pre-#2093 `ode_analytical_supported`'s scaling allowlist (only `None`/`ScalarScale`/an
     // axis-admissible `ExpressionScale` reach here), so no extra guard is needed; LTBS
     // stays FD via that allowlist's `!log_transform` admissibility. A `TIME`-built-in
     // structural parameter is served here too (per-event dynamic, mirrors TV-cov) and
@@ -604,7 +620,7 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // does. A bolus dose's (lagged) arrival is a *fixed* (non-dual) boundary when
     // there is no estimated lagtime, so the pure TV-cov case needs no saltation; the
     // combined lagtime + input-rate saltation is gated separately by
-    // `ode_analytical_supported` (which this function calls above), so a model
+    // `ode_walk_model_scope` (the model-level scope, checked before this gate), so a model
     // reaching here with both already carries only the boundary-safe kinds.
     // `ZeroOrder`'s moving-boundary window (`#530`) is now ported to this walk too (#486):
     // `integrate_tvcov_g` rebuilds the constant `F·amt·frac/dur` window from each dose's own
@@ -620,43 +636,46 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // `init(...)` is **fully analytic** on this non-IOV event-driven walk — it composes with
     // every dosing feature the walk carries (finite infusion, estimated lagtime, built-in
     // input-rate forcing, steady-state, modeled-duration/rate dose, and EVID 3/4 reset), each
-    // validated by an FD-vs-production test (below). The one-line summary of why each is safe:
+    // validated (before #2093) by an FD-vs-production test (below). The one-line summary of
+    // why each is safe:
     // A **finite infusion** now composes with `init` (#486): the walk seeds `init_state` and
     // then accumulates the `active_infusions` forcing on top of the running (init-derived)
     // state — the forcing is a `du/dt` additive term with no zero-baseline assumption, so the
-    // analytic gradient already matches FD-of-production on a non-zero baseline (validated by
-    // `ode_provider_tvcov_init_infusion_matches_production`).
+    // analytic gradient already matches FD-of-production on a non-zero baseline (validated
+    // pre-#2093 by `ode_provider_tvcov_init_infusion_matches_production`).
     // An estimated **lagtime** also composes with `init` (#486): the dose-arrival saltation
     // reads the *actual* pre-arrival state `x⁻ = u` (the decaying `init` baseline) and its
     // velocity `g(x⁻)` — the "`x⁻ = 0` first-dose reduction" in the comment there is only a
     // reduction, not an assumption, so a non-zero `init` baseline flows through the saltation
-    // unchanged (validated by `ode_provider_tvcov_init_lagtime_matches_production`).
+    // unchanged (validated pre-#2093 by `ode_provider_tvcov_init_lagtime_matches_production`).
     // A **modeled-duration/rate dose** (`RATE=-1/-2`) also composes with `init` (#486): the
     // moving infusion-end boundary is carried by the rate-off saltation reading the live
     // `inf_eff` jet, on top of the init-seeded running state — no zero-baseline assumption
-    // (validated by `ode_provider_tvcov_init_modeled_duration_matches_production`; the
-    // slot-presence invariant below still guards an undeclared `D{cmt}`/`R{cmt}`).
+    // (validated pre-#2093 by `ode_provider_tvcov_init_modeled_duration_matches_production`;
+    // the slot-presence invariant below still guards an undeclared `D{cmt}`/`R{cmt}`).
     // A built-in **input-rate forcing** also composes with `init` (#486). For continuous kinds
     // (igd/transit/weibull/first_order) `add_prepared_input_rate_forcing` adds `R_in(tad)` to
     // `du/dt` on top of the init-seeded running state; for `ZeroOrder` (now carried on this walk
     // since #653) the per-segment constant `active_zero` channel delivers `F·amt·frac/dur` and
     // the moving-end rate-off saltation reads the same running state. Both are orthogonal to the
-    // starting-state offset (validated by `ode_provider_tvcov_init_input_rate_matches_production`
-    // and `ode_provider_tvcov_init_zero_order_matches_production`).
+    // starting-state offset (validated pre-#2093 by
+    // `ode_provider_tvcov_init_input_rate_matches_production` and
+    // `ode_provider_tvcov_init_zero_order_matches_production`).
     // **Steady-state** also composes with `init` (#486): production's `equilibrate_ss_state`
     // seeds the SS trough from zero and *overwrites* the whole state at the SS dose, discarding
     // `init` there — so the dual `equilibrate_ss_state_g` (which also seeds from zero) matches
     // it; `init` only affects the pre-SS-dose segments, which the walk carries via `init_state`
-    // (validated by `ode_provider_tvcov_init_ss_matches_production`).
+    // (validated pre-#2093 by `ode_provider_tvcov_init_ss_matches_production`).
     // An EVID 3/4 **reset** also composes with `init` (#486): production re-applies
     // `init(&pk_at_reset[idx].values)` at each reset — the reset ROW's own snapshot, since an
     // EVID=3/4 row is a data record (#1133) — and the `K_RESET` branch of `integrate_tvcov_g`
     // mirrors that by re-seeding the state from `pk_at_reset[idx]` (via the shared
     // `init_taylor_seed_at`, carrying `∂init/∂(θ,η)` at that snapshot) instead of zeroing —
-    // validated by `ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, whose
-    // covariate moves at the reset row so the snapshot is observable.
+    // validated pre-#2093 by
+    // `ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, whose covariate moves
+    // at the reset row so the snapshot is observable.
     // With A–F all composing, `init(...)` is fully analytic on the non-IOV event-driven walk;
-    // no per-feature FD clause remains here (IOV is gated separately in `ode_iov_supported`).
+    // no per-feature FD clause remains here (IOV is gated separately in `ode_iov_walk_scope`).
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
     // inside the walk (`inf_eff` reads `pk_at_dose[k][slot]`), so the moving infusion-end
     // boundary is analytic via the rate-off saltation. Modeled-dose × steady-state IS now
@@ -702,8 +721,8 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // `reads_model_time`, not the bare `uses_time_vars` this gate asked until #1124: a bare
     // `TIME` in the RHS compiles to `Op::PushTime`, which `uses_time_vars` structurally cannot
     // see, so that spelling reached `equilibrate_ss_state_g` while `T` — the same quantity —
-    // declined. The gap was known: this gate's own regression test
-    // (`ode_ss_time_only_rhs_still_routes_to_fd`) spells the term `T` *to work around it*.
+    // declined. The gap was known: this gate's own (pre-#2093, retired) regression test
+    // (`ode_ss_time_only_rhs_still_routes_to_fd`) spelled the term `T` *to work around it*.
     //
     // The gate is about the analytic-vs-FD **gradient** route, and one side of what it
     // used to say has changed. The production *value* for `TAD` is now the periodic steady
@@ -717,7 +736,8 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // under SS is unchanged: it matches NONMEM while agreeing with neither engine's own
     // dose train (67% apart — an absolute clock has no periodic limit to converge to), and
     // `TAFD` under SS still reads `NaN` by design. Those are #1139's remaining half. The
-    // same note is at `pk/mod.rs`, `pk/modified_release.rs`, and `ode_provider_tests.rs`.
+    // same note is at `pk/mod.rs` and `pk/modified_release.rs` (and was in the pre-#2093
+    // `ode_provider_tests.rs`).
     if has_ss
         && ode
             .rhs_program
@@ -737,14 +757,15 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
 }
 
 /// `ode_walk_model_scope` for an IOV model (IOV + FREM is scored by a sentinel).
-/// `ode_iov_supported` adds the forward provider's own width and scaling limits; the
-/// adjoint gradient needs only this.
+/// The retired (pre-#2093) `ode_iov_supported` added the forward provider's own width and
+/// scaling limits; the adjoint gradient needs only this.
 pub(crate) fn ode_iov_model_scope(model: &CompiledModel) -> bool {
     model.n_kappa > 0 && model.frem_config.is_none() && ode_walk_model_scope(model)
 }
 
-/// Central finite differences of `init_fn` over the differentiated PK slots — the shared
-/// stencil behind `dual_init_state`, `dual1_init_state`, and `tvcov_init_state`, so the
+/// Central finite differences of `init_fn` over the differentiated PK slots — the
+/// stencil behind `init_taylor_seed_at` (and through it `tvcov_init_state` and
+/// `init_seed`'s closure fallback), so the
 /// `he`/`h2` steps and the 2-/3-/4-point formulas live in **one** place. Returns
 /// `(base, d1, d2)` where `d1[s][i] = ∂init_s/∂p_{pk_indices[i]}` and, when `want_d2`, the
 /// symmetric `d2[s][i][j] = ∂²init_s/∂p_i∂p_j`; `d2` is empty otherwise (gradient-only
@@ -809,13 +830,11 @@ fn init_fd_derivs(
 }
 
 /// Seed the ODE `init(...)` initial state for the **event-driven TV-cov walk**, on the
-/// walk's own dual basis (`Dual2<M>` outer / `Dual1<N>` inner — whatever `T` the caller
-/// propagates). Unlike the static walk, which seeds `init` on the PK-parameter axes
-/// (`dual_init_state`) and chains to (θ,η) at the readout, the TV-cov walk propagates
-/// its state on (θ,η) directly (`seed_pk_dual2`/`seed_pk_dual1`), so `init` must be
-/// seeded on that basis here — and is consumed by `integrate_tvcov_g` as the initial
-/// state (`ode_tvcov_supported` keeps `init(...)` + EVID 3/4 reset on FD, since a reset
-/// re-seeds production at the reset-event snapshot but the walk carries one subject jet).
+/// walk's own dual basis (whatever `T` the adjoint's recorder propagates). The TV-cov walk
+/// propagates its state on the recorder's basis directly (each event's taped parameter
+/// snapshot), so `init` must be seeded on that basis here — and is consumed by
+/// `integrate_tvcov_g` as the initial state (an EVID 3/4 reset re-seeds separately, from
+/// the reset row's own snapshot via `init_seed`, #1133).
 ///
 /// Production seeds `init` at the subject's **first record** covariate snapshot
 /// (`init_pk`, `predictions.rs`: smallest record time across dose / obs / pk-only), so
@@ -985,18 +1004,15 @@ fn init_taylor_seed_at<T: crate::sens::num::PkNum>(
 /// `Dual2` ops carry `∂f/∂pk` and `∂²f/∂pk²` exactly — the η/θ chain that follows is
 /// unchanged. An η-dependent `ExpressionScale` divisor is NOT applied here — it can
 /// reference θ/η directly (not only PK params), so it is applied on the final
-/// `(θ,η)`-space jet after the chain (`apply_expression_scale_outer`, #486). Mirrors
+/// prediction after the walk (the adjoint's `apply_expression_scale`, #486). Mirrors
 /// `pk::apply_scaling` (`pred /= k`) and `pk::apply_log_transform`
 /// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
 /// constant, so the jet vanishes).
 ///
 /// Basis-agnostic: it only divides/logs the dual `p` as a whole, so it works
-/// identically whether `p`'s axes are PK-parameter space (the static walk,
-/// chained to `(θ,η)` afterward) or already `(θ,η)`-space (the TV-cov walk's
-/// `seed_pk_dual2` convention) — already proven by `resolve_obs_readout`
-/// calling it from both. `pub(crate)`: also reused by
-/// `pk::modified_release::mr_sens_dual`/`mr_eta_grad_dual` (#860 Phase A6),
-/// whose `mr_observable_g::<Dual2<M>>` result is `(θ,η)`-seeded the same way.
+/// identically on whatever basis the walk's parameters are seeded — already proven by
+/// `resolve_obs_readout` calling it from both walks. `pub(crate)`: also reused by the
+/// adjoint's compartment-free recorder (`record_algebraic`).
 pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     p: T,
@@ -1008,7 +1024,7 @@ pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
     if p.val().is_nan() {
         return p;
     }
-    // `ScalarScale` is the only scaling the gate (`ode_analytical_supported`) admits
+    // `ScalarScale` is the only scaling the model scope (`ode_walk_model_scope`) admits
     // over duals — `ExpressionScale`/`PerCmt` scaling route to the Form-C `y = state/V`
     // readout instead, so production's full `build_obs_scale_array` need not be lifted
     // here. Divide (not multiply by `1/k`) to match production's `pred /= s` exactly.
@@ -1037,7 +1053,7 @@ pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
 
 /// Resolve the ODE readout for observation `j` over the dual state `st`, then apply
 /// the negative-readout clamp and the output transform — the single readout site
-/// shared by the static `integrate_subject_duals` and the TV-cov
+/// shared by the static `integrate_seeded_duals` and the TV-cov
 /// `integrate_tvcov_readout` walks (#449 re-review #7). `params` is the flat
 /// PK-param dual vector the Form-C / per-CMT program reads: `params_dual` for the
 /// static walk, the per-event `pk_at_obs[j]` snapshot for the TV-cov walk. The
@@ -1115,10 +1131,8 @@ fn f_bio_slot(ode: &OdeSpec, cmt: usize) -> usize {
 }
 
 /// The static walk from already-seeded PK-slot duals: dose bioavailability, absorption
-/// forcings, the integration, and the per-observation readout. Shared by the forward
-/// providers (seeded through `PkNum::var` by
-/// `integrate_subject_duals`) and the adjoint gradient, which seeds each individual
-/// parameter with its η-tangents directly.
+/// forcings, the integration, and the per-observation readout. Called by the adjoint's
+/// `record_ode`, which seeds each individual parameter with its η-tangents directly.
 pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     subject: &Subject,
@@ -1159,7 +1173,7 @@ pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
 
     // Built-in absorption input-rate forcings (#430), parallel to `ode.input_rate`,
     // built over the dual type `T` (so they thread through `Dual2`/`Dual1`/`DualMixed`
-    // alike). The gate (`ode_analytical_supported`) admits only kinds lifted to
+    // alike). The model scope (`ode_walk_model_scope`) admits only kinds lifted to
     // `PkNum`, so `prepare_dual` returns `Some` for each; bail to FD otherwise. One
     // subject-static snapshot, so every dose reads the same one — its dose record's.
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
@@ -1207,15 +1221,14 @@ pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
     Some(preds)
 }
 
-/// Shared TV-cov walk + readout for both ODE drivers, generic over the dual type
-/// `T` (`Dual2<M>` outer, `Dual1<N>` inner): resolve per-dose bioavailability, run
+/// Shared TV-cov walk + readout for both ODE recorders (`record_ode`, `record_ode_iov`),
+/// generic over the number type `T`: resolve per-dose bioavailability, run
 /// the bolus event-driven walk over the per-event-seeded params, then per
 /// observation apply the readout (`ObsCmt` / `Single` / per-CMT), the
 /// negative-readout clamp, and the output transform. Returns one transformed
 /// prediction per observation; the caller reads its `grad`/`hess` and chains. The
-/// per-event PK-param duals are built by the caller, since the seeding differs by
-/// order (`seed_pk_dual2` carries the Hessian, `seed_pk_dual1` only the gradient) —
-/// the TV-cov analogue of `integrate_subject_duals` (#449 review #13).
+/// per-event PK-param duals are built by the caller (`seed_tvcov_snapshots` /
+/// `seed_iov_events`) — the TV-cov analogue of `integrate_seeded_duals` (#449 review #13).
 fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
     subject: &Subject,
@@ -1224,8 +1237,8 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
     pk_at_pk_only: &[Vec<T>],
     pk_at_reset: &[Vec<T>],
 ) -> Vec<T> {
-    // `ode_tvcov_supported` (checked by both TV-cov entry points before reaching
-    // here) calls `ode_analytical_supported`, which declines a model whose `ode_spec`
+    // The model scope (`ode_walk_model_scope`, checked before any walk is reached; the
+    // `expect` texts below keep its pre-#2093 names) declines a model whose `ode_spec`
     // or `rhs_program` is `None` — so both are guaranteed present and this readout is
     // infallible (the former `Option` return was dead) (#451 re-review #12).
     let ode = model
@@ -1256,8 +1269,9 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
         .fold(f64::INFINITY, f64::min);
     // Initial compartment state from `init(...)`, seeded on the walk's own dual basis at
     // the subject's first-record covariate snapshot (matching production `init_pk`); all
-    // zeros when no `init(...)` is declared (#486). `ode_tvcov_supported` keeps `init` +
-    // EVID 3/4 reset on FD, so a single subject-level init jet is exact here.
+    // zeros when no `init(...)` is declared (#486). An EVID 3/4 reset re-seeds from its
+    // own row's snapshot in the walk (`K_RESET`, #1133), so one subject-level init jet
+    // is exact for the initial state.
     let init_state: Vec<T> = match ode.init_fn.as_ref() {
         Some(_) => tvcov_init_state::<T>(
             ode,
@@ -1424,7 +1438,7 @@ fn seed_tvcov_snapshots<T: Clone>(
 }
 
 /// The IOV event walk's structural scope for `subject` (whose `layout` the caller built),
-/// without the forward provider's dual-width cap: the adjoint gradient's width is the
+/// without the retired forward provider's dual-width cap: the adjoint gradient's width is the
 /// stacked η alone.
 pub(crate) fn ode_iov_walk_scope(
     model: &CompiledModel,
@@ -1441,10 +1455,10 @@ pub(crate) fn ode_iov_walk_scope(
     // #530/#486: modeled-`RATE`/duration doses (`RATE=-1`/`-2`, `R{cmt}`/`D{cmt}`) are
     // resolved from their **per-occasion** PK slot as a live jet inside the event walk
     // (`inf_eff` reads `pk_at_dose[k][slot]`, seeded per occasion group by
-    // `seed_pk_dual2_iov` so a `κ`-coupled modeled window — `D1 = TVD1·exp(η + κ)` —
+    // `seed_iov_events` so a `κ`-coupled modeled window — `D1 = TVD1·exp(η + κ)` —
     // lands its sensitivity in the correct stacked axis), so the moving infusion-end
     // boundary is analytic via the rate-off saltation, exactly as on the non-IOV TV-cov
-    // walk (`ode_tvcov_supported`). Modeled-dose × steady-state IS now analytic too (#486):
+    // walk (`event_walk_scope`). Modeled-dose × steady-state IS now analytic too (#486):
     // `equilibrate_ss_state_g` threads the same `inf_eff` jet into its per-cycle active/quiet
     // split. Decline to FD only when a modeled dose's `D{cmt}`/`R{cmt}` slot is absent
     // (`check_model_data` rejects such a model, but emit FD rather than a wrong gradient if
@@ -1469,14 +1483,14 @@ pub(crate) fn ode_iov_walk_scope(
     // `equilibrate_ss_state_g`'s per-cycle active/quiet split reads the same `F`-scaled
     // `inf_eff` window as the main walk).
     // Steady-state (bolus and infusion) is handled via the dual equilibration. SS combined
-    // with an estimated lagtime IS now analytic too (mirrors `ode_tvcov_supported`, #486):
+    // with an estimated lagtime IS now analytic too (mirrors `event_walk_scope`, #486):
     // the shared `integrate_tvcov_g` walk carries the `K_SS_SEED` pre-arrival seed, and the
     // dose's own arrival still goes through the unmodified general lagtime saltation,
     // regardless of outer/IOV dispatch.
     // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
     // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
-    // (mirrors `ode_tvcov_supported`, #473 review #1). `reads_model_time` so the bare-`TIME`
-    // spelling is covered too (#1124) — see the note at the `ode_tvcov_supported` gate.
+    // (mirrors `event_walk_scope`, #473 review #1). `reads_model_time` so the bare-`TIME`
+    // spelling is covered too (#1124) — see the note at the `event_walk_scope` gate.
     if has_ss
         && model
             .ode_spec
@@ -1497,7 +1511,7 @@ pub(crate) fn ode_iov_walk_scope(
     // `equilibrate_ss_input_rate_state_g`, whose fixed-point / pulse-train carries κ's jet through
     // `params` exactly as it does η/θ. Only SS into a `zero_order` window and SS + an absorption
     // lagtime stay out of scope; the decline below is the same belt-and-suspenders guard as the
-    // non-IOV gate (`ode_tvcov_supported`), sharing `CompiledModel::ss_absorption_out_of_scope`.
+    // non-IOV gate (`event_walk_scope`), sharing `CompiledModel::ss_absorption_out_of_scope`.
     if model.ss_absorption_out_of_scope(subject) {
         return None;
     }
@@ -1509,8 +1523,9 @@ pub(crate) fn ode_iov_walk_scope(
 /// Whether the IOV ODE walk must seed each event individually (its own occasion ×
 /// covariate snapshot × time) rather than sharing one source per occasion group: TV
 /// covariates, EVID=2 covariate breakpoints, or a `TIME`-built-in structural parameter.
-/// Shared by `run_subject_iov` (outer `Dual2`) and `run_subject_iov_eta` (inner `Dual1`)
-/// so their per-event seeding decisions can't desync (#637 round-2 review #4).
+/// Read by the adjoint's `record_ode_iov`; before #2093 it was shared by the outer and
+/// inner IOV walks so their per-event seeding decisions could not desync (#637 round-2
+/// review #4).
 fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
@@ -1679,7 +1694,7 @@ fn seed_iov_events<T: Clone>(
 ///
 /// `δ⁻` is the limit whose event ordering the stable sort reproduces, and only the candidate
 /// rule lands on it. The incumbent rule sits between the two — a mixture that is not the
-/// derivative of any single consistent perturbation. Pinned by
+/// derivative of any single consistent perturbation. Pinned before #2093 by the retired
 /// `ode_tad_rhs_co_timed_arrivals_resolve_to_one_sided_limit`.
 ///
 /// A consequence worth stating because it makes the surrounding code simpler to reason about:
@@ -1760,7 +1775,8 @@ fn eval_rhs_anchored<T: crate::sens::num::vm::VmNum>(
 /// `TIME`/`TAFD`/`TAD` is non-autonomous, so its explicit time partial is a real missing term
 /// in the `δlag²` coefficient. That is **#1075**, not #1070: it is second-order only, it
 /// pre-dates the dual `tad`, and #1070 improved it (`∂²f/∂η_ALAG²` 6.4e-1 → 2.2e-1 on
-/// `ode_tad_rhs_with_estimated_lagtime_is_analytic_and_exact`'s fixture) without closing it.
+/// the pre-#2093 `ode_tad_rhs_with_estimated_lagtime_is_analytic_and_exact`'s fixture) without
+/// closing it.
 /// Seeding the anchor here with `−1` — so `TAD = t − anchor` carries `+1` on the same `ε`
 /// axis as the state seed, making this return `J·g + ∂f/∂TAD` — recovers part of the gap
 /// (2.2e-1 → 1.5e-1) and not all of it, so it needs #1075's full derivation rather than that
@@ -2626,8 +2642,8 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
 }
 
 /// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
-/// mirror of the analytical `super::provider::subject_sensitivities_tvcov` /
-/// `event_driven_sens_g`. For the **bolus** subset it reproduces production's
+/// mirror of the closed-form event walk (`super::provider::closed_form_event_predictions` /
+/// `event_driven_sens_g`). For the **bolus** subset it reproduces production's
 /// `ode_predictions_event_driven`: a merged dose+obs timeline (dose sorts before a
 /// co-timed obs), each segment `[cur_t, t_event]` integrated with the params
 /// evaluated **at** `t_event` (NONMEM end-of-interval), boluses applied after the
@@ -3036,7 +3052,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
         //
         // The condition is production's own predicate, not a restatement of it: the two
         // walks must seed on exactly the same set of doses or they disagree in **value**,
-        // and `check_vs_production` asserts `obs.f` as well as the derivatives. It excludes
+        // and the adjoint's `fd_oracle` parity differences the production objective, so a
+        // value split shows as a gradient mismatch. It excludes
         // a zero lag (record and arrival coincide) and a lag of a full interval or more
         // (phase `II − lag` is not a phase) — see `ss_seeded_at_record`.
         if crate::dosing::ss_seeded_at_record(d, lag_val(k)) {
@@ -3794,8 +3811,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         // loaded at the dose record and flowed by the walk, so it carries the
                         // jet the ordinary way and injecting it again would double-count. Scoped
                         // by production's own predicate so the two engines agree on which doses
-                        // are which; `ode_provider_ss_lagtime_infusion_matches_production`, with
-                        // its flat-covariate Hessian-vs-FD check, is red on either mistake.
+                        // are which; the pre-#2093
+                        // `ode_provider_ss_lagtime_infusion_matches_production`, with its
+                        // flat-covariate Hessian-vs-FD check, was red on either mistake
+                        // (retired in #2093).
                         //
                         // An infusion recorded before a reset reached here — the EVID=3/4 reset
                         // in force (#1587) or an `SS=1` record (#1586) — never turns on: the
@@ -4064,10 +4083,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         // so that arm is reachable rather than vacuous.
                         //
                         // Under flat covariates the two terms cancel (`x⁻` is lag-invariant
-                        // there), which is what makes
+                        // there), which is what made the pre-#2093
                         // `ode_provider_ss_lagtime{,_infusion}_matches_production` — both of
-                        // which run a Hessian-vs-FD check — the live guard on this line:
-                        // re-widen the skip to every SS dose and they go red.
+                        // which ran a Hessian-vs-FD check — the guard on this line (retired in
+                        // #2093): re-widening the skip to every SS dose turned them red.
                         //
                         // `g±` are the FULL one-sided velocities, not the bare user RHS:
                         // every forcing that straddles this instant (another dose's
@@ -4627,10 +4646,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // This deliberately does NOT use `params` (which is `last_params` for a `K_RESET`
             // event): before #1133 both engines read the previous record, and `Dual2`-vs-FD
             // parity could not tell — FD perturbs this same walk's value path, so a shared
-            // wrong convention moves both sides together. The oracle that separates them is
-            // `check_vs_production`, which FDs the *production* predictor
-            // (`ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`), and
-            // beneath that the NONMEM anchor in
+            // wrong convention moves both sides together. The oracle that separated them was the
+            // pre-#2093 `check_vs_production`, which FD'd the *production* predictor
+            // (`ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, retired in
+            // #2093); now it is the adjoint's `fd_oracle` (`sens/ode_adjoint_tests.rs`), which
+            // differences the production objective, and beneath that the NONMEM anchor in
             // `tests/reset_init_snapshot_nonmem_anchor.rs`.
             match init_seed::<T>(ode, &pk_at_reset[idx], pk_indices) {
                 Some(seed) => u = seed,
@@ -4687,7 +4707,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
     // (Estimated lagtime is handled on the event-driven walk, not here — see
-    // `ode_subject_supported`. This static walk applies doses at their record times.)
+    // `static_walk_subject_supported`. This static walk applies doses at their record times.)
 
     // Sorted `(obs_time, index)` for O(log n) tolerance lookup at each break time
     // and solver save point, replacing the per-query linear scan over all
@@ -4740,8 +4760,9 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // Measured rather than assumed, because "a mask covers it" is exactly the kind of claim
     // that is true until it isn't: an observation one ULP *before* a dose reads the pre-dose
     // 155.847 on both this walk and production, and a record before the first break reads
-    // 0.0 on both. `provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose` pins the first;
-    // without it no provider test placed an observation on the mirror side at all.
+    // 0.0 on both. The pre-#2093 `provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose` pinned
+    // the first (retired in #2093); without it no provider test placed an observation on the
+    // mirror side at all.
     let mut band_scratch: Vec<usize> = Vec::new();
     let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         obs_index.records_at_break(q, &mut band_scratch);
@@ -4926,8 +4947,8 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // that dose was never applied: the walk recorded the observation from the preceding
     // segment's `t_end` save point, pre-dose, while `ode_predictions` applied it and read
     // post-dose. Measured 3.79 here against production's 1003.79 — the same gradient-vs-
-    // objective divergence #1226 fixes one break earlier, and it is what
-    // `provider_reads_a_dose_landing_on_the_last_observation` pins.
+    // objective divergence #1226 fixes one break earlier, and it is what the pre-#2093
+    // `provider_reads_a_dose_landing_on_the_last_observation` pinned (retired in #2093).
     let mut auto_state = OdeAutoSwitchState::default();
     for w in 0..break_times.len() {
         let t_start = break_times[w];
@@ -4945,7 +4966,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         }
         // Uniformity with the `f64` twin (#1576, #1586): one gate per break, read by the
         // zero-order saltation, the infusion and zero-order windows and the forcing below.
-        // Periodic SS is declined upstream of this walk (`ode_subject_supported`), so no
+        // Periodic SS is declined upstream of this walk (`static_walk_subject_supported`), so no
         // `SS=1` record gates; the EVID=3/4 half reads the tracked `reset_floor`.
         let gate =
             crate::ode::predictions::ResetGate::at_segment(&subject.doses, reset_floor, t_start);
@@ -5124,8 +5145,8 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                 t,
                 first_dose_time,
                 // Zero jet by construction: this walk folds the *unlagged* dose times and
-                // `ode_subject_supported` declines an estimated lagtime outright, so #1070's
-                // `∂TAD/∂lag` term is absent here rather than dropped.
+                // `static_walk_subject_supported` declines an estimated lagtime outright, so
+                // #1070's `∂TAD/∂lag` term is absent here rather than dropped.
                 //
                 // That is a statement about the JET only. The VALUE is a separate, open
                 // defect: the fold above leaves `NEG_INFINITY` before the first dose and
@@ -5214,8 +5235,8 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // that guard). Swapping either exit for the other turns an actionable fallback into a silent
     // one, or spends N+1 solves reproducing a `NaN` the model guarantees.
     //
-    // Worth knowing before relying on this arm: it appears to be **unreachable from
-    // `ode_subject_sensitivities` today**. Nine shapes aimed at it — an observation below the
+    // Worth knowing before relying on this arm: it appeared to be **unreachable from
+    // `ode_subject_sensitivities`** (the pre-#2093 forward entry point). Nine shapes aimed at it — an observation below the
     // timeline floor, an all-negative grid, observations `5e-13` after the integration start and
     // after a dose, duplicate and `1e-16`-apart times, a single observation at `t = 0`,
     // observations entirely before the first dose, and no doses at all — every one comes back

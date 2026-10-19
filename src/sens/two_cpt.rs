@@ -377,7 +377,7 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
 }
 
 /// Transit-absorption counterpart to [`two_cpt_oral_g`] for the analytic
-/// `two_cpt_transit` model (#386 PR D), used by the sensitivity provider. Transit
+/// `two_cpt_transit` model (#386 PR D), used by the analytic gradient path. Transit
 /// rejects infusion/SS doses at parse, so only the absorbed-bolus route exists — a
 /// thin wrapper over [`two_cpt_transit_amt_g`] with `F` baked into the kernel.
 /// Generic over [`PkNum`] so prediction (`T = f64`) and the `Dual1`/`Dual2`
@@ -486,7 +486,7 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
 }
 
 /// Inverse-Gaussian counterpart to [`two_cpt_transit_conc_g`] for the analytic
-/// `two_cpt_ig` model (#790), used by the sensitivity provider. IG rejects
+/// `two_cpt_ig` model (#790), used by the analytic gradient path. IG rejects
 /// infusion/SS doses at parse, so only the absorbed-bolus route exists — a thin
 /// wrapper over [`two_cpt_ig_amt_g`] with `F` baked into the kernel.
 #[allow(clippy::too_many_arguments)]

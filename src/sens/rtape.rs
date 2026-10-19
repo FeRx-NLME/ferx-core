@@ -564,10 +564,12 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     }
     fn ln_gamma(self) -> Self {
         let x = self.v.val();
+        // The derivative ψ lifted with its own ψ′ and ψ″ (tetragamma), so a second-order
+        // base differentiates it exactly instead of seeing a truncated `0`.
         let d = self.v.lift2(
             crate::stats::special::digamma(x),
             crate::stats::special::trigamma(x),
-            0.0,
+            crate::stats::special::tetragamma(x),
         );
         self.chain(self.v.ln_gamma(), d)
     }
@@ -582,9 +584,12 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         )
     }
     /// `φ(self)` with `φ = v`, `φ′ = d1`, `φ″ = d2`: the tangent factor `φ′(x)` is lifted
-    /// on the base with derivative `φ″`, so a reverse sweep over the tangents is exact.
+    /// on the base with derivative `φ″`, so a reverse sweep over the tangents is exact. Its own
+    /// second derivative `φ‴` is unknown here: exact as `0` for an affine lift (`φ″ = 0`), and
+    /// otherwise `NaN`, which a first-order base (`f64`, `R`) never reads and a second-order one
+    /// turns into a visible decline rather than a silently truncated jet (#2093 review).
     fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
-        let d = self.v.lift2(d1, d2, 0.0);
+        let d = self.v.lift2(d1, d2, if d2 == 0.0 { 0.0 } else { f64::NAN });
         self.chain(self.v.lift2(v, d1, d2), d)
     }
     /// The value lifted on the base with the derivatives it tracks, and the tangent factor
@@ -893,10 +898,10 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         }
     }
     fn ln_gamma(self) -> Self {
-        use crate::stats::special::{digamma, tetragamma, trigamma};
+        use crate::stats::special::{digamma, pentagamma, tetragamma, trigamma};
         let x = self.v.val();
         let p1 = self.v.lift2(digamma(x), trigamma(x), tetragamma(x));
-        let p2 = self.v.lift2(trigamma(x), tetragamma(x), f64::NAN);
+        let p2 = self.v.lift2(trigamma(x), tetragamma(x), pentagamma(x));
         self.chain2(self.v.ln_gamma(), p1, p2)
     }
     fn jets_finite(self) -> bool {

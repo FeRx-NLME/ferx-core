@@ -268,10 +268,13 @@ endpoints, sparse data, and large `ω²`.
 AGQ reuses the FOCE/Laplace machinery almost entirely:
 
 1. **Inner loop — unchanged.** The per-subject EBE mode `η̂` comes from the same
-   solver FOCE/FOCEI use, including the analytic `Dual2` η-gradient where the
-   model is in the sensitivity provider's scope. AGQ does **not** re-optimise the
-   mode; it only lays the grid around it.
-2. **Hessian.** `H` is central-differenced from the true conditional NLL at `η̂`.
+   solver FOCE/FOCEI use, on the exact inner gradient from the adjoint's recording
+   wherever it serves the subject. AGQ does **not** re-optimise the mode; it only
+   lays the grid around it.
+2. **Hessian.** Under the exact anchor (Laplace's) `H` is the exact conditional
+   Hessian `∂²nll/∂η²` from the same recording, central-differenced from the
+   conditional NLL only where no recorder serves the subject (TTE, categorical
+   endpoints). Under the Gauss–Newton anchor it is FOCEI's `H̃`.
 3. **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then
    transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
 4. **Objective.** The exact conditional likelihood is evaluated at each node.
@@ -324,6 +327,13 @@ not yet carry, or `gradient_method = fd` — takes a per-subject finite differen
 objective with the inner loop reconverged at each point. That is correct, but slower than
 the analytic score, and it is the route those endpoints take until their likelihoods join
 the adjoint kernel. The fit output reports which route ran.
+
+A subject inside the scope can still miss the exact gradient at one trial point. If the inner
+search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
+is indefinite, the identity behind the exact score does not hold. The subject then takes the
+analytic gradient at its held EBE, which leaves out the EBE-response term, the same salvage
+FOCE and FOCEI use. The outer gradient fallback warning counts these subjects. The covariance
+step never uses a held-EBE score: it takes the exact score or the reconverged one.
 
 ### Where AGQ stops
 
@@ -466,9 +476,9 @@ read, and the error names the occasion count so the cause is obvious.
 
 - **Exponential in the random-effect dimension** — see the cost table above, and
   the IOV section below. This is the real limit.
-- Models outside the `Dual2` provider take a finite-differenced θ/σ score rather than
-  an analytic one (see above). Same gradient, no inner re-solve, just a little slower
-  per iteration.
+- Subjects outside the adjoint's scope take a reconverged finite-difference score
+  rather than an analytic one (see [Scope](#scope)). The gradient is the same, but each
+  iteration is slower.
 - Mixture models support plain FOCEI, but `focei` with `n_agq > 1` is rejected:
   the mixture engine does not yet integrate each class by quadrature. It must not
   silently ignore the node count.

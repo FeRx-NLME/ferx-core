@@ -33,8 +33,8 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
 /// this enum describes what actually runs and is used only for reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GradientMethodKind {
-    /// Exact analytic `Dual2` η-gradient from the sensitivity provider — one
-    /// provider evaluation per inner step, independent of n_eta.
+    /// Exact analytic η-gradient (the adjoint recorder run tape-free,
+    /// `exact_inner_gradient`) — one evaluation per inner step, independent of n_eta.
     Analytic,
     /// Central finite differences — cost scales as 2×n_eta per gradient call.
     FiniteDifferences,
@@ -80,8 +80,8 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// Gradient method used in the outer (population parameter) loop.
 ///
 /// For a gradient-driven FOCE/FOCEI fit the outer optimiser uses the **exact
-/// analytic** packed gradient when the model is in the sensitivity provider's
-/// scope (`sens_supported` / `iov_sens_supported`) and the user did not
+/// analytic** packed gradient when the model is in the adjoint gradient's
+/// scope (`adjoint::model_in_scope`, IOV included) and the user did not
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
@@ -99,7 +99,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// predicates it reads take only `&CompiledModel`, so they answer "may this model use
 /// the analytic outer gradient", not "did it":
 ///
-/// - A subject the provider declines at runtime is salvaged onto a per-subject gradient —
+/// - A subject the adjoint declines at runtime is salvaged onto a per-subject gradient —
 ///   held-EBE in `population_gradient_sens_mixed` (#1529), reconverged FD in `_iov_mixed` —
 ///   while this keeps reporting `Analytic` — correctly, for the model.
 /// - A `reconverge_gradient_interval` override forces the reconverged-FD gradient without
@@ -168,8 +168,8 @@ pub fn gradient_method_outer(
                 | Optimizer::NloptLbfgs
                 | Optimizer::Mma
                 | Optimizer::TrustRegion => {
-                    // Shared predicate (#490) — now IOV-aware via `iov_sens_supported`, which
-                    // admits ODE IOV models too, so the reported method tracks the live outer
+                    // Shared predicate (#490) — IOV-aware (since #2093 via
+                    // `adjoint::model_in_scope`, which admits ODE IOV models too), so the reported method tracks the live outer
                     // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
                     // Shared with `resolve_auto` so the reported method tracks the live outer
                     // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
