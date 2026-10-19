@@ -13,6 +13,11 @@
 //! draws ε between subjects on the η stream, the adaptive path does not, so only the
 //! first (subject, replicate) shares its η draw across the two engines.
 //!
+//! It runs once per readout form. Form C (`y = central / V`) divides inside the readout
+//! expression. Form A (`obs_scale = V`) divides afterwards, on a path of its own that
+//! reads `params.theta` again (#2129, #2142): a run that used the fitted θ for the model
+//! and the initial θ for the scale is visible only there.
+//!
 //! Tier 2: the fit is two outer iterations, which is enough to move θ, Ω and σ off
 //! their initial values; nothing here needs it to converge.
 
@@ -26,15 +31,29 @@ use ferx_core::{
     SimulateOptions,
 };
 
-// 1-cpt IV ODE with BSV on CL. The readout is Form C (`y = central / V`): a Form A/B
-// `obs_scale` is not applied on the adaptive path until #2142 (#2129) lands, and this
-// test is about the parameters, not the scaling.
+/// How the model turns `central` (an amount) into a concentration.
+#[derive(Clone, Copy)]
+enum Readout {
+    /// Form A: `obs_scale = V`, divided after the readout.
+    ObsScale,
+    /// Form C: `y = central / V`, divided inside the readout expression.
+    Expression,
+}
+
+// 1-cpt IV ODE with BSV on CL, in the given readout form. The monitored signal is
+// `central / V` in both, so the controller sees the same concentration.
 //
 // The `[adaptive_dosing]` block holds at every decision (`signal >= 0` always matches,
 // first match wins), so every dose comes from the subject's base regimen. The
 // decisions sit on the dose times, so the reactive driver and the static engine
 // segment the horizon identically.
-const MODEL: &str = r#"
+fn model_src(readout: Readout) -> String {
+    let (structural, scaling) = match readout {
+        Readout::ObsScale => ("ode(obs_cmt=central, states=[central])", "obs_scale = V"),
+        Readout::Expression => ("ode(states=[central])", "y = central / V"),
+    };
+    format!(
+        r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 1.0, 500.0)
@@ -44,11 +63,11 @@ const MODEL: &str = r#"
   CL = TVCL * exp(ETA_CL)
   V  = TVV
 [structural_model]
-  ode(states=[central])
+  {structural}
 [odes]
   d/dt(central) = -(CL / V) * central
 [scaling]
-  y = central / V
+  {scaling}
 [error_model]
   DV ~ proportional(PROP)
 [adaptive_dosing]
@@ -58,7 +77,9 @@ const MODEL: &str = r#"
   route = bolus(cmt=1)
   dose_bounds = [0, 1000]
   when signal >= 0 : hold
-"#;
+"#
+    )
+}
 
 const OBS_TIMES: [f64; 7] = [1.0, 4.0, 8.0, 23.0, 25.0, 30.0, 47.0];
 
@@ -93,8 +114,17 @@ fn population(n: usize) -> Population {
 }
 
 #[test]
-fn adaptive_run_on_fitted_params_matches_static_simulate() {
-    let parsed = parse_full_model(MODEL).expect("model parses");
+fn adaptive_run_on_fitted_params_matches_static_simulate_obs_scale_readout() {
+    check_fitted_params_reach_the_adaptive_run(Readout::ObsScale);
+}
+
+#[test]
+fn adaptive_run_on_fitted_params_matches_static_simulate_expression_readout() {
+    check_fitted_params_reach_the_adaptive_run(Readout::Expression);
+}
+
+fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
+    let parsed = parse_full_model(&model_src(readout)).expect("model parses");
     let model = &parsed.model;
     let spec = parsed
         .adaptive_dosing
