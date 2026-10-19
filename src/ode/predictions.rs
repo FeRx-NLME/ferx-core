@@ -2548,11 +2548,90 @@ fn wrap_rhs_with_forcings<'a>(
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    let force = forcing_adder(
+        ode,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        reset_floor,
+        t_seg,
+        prepared,
+        infusions,
+        zero_order,
+    );
+    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        force(t, dy);
+    }
+}
+
+/// `ode.rhs` plus `force` — [`wrap_rhs_with_forcings`] over a caller-held forcing, so the
+/// same forcing can serve [`forced_columns`].
+fn forced<'a>(
+    ode: &'a OdeSpec,
+    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        force(t, dy);
+    }
+}
+
+/// [`forced`]'s forward-difference Jacobian columns in one lane pass
+/// (`OdeRhsProgram::rhs_columns`, then `force` per column, as the scalar RHS adds it).
+/// `None` when the program does not run on lanes.
+fn forced_columns<'a>(
+    ode: &'a OdeSpec,
+    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+) -> Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a> {
+    let raw = ode.rhs_program.as_ref()?.rhs_columns()?;
+    let n = ode.n_states;
+    Some(
+        move |y: &[f64], p: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
+            raw(y, p, t, cols, out) && {
+                for c in 0..cols.len() {
+                    force(t, &mut out[c * n..(c + 1) * n]);
+                }
+                true
+            }
+        },
+    )
+}
+
+/// Register `columns` as `rhs`'s batched Jacobian for the guard's lifetime
+/// (`rosenbrock::FdColumnsGuard`): a stiff step's `J` then costs one lane pass rather than
+/// `n` right-hand-side calls, with the same bits.
+fn register_columns<'a>(
+    rhs: &'a impl Fn(&[f64], &[f64], f64, &mut [f64]),
+    columns: &'a Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a>,
+) -> crate::ode::rosenbrock::FdColumnsGuard {
+    crate::ode::rosenbrock::FdColumnsGuard::register(
+        rhs,
+        columns
+            .as_ref()
+            .map(|c| c as &crate::ode::rosenbrock::FdColumns<'_>),
+    )
+}
+
+/// The state-independent inputs [`wrap_rhs_with_forcings`] adds to the model's `du` at
+/// time `t`: zero-order windows, infusions and the prepared absorption input rates, in
+/// that order.
+#[allow(clippy::too_many_arguments)]
+fn forcing_adder<'a>(
+    ode: &'a OdeSpec,
+    doses: &'a [DoseEvent],
+    dose_lagtimes: &'a [f64],
+    dose_f_bio: &'a [f64],
+    reset_floor: f64,
+    t_seg: f64,
+    prepared: &'a PreparedForcings,
+    infusions: InfusionInput,
+    zero_order: &'a [(usize, f64)],
+) -> impl Fn(f64, &mut [f64]) + 'a {
     // Built once per closure: `t_seg` and `reset_floor` are fixed for the segment it
     // integrates.
     let gate = ResetGate::at_segment(doses, reset_floor, t_seg);
-    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-        (ode.rhs)(y, p, t, dy);
+    move |t: f64, dy: &mut [f64]| {
         // Zero-order absorption (#504): a constant rate per *segment*, injected the
         // same way as a spanning infusion (independent of the infusion gating
         // shape). The caller passes only the windows that fully contain this
@@ -3659,7 +3738,7 @@ fn integrate_segment(
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
-    let wrapped_rhs = wrap_rhs_with_forcings(
+    let force = forcing_adder(
         ode,
         &subject.doses,
         dose_lagtimes,
@@ -3670,6 +3749,9 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
+    let wrapped_rhs = forced(ode, &force);
+    let columns = forced_columns(ode, &force);
+    let _fd_columns = register_columns(&wrapped_rhs, &columns);
     let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
@@ -7123,7 +7205,7 @@ pub fn ode_predictions_event_driven(
             // time-varying covariates).
             let zero_order =
                 active_zero_order_inputs(&zo_windows, &subject.doses, cur_t, t_event, reset_floor);
-            let wrapped_rhs = wrap_rhs_with_forcings(
+            let force = forcing_adder(
                 ode,
                 &subject.doses,
                 &dose_lagtimes,
@@ -7134,6 +7216,9 @@ pub fn ode_predictions_event_driven(
                 InfusionInput::Spanning(active),
                 &zero_order,
             );
+            let wrapped_rhs = forced(ode, &force);
+            let columns = forced_columns(ode, &force);
+            let _fd_columns = register_columns(&wrapped_rhs, &columns);
             let saveat = vec![t_event];
             let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
@@ -7694,7 +7779,7 @@ pub fn ode_predictions_with_states(
         );
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -7705,6 +7790,9 @@ pub fn ode_predictions_with_states(
             InfusionInput::Gated(gated),
             &zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8301,7 +8389,7 @@ pub(crate) fn ode_dense_solve_states_reading(
 
         let seg_saveat = segment_saveat(saveat, t_start, t_end);
 
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -8312,6 +8400,9 @@ pub(crate) fn ode_dense_solve_states_reading(
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8478,7 +8569,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &mut applied,
         );
 
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -8489,6 +8580,9 @@ pub(crate) fn ode_solve_until_chz_threshold(
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.

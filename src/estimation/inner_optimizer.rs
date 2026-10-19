@@ -4339,6 +4339,7 @@ fn lbfgs_core(
             };
         }
 
+        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
         let (alpha, f_new) = backtracking_line_search(
             obj,
             x,
@@ -4347,7 +4348,12 @@ fn lbfgs_core(
             f_cur,
             &mut line_search_point,
             short_line_search,
+            floor,
         );
+        // At the noise floor an unverifiable step is convergence, not a failure.
+        if alpha == 0.0 && floor {
+            return true;
+        }
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -4488,6 +4494,7 @@ fn dense_bfgs_core(
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
+            let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
             let (alpha, f_new) = backtracking_line_search(
                 obj,
                 x,
@@ -4496,7 +4503,12 @@ fn dense_bfgs_core(
                 f_cur,
                 &mut line_search_point,
                 short_line_search,
+                floor,
             );
+            // At the noise floor an unverifiable step is convergence, not a failure.
+            if alpha == 0.0 && floor {
+                return true;
+            }
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -4515,6 +4527,7 @@ fn dense_bfgs_core(
             continue;
         }
 
+        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
         let (alpha, f_new) = backtracking_line_search(
             obj,
             x,
@@ -4523,7 +4536,12 @@ fn dense_bfgs_core(
             f_cur,
             &mut line_search_point,
             short_line_search,
+            floor,
         );
+        // At the noise floor an unverifiable step is convergence, not a failure.
+        if alpha == 0.0 && floor {
+            return true;
+        }
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -4824,6 +4842,25 @@ fn iov_prior_maha(
     q
 }
 
+/// Whether the step along `d` cannot improve the objective by more than the flat-step
+/// threshold of [`objective_stalled`] (`INNER_FTOL_REL·(1+|f|)`): `|∇f·d|` bounds the decrease
+/// the quasi-Newton model predicts at `α = 1` (it is twice that, `½|∇f·d|`), so any step the
+/// line search could find is flat by definition. On an ODE objective (`enable_stall`) its
+/// solver-noise floor sits above that threshold, and the search spent 11–14 solves backtracking
+/// to accept such a step — three times per solve before the stall stop fired (#2093). There the
+/// line search tries the full step alone, and a rejected one ends the solve as converged
+/// at the noise floor; an accepted one is kept (it often is: the noise can favour it). An
+/// exact objective never takes this exit. Callers pass `enable_stall && !gnorm_improving`:
+/// the stall stop's own plateau guard, so a solve whose gradient is still falling keeps
+/// descending even when each step is flat.
+fn step_below_noise_floor(enable_stall: bool, d: &[f64], g: &[f64], f: f64) -> bool {
+    if !enable_stall {
+        return false;
+    }
+    let dg: f64 = d.iter().zip(g).map(|(di, gi)| di * gi).sum();
+    dg < 0.0 && -dg <= INNER_FTOL_REL * (1.0 + f.abs())
+}
+
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
 /// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
 /// L-BFGS inner drivers so the two paths cannot drift apart on convergence (#555).
@@ -4858,6 +4895,9 @@ fn backtracking_line_search(
     f0: f64,
     x_new: &mut [f64],
     short_line_search: bool,
+    // `step_below_noise_floor`: try the full step only; there is nothing a backtrack
+    // could verify.
+    single_trial: bool,
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
@@ -4871,7 +4911,12 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    for _ in 0..inner_line_search_trials(short_line_search) {
+    let trials = if single_trial {
+        1
+    } else {
+        inner_line_search_trials(short_line_search)
+    };
+    for _ in 0..trials {
         for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
         }

@@ -510,6 +510,69 @@ struct RosWorkspace<T> {
     u_new: Vec<T>,
     /// Embedded error estimate for the proposed step.
     err: Vec<T>,
+    /// Buffers of [`Self::registered_columns`].
+    fd_batch: FdBatch,
+}
+
+#[derive(Default)]
+struct FdBatch {
+    u: Vec<f64>,
+    p: Vec<f64>,
+    cols: Vec<(usize, f64)>,
+    out: Vec<f64>,
+}
+
+/// A batched forward-difference column evaluator for one `f64` right-hand side:
+/// `f(u + δ_c·e_{j_c})` for each `(j_c, δ_c)`, into `out[c·n .. (c+1)·n]`; `false` declines.
+pub(crate) type FdColumns<'a> =
+    dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a;
+
+type FdColumnsEntry = (*const (), *const FdColumns<'static>);
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the scalar column loop even for a registered right-hand side.
+    pub(crate) static FD_COLUMNS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test counter: Jacobians filled from a registered batched evaluator.
+    pub(crate) static FD_COLUMNS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// The `(rhs address, column evaluator)` an [`FdColumnsGuard`] registered.
+    static FD_COLUMNS: std::cell::Cell<Option<FdColumnsEntry>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Registers `columns` as the batched Jacobian evaluator of exactly the closure `rhs` for the
+/// guard's lifetime, on this thread: a Rosenbrock step whose `rhs` *is* that closure (same
+/// address) fills `J` from it ([`RosWorkspace::registered_columns`]); every other right-hand
+/// side, a dual one included, keeps the scalar loop. Restores the previous registration on
+/// drop, so nested integrations of other systems are unaffected.
+pub(crate) struct FdColumnsGuard {
+    prev: Option<FdColumnsEntry>,
+}
+
+impl FdColumnsGuard {
+    pub(crate) fn register<'a, F: Fn(&[f64], &[f64], f64, &mut [f64])>(
+        rhs: &'a F,
+        columns: Option<&'a FdColumns<'a>>,
+    ) -> Self {
+        let prev = FD_COLUMNS.with(|c| c.get());
+        if let Some(columns) = columns {
+            // SAFETY: lifetime erasure only; the pointer is dereferenced solely while this
+            // guard is alive (see `registered_columns`), and the guard borrows `columns`.
+            let columns: *const FdColumns<'static> =
+                unsafe { std::mem::transmute(columns as *const FdColumns<'a>) };
+            FD_COLUMNS.with(|c| c.set(Some((rhs as *const F as *const (), columns))));
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for FdColumnsGuard {
+    fn drop(&mut self) {
+        FD_COLUMNS.with(|c| c.set(self.prev));
+    }
 }
 
 /// Why a step attempt could not be scored.
@@ -538,6 +601,7 @@ impl<T: PkNum> RosWorkspace<T> {
             rhs_tmp: vec![zero; n],
             u_new: vec![zero; n],
             err: vec![zero; n],
+            fd_batch: FdBatch::default(),
         }
     }
 
@@ -565,6 +629,27 @@ impl<T: PkNum> RosWorkspace<T> {
         let n = self.n;
         rhs(u, params, t, &mut self.f0);
 
+        if !self.registered_columns(rhs, u, params, t) {
+            self.scalar_columns(rhs, u, params, t);
+        }
+
+        let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
+        rhs(u, params, t + delt, &mut self.f_tmp);
+        let inv = T::from_f64(1.0 / delt);
+        for i in 0..n {
+            self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
+        }
+    }
+
+    /// The `n` forward-difference columns of `J`, one right-hand-side call each.
+    fn scalar_columns(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+    ) {
+        let n = self.n;
         for j in 0..n {
             let delt = (f64::EPSILON * u[j].val().abs().max(FD_FLOOR)).sqrt();
             self.u_tmp.copy_from_slice(u);
@@ -575,13 +660,56 @@ impl<T: PkNum> RosWorkspace<T> {
                 self.jac[i * n + j] = (self.f_tmp[i] - self.f0[i]) * inv;
             }
         }
+    }
 
-        let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
-        rhs(u, params, t + delt, &mut self.f_tmp);
-        let inv = T::from_f64(1.0 / delt);
-        for i in 0..n {
-            self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
+    /// [`Self::scalar_columns`] in one batched pass, when `rhs` is the closure an
+    /// [`FdColumnsGuard`] registered for this thread. The registered evaluator performs each
+    /// column's scalar operations exactly, so `J` is bit-identical to the scalar loop's.
+    /// `false` (nothing written) for any other `rhs`, and whenever the evaluator declines.
+    fn registered_columns(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+    ) -> bool {
+        #[cfg(test)]
+        if FD_COLUMNS_OFF.with(|c| c.get()) {
+            return false;
         }
+        let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|(key, f)| {
+            (key == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()).then_some(f)
+        }) else {
+            return false;
+        };
+        // SAFETY: the guard that stored `columns` outlives every integration it scopes (it is
+        // dropped only after the solve returns) and restores the previous entry on drop.
+        let columns = unsafe { &*columns };
+        let n = self.n;
+        let b = &mut self.fd_batch;
+        b.u.clear();
+        b.u.extend(u.iter().map(|x| x.val()));
+        b.p.clear();
+        b.p.extend(params.iter().map(|x| x.val()));
+        b.cols.clear();
+        b.cols.extend(
+            b.u.iter()
+                .enumerate()
+                .map(|(j, x)| (j, (f64::EPSILON * x.abs().max(FD_FLOOR)).sqrt())),
+        );
+        b.out.resize(n * n, 0.0);
+        if !columns(&b.u, &b.p, t, &b.cols, &mut b.out) {
+            return false;
+        }
+        #[cfg(test)]
+        FD_COLUMNS_HITS.with(|c| c.set(c.get() + 1));
+        for (j, &(_, delt)) in b.cols.iter().enumerate() {
+            let inv = T::from_f64(1.0 / delt);
+            for i in 0..n {
+                self.jac[i * n + j] = (T::from_f64(b.out[j * n + i]) - self.f0[i]) * inv;
+            }
+        }
+        true
     }
 
     /// `W = I/(γh) − J`, factored in place over the `J` [`refresh_jacobian`] left behind.

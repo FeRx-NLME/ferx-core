@@ -14694,7 +14694,7 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
     );
-    let rhs_program = OdeRhsProgram {
+    let mut rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
         state_count,
@@ -14715,10 +14715,17 @@ fn build_ode_spec(
         init_program,
         hoist: rhs_hoist,
         binding,
+        columns: None,
     };
 
-    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
-        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+    // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
+    // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
+    let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
+        Some(h) => &h.stmts,
+        None => &stmts_owned,
+    });
+    let rhs_eval = std::sync::Arc::new(
+        move |u: &[f64], params: &[f64], t: f64, sink: RhsSink<'_>| -> bool {
             // The RHS always reserves two trailing slots for dose-time anchors:
             // TAFD at MAX_PK_PARAMS and TAD at MAX_PK_PARAMS + 1. Passing a bare
             // PkParams::values array (which ends at MAX_PK_PARAMS) turns either
@@ -14815,16 +14822,6 @@ fn build_ode_spec(
                     }
                 }
 
-                // Reset du so a state without a firing d/dt this iteration
-                // (e.g. inside an untaken if-branch) gets 0.0 rather than
-                // stale memory. The lean binding proved every path writes all
-                // `state_count` of them; a `du` of another length keeps the reset.
-                if binding.zero || du.len() != state_count {
-                    for slot in du.iter_mut() {
-                        *slot = 0.0;
-                    }
-                }
-
                 let empty_theta: [f64; 0] = [];
                 let empty_eta: [f64; 0] = [];
                 let empty_cov: [f64; 0] = [];
@@ -14849,18 +14846,58 @@ fn build_ode_spec(
                     }
                     None => &stmts_owned,
                 };
-                eval_statements_indexed_with_stack(
-                    run_stmts,
-                    &empty_theta,
-                    &empty_eta,
-                    &empty_cov,
-                    &mut scratch.rhs_vars,
-                    Some(du),
-                    &empty_nn_outputs,
-                    &mut scratch.bc_stack,
-                );
-            });
-        });
+                match sink {
+                    RhsSink::Value(du) => {
+                        // Reset du so a state without a firing d/dt this iteration
+                        // (e.g. inside an untaken if-branch) gets 0.0 rather than
+                        // stale memory. The lean binding proved every path writes all
+                        // `state_count` of them; a `du` of another length keeps the reset.
+                        if binding.zero || du.len() != state_count {
+                            for slot in du.iter_mut() {
+                                *slot = 0.0;
+                            }
+                        }
+                        eval_statements_indexed_with_stack(
+                            run_stmts,
+                            &empty_theta,
+                            &empty_eta,
+                            &empty_cov,
+                            &mut scratch.rhs_vars,
+                            Some(du),
+                            &empty_nn_outputs,
+                            &mut scratch.bc_stack,
+                        );
+                        true
+                    }
+                    RhsSink::Columns { cols, out } => {
+                        rhs_lanes_ok
+                            && eval_rhs_columns(
+                                run_stmts,
+                                &scratch.rhs_vars,
+                                &u[..copy_n],
+                                state_count,
+                                cols,
+                                out,
+                            )
+                    }
+                }
+            })
+        },
+    );
+    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> = {
+        let e = rhs_eval.clone();
+        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+            e(u, params, t, RhsSink::Value(du));
+        })
+    };
+    let rhs_columns: Option<RhsColumnsFn> = rhs_lanes_ok.then(|| -> RhsColumnsFn {
+        Box::new(
+            move |u: &[f64], params: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
+                rhs_eval(u, params, t, RhsSink::Columns { cols, out })
+            },
+        )
+    });
+    rhs_program.columns = rhs_columns;
 
     // Build the init_fn closure from the extracted `init(state) = expr`
     // directives. It mirrors the RHS variable binding: each individual parameter
@@ -26373,6 +26410,77 @@ fn eval_bytecode(
     nn_outputs: &[Vec<f64>],
     stack: &mut Vec<f64>,
 ) -> f64 {
+    // One lane cannot disagree with itself at a jump, so the `None` arm is unreachable.
+    eval_bytecode_lanes(bc, theta, eta, covariates, vars, nn_outputs, stack).unwrap_or(f64::NAN)
+}
+
+/// A value of the `f64` bytecode VM: one `f64`, or `K` of them evaluated in lockstep
+/// ([`eval_bytecode_lanes`]). Every operation applies the scalar `f64` expression lane by lane,
+/// so a lane's result is bit-identical to the scalar evaluation of the same inputs.
+pub(crate) trait Lane: Copy {
+    /// Lane count.
+    const K: usize;
+    fn splat(x: f64) -> Self;
+    fn map(self, f: impl Fn(f64) -> f64) -> Self;
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self;
+    /// `Some(b)` when `f(lane)` is `b` in every lane, `None` when the lanes disagree.
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool>;
+}
+
+impl Lane for f64 {
+    const K: usize = 1;
+    #[inline(always)]
+    fn splat(x: f64) -> Self {
+        x
+    }
+    #[inline(always)]
+    fn map(self, f: impl Fn(f64) -> f64) -> Self {
+        f(self)
+    }
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self {
+        f(self, o)
+    }
+    #[inline(always)]
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool> {
+        Some(f(self))
+    }
+}
+
+impl<const N: usize> Lane for [f64; N] {
+    const K: usize = N;
+    #[inline(always)]
+    fn splat(x: f64) -> Self {
+        [x; N]
+    }
+    #[inline(always)]
+    fn map(self, f: impl Fn(f64) -> f64) -> Self {
+        self.map(f)
+    }
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self {
+        std::array::from_fn(|i| f(self[i], o[i]))
+    }
+    #[inline(always)]
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool> {
+        let first = f(self[0]);
+        self[1..].iter().all(|&x| f(x) == first).then_some(first)
+    }
+}
+
+/// [`eval_bytecode`] over [`Lane`] values: `vars` (the only per-lane input) carries one value
+/// per lane, everything else is shared. `None` when the lanes take different branches at a
+/// jump — the caller evaluates those lanes one at a time instead.
+#[inline]
+fn eval_bytecode_lanes<L: Lane>(
+    bc: &Bytecode,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[L],
+    nn_outputs: &[Vec<f64>],
+    stack: &mut Vec<L>,
+) -> Option<L> {
     stack.clear();
     stack.reserve(bc.max_stack);
     let mut pc: usize = 0;
@@ -26405,16 +26513,30 @@ fn eval_bytecode(
             unsafe { *buf.add(len) }
         }};
     }
+    macro_rules! unary {
+        ($f:expr) => {{
+            let v = pop!();
+            push!(v.map($f));
+        }};
+    }
+    macro_rules! binary {
+        ($f:expr) => {{
+            let b = pop!();
+            let a = pop!();
+            push!(a.zip(b, $f));
+        }};
+    }
+    let bool01 = |c: bool| if c { 1.0 } else { 0.0 };
 
     while pc < ops.len() {
         match ops[pc] {
-            Op::PushConst(i) => push!(consts[i as usize]),
-            Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushTime => push!(current_model_time()),
-            Op::PushMixNum => push!(current_mixture_class() as f64),
-            Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushCov(i) => push!(covariates.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushConst(i) => push!(L::splat(consts[i as usize])),
+            Op::PushTheta(i) => push!(L::splat(theta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushEta(i) => push!(L::splat(eta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushTime => push!(L::splat(current_model_time())),
+            Op::PushMixNum => push!(L::splat(current_mixture_class() as f64)),
+            Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(L::splat(0.0))),
+            Op::PushCov(i) => push!(L::splat(covariates.get(i as usize).copied().unwrap_or(0.0))),
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
@@ -26427,154 +26549,60 @@ fn eval_bytecode(
                         );
                         0.0
                     });
-                push!(v);
+                push!(L::splat(v));
             }
             Op::PushThetaGather(g) => {
                 let raw = pop!();
                 let v = match bc.gathers.get(g as usize) {
-                    Some(spec) => eval_gather(spec, theta, raw),
+                    Some(spec) => raw.map(|r| eval_gather(spec, theta, r)),
                     None => {
                         debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
-                        f64::NAN
+                        L::splat(f64::NAN)
                     }
                 };
                 push!(v);
             }
-            Op::Add => {
-                let b = pop!();
-                let a = pop!();
-                push!(a + b);
-            }
-            Op::Sub => {
-                let b = pop!();
-                let a = pop!();
-                push!(a - b);
-            }
-            Op::RSub => {
-                let b = pop!();
-                let a = pop!();
-                push!(b - a);
-            }
-            Op::Mul => {
-                let b = pop!();
-                let a = pop!();
-                push!(a * b);
-            }
-            Op::Div => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.abs() < 1e-30 { 0.0 } else { a / b });
-            }
-            Op::Pow => {
-                let e = pop!();
-                let b = pop!();
-                push!(b.powf(e));
-            }
-            Op::Mod => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.abs() < 1e-30 {
-                    0.0
-                } else {
-                    a.rem_euclid(b)
-                });
-            }
-            Op::Exp => {
-                let v = pop!();
-                push!(v.exp());
-            }
-            Op::Ln => {
-                let v = pop!();
-                let v = if v >= 1e-30 { v } else { 1e-30 };
-                push!(v.ln());
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                let v = if v >= 0.0 { v } else { 0.0 };
-                push!(v.sqrt());
-            }
-            Op::Abs => {
-                let v = pop!();
-                push!(v.abs());
-            }
-            Op::Floor => {
-                let v = pop!();
-                push!(v.floor());
-            }
-            Op::Ceil => {
-                let v = pop!();
-                push!(v.ceil());
-            }
-            Op::Round => {
-                let v = pop!();
-                push!(v.round());
-            }
-            Op::InvLogit => {
-                let v = pop!();
-                let r = if v >= 0.0 {
-                    1.0 / (1.0 + (-v).exp())
-                } else {
-                    let e = v.exp();
-                    e / (1.0 + e)
-                };
-                push!(r);
-            }
-            Op::Logit => {
-                let v = pop!();
+            Op::Add => binary!(|a, b| a + b),
+            Op::Sub => binary!(|a, b| a - b),
+            Op::RSub => binary!(|a, b| b - a),
+            Op::Mul => binary!(|a, b| a * b),
+            Op::Div => binary!(|a, b| if b.abs() < 1e-30 { 0.0 } else { a / b }),
+            Op::Pow => binary!(|b, e| b.powf(e)),
+            Op::Mod => binary!(|a, b| if b.abs() < 1e-30 {
+                0.0
+            } else {
+                a.rem_euclid(b)
+            }),
+            Op::Exp => unary!(|v| v.exp()),
+            Op::Ln => unary!(|v| (if v >= 1e-30 { v } else { 1e-30 }).ln()),
+            Op::Sqrt => unary!(|v| (if v >= 0.0 { v } else { 0.0 }).sqrt()),
+            Op::Abs => unary!(|v| v.abs()),
+            Op::Floor => unary!(|v| v.floor()),
+            Op::Ceil => unary!(|v| v.ceil()),
+            Op::Round => unary!(|v| v.round()),
+            Op::InvLogit => unary!(|v| if v >= 0.0 {
+                1.0 / (1.0 + (-v).exp())
+            } else {
+                let e = v.exp();
+                e / (1.0 + e)
+            }),
+            Op::Logit => unary!(|v| {
                 let clamped = v.clamp(1e-15, 1.0 - 1e-15);
-                push!((clamped / (1.0 - clamped)).ln());
-            }
-            Op::CmpLt => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l < r { 1.0 } else { 0.0 });
-            }
-            Op::CmpLe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l <= r { 1.0 } else { 0.0 });
-            }
-            Op::CmpGt => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l > r { 1.0 } else { 0.0 });
-            }
-            Op::CmpGe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l >= r { 1.0 } else { 0.0 });
-            }
-            Op::CmpEq => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l == r { 1.0 } else { 0.0 });
-            }
-            Op::CmpNe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l != r { 1.0 } else { 0.0 });
-            }
-            Op::LogicAnd => {
-                let b = pop!();
-                let a = pop!();
-                push!(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::LogicOr => {
-                let b = pop!();
-                let a = pop!();
-                push!(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::LogicNot => {
-                let v = pop!();
-                push!(if v == 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::IsPresent => {
-                let v = pop!();
-                push!(if v.is_nan() { 0.0 } else { 1.0 });
-            }
+                (clamped / (1.0 - clamped)).ln()
+            }),
+            Op::CmpLt => binary!(|l, r| bool01(l < r)),
+            Op::CmpLe => binary!(|l, r| bool01(l <= r)),
+            Op::CmpGt => binary!(|l, r| bool01(l > r)),
+            Op::CmpGe => binary!(|l, r| bool01(l >= r)),
+            Op::CmpEq => binary!(|l, r| bool01(l == r)),
+            Op::CmpNe => binary!(|l, r| bool01(l != r)),
+            Op::LogicAnd => binary!(|a, b| bool01(a != 0.0 && b != 0.0)),
+            Op::LogicOr => binary!(|a, b| bool01(a != 0.0 || b != 0.0)),
+            Op::LogicNot => unary!(|v| bool01(v == 0.0)),
+            Op::IsPresent => unary!(|v| bool01(!v.is_nan())),
             Op::JumpIfFalse(target) => {
                 let v = pop!();
-                if v == 0.0 {
+                if v.all_same(|x| x == 0.0)? {
                     pc = target as usize;
                     continue;
                 }
@@ -26595,11 +26623,11 @@ fn eval_bytecode(
         len == 1,
         "eval_bytecode: bytecode finished at stack depth {len}, expected 1",
     );
-    if len > 0 {
+    Some(if len > 0 {
         unsafe { *buf.add(len - 1) }
     } else {
-        0.0
-    }
+        L::splat(0.0)
+    })
 }
 
 impl Op {
@@ -27885,6 +27913,100 @@ fn rhs_lift_eval_g<T: crate::sens::num::vm::VmNum>(
     eval_bytecode_g::<T>(bc, &[], &[], &[], vars, &[], stack)
 }
 
+/// `f(u + δ_c·e_{j_c})` for each `(j_c, δ_c)` in `cols`, written to `out[c·n .. (c+1)·n]`:
+/// the columns of a forward-difference Jacobian, bit-identical to `n` scalar RHS calls.
+/// `false` when the lanes could not be evaluated together (they disagree at a branch).
+pub(crate) type RhsColumnsFn =
+    Box<dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + Send + Sync>;
+
+/// What the shared ODE RHS binding feeds: the scalar `du`, or batched FD columns.
+enum RhsSink<'a> {
+    Value(&'a mut [f64]),
+    Columns {
+        cols: &'a [(usize, f64)],
+        out: &'a mut [f64],
+    },
+}
+
+/// Lanes per pass of [`eval_rhs_columns`].
+const RHS_LANES: usize = 8;
+
+thread_local! {
+    /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
+    static RHS_LANE_SCRATCH: std::cell::RefCell<(
+        Vec<[f64; RHS_LANES]>,
+        Vec<[f64; RHS_LANES]>,
+        Vec<[f64; RHS_LANES]>,
+    )> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
+/// Whether every statement is a straight-line bytecode assignment, the shape
+/// [`eval_rhs_columns`] runs on lanes (an `If` statement's branch is per lane).
+fn stmts_lane_evaluable(stmts: &[Statement]) -> bool {
+    stmts
+        .iter()
+        .all(|s| matches!(s, Statement::AssignBc(..) | Statement::DiffEqBc(..)))
+}
+
+/// [`RhsColumnsFn`] over a bound RHS: `vars` is the scalar binding at the base state `u`
+/// (parameters, time slots and lifted values included), and each lane replaces one state
+/// slot by `u_j + δ` — the value a scalar call on the perturbed state binds there — and
+/// runs `stmts`, so every lane performs the scalar evaluation's operations exactly.
+fn eval_rhs_columns(
+    stmts: &[Statement],
+    vars: &[f64],
+    u: &[f64],
+    n: usize,
+    cols: &[(usize, f64)],
+    out: &mut [f64],
+) -> bool {
+    if out.len() < cols.len() * n || cols.iter().any(|&(j, _)| j >= u.len()) {
+        return false;
+    }
+    RHS_LANE_SCRATCH.with(|cell| {
+        let (lv, ldu, stack) = &mut *cell.borrow_mut();
+        for (chunk_i, chunk) in cols.chunks(RHS_LANES).enumerate() {
+            lv.clear();
+            lv.extend(vars.iter().map(|&v| [v; RHS_LANES]));
+            // Unused lanes repeat the chunk's first column.
+            for l in 0..RHS_LANES {
+                let (j, d) = chunk[l.min(chunk.len() - 1)];
+                lv[j][l] = u[j] + d;
+            }
+            ldu.clear();
+            ldu.resize(n, [0.0; RHS_LANES]);
+            for st in stmts {
+                match st {
+                    Statement::AssignBc(idx, bc) => {
+                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
+                            return false;
+                        };
+                        if let Some(slot) = lv.get_mut(*idx) {
+                            *slot = v;
+                        }
+                    }
+                    Statement::DiffEqBc(i, bc) => {
+                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
+                            return false;
+                        };
+                        if let Some(slot) = ldu.get_mut(*i) {
+                            *slot = v;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            for (l, _) in chunk.iter().enumerate() {
+                let c = chunk_i * RHS_LANES + l;
+                for i in 0..n {
+                    out[c * n + i] = ldu[i][l];
+                }
+            }
+        }
+        true
+    })
+}
+
 pub struct OdeRhsProgram {
     stmts: Vec<Statement>,
     n_vars_total: usize,
@@ -27934,6 +28056,9 @@ pub struct OdeRhsProgram {
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
     hoist: Option<RhsHoist>,
+    /// The f64 RHS at many single-state perturbations in one lane pass
+    /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
+    columns: Option<RhsColumnsFn>,
     /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
     /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
@@ -27968,6 +28093,11 @@ pub struct OdeRhsProgram {
 }
 
 impl OdeRhsProgram {
+    /// The batched FD-column evaluator of the f64 RHS, when the program runs on lanes.
+    pub(crate) fn rhs_columns(&self) -> Option<&RhsColumnsFn> {
+        self.columns.as_ref()
+    }
+
     /// The initial state `init(...)` sets, evaluated over `T` from the PK-parameter
     /// vector `params` (states other than the seeded ones, and every state at the origin,
     /// read 0): the exact counterpart of `OdeSpec::init_fn` on a dual walk. `None` when

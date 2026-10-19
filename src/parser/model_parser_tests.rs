@@ -33803,3 +33803,48 @@ fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
         );
     }
 }
+
+/// `eval_bytecode_lanes` over `[f64; 4]` is four scalar evaluations: each lane's bits equal
+/// `eval_bytecode` on that lane's inputs (guards, powers, comparisons and a branch the lanes
+/// agree on), and lanes that disagree at a branch decline rather than follow lane 0.
+#[test]
+fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
+    let e = binop(
+        BinOp::Add,
+        binop(
+            BinOp::Div,
+            power_expr(varidx(0), lit(1.7)),
+            binop(BinOp::Sub, varidx(1), lit(0.3)),
+        ),
+        cond(
+            cmp(varidx(1), CmpOp::Gt, lit(-100.0)),
+            unary("exp", binop(BinOp::Mul, varidx(0), lit(-0.4))),
+            unary("ln", varidx(1)),
+        ),
+    );
+    let bc = compile_bytecode(&e);
+    let lanes = [
+        [1.3, 0.3],
+        [2.0, 5.0],
+        [0.0, -1.0],
+        [7.5, 0.30000000000000004],
+    ];
+    let vars: Vec<[f64; 4]> = (0..2)
+        .map(|v| std::array::from_fn(|l| lanes[l][v]))
+        .collect();
+    let mut stack = Vec::new();
+    let got = eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).expect("agree");
+    for (l, inputs) in lanes.iter().enumerate() {
+        let want = eval_bytecode(&bc, &[], &[], &[], inputs, &[], &mut Vec::new());
+        assert_eq!(
+            got[l].to_bits(),
+            want.to_bits(),
+            "lane {l}: {} vs {want}",
+            got[l]
+        );
+    }
+    // A branch the lanes take differently: lane 2's `v1` falls below the threshold.
+    let split = cond(cmp(varidx(1), CmpOp::Gt, lit(0.0)), varidx(0), varidx(1));
+    let bc = compile_bytecode(&split);
+    assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
+}
