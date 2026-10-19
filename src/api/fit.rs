@@ -2913,7 +2913,7 @@ fn fit_inner(
     // families, and getting it wrong demotes a converged VI fit that was finished
     // the recommended way (`methods = vi, imp` + `imp_eval_only`).
     let objective_stage = objective_stage.unwrap_or(final_method);
-    if let Some((msg, entry)) =
+    if let Some((msg, mut entry)) =
         nonfinite_objective_warning(&mut converged, ofv, objective_stage, options)
     {
         // The estimator that produced this objective has already pushed the same
@@ -2928,6 +2928,10 @@ fn fit_inner(
         // *different* stage's non-finite objective in the same chain is a
         // different string and survives.
         warnings.retain(|w| !w.ends_with(msg.as_str()));
+        // Only this copy sees the per-subject results, so only it names the
+        // subjects (#2038) — after the de-duplication, which matches the estimator's
+        // copy on the sentence both share.
+        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population);
         warnings.push(msg);
         native_warnings.push(entry);
     }

@@ -1923,18 +1923,33 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 /// * `±inf` — an overflow rather than an indeterminate form.
 /// * the **sentinel** — finite, and the reason `is_finite()` alone is not the
 ///   gate. The inner objective clamps a blown-up individual contribution to a
-///   `~1e20` rail, the outer objective doubles it, and an optimizer can report
-///   `Success` sitting on that plateau because every direction looks flat. The
-///   fit was *repelled*, not solved. See [`DIVERGENCE_OFV`].
+///   [`SUBJECT_SENTINEL_NLL`] rail, the outer objective doubles it, and an
+///   optimizer can report `Success` sitting on that plateau because every
+///   direction looks flat. The fit was *repelled*, not solved. See
+///   [`DIVERGENCE_OFV`].
+/// * **too large to be a fit** — finite, at or above [`DIVERGENCE_OFV`] but below
+///   the sentinel, so no subject was clamped (#2038). A subject's own objective is
+///   that large on its own terms: measured, a proportional error on a prediction of
+///   0 bottoms out at the residual-SD floor and scores `4.6e14`. Calling that the
+///   sentinel sent the user looking for a clamp that never happened.
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
     } else if ofv.is_infinite() {
         "infinite"
-    } else {
+    } else if ofv >= SUBJECT_SENTINEL_NLL {
         "at the divergence sentinel"
+    } else {
+        "too large to be a fit"
     }
 }
+
+/// The value the per-subject objective is clamped to when it is not finite — the
+/// `1e20` written as a literal at each guard in `crate::stats::likelihood`. A
+/// population objective at or above it therefore holds at least one clamped subject
+/// (one subject's `2 · 1e20` already exceeds it), and one below it holds none, which
+/// is the line [`nonfinite_objective_reason`] draws (#2038).
+pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is
