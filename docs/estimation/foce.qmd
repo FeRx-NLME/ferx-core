@@ -245,7 +245,6 @@ above.
 
 | Feature / combination | Engine | Loops on FD | Why |
 |---|---|---|---|
-| η-dependent `obs_scale` × LTBS | ODE | both | the recorder applies the expression quotient after the walk, which cannot follow production's scale-then-log order |
 | `input_rate` forcing + SDE `[diffusion]` | both | both | stochastic dynamics have no recorder |
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
 | SS + non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) | ODE | both | a non-autonomous field breaks the steady-state cycle recurrence |

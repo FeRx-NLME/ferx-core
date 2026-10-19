@@ -156,7 +156,17 @@ fn probe_rhs_f64(spec: &OdeSpec, u: &[f64], p: &[f64], t: f64) -> Option<Vec<f64
     // It is settled statically instead, in `mr_scope`, which declines any RHS
     // that reads model time in any spelling before identification is attempted —
     // so no `TAD`-reading program ever reaches this probe, and the pin is inert.
-    prog.eval_rhs_g::<f64>(u, p, t, t, 0.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        u,
+        p,
+        t,
+        t,
+        0.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     Some(du)
 }
 
@@ -381,7 +391,17 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
 
     let probe = |u: &[T], vars: &mut Vec<T>, stack: &mut Vec<T>| -> Vec<T> {
         let mut du = vec![T::from_f64(0.0); n];
-        prog.eval_rhs_g::<T>(u, p, 0.0, 0.0, T::from_f64(0.0), &mut du, vars, stack);
+        prog.eval_rhs_g::<T>(
+            u,
+            p,
+            0.0,
+            0.0,
+            T::from_f64(0.0),
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut du,
+            vars,
+            stack,
+        );
         du
     };
 

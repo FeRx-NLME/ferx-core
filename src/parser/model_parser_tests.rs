@@ -31296,7 +31296,17 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     for (k, (p, u, t)) in calls.iter().enumerate() {
         let params = hoist_params::<f64>(prog, &p[..]);
         let mut want = [0.0; 2];
-        plain.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut want, &mut vars_p, &mut stack_p);
+        plain.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut want,
+            &mut vars_p,
+            &mut stack_p,
+        );
         let mut got_g = [0.0; 2];
         prog.eval_rhs_g::<f64>(
             u,
@@ -31304,6 +31314,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             *t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got_g,
             &mut vars_h,
             &mut stack_h,
@@ -31357,6 +31368,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut vars_p,
             &mut stack_p,
@@ -31368,6 +31380,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got,
             &mut vars_h,
             &mut stack_h,
@@ -31417,6 +31430,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         0.5,
         0.5,
         M::constant(0.5),
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut got,
         &mut vars_m,
         &mut stack_m,
@@ -31433,6 +31447,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         0.5,
         0.5,
         M::constant(0.5),
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut want,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -31471,6 +31486,7 @@ fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
                 1.0,
                 1.0,
                 1.0,
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut want,
                 &mut Vec::new(),
                 &mut Vec::new(),
@@ -31503,7 +31519,17 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
     let mut vars: Vec<f64> = Vec::new();
     let mut stack: Vec<f64> = Vec::new();
     let mut du = [0.0];
-    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        1.0,
+        1.0,
+        1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     let clean = du[0];
     // The maximal parameter-only subtree of `−(CL/V)·central` is `0 − CL/V`.
     assert!(
@@ -31514,7 +31540,17 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
 
     // Same inputs: a hit, so the poisoned value is what the RHS reads.
     vars[slot] = 1.0e6;
-    prog.eval_rhs_g::<f64>(&u, &p1, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        2.0,
+        2.0,
+        2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(
         hoist_bits_eq(du[0], 1.0e6 * 50.0),
         "hit did not reuse the cache: {}",
@@ -31523,14 +31559,34 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
 
     // A moved parameter: a miss, so the poison is replaced by the fresh value.
     vars[slot] = 1.0e6;
-    prog.eval_rhs_g::<f64>(&u, &p2, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p2,
+        2.0,
+        2.0,
+        2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(
         hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
         "miss did not recompute: {}",
         du[0]
     );
     // And back: a miss again, giving the first call's value.
-    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        1.0,
+        1.0,
+        1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(hoist_bits_eq(du[0], clean));
 }
 
@@ -31577,6 +31633,7 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
         1.0,
         1.0,
         1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut want,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -31700,13 +31757,22 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
             1.0,
             1.0,
             1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0];
         prog.eval_rhs_g::<f64>(
-            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
         );
         let mut got_c = [0.0];
         (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got_c);
@@ -31804,12 +31870,23 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             *t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = vec![0.0; n_states];
-        prog.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut got_g, &mut vars, &mut stack);
+        prog.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
+        );
         let mut got_c = vec![0.0; n_states];
         (model.ode_spec.as_ref().unwrap().rhs)(u, &params, *t, &mut got_c);
         let ud: Vec<D> = u.iter().map(|&x| D::constant(x)).collect();
@@ -31820,6 +31897,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dwant,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -31831,6 +31909,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dgot,
             &mut dvars,
             &mut dstack,
@@ -31910,6 +31989,7 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
         2.0,
         2.0,
         2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut du,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -31992,12 +32072,23 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0; 2];
-        prog.eval_rhs_g::<f64>(&u, &params, t, t, t, &mut got_g, &mut vars, &mut stack);
+        prog.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            t,
+            t,
+            t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
+        );
         let mut got_c = [0.0; 2];
         rhs(&u, &params, t, &mut got_c);
         let dp: Vec<D> = p.iter().map(|&x| D::var(x, 0)).collect();
@@ -32009,6 +32100,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             D::constant(t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dwant,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -32020,6 +32112,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             D::constant(t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dgot,
             &mut dvars,
             &mut dstack,
@@ -32093,13 +32186,22 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
             1.0,
             1.0,
             1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0];
         prog.eval_rhs_g::<f64>(
-            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
         );
         let mut got_c = [0.0];
         rhs(&u, &params, 1.0, &mut got_c);
@@ -32156,6 +32258,7 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
             1.25,
             1.25,
             D::constant(1.25),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -32167,6 +32270,7 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
             1.25,
             1.25,
             D::constant(1.25),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got,
             &mut vars,
             &mut stack,
@@ -32581,6 +32685,7 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
                 *t,
                 t - first,
                 tad,
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut du,
                 &mut vars,
                 &mut stack,
@@ -32715,11 +32820,29 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
     let (mut vars, mut stack) = (Vec::new(), Vec::new());
     let mut sink = vec![0.0; 2];
     sp.eval_rhs_g::<f64>(
-        &u, &params, 0.5, 0.25, 0.1, &mut sink, &mut vars, &mut stack,
+        &u,
+        &params,
+        0.5,
+        0.25,
+        0.1,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut sink,
+        &mut vars,
+        &mut stack,
     );
     assert_eq!(vars.len(), sp.n_vars_total);
     let mut got = vec![0.0; 2];
-    lp.eval_rhs_g::<f64>(&u, &params, 0.5, 0.25, 0.1, &mut got, &mut vars, &mut stack);
+    lp.eval_rhs_g::<f64>(
+        &u,
+        &params,
+        0.5,
+        0.25,
+        0.1,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut got,
+        &mut vars,
+        &mut stack,
+    );
     for j in 0..2 {
         assert!(
             hoist_bits_eq(got[j], want[j]),
@@ -32953,6 +33076,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 *t,
                 tafd_of(*t),
                 tad_of(*t),
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut want,
                 &mut vf,
                 &mut sf,
@@ -32965,6 +33089,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 *t,
                 tafd_of(*t),
                 tad_of(*t),
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut got,
                 &mut vl,
                 &mut sl,

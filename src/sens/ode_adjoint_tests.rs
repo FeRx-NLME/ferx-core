@@ -1634,7 +1634,7 @@ const ODE_IOV: &str = r#"
 
 /// Three occasions, a dose at the start of each, so every later occasion starts with
 /// residual drug from the previous one (κ_g reaches the following occasions too).
-fn iov_subject(model: &CompiledModel) -> Subject {
+pub(super) fn iov_subject(model: &CompiledModel) -> Subject {
     let times = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
     let doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -1660,7 +1660,7 @@ fn iov_subject(model: &CompiledModel) -> Subject {
     s
 }
 
-fn iov_parity(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
+pub(super) fn iov_parity(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
     assert!(
         model.n_kappa > 0 && s.occasions.iter().any(|&o| o > 0),
         "an IOV fixture"

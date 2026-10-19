@@ -14486,8 +14486,6 @@ fn build_ode_spec(
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
     let rhs_reads_time_builtin = stmts_read_time_builtin(&stmts_owned);
-    let reads_absolute_time =
-        rhs_reads_time_builtin || stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot]);
     // The no-feedback precondition the narrow flag below rests on, established by
     // rejection rather than by detect-and-widen (#1166). Reading the cumulative
     // hazard back into the dynamics — from a PK derivative, an intermediate, an
@@ -14678,6 +14676,12 @@ fn build_ode_spec(
                 .collect::<Option<Vec<_>>>()
         })
         .flatten();
+    // A bare `TIME` reads the model-time thread-local (`Op::PushTime`, #610), which is an
+    // `f64`; the time slot holds the same clock. Reading the slot instead lets a dual
+    // evaluation carry a time offset (`OdeRhsProgram::eval_rhs_g`'s `dt`) through every
+    // clock spelling, which the moving-boundary flows need; the `f64` value is unchanged.
+    // The flags above were read off the original statements.
+    rewrite_push_time_to_slot(&mut stmts_owned, time_slot);
     // Lift the parameter-only subexpressions out of the RK stages. Individual
     // parameters and `MACHEPS` are the slots that stay fixed across the calls of
     // one integration; `build_rhs_hoist` drops any the program itself assigns.
@@ -14706,7 +14710,6 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
         uses_time_vars,
-        reads_absolute_time,
         reads_time_builtin: rhs_reads_time_builtin,
         pk_reads_model_time,
         pk_reads_tafd,
@@ -27335,6 +27338,34 @@ fn cond_reads_time_builtin(c: &Condition) -> bool {
 /// expressions, and `if` conditions / branch bodies alike. A condition is as
 /// load-bearing as an assignment here: `if (TIME > 6) { … }` makes the system
 /// non-autonomous even though no statement outside the branch mentions `TIME`.
+/// Replace every `Op::PushTime` in compiled RHS statements with a read of the time slot,
+/// which the RHS binding seeds with the same integrator clock (see the call site).
+fn rewrite_push_time_to_slot(stmts: &mut [Statement], time_slot: usize) {
+    for st in stmts.iter_mut() {
+        match st {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                for op in bc.ops.iter_mut() {
+                    if matches!(op, Op::PushTime) {
+                        *op = Op::PushVar(time_slot as u32);
+                    }
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches.iter_mut() {
+                    rewrite_push_time_to_slot(body, time_slot);
+                }
+                if let Some(eb) = else_body.as_deref_mut() {
+                    rewrite_push_time_to_slot(eb, time_slot);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn stmts_read_time_builtin(stmts: &[Statement]) -> bool {
     stmts.iter().any(|s| match s {
         Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
@@ -28038,11 +28069,6 @@ pub struct OdeRhsProgram {
     /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
     /// the gate routes SS subjects on a non-autonomous RHS to FD (#473 review #1).
     uses_time_vars: bool,
-    /// Whether the RHS reads an **absolute** clock — `TIME`, `T`/`t` or `TAFD` — rather than
-    /// only `TAD`. `TAD` is carried by the dual anchor, so a moving-boundary flow can shift it
-    /// exactly; the absolute clocks enter the evaluator as `f64` and cannot be shifted
-    /// (`sens::ode_provider::boundary_velocity`'s time offset).
-    reads_absolute_time: bool,
     /// Does the RHS read the bare `TIME` built-in? Disjoint from
     /// [`Self::uses_time_vars`], which covers the slot-backed `T`/`t`/`TAFD`/`TAD`
     /// and is `false` for a `TIME`-only RHS — see [`stmts_read_time_builtin`]
@@ -28136,11 +28162,6 @@ impl OdeRhsProgram {
             out[*idx] = prog.eval_output_g(&zeros, params, &empty, &mut vars, &mut stack);
         }
         Some(out)
-    }
-
-    /// See [`OdeRhsProgram::reads_absolute_time`].
-    pub(crate) fn reads_absolute_time(&self) -> bool {
-        self.reads_absolute_time
     }
 
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
@@ -28517,6 +28538,7 @@ impl OdeRhsProgram {
         t: f64,
         tafd: f64,
         tad: T,
+        dt: T,
         du: &mut [T],
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
@@ -28551,12 +28573,12 @@ impl OdeRhsProgram {
         }
         if b.seed_time {
             if let Some(d) = vars.get_mut(self.time_slot) {
-                *d = T::from_f64(t);
+                *d = T::from_f64(t) + dt;
             }
         }
         if b.seed_tafd {
             if let Some(d) = vars.get_mut(self.tafd_slot) {
-                *d = T::from_f64(tafd);
+                *d = T::from_f64(tafd) + dt;
             }
         }
         if b.seed_tad {

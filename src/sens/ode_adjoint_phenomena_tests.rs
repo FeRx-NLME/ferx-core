@@ -1913,7 +1913,7 @@ fn tad_reading_rhs_across_an_estimated_lag_matches_fd() {
     );
     let m = tight(parse_model_string(&src).unwrap());
     let prog = m.ode_spec.as_ref().unwrap().rhs_program.as_ref().unwrap();
-    assert!(prog.uses_time_vars() && !prog.reads_absolute_time());
+    assert!(prog.uses_time_vars() && !prog.pk_reads_absolute_time());
     let s = two_dose_subject(&m);
     assert!(served(&m, &s));
     let g = parity(&m, &s);
@@ -2171,5 +2171,96 @@ fn modeled_dose_on_the_closed_form_walk_matches_reconverged_fd() {
             jac < 2e-11 && grad < 7e-6,
             "{label}: jac {jac:.2e} grad {grad:.2e}"
         );
+    }
+}
+
+/// An RHS reading an **absolute** clock (`TIME`, `TAFD`) across an estimated lag, at third
+/// order. The moving-boundary flows evaluate the field at `t + s` with `s` jet-only, and the
+/// RHS binding carries that offset into every clock spelling (`OdeRhsProgram::eval_rhs_g`'s
+/// `dt`; a bare `TIME` is compiled to read the time slot) — before which these recordings
+/// declined: the absolute clock entered as an `f64` the flow could not shift.
+#[test]
+fn absolute_clock_rhs_across_an_estimated_lag_is_exact_at_third_order() {
+    for (label, factor) in [("TIME", "(1 + 0.02 * TIME)"), ("TAFD", "(1 + 0.02 * TAFD)")] {
+        let src = ODE_LAG.replace(
+            "d/dt(central) = KA * depot - (CL/V) * central",
+            &format!("d/dt(central) = KA * depot - (CL/V) * central * {factor}"),
+        );
+        let m = tight(parse_model_string(&src).unwrap());
+        let s = two_dose_subject(&m);
+        assert!(served(&m, &s), "{label}: served");
+        let (h, _) = hessian_gaps(&m, &s, true);
+        eprintln!("{label} RHS, lag: R-matrix vs FD {h:.2e}");
+        // Measured 8.3e-6 (R-matrix) and 4.3e-6 (Laplace gradient) for both clocks on
+        // Linux — the FD references' own noise on a time-dependent field (the TAD fixture
+        // above moves 1.2e-5–3.0e-5 with the FD step) — so ~10× headroom over that.
+        assert!(h.is_finite() && h < 8e-5, "{label}: R-matrix {h:.2e}");
+        let g = super::tests::fd_oracle_agq(&m, &s, 1, true);
+        eprintln!("{label} RHS, lag: Laplace gradient vs reconverged FD {g:.2e}");
+        assert!(
+            g.is_finite() && g < 4e-5,
+            "{label}: Laplace gradient {g:.2e}"
+        );
+    }
+}
+
+/// An η-dependent `obs_scale` under LTBS on an ODE model, which took finite differences on
+/// both loops: the walk applied the LTBS log inside its readout, before the expression
+/// scale the adjoint applies after the walk, so it could not reproduce production's
+/// scale-then-log `ln(f/s)`. The readout now defers the log under an expression scale and
+/// `apply_expression_scale` takes it after the quotient. Pinned on the values (the recorder
+/// against production's own log-scale predictions), FOCEI and FOCE gradients against
+/// reconverged FD, and an IOV twin (κ on `V`, one scale per occasion group).
+#[test]
+fn eta_dependent_obs_scale_under_ltbs_on_an_ode_is_analytic() {
+    let src = |iov: bool| {
+        format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+             theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n{}  \
+             sigma ADD_LOG ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+             V = TVV * exp(ETA_V{})\n  KA = TVKA\n[structural_model]\n  \
+             ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+             d/dt(central) = KA * depot - (CL/V) * central\n[scaling]\n  obs_scale = V\n\
+             [error_model]\n  log(DV) ~ additive(ADD_LOG)\n{}",
+            if iov { "  kappa KAPPA_V ~ 0.03\n" } else { "" },
+            if iov { " + KAPPA_V" } else { "" },
+            if iov {
+                "[fit_options]\n  iov_column = OCC\n"
+            } else {
+                ""
+            },
+        )
+    };
+    let m = tight(parse_model_string(&src(false)).unwrap());
+    assert!(m.log_transform, "LTBS");
+    assert!(matches!(
+        m.scaling,
+        crate::types::ScalingSpec::ExpressionScale { .. }
+    ));
+    let s = two_dose_subject(&m);
+    let eta = [0.08, -0.05];
+    let theta = &m.default_params.theta;
+    let rec = crate::sens::provider::subject_eta_grad(&m, &s, theta, &eta).expect("served");
+    let prod = crate::pk::compute_predictions_with_tv(&m, &s, theta, &eta);
+    for (j, (r, p)) in rec.iter().zip(&prod).enumerate() {
+        assert!(
+            (r.f - p).abs() < 1e-9 * (1.0 + p.abs()),
+            "obs {j}: {} vs {p}",
+            r.f
+        );
+    }
+    for (interaction, name) in [(true, "FOCEI"), (false, "FOCE")] {
+        let g = fd_oracle(&m, &s, interaction);
+        eprintln!("obs_scale × LTBS (ODE) {name}: gradient vs reconverged FD {g:.2e}");
+        // Measured 7.9e-9 (FOCEI) / 9.7e-9 (FOCE) on Linux; ~10× headroom.
+        assert!(g < 1e-7, "{name}: {g:.2e}");
+    }
+    let m = tight(parse_model_string(&src(true)).unwrap());
+    let s = super::tests::iov_subject(&m);
+    for (interaction, name) in [(true, "FOCEI"), (false, "FOCE")] {
+        let g = super::tests::iov_parity(&m, &s, interaction);
+        eprintln!("obs_scale × LTBS (ODE, IOV) {name}: gradient vs reconverged FD {g:.2e}");
+        // Measured 1.9e-7 on Linux, both; ~10× headroom.
+        assert!(g < 2e-6, "IOV {name}: {g:.2e}");
     }
 }

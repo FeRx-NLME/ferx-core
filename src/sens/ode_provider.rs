@@ -131,10 +131,9 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     // **static** walk AND the **TV-cov event-driven** walk — the scale is subject-static
     // even under time-varying covariates (production `apply_scaling` reads
     // `subject.covariates`, not a per-event snapshot), so `event_walk_subject_supported` admits it
-    // and applies one subject-static quotient post-walk (#486). It still requires
-    // `!log_transform` (the walk applies LTBS in PK-param space *before* the η/θ chain, so
-    // the production scale-then-log order can't be reproduced by a post-walk quotient —
-    // LTBS keeps the FD fallback). Both compose with a Form-C readout (`y = state/V`), the
+    // and applies one subject-static quotient post-walk (#486). Under LTBS the readout
+    // defers its log to that quotient (`apply_output_transform`), so the tape reproduces
+    // production's scale-then-log `ln(f/s)`. Both compose with a Form-C readout (`y = state/V`), the
     // other supported route. Allowlist (not denylist) so a future scaling variant can only
     // *narrow* the analytic scope, never silently admit an unhandled one.
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
@@ -590,8 +589,8 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // IOV per-occasion-group machinery (#590) collapses to one jet because there is no κ.
     // Admissibility (`!log_transform`, axis counts, axis cap) was enforced upstream by the
     // pre-#2093 `ode_analytical_supported`'s scaling allowlist (only `None`/`ScalarScale`/an
-    // axis-admissible `ExpressionScale` reach here), so no extra guard is needed; LTBS
-    // stays FD via that allowlist's `!log_transform` admissibility. A `TIME`-built-in
+    // axis-admissible `ExpressionScale` reach here), so no extra guard is needed; under LTBS
+    // the log follows the quotient (`apply_expression_scale`). A `TIME`-built-in
     // structural parameter is served here too (per-event dynamic, mirrors TV-cov) and
     // composes with the same subject-static scale quotient.
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
@@ -1018,22 +1017,31 @@ pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
         ScalingSpec::ScalarScale(k) if k != 1.0 => p / T::from_f64(k),
         _ => p,
     };
-    // LTBS log. The value goes through the shared generic transform — the same
-    // floor-then-log production runs on f64 (#451); the `NaN` pre-check above keeps a
-    // `NaN` readout visible rather than letting the floor convert it to `ln(LTBS_FLOOR)`.
-    // The gradient keys on the strict `> LTBS_FLOOR` boundary, matching the analytical
-    // path (`provider.rs`) and `apply_log_transform`'s clamp semantics: at or below the
-    // floor the readout is clamped to a constant so its derivatives vanish, rather than
-    // `guard_floor` retaining the jet exactly at the floor (#460 review). Above the
-    // floor the dual `ln` carries the jet (and `ltbs_log_g` is then just `p.ln()`).
-    if model.log_transform {
-        if p.val() > crate::pk::LTBS_FLOOR {
-            crate::pk::ltbs_log_g(p)
-        } else {
-            T::from_f64(crate::pk::ltbs_log_g(p.val()))
-        }
+    // LTBS log — deferred under an expression scale, which production applies *before* the
+    // log (`apply_scaling` then `apply_log_transform`) and the adjoint applies after the walk
+    // (`apply_expression_scale`, which then takes this same log).
+    let deferred = matches!(model.scaling, ScalingSpec::ExpressionScale { .. });
+    if model.log_transform && !deferred {
+        ltbs_readout(p)
     } else {
         p
+    }
+}
+
+/// The LTBS log of a dual readout. The value goes through the shared generic transform —
+/// the same floor-then-log production runs on f64 (#451). The gradient keys on the strict
+/// `> LTBS_FLOOR` boundary, matching the analytical path (`provider.rs`) and
+/// `apply_log_transform`'s clamp semantics: at or below the floor the readout is clamped to
+/// a constant so its derivatives vanish, rather than `guard_floor` retaining the jet exactly
+/// at the floor (#460 review). Above the floor the dual `ln` carries the jet (and
+/// `ltbs_log_g` is then just `p.ln()`). A `NaN` stays `NaN`.
+pub(crate) fn ltbs_readout<T: crate::sens::num::PkNum>(p: T) -> T {
+    if p.val().is_nan() {
+        p
+    } else if p.val() > crate::pk::LTBS_FLOOR {
+        crate::pk::ltbs_log_g(p)
+    } else {
+        T::from_f64(crate::pk::ltbs_log_g(p.val()))
     }
 }
 
@@ -1734,6 +1742,36 @@ fn eval_rhs_anchored<T: crate::sens::num::vm::VmNum>(
     vars: &mut Vec<T>,
     stack: &mut Vec<T>,
 ) {
+    eval_rhs_at_offset(
+        program,
+        us,
+        ps,
+        t,
+        T::from_f64(0.0),
+        first_dose_time,
+        last_dose_eff,
+        du,
+        vars,
+        stack,
+    );
+}
+
+/// [`eval_rhs_anchored`] at the clock `t + dt`, `dt` a jet-only offset (a moving-boundary
+/// flow's, [`cross_moving_boundary`]): every clock the RHS reads — `TIME`/`T`, `TAFD`, `TAD` —
+/// moves by `dt`, so the field's explicit time dependence carries the offset's jet exactly.
+#[allow(clippy::too_many_arguments)]
+fn eval_rhs_at_offset<T: crate::sens::num::vm::VmNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    us: &[T],
+    ps: &[T],
+    t: f64,
+    dt: T,
+    first_dose_time: f64,
+    last_dose_eff: T,
+    du: &mut [T],
+    vars: &mut Vec<T>,
+    stack: &mut Vec<T>,
+) {
     let tafd = if first_dose_time.is_finite() {
         t - first_dose_time
     } else {
@@ -1745,11 +1783,11 @@ fn eval_rhs_anchored<T: crate::sens::num::vm::VmNum>(
     // `last_dose_eff`. `TAFD` anchors at the unlagged first dose *record* in both engines,
     // so it stays a constant (measured exact, #1070 probe 2a).
     let tad = if last_dose_eff.val().is_finite() {
-        T::from_f64(t) - last_dose_eff
+        T::from_f64(t) - last_dose_eff + dt
     } else {
         T::from_f64(f64::NAN)
     };
-    program.eval_rhs_g::<T>(us, ps, t, tafd, tad, du, vars, stack);
+    program.eval_rhs_g::<T>(us, ps, t, tafd, tad, dt, du, vars, stack);
 }
 
 /// The jet-only part of a moving-boundary time `x` (an estimated lagtime or
@@ -2968,13 +3006,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     //   double-counts it at first order and adds a spurious `½(J⁻−J⁺)r` at second.
     //
     // `s` is a jet-only time offset from `t_ev`, for the moving-boundary flows
-    // ([`cross_moving_boundary`]): the clock the field reads is `t_ev + s`. `TAD` and every
-    // pointwise input rate read time only *relative* to an arrival, so the offset is carried
-    // exactly by shifting those anchors by `−s` (the window membership is value-based and
-    // unchanged by a value-zero `s`). An absolute clock (`TIME`, `T`, `TAFD`) enters the
-    // evaluator as `f64` and cannot be shifted; through second order its explicit-time terms
-    // cancel between the two sides of the flow, beyond it they do not, so a type that carries
-    // higher derivatives gets `NaN` there and its recording declines.
+    // ([`cross_moving_boundary`]): the clock the field reads is `t_ev + s`, in every
+    // spelling (`eval_rhs_at_offset`), and every pointwise input rate reads its `tad`
+    // shifted the same way (its dose lags by `−s`). The window membership is value-based and
+    // unchanged by a value-zero `s`.
     let boundary_velocity = |state: &[T],
                              side_params: &[T],
                              t_ev: f64,
@@ -2985,17 +3020,15 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
      -> Vec<T> {
         let eps = crate::ode::predictions::INFUSION_EPS;
         let shifted = !s.is_constant();
-        if shifted && !T::TAYLOR2_EXACT && program.reads_absolute_time() {
-            return vec![T::from_f64(f64::NAN); n_states];
-        }
         let mut v = vec![T::from_f64(0.0); n_states];
-        eval_rhs_anchored::<T>(
+        eval_rhs_at_offset::<T>(
             program,
             state,
             side_params,
             t_ev,
+            s,
             first_dose_time,
-            last_dose - s,
+            last_dose,
             &mut v,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
@@ -4716,17 +4749,14 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                 let eps = crate::ode::predictions::INFUSION_EPS;
                 let t_next = break_times.get(w + 1).copied().unwrap_or(t_start);
                 let post_field = |x: &[T], s: T, out: &mut [T]| {
-                    if !s.is_constant() && !T::TAYLOR2_EXACT && program.reads_absolute_time() {
-                        out.fill(T::from_f64(f64::NAN));
-                        return;
-                    }
-                    eval_rhs_anchored::<T>(
+                    eval_rhs_at_offset::<T>(
                         program,
                         x,
                         params_dual,
                         t_start,
+                        s,
                         first_dose_time,
-                        T::from_f64(last_dose_eff) - s,
+                        T::from_f64(last_dose_eff),
                         out,
                         &mut vars_cell.borrow_mut(),
                         &mut stack_cell.borrow_mut(),

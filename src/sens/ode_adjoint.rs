@@ -536,7 +536,7 @@ fn apply_expression_scale<T: VmNum>(
     match &model.scaling {
         ScalingSpec::ExpressionScale {
             deriv: Some(prog), ..
-        } if !model.log_transform => {
+        } => {
             let vars: Vec<T> = prog
                 .var_to_pk_slot()
                 .iter()
@@ -554,6 +554,11 @@ fn apply_expression_scale<T: VmNum>(
             }
             for y in preds.iter_mut() {
                 *y = *y / s;
+                // Production's order: the scale, then the LTBS log (`apply_output_transform`
+                // left it for here).
+                if model.log_transform {
+                    *y = crate::sens::ode_provider::ltbs_readout(*y);
+                }
             }
             Some(preds)
         }
@@ -861,7 +866,7 @@ fn record_ode_iov<T: VmNum>(
         // `apply_scaling`), applied to that group's observations.
         ScalingSpec::ExpressionScale {
             deriv: Some(sprog), ..
-        } if !model.log_transform => {
+        } => {
             let groups = match shared {
                 Some(g) => g,
                 None => static_groups()?,
@@ -883,6 +888,9 @@ fn record_ode_iov<T: VmNum>(
                     return None;
                 }
                 *y = *y / s;
+                if model.log_transform {
+                    *y = crate::sens::ode_provider::ltbs_readout(*y);
+                }
             }
         }
         ScalingSpec::ExpressionScale { .. } | ScalingSpec::PerCmt(_) => return None,
