@@ -792,8 +792,9 @@ fn apply_readout_jet<T: crate::sens::num::vm::VmNum>(
 /// function: an individual parameter carrying a κ would be frozen at its typical value.
 /// Then runs the readout jet under this observation's model time.
 ///
-/// `conc` **must already be clamped to ≥ 0** — production clamps `conc.max(0.0)` *before* the
-/// readout ([`crate::pk::event_driven`] → [`crate::pk::apply_analytic_readout`]) and returns
+/// `conc` **must already be clamped to ≥ 0** — production floors it in
+/// `central_concentration_g` *before* the readout ([`crate::pk::event_driven`] →
+/// [`crate::pk::apply_analytic_readout`]) and returns
 /// the readout output unclamped, so the caller clamps the concentration jet and does not
 /// re-clamp the result. A readout referencing `TIME` resolves `Op::PushTime` from the
 /// model-time thread-local, so it is entered at `obs_time` to match the guard
@@ -2760,8 +2761,8 @@ fn run_obs_iov<const M: usize>(
 
     let mut obs_out = Vec::with_capacity(conc.len());
     for (j, c) in conc.iter().enumerate() {
-        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
-        // `conc.max(0.0)` in `event_driven_predictions` and only then applies the readout
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production floors the
+        // concentration in `central_concentration_g` and only then applies the readout
         // (which is returned unclamped). A negative value's derivatives vanish, matching the
         // OFV. For a plain (no-readout) model this reproduces the old post-loop clamp exactly
         // (`constant(0.0)` has zero grad/hess).
@@ -4430,8 +4431,8 @@ fn run_obs_tvcov<const M: usize>(
     debug_assert!(prev.is_empty() || prev.len() == conc.len());
     let mut obs_out = Vec::with_capacity(conc.len());
     for (j, c) in conc.iter().enumerate() {
-        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
-        // `conc.max(0.0)` and only then applies the readout (returned unclamped). For a
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production floors it in
+        // `central_concentration_g` and only then applies the readout (returned unclamped). For a
         // plain model this reproduces the old post-loop clamp (`constant(0.0)` zeros grad/hess).
         let c_clamped: Dual2<M> = if c.value < 0.0 {
             Dual2::<M>::constant(0.0)

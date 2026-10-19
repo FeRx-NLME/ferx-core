@@ -1380,6 +1380,36 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     state
 }
 
+/// The concentration an observation reads from the central amount, `amount / v`,
+/// floored at zero. The production walk
+/// (`event_driven::event_driven_predictions_with_schedule_impl`) and its dual twin
+/// [`event_driven_sens_with_doses_g`] both read through this one function, so they
+/// cannot disagree on a degenerate record (#2039).
+///
+/// - A finite `v ≤ 0` reads 0, as the superposition closed forms' own guard does
+///   (`one_cpt_iv_bolus_amt_g`).
+/// - A `NaN`, in `v` or in the amount, is kept. The walk used to test `v > 0.0`,
+///   which is false for a `NaN`, and floor with `f64::max`, which discards one, so a
+///   subject whose `CL` or `V` was `NaN` from some record on was served a prediction
+///   of 0 there and scored against it with a finite objective. Superposition keeps
+///   the `NaN` since #1399, and so does the ODE engine.
+/// - A negative concentration clamps to 0 and its derivatives vanish there, so the
+///   dual path is consistent with the objective.
+#[inline]
+pub(crate) fn central_concentration_g<T: PkNum>(amount: T, v: T) -> T {
+    let conc = if v.val() > 0.0 || v.val().is_nan() {
+        amount / v
+    } else {
+        T::from_f64(0.0)
+    };
+    // `<` is false for a `NaN`, which therefore passes through.
+    if conc.val() < 0.0 {
+        T::from_f64(0.0)
+    } else {
+        conc
+    }
+}
+
 /// Event-driven **sensitivity** walk for the 1-/2-cpt models: returns the dual
 /// concentration at every observation, parallel to `subject.obs_times`. The
 /// `Dual2`-differentiable mirror of
@@ -1617,19 +1647,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     }
                     None => &state[..],
                 };
-                let v = pk_now.v;
-                let conc = if v.val() > 0.0 {
-                    read[central_slot] / v
-                } else {
-                    T::from_f64(0.0)
-                };
-                // Mirror production's `conc.max(0.0)`: a negative value clamps to
-                // 0, so its derivatives vanish there (consistency with the OFV).
-                preds[ev.orig_idx] = if conc.val() < 0.0 {
-                    T::from_f64(0.0)
-                } else {
-                    conc
-                };
+                preds[ev.orig_idx] = central_concentration_g(read[central_slot], pk_now.v);
             }
             EventKind::PkOnly => {}
             EventKind::Reset => unreachable!("Reset handled before pk_for_g above"),
@@ -1823,6 +1841,152 @@ mod tests {
             fd.abs() > 1e-3,
             "fixture is inert: d f / d CL_C = {fd} at the last observation"
         );
+    }
+
+    /// #2039: the observation readout keeps a `NaN`, in the volume or in the amount,
+    /// and floors everything else at 0, on `f64` and on `Dual2`. A finite `v ≤ 0`
+    /// reads 0, as the superposition closed forms do. A clamped negative carries no
+    /// derivative.
+    #[test]
+    fn central_concentration_keeps_a_nan_and_floors_the_rest() {
+        let f = central_concentration_g::<f64>;
+        assert_eq!(f(50.0, 10.0), 5.0);
+        assert!(f(50.0, f64::NAN).is_nan(), "a NaN volume is kept");
+        assert!(f(f64::NAN, 10.0).is_nan(), "a NaN amount is kept");
+        assert_eq!(f(50.0, 0.0), 0.0, "a zero volume reads 0");
+        assert_eq!(f(50.0, -5.0), 0.0, "a negative volume reads 0");
+        assert_eq!(f(-1.0, 10.0), 0.0, "a negative concentration clamps");
+
+        let d = central_concentration_g::<Dual2<1>>;
+        assert!(d(Dual2::constant(50.0), Dual2::constant(f64::NAN))
+            .value
+            .is_nan());
+        assert!(d(Dual2::var(f64::NAN, 0), Dual2::constant(10.0))
+            .value
+            .is_nan());
+        let clamped = d(Dual2::var(-1.0, 0), Dual2::constant(10.0));
+        assert_eq!((clamped.value, clamped.grad[0]), (0.0, 0.0));
+        let live = d(Dual2::var(50.0, 0), Dual2::constant(10.0));
+        assert_eq!((live.value, live.grad[0]), (5.0, 0.1));
+    }
+
+    /// #2039: the dual walk serves a `NaN` volume as `NaN`, at the same records as the
+    /// production walk, so the gradient path and the value path see the same subject.
+    /// It already kept a `NaN` concentration (its floor was `<`, not `f64::max`), but
+    /// a `NaN` volume failed its `v > 0` test and read 0, while the production walk
+    /// served the `NaN` once #2039 fixed it.
+    ///
+    /// The fixture reaches all three ways the dual walk reads an observation: the IV
+    /// bolus state (slot 0), the oral central slot (slot 1), and the stepped-back copy
+    /// `obs_boundary_correction` builds when a record sits on a lagged arrival.
+    ///
+    /// Mutation (run): restore this walk's inline `if v.val() > 0.0 { .. } else { 0 }`
+    /// readout → the `V` rows here die, and the production walk's tests stay green.
+    #[test]
+    fn dual_walk_serves_a_nan_volume_as_nan_where_production_does() {
+        use crate::pk::event_driven::EventSchedule;
+        use crate::types::{DoseEvent, PK_IDX_LAGTIME};
+
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let subject = crate::types::Subject {
+            id: "1".into(),
+            doses: doses.clone(),
+            obs_times: vec![1.0, 2.0, 4.0, 8.0, 13.0, 24.0],
+            observations: vec![0.0; 6],
+            obs_cmts: vec![1; 6],
+            cens: vec![0; 6],
+            ..Default::default()
+        };
+        let bad_from = 2;
+        // `lag = 1` puts the second dose's arrival on the t = 13 record, inside the
+        // `NaN` span.
+        for (route, model, ka, lag) in [
+            ("IV bolus", PkModel::OneCptIv, 0.0, 0.0),
+            ("oral", PkModel::OneCptOral, 1.2, 0.0),
+            (
+                "IV, record on a lagged arrival",
+                PkModel::OneCptIv,
+                0.0,
+                1.0,
+            ),
+        ] {
+            let lagtimes = [0.0, lag];
+            let lag_dual: Vec<Dual2<1>> = if lag > 0.0 {
+                lagtimes.iter().map(|&l| Dual2::constant(l)).collect()
+            } else {
+                Vec::new()
+            };
+            // Each route must reach the read it is here for, or the row tests nothing.
+            assert_eq!(
+                obs_boundary_correction::<Dual2<1>>(&doses, &lagtimes, &lag_dual, &[], 0.0, 13.0)
+                    .is_some(),
+                lag > 0.0,
+                "{route}: the t = 13 record does not take the read this row is for"
+            );
+            let pk_dose: Vec<PkParams> = lagtimes
+                .iter()
+                .map(|&l| {
+                    let mut p = pk_of(5.0, 80.0, ka);
+                    p.values[PK_IDX_LAGTIME] = l;
+                    p
+                })
+                .collect();
+            let schedule = EventSchedule::for_subject(&subject, model, &doses, &lagtimes);
+            let with_ka = |p: PkDual<Dual2<1>>| PkDual {
+                ka: Dual2::constant(ka),
+                ..p
+            };
+            for (label, cl, v) in [("V", 5.0, f64::NAN), ("CL", f64::NAN, 80.0)] {
+                let pk_obs: Vec<PkParams> = (0..6)
+                    .map(|j| {
+                        if j < bad_from {
+                            pk_of(5.0, 80.0, ka)
+                        } else {
+                            pk_of(cl, v, ka)
+                        }
+                    })
+                    .collect();
+                let production = event_driven_predictions(model, &subject, &pk_dose, &pk_obs, &[]);
+                let pk_at_obs: Vec<PkDual<Dual2<1>>> = pk_obs
+                    .iter()
+                    .map(|p| {
+                        with_ka(pk_dual_cl_var(
+                            p.values[PK_IDX_CL],
+                            p.values[PK_IDX_V],
+                            true,
+                        ))
+                    })
+                    .collect();
+                let dual: Vec<Dual2<1>> = event_driven_sens_with_doses_g(
+                    model,
+                    &subject,
+                    &schedule,
+                    &doses,
+                    &lag_dual,
+                    &[],
+                    &[with_ka(pk_dual_cl_var(5.0, 80.0, false)); 2],
+                    &pk_at_obs,
+                    &[],
+                );
+                assert!(
+                    production[..bad_from].iter().all(|&p| p > 0.0),
+                    "{route}: the records before the NaN read 0, so the fixture is inert: \
+                     {production:?}"
+                );
+                for (j, (d, p)) in dual.iter().zip(production.iter()).enumerate() {
+                    assert_eq!(
+                        (j >= bad_from, j >= bad_from),
+                        (d.value.is_nan(), p.is_nan()),
+                        "{route}, {label} = NaN from record {bad_from} on, record {j}: dual {} \
+                         vs production {p}",
+                        d.value
+                    );
+                }
+            }
+        }
     }
 
     /// Central FD grad + 4-point Hessian of a 2-arg `f64` closure.
