@@ -84,7 +84,9 @@ pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{
     configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
 };
-pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope};
+pub(crate) use pool::{
+    install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope, with_fit_scope_ode,
+};
 // Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
 // private to `api`, so a test elsewhere in the crate needs the re-export.
 #[cfg(test)]

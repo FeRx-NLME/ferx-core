@@ -7267,6 +7267,264 @@ fn issue_1934_model_with_q_prior(
     )
 }
 
+/// [`issue_1934_model`] as an `[odes]` model solved by `ode_method` (#2001): the same
+/// two-compartment structure written as a linear ODE, so `auto` takes the exact
+/// matrix-exponential path and `rk45` integrates it.
+fn issue_1934_ode_model(
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    om: [f64; 3],
+    sig: f64,
+    ode_method: &str,
+) -> String {
+    issue_1934_model(cl, v1, q, v2, om, sig).replace(
+        "  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n",
+        &format!(
+            "  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[fit_options]
+  ode_method = {ode_method}
+"
+        ),
+    )
+}
+
+/// `examples/two_cpt_iv_ode.ferx` with its initial estimates replaced by `theta` (TVCL,
+/// TVV1, TVQ, TVV2), the diagonal `omega` and the `sigma` SD, solved by `ode_method`.
+fn two_cpt_iv_ode_at(theta: [f64; 4], omega: [f64; 4], sigma: f64, ode_method: &str) -> String {
+    let src = std::fs::read_to_string("examples/two_cpt_iv_ode.ferx").expect("example reads");
+    let mut out = String::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        let theta_at = |name: &str, k: usize| {
+            let (_, bounds) = t.split_once(',').expect("theta has bounds");
+            format!("  theta {name}({},{bounds}", theta[k])
+        };
+        let replaced = match () {
+            _ if t.starts_with("theta TVCL(") => theta_at("TVCL", 0),
+            _ if t.starts_with("theta TVV1(") => theta_at("TVV1", 1),
+            _ if t.starts_with("theta TVQ(") => theta_at("TVQ", 2),
+            _ if t.starts_with("theta TVV2(") => theta_at("TVV2", 3),
+            _ if t.starts_with("omega ETA_CL ") => format!("  omega ETA_CL ~ {}", omega[0]),
+            _ if t.starts_with("omega ETA_V1 ") => format!("  omega ETA_V1 ~ {}", omega[1]),
+            _ if t.starts_with("omega ETA_Q ") => format!("  omega ETA_Q  ~ {}", omega[2]),
+            _ if t.starts_with("omega ETA_V2 ") => format!("  omega ETA_V2 ~ {}", omega[3]),
+            _ if t.starts_with("sigma PROP_ERR ") => format!("  sigma PROP_ERR ~ {sigma} (sd)"),
+            _ if t.starts_with("[fit_options]") => {
+                format!("[fit_options]\n  ode_method = {ode_method}")
+            }
+            _ => line.to_string(),
+        };
+        out.push_str(&replaced);
+        out.push('\n');
+    }
+    out
+}
+
+/// The decrement BHHH forms from the per-subject gradients at the fit's own solver
+/// settings, at the fit's own EBEs, with no penalty: what `predicted_remaining_gain`
+/// would return on an ODE model without the tight re-solve (#2001).
+fn decrement_at_fit_tolerance(model: &CompiledModel, pop: &Population, opts: &FitOptions) -> f64 {
+    let p = &model.default_params;
+    let (x, ehs, _, kappas) = ebes_at(model, p, pop, opts);
+    let per_subject =
+        per_subject_outer_gradients(model, pop, p, &x, &ehs, &kappas, opts).expect("in scope");
+    let n = x.len();
+    bhhh_newton_decrement(
+        &per_subject,
+        &vec![0.0; n],
+        &DMatrix::zeros(n, n),
+        &x,
+        &compute_bounds(p),
+        &packed_fixed_mask(p),
+    )
+    .expect("decrement forms")
+}
+
+/// #2001: on an integrated ODE model the decrement is formed at a tight tolerance, and
+/// agrees with the exact one. The fixture is the issue's: `two_cpt_iv_ode` at the point
+/// #1999's guard latched (OFV −885.388, 4.1 short of the optimum; the fit YAML at
+/// `6138e201`, 6 figures) and at the optimum rk45 L-BFGS reaches on `main` (−889.520). The
+/// model is linear, so `ode_method = auto` solves it exactly by matrix exponential (#852)
+/// — a third way, outside the integrator, that says what the decrement *is*.
+///
+/// Measured on Linux x86_64. Exact: 9.29607 at the latch, 0.0083236 at the optimum, a
+/// straddle of the 0.1 threshold — 93× above it and 12× below. rk45 at the fit's default
+/// tolerance reads 1.85 at the optimum, which is why #1999 withheld the check: the guard
+/// could never have stopped there. With the tight re-solve rk45 reads 9.296079 and
+/// 0.0083207, within 1.3e-5 and 2.9e-6 of exact. The bound is 1e-3: 75× the worse
+/// realised error, 100× under the threshold, and 1.85 short of the fit-tolerance value.
+#[test]
+fn predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    type Point = ([f64; 4], [f64; 4], f64);
+    let latch: Point = (
+        [4.410713, 15.131981, 3.056503, 30.547907],
+        [0.106304, 0.125207, 0.200885, 0.155107],
+        0.010190,
+    );
+    let optimum: Point = (
+        [4.414254, 15.508273, 3.141432, 29.322428],
+        [0.075612, 0.101558, 0.100074, 0.156294],
+        0.010136,
+    );
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let model = |(theta, omega, sigma): Point, method: &str| {
+        let m = parse_model_string(&two_cpt_iv_ode_at(theta, omega, sigma, method))
+            .expect("fixture parses");
+        assert!(m.is_ode_based(), "fixture is an [odes] model");
+        m
+    };
+    let gain = |m: &CompiledModel| gain_at(m, &pop, &opts).expect("an ODE model has a gain");
+
+    let exact_latch = gain(&model(latch, "auto"));
+    let exact_optimum = gain(&model(optimum, "auto"));
+    let rk45_latch = gain(&model(latch, "rk45"));
+    let rk45_optimum = gain(&model(optimum, "rk45"));
+    let loose_optimum = decrement_at_fit_tolerance(&model(optimum, "rk45"), &pop, &opts);
+    eprintln!(
+        "exact {exact_latch:e} / {exact_optimum:e}; rk45 {rk45_latch:e} / {rk45_optimum:e}; \
+         rk45 at the fit tolerance, optimum: {loose_optimum:e}"
+    );
+    for v in [
+        exact_latch,
+        exact_optimum,
+        rk45_latch,
+        rk45_optimum,
+        loose_optimum,
+    ] {
+        assert!(v.is_finite(), "{v}");
+    }
+    // The straddle, on the exact path: the latch is a creep, the optimum may stop.
+    assert!(
+        !gain_is_negligible(Some(exact_latch)),
+        "latch: {exact_latch}"
+    );
+    assert!(
+        gain_is_negligible(Some(exact_optimum)),
+        "optimum: {exact_optimum}"
+    );
+    // The fixture's integrator noise is real: at the fit's tolerance the optimum reads as a
+    // creep, so a decrement that skipped the tight re-solve fails the agreement below.
+    assert!(
+        !gain_is_negligible(Some(loose_optimum)),
+        "fit-tolerance optimum: {loose_optimum}"
+    );
+    for (label, got, want) in [
+        ("latch", rk45_latch, exact_latch),
+        ("optimum", rk45_optimum, exact_optimum),
+    ] {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "{label}: rk45 decrement {got} vs exact {want}"
+        );
+    }
+}
+
+/// The tight re-solve's solver settings (#2001): `reltol` capped at 1e-9 and never loosened,
+/// `abstol` moved by the same factor (so the abstol/reltol ratio — the state scale the
+/// model was written for — is kept), the step budget raised, every other field the fit's.
+/// An exact (matrix-exponential) model and a closed form without an integrated twin get
+/// none; a closed form whose absorption twin integrates some subjects gets the twin's.
+#[test]
+fn decrement_ode_override_tightens_and_keeps_the_fits_other_settings() {
+    use crate::ode::OdeMethod;
+    use crate::parser::model_parser::{parse_model_file, parse_model_string};
+    use std::path::Path;
+
+    let opts = focei_options();
+    let at = |method: &str| {
+        let src = issue_1934_ode_model(4.0, 12.0, 0.01, 25.0, [0.1, 0.01, 0.1], 0.01, method);
+        parse_model_string(&src).expect("parses")
+    };
+    let rk45 = at("rk45");
+    let ov = decrement_ode_override(&rk45, &opts).expect("an integrated model is tightened");
+    assert_eq!(ov.reltol, Some(1e-9));
+    let abstol = ov.abstol.expect("abstol moved");
+    assert!(
+        (abstol - 1e-11).abs() < 1e-24,
+        "1e-6 × (1e-9 / 1e-4): {abstol}"
+    );
+    assert_eq!(ov.max_steps, Some(10_000 * 100));
+    assert_eq!(ov.method, None, "the method is the model's");
+
+    // A fit-scoped override the caller expressed is kept, not dropped for the re-solve.
+    let ros = FitOptions {
+        ode_method: OdeMethod::Rosenbrock23,
+        ..focei_options()
+    };
+    let ov = decrement_ode_override(&rk45, &ros).expect("tightened");
+    assert_eq!(ov.method, Some(OdeMethod::Rosenbrock23));
+
+    // A fit already tighter than the cap is not loosened.
+    let tight = parse_model_string(&issue_1934_ode_model(
+        4.0,
+        12.0,
+        0.01,
+        25.0,
+        [0.1, 0.01, 0.1],
+        0.01,
+        "rk45\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13",
+    ))
+    .expect("parses");
+    let ov = decrement_ode_override(&tight, &opts).expect("tightened");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-11), Some(1e-13)));
+
+    assert_eq!(
+        decrement_ode_override(&at("auto"), &opts),
+        None,
+        "exact path"
+    );
+    let closed = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
+    assert_eq!(decrement_ode_override(&closed, &opts), None, "closed form");
+    let transit = parse_model_file(Path::new("examples/one_cpt_transit.ferx")).expect("parses");
+    assert!(transit.ode_spec.is_none() && transit.absorption_ode_equivalent.is_some());
+    assert!(
+        decrement_ode_override(&transit, &opts).is_some(),
+        "a closed form's integrated absorption twin"
+    );
+}
+
+/// #2001: tightening the gradient alone is not enough; the EBEs are re-solved at the tight
+/// tolerance too. An η̂ solved under the integrator's error is not stationary for the
+/// tight objective, and the outer gradient, formed as if it were, carries the difference.
+/// On the #1934 model's ODE twin at NONMEM's optimum (the `.ext` final row of
+/// `predicted_remaining_gain_straddles_the_issue_1934_false_stop`) under `rosenbrock23`,
+/// measured on Linux x86_64: 1.7e-4 at the fit's tolerance, **2.14** with only the
+/// gradient tightened, 5.74e-7 with both — the closed form reads 5.8e-7. The bound is 1e-3:
+/// 1700× the realised value, and 2000× under what the gradient-only re-solve returns.
+#[test]
+fn predicted_remaining_gain_re_solves_the_ebes_at_the_tight_tolerance() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let m = parse_model_string(&issue_1934_ode_model(
+        4.80976,
+        15.4816,
+        2.94425,
+        19.0347,
+        [0.0973620, -0.00531834, 0.101737],
+        0.00666718,
+        "rosenbrock23",
+    ))
+    .expect("fixture parses");
+    let got = gain_at(&m, &pop, &focei_options()).expect("an ODE model has a gain");
+    eprintln!("rosenbrock23 at NONMEM's optimum: {got:e}");
+    assert!(got.is_finite() && got < 1e-3, "NONMEM's optimum: {got}");
+}
+
 fn focei_options() -> FitOptions {
     FitOptions {
         method: EstimationMethod::FoceI,
@@ -7367,9 +7625,83 @@ fn predicted_remaining_gain_straddles_the_issue_1934_false_stop() {
     );
 }
 
-/// Where no decrement is formed, both sides of each exclusion: the ODE twin of a
-/// closed-form example (its gradient is the integrator's, see `predicted_remaining_gain`),
-/// and AGQ, whose objective is not the one `subject_analytic_outer_gradient` differentiates.
+/// #2001: an ODE model solved exactly by matrix exponential (#852) gets the closed form's
+/// decrement, with no tight re-solve. #1999 withheld the check from every ODE model, so
+/// SLSQP on the #1934 model's ODE twin (`ode_method = auto`) from TVQ = 0.01 latched at
+/// −204.41 and reported converged, 227.8 short of NONMEM's −432.17 — the #1934 false stop
+/// again, one model block over. At both of #1934's points the decrement is the closed
+/// form's: measured on Linux x86_64, 14.832907993 vs 14.832907995 at the false stop and
+/// 5.7691e-7 vs 5.7670e-7 at NONMEM's optimum — 1.7e-9 and 2.1e-10 apart. The bound is
+/// 1e-7 absolute (60× the worse), a millionth of the 0.1 threshold, so the straddle
+/// carries over unchanged.
+#[test]
+fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let points: [(f64, f64, f64, f64, [f64; 3], f64); 2] = [
+        (
+            6.735588,
+            16.155540,
+            0.011638,
+            23.488333,
+            [0.061883, -0.018713, 0.101651],
+            0.043717,
+        ),
+        (
+            4.80976,
+            15.4816,
+            2.94425,
+            19.0347,
+            [0.0973620, -0.00531834, 0.101737],
+            0.00666718,
+        ),
+    ];
+    let mut gains = Vec::new();
+    for (cl, v1, q, v2, om, sig) in points {
+        let closed = parse_model_string(&issue_1934_model(cl, v1, q, v2, om, sig)).unwrap();
+        let ode =
+            parse_model_string(&issue_1934_ode_model(cl, v1, q, v2, om, sig, "auto")).unwrap();
+        assert_eq!(
+            ode.ode_spec
+                .as_ref()
+                .map(|s| s.effective_solver_opts().method),
+            Some(crate::ode::OdeMethod::Linear),
+            "fixture takes the exact path"
+        );
+        assert_eq!(
+            decrement_ode_override(&ode, &opts),
+            None,
+            "nothing to tighten"
+        );
+        let want = gain_at(&closed, &pop, &opts).expect("closed form");
+        let got = gain_at(&ode, &pop, &opts).expect("exact ODE");
+        eprintln!("closed {want:e}, exact ODE {got:e}");
+        assert!(
+            got.is_finite() && (got - want).abs() <= 1e-7,
+            "exact ODE {got} vs closed form {want}"
+        );
+        gains.push(got);
+    }
+    assert!(
+        !gain_is_negligible(Some(gains[0])),
+        "false stop: {}",
+        gains[0]
+    );
+    assert!(
+        gain_is_negligible(Some(gains[1])),
+        "NONMEM optimum: {}",
+        gains[1]
+    );
+}
+
+/// Where no decrement is formed, both sides of each exclusion: AGQ, whose objective is not
+/// the one `subject_analytic_outer_gradient` differentiates, and a mixture. An ODE model
+/// is no longer one (#2001): see `predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms`
+/// and `predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one`.
 #[test]
 fn predicted_remaining_gain_is_withheld_from_inexact_objectives() {
     use crate::parser::model_parser::parse_model_file;
@@ -7379,9 +7711,7 @@ fn predicted_remaining_gain_is_withheld_from_inexact_objectives() {
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
     let opts = focei_options();
     let closed = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
-    let ode = parse_model_file(Path::new("examples/two_cpt_iv_ode.ferx")).expect("parses");
     assert!(gain_at(&closed, &pop, &opts).is_some(), "closed form");
-    assert_eq!(gain_at(&ode, &pop, &opts), None, "ODE");
 
     let agq = FitOptions {
         n_agq: 3,
@@ -7581,21 +7911,38 @@ fn predicted_remaining_gain_includes_the_prior_penalty() {
 /// budget of `outer_maxiter = 8` (72 evals for 8 packed parameters) stops it there, well
 /// short of convergence, so this is not a fit to convergence. Without the wiring the
 /// guard latches at eval 60 and both assertions fail.
+///
+/// The second fixture is the same model as an `[odes]` block solved exactly (#2001): before
+/// #2001 the veto was withheld from every ODE model, and this run latched at eval 66 on
+/// −204.4130 and reported converged. With it the run is still descending when the budget
+/// ends, more slowly than the closed form's (its objective is the matrix exponential's, so
+/// SLSQP takes a different path): −226.56 at eval 72, measured on Linux x86_64. The escape
+/// bound there is −215, 10.6 past the false stop and 11.6 short of the run.
 #[test]
 fn latch_veto_is_wired_into_the_objective() {
     use crate::parser::model_parser::parse_model_string;
+
+    for (label, src, escaped_below) in [
+        (
+            "closed form",
+            issue_1934_model(4.0, 12.0, 0.01, 25.0, [0.1, 0.01, 0.1], 0.01),
+            -240.0,
+        ),
+        (
+            "exact ODE",
+            issue_1934_ode_model(4.0, 12.0, 0.01, 25.0, [0.1, 0.01, 0.1], 0.01, "auto"),
+            -215.0,
+        ),
+    ] {
+        let model = parse_model_string(&src).expect("model parses");
+        latch_veto_is_wired_on(label, &model, escaped_below);
+    }
+}
+
+fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64) {
     use crate::read_nonmem_csv;
     use std::path::Path;
 
-    let model = parse_model_string(&issue_1934_model(
-        4.0,
-        12.0,
-        0.01,
-        25.0,
-        [0.1, 0.01, 0.1],
-        0.01,
-    ))
-    .expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
     let opts = FitOptions {
         optimizer: Optimizer::Slsqp,
@@ -7606,7 +7953,7 @@ fn latch_veto_is_wired_into_the_objective() {
         ..focei_options()
     };
     let (result, outcome) = optimize_nlopt_once(
-        &model,
+        model,
         &pop,
         &model.default_params,
         &opts,
@@ -7614,14 +7961,15 @@ fn latch_veto_is_wired_into_the_objective() {
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
     );
+    eprintln!("{label}: OFV {}", result.ofv);
     assert!(
         !outcome.stagnation_latched,
-        "the creep must not latch (OFV {})",
+        "{label}: the creep must not latch (OFV {})",
         result.ofv
     );
     assert!(
-        result.ofv < -240.0,
-        "the escape must be under way by the budget's end: OFV {}",
+        result.ofv < escaped_below,
+        "{label}: the escape must be under way by the budget's end: OFV {}",
         result.ofv
     );
 }
