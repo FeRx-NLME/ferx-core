@@ -97,6 +97,17 @@ impl<'a> AdaptiveInputs<'a> {
         let Some(etas) = self.etas else {
             return Ok(vec![None; population.subjects.len()]);
         };
+        // A mixture fit estimates each subject's η under its own class, but the adaptive
+        // run carries no class (`MIXNUM` reads 1), so a class-2 η̂ would be simulated
+        // under class 1 (#2162 review, finding 1).
+        if model.mixture.is_some() {
+            return Err(refusal(
+                "supplied η are not supported on a [mixture] model. Each subject's η was \
+                 estimated under its own mixture class, and an adaptive run simulates every \
+                 subject under class 1"
+                    .to_string(),
+            ));
+        }
         if etas.names != model.eta_names {
             return Err(refusal(format!(
                 "the supplied η are named [{}] but the model's are [{}]; supply every η of \

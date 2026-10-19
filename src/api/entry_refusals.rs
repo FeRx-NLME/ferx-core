@@ -148,7 +148,7 @@ pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
 /// `E_SUPPLIED_ETAS`: per-subject η handed to an adaptive run that cannot be used as
 /// given (#1594): a table whose IDs and rows differ in count, a row that is not one
 /// finite value per named η, a repeated ID, η names that are not the model's in the
-/// model's order, or a simulated subject with no supplied η under
+/// model's order, a `[mixture]` model, or a simulated subject with no supplied η under
 /// `UnmatchedSubjects::Refuse`.
 pub(crate) fn supplied_etas(message: impl Into<String>) -> EngineError {
     coded("E_SUPPLIED_ETAS", None, message.into())

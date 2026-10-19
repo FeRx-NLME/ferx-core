@@ -307,9 +307,9 @@ where
 ///
 /// # Errors
 ///
-/// As [`simulate_adaptive`], plus `E_SUPPLIED_ETAS` when the supplied η are not named
-/// as the model's, or a simulated subject has none under
-/// [`UnmatchedSubjects::Refuse`] (the default).
+/// As [`simulate_adaptive`], plus `E_SUPPLIED_ETAS` when the model has a `[mixture]`
+/// (the run carries no class), the supplied η are not named as the model's, or a
+/// simulated subject has none under [`UnmatchedSubjects::Refuse`] (the default).
 pub fn simulate_adaptive_with_inputs<F, C>(
     model: &CompiledModel,
     population: &Population,

@@ -205,10 +205,12 @@ How supplied η are used:
 | Replicates | A supplied η is the same in every replicate. κ, the controller's assay and the residual error are still drawn. |
 | The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
 | The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
+| A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run does not carry the class: it would simulate every subject under class 1. |
 
 A refusal names its cause: IDs and rows that differ in count, a row with the
 wrong number of values or a non-finite one, a repeated ID, η names that are not
-the model's, a fit of another model (`from_fit`), or an unmatched subject.
+the model's, a fit of another model (`from_fit`), a `[mixture]` model, or an
+unmatched subject.
 
 A supplied η̂ is a point estimate, and the run treats it as exact. For a subject
 with few observations (high shrinkage) that understates how uncertain the

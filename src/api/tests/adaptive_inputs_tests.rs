@@ -474,6 +474,59 @@ fn supplied_eta_refusals_carry_their_code_and_text() {
     assert_eq!(c, code);
 }
 
+// Two-class mixture on CL. Class 2 clears 4× faster, so a class-2 subject's η̂
+// simulated under class 1 is a wrong number, not a rounding difference.
+const ODE_MIXTURE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta MIXL(0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// #2162 review, finding 1: the adaptive run carries no mixture class, so supplied η
+/// on a `[mixture]` model are refused. Both sides of the gate: the same η on the same
+/// population run on the class-free model.
+#[test]
+fn supplied_eta_on_a_mixture_model_is_refused() {
+    let mixture = parse_model_string(ODE_MIXTURE).expect("parse mixture");
+    assert!(mixture.mixture.is_some(), "the fixture is a mixture model");
+    let plain = parse_model_string(ODE_IIV).expect("parse");
+    let pop = population(&["1"]);
+    let e = etas(&[("1", 0.2)]);
+    let opts = options(1, ObserveMode::Ipred);
+    let run = |m: &CompiledModel| {
+        let inputs = AdaptiveInputs::new(&m.default_params).with_etas(&e);
+        simulate_adaptive_with_inputs(m, &pop, &inputs, 1, hold_all, &opts)
+    };
+    assert_eq!(
+        refusal(run(&mixture)),
+        (
+            "E_SUPPLIED_ETAS".to_string(),
+            "supplied η are not supported on a [mixture] model. Each subject's η was \
+             estimated under its own mixture class, and an adaptive run simulates every \
+             subject under class 1"
+                .to_string()
+        )
+    );
+    assert!(run(&plain).is_ok(), "the class-free model takes supplied η");
+}
+
 /// More than ten unmatched subjects: the list is cut at ten and the rest counted.
 #[test]
 fn unmatched_list_is_capped_at_ten() {
