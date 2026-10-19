@@ -2148,6 +2148,17 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: while set, every certified-linear segment integrated on this thread is
+    /// declined by the matrix exponential and integrated instead, as a real decline would be
+    /// (#2143 review). A model file cannot produce a decline that does not also diverge, and
+    /// the stagnation guard's decrement has to be seen refusing one. Per thread, so a test
+    /// sets it inside a one-worker pool and no other test can see it.
+    pub(crate) static FORCE_LINEAR_DECLINE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 thread_local! {
     /// Per-thread collector for [`SolverStatsScope`]. `None` when no scope is active, which
     /// is every production integration outside the post-fit diagnostic pass.
@@ -2326,10 +2337,16 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // individually. A segment it declines is integrated as `Auto` would integrate it.
     if opts.method == OdeMethod::Linear {
         if (t_span.1 - t_span.0).abs() >= 1e-15 {
-            if let Some(out) =
-                super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
-            {
-                return out;
+            #[cfg(test)]
+            let declined_by_test = FORCE_LINEAR_DECLINE.get();
+            #[cfg(not(test))]
+            let declined_by_test = false;
+            if !declined_by_test {
+                if let Some(out) =
+                    super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
+                {
+                    return out;
+                }
             }
             if let Some(s) = stats.as_deref_mut() {
                 s.linear_declined_segments += 1;

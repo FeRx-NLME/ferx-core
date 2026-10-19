@@ -1345,6 +1345,7 @@ fn test_ebe_result_converged_flag() {
         nll: 1.5,
         kappas: Vec::new(),
         hard_reject: false,
+        screen_moved: false,
     };
     assert!(r.converged);
     assert!(!r.used_fallback);
@@ -1568,6 +1569,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1628,6 +1630,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1652,6 +1655,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
             true,
         )
@@ -1723,6 +1727,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         ebe_variance: EbeVariance::Conditional,
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
+        screen: 0,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -1842,6 +1847,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 1.0,
             kappas: Vec::new(),
             hard_reject: false,
+            screen_moved: false,
         },
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
@@ -1853,6 +1859,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 2.0,
             kappas: Vec::new(),
             hard_reject: false,
+            screen_moved: false,
         },
     ];
     // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -1885,6 +1892,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         nll: 1.0,
         kappas: Vec::new(),
         hard_reject,
+        screen_moved: false,
     };
     // One hard-rejected subject with a single observation, one normal subject.
     let results = [make(true), make(false)];
@@ -4713,4 +4721,68 @@ fn far_seed_on_config_1_still_reaches_the_deeper_mode() {
         r.nll,
         trapped.nll
     );
+}
+
+/// The identity path's first-step scaling is decided once, at the first iterate (#2093).
+/// Fixture: `f = −eˣ` from `x₀ = −0.2`, so ‖g₀‖ = 0.82 (below 1: no scaling) and after the
+/// unit first step ‖g₁‖ = 1.86. The function is concave, so `sᵀy < 0` and BFGS skips its
+/// update: `h_inv` is still the identity at iteration 2 and its first trial is `x₁ + 1.86`.
+/// Before, the flag cleared only when the scaling fired, so iteration 2 rescaled by 1/‖g₁‖
+/// and tried `x₁ + 1` (mutation, run: restoring `first_step = false` inside the `if`).
+#[test]
+fn the_identity_first_step_scaling_is_decided_once() {
+    use std::cell::RefCell;
+    let trials = RefCell::new(Vec::new());
+    let obj = |x: &[f64]| {
+        trials.borrow_mut().push(x[0]);
+        -x[0].exp()
+    };
+    let grad = |x: &[f64]| vec![-x[0].exp()];
+    let never = |_: &[f64]| false;
+    let mut x = vec![-0.2];
+    dense_bfgs_core(
+        &obj, &grad, &mut x, 1, 2, 1e-12, None, None, None, &never, false,
+    );
+    let t = trials.borrow();
+    // trials[0] is the start's own objective; [1] the first iteration's α = 1 trial.
+    let x0 = -0.2f64;
+    // ‖g₀‖ < 1, so the identity step is −g₀ = +e^{x₀}, accepted at α = 1 (f is decreasing).
+    let x1 = x0 + x0.exp();
+    assert!((t[1] - x1).abs() < 1e-12, "first trial {} vs {x1}", t[1]);
+    let g1 = x1.exp();
+    assert!(g1 > 1.0, "fixture premise: ‖g₁‖ = {g1} must exceed 1");
+    let second = t[2];
+    assert!(
+        (second - (x1 + g1)).abs() < 1e-12,
+        "iteration 2's first trial is {second}: expected the unscaled x₁ + ‖g₁‖ = {}, not \
+         the rescaled x₁ + 1 = {}",
+        x1 + g1,
+        x1 + 1.0
+    );
+}
+
+/// L-BFGS's empty-history direction on the identity path takes the same 1/‖g‖ first-step
+/// scaling dense BFGS always had (#2099): from a steep start the first trial point is one unit
+/// along `−g/‖g‖`.
+#[test]
+fn lbfgs_scales_its_identity_first_step_like_dense_bfgs() {
+    use std::cell::RefCell;
+    let trials = RefCell::new(Vec::new());
+    let obj = |x: &[f64]| {
+        trials.borrow_mut().push(x.to_vec());
+        0.5e6 * (x[0] - 1.0).powi(2) + 0.5e6 * (x[1] + 2.0).powi(2)
+    };
+    let grad = |x: &[f64]| vec![1e6 * (x[0] - 1.0), 1e6 * (x[1] + 2.0)];
+    let never = |_: &[f64]| false;
+    let mut x = vec![0.0, 0.0];
+    lbfgs_core(&obj, &grad, &mut x, 2, 1, 1e-8, None, None, &never, false);
+    let t = &trials.borrow()[1];
+    let step = (t[0].powi(2) + t[1].powi(2)).sqrt();
+    assert!(
+        (step - 1.0).abs() < 1e-12,
+        "first trial {t:?} is {step} from the start, not 1"
+    );
+    let g0 = [-1e6f64, 2e6];
+    let gn = (g0[0] * g0[0] + g0[1] * g0[1]).sqrt();
+    assert!((t[0] + g0[0] / gn).abs() < 1e-12 && (t[1] + g0[1] / gn).abs() < 1e-12);
 }

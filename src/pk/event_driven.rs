@@ -1094,15 +1094,12 @@ fn event_driven_predictions_with_schedule_impl(
                 // bolus path's `F·AMT` jump.
             }
             EventKind::Obs => {
-                let v = pk_now.v();
                 // Read from the central-compartment slot — depot for slot 0
-                // on oral models, central for slot 1.
-                let conc = if v > 0.0 {
-                    state[central_slot] / v
-                } else {
-                    0.0
-                };
-                preds[ev.orig_idx] = conc.max(0.0);
+                // on oral models, central for slot 1. A `NaN` is kept (#2039).
+                preds[ev.orig_idx] = crate::sens::propagate::central_concentration_g(
+                    state[central_slot],
+                    pk_now.v(),
+                );
             }
             EventKind::PkOnly => {
                 // EVID=2: $PK ran at this row but state is unchanged;
@@ -2561,6 +2558,106 @@ mod tests {
         let mut p = pk_three(cl, v1, q2, v2, q3, v3);
         p.values[crate::types::PK_IDX_KA] = ka;
         p
+    }
+
+    /// #2039: a subject whose `CL` or `V` is `NaN` from one record on (a covariate that
+    /// varies within the subject and is unusable on that record) is served `NaN` there
+    /// and after, and its finite value before. The walk used to serve 0 from that record
+    /// on, so the subject scored against a confident zero with a finite objective.
+    /// Both central slots are covered: slot 0 on an IV model, slot 1 on an oral one.
+    ///
+    /// Mutations (run): restore `conc.max(0.0)` as the floor in
+    /// `central_concentration_g` → every row dies (0 served); drop its
+    /// `|| v.val().is_nan()` → the `V` rows die; restore this walk's own inline
+    /// `if v > 0.0 { .. } else { 0.0 }` readout → every row dies.
+    #[test]
+    fn a_nan_clearance_or_volume_from_one_record_on_is_served_as_nan_not_zero() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let bad_from = 2; // TIME 4
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut good = pk_two(5.0, 80.0, 3.0, 40.0);
+                good.values[crate::types::PK_IDX_KA] = 1.2;
+                let mut bad = good;
+                bad.values[idx] = f64::NAN;
+                let pk_dose = vec![good; subj.doses.len()];
+                let pk_obs: Vec<PkParams> = (0..obs_times.len())
+                    .map(|j| if j < bad_from { good } else { bad })
+                    .collect();
+                let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
+                for (j, p) in preds.iter().enumerate() {
+                    if j < bad_from {
+                        assert!(
+                            p.is_finite() && *p > 0.0,
+                            "{model:?} {label}: record {j} precedes the NaN and must be \
+                             finite: {preds:?}"
+                        );
+                    } else {
+                        assert!(
+                            p.is_nan(),
+                            "{model:?} {label} = NaN from record {bad_from} on: record {j} \
+                             must be served NaN, not {p}: {preds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2039: with the parameter `NaN` on every record, the walk and the superposition
+    /// closed form give the same `NaN` (the superposition one since #1399), so whether a
+    /// subject's unusable covariate is reported no longer depends on whether that
+    /// covariate happens to vary over time. No observation sits on a dose time: there no
+    /// time has elapsed, the walk reads the dose itself, and a `NaN` `CL` has not yet
+    /// acted on it.
+    ///
+    /// Mutation (run): restore `conc.max(0.0)` → the walk serves 0, superposition `NaN`.
+    #[test]
+    fn event_driven_and_superposition_agree_on_a_constant_nan_parameter() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 4.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
+                pk.values[crate::types::PK_IDX_KA] = 1.2;
+                pk.values[idx] = f64::NAN;
+                let walk = event_driven_predictions(
+                    model,
+                    &subj,
+                    &vec![pk; subj.doses.len()],
+                    &vec![pk; obs_times.len()],
+                    &[],
+                );
+                let superposition: Vec<f64> = obs_times
+                    .iter()
+                    .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                    .collect();
+                assert!(
+                    superposition.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: premise — superposition serves NaN: {superposition:?}"
+                );
+                assert!(
+                    walk.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: the walk must serve the NaN superposition does, \
+                     not {walk:?}"
+                );
+            }
+        }
     }
 
     #[test]

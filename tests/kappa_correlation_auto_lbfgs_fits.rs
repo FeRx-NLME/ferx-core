@@ -9,6 +9,12 @@
 //! The fits must agree with each other, and none may end above the nested kappa-only fit.
 //! The numbers in the bounds are Linux (`tools/linux-test.sh`), see each constant.
 //!
+//! **Not run under `nn`.** The two fits touch no neural-network code, and they take
+//! 8m25s in CI. `slow-tests.yml`'s `nn` leg runs the whole workspace a second time under
+//! a 100-minute budget, and on a slow runner it already took 99 minutes, so after #2127
+//! the leg timed out partway through the `nn` tests (run 39166097699, #1239). The core
+//! leg runs both fits on every push.
+//!
 //! - `tests/data/mbma_placebo_corr/` — ferx-r's `mbma_placebo` example (synthetic data,
 //!   generator in ferx-r's `inst/examples/mbma_placebo/simulate_dataset.R`), plus
 //!   `theta RHO` and `correlation car1(RHO) by OCC`: the reporter's model.
@@ -159,8 +165,8 @@ const MBMA_NESTED_TOL: f64 = 0.0;
 
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn mbma_placebo_car1_reaches_one_optimum_from_every_start() {
     let fits: Vec<(f64, FitResult)> = [0.01, 0.3, 0.6]
@@ -189,8 +195,8 @@ const EXACT3_NESTED_TOL: f64 = 0.0;
 
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn nested_exact3_ar1_reaches_one_optimum_from_every_start() {
     let fits: Vec<(f64, FitResult)> = [-0.3, 0.5]

@@ -116,6 +116,20 @@ pub(crate) fn reject_unsupported_adaptive(
             ),
         ));
     }
+    // LTBS (`log(DV) ~ additive(…)`) puts the prediction and σ on the log scale. The
+    // driver reads and noises the linear readout and returns it unlogged, so a `Dv`
+    // signal would carry a log-scale σ on a linear value and every trajectory row
+    // would disagree with `simulate()` (#2129).
+    if model.log_transform {
+        return Err(super::entry_refusals::adaptive_unsupported(
+            Some("error_model"),
+            "adaptive-dosing simulation does not support a log-transformed error model \
+             (`log(DV) ~ …` / `DV ~ log_additive(…)`): the controller reads and noises the \
+             linear readout and the trajectories are returned unlogged, so they would not be \
+             on the model's scale. Use an untransformed error model for the adaptive \
+             simulation.",
+        ));
+    }
     // Time-varying covariates (and `TIME`-in-PK, #700), IOV (#701), and system-reset
     // events (EVID=3, #716) are all now supported by the reactive driver and are no
     // longer rejected here.
@@ -316,6 +330,7 @@ where
         .map(|spec| crate::sim::adaptive::AdaptiveMonitor {
             spec,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let make = move || {
@@ -810,6 +825,32 @@ where
                 ),
             };
 
+            // `[scaling]` Form A/B divides the model's readout (#2129): a monitor that
+            // reads it (no `observe` expression) gets the divisor of its compartment,
+            // evaluated per subject as `apply_scaling` does, under the η the driver
+            // hands the readout (the decision window's `[η | κ]` under IOV).
+            let has_obs_scale = !matches!(model.scaling, crate::types::ScalingSpec::None);
+            let monitor_scales: Vec<_> = monitors
+                .iter()
+                .map(|am| {
+                    let cmt = am.spec.cmt;
+                    move |eta: &[f64]| {
+                        crate::pk::obs_scale_divisors(model, subject, &params.theta, eta, &[cmt])[0]
+                    }
+                })
+                .collect();
+            let subject_monitors: Vec<crate::sim::adaptive::AdaptiveMonitor> = monitors
+                .iter()
+                .zip(&monitor_scales)
+                .map(|(am, scale)| crate::sim::adaptive::AdaptiveMonitor {
+                    spec: am.spec,
+                    observe: am.observe,
+                    obs_scale: (has_obs_scale && am.observe.is_none())
+                        .then_some(scale as &dyn Fn(&[f64]) -> f64),
+                })
+                .collect();
+            let monitors = subject_monitors.as_slice();
+
             // A fresh controller per (subject, replicate) — see the factory note.
             let mut controller = make_controller();
             // A refusal carries the code of its kind; a runtime failure carries none (#1983).
@@ -888,7 +929,37 @@ where
 
             // Tagged trajectory rows (Ipred only). `run.predictions` is indexed
             // by the subject's observation grid, exactly like `emit_subject_rows`.
-            for (j, &pred) in run.predictions.iter().enumerate() {
+            // The driver (and the replay that verified it) return the bare readout;
+            // `[scaling]` Form A/B is applied here, as `simulate()` applies it (#2129).
+            let mut predictions = run.predictions;
+            match eta_occ.as_deref() {
+                None => crate::pk::apply_scaling(
+                    model,
+                    subject,
+                    &params.theta,
+                    &eta_slice,
+                    &mut predictions,
+                ),
+                // IOV: each row divides under its decision window's `[η | κ]` — the eta
+                // the driver read the row with (`occasion_of`, as `compute_event_pk_params_iov`
+                // resolves it) — as `predict_iov` scales each occasion under its own κ.
+                Some(eo) if has_obs_scale => {
+                    for (j, pred) in predictions.iter_mut().enumerate() {
+                        let eta_j = crate::pk::occasion_of(decision_times, subject.obs_times[j])
+                            .map_or(eta_slice.as_slice(), |g| eo[g].as_slice());
+                        let scale = crate::pk::obs_scale_divisors(
+                            model,
+                            subject,
+                            &params.theta,
+                            eta_j,
+                            &subject.obs_cmts[j..=j],
+                        )[0];
+                        *pred = crate::pk::divide_by_obs_scale(*pred, scale);
+                    }
+                }
+                Some(_) => {}
+            }
+            for (j, &pred) in predictions.iter().enumerate() {
                 trajectories.push(SimulationResult {
                     draw: 1,
                     sim,
@@ -954,6 +1025,13 @@ where
                         mon.observe,
                         mon.spec.cmt,
                     )
+                    .into_iter()
+                    // The pass integrates the bare readout. Its divisor is one constant
+                    // per subject here — `auc_target` is refused above under IOV and
+                    // time-varying covariates — so dividing the window AUC is dividing
+                    // every grid point (#2129).
+                    .map(|auc| mon.scale_readout(auc, &eta_slice))
+                    .collect()
                 }
                 _ => Vec::new(),
             };
@@ -1574,6 +1652,7 @@ pub fn simulate_adaptive_from_spec(
     let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
         spec: &compiled.monitors[0],
         observe: compiled.observe.as_ref(),
+        obs_scale: None,
     }];
 
     run_adaptive_population(

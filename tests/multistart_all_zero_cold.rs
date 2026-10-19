@@ -21,7 +21,10 @@
 //! reports OFV −235.559329, `converged = false`, `W_EBE_START_DEPENDENT` and
 //! `TVCL = 1.065939` (the optimum of the trapped objective; macOS arm64); with the fix,
 //! −235.559336063, `converged = true` and `TVCL = 1.066269578`, the same to the printed
-//! 9 decimals on Linux and macOS arm64. Both run in under a second.
+//! 9 decimals on Linux and macOS arm64. Both run in under a second. With #2013's screen
+//! on (the default), the fixed fit gives −235.559336071 and also reports the screen-moved
+//! `W_EBE_START_DEPENDENT` for subject 1, which is correct: its deeper mode is off every
+//! axis. The test tells that warning apart from #1565's trapped-basin one.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, FitResult};
@@ -89,6 +92,12 @@ fn run(inner_restarts: usize) -> FitResult {
     fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("the fit runs")
 }
 
+/// Whether `w` is #2013's screen-moved warning. It shares the `W_EBE_START_DEPENDENT`
+/// token with #1565's trapped-basin warning, which is the one this test is about.
+fn is_screen_moved(w: &str) -> bool {
+    w.contains("Sobol screen")
+}
+
 fn eta_ka(result: &FitResult, id: &str) -> f64 {
     let s = result
         .subjects
@@ -112,7 +121,7 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
     let start_dependent: Vec<&String> = fixed
         .warnings
         .iter()
-        .filter(|w| w.contains("W_EBE_START_DEPENDENT"))
+        .filter(|w| w.contains("W_EBE_START_DEPENDENT") && !is_screen_moved(w))
         .collect();
     println!(
         "#2014 inner_restarts=1: OFV {:.9}, converged {}, {} iterations, TVCL {:.9}, \
@@ -127,6 +136,18 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
         start_dependent.is_empty(),
         "the optimizer minimised under EBEs a cold re-solve beats (#2014): {start_dependent:?}"
     );
+    // Subject 1's deeper mode is off every axis, the case #2013's screen exists for, so
+    // the final cold solve's screen reaches it and descent from η = 0 does not. That
+    // warning is correct here, and it names subject 1 alone.
+    let screen_moved: Vec<&String> = fixed
+        .warnings
+        .iter()
+        .filter(|w| is_screen_moved(w))
+        .collect();
+    assert!(
+        screen_moved.len() == 1 && screen_moved[0].contains("of 1 subject (1)"),
+        "the screen-moved warning should name subject 1 alone: {screen_moved:?}"
+    );
     assert!(
         fixed.converged,
         "the fit was restarted out of a trapped basin (#1565) instead of starting in the \
@@ -138,7 +159,8 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
         eta_ka(&fixed, "1")
     );
     // Both references are this test's own run, identical to 9 decimals on Linux and macOS
-    // arm64 (OFV −235.559336063, TVCL 1.066269578). The OFV bound is a sanity
+    // arm64 (OFV −235.559336071 with the #2013 screen on, −235.559336063 without it;
+    // TVCL 1.066269578 either way). The OFV bound is a sanity
     // check only: the reported OFV is a cold re-solve either way, and the trapped fit's is
     // 7e-6 away. The TVCL bound is what separates the two optima: 1.065939 is 3.3e-4 away,
     // 3.3× the bound.

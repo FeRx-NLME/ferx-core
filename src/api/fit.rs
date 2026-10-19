@@ -2656,12 +2656,9 @@ fn fit_inner(
         // ODE models with resets are handled correctly (ode_dense_solve_states applies
         // the reset as a break-point); this warning is analytical-only.
         //
-        // One nuance for a TV-covariate ODE subject, already inside
-        // W_DERIVED_CMT_TV_ODE's scope above: that state pass is frozen at the
-        // first-observation snapshot throughout, so an `[odes] init(...)` re-seeded at a
-        // reset uses that snapshot rather than the reset row's own, while `ipred` uses the
-        // reset row's (#1133). Self-consistent within the pass and covered by the warning,
-        // but it means the two can differ by the covariate ratio at the reset.
+        // An `[odes] init(...)` re-seeded at a reset reads the reset row's own snapshot
+        // in the state pass, as `ipred` does (#1133, #2133); only the disposition stays
+        // at the first-observation snapshot, which W_DERIVED_CMT_TV_ODE above covers.
         if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \

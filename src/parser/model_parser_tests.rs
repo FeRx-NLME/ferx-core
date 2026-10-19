@@ -10399,6 +10399,26 @@ fn test_parse_inner_restarts() {
 }
 
 #[test]
+fn test_parse_inner_screen() {
+    // Default is 100 (the #2013 Sobol screen on); the key sets N, and `0` disables it.
+    let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+        .unwrap()
+        .fit_options
+        .inner_screen;
+    assert_eq!(default, 100);
+    for (line, want) in [
+        ("  method = focei\n  inner_screen = 300", 300),
+        ("  method = focei\n  inner_screen = 0", 0),
+    ] {
+        let parsed = parse_full_model(&minimal_model_with_fit_options(line)).unwrap();
+        assert_eq!(parsed.fit_options.inner_screen, want, "{line}");
+        let unused = parsed.fit_options.unsupported_keys_warnings();
+        assert!(unused.is_empty(), "{line} is a focei key: {unused:?}");
+    }
+    assert!(parse_full_model(&minimal_model_with_fit_options("  inner_screen = -1")).is_err());
+}
+
+#[test]
 fn test_fit_options_defaults() {
     // Guard against accidental drift in defaults — documented as:
     //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,

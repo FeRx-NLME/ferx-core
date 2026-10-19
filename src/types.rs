@@ -8284,6 +8284,19 @@ pub struct FitOptions {
     /// unaffected — an alternate seed that reconverges to the same mode is not
     /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
+    /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
+    /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start
+    /// [`inner_restarts`](Self::inner_restarts) gates, before its per-coordinate scan, so it
+    /// runs only on the same cold solves and `inner_restarts = 0` disables it too. Each
+    /// subject scores `inner_screen` Sobol points drawn from `N(0, 4Ω)` on its individual
+    /// objective, descends from the 3 lowest, and keeps a result only when it is lower
+    /// than the mode it already has and more than 0.5 from it in the Ω⁻¹ metric. A per-
+    /// coordinate scan cannot reach a mode that is off every axis — the flip-flop twin of
+    /// a one-compartment oral subject, where `CL`, `V` and `KA` move together — and this
+    /// can. The stream is keyed by the subject's ID, so a subject screens the same points
+    /// whatever the thread count or its position in the data. The IOV inner solve has no
+    /// multi-start and runs no screen.
+    pub inner_screen: usize,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -9167,6 +9180,9 @@ impl Default for FitOptions {
             // *accepts* a strictly-lower mode. Unimodal subjects stay bit-identical;
             // set `inner_restarts = 0` to disable. See `FitOptions::inner_restarts`.
             inner_restarts: 1,
+            // On by default (#2013): the screen runs on the cold solves the multi-start
+            // already runs on. See `FitOptions::inner_screen`.
+            inner_screen: 100,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
@@ -10552,6 +10568,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_screen",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10572,6 +10589,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_screen",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10593,6 +10611,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_screen",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10610,6 +10629,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_screen",
             "inner_optimizer",
             "gn_lambda",
             "nn_l2",
@@ -10620,6 +10640,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_screen",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",

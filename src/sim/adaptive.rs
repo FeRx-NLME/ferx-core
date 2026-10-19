@@ -159,6 +159,25 @@ impl MonitorSpec {
 pub(crate) struct AdaptiveMonitor<'a> {
     pub spec: &'a MonitorSpec,
     pub observe: Option<&'a crate::ode::OdeOutputFn>,
+    /// The `[scaling]` Form A/B divisor of the model readout this monitor reads, as
+    /// a function of the η in force (the decision window's `[η | κ]` under IOV) —
+    /// the divisor `predict()` / `simulate()` apply to an observation on `spec.cmt`
+    /// (#2129). `None` when nothing divides the readout: no `[scaling]`, a Form C
+    /// `y = <expr>` readout (already in observation units), or an `observe`
+    /// expression, which names its own signal.
+    pub obs_scale: Option<&'a dyn Fn(&[f64]) -> f64>,
+}
+
+impl AdaptiveMonitor<'_> {
+    /// `raw` — the readout at `spec.cmt` — in observation units under `eta`; the
+    /// identity when [`Self::obs_scale`] is `None`. An invalid divisor reads `NaN`,
+    /// which the driver refuses as a non-finite signal.
+    pub(crate) fn scale_readout(&self, raw: f64, eta: &[f64]) -> f64 {
+        match self.obs_scale {
+            Some(scale) => crate::pk::divide_by_obs_scale(raw, scale(eta)),
+            None => raw,
+        }
+    }
 }
 
 /// What a controller returns at one decision: the dose [`DoseAction`]s to apply,

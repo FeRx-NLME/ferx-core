@@ -59,7 +59,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/api/pool.rs",
-        "with_fit_scope",
+        "with_scope",
         2,
         "runtime: the fit-scoped worker pool could not be built; its ODE-option refusal is coded (#2044)",
     ),

@@ -134,6 +134,7 @@ jobs:
             --test cmt_data_selection_scope \
             --test cmt_endpoint_scope \
             --test dose_compartment_routing \
+            --test kappa_correlation_auto_lbfgs_fits \
             --test lagged_zero_order_break_times \
             --test level_no_gaussian_nonmem_anchor \
             --test markov_nonmem \
@@ -146,6 +147,7 @@ jobs:
             --test one_snapshot_dose_reads_survival \
             --test pktte_prestart_entry \
             --test pktte_tdep_nonmem_anchor \
+            --test profiled_levels_fits \
             --test reset_clock_nonmem_anchor \
             --test sampler_covariance_non_gaussian \
             --test ss_chz_nonmem_anchor \

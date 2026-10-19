@@ -238,6 +238,32 @@ monitor therefore reproduces the `Ipred` monitor sample for sample on a Form C
 readout, negative samples included; on the bare-state readout the floor still
 applies, so the two agree only where the latent value is non-negative.
 
+### Monitors and trajectories are on the model's scale
+
+A monitor with no `observe` expression — every programmatic [`MonitorSpec`], and
+the declarative block under `with_assay_error` — reads the model's readout for its
+compartment **including** a Form A / Form B `[scaling]` divisor
+(`obs_scale = V`, `obs_scale[CMT=n] = …`), the same value an observation on that
+compartment reports in `predict()` / `simulate()`. A `Dv` monitor draws its σ on
+that scaled value, and the `auc_target` exposure metric integrates it. The
+trajectory rows carry the same divisor, so a controller that holds reproduces
+`simulate()` row for row. An `observe` expression names its own signal and is
+never divided again: under `obs_scale = V`, `observe = central / V` is the
+concentration.
+
+The divisor is the one `predict()` uses: evaluated per subject at the baseline
+covariates, and — under IOV — with the κ of the decision window the reading falls
+in. Before #2129 the adaptive path skipped Forms A and B entirely: every
+trajectory row and every observe-less signal came back as the bare amount (×`V`
+for `obs_scale = V`), so a controller titrated against a value `V` times too
+high, with no warning. Form C (`y = central / V`) was always honoured.
+
+A log-transformed error model — `log(DV) ~ additive(…)` / `DV ~ log_additive(…)`
+(LTBS) — is refused (`E_ADAPTIVE_UNSUPPORTED`). `simulate()` reports such a model's
+predictions as `ln(IPRED)`, but the reactive driver reads, noises and returns the
+linear readout, so its trajectories and a `Dv` signal would not be on the model's
+scale.
+
 ## Example
 
 ```rust
