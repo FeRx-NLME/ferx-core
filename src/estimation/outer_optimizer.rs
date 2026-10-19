@@ -2575,11 +2575,25 @@ fn failure_is_converged_plateau(
     made_progress && plateaued && consistent && left_init
 }
 
+/// Can [`per_subject_outer_gradients`] be formed for this objective at all — not an AGQ or
+/// mixture objective, and the model inside the analytic outer scope? Asked on its own by
+/// [`predicted_remaining_gain`] before the tight re-solve it would otherwise pay for a
+/// certain `None` (#2143 review).
+fn per_subject_outer_gradients_in_scope(model: &CompiledModel, options: &FitOptions) -> bool {
+    options.agq_nodes().is_none()
+        && model.mixture.is_none()
+        && crate::sens::provider::analytic_outer_gradient_available(model)
+}
+
 /// Per-subject outer gradients `∂nllᵢ/∂x` (packed space) at `x`, from the same analytic
 /// entry points the optimizer's gradient is assembled from, for [`bhhh_newton_decrement`]
 /// (#1934). `None` whenever any subject has no analytic gradient — an AGQ or mixture
 /// objective, a model outside the analytic outer scope, or one subject the provider
 /// declines — so the decrement is never formed from a mix of exact and salvaged rows.
+///
+/// Production reads it through [`per_subject_outer_gradients_checked`], which also asks
+/// whether each subject's integration backs a decrement; this unchecked form is the tests'.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn per_subject_outer_gradients(
     model: &CompiledModel,
@@ -2590,10 +2604,49 @@ fn per_subject_outer_gradients(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<Vec<Vec<f64>>> {
-    if options.agq_nodes().is_some()
-        || model.mixture.is_some()
-        || !crate::sens::provider::analytic_outer_gradient_available(model)
-    {
+    per_subject_outer_gradients_checked(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        options,
+        false,
+    )
+}
+
+/// Did one subject's integrations solve the trajectory the decrement assumes (#2143 review)?
+/// Not when a segment stopped short and kept its padded tail (a stop the driver discarded
+/// and re-solved does not count, as in the post-fit `kept_unfinished_segments`), diverged, or
+/// — on a model routed to the exact path — was declined by the matrix exponential and
+/// integrated instead, at the fit's tolerance and outside the tight re-solve.
+fn integration_backs_a_decrement(st: &crate::ode::solver::OdeSolverStats) -> bool {
+    let kept_unfinished = st
+        .unfinished_segments
+        .saturating_sub(st.discarded_unfinished_segments);
+    kept_unfinished == 0 && st.diverged_segments == 0 && st.linear_declined_segments == 0
+}
+
+/// [`per_subject_outer_gradients`], and with `require_complete` also `None` when any
+/// subject's integration stopped short of its horizon (#2143 review). The driver pads a
+/// segment that exhausts its step budget on a finite state with the last state (#603), so
+/// the prediction stays finite and so does the gradient formed from it — of a trajectory
+/// that was never integrated. Each subject's walk is counted on its own worker
+/// ([`crate::ode::solver::SolverStatsScope`] is per thread), and a stop the driver
+/// discarded and re-solved does not count.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_outer_gradients_checked(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    require_complete: bool,
+) -> Option<Vec<Vec<f64>>> {
+    if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
     let iov = crate::sens::provider::iov_sens_supported(model);
@@ -2602,7 +2655,8 @@ fn per_subject_outer_gradients(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            if iov {
+            let scope = require_complete.then(crate::ode::solver::SolverStatsScope::enter);
+            let gradient = if iov {
                 let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
                 for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
                     stacked.extend(kap.iter().copied());
@@ -2624,7 +2678,11 @@ fn per_subject_outer_gradients(
                     ehs[i].as_slice(),
                     options.interaction,
                 )
+            };
+            if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
+                return None;
             }
+            gradient
         })
         .collect()
 }
@@ -2714,6 +2772,22 @@ fn bhhh_newton_decrement(
 /// has nothing left in it a user could act on.
 const LATCH_MAX_PREDICTED_GAIN: f64 = 0.1;
 
+/// The `ode_reltol` an integrated model's decrement is formed at (#2001); a fit already
+/// tighter keeps its own. Not a threshold: the decrement is compared against
+/// [`LATCH_MAX_PREDICTED_GAIN`] as on a closed form, and this only has to put the
+/// integrator's contribution far below it. Measured on Linux x86_64 against the exact
+/// (matrix-exponential) value of the same linear models: within 1.3e-5 (rk45) and 1.1e-4
+/// (rosenbrock23) on `two_cpt_iv_ode`, whose default-tolerance decrement at its optimum is
+/// 1.85 against an exact 0.008; and 5.7e-7 against the closed form's 5.8e-7 at NONMEM's
+/// optimum of the #1934 model (the default tolerance reads up to 1.7e-4 there).
+const DECREMENT_ODE_RELTOL: f64 = 1e-9;
+
+/// How much the step budget grows for the tight re-solve. Tightening the default
+/// `ode_reltol` 1e-5× costs an order-`p` stepper ~(1e5)^(1/p) more steps: ~10× for rk45,
+/// ~46× for rosenbrock23, whose step control runs on an O(h³) local error. 100 covers both
+/// with 2× headroom; it is a cap, paid only by a solve that needs it.
+const DECREMENT_ODE_MAX_STEPS_FACTOR: usize = 100;
+
 /// The warning for a stagnation latch that overrode the #1934 veto: a Newton step from
 /// the best point still predicted `gain`, but a full re-armed window did not realise any
 /// of it.
@@ -2733,17 +2807,79 @@ fn gain_is_negligible(predicted_gain: Option<f64>) -> bool {
     predicted_gain.is_none_or(|gain| gain <= LATCH_MAX_PREDICTED_GAIN)
 }
 
+/// The ODE solver override [`predicted_remaining_gain`] re-solves an integrated model under
+/// (#2001), or `None` when nothing integrates: a closed form without an absorption twin,
+/// or an ODE model `auto` solves exactly by matrix exponential (#852), whose gradient is
+/// already exact. The spec is the model's own or, for a closed form, its absorption twin's
+/// ([`CompiledModel::honors_ode_solver_opts`]); a model has one or the other.
+///
+/// `reltol` drops to [`DECREMENT_ODE_RELTOL`] and `abstol` by the same factor, so their
+/// ratio — the state scale the model was written for — is kept; the step budget grows by
+/// [`DECREMENT_ODE_MAX_STEPS_FACTOR`]. Every other field is the fit's own override, so a
+/// caller's `ode_method` reaches the re-solve. Read on the thread the objective closure
+/// runs on, where the fit's override is armed, so `effective_solver_opts` is what the fit
+/// actually integrates at.
+fn decrement_ode_override(
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> Option<crate::ode::solver::OdeSolverOverride> {
+    let spec = model.ode_spec.as_ref().or_else(|| {
+        model
+            .absorption_ode_equivalent
+            .as_ref()
+            .and_then(|eq| eq.built().ode_spec.as_ref())
+    })?;
+    let eff = spec.effective_solver_opts();
+    if eff.method == crate::ode::OdeMethod::Linear {
+        return None;
+    }
+    let reltol = eff.reltol.min(DECREMENT_ODE_RELTOL);
+    Some(crate::ode::solver::OdeSolverOverride {
+        reltol: Some(reltol),
+        abstol: Some(eff.abstol * (reltol / eff.reltol)),
+        max_steps: Some(eff.max_steps.saturating_mul(DECREMENT_ODE_MAX_STEPS_FACTOR)),
+        ..options.ode_solver_override()
+    })
+}
+
+/// The incumbent's per-subject EBEs as inner-loop warm starts: `η̂`, then each occasion
+/// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
+/// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
+/// (#2001 review). A subject with no κ cells is its `η̂` alone.
+fn joint_warm_starts(ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> Vec<DVector<f64>> {
+    ehs.iter()
+        .enumerate()
+        .map(|(i, eta)| {
+            let cells = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            DVector::from_iterator(
+                eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
+                eta.iter()
+                    .chain(cells.iter().flat_map(|c| c.iter()))
+                    .copied(),
+            )
+        })
+        .collect()
+}
+
 /// [`bhhh_newton_decrement`] of the objective the optimizer minimises (−2LL plus any prior
 /// or covariate-NN penalty) at packed `x` with EBEs `ehs` / `kappas`, or `None` where it is
 /// not trusted to separate a creep from an optimum.
 ///
-/// It is formed only on an **exact** objective: an ODE model, or a closed-form one whose
-/// absorption twin integrates some subjects ([`CompiledModel::honors_ode_solver_opts`]),
-/// is skipped. Its analytic gradient is that of the integrated objective at the solver's
-/// tolerance, and the two disagree by enough to swamp the signal: `two_cpt_iv_ode` at the
-/// default `ode_reltol` reads 2.0–2.5 at its optimum (L-BFGS and BOBYQA), against 2e-9 at
-/// `ode_reltol = 1e-9`. Its own latch at the default tolerance is 4.1 OFV short of that
-/// optimum and reads 7.8, so no single threshold separates the two there.
+/// On an integrated model ([`decrement_ode_override`]) the analytic gradient is that of the
+/// objective at the solver's tolerance, and at the default `ode_reltol` the difference
+/// swamps the signal: `two_cpt_iv_ode` reads 1.85 at its optimum, where the exact value is
+/// 0.008, so the closed form's threshold would never let it stop (#2001; before it, the
+/// decrement was withheld from every ODE model, and their fits latched on the OFV window
+/// alone). So both the EBEs and the per-subject gradients are re-solved at the incumbent at
+/// a tight tolerance, the EBEs warm-started from `ehs` and `kappas` ([`joint_warm_starts`]),
+/// under a scope every worker carries.
+/// The EBEs too, not only the gradient: an η̂ solved under the integrator's error is not
+/// stationary for the tight objective, and the gradient, formed as if it were, carries the
+/// difference — 2.14 at NONMEM's optimum of the #1934 model under rosenbrock23 with the
+/// gradient alone tightened, 5.7e-7 with both. A pass that cannot be formed (a scope that
+/// cannot be built, a re-solve that leaves a subject unconverged or start-rejected, a
+/// gradient out of scope, a non-finite component) is `None`, which latches as before
+/// #1934.
 #[allow(clippy::too_many_arguments)]
 fn predicted_remaining_gain(
     model: &CompiledModel,
@@ -2757,11 +2893,40 @@ fn predicted_remaining_gain(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
-    if model.honors_ode_solver_opts() {
+    if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
-    let per_subject =
-        per_subject_outer_gradients(model, population, init_params, x, ehs, kappas, options)?;
+    let per_subject = match decrement_ode_override(model, options) {
+        None => {
+            // A model routed to the exact path is checked too: a segment the matrix
+            // exponential declines is integrated at the fit's tolerance (#2143 review).
+            let checked = model.honors_ode_solver_opts();
+            per_subject_outer_gradients_checked(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+                kappas,
+                options,
+                checked,
+            )?
+        }
+        Some(ode) => {
+            #[cfg(test)]
+            TIGHT_RESOLVES.with(|n| n.set(n.get() + 1));
+            tight_per_subject_gradients(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+                kappas,
+                options,
+                ode,
+            )?
+        }
+    };
     let n = x.len();
     let theta = unpack_params(x, init_params).theta;
     let mut penalty_grad = vec![0.0; n];
@@ -2778,6 +2943,65 @@ fn predicted_remaining_gain(
         bounds,
         &packed_fixed_mask(init_params),
     )
+}
+
+/// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
+/// tight ODE override `ode` ([`predicted_remaining_gain`], #2001). `None` when the scope
+/// cannot be built, the re-solve leaves a subject unconverged or start-rejected, or the
+/// gradients cannot be formed.
+#[allow(clippy::too_many_arguments)]
+fn tight_per_subject_gradients(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    ode: crate::ode::solver::OdeSolverOverride,
+) -> Option<Vec<Vec<f64>>> {
+    crate::api::with_fit_scope_ode(options, ode, || {
+        let params = unpack_params(x, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let warm = joint_warm_starts(ehs, kappas);
+        let (ehs, _, stats, kappas) = run_inner_loop_warm_seeded(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm),
+            Some(&mu_k),
+            0,
+            0,
+            InnerHessianSeed::for_options(options),
+            options,
+        );
+        // The decrement assumes every η̂ is a mode; one that did not converge (or a
+        // start the inner loop refused) still yields a finite gradient, formed as if
+        // it were. No decrement then — the latch proceeds as before #1934.
+        if stats.n_unconverged > 0 || stats.n_start_rejected > 0 {
+            return None;
+        }
+        per_subject_outer_gradients_checked(
+            model,
+            population,
+            init_params,
+            x,
+            &ehs,
+            &kappas,
+            options,
+            true,
+        )
+    })
+    .ok()?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
+    /// test can see that an out-of-scope objective skips one (#2143 review).
+    static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
