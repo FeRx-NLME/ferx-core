@@ -450,8 +450,8 @@ pub struct AdaptiveSubjectMetrics {
     pub auc_target_attainment: Option<f64>,
     /// Whether this subject's η was supplied (`AdaptiveInputs::with_etas`, #1594)
     /// rather than drawn from Ω. Its between-subject variability is then conditioned
-    /// on, not simulated: across replicates it varies by κ, the assay and the
-    /// residual noise only.
+    /// on, not simulated: across replicates it varies by κ and a `Dv` monitor's assay
+    /// only (adaptive trajectories carry no residual error).
     pub eta_supplied: bool,
 }
 

@@ -75,7 +75,9 @@ impl<'a> AdaptiveInputs<'a> {
     }
 
     /// Simulate each subject the `etas` carry at its own η. A supplied η stays fixed
-    /// across replicates; κ, the assay and the residual noise are still drawn.
+    /// across replicates; κ and a `Dv` monitor's assay are still drawn. Adaptive
+    /// trajectories carry no residual error, so without IOV or an assay the replicates
+    /// of a supplied subject are identical.
     pub fn with_etas(mut self, etas: &'a SuppliedEtas) -> Self {
         self.etas = Some(etas);
         self

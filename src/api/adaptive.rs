@@ -300,8 +300,8 @@ where
 /// [`AdaptiveInputs`] (#1594).
 ///
 /// With [`AdaptiveInputs::with_etas`], each subject the [`SuppliedEtas`] carry is
-/// simulated at its own η in every replicate, instead of a draw from Ω; κ, the assay
-/// and the residual noise are drawn as before. A supplied subject still consumes its
+/// simulated at its own η in every replicate, instead of a draw from Ω; κ and a `Dv`
+/// monitor's assay are drawn as before. A supplied subject still consumes its
 /// draw from the η stream, so every other subject's drawn η is the one the same seed
 /// gives without supplied η.
 ///

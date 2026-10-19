@@ -202,7 +202,7 @@ How supplied η are used:
 | Matching | By subject ID. A supplied subject that is not in the simulated population is ignored. |
 | A simulated subject with no supplied η | Refused (`E_SUPPLIED_ETAS`), listing the IDs. With `.with_unmatched(UnmatchedSubjects::Draw)` its η is drawn from Ω instead, so known and virtual patients can share one run. |
 | A row | Every η of the model, named and ordered as the model's. There is no partial row: under a block Ω the missing η would need a draw conditional on the given ones. |
-| Replicates | A supplied η is the same in every replicate. κ, the controller's assay and the residual error are still drawn. |
+| Replicates | A supplied η is the same in every replicate. κ and the controller's assay (a `Dv` monitor) are still drawn. Adaptive trajectories carry no residual error, so without IOV or an assay the replicates of a supplied subject are identical. |
 | The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
 | The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
 | A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run does not carry the class: it would simulate every subject under class 1. |
