@@ -171,7 +171,8 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 | Job | Command | Purpose |
 |-----|---------|---------|
 | **Check** | `tools/preflight.sh check` | The five `cargo check` feature sets — `ci`, `ci,survival,slow-tests`, `ci,markov`, `ci,nn,slow-tests`, and the workspace members under `ferx-core/ci`. Covers every feature combo, including the ones no per-PR test job builds (#1157) |
-| **Tests + coverage (core)** | `cargo llvm-cov --workspace --tests --features ferx-core/ci` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — and produces the per-PR patch-coverage report (`fast` flag) |
+| **Tests + coverage (core k/4)** | `cargo llvm-cov --workspace --features ferx-core/ci $(tools/ci-test-shard.py args k 4)` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — split by test binary over four runners (#2167); the four shard lists together are `--tests` |
+| **Tests + coverage (core)** | `codecov/codecov-action` on the shard reports | Uploads the four shards' lcov files as one per-PR patch-coverage report (`fast` flag) |
 | **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <each endpoint test file> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
 | **Clippy** | `tools/preflight.sh clippy` | Lint `ferx-core` under `ci,markov,nn` with `--all-targets` (without it a third of the repo — every `#[cfg(test)]` module and all of `tests/` — goes unlinted, #1023), then the workspace members |
 | **Format** | `tools/preflight.sh fmt` | Enforce consistent formatting (`--all`: the workspace members too). `.githooks/pre-commit` runs this same group |

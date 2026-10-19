@@ -404,9 +404,23 @@ jobs:
   # features, and `--tests` ⊇ `--lib` plus both of those integration files — so it
   # was removed rather than kept paying an 11-min lib compile twice over. The
   # nightly toolchain is still exercised per-PR by `Check`, `Clippy` and `Format`.
+  #
+  # Sharded by test binary (#2167): `--tests` ran the ~300 binaries serially, ~44
+  # of a ~56 min job. Each matrix runner builds the same instrumented workspace
+  # and runs its share — `tools/ci-test-shard.py` balances them from
+  # `tools/ci-test-weights.txt` and reads the target list from `cargo metadata`,
+  # so a new test file is always scheduled. `coverage-pr-upload` then sends the N
+  # lcov files to Codecov as ONE `fast` upload, so Codecov sees exactly what the
+  # unsharded job sent (no partial-upload patch status). The ~10 min compile is
+  # paid per shard: rust-cache holds dependencies only, never ferx-core itself.
   coverage-pr:
-    name: Tests + coverage (core)
+    name: Tests + coverage (core ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports, like `--no-fail-fast` within one.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # PRs *and* pushes to `main`. The `push` half matters: the removed `Test` job
     # had no `if:` and so ran on main pushes, and this is now the only job that
     # executes the base suite — without `push` a merge commit would run no tests
@@ -415,7 +429,6 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     permissions:
       contents: read
-      pull-requests: write # for the below-floor nudge comment
     # Stable, not nightly: `--features ci` has no nightly-only code.
     # Keeps the instrumented `ci-cov` cache warm across runs
     # (stable rustc bumps ~6-weekly vs nightly daily). See the endpoints job.
@@ -447,6 +460,8 @@ jobs:
         # fits here tolerate the ThinLTO-off fit slowdown that the nightly
         # `coverage`/`slow-tests` jobs avoid by staying on `ci-test`. `--tests`
         # so the integration tests both run and count (same rationale as nightly).
+        # (Now spelled as this shard's `--lib --bins` / `--test NAME` list, whose
+        # union over the shards is `--tests` — see the job comment above.)
         #
         # `--workspace` + package-qualified `ferx-core/ci` (#1114): the `ferx`
         # CLI moved from `src/bin/run_model.rs` into `crates/ferx-cli`, and its
@@ -479,12 +494,52 @@ jobs:
         # with the guards off, and arming it there fails them for doing the right thing.
         env:
           FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
-        run: cargo llvm-cov --workspace --tests --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov $(python3 tools/ci-test-shard.py args ${{ matrix.shard }} ${{ strategy.job-total }}) --lcov --output-path lcov.info
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lcov-core-${{ matrix.shard }}
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 3
+
+  # One Codecov upload for all `coverage-pr` shards (#2167), and the job that carries
+  # the `Tests + coverage (core)` name the `main-protection` ruleset REQUIRES. So it
+  # must go red when a shard does, not be skipped: GitHub counts a skipped job as a
+  # passing required check, and plain `needs:` skips this job on a red shard — a PR
+  # with failing tests would show every required check green. Hence `!cancelled()`
+  # plus the explicit result check as the first step, which also stops the upload
+  # (as before, when a red test run skipped the upload step).
+  coverage-pr-upload:
+    name: Tests + coverage (core)
+    needs: coverage-pr
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+    permissions:
+      contents: read
+      pull-requests: write # for the below-floor nudge comment
+    steps:
+      - name: Every test shard passed
+        if: needs.coverage-pr.result != 'success'
+        run: |
+          echo "::error::a \`Tests + coverage (core k/N)\` shard ended '${{ needs.coverage-pr.result }}' — see that job's log"
+          exit 1
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: lcov-core-*
+          path: lcov
+      - name: List the shard reports
+        id: lcov
+        run: |
+          files=$(find lcov -name lcov.info | sort | paste -sd, -)
+          echo "$files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7
         with:
-          files: lcov.info
+          files: ${{ steps.lcov.outputs.files }}
           flags: fast
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

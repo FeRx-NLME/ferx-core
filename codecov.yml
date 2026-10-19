@@ -8,7 +8,8 @@
 #   project/floor_weekly -> 90% floor ENFORCED on the weekly main run (goes red
 #                           below 90%); never evaluated on PRs, so it blocks no one
 # Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci, from
-# `Tests + coverage (core)`) + `survival`, `markov` AND `nn`, which are ALL uploaded
+# `Tests + coverage (core)`, one upload carrying the lcov files of its four test
+# shards, #2167) + `survival`, `markov` AND `nn`, which are ALL uploaded
 # from the single `Tests + coverage (TTE/CTMM endpoints)` job (--features
 # ci,markov,nn, and `markov = ["survival"]` so that build is a strict superset of a
 # survival-only one); nightly upload = `slow` flag (--features ci,slow-tests).
