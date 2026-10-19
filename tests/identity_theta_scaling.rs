@@ -93,8 +93,9 @@ fn tvv_s(result: &FitResult) -> f64 {
 fn a_large_identity_theta_reaches_the_minimum_under_auto() {
     let r = fit_with(Optimizer::Auto, ParameterScaling::Auto);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // PLACEHOLDER band: macOS arm64 gives −286.0042 (33 iterations) and
-    // TVV_S 773770.6; to be set from a Linux x86_64 run.
+    // Linux x86_64 (glibc 2.28), at 327f7442: OFV −286.0042195068 in 33
+    // iterations, 2.0e-5 from OFV_MIN, so the 1e-3 band has 50× headroom; TVV_S
+    // 773770.613, 0.013 from the bound's centre, against 100.
     assert!(
         (r.ofv - OFV_MIN).abs() < 1e-3,
         "auto: OFV {} is not the minimum {OFV_MIN} (stalled fits end at {OFV_STALLED})",
@@ -115,8 +116,10 @@ fn a_large_identity_theta_reaches_the_minimum_under_auto() {
 fn a_large_identity_theta_reaches_the_minimum_under_bobyqa() {
     let r = fit_with(Optimizer::Bobyqa, ParameterScaling::Auto);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // PLACEHOLDER band: macOS arm64 gives −285.9834 (173 iterations) and
-    // TVV_S 774411.0; to be set from a Linux x86_64 run.
+    // Linux x86_64 (glibc 2.28), at 327f7442: OFV −286.0015322000 in 173
+    // iterations, 0.0027 above OFV_MIN, so the 0.05 band has 18× headroom and
+    // still sits 20 below the stall. BOBYQA stops short of the minimum, so TVV_S
+    // (773868.45) is not pinned.
     assert!(
         r.ofv < OFV_MIN + 0.05 && r.ofv > OFV_MIN - 1e-3,
         "bobyqa: OFV {} is not within 0.05 of the minimum {OFV_MIN} \
@@ -133,7 +136,8 @@ fn a_large_identity_theta_reaches_the_minimum_under_bobyqa() {
 fn an_explicit_none_still_leaves_the_large_identity_theta_stalled() {
     let r = fit_with(Optimizer::Auto, ParameterScaling::None);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // PLACEHOLDER band: macOS arm64 gives −265.4195 and TVV_S 999999.99999.
+    // Linux x86_64 (glibc 2.28), at 327f7442: OFV −265.4195452100 in 25
+    // iterations, 4.5e-4 from OFV_STALLED against 0.05; TVV_S 999999.999987.
     assert!(
         (r.ofv - OFV_STALLED).abs() < 0.05,
         "none: OFV {} should stay at the stall {OFV_STALLED}; if it reaches the \
