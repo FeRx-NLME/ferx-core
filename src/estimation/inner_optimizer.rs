@@ -537,6 +537,10 @@ pub struct EbeResult {
     /// OFV. Unlike plain non-convergence this forces rejection regardless of
     /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub hard_reject: bool,
+    /// True when the cold multi-start's Sobol screen (#2013) replaced the EBE the
+    /// search would otherwise have returned. The final re-solve names these subjects in
+    /// `W_EBE_START_DEPENDENT`.
+    pub(crate) screen_moved: bool,
 }
 
 /// Positive conditional Gauss–Newton metric for dense-BFGS initialization.
@@ -906,6 +910,10 @@ pub(crate) struct InnerSolvePolicy {
     /// at the requested tolerance. Diagnostic, covariance, ODE/FREM, FD, and AGQ/Laplace
     /// solves keep strict behaviour.
     pub(crate) accelerate_exact_outer: bool,
+    /// Size `N` of the Sobol screen a cold multi-start runs before its per-coordinate
+    /// scan (#2013, `FitOptions::inner_screen`). `0`, the `Default`, is the historical
+    /// solve with no screen.
+    pub(crate) screen: usize,
 }
 
 impl InnerSolvePolicy {
@@ -920,6 +928,7 @@ impl InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(options, model),
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
+            screen: options.inner_screen,
         }
     }
 }
@@ -1573,13 +1582,10 @@ pub fn find_ebe(
     )
 }
 
-/// [`find_ebe`] under a stage's residual-variance convention ([`EbeVariance`], #1722).
-///
-/// The public [`find_ebe`] is the generic conditional EBE search and stays that way; a
-/// caller that scores the result with a FOCE marginal — a covariance stencil, a
-/// per-subject FD salvage, a mixture class solve — reads the convention from
-/// [`EbeVariance::for_options`] and passes it here, so the EBE it re-solves is the mode
-/// of the objective that marginal is linearised around.
+/// [`find_ebe`] under a given residual-variance convention ([`EbeVariance`], #1722) and
+/// no #2013 screen: what a test uses to set one convention against another. Production
+/// callers use [`find_ebe_for_stage`], which also runs the stage's screen.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_with_variance(
     model: &CompiledModel,
@@ -1610,8 +1616,14 @@ pub(crate) fn find_ebe_with_variance(
     )
 }
 
-/// [`find_ebe_with_variance`] under the convention of the stage `options` describe — what
-/// every production caller uses, so the convention is never a value a call site picks.
+/// [`find_ebe`] under the stage `options` describe: its residual-variance convention
+/// ([`EbeVariance`], #1722) and its `inner_screen` (#2013), with the historical BFGS seed.
+///
+/// The public [`find_ebe`] is the generic conditional EBE search and stays that way; a
+/// caller that scores the result with a FOCE marginal — a covariance stencil, a
+/// per-subject FD salvage, a mixture class solve — re-solves here, so the EBE it gets is
+/// the mode of the objective that marginal is linearised around, found the way the fit
+/// found it. Every production caller uses this, so neither is a value a call site picks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_for_stage(
     model: &CompiledModel,
@@ -1624,7 +1636,8 @@ pub(crate) fn find_ebe_for_stage(
     restarts: usize,
     stage: &crate::types::FitOptions,
 ) -> EbeResult {
-    find_ebe_with_variance(
+    let schedule = cacheable_schedule(model, subject);
+    find_ebe_impl(
         model,
         subject,
         params,
@@ -1633,7 +1646,14 @@ pub(crate) fn find_ebe_for_stage(
         eta_init,
         mu_k,
         restarts,
-        EbeVariance::for_options(stage, model),
+        schedule.as_ref(),
+        // The historical seed, as `find_ebe_with_variance` uses; only the convention and
+        // the #2013 screen come from the stage.
+        InnerSolvePolicy {
+            ebe_variance: EbeVariance::for_options(stage, model),
+            screen: stage.inner_screen,
+            ..InnerSolvePolicy::default()
+        },
     )
 }
 
@@ -1677,6 +1697,10 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// #2013 screen descents that came back lower than the incumbent but within
+    /// `SCREEN_MIN_OMEGA_DIST` of it, so the distance gate alone turned them away.
+    pub(crate) static SCREEN_SAME_BASIN_REJECTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -1731,6 +1755,7 @@ fn find_ebe_impl(
             nll: 1e20,
             kappas: Vec::new(),
             hard_reject: true,
+            screen_moved: false,
         };
     }
 
@@ -2194,9 +2219,62 @@ fn find_ebe_solve(
     // reconverges to the same basin is rejected by that guard. So a scanned
     // coordinate's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
     // strictly better mode.
+    // A candidate that replaces the incumbent replaces its convergence flag too
+    // (`ebe_converged = ok`, in both the screen and the axis scan): a descent that stopped
+    // at `inner_maxiter` below a converged incumbent is not a mode, and keeping the
+    // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
+    // It is still taken — it is strictly lower, so likely in the better basin.
+    let mut screen_moved = false;
     if restarts > 0 && !is_warm_start(eta_init) {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        // ── Sobol screen (`[fit_options] inner_screen`, #2013) ──────────────
+        // The axis scan below re-seeds one coordinate at a time, so it cannot reach a
+        // mode that lies off every axis: the flip-flop twin of a one-compartment oral
+        // subject sits where `η_ka` and `η_V` move together (`ka ↔ CL/V`), and a cold
+        // BFGS from η = 0 and every axis seed descend into the same shallower basin.
+        // The screen scores `policy.screen` quasi-random points from `N(0, 4Ω)`, keyed
+        // by the subject's ID, and descends from the `SCREEN_TOP_K` lowest. A descent
+        // replaces the incumbent only when it is lower by more than the same `1e-9` the
+        // axis scan uses AND lies more than `SCREEN_MIN_OMEGA_DIST` from it in the Ω⁻¹
+        // metric: a descent that reconverges to the incumbent's basin, whatever its
+        // objective, never moves the EBE. So a unimodal subject is bit-identical to
+        // `inner_screen = 0`, at the price of `N` objective evaluations and `K` descents
+        // per cold solve.
+        if policy.screen > 0 {
+            let starts = screen_starts(&obj, &params.omega, n_eta, policy.screen, &subject.id);
+            for start in starts {
+                let mut cand = start;
+                let ok = inner_minimize_with_grad(
+                    &obj,
+                    &agrad,
+                    &mut cand,
+                    n_eta,
+                    max_iter,
+                    tol,
+                    precond.as_deref(),
+                    None,
+                    stop_precond,
+                    &stall_at,
+                    false,
+                );
+                if !cand.iter().all(|v| v.is_finite()) {
+                    continue;
+                }
+                let cand_nll = obj(&cand);
+                if cand_nll + 1e-9 < nll {
+                    if omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST {
+                        nll = cand_nll;
+                        eta = cand;
+                        ebe_converged = ok;
+                        screen_moved = true;
+                    } else {
+                        #[cfg(test)]
+                        SCREEN_SAME_BASIN_REJECTS.with(|n| n.set(n.get() + 1));
+                    }
+                }
+            }
+        }
         // Reset / TV-covariate subjects (family 1) scan every coordinate, exactly
         // as before — bit-identical. Everyone else (family 2) is probed per
         // coordinate and scans only the weakly-identified ones, so well-informed
@@ -2240,7 +2318,7 @@ fn find_ebe_solve(
                         if cand_nll + 1e-9 < nll {
                             nll = cand_nll;
                             eta = cand;
-                            ebe_converged = ebe_converged || ok;
+                            ebe_converged = ok;
                         }
                     }
                 }
@@ -2332,6 +2410,7 @@ fn find_ebe_solve(
         nll,
         kappas: Vec::new(),
         hard_reject: false,
+        screen_moved,
     })
 }
 
@@ -2697,6 +2776,7 @@ fn find_ebe_iov(
             nll: start_nll,
             kappas: kappas_vec,
             hard_reject: true,
+            screen_moved: false,
         };
     }
 
@@ -2809,6 +2889,7 @@ fn find_ebe_iov(
         nll,
         kappas: kappas_vec,
         hard_reject: false,
+        screen_moved: false,
     }
 }
 
@@ -4874,6 +4955,66 @@ const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
 /// covariate's own variance, so its Mahalanobis distance stays O(1) and it never trips this.
 const RUNAWAY_EBE_MAHA_PER_ETA: f64 = 100.0;
 
+/// Starts the #2013 screen descends from: the lowest-objective Sobol points it scores.
+const SCREEN_TOP_K: usize = 3;
+/// Scale of the #2013 screen's proposal: `N(0, (2)²·Ω)`, twice the prior SD per axis.
+const SCREEN_SD_MULT: f64 = 2.0;
+/// Least Ω⁻¹-metric distance from the incumbent η̂ at which a #2013 screen descent counts
+/// as a different mode.
+const SCREEN_MIN_OMEGA_DIST: f64 = 0.5;
+
+/// Starts the #2013 screen keeps: the [`SCREEN_TOP_K`] lowest of `n` Sobol points from
+/// `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first. A point whose objective is not
+/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
+/// depends neither on the worker thread nor on the subject's position in the data. Empty
+/// when there is nothing to draw, or more random effects than the Sobol table carries.
+fn screen_starts(
+    obj: &dyn Fn(&[f64]) -> f64,
+    omega: &crate::types::OmegaMatrix,
+    n_eta: usize,
+    n: usize,
+    subject_id: &str,
+) -> Vec<Vec<f64>> {
+    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms, SOBOL_MAX_DIMS};
+    if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
+        return Vec::new();
+    }
+    let mut scored: Vec<(f64, Vec<f64>)> = sobol_uniforms(n_eta, n, screen_seed(subject_id))
+        .into_iter()
+        .filter_map(|u| {
+            let z = DVector::from_iterator(
+                n_eta,
+                u.iter().map(|&ui| SCREEN_SD_MULT * inv_normal_cdf(ui)),
+            );
+            let e: Vec<f64> = (&omega.chol * z).iter().copied().collect();
+            let v = obj(&e);
+            v.is_finite().then_some((v, e))
+        })
+        .collect();
+    // Stable, and `total_cmp` is a total order, so ties keep Sobol order.
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    scored
+        .into_iter()
+        .take(SCREEN_TOP_K)
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed
+/// function of the ID's bytes, unlike `std`'s randomly keyed hasher.
+fn screen_seed(subject_id: &str) -> u64 {
+    subject_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// `‖a − b‖` in the prior's Ω⁻¹ metric: the #2013 screen's test that a descent reached a
+/// different mode, not the incumbent's basin again.
+fn omega_distance(a: &[f64], b: &[f64], omega: &crate::types::OmegaMatrix) -> f64 {
+    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    ebe_prior_maha(&d, omega).sqrt()
+}
+
 /// Squared Mahalanobis distance of an EBE under the prior, `ηᵀΩ⁻¹η` — the metric the
 /// runaway guard (see [`RUNAWAY_EBE_MAHA_PER_ETA`]) tests. Uses the cached `Ω⁻¹` the
 /// individual objective already carries, so this costs `O(n_eta²)` flops and no
@@ -5185,9 +5326,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
         restarts,
         InnerSolvePolicy {
             seed,
-            ebe_variance: EbeVariance::for_options(stage, model),
-            capture_terminal_hessian: false,
-            accelerate_exact_outer: false,
+            ..InnerSolvePolicy::for_stage(stage, model)
         },
         // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
         // Gauss–Newton and the trust region, which would carry a placeholder into a
@@ -5312,6 +5451,7 @@ fn cancelled_ebe_placeholder(
         nll: f64::INFINITY,
         kappas: vec![DVector::zeros(model.n_kappa); n_occ],
         hard_reject: true,
+        screen_moved: false,
     }
 }
 
@@ -5409,3 +5549,7 @@ mod tests;
 #[cfg(test)]
 #[path = "inner_optimizer_iov_tests.rs"]
 mod iov_tests;
+
+#[cfg(test)]
+#[path = "inner_optimizer_screen_tests.rs"]
+mod screen_tests;

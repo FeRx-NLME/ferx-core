@@ -1244,6 +1244,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
         .map(|s| AdaptiveMonitor {
             spec: s,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let base = make_subject(vec![], obs_times.to_vec());
@@ -1674,6 +1675,7 @@ fn adaptive_tv_decision_between_records_reads_locf_covariate() {
     let mons = vec![AdaptiveMonitor {
         spec: &spec,
         observe: Some(&obs_fn),
+        obs_scale: None,
     }];
     // Hold every decision — we only care about the monitored signal it recorded.
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
@@ -1982,6 +1984,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         .map(|s| AdaptiveMonitor {
             spec: s,
             observe: None,
+            obs_scale: None,
         })
         .collect();
     let base = make_subject(vec![], obs_times.to_vec());
@@ -2090,6 +2093,7 @@ fn adaptive_iov_threads_occasion_eta_into_readout() {
     let mons = vec![AdaptiveMonitor {
         spec: &spec,
         observe: Some(&obs_fn),
+        obs_scale: None,
     }];
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
         actions: vec![DoseAction::Hold],
@@ -6363,6 +6367,109 @@ fn ode_reset_reseeds_each_reset_from_its_own_snapshot() {
 }
 
 #[test]
+fn state_pass_reseeds_co_timed_resets_from_the_last_row() {
+    // #2133: the state pass re-seeds a reset at its own row, and of two resets within
+    // `EVENT_MATCH_TOL` the event-driven walk applies both in order, so the last row's
+    // seed survives. The reader shifts co-timed reset rows `RESET_SEGMENT_GAP` apart, so
+    // this pair is reachable only from a hand-built subject: no anchor can tell the first
+    // match from the last. Reset 0 -> baseline 20, reset 1 -> baseline 35, then decay under
+    // KIN = 10, KOUT = 2 to t = 7: 5 + 30·e^{−4} = 5.5496, against 5 + 15·e^{−4} = 5.2747
+    // from the first match. The observation at t = 5 sits between the two rows, so it reads
+    // reset 0's 20: the two resets are distinct breaks (the timeline dedups at 1e-15), and
+    // matching every reset in the band at the first one reads reset 1's 35 there (PR #2141
+    // review). Tight tolerances: at the defaults the solve is 3e-5 relative off the closed
+    // form.
+    let mut ode = turnover_ode_spec_with_init();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-10;
+    let pk = pk_kin_kout(10.0, 2.0); // baseline 5
+    let obs_times = vec![0.0, 5.0, 7.0];
+    let mut subj = make_subject(Vec::new(), obs_times.clone());
+    subj.reset_times = vec![5.0, 5.0 + 1e-13];
+    let pk_obs = vec![pk; obs_times.len()];
+    let pk_reset = vec![pk_kin_kout(40.0, 2.0), pk_kin_kout(70.0, 2.0)];
+
+    let (ipred, states) = ode_predictions_event_driven_with_states(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &[],
+        &pk_obs,
+        &[],
+        &pk_reset,
+    );
+    assert_relative_eq!(states[0][0], 5.0, epsilon = 1e-6);
+    assert_relative_eq!(ipred[1], 20.0, epsilon = 1e-6);
+    assert_relative_eq!(states[1][0], 20.0, epsilon = 1e-6);
+    let want = 5.0 + 30.0 * (-4.0_f64).exp();
+    assert_relative_eq!(ipred[2], want, epsilon = 1e-6);
+    assert_relative_eq!(states[2][0], want, epsilon = 1e-6);
+}
+
+#[test]
+fn state_pass_reseeds_a_reset_on_the_final_break() {
+    // #2133: the walk's last break has no next one (`t_end == t_start`), so a reset there
+    // cannot be told apart from a later reset by `rt < t_end`. A reset co-timed with the
+    // last observation must still re-seed it (baseline 20) rather than leave the
+    // equilibrium 5 in place.
+    let mut ode = turnover_ode_spec_with_init();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-10;
+    let pk = pk_kin_kout(10.0, 2.0); // baseline 5
+    let obs_times = vec![0.0, 5.0];
+    let mut subj = make_subject(Vec::new(), obs_times.clone());
+    subj.reset_times = vec![5.0];
+    let pk_obs = vec![pk; obs_times.len()];
+    let pk_reset = vec![pk_kin_kout(40.0, 2.0)]; // baseline 20
+
+    let (ipred, states) = ode_predictions_event_driven_with_states(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &[],
+        &pk_obs,
+        &[],
+        &pk_reset,
+    );
+    assert_relative_eq!(ipred[1], 20.0, epsilon = 1e-6);
+    assert_relative_eq!(states[1][0], 20.0, epsilon = 1e-6);
+}
+
+#[test]
+fn state_pass_seeds_init_from_the_first_record_not_the_first_observation() {
+    // #2133: an EVID=2 row before the first observation carries KIN = 40 (baseline 20);
+    // the observation's own snapshot has KIN = 10 (baseline 5). `init()` follows the first
+    // record, so the states start at 20, then integrate under the observation's KIN = 10,
+    // KOUT = 2 to R(1) = 5 + 15·e^{−2} — as IPRED does, whose segment ending at the
+    // observation reads that record's snapshot. Seeding from the first observation, as the
+    // state pass did, reads 5 (a seed at equilibrium).
+    let mut ode = turnover_ode_spec_with_init();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-10;
+    let obs_times = vec![1.0];
+    let mut subj = make_subject(Vec::new(), obs_times.clone());
+    subj.pk_only_times = vec![0.0];
+    let pk_obs = vec![pk_kin_kout(10.0, 2.0)];
+    let pk_only = vec![pk_kin_kout(40.0, 2.0)];
+
+    let (ipred, states) = ode_predictions_event_driven_with_states(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &[],
+        &pk_obs,
+        &pk_only,
+        &[],
+    );
+    let want = 5.0 + 15.0 * (-2.0_f64).exp();
+    assert_relative_eq!(ipred[0], want, epsilon = 1e-6);
+    assert_relative_eq!(states[0][0], want, epsilon = 1e-6);
+}
+
+#[test]
 fn ode_init_uses_chronologically_first_record_not_first_dose() {
     // Regression (Copilot review #1): with time-varying covariates the init
     // snapshot must come from the earliest record by TIME, not the first
@@ -8045,6 +8152,7 @@ fn adaptive_observe_expression_flows_through_driver() {
     let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
         spec: &compiled.monitors[0],
         observe: compiled.observe.as_ref(),
+        obs_scale: None,
     }];
     let run = ode_predictions_adaptive_impl(
         model.ode_spec.as_ref().unwrap(),
