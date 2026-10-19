@@ -865,12 +865,19 @@ that is still going somewhere:
   The veto is not repeatable at a point that does not move: if a re-armed window ends
   with the best point unchanged, the guard stops anyway and adds a warning with the
   predicted gain that was not realised.
-  It runs only where the per-subject gradients are exact: closed-form FOCE/FOCEI models
-  in the analytic-gradient scope, without a mixture. An ODE model's analytic gradient
-  carries the integrator's error, which at the default `ode_reltol` puts the decrement at
-  an optimum in the same range as a genuine creep, so ODE models (and closed-form models
-  with an absorption ODE twin) stop on the OFV window alone, as do Laplace/AGQ, mixture
-  and `gradient = fd` fits.
+  It runs on FOCE/FOCEI models in the analytic-gradient scope, without a mixture;
+  Laplace/AGQ, mixture and `gradient = fd` fits stop on the OFV window alone.
+  ODE models are included (#2001). One that `auto` solves exactly by matrix
+  exponential gets the closed form's decrement directly. One that is integrated —
+  or a closed-form model whose absorption ODE twin integrates some subjects — has an
+  analytic gradient that carries the integrator's error, and at the default
+  `ode_reltol` that error alone can read as more than the threshold at an optimum
+  (1.85 on `two_cpt_iv_ode`, whose exact value there is 0.008). So for those the guard
+  re-solves the EBEs and the per-subject gradients at the best point at a tight
+  tolerance first: `ode_reltol` capped at 1e-9, `ode_abstol` moved by the same factor,
+  and a larger step budget. The threshold is the closed form's 0.1. This costs one
+  extra inner solve and gradient pass each time a window expires, and only on
+  integrated models.
 
 ## Options That Don't Apply to the Selected Method
 
