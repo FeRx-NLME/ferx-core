@@ -7982,9 +7982,11 @@ pub fn ode_predictions_with_states(
 ///
 /// `ipred` is exact (the event-driven path uses per-event PK parameters). The
 /// compartment `states`, however, are derived from a second pass of the dense walk
-/// behind [`ode_dense_solve_states`], whose **disposition** (CL, V, etc.) and `init()`
-/// are the first observation's PK parameters held fixed for the entire timeline. Every
-/// dose-record quantity — absorption kernel, pathway fraction, route lag, zero-order
+/// behind [`ode_dense_solve_states`], whose **disposition** (CL, V, etc.) is the first
+/// observation's PK parameters held fixed for the entire timeline. `init()` is not part of
+/// that approximation: it is seeded from the subject's first record of any kind and
+/// re-seeded at each EVID=3/4 reset from that reset row's own parameters, as `ipred`
+/// seeds it (#2133). Every dose-record quantity — absorption kernel, pathway fraction, route lag, zero-order
 /// `dur`, compartment lag, `F`, `D{n}`/`R{n}` and the SS run-in — is read at its own
 /// dose record (`pk_at_dose`), as `ipred` reads it (#1575). For subjects whose
 /// disposition genuinely varies between observations the states will be approximate.
@@ -8276,12 +8278,15 @@ fn apply_segment_boundary(
     );
     // EVID=3/4 reset: re-seed compartments before processing doses at this time.
     // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
-    // Each reset overwrites the state, so of several co-timed ones the last row's seed is
-    // the one the event-driven walk leaves behind.
+    // Each reset overwrites the state, so of several resets on this break the last row's
+    // seed is the one the event-driven walk leaves behind. A reset that has a break of its
+    // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
+    // precedes it, as an observation between the two rows does in the event-driven walk.
+    // On the final break (`t_end == t_start`) nothing later exists.
     if let Some(r) = subject
         .reset_times
         .iter()
-        .rposition(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
+        .rposition(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start))
     {
         *u = ode.initial_state(init_reads.reset(disposition, r));
     }
