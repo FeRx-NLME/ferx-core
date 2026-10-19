@@ -261,6 +261,151 @@ fn resolve_scaling_routes_auto_by_optimizer() {
     assert_eq!(resolve_scaling(Abs, Optimizer::Slsqp), Abs);
 }
 
+/// A template for `nlopt_scale_vector` (#2146): θ in packed order
+/// `[TVCL 5 (log), TVBIG 1e6 (log), B_BIG 1e6, B_SMALL -0.01, B_10 10, B_10P5 10.5,
+/// B_NEG -1e6]`, the last five identity-packed, then one Ω diagonal and one Σ.
+///
+/// `TVBIG` packs to ln(1e6) ≈ 13.8, above the threshold, so a rule that forgot to
+/// ask about the packing would scale it. `B_10` and `B_10P5` sit on the two sides of
+/// the `> 10` gate.
+fn identity_scale_template() -> ModelParameters {
+    use crate::types::{OmegaMatrix, SigmaVector};
+    ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
+        theta: vec![5.0, 1e6, 1e6, -0.01, 10.0, 10.5, -1e6],
+        theta_names: [
+            "TVCL", "TVBIG", "B_BIG", "B_SMALL", "B_10", "B_10P5", "B_NEG",
+        ]
+        .map(String::from)
+        .to_vec(),
+        theta_lower: vec![0.1, 1.0, -5e7, -1.0, -500.0, -500.0, -5e7],
+        theta_upper: vec![50.0, 1e8, 5e7, 1.0, 500.0, 500.0, 5e7],
+        theta_fixed: vec![false; 7],
+        omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
+        omega_fixed: vec![false],
+        sigma: SigmaVector {
+            values: vec![0.1],
+            names: vec!["ERR".into()],
+        },
+        sigma_fixed: vec![false],
+        omega_iov: None,
+        kappa_fixed: Vec::new(),
+        mixture: None,
+    }
+}
+
+fn identity_scale_vector(
+    parameter_scaling: ParameterScaling,
+    optimizer: Optimizer,
+    scale_params: bool,
+    template: &ModelParameters,
+) -> Vec<f64> {
+    let PackedStart {
+        packed: x0, bounds, ..
+    } = pack_with_bounds(template);
+    let options = FitOptions {
+        parameter_scaling,
+        optimizer,
+        scale_params,
+        ..FitOptions::default()
+    };
+    nlopt_scale_vector(&options, false, &x0, template, &bounds)
+}
+
+/// Every strategy that magnitude-scales or leaves the coordinates unscaled divides an
+/// identity-packed θ with |θ₀| > 10 by |θ₀|, and changes nothing else (#2146).
+///
+/// The expected vector is main's (all ones, because an identity-packed θ is present)
+/// with exactly `B_BIG`, `B_10P5` and `B_NEG` replaced. Without the rule `B_BIG` stays
+/// at 1 and L-BFGS stops at the initial 1e6 on the issue's warfarin model (OFV
+/// −265.4195 against −286.0042). `B_10` → 1 against `B_10P5` → 10.5 pins the strict
+/// `>`. `B_NEG` → 1e6 pins the `abs`. `TVBIG` → 1 pins the packing test. `B_SMALL` →
+/// 1 is the near-zero covariate case `7e7a3a4a` turned the scaling off for.
+#[test]
+fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
+    use crate::types::ParameterScaling::{Abs, Auto};
+    let template = identity_scale_template();
+    let want = [1.0, 1.0, 1e6, 1.0, 1.0, 10.5, 1e6, 1.0, 1.0];
+    for (ps, opt, scale_params) in [
+        // `auto` → `abs`: the default for the gradient-based optimizers.
+        (Auto, Optimizer::NloptLbfgs, false),
+        (Auto, Optimizer::Slsqp, false),
+        // `auto` → unscaled: BOBYQA stalls from θ₀ = 100 without the rule.
+        (Auto, Optimizer::Bobyqa, false),
+        (Auto, Optimizer::Mma, false),
+        // Written by the user, and the legacy `scale_params` alias.
+        (Abs, Optimizer::NloptLbfgs, false),
+        (Abs, Optimizer::Bobyqa, false),
+        (Auto, Optimizer::Bobyqa, true),
+    ] {
+        let got = identity_scale_vector(ps, opt, scale_params, &template);
+        assert_eq!(
+            got, want,
+            "{ps:?} / {opt:?} / scale_params = {scale_params}"
+        );
+    }
+}
+
+/// An explicit `parameter_scaling = none` is the legacy unscaled path and stays so,
+/// with or without `scale_params`: no identity θ is scaled (#2146).
+#[test]
+fn nlopt_scale_vector_leaves_an_explicit_none_unscaled() {
+    let template = identity_scale_template();
+    for opt in [Optimizer::NloptLbfgs, Optimizer::Bobyqa] {
+        for scale_params in [false, true] {
+            let got = identity_scale_vector(ParameterScaling::None, opt, scale_params, &template);
+            assert_eq!(got, vec![1.0; 9], "{opt:?} / scale_params = {scale_params}");
+        }
+    }
+}
+
+/// `rescale2` normalises every coordinate by its bound half-range, an identity θ
+/// included, and the #2146 rule does not overwrite it: `B_BIG` keeps 5e7, not 1e6.
+#[test]
+fn nlopt_scale_vector_leaves_rescale2_to_the_bound_half_range() {
+    let template = identity_scale_template();
+    let PackedStart { bounds, .. } = pack_with_bounds(&template);
+    let got = identity_scale_vector(
+        ParameterScaling::Rescale2,
+        Optimizer::NloptLbfgs,
+        false,
+        &template,
+    );
+    assert_eq!(got, compute_rescale2_scale(&bounds));
+    assert_eq!(got[2], 5e7, "B_BIG takes its half-range");
+}
+
+/// With no identity-packed θ, `abs` is `compute_scale_packed` on every coordinate, as
+/// before #2146; and with only small identity θ the switch-off of `7e7a3a4a` still
+/// gives all ones.
+#[test]
+fn nlopt_scale_vector_keeps_the_existing_vector_without_a_large_identity_theta() {
+    let mut log_only = identity_scale_template();
+    log_only.theta.truncate(2);
+    log_only.theta_names.truncate(2);
+    log_only.theta_lower.truncate(2);
+    log_only.theta_upper.truncate(2);
+    log_only.theta_fixed.truncate(2);
+    let PackedStart { packed: x0, .. } = pack_with_bounds(&log_only);
+    let got = identity_scale_vector(
+        ParameterScaling::Auto,
+        Optimizer::NloptLbfgs,
+        false,
+        &log_only,
+    );
+    assert_eq!(got, compute_scale_packed(&x0, &log_only));
+    assert!(
+        got[1] > 13.0,
+        "TVBIG is scaled by |ln 1e6| when no θ is identity-packed"
+    );
+
+    let mut small = identity_scale_template();
+    small.theta = vec![5.0, 1e6, 0.5, -0.01, 10.0, -3.0, 0.001];
+    let got = identity_scale_vector(ParameterScaling::Auto, Optimizer::NloptLbfgs, false, &small);
+    assert_eq!(got, vec![1.0; 9]);
+}
+
 // ── invert_psd_with_floor: regularised PD inversion ──────────────────────
 
 /// A genuinely PD matrix is inverted unchanged (n_clipped == 0) and the

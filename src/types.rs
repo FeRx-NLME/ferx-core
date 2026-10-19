@@ -9677,17 +9677,17 @@ pub enum InnerOptimizer {
 /// Crucially, `Rescale2` is **harmful to the derivative-free `Bobyqa`**
 /// (e.g. it drops `emax_pkpd` from OFV −36.76 to −13.51 and `three_cpt_iv` from
 /// −730.6 to −715.9): rescaling the trust region of a gradient-free optimizer
-/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto),
-/// which applies `Rescale2` only to the gradient-based optimizers that benefit.
+/// distorts its quadratic model. The default [`Auto`](Self::Auto) does not
+/// apply `Rescale2` to any optimizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ParameterScaling {
-    /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
-    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
-    /// otherwise — so the derivative-free `Bobyqa` (where `Rescale2` is
-    /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
-    /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
-    /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
-    /// cold-start convergence on IOV models (#335).
+    /// **Default.** Apply `Abs` for the gradient-based optimizers (`Bfgs`,
+    /// `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling otherwise — so the
+    /// derivative-free `Bobyqa` and `Mma`/`TrustRegion` are left unscaled, with
+    /// the legacy `scale_params` / IOV-auto-enable still applying in that
+    /// unscaled branch. Under both, the NLopt optimizers also divide an
+    /// identity-packed θ (lower bound < 0) whose initial magnitude exceeds 10 by
+    /// that magnitude (#2146).
     #[default]
     Auto,
     /// No scaling: fall back to the legacy `scale_params` bool (and the IOV+SLSQP
