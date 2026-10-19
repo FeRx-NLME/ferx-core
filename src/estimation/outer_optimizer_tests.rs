@@ -7576,6 +7576,90 @@ fn predicted_remaining_gain_seeds_the_tight_re_solve_with_the_kappas() {
     );
 }
 
+/// #2143 review: a tight integration that stops short of its horizon gives no decrement. The
+/// driver pads a budget-exhausted segment with its last (finite) state, so the EBEs still
+/// converge and the gradient is still finite — of a trajectory that was never integrated.
+/// The fixture is the #1934 model's ODE twin under rk45 at the false stop with a baked
+/// `ode_max_steps = 1`, so the tight re-solve gets 100 steps. Measured on Linux x86_64:
+/// every tight EBE converges and the gradients form without the completeness check, so the
+/// check is the only thing between that state and a decrement; the control at the default
+/// budget forms one (14.83). A budget of 2 behaves like 1 and 3 already completes.
+#[test]
+fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = focei_options();
+    let at = |method: &str| {
+        let m = parse_model_string(&issue_1934_ode_model(
+            6.735588,
+            16.155540,
+            0.011638,
+            23.488333,
+            [0.061883, -0.018713, 0.101651],
+            0.043717,
+            method,
+        ))
+        .expect("fixture parses");
+        let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &pop, &opts);
+        (m, x, ehs, kappas)
+    };
+
+    let (m, x, ehs, kappas) = at("rk45\n  ode_max_steps = 1");
+    let p = &m.default_params;
+    let ov = decrement_ode_override(&m, &opts).expect("integrated");
+    assert_eq!(ov.max_steps, Some(100), "fixture's tight budget");
+    let (converged, unchecked, checked) = crate::api::with_fit_scope_ode(&opts, ov, || {
+        let pp = unpack_params(&x, p);
+        let mu_k = compute_mu_k(&m, &pp.theta, opts.mu_referencing);
+        let warm = joint_warm_starts(&ehs, &kappas);
+        let (e, _, stats, k) = run_inner_loop_warm_seeded(
+            &m,
+            &pop,
+            &pp,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            Some(&warm),
+            Some(&mu_k),
+            0,
+            0,
+            InnerHessianSeed::for_options(&opts),
+            &opts,
+        );
+        let gradients = |strict| {
+            per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
+        };
+        (
+            stats.n_unconverged == 0 && stats.n_start_rejected == 0,
+            gradients(false),
+            gradients(true),
+        )
+    })
+    .expect("scope builds");
+    assert!(
+        converged,
+        "the truncation must not show up as an inner failure"
+    );
+    assert!(
+        unchecked,
+        "the truncated gradients must form, or the check is unobservable"
+    );
+    assert!(
+        !checked,
+        "an unfinished integration must not form gradients"
+    );
+    assert_eq!(gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts), None);
+
+    let (m, x, ehs, kappas) = at("rk45");
+    let full = gain_with(&m, &pop, &m.default_params, &x, &ehs, &kappas, &opts);
+    assert!(
+        full.is_some_and(|g| g.is_finite() && !gain_is_negligible(Some(g))),
+        "default budget: {full:?}"
+    );
+}
+
 /// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve
 /// instead of paying for it (up to a 100× step budget) and then returning `None`. Both
 /// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI starts one

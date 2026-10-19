@@ -2543,6 +2543,36 @@ fn per_subject_outer_gradients(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<Vec<Vec<f64>>> {
+    per_subject_outer_gradients_checked(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        options,
+        false,
+    )
+}
+
+/// [`per_subject_outer_gradients`], and with `require_complete` also `None` when any
+/// subject's integration stopped short of its horizon (#2143 review). The driver pads a
+/// segment that exhausts its step budget on a finite state with the last state (#603), so
+/// the prediction stays finite and so does the gradient formed from it — of a trajectory
+/// that was never integrated. Each subject's walk is counted on its own worker
+/// ([`crate::ode::solver::SolverStatsScope`] is per thread), and a stop the driver
+/// discarded and re-solved does not count.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_outer_gradients_checked(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    require_complete: bool,
+) -> Option<Vec<Vec<f64>>> {
     if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
@@ -2552,7 +2582,8 @@ fn per_subject_outer_gradients(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            if iov {
+            let scope = require_complete.then(crate::ode::solver::SolverStatsScope::enter);
+            let gradient = if iov {
                 let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
                 for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
                     stacked.extend(kap.iter().copied());
@@ -2574,7 +2605,17 @@ fn per_subject_outer_gradients(
                     ehs[i].as_slice(),
                     options.interaction,
                 )
+            };
+            if let Some(scope) = scope {
+                let st = scope.collected();
+                let kept_unfinished = st
+                    .unfinished_segments
+                    .saturating_sub(st.discarded_unfinished_segments);
+                if kept_unfinished > 0 || st.diverged_segments > 0 {
+                    return None;
+                }
             }
+            gradient
         })
         .collect()
 }
@@ -2863,7 +2904,16 @@ fn tight_per_subject_gradients(
         if stats.n_unconverged > 0 || stats.n_start_rejected > 0 {
             return None;
         }
-        per_subject_outer_gradients(model, population, init_params, x, &ehs, &kappas, options)
+        per_subject_outer_gradients_checked(
+            model,
+            population,
+            init_params,
+            x,
+            &ehs,
+            &kappas,
+            options,
+            true,
+        )
     })
     .ok()?
 }
