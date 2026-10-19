@@ -424,9 +424,14 @@ Every generated factor is wrapped in a neutral guard:
 ```
 
 A missing covariate is `NaN`, so `present(...)` is false and the factor is
-exactly `1.0`. This is not belt-and-braces: division by a missing value
-**underflows to `0.0`** in ferx rather than producing an infinity, so an
-unguarded factor would zero the parameter silently instead of failing loudly.
+exactly `1.0`. Without the guard the factor is `NaN` for that subject: `/`, `-`
+and `^` all carry a `NaN` through, so `(WT / 70)^THETA_CL_WT` is `NaN` and the
+objective is non-finite (`W_NONFINITE_OBJECTIVE`). The guard is what lets the
+generated model run on such data at all. A hand-written relation that reads the
+covariate through `log` or `sqrt` is the dangerous case, because those two
+floor a `NaN` to a finite value and the fit goes on with a wrong parameter and
+no error (see
+[Values outside an operation's domain](individual-parameters.qmd#values-outside-an-operations-domain)).
 
 The neutral value is the **operator's**, not a shared `1.0`: an additive
 relation guards to `0.0`, because a missing covariate must contribute nothing
