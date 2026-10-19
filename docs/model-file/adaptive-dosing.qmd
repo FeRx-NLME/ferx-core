@@ -161,14 +161,66 @@ Otherwise the fitted θ is read at the wrong level positions, or each covariate 
 centred on the simulated population's statistic instead of the fit's. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
-Each subject's η is still drawn from the fitted Ω; the run does not reuse a fit's
-per-subject EBEs.
+Each subject's η is still drawn from the fitted Ω. To simulate known patients at
+their own fitted η instead, see
+[Supplied individual values](#supplied-individual-values).
 
 The block compiles to exactly the controller, monitor, and engine described
 below, so every guarantee in [Monitors](#monitors) and
 [Verification](#verification-on-by-default) applies unchanged, and `result` is
 the same bundled `trajectories` / `ledger` / `decisions`. The lower-level
 programmatic API follows.
+
+### Supplied individual values
+
+A run can simulate known patients at their own η rather than a draw from Ω, for
+example to try a dosing rule on the patients a model was fitted to. Build the η
+with `SuppliedEtas` and hand them to the run through `AdaptiveInputs`:
+
+```rust
+use ferx_core::{simulate_adaptive_from_spec_with_inputs, AdaptiveInputs, SuppliedEtas};
+
+// The fit's empirical Bayes estimates, one row per fitted subject.
+let etas = SuppliedEtas::from_fit(&fit, &parsed.model)?;
+// Or your own: IDs, η names in the model's order, one row per subject.
+// let etas = SuppliedEtas::from_table(ids, names, rows)?;
+
+let inputs = AdaptiveInputs::new(&params).with_etas(&etas);
+let result = simulate_adaptive_from_spec_with_inputs(
+    &parsed.model, &population, &inputs, 100, spec, &opts,
+)?;
+```
+
+`simulate_adaptive_with_inputs` is the same for a programmatic controller. The
+two entry points without `_with_inputs` are `AdaptiveInputs::new(params)` with no
+η supplied.
+
+How supplied η are used:
+
+| Rule | Behaviour |
+|---|---|
+| Matching | By subject ID. A supplied subject that is not in the simulated population is ignored. |
+| A simulated subject with no supplied η | Refused (`E_SUPPLIED_ETAS`), listing the IDs. With `.with_unmatched(UnmatchedSubjects::Draw)` its η is drawn from Ω instead, so known and virtual patients can share one run. |
+| A row | Every η of the model, named and ordered as the model's. There is no partial row: under a block Ω the missing η would need a draw conditional on the given ones. |
+| Replicates | A supplied η is the same in every replicate. κ, the controller's assay and the residual error are still drawn. |
+| The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
+| The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
+
+A refusal names its cause: IDs and rows that differ in count, a row with the
+wrong number of values or a non-finite one, a repeated ID, η names that are not
+the model's, a fit of another model (`from_fit`), or an unmatched subject.
+
+A supplied η̂ is a point estimate, and the run treats it as exact. For a subject
+with few observations (high shrinkage) that understates how uncertain the
+patient's parameters are, so the spread across replicates is optimistic. Drawing
+η from its posterior instead is
+[#2154](https://github.com/FeRx-NLME/ferx-core/issues/2154); re-estimating η from
+the simulated assays inside the run (a MAP-Bayesian controller) is
+[#2155](https://github.com/FeRx-NLME/ferx-core/issues/2155).
+
+The test that ties this to the fit: with a holding controller and the fit's own
+doses, the run's IPRED at the supplied η̂ equals the fit's IPRED bit for bit, on
+a population ordered differently from the fit's.
 
 ## The controller
 

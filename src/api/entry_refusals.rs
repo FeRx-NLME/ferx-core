@@ -145,6 +145,15 @@ pub(crate) fn adaptive_options(message: impl Into<String>) -> EngineError {
     coded("E_ADAPTIVE_OPTIONS", None, message.into())
 }
 
+/// `E_SUPPLIED_ETAS`: per-subject η handed to an adaptive run that cannot be used as
+/// given (#1594): a table whose IDs and rows differ in count, a row that is not one
+/// finite value per named η, a repeated ID, η names that are not the model's in the
+/// model's order, or a simulated subject with no supplied η under
+/// `UnmatchedSubjects::Refuse`.
+pub(crate) fn supplied_etas(message: impl Into<String>) -> EngineError {
+    coded("E_SUPPLIED_ETAS", None, message.into())
+}
+
 /// `E_ADAPTIVE_CONTROLLER_ACTION`: a controller returned an action the driver refuses —
 /// a dose with a non-finite or negative amount, a rate that is not positive and finite,
 /// compartment 0 or one past the model's states, a compartment fed by an input-rate

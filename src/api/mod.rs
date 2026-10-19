@@ -47,6 +47,7 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod adaptive_inputs;
 mod covariate_stats;
 mod entry_refusals;
 mod fit;
@@ -59,9 +60,10 @@ mod run;
 mod simulate;
 
 pub use adaptive::{
-    simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
-    AdaptiveSimulationResult,
+    simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
+    simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
 };
+pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UnmatchedSubjects};
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub(crate) use entry_refusals::{
@@ -464,6 +466,11 @@ mod adaptive_sim_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_obs_scale_tests.rs"]
 mod adaptive_obs_scale_tests;
+
+// #1594: supplied per-subject η on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_inputs_tests.rs"]
+mod adaptive_inputs_tests;
 
 // ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
 //

@@ -272,6 +272,8 @@ pub struct AdaptiveSimulationResult {
 ///
 /// The `draw` tag on every row is `1`: this slice carries no parameter
 /// uncertainty (that is Part C / a later slice), only between-subject η.
+///
+/// Equivalent to [`simulate_adaptive_with_inputs`] with `AdaptiveInputs::new(params)`.
 pub fn simulate_adaptive<F, C>(
     model: &CompiledModel,
     population: &Population,
@@ -284,6 +286,43 @@ where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
 {
+    simulate_adaptive_with_inputs(
+        model,
+        population,
+        &AdaptiveInputs::new(params),
+        n_sim,
+        make_controller,
+        opts,
+    )
+}
+
+/// [`simulate_adaptive`], taking its parameter point and any per-subject η as
+/// [`AdaptiveInputs`] (#1594).
+///
+/// With [`AdaptiveInputs::with_etas`], each subject the [`SuppliedEtas`] carry is
+/// simulated at its own η in every replicate, instead of a draw from Ω; κ, the assay
+/// and the residual noise are drawn as before. A supplied subject still consumes its
+/// draw from the η stream, so every other subject's drawn η is the one the same seed
+/// gives without supplied η.
+///
+/// # Errors
+///
+/// As [`simulate_adaptive`], plus `E_SUPPLIED_ETAS` when the supplied η are not named
+/// as the model's, or a simulated subject has none under
+/// [`UnmatchedSubjects::Refuse`] (the default).
+pub fn simulate_adaptive_with_inputs<F, C>(
+    model: &CompiledModel,
+    population: &Population,
+    inputs: &AdaptiveInputs<'_>,
+    n_sim: usize,
+    make_controller: F,
+    opts: &AdaptiveSimulateOptions,
+) -> Result<AdaptiveSimulationResult, EngineError>
+where
+    F: Fn() -> C,
+    C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
+{
+    let params = inputs.params;
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
         super::entry_refusals::adaptive_unsupported(
             None,
@@ -344,7 +383,7 @@ where
         model,
         ode,
         population,
-        params,
+        inputs,
         n_sim,
         &opts.decision_times,
         &monitors,
@@ -439,7 +478,8 @@ fn spec_refusal(message: String) -> EngineError {
 }
 
 /// Shared per-(subject, replicate) orchestration behind [`simulate_adaptive`] and
-/// [`simulate_adaptive_from_spec`]: draw η ~ N(0, Ω), mint a **fresh** controller,
+/// [`simulate_adaptive_from_spec`]: draw η ~ N(0, Ω) (or take the subject's supplied
+/// η, #1594), mint a **fresh** controller,
 /// run the reactive ODE driver, (optionally) verify the frozen-schedule replay,
 /// and stamp the replicate tags onto the trajectory / ledger / decision rows.
 ///
@@ -458,7 +498,7 @@ fn run_adaptive_population<F, C>(
     model: &CompiledModel,
     ode: &crate::ode::OdeSpec,
     population: &Population,
-    params: &ModelParameters,
+    inputs: &AdaptiveInputs<'_>,
     n_sim: usize,
     decision_times: &[f64],
     monitors: &[crate::sim::adaptive::AdaptiveMonitor],
@@ -477,6 +517,7 @@ where
     // equilibrations, and a clear placed after it would drop the note they wrote. The frozen-
     // replay verifier and the signal-AUC pass write into the same window — same run, deduped.
     crate::dosing::clear_ss_nonconvergence_warnings();
+    let params = inputs.params;
 
     // Reject model/data the reactive driver cannot faithfully simulate (SDE) with a
     // typed error — never a silent wrong answer (#391). IOV, time-varying covariates,
@@ -512,6 +553,11 @@ where
         model, population,
     ))?;
     first_error(&check_absorption_dosing(model, population))?;
+
+    // Each subject's supplied η (#1594), in population order; `None` draws it. Refused
+    // here, before any subject runs, when the η are not named as the model's or a
+    // subject has none under `UnmatchedSubjects::Refuse`.
+    let supplied_etas = inputs.resolve(model, population)?;
 
     // The occasion bookkeeping assumes a strictly-increasing decision schedule:
     // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
@@ -693,13 +739,22 @@ where
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
-        for subject in &population.subjects {
+        for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
             // Draw η ~ N(0, Ω). `eta_slice` (η with κ appended as zeros) is the
             // **baseline** window — the parameters before the first decision, and
             // the reactive driver's fixed eta on a non-IOV run.
+            //
+            // A supplied subject (#1594) still draws its `n_eta` normals and drops
+            // them: one stream serves every subject, so skipping the draw would shift
+            // every later subject's η off the values the same seed gives without it.
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let eta = &*eta_factor * DVector::from_column_slice(&z);
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+            let mut eta_slice: Vec<f64> = match supplied {
+                Some(eta) => eta.clone(),
+                None => (&*eta_factor * DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect(),
+            };
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
             // Inter-occasion variability (#701): draw a fresh κ per decision window
@@ -1041,7 +1096,7 @@ where
             // before the rows are moved into the population vectors below; the
             // `(subject, draw, sim)` key is stamped here rather than read from the
             // rows (whose tags the single-subject driver still leaves at 0).
-            metrics.push(crate::sim::adaptive::compute_subject_metrics(
+            let mut subject_metrics = crate::sim::adaptive::compute_subject_metrics(
                 &subject.id,
                 1,
                 sim,
@@ -1050,7 +1105,9 @@ where
                 target_window,
                 auc_target,
                 &window_aucs,
-            ));
+            );
+            subject_metrics.eta_supplied = supplied.is_some();
+            metrics.push(subject_metrics);
 
             // Stamp the replicate tags onto the ledger + decision rows — the
             // single-subject driver emits draw/sim = 0.
@@ -1576,6 +1633,9 @@ fn check_event_pk_records(
 /// not the raw compartment amount. With `with_assay_error`, the designated
 /// endpoint's residual error noises the reading on the S1.5 controller-assay
 /// substream; an `observe` whose endpoint is ambiguous is rejected at parse time.
+///
+/// Equivalent to [`simulate_adaptive_from_spec_with_inputs`] with
+/// `AdaptiveInputs::new(params)`.
 pub fn simulate_adaptive_from_spec(
     model: &CompiledModel,
     population: &Population,
@@ -1584,6 +1644,33 @@ pub fn simulate_adaptive_from_spec(
     spec: &crate::sim::adaptive::AdaptiveDosingSpec,
     opts: &AdaptiveSimulateOptions,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
+    simulate_adaptive_from_spec_with_inputs(
+        model,
+        population,
+        &AdaptiveInputs::new(params),
+        n_sim,
+        spec,
+        opts,
+    )
+}
+
+/// [`simulate_adaptive_from_spec`], taking its parameter point and any per-subject η
+/// as [`AdaptiveInputs`] (#1594). Supplied η behave as on
+/// [`simulate_adaptive_with_inputs`].
+///
+/// # Errors
+///
+/// As [`simulate_adaptive_from_spec`], plus `E_SUPPLIED_ETAS` as on
+/// [`simulate_adaptive_with_inputs`].
+pub fn simulate_adaptive_from_spec_with_inputs(
+    model: &CompiledModel,
+    population: &Population,
+    inputs: &AdaptiveInputs<'_>,
+    n_sim: usize,
+    spec: &crate::sim::adaptive::AdaptiveDosingSpec,
+    opts: &AdaptiveSimulateOptions,
+) -> Result<AdaptiveSimulationResult, EngineError> {
+    let params = inputs.params;
     // The spec is the single source of truth for the decision schedule and the
     // monitored signal; an `opts` that *also* sets them is ambiguous (two
     // schedules, two monitors) — reject it rather than silently pick one.
@@ -1659,7 +1746,7 @@ pub fn simulate_adaptive_from_spec(
         model,
         ode,
         population,
-        params,
+        inputs,
         n_sim,
         &spec.at,
         &monitors,
