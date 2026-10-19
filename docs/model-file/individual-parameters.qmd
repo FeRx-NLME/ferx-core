@@ -129,10 +129,16 @@ non-finite objective that results
 ([A non-finite objective](../warnings.qmd#non-finite-objective)).
 
 A missing covariate is `NaN` (see [`present(...)`](#present...-guarding-a-covariate-that-may-be-missing)
-below). `NaN` passes through arithmetic, `^` and `exp`, so a missing covariate
-in any of them gives a `NaN` parameter. `log` and `sqrt` floor it to a finite
-value instead, so a missing covariate under either one gives a finite, wrong
-parameter and no error.
+below). `NaN` passes through arithmetic, `^`, `exp` and `logit`, so a missing
+covariate in any of them gives a `NaN` parameter. The constructs below give a
+finite value instead, so a missing covariate under any of them gives a finite,
+wrong parameter and no error:
+
+- `log` and `sqrt` floor it, to `-69.08` and `0`;
+- `min` and `max` drop it and return the other argument, so
+  `min(CRCL / 100, 1.5)` is `1.5`;
+- `<`, `<=`, `>`, `>=` and `==` are false for `NaN`, and `!=` is true, so
+  `if (CRCL > 60) 1.0 else 2.0` takes the `else` branch and is `2.0`.
 
 **Coming from NONMEM.** NONMEM protects these operations only when asked:
 `$ABBR PROTECT` makes NM-TRAN replace `LOG`, `SQRT` and `EXP` with `PLOG`,
