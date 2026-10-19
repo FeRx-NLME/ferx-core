@@ -921,6 +921,7 @@ mod tests {
                 inner_maxiter: 17,
                 inner_tol: 3e-4,
                 inner_restarts: 4,
+                inner_screen: 7,
                 mu_referencing: false,
                 n_agq: 5,
                 inner_optimizer: InnerOptimizer::Lbfgs,

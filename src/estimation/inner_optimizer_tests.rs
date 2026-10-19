@@ -1508,6 +1508,7 @@ fn test_ebe_result_converged_flag() {
         nll: 1.5,
         kappas: Vec::new(),
         hard_reject: false,
+        screen_moved: false,
     };
     assert!(r.converged);
     assert!(!r.used_fallback);
@@ -1731,6 +1732,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1791,6 +1793,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1815,6 +1818,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 ebe_variance: EbeVariance::Conditional,
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
+                screen: 0,
             },
             true,
         )
@@ -1882,6 +1886,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         ebe_variance: EbeVariance::Conditional,
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
+        screen: 0,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -2086,6 +2091,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 1.0,
             kappas: Vec::new(),
             hard_reject: false,
+            screen_moved: false,
         },
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
@@ -2097,6 +2103,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 2.0,
             kappas: Vec::new(),
             hard_reject: false,
+            screen_moved: false,
         },
     ];
     // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -2129,6 +2136,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         nll: 1.0,
         kappas: Vec::new(),
         hard_reject,
+        screen_moved: false,
     };
     // One hard-rejected subject with a single observation, one normal subject.
     let results = [make(true), make(false)];

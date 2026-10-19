@@ -52,7 +52,7 @@ const TWO_PI: f64 = std::f64::consts::TAU;
 /// [`crate::stats::special::normal_inv_cdf`]. Because the clamped u is always in
 /// (0,1), that function's `p<=0`/`p>=1` ±inf guards never fire, so the output is
 /// bit-identical to the prior inline copy for every input this wrapper receives.
-fn inv_normal_cdf(u: f64) -> f64 {
+pub(crate) fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
@@ -110,7 +110,7 @@ fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
 /// That is what lets [`sobol_qmc_draws`] append the Student-t and mixture
 /// coordinates without moving the normals. Each value is mapped to the centre
 /// of its 2⁻³² cell, which keeps it strictly inside (0, 1).
-fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+pub(crate) fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
     use sobol::Sobol;
 
     let seeds = owen_coordinate_seeds(dim, seed);
