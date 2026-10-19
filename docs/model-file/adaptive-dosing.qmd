@@ -120,6 +120,8 @@ no-op rather than a silent skip.
 ### Running it
 
 ```rust
+use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
+use ferx_core::io::fitrx::load_fit;
 use ferx_core::{parse_full_model_file, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
 use std::path::Path;
 
@@ -129,15 +131,29 @@ let spec = parsed
     .as_ref()
     .ok_or("model has no [adaptive_dosing] block")?;
 
+// The fitted estimates: θ, Ω, σ (and Ω_IOV) from a saved fit of this model.
+let fit = load_fit(Path::new("run1.fitrx"))?.fit;
+let params = fitted_params_from_result(&fit, &parsed.model)?;
+
 // The block owns the schedule and the monitor, so leave `decision_times` and
 // `monitors` empty here (setting either is a typed error); `seed` / `verify` /
-// `max_decisions` still apply.
-let opts = AdaptiveSimulateOptions { seed: Some(42), ..Default::default() };
+// `max_decisions` still apply. The struct is `#[non_exhaustive]`: start from
+// `default()` and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
 
-let result = simulate_adaptive_from_spec(
-    &parsed.model, &population, &parsed.model.default_params, 100, spec, &opts,
-)?;
+let result = simulate_adaptive_from_spec(&parsed.model, &population, &params, 100, spec, &opts)?;
 ```
+
+The simulation runs on whatever parameters you pass. `parsed.model.default_params`
+are the **initial estimates** from `[parameters]`, not a fit's; passing them
+simulates the model as written before estimation. To simulate a fitted model, pass
+`fitted_params_from_result(&fit, &model)`. It takes a `FitResult` from
+[`load_fit`](../file-formats/fitrx.qmd#loading-a-bundle) or straight from `fit()`,
+and returns an error (`E_PARAM_SHAPE`) when the fit's Ω or σ does not match the model.
+
+Each subject's η is still drawn from the fitted Ω; the run does not reuse a fit's
+per-subject EBEs.
 
 The block compiles to exactly the controller, monitor, and engine described
 below, so every guarantee in [Monitors](#monitors) and
@@ -271,14 +287,14 @@ use ferx_core::{
     simulate_adaptive, AdaptiveSimulateOptions, ControllerCtx, DoseAction, MonitorSpec, ObserveMode,
 };
 
-let opts = AdaptiveSimulateOptions {
-    seed: Some(42),
-    decision_times: vec![0.0, 24.0, 48.0, 72.0, 96.0],
-    // Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
-    // to titrate on the latent prediction instead.
-    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)],
-    ..Default::default() // verify = true, max_decisions = 10_000
-};
+// `#[non_exhaustive]`: start from `default()` (verify = true,
+// max_decisions = 10_000) and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
+opts.decision_times = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+// Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
+// to titrate on the latent prediction instead.
+opts.monitors = vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)];
 
 // A fresh controller per subject: titrate a trough toward the [10, 20] window.
 let make_controller = || {
