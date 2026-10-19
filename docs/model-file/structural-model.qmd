@@ -306,7 +306,7 @@ ordinary individual parameter.
 Finite differences are used — correctly, just more slowly, and reported as FD
 rather than claimed as analytic — past the width cap: more than 48 random effects
 for a subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions
-under IOV (24 for the covariance step's analytic R-matrix and Laplace's exact anchor).
+under IOV (24 for Laplace's exact anchor).
 The number of θ does not count.
 
 See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*

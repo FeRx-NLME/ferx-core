@@ -255,8 +255,8 @@ above.
 | `input_rate` forcing + SDE `[diffusion]` | both | both | stochastic dynamics have no recorder |
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
 | SS + an RHS reading `TIME`/`T`/`TAFD`, or `TAD` with a lagged SS dose | ODE | both | an absolute clock has no periodic steady state; the lagged pre-arrival window's `TAD` convention is open (#1126). A `TAD`-only RHS under unlagged SS is analytic |
-| observation / reset / covariate change exactly on a lagged arrival | closed-form | both | the walk resolves one dual position per break time |
-| more than 48 random effects (stacked `[η, κ]` under IOV; 24 for the R-matrix and Laplace's exact anchor) | both | both | the widest dispatch bucket of the adjoint |
+| a reset or covariate change exactly on a moving boundary (a lagged arrival, a moving window end), or two moving boundaries coinciding | closed-form | both | the walk resolves one dual position per break time. An *observation* on a moving boundary is analytic ([below](#sampling-on-a-moving-boundary)) |
+| more than 48 random effects (stacked `[η, κ]` under IOV; 24 for Laplace's exact anchor, 8 for its exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
 
 Since the adjoint gradient (#486), LTBS × IOV on ODE models, a rate-defined infusion under
 `F ≠ 1`, the M3 × IOV × `iiv_on_ruv` triple's inner gradient, and models past the forward
@@ -293,8 +293,8 @@ The practical consequence is that at *exactly* such a coincidence an analytic gr
 Since the adjoint (#2093) model size is not a limit on the analytic route. Its cost does not grow
 with the number of θ, so neither the θ count nor the number of individual parameters is capped,
 and a Form-C `[scaling] y = <expr>` readout is recorded like any other. What does limit it is the
-number of random effects of one subject: 24, counting the stacked `[η, κ₁…κ_K]` under IOV (8 for
-Laplace's exact-anchor R-matrix). A subject past that takes finite differences, named in
+number of random effects of one subject: 48, counting the stacked `[η, κ₁…κ_K]` under IOV (24 for
+Laplace's exact anchor, 8 for its exact R-matrix). A subject past that takes finite differences, named in
 `FitResult.warnings`.
 
 Before #2093 the forward sensitivity provider had model-size caps instead: `θ + η` at 24 on the
@@ -874,16 +874,27 @@ not the optimum of it.
 So when the cold solve lands more than **0.05 OFV units below** the objective the optimizer
 saw at the same point, the run is not converged, whichever way NLopt stopped. The bound is
 absolute rather than relative because one subject's mode switch is worth the same number of
-units at OFV 790 as at 65,000. ferx then **restarts the optimizer once from that point** on
+units at OFV 790 as at 65,000. ferx then **restarts the optimizer from that point** on
 the remaining `maxiter` budget, through the same machinery as a
 [mid-descent stall](#stopping-without-converging). The restart's first inner solve is cold,
 so it optimizes the objective the fit reports. It is adopted unless it ends higher; a tie
-goes to the restart, whose own verdict is then the honest one. An adopted restart leaves an
-`optimizer_health` note in `FitResult.warnings`. If the gap survives, because no budget was
-left or the restart found a gap of its own, the fit reports `converged: false` with an
+goes to the restart, whose own verdict is then the honest one. A restarted leg can trap
+again as θ moves on, so the restart repeats — up to three more times, each adopted on the
+same rule, all on the one budget (#2093). An adopted restart leaves an `optimizer_health`
+note in `FitResult.warnings`. If the gap survives, because no budget was left or the
+restarts ran out, the fit reports `converged: false` with an
 `ebe_start_dependent` warning. That warning says how far below the cold solve landed and
 how many subjects moved. Refitting from the reported estimates is the remedy, since a new
 fit's first inner solve is cold.
+
+The check also runs **during** each leg (#2093), not only once NLopt stops: at the 32nd,
+64th, 128th, … feasible evaluation, the same cold solve is scored at the best point so far,
+and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt itself gave up.
+On `examples/warfarin_dcm.ferx` the first leg crawled from −311 to −314 for over 200
+evaluations while a cold solve at its best point scored −520, and the restart then had too
+little budget left (−1154.59, unconverged). With the probe, two traps are caught at
+evaluation 32 of their legs and the fit converges at −1185.46 in 145 evaluations. A leg the
+probe clears runs on unchanged, at the cost of one cold inner pass per probe.
 
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective

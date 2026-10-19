@@ -2339,6 +2339,21 @@ fn a_subject_past_24_stacked_random_effects_matches_reconverged_fd() {
     assert!(g < 3.4e-6, "{g:.2e}");
 }
 
+/// The same subject's analytic R-matrix, through the 48 Hessian bucket (#2093), against the
+/// reconverged-FD Hessian of its gradient. Measured 3.04e-11 on Linux; ~10× headroom. Without the
+/// 48 bucket the subject declines, and `hessian_gaps` fails on a subject out of scope.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_subject_past_24_stacked_random_effects_has_an_exact_r_matrix() {
+    let (m, s) = wide_iov_fixture();
+    let (h, _) = hessian_gaps(&m, &s, true);
+    eprintln!("30 stacked: FOCEI R-matrix vs reconverged FD {h:.2e}");
+    assert!(h < 3e-10, "{h:.2e}");
+}
+
 /// A `TAD`-reading RHS under steady-state dosing (#2093): served now that the dual SS run-in
 /// replays production's per-window clocks (`ss_run_in_params`: local time from 0, `TAD` from
 /// the pulse, an infusion's quiet window at `TAD = τ + T_inf`, `TAFD` `NaN`). Pinned on the

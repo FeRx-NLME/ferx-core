@@ -2381,6 +2381,16 @@ const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 /// path has no cold solve; a run with no feasible evaluation has no best-seen) or a
 /// non-finite one, which [`ColdSolveVerdict::NonFinite`] and
 /// [`gate_converged_on_objective`] already own.
+/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
+/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
+/// chance to settle (#2093).
+fn basin_probe_due(feasible_evals: usize) -> bool {
+    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
+}
+
+/// The first feasible evaluation at which [`basin_probe_due`] fires.
+const BASIN_PROBE_FIRST: usize = 32;
+
 fn cold_solve_beats_best_seen(cold_ofv: Option<f64>, best_seen_ofv: Option<f64>) -> Option<f64> {
     let (cold, best) = (cold_ofv?, best_seen_ofv?);
     if !cold.is_finite() || !best.is_finite() {
@@ -2942,59 +2952,88 @@ fn optimize_nlopt(
         || attempt(init_params, true),
         |(result, _)| penalized(result),
     );
-    resolve_mid_descent_restart(
-        options.verbose,
-        crate::cancel::is_cancelled(&options.cancel),
-        (first, restart_cause),
-        |stalled, cause| {
-            // `escape_from = init_params`, not the point this leg starts at. The
-            // restart begins at the stalled estimates, so measuring the published
-            // escape verdict against *its own* start would report a fit that
-            // recovered thousands of OFV units as having never moved whenever the
-            // restart's own step is small — and `model_selection::stalled_at_init`
-            // prefers that flag over its `theta_init` comparison, so the recovered
-            // fit would carry `W_STALLED_AT_INIT` and be thrown out by the default
-            // `Strictness::reject_init_stall`. The question the published flag
-            // answers is "are the reported estimates still on top of the values the
-            // user supplied", and that reference does not move when the optimizer
-            // is restarted (#1277 review).
-            let (mut restarted, _) = optimize_nlopt_once(
-                model,
-                population,
-                &stalled.params,
-                options,
-                false,
-                declines,
-                Some(RestartLeg {
-                    escape_from: init_params,
-                    spent_evals: stalled.n_iterations,
-                }),
-            );
-            // `n_iterations` reports the evaluations the fit spent, and the
-            // restart is a continuation of the same fit rather than a fresh one,
-            // so the two legs add up — and the second leg ran on what the first
-            // left of the budget (`RestartLeg::spent_evals`), so the sum is
-            // bounded by `outer_maxiter` like any other fit's.
-            restarted.n_iterations += stalled.n_iterations;
-            // Pushed on the restart's own result, so it reaches `FitResult` only
-            // if the restart is adopted — a rejected restart is dropped whole.
-            // `classify_warning` files both under `optimizer_health` on the phrase
-            // "resumed from the best point seen".
-            restarted.warnings.push(match cause {
-                RestartCause::MidDescent => mid_descent_restart_warning(
-                    options.optimizer,
-                    stalled.ofv,
-                    stalled.n_iterations,
-                ),
-                RestartCause::BasinShift => {
-                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
-                }
-            });
-            restarted
-        },
-        penalized,
-    )
+    // #2093: a basin-shift restart may itself end in a basin shift (the restarted leg's
+    // warm EBEs can be trapped again as θ moves on), so it is re-run while each restart is
+    // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
+    // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
+    // A mid-descent stall keeps its single restart: a second stall reports as a stall.
+    let mut current = first;
+    let mut cause = restart_cause;
+    let mut basin_restarts = 0usize;
+    loop {
+        let next_cause: std::cell::Cell<Option<RestartCause>> = std::cell::Cell::new(None);
+        let spent_before = current.n_iterations;
+        let next = resolve_mid_descent_restart(
+            options.verbose,
+            crate::cancel::is_cancelled(&options.cancel),
+            (current, cause),
+            |stalled, cause| {
+                // `escape_from = init_params`, not the point this leg starts at. The
+                // restart begins at the stalled estimates, so measuring the published
+                // escape verdict against *its own* start would report a fit that
+                // recovered thousands of OFV units as having never moved whenever the
+                // restart's own step is small — and `model_selection::stalled_at_init`
+                // prefers that flag over its `theta_init` comparison, so the recovered
+                // fit would carry `W_STALLED_AT_INIT` and be thrown out by the default
+                // `Strictness::reject_init_stall`. The question the published flag
+                // answers is "are the reported estimates still on top of the values the
+                // user supplied", and that reference does not move when the optimizer
+                // is restarted (#1277 review).
+                let (mut restarted, restarted_outcome) = optimize_nlopt_once(
+                    model,
+                    population,
+                    &stalled.params,
+                    options,
+                    false,
+                    declines,
+                    Some(RestartLeg {
+                        escape_from: init_params,
+                        spent_evals: stalled.n_iterations,
+                    }),
+                );
+                // `n_iterations` reports the evaluations the fit spent, and the
+                // restart is a continuation of the same fit rather than a fresh one,
+                // so the two legs add up — and the second leg ran on what the first
+                // left of the budget (`RestartLeg::spent_evals`), so the sum is
+                // bounded by `outer_maxiter` like any other fit's.
+                restarted.n_iterations += stalled.n_iterations;
+                next_cause.set(restarted_outcome.restart_cause());
+                // Pushed on the restart's own result, so it reaches `FitResult` only
+                // if the restart is adopted — a rejected restart is dropped whole.
+                // `classify_warning` files both under `optimizer_health` on the phrase
+                // "resumed from the best point seen".
+                restarted.warnings.push(match cause {
+                    RestartCause::MidDescent => mid_descent_restart_warning(
+                        options.optimizer,
+                        stalled.ofv,
+                        stalled.n_iterations,
+                    ),
+                    RestartCause::BasinShift => {
+                        basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
+                    }
+                });
+                restarted
+            },
+            penalized,
+        );
+        // The restarted leg's own `basin_shift` already requires budget left on the shared
+        // evaluation budget (`AttemptOutcome::basin_shift`).
+        let adopted = next.n_iterations != spent_before;
+        current = next;
+        match next_cause.get() {
+            Some(RestartCause::BasinShift) if adopted && basin_restarts < MAX_BASIN_RESTARTS => {
+                basin_restarts += 1;
+                cause = Some(RestartCause::BasinShift);
+            }
+            _ => break current,
+        }
+    }
 }
+
+/// How many basin-shift restarts [`optimize_nlopt`] runs at most after the first (#2093).
+/// Each must be adopted and the legs share the fit's budget, so this only bounds the work
+/// on a fit whose warm EBEs keep re-trapping.
+const MAX_BASIN_RESTARTS: usize = 3;
 
 /// Restart a run that stopped mid-descent from the best point it reached, and
 /// report whichever attempt ended lower (#1277).
@@ -3042,8 +3081,10 @@ fn optimize_nlopt(
 ///   objective's 1e20 short-circuit rather than at a minimum and would look like
 ///   a stall to every test here.
 ///
-/// There is exactly one restart — a second stall reports as a stall, which is
-/// the honest signal and caps what this adds at one extra optimization. (The
+/// There is exactly one restart for a stall — a second stall reports as a stall, which
+/// is the honest signal and caps what this adds at one extra optimization. A basin-shift
+/// restart may repeat ([`optimize_nlopt`], `MAX_BASIN_RESTARTS`, #2093), on the same
+/// shared budget. (The
 /// ceiling for the whole of [`optimize_nlopt`] is three, since the `left_init`
 /// retry can fire first and hand its own result here.)
 ///
@@ -3943,6 +3984,59 @@ fn optimize_nlopt_once(
             stagnation_latched_cl.store(true, Ordering::Relaxed);
             latch_overrode_veto_cl.store(state.latch_overrode_veto, Ordering::Relaxed);
         }
+        // #2093: a basin probe *during* the leg. The end-of-leg cold re-solve (#1565) is the
+        // only place a warm-start trap was detected, so a leg minimising against EBEs some
+        // subjects hold in a higher individual mode ran until NLopt itself gave up.
+        // Measured on `examples/warfarin_dcm.ferx`: 302 evaluations crawling −311 → −314
+        // while a cold solve at the incumbent scored −520, and the restart then spent the
+        // rest of the budget. On a geometric schedule of feasible evaluations (32, 64,
+        // 128, …: a logarithmic number of cold passes per leg) the same cold solve the
+        // end-of-leg check runs is scored at the incumbent; when it beats the best seen by
+        // that check's own margin ([`cold_solve_beats_best_seen`]), the leg stops through
+        // the stagnation early-return and the end-of-leg check files the basin-shift
+        // restart. A leg whose probe finds nothing continues on a bit-identical trajectory.
+        if !state.stagnation_stopped && !guarded && init_params.mixture.is_none() {
+            let feasible = plateau_tracker_cl.lock().unwrap().2;
+            if basin_probe_due(feasible) {
+                let incumbent = best_solve_cl
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|inc| inc.xs.clone());
+                let best = best_seen_cl.lock().unwrap().get().map(|b| b.ofv_clean);
+                if let Some(xs_inc) = incumbent {
+                    let x_inc: Vec<f64> = xs_inc.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let p = unpack_params(&x_inc, init_params);
+                    let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
+                    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+                        model,
+                        population,
+                        &p,
+                        options.inner_maxiter,
+                        options.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        options.min_obs_for_convergence_check as usize,
+                        options.inner_restarts,
+                        InnerHessianSeed::for_options(options),
+                        options,
+                    );
+                    let cold =
+                        2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
+                    if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
+                        state.stagnation_stopped = true;
+                        if verbose {
+                            eprintln!(
+                                "Eval {:>4}: basin probe — a cold re-solve at the best point \
+                                 scores {cold:.6}, {gap:.4} below the best seen; ending this \
+                                 leg for a basin-shift restart.",
+                                state.n_evals,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if state.stagnation_stopped && verbose {
             eprintln!(
                 "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
@@ -4532,7 +4626,8 @@ fn optimize_nlopt_once(
     // *after* `stalled_mid_descent` is read, which must keep meaning "bare `Failure`
     // the plateau check rejected": folding this in would also fire the "stopped
     // mid-descent with its budget spent" advice on a run that did nothing of the kind.
-    // `optimize_nlopt` restarts such a run once ([`RestartCause::BasinShift`]); this
+    // `optimize_nlopt` restarts such a run ([`RestartCause::BasinShift`], repeated up to
+    // `MAX_BASIN_RESTARTS` times since #2093); this
     // warning reaches the user only if that restart is not adopted or not possible.
     let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
     if let (Some(gap), Some(cold), Some(best)) = (basin_gap, cold_ofv, best_seen_ofv) {

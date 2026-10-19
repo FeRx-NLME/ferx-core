@@ -7665,3 +7665,40 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
         );
     }
 }
+
+/// The mid-leg basin probe's schedule (#2093): 32, 64, 128, … feasible evaluations, so a
+/// leg pays a logarithmic number of cold passes and none before its 32nd evaluation.
+#[test]
+fn the_basin_probe_runs_on_a_geometric_schedule() {
+    let due: Vec<usize> = (1..=600).filter(|&n| basin_probe_due(n)).collect();
+    assert_eq!(due, vec![32, 64, 128, 256, 512]);
+}
+
+/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
+/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
+/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
+/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
+/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
+/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
+/// it does again. `main` and the previous head reached −1173.559691.
+#[cfg(feature = "nn")]
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+    let r = crate::fit_from_files(
+        "examples/warfarin_dcm.ferx",
+        Some("data/warfarin_dcm.csv"),
+        None,
+        None,
+    )
+    .expect("warfarin_dcm fits");
+    assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
+    assert!(
+        r.ofv < -1180.0,
+        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv
+    );
+}

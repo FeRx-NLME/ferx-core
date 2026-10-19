@@ -104,6 +104,7 @@ impl<const N: usize> Dir<N> {
         }
     }
 
+    #[cfg(feature = "nn")]
     fn eta(k: usize) -> Self {
         Dir {
             x: None,
@@ -149,6 +150,7 @@ pub(crate) fn subject_adjoint_cov_hessian(
         (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
         (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
         (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
+        (48, _) => hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
         _ => None,
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
@@ -158,7 +160,7 @@ pub(crate) fn subject_adjoint_cov_hessian(
 /// The Hessian's dispatch widths: its own, shorter ladder (the covariance step runs once per
 /// fit, so padding is cheap while every bucket instantiates the recorders over a nested
 /// dual).
-const HESSIAN_BUCKETS: [usize; 4] = [4, 6, 8, 24];
+const HESSIAN_BUCKETS: [usize; 5] = [4, 6, 8, 24, 48];
 
 /// The exact anchor's Hessian widths. Its inner η-dual carries `Q` as well as `(f, G)`, so
 /// a value is `(1 + K) · (1 + N + N(N+1)/2)` taped scalars (16 bytes): ~2 kB at `N = 4`,
@@ -241,6 +243,7 @@ pub(crate) fn subject_adjoint_eta_dx(
         6 => go::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
         8 => go::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
         24 => go::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
+        48 => go::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
         _ => None,
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);

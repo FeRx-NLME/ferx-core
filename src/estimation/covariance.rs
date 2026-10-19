@@ -1060,6 +1060,15 @@ pub(super) fn analytic_cov_assembly(
             Some(2.0 * h)
         })
         .collect();
+    // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
+    // between subjects so they are not reallocated per pass. Past the last subject nothing
+    // else needs them at that size, so release them on every worker of the pool (#2093):
+    // a 1M-node tape — what `rtape_trim`'s per-pass threshold lets a worker keep — is
+    // ~100 MB (offsets, entries and eight adjoint lanes per node), and stayed pinned for the
+    // rest of a long-lived process (an R session). This does not lower the step's own peak,
+    // which is the tape at its largest during the passes: measured +4–5 MB of peak RSS over
+    // `main` without the covariance step and +13–27 MB with it on the bundled models.
+    rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
     let mut acc = DMatrix::<f64>::zeros(n, n);
     let mut declined: Vec<usize> = Vec::new();
     for (i, h) in per_subject.into_iter().enumerate() {
