@@ -1,16 +1,25 @@
 //! `profile`d θ level blocks (#1065): fits to convergence, gated `slow-tests`.
 //!
 //! - **D1 / D2**, the degenerate oracle: the profiled fit and the unprofiled fit of one
-//!   model reach the same OFV, structural estimates and standard errors. The unprofiled
-//!   side is **started at the profiled optimum** and must not improve on it by more than
-//!   the bound — its own stopping point is loose at this size (the plan's M6 measured
-//!   `Converged: YES` at `|g|∞` 2.6–14.9), so two independent fits would compare two
-//!   stopping rules, not two objectives. D1 is F1 (linear in η and κ), D2 is F2
-//!   (nonlinear in η).
+//!   model reach the same OFV and structural estimates. The unprofiled side is **started
+//!   at the profiled optimum** and must not improve on it by more than the bound — its own
+//!   stopping point is loose at this size (the plan's M6 measured `Converged: YES` at
+//!   `|g|∞` 2.6–14.9), so two independent fits would compare two stopping rules, not two
+//!   objectives. D1 is F1 (linear in η and κ), D2 is F2 (nonlinear in η). The standard
+//!   errors are compared at one fixed point instead, by C1 in `tests/profiled_levels.rs`
+//!   (Tier 2, every PR).
 //! - **A2 (fit)**: the profiled F2 fit against NONMEM's OFV with every level a `THETA`.
 //! - **S1**: the plan's 100-study × 8-visit measurement — the profiled fit converges and
 //!   its covariance is `r` and succeeds; unprofiled, the same model is 705 packed
 //!   coordinates, and its covariance routes to `s` and has no standard error at all (M6).
+//!
+//! **Run time (#2130 follow-up).** The core slow leg has a 100-minute budget (#1239) and
+//! was at 99m59s on `main` before this file landed. On the CI runner (one Rayon thread,
+//! tests in parallel) the file took 559 s at `e44a7e2e`: S1 559 s, D2 491 s, D1 222 s,
+//! A2 70 s. Most of D1/D2 was the unprofiled restart's FD `R` (41 coordinates for D2:
+//! 2·41² reconverged objectives) and most of S1 the unprofiled 705-coordinate fit. Both
+//! are gone. Each test is also ignored under `nn`: they read no nn code, and the `nn`
+//! leg re-runs the workspace under the same budget (#2138 did the same).
 
 use ferx_core::types::{CovarianceMethod, FitOptions, FitResult, ModelParameters, OmegaMatrix};
 use std::path::PathBuf;
@@ -75,10 +84,14 @@ fn start_at(template: &ModelParameters, f: &FitResult) -> ModelParameters {
 /// D1 / D2: profiled, then unprofiled from the profiled optimum.
 fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
     let prof_prep = prep(model, data, None);
-    let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, true);
+    let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, false);
     assert!(prof.converged, "{:?}", prof.warnings);
     let plain_prep = prep(model, data, Some(decl));
-    let (plain, t_plain) = fit(&plain_prep, &start_at(&plain_prep.init_params, &prof), true);
+    let (plain, t_plain) = fit(
+        &plain_prep,
+        &start_at(&plain_prep.init_params, &prof),
+        false,
+    );
     assert!(prof.ofv.is_finite() && plain.ofv.is_finite());
     let improvement = prof.ofv - plain.ofv;
     let worst_theta = (0..n_struct)
@@ -87,20 +100,9 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
             assert!(v.is_finite());
             a.max(v)
         });
-    let (sp, su) = (
-        prof.se_theta.as_ref().expect("profiled SE"),
-        plain.se_theta.as_ref().expect("unprofiled SE"),
-    );
-    let worst_se = (0..sp.len())
-        .map(|k| ((sp[k] - su[k]) / su[k]).abs())
-        .fold(0.0_f64, |a, v| {
-            assert!(v.is_finite());
-            a.max(v)
-        });
     eprintln!(
         "{model}: profiled OFV {:.9} ({t_prof:.1}s, {} evals), unprofiled from there {:.9} \
-         ({t_plain:.1}s); improvement {improvement:.3e}, structural θ {worst_theta:.3e}, \
-         SE {worst_se:.3e}",
+         ({t_plain:.1}s); improvement {improvement:.3e}, structural θ {worst_theta:.3e}",
         prof.ofv, prof.n_iterations, plain.ofv
     );
     assert!(
@@ -112,20 +114,18 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
         "the unprofiled fit lost {improvement}"
     );
     assert!(worst_theta < D_THETA, "{worst_theta}");
-    assert!(worst_se < D_SE, "{worst_se}");
 }
 
-/// Realised on Linux aarch64: D1 the unprofiled restart improves by 2.2e-6, D2 by
-/// −2.4e-7; the structural θ move 2.5e-4 (D1) and 0 (D2) relative; SEs differ by 7.0e-3
-/// (D1) and 4.7e-3 (D2). macOS arm64 within 5e-7 of each. Bands at ≥ 2.9× the worst.
+/// Realised on Linux aarch64: D1 the unprofiled restart improves by 1.6e-8, D2 by
+/// −2.4e-7; the structural θ move 7.1e-8 (D1) and 0 (D2) relative. Bands at ≥ 4× the
+/// worst.
 const D_OFV: f64 = 1e-4;
 const D_THETA: f64 = 1e-3;
-const D_SE: f64 = 2e-2;
 
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn d1_a_profiled_fit_is_the_unprofiled_fit_linear_in_eta() {
     degenerate_oracle(
@@ -138,8 +138,8 @@ fn d1_a_profiled_fit_is_the_unprofiled_fit_linear_in_eta() {
 
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
     degenerate_oracle(
@@ -153,8 +153,8 @@ fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
 /// The profiled F2 fit against NONMEM's own optimum, every level a `THETA` there.
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     let text =
@@ -188,16 +188,14 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
 const A2_FIT_OFV: f64 = 1e-5;
 
 /// S1: 100 studies × 8 visits. Profiled: a 5-coordinate search and the `r` covariance
-/// with a standard error for every structural parameter and every level. Unprofiled
-/// (705 packed coordinates) it is fitted without its covariance step, which the plan's
-/// M6 measured routing to `s` and failing (S rank-deficient: 100 subjects, 705
-/// coordinates). The profiled OFV must not be above the unprofiled one; measured
-/// (Linux aarch64, macOS the same to the printed digit) it is 0.42 below, the
-/// unprofiled fit stopping early.
+/// with a standard error for every structural parameter and every level. The profiled
+/// OFV must not be above the unprofiled fit's, which is the measured constant
+/// [`S1_UNPROFILED_OFV`] rather than a second fit: that fit is a 705-coordinate FD search
+/// and was most of this test's CI time. Measured, the profiled fit is 0.42 below it.
 #[test]
 #[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
     let data = "tests/data/profile_mbma/s100t8.csv";
@@ -216,18 +214,26 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
         .iter()
         .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
 
-    let u = prep(model, data, Some("](0.0, -10.0, 10.0)"));
-    let (plain, t_plain) = fit(&u, &u.init_params, false);
     eprintln!(
-        "S1: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {}); unprofiled OFV \
-         {:.6} ({t_plain:.1}s, {} evals, no covariance)",
-        prof.ofv, prof.n_iterations, prof.n_parameters, plain.ofv, plain.n_iterations
+        "S1: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {}); unprofiled \
+         OFV {S1_UNPROFILED_OFV} (measured)",
+        prof.ofv, prof.n_iterations, prof.n_parameters
     );
-    assert_eq!(prof.n_parameters, plain.n_parameters);
+    assert_eq!(
+        prof.n_parameters, 705,
+        "the unprofiled count: 3 θ, 700 levels, ω, σ"
+    );
     assert!(
-        prof.ofv <= plain.ofv + 1e-3,
-        "{} vs {}",
-        prof.ofv,
-        plain.ofv
+        prof.ofv <= S1_UNPROFILED_OFV + 1e-3,
+        "{} vs {S1_UNPROFILED_OFV}",
+        prof.ofv
     );
 }
+
+/// The unprofiled S1 fit's OFV (705 packed coordinates, from the model file's inits, no
+/// covariance step): −3579.167062, the same six digits on Linux aarch64
+/// (`tools/linux-test.sh`) and macOS arm64 at #2130's head, and in the plan's M6. It
+/// stops early (`|g|∞` 2.6); the profiled fit reaches −3579.589899. Re-measure it if the
+/// unprofiled engine changes: the assertion only needs the profiled fit not to be above
+/// it.
+const S1_UNPROFILED_OFV: f64 = -3579.167062;
