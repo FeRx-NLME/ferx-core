@@ -10,7 +10,7 @@ use crate::parser::model_parser::parse_model_string;
 use crate::types::{DoseEvent, Subject};
 use std::collections::HashMap;
 
-fn subject(
+pub(super) fn subject(
     model: &CompiledModel,
     doses: Vec<DoseEvent>,
     times: &[f64],
@@ -63,7 +63,7 @@ fn subject(
 }
 
 /// Parameters moved off the defaults, so the gradient is far from zero in every block.
-fn moved_params(model: &CompiledModel) -> ModelParameters {
+pub(super) fn moved_params(model: &CompiledModel) -> ModelParameters {
     let mut p = model.default_params.clone();
     for (m, t) in p.theta.iter_mut().enumerate() {
         *t *= if m % 2 == 0 { 1.12 } else { 0.91 };
@@ -73,7 +73,7 @@ fn moved_params(model: &CompiledModel) -> ModelParameters {
 
 /// The worst relative gap `|adj − fd| / (1 + |fd|)` over all packed coordinates between the
 /// FOCEI adjoint gradient and the reconverged-FD oracle ([`fd_oracle`]).
-fn parity(model: &CompiledModel, s: &Subject) -> f64 {
+pub(super) fn parity(model: &CompiledModel, s: &Subject) -> f64 {
     parity_for(model, s, true)
 }
 
@@ -84,7 +84,7 @@ fn parity_foce(model: &CompiledModel, s: &Subject) -> f64 {
 
 /// The EBE the fit would use: FOCE's under its frozen-variance convention
 /// (`EbeVariance::Population`), FOCEI's conditional one.
-fn ebe_for(
+pub(super) fn ebe_for(
     model: &CompiledModel,
     s: &Subject,
     params: &ModelParameters,
@@ -212,7 +212,7 @@ fn chain_model(k: usize) -> String {
     s
 }
 
-fn with_tol(mut model: CompiledModel, reltol: f64, abstol: f64) -> CompiledModel {
+pub(super) fn with_tol(mut model: CompiledModel, reltol: f64, abstol: f64) -> CompiledModel {
     if let Some(ode) = model.ode_spec.as_mut() {
         ode.solver_opts.reltol = reltol;
         ode.solver_opts.abstol = abstol;
@@ -222,7 +222,7 @@ fn with_tol(mut model: CompiledModel, reltol: f64, abstol: f64) -> CompiledModel
 
 /// Both gradients differentiate the same discrete trajectory, so at a tolerance where
 /// that trajectory is converged they must agree to round-off.
-fn tight(model: CompiledModel) -> CompiledModel {
+pub(super) fn tight(model: CompiledModel) -> CompiledModel {
     with_tol(model, 1e-10, 1e-12)
 }
 
@@ -371,7 +371,7 @@ fn reconverged_f(model: &CompiledModel, s: &Subject, template: &ModelParameters,
 
 /// `∂f/∂η` for the oracle objective: a Richardson difference of the production predictor,
 /// so the oracle never depends on the engine under test.
-fn oracle_jacobian(
+pub(super) fn oracle_jacobian(
     model: &CompiledModel,
     s: &Subject,
     theta: &[f64],
@@ -481,7 +481,7 @@ thread_local! {
 /// Worst relative gap `|adj − FD|/(1 + |FD|)` between the adjoint gradient and a
 /// Richardson-extrapolated central difference of the objective with the EBE re-found at
 /// every point: an oracle that shares no derivative code with either provider.
-fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
+pub(super) fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, ORACLE_EBE_TOL.get(), interaction);
@@ -651,7 +651,7 @@ fn analytic_adjoint_matches_reconverged_fd_steady_state() {
 
 /// Censor the rows in `rows` (left, `CENS=1`) at a limit above the prediction, so the M3
 /// term is live and non-trivial.
-fn censor(mut s: Subject, rows: &[usize]) -> Subject {
+pub(super) fn censor(mut s: Subject, rows: &[usize]) -> Subject {
     for &j in rows {
         s.cens[j] = 1;
         s.observations[j] *= 1.6;
@@ -1068,7 +1068,7 @@ fn adjoint_on_the_exact_linear_path_matches_reconverged_fd() {
 }
 
 /// A subject skeleton with the given doses and observation times (no DV yet).
-fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
+pub(super) fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
     let n = times.len();
     Subject {
         obs_rgroup: Vec::new(),
@@ -2254,7 +2254,7 @@ fn laplace_kernel_is_the_production_objective() {
 
 /// [`fd_oracle`] for an AGQ objective: Richardson FD of production's AGQ objective with
 /// the (conditional) EBE re-found at every point.
-fn fd_oracle_agq(model: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
+pub(super) fn fd_oracle_agq(model: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, 1e-12, true);
@@ -2793,7 +2793,7 @@ fn closed_form_per_compartment_scale_matches_reconverged_fd() {
 /// shared `1e-5` bound has ≥ 1.5× headroom on the worst and two orders on most. Against the
 /// forward assembly, before it was removed: 6.6e-9 (closed form), 7.9e-8 (ODE), 2.0e-6 (IOV,
 /// whose third order the forward side central-differenced).
-fn hessian_gaps(model: &CompiledModel, s: &Subject, interaction: bool) -> (f64, f64) {
+pub(super) fn hessian_gaps(model: &CompiledModel, s: &Subject, interaction: bool) -> (f64, f64) {
     hessian_gaps_for(
         model,
         s,
@@ -2805,7 +2805,11 @@ fn hessian_gaps(model: &CompiledModel, s: &Subject, interaction: bool) -> (f64, 
     )
 }
 
-fn hessian_gaps_for(model: &CompiledModel, s: &Subject, objective: Objective) -> (f64, f64) {
+pub(super) fn hessian_gaps_for(
+    model: &CompiledModel,
+    s: &Subject,
+    objective: Objective,
+) -> (f64, f64) {
     let interaction = objective != Objective::Foce;
     use crate::estimation::parameterization::unpack_params;
     let params = moved_params(model);

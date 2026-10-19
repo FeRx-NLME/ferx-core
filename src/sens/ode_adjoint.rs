@@ -2692,3 +2692,7 @@ pub(crate) use hessian::{cov_width_declines, subject_adjoint_cov_hessian, subjec
 #[cfg(test)]
 #[path = "ode_adjoint_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ode_adjoint_phenomena_tests.rs"]
+mod phenomena_tests;

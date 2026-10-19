@@ -328,6 +328,13 @@ objective with the inner loop reconverged at each point. That is correct, but sl
 the analytic score, and it is the route those endpoints take until their likelihoods join
 the adjoint kernel. The fit output reports which route ran.
 
+Under the exact (Laplace) anchor, an `[odes]` subject whose event times move with the
+parameters (an estimated `LAGTIME`, a per-route `lag=`, a modeled duration `D{n}`) is also
+scored by reconverged finite differences. Its gradient needs `∂²f/∂η²` differentiated once more,
+and the event walk differentiates a moving boundary exactly only through second order. The
+Gauss–Newton anchor and FOCE/FOCEI need no more than that, so they stay analytic on these
+subjects.
+
 A subject inside the scope can still miss the exact gradient at one trial point. If the inner
 search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
 is indefinite, the identity behind the exact score does not hold. The subject then takes the

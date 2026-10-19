@@ -1826,9 +1826,24 @@ fn jdotg_value<T: crate::sens::num::PkNum>(
 /// position is unchanged) but the same derivatives as `x`, so it is the `δ` fed
 /// into a saltation correction (e.g. `δlag`, `δt_inf`). Shared by every call site
 /// so the convention can't drift between them.
+///
+/// The saltations expand the boundary shift to `δ²` with an `f64` `δ²` coefficient
+/// (`jdotg_value`), which is exact through second order in the parameters and no further:
+/// a third-order term needs the coefficient's own jet and a `δ³` term. So for a type that
+/// carries more than second-order derivatives (`!PkNum::TAYLOR2_EXACT`: the covariance
+/// step's nested duals, the Laplace exact anchor's taped Hessian) a shift that carries a
+/// jet is returned as `NaN`, and the recording declines to its salvage instead of
+/// returning a truncated jet. Measured before this guard (#2093 review, finding 6): the
+/// FOCEI R-matrix on a depot `LAGTIME` with IIV was 3.2e-1 off FD of the exact gradient,
+/// the Laplace gradient on the same model 6.6e-3 off reconverged FD; second-order
+/// consumers on the same fixtures were exact (≤ 1e-6).
 #[inline]
 fn jet_only<T: crate::sens::num::PkNum>(x: T) -> T {
-    x - T::from_f64(x.val())
+    let d = x - T::from_f64(x.val());
+    if !T::TAYLOR2_EXACT && !d.is_constant() {
+        return T::from_f64(f64::NAN);
+    }
+    d
 }
 
 /// Estimated-lagtime event-time saltation at an **infusion rate boundary** (the rate
