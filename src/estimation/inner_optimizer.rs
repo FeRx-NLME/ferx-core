@@ -2219,6 +2219,11 @@ fn find_ebe_solve(
     // reconverges to the same basin is rejected by that guard. So a scanned
     // coordinate's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
     // strictly better mode.
+    // A candidate that replaces the incumbent replaces its convergence flag too
+    // (`ebe_converged = ok`, in both the screen and the axis scan): a descent that stopped
+    // at `inner_maxiter` below a converged incumbent is not a mode, and keeping the
+    // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
+    // It is still taken — it is strictly lower, so likely in the better basin.
     let mut screen_moved = false;
     if restarts > 0 && !is_warm_start(eta_init) {
         #[cfg(test)]
@@ -2261,7 +2266,7 @@ fn find_ebe_solve(
                     if omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST {
                         nll = cand_nll;
                         eta = cand;
-                        ebe_converged = ebe_converged || ok;
+                        ebe_converged = ok;
                         screen_moved = true;
                     } else {
                         #[cfg(test)]
@@ -2313,7 +2318,7 @@ fn find_ebe_solve(
                         if cand_nll + 1e-9 < nll {
                             nll = cand_nll;
                             eta = cand;
-                            ebe_converged = ebe_converged || ok;
+                            ebe_converged = ok;
                         }
                     }
                 }

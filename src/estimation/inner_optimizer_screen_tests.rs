@@ -468,3 +468,124 @@ fn the_distance_gate_keeps_a_loosely_converged_unimodal_subject() {
         assert!(!on.screen_moved, "{}", cfg.name);
     }
 }
+
+/// Raw L2 gradient of the individual objective at the returned η̂.
+fn grad_norm_at(m: &CompiledModel, subj: &Subject, eta: &DVector<f64>) -> f64 {
+    let p = &m.default_params;
+    let g = analytic_eta_nll_gradient(m, subj, &p.theta, eta.as_slice(), &p.omega, &p.sigma.values)
+        .expect("the flip-flop model has an analytic inner gradient");
+    let n = g.iter().map(|x| x * x).sum::<f64>().sqrt();
+    assert!(n.is_finite(), "gradient at {eta:?} is not finite");
+    n
+}
+
+/// Above this raw gradient norm a returned η̂ is not a mode. The largest norm any
+/// *converged* solve in the two sweeps below returns is 5.6e-4 (Linux x86_64, the axis
+/// sweep's incumbent at `inner_maxiter = 42`), so the bound has ~18× headroom. The descents
+/// the old `ebe_converged || ok` mislabelled stop at up to 3.5e-1 (screen) and 2.3e2 (axis
+/// scan); seven screen cells and nine axis cells lie above the bound.
+const NOT_A_MODE_GRAD: f64 = 1e-2;
+
+/// Asserts the #2100 contract on one solve, and returns whether this cell straddles it:
+/// the incumbent (`off`, the same cold solve without the block under test) converged, a
+/// candidate from the block replaced it, and that candidate's own descent did not converge.
+/// The old `ebe_converged || ok` reported exactly those cells converged.
+fn check_converged_flag(
+    what: &str,
+    m: &CompiledModel,
+    subj: &Subject,
+    off: &EbeResult,
+    on: &EbeResult,
+) -> bool {
+    let g = grad_norm_at(m, subj, &on.eta);
+    assert!(
+        !on.converged || g < NOT_A_MODE_GRAD,
+        "{what}: η̂ reported converged at |∇| = {g:.3e} (nll {:.6}, incumbent {:.6})",
+        on.nll,
+        off.nll
+    );
+    off.converged && on.nll + 1e-9 < off.nll && !on.converged
+}
+
+/// #2100, the screen's acceptance block: a screen descent that stops at `inner_maxiter`
+/// below a converged incumbent replaces it, and the returned EBE must then carry the
+/// descent's own flag, not the incumbent's. Config 1 at a low `inner_maxiter` is where the
+/// incumbent (the trapped mode) already converges and the screen's winning descent has not
+/// yet met the deeper mode's gradient test.
+#[test]
+fn a_screen_descent_that_stopped_short_is_not_reported_converged() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let mut straddles = 0;
+    for tol in [1e-5, 1e-3] {
+        for max_iter in 5..=15 {
+            let o = FitOptions {
+                inner_maxiter: max_iter,
+                inner_tol: tol,
+                ..opts.clone()
+            };
+            for id in ["S1", "S2", "S3", "S4"] {
+                let subj = flip_flop_subject(id, cfg);
+                let off = solve(&m, &o, &subj, 0, 1, None);
+                let on = solve(&m, &o, &subj, 100, 1, None);
+                let what = format!("{id} inner_tol = {tol}, inner_maxiter = {max_iter}");
+                if check_converged_flag(&what, &m, &subj, &off, &on) {
+                    assert!(on.screen_moved, "{what}: the screen made the move");
+                    straddles += 1;
+                }
+            }
+        }
+    }
+    // Without a straddling cell the bound above would pass vacuously.
+    assert!(
+        straddles > 0,
+        "no cell had a failed screen descent replace a converged incumbent"
+    );
+    // The other side: at the default `inner_maxiter` the same descent converges.
+    let subj = flip_flop_subject("S1", cfg);
+    let full = solve(&m, &opts, &subj, 100, 1, None);
+    assert!(
+        full.screen_moved && full.converged,
+        "default inner_maxiter converges"
+    );
+}
+
+/// #2100, the axis scan's acceptance block. A per-row covariate the model never reads makes
+/// the subject a scan-all subject (`has_tv_covariates`), so the `±2·sd` seeds run on every
+/// coordinate; with the screen off, a seed is the only thing that can move the EBE.
+#[test]
+fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let mut subj = flip_flop_subject("S1", cfg);
+    subj.obs_covariates = TIMES
+        .iter()
+        .map(|_| std::collections::HashMap::from([("UNUSED".to_string(), 1.0)]))
+        .collect();
+    assert!(subj.has_tv_covariates());
+    let mut straddles = 0;
+    for max_iter in 40..=60 {
+        let o = FitOptions {
+            inner_maxiter: max_iter,
+            inner_tol: 1e-5,
+            ..opts.clone()
+        };
+        let off = solve(&m, &o, &subj, 0, 0, None);
+        let on = solve(&m, &o, &subj, 0, 1, None);
+        assert!(!on.screen_moved);
+        let what = format!("inner_maxiter = {max_iter}");
+        if check_converged_flag(&what, &m, &subj, &off, &on) {
+            straddles += 1;
+        }
+    }
+    assert!(
+        straddles > 0,
+        "no cell had a failed axis seed replace a converged incumbent"
+    );
+    let full = solve(&m, &opts, &subj, 0, 1, None);
+    assert!(
+        (full.nll - cfg.deeper).abs() < 1e-4 && full.converged,
+        "default inner_maxiter: the seed converges to the deeper mode, nll {}",
+        full.nll
+    );
+}
