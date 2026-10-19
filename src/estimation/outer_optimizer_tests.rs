@@ -7576,6 +7576,46 @@ fn predicted_remaining_gain_seeds_the_tight_re_solve_with_the_kappas() {
     );
 }
 
+/// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve
+/// instead of paying for it (up to a 100× step budget) and then returning `None`. Both
+/// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI starts one
+/// re-solve and forms a decrement, AGQ starts none and forms none.
+#[test]
+fn predicted_remaining_gain_skips_the_tight_re_solve_out_of_scope() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let m = parse_model_string(&issue_1934_ode_model(
+        6.735588,
+        16.155540,
+        0.011638,
+        23.488333,
+        [0.061883, -0.018713, 0.101651],
+        0.043717,
+        "rk45",
+    ))
+    .expect("fixture parses");
+    let opts = focei_options();
+    let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &pop, &opts);
+    let agq = FitOptions {
+        n_agq: 3,
+        ..focei_options()
+    };
+    let resolves = || super::TIGHT_RESOLVES.with(|n| n.get());
+    for (label, o, in_scope) in [("FOCEI", &opts, true), ("AGQ", &agq, false)] {
+        let before = resolves();
+        let got = gain_with(&m, &pop, &m.default_params, &x, &ehs, &kappas, o);
+        assert_eq!(got.is_some(), in_scope, "{label}: {got:?}");
+        assert_eq!(
+            resolves() - before,
+            usize::from(in_scope),
+            "{label}: tight re-solves started"
+        );
+    }
+}
+
 /// #2001 review: a tight re-solve that leaves a subject unconverged gives no decrement — the
 /// gradient formula assumes every η̂ is a mode, and an unconverged one still yields a
 /// finite gradient. Both sides of the gate in one test: the #1934 model's ODE twin under

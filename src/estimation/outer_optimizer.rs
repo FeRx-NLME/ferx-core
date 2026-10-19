@@ -2518,6 +2518,16 @@ fn failure_is_converged_plateau(
     made_progress && plateaued && consistent && left_init
 }
 
+/// Can [`per_subject_outer_gradients`] be formed for this objective at all — not an AGQ or
+/// mixture objective, and the model inside the analytic outer scope? Asked on its own by
+/// [`predicted_remaining_gain`] before the tight re-solve it would otherwise pay for a
+/// certain `None` (#2143 review).
+fn per_subject_outer_gradients_in_scope(model: &CompiledModel, options: &FitOptions) -> bool {
+    options.agq_nodes().is_none()
+        && model.mixture.is_none()
+        && crate::sens::provider::analytic_outer_gradient_available(model)
+}
+
 /// Per-subject outer gradients `∂nllᵢ/∂x` (packed space) at `x`, from the same analytic
 /// entry points the optimizer's gradient is assembled from, for [`bhhh_newton_decrement`]
 /// (#1934). `None` whenever any subject has no analytic gradient — an AGQ or mixture
@@ -2533,10 +2543,7 @@ fn per_subject_outer_gradients(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<Vec<Vec<f64>>> {
-    if options.agq_nodes().is_some()
-        || model.mixture.is_some()
-        || !crate::sens::provider::analytic_outer_gradient_available(model)
-    {
+    if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
     let iov = crate::sens::provider::iov_sens_supported(model);
@@ -2778,36 +2785,27 @@ fn predicted_remaining_gain(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
+    if !per_subject_outer_gradients_in_scope(model, options) {
+        return None;
+    }
     let per_subject = match decrement_ode_override(model, options) {
         None => {
             per_subject_outer_gradients(model, population, init_params, x, ehs, kappas, options)?
         }
-        Some(ode) => crate::api::with_fit_scope_ode(options, ode, || {
-            let params = unpack_params(x, init_params);
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let warm = joint_warm_starts(ehs, kappas);
-            let (ehs, _, stats, kappas) = run_inner_loop_warm_seeded(
+        Some(ode) => {
+            #[cfg(test)]
+            TIGHT_RESOLVES.with(|n| n.set(n.get() + 1));
+            tight_per_subject_gradients(
                 model,
                 population,
-                &params,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&warm),
-                Some(&mu_k),
-                0,
-                0,
-                InnerHessianSeed::for_options(options),
+                init_params,
+                x,
+                ehs,
+                kappas,
                 options,
-            );
-            // The decrement assumes every η̂ is a mode; one that did not converge (or a
-            // start the inner loop refused) still yields a finite gradient, formed as if
-            // it were. No decrement then — the latch proceeds as before #1934.
-            if stats.n_unconverged > 0 || stats.n_start_rejected > 0 {
-                return None;
-            }
-            per_subject_outer_gradients(model, population, init_params, x, &ehs, &kappas, options)
-        })
-        .ok()??,
+                ode,
+            )?
+        }
     };
     let n = x.len();
     let theta = unpack_params(x, init_params).theta;
@@ -2825,6 +2823,56 @@ fn predicted_remaining_gain(
         bounds,
         &packed_fixed_mask(init_params),
     )
+}
+
+/// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
+/// tight ODE override `ode` ([`predicted_remaining_gain`], #2001). `None` when the scope
+/// cannot be built, the re-solve leaves a subject unconverged or start-rejected, or the
+/// gradients cannot be formed.
+#[allow(clippy::too_many_arguments)]
+fn tight_per_subject_gradients(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    ode: crate::ode::solver::OdeSolverOverride,
+) -> Option<Vec<Vec<f64>>> {
+    crate::api::with_fit_scope_ode(options, ode, || {
+        let params = unpack_params(x, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let warm = joint_warm_starts(ehs, kappas);
+        let (ehs, _, stats, kappas) = run_inner_loop_warm_seeded(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm),
+            Some(&mu_k),
+            0,
+            0,
+            InnerHessianSeed::for_options(options),
+            options,
+        );
+        // The decrement assumes every η̂ is a mode; one that did not converge (or a
+        // start the inner loop refused) still yields a finite gradient, formed as if
+        // it were. No decrement then — the latch proceeds as before #1934.
+        if stats.n_unconverged > 0 || stats.n_start_rejected > 0 {
+            return None;
+        }
+        per_subject_outer_gradients(model, population, init_params, x, &ehs, &kappas, options)
+    })
+    .ok()?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
+    /// test can see that an out-of-scope objective skips one (#2143 review).
+    static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
