@@ -13,8 +13,8 @@
 //! production predictor for `∂f/∂η`. Each bound is the measured worst with ~10× headroom.
 
 use super::tests::{
-    censor, ebe_for, fd_oracle, hessian_gaps, hessian_gaps_for, moved_params, oracle_jacobian,
-    parity, subject, subject_shell, tight, with_tol,
+    censor, ebe_for, fd_oracle, hessian_gaps, hessian_gaps_for, laplace_prod, moved_params,
+    oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
 };
 use super::*;
 use crate::estimation::parameterization::pack_params;
@@ -1922,4 +1922,254 @@ fn tad_reading_rhs_across_an_estimated_lag_matches_fd() {
     let (h, _) = hessian_gaps(&m, &s, true);
     eprintln!("TAD RHS, lag: R-matrix vs FD {h:.2e}");
     assert!(h.is_finite() && h < 1e-4, "R-matrix {h:.2e}");
+}
+
+/// #2121 (ported from `main`'s forward-provider test): the dual ODE walk seeds `init(...)` from
+/// the subject's first record in file order — here an EVID=2 row (WT 70) tied at TIME 0 with
+/// an observation (WT 140), where the row wins (`crate::dosing::first_record`). The seed is
+/// pinned to its closed form `f(0) = TVB·WT·exp(η_B)/V` at the row's WT, and the recorder's
+/// η-Jacobian to FD of production: a dual seed read off the observation would make
+/// `∂f(0)/∂η_B = f(0)` twice the value path's.
+#[test]
+fn ode_init_seed_at_an_evid2_obs_tie_reads_the_first_record() {
+    const SRC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVB(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_B  ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  BASE = TVB * WT * exp(ETA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let m = parse_model_string(SRC).expect("parse");
+    let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    let mut s = subject(&m, Vec::new(), &[0.0, 2.0, 4.0, 8.0], &[0.15, -0.10]);
+    s.covariates = wt(140.0);
+    s.obs_covariates = vec![wt(140.0); 4];
+    s.pk_only_times = vec![0.0];
+    s.pk_only_raw_times = vec![0.0];
+    s.pk_only_covariates = vec![wt(70.0)];
+    s.pk_only_occasions = vec![1];
+    assert!(s.has_tv_covariates(), "fixture must carry TV covariates");
+    let eta = [0.15, -0.10];
+    let f = crate::pk::compute_predictions_with_tv(&m, &s, &m.default_params.theta, &eta);
+    let seed = |w: f64| 10.0 * w * (-0.10_f64).exp() / 50.0;
+    assert!(
+        (f[0] - seed(70.0)).abs() < 1e-9,
+        "f(0) = {} must be the EVID=2 row's seed {} (the observation's: {})",
+        f[0],
+        seed(70.0),
+        seed(140.0)
+    );
+    let gap = jacobian_gap(&m, &s, &eta, "init seed at an EVID=2 / obs tie");
+    eprintln!("init seed tie: η-Jacobian vs FD {gap:.2e}");
+    assert!(gap < 1e-7, "η-Jacobian vs FD {gap:.2e}");
+}
+
+/// Why an SPD `H` keeps the identity off the mode (#2093 review, Codex finding 1). At
+/// `η̂ = η* + ε` with `∇_η l = Hε`, `∂Ψ/∂x` differs from the converged objective's total
+/// derivative by `O(|∇_η l|)`: the identity's error is *first order in the stationarity gap*.
+/// The salvage a decline would take — the held-EBE gradient `∂F/∂x` at fixed `η̂` — omits the
+/// EBE response altogether, an `O(1)` error. So at a strict mode the solve is kept whatever
+/// `∇_η l` is; the indefinite branch declines, because an indefinite `H` off the mode is not
+/// near a minimum and `H⁻¹` there means nothing (`mode_solve_declines_an_indefinite_hessian_off_the_mode`).
+#[test]
+fn off_the_mode_the_identity_beats_the_held_ebe_gradient() {
+    let m = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = two_dose_subject(&m);
+    let params = moved_params(&m);
+    let x = pack_params(&params);
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let star = ebe_for(&m, &s, &params, 1e-12, true);
+    let truth = subject_adjoint_gradient(&m, &s, &params, &x, star.as_slice(), laplace).unwrap();
+    let rel = |g: &[f64]| {
+        g.iter()
+            .zip(&truth)
+            .map(|(a, b)| {
+                assert!(a.is_finite());
+                (a - b).abs() / (1.0 + b.abs())
+            })
+            .fold(0.0f64, f64::max)
+    };
+    let dir = [1.0, -0.5, 0.7];
+    let mut errs = Vec::new();
+    for delta in [1e-3, 1e-2] {
+        let eta: Vec<f64> = star.iter().zip(&dir).map(|(e, d)| e + delta * d).collect();
+        let h = exact_inner_hessian(&m, &s, &params, &eta).expect("recorded");
+        assert!(
+            h.clone().cholesky().is_some(),
+            "a strict mode's neighbourhood: SPD"
+        );
+        let psi = subject_adjoint_gradient(&m, &s, &params, &x, &eta, laplace).expect("served");
+        let held: Vec<f64> = (0..x.len())
+            .map(|k| {
+                let hk = 1e-5 * (1.0 + x[k].abs());
+                let at = |d: f64| {
+                    let mut xv = x.clone();
+                    xv[k] += d;
+                    let p = crate::estimation::parameterization::unpack_params(&xv, &params);
+                    laplace_prod(&m, &s, &p, &eta)
+                };
+                (at(hk) - at(-hk)) / (2.0 * hk)
+            })
+            .collect();
+        let (ep, eh) = (rel(&psi), rel(&held));
+        eprintln!("δ = {delta:.0e}: identity {ep:.2e}, held EBE {eh:.2e}");
+        errs.push((ep, eh));
+    }
+    // First order: ten times the gap, about ten times the error.
+    let ratio = errs[1].0 / errs[0].0;
+    assert!(
+        (5.0..20.0).contains(&ratio),
+        "identity error ratio {ratio:.2}"
+    );
+    for (ep, eh) in errs {
+        assert!(eh > 10.0 * ep, "held EBE {eh:.2e} vs identity {ep:.2e}");
+    }
+}
+
+/// Two combinations `docs/estimation/foce.qmd` once described both as FD fallbacks and as
+/// analytic (#2093 review, Codex finding 4): ODE `iiv_on_ruv` × M3 (an "inner-loop-only FD
+/// fallback") and a closed-form steady-state dose under an estimated lag (a "deliberate FD
+/// exception"). Both are served by the recorder on both loops and match reconverged FD.
+#[test]
+fn ode_iiv_on_ruv_with_m3_and_closed_form_ss_with_lag_are_analytic() {
+    // (1) ODE iiv_on_ruv × M3, non-IOV: inner (η-gradient) and outer served, matching FD.
+    let src = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+    let mut m = tight(parse_model_string(src).unwrap());
+    m.bloq_method = crate::types::BloqMethod::M3;
+    let s = censor(two_dose_subject(&m), &[0, 7]);
+    let inner =
+        crate::sens::provider::subject_eta_grad(&m, &s, &m.default_params.theta, &[0.05, 0.02]);
+    assert!(
+        inner.is_some() && served(&m, &s),
+        "ODE iiv_on_ruv × M3 must be served"
+    );
+    let g = parity(&m, &s);
+    eprintln!("ODE iiv_on_ruv × M3: gradient vs reconverged FD {g:.2e}");
+    // Measured 6.2e-7 on Linux; ~10× headroom.
+    assert!(g < 6e-6, "{g:.2e}");
+    // (2) closed-form SS bolus + estimated lag.
+    let cf = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.1
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+  ALAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(cf).unwrap();
+    let s = subject(
+        &m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0],
+        &[0.1, -0.05],
+    );
+    let inner =
+        crate::sens::provider::subject_eta_grad(&m, &s, &m.default_params.theta, &[0.05, 0.02]);
+    assert!(
+        inner.is_some() && served(&m, &s),
+        "closed-form SS + lag must be served"
+    );
+    let g = parity(&m, &s);
+    eprintln!("closed-form SS + lag: gradient vs reconverged FD {g:.2e}");
+    // Measured 4.5e-6 on Linux; ~10× headroom.
+    assert!(g < 5e-5, "{g:.2e}");
+}
+
+/// Modeled `D1`/`R1` on the **closed-form** event walk (#2093 review, Codex finding 2): the
+/// same fixtures as the ODE tests above, with the structure swapped for `one_cpt_iv`. The
+/// walk reads each dose's modeled slot as a dual (`slot_dual` in `record_analytic_events`);
+/// read as a constant, the predictions stay right and only the moving infusion-end
+/// derivative is lost, which these tests see.
+#[test]
+fn modeled_dose_on_the_closed_form_walk_matches_reconverged_fd() {
+    let cf = |src: &str| {
+        src.replace(
+            "[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -CL/V * central\n[scaling]\n  y = central / V\n",
+            "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n",
+        )
+    };
+    for (src, mode, label) in [
+        (
+            cf(MODELED_DUR_ODE),
+            RateMode::ModeledDuration,
+            "closed-form D1",
+        ),
+        (
+            cf(MODELED_RATE_ODE),
+            RateMode::ModeledRate,
+            "closed-form R1",
+        ),
+    ] {
+        let m = parse_model_string(&src).unwrap();
+        assert!(m.ode_spec.is_none(), "{label}: must be closed form");
+        let s = modeled_subject(&m, mode, &[1.0, 3.0, 6.0, 7.5, 9.0, 12.0, 14.0, 20.0]);
+        assert!(!s.all_doses_fixed());
+        let (jac, grad) = measure(&m, &s, &[0, 2], label);
+        eprintln!("{label}: jac {jac:.2e} grad {grad:.2e}");
+        // Measured jac 2.1e-12 / 1.8e-12, gradient 9.7e-9 / 7.0e-7 (D1 / R1) on Linux;
+        // ~10× headroom on the worse.
+        assert!(
+            jac < 2e-11 && grad < 7e-6,
+            "{label}: jac {jac:.2e} grad {grad:.2e}"
+        );
+    }
 }

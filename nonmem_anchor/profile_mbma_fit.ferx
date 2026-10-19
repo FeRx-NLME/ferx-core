@@ -1,0 +1,39 @@
+# #1065 NONMEM anchor A2, and fixture F2 of the profile tests: a profiled unstructured
+# placebo block whose study shares its rows with a between-arm kappa, with a drug
+# effect nonlinear in the study's eta. Twin of `profile_mbma.ctl` (every level a THETA there).
+# Data and control stream: `simulate_profile_mbma.py` (synthetic, fixed seed).
+#
+# The unprofiled twin the tests compare against is this file with the block line read
+# as `theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)`.
+
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta ET50(2.0, 0.01, 100.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile
+
+  omega ETA_EM ~ 0.25
+  kappa KAPPA_ARM ~ 1.0
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  STUDY categorical
+  TRT   continuous
+  SE    continuous
+
+[individual_parameters]
+  BASE  = TVE0 + PLACEBO + KAPPA_ARM
+  EMAXI = EMAX * exp(ETA_EM)
+
+[structural_model]
+  DRUG = TRT * EMAXI * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = true

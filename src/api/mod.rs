@@ -74,11 +74,11 @@ pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
+pub(crate) use levels::{active_levels, bind_from_fit_on, write_fitted_level_columns};
 pub use levels::{
     bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
     theta_level_values, ThetaLevelValue,
 };
-pub(crate) use levels::{bind_from_fit_on, write_fitted_level_columns};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{

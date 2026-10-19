@@ -368,6 +368,13 @@ fn adjoint_gradient(
 /// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
 /// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
 /// score ([`subject_adjoint_held_ebe_score`]), not the reconverged one.
+///
+/// The SPD branch takes no such gate, deliberately. Near a strict mode `η̂ = η* + ε` and
+/// `∂Ψ/∂x` misses the converged objective's total derivative by `O(|∇_η l|)` only, while
+/// every salvage a decline could take drops the EBE response, an `O(1)` error: measured off
+/// a Laplace mode, 2.1e-3 vs 3.0 at `|ε| ≈ 1e-3` and 2.1e-2 vs 2.6 at 1e-2
+/// (`off_the_mode_the_identity_beats_the_held_ebe_gradient`). An indefinite `H` off the mode
+/// is not near a minimum at all, which is what the gate above refuses.
 fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVector<f64>> {
     if let Some(c) = h.clone().cholesky() {
         return Some(c.solve(b));

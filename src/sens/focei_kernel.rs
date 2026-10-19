@@ -640,7 +640,6 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
     let unit = |k: usize| -> [T; N] { std::array::from_fn(|l| c(if l == k { 1.0 } else { 0.0 })) };
     // Per row: prediction, η-sensitivity, linearised mean f₀ and LᵀG (for GΩGᵀ = (LᵀG)ᵀ(LᵀG)).
     let lch = &p.omega.chol;
-    let mut gs: Vec<[T; N]> = Vec::with_capacity(n);
     let mut f0: Vec<T> = Vec::with_capacity(n);
     let mut lg: Vec<[T; N]> = Vec::with_capacity(n);
     for j in 0..n {
@@ -652,7 +651,6 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
         lg.push(std::array::from_fn(|cc| {
             T::wsum3(0.0, (cc..N).map(|r| (one, lch[r][cc], gj[r])))
         }));
-        gs.push(gj);
     }
     let r_eval: Vec<T> = match fpop {
         Some(fp) => fp.to_vec(),

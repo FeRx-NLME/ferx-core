@@ -152,7 +152,15 @@ pub trait PkNum:
     /// at `self.val()` (`v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`): the special functions the
     /// likelihood needs (e.g. `log Φ` for M3 rows) and a residual variance as a function of
     /// the prediction. Exact to second order on every dual and tape type.
-    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self;
+    ///
+    /// Provided, as the second-order Taylor polynomial in `δ = self − self.val()` (value `0`,
+    /// `self`'s jet), so an implementor outside this crate keeps compiling (#2093 review): it is
+    /// exact for every type tracking at most second derivatives, which every external `PkNum`
+    /// predating this member is. Every type in this crate overrides it.
+    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+        let dx = self - Self::from_f64(self.val());
+        Self::from_f64(v) + dx * Self::from_f64(d1) + dx * dx * Self::from_f64(0.5 * d2)
+    }
 
     /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
     /// second-order jet over a differentiable base (`sens::rtape::DualH`): their
@@ -793,5 +801,80 @@ mod tests {
         // caller checks `val()` separately.
         assert!(PkNum::jets_finite(f64::NAN));
         assert!(PkNum::jets_finite(f64::INFINITY));
+    }
+
+    /// `PkNum::lift2`'s provided default (the second-order Taylor polynomial) for an
+    /// implementor outside this crate, which supplies only the required members: on a
+    /// second-order dual it reproduces the crate's own exact `lift2` (value, gradient and
+    /// Hessian), so adding the member broke no external implementor (#2093 review).
+    #[test]
+    fn lift2_default_is_exact_for_an_external_second_order_type() {
+        #[derive(Clone, Copy, Debug)]
+        struct Ext(Dual2<1>);
+        macro_rules! op {
+            ($tr:ident, $f:ident) => {
+                impl std::ops::$tr for Ext {
+                    type Output = Ext;
+                    fn $f(self, o: Ext) -> Ext {
+                        Ext(std::ops::$tr::$f(self.0, o.0))
+                    }
+                }
+            };
+        }
+        op!(Add, add);
+        op!(Sub, sub);
+        op!(Mul, mul);
+        op!(Div, div);
+        impl std::ops::Neg for Ext {
+            type Output = Ext;
+            fn neg(self) -> Ext {
+                Ext(-self.0)
+            }
+        }
+        macro_rules! un {
+            ($($f:ident),*) => { $(fn $f(self) -> Self { Ext(PkNum::$f(self.0)) })* };
+        }
+        impl PkNum for Ext {
+            const SECOND_ORDER: bool = true;
+            fn from_f64(x: f64) -> Self {
+                Ext(<Dual2<1> as PkNum>::from_f64(x))
+            }
+            fn var(x: f64, dim: usize) -> Self {
+                Ext(<Dual2<1> as PkNum>::var(x, dim))
+            }
+            fn val(self) -> f64 {
+                PkNum::val(self.0)
+            }
+            un!(exp, ln, sqrt, abs, inv_logit, logit, cos, acos, ln_gamma);
+            fn pow(self, e: Self) -> Self {
+                Ext(PkNum::pow(self.0, e.0))
+            }
+            fn guard_floor(self, lo: f64) -> Self {
+                Ext(PkNum::guard_floor(self.0, lo))
+            }
+            fn jets_finite(self) -> bool {
+                PkNum::jets_finite(self.0)
+            }
+        }
+        let x = <Dual2<1> as PkNum>::var(0.7, 0) * <Dual2<1> as PkNum>::var(0.7, 0);
+        let (v, d1, d2) = (0.3, -1.7, 2.9);
+        let want = PkNum::lift2(x, v, d1, d2);
+        let got = PkNum::lift2(Ext(x), v, d1, d2).0;
+        assert!(
+            (got.value - want.value).abs() < 1e-15,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            (got.grad[0] - want.grad[0]).abs() < 1e-14,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            (got.hess[0][0] - want.hess[0][0]).abs() < 1e-13,
+            "{got:?} vs {want:?}"
+        );
+        assert!(
+            want.hess[0][0].abs() > 1.0,
+            "a curved jet, so the d2 term is live"
+        );
     }
 }

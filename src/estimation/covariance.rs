@@ -552,7 +552,7 @@ pub(crate) fn combine_covariance_and_reference(
 /// *during* the long finite-difference / score loops, which short-circuit and
 /// return [`CovarianceStepResult::Unusable`] so the fit still finishes (without
 /// standard errors) instead of running the cancelled work to completion.
-const COV_CANCELLED_MSG: &str =
+pub(super) const COV_CANCELLED_MSG: &str =
     "Covariance step cancelled before completion; standard errors not available.";
 
 /// Throttle stride for the covariance progress reporter: at most ~20 lines per

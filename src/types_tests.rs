@@ -3923,3 +3923,97 @@ fn pk_slot_rows_keeps_its_range_guard() {
         "pk_slot_rows must keep the range condition the assert and the filter share"
     );
 }
+
+// ── #2122 / #2101: kappa with a residual `correlation` line is analytic ──────────────────
+mod kappa_correlation_auto_route {
+    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::sens::provider::analytic_outer_gradient_in_scope;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    /// A one-level compartment-free model, optionally with a kappa, a
+    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ.
+    fn src(kappa: bool, corr: bool, extra: usize) -> String {
+        let extras: String = (0..extra)
+            .map(|i| format!("  theta X{i}(1.0, 0.0, 10.0)\n"))
+            .collect();
+        format!(
+            "[parameters]\n  theta TVE0(10.0)\n  theta TVEMAX(20.0)\n  theta RHO(0.3, 0.0, 0.9)\n\
+             {extras}  omega ETA_SP ~ 0.09\n{}  sigma ADD ~ 0.25\n\
+             [individual_parameters]\n  EMAX = TVEMAX * exp(ETA_SP{})\n\
+             [structural_model]\n  y = TVE0 + EMAX * TIME / (TIME + 3)\n\
+             [error_model]\n  DV ~ additive(ADD)\n{}\
+             [fit_options]\n  iov_column = ARMID\n",
+            if kappa { "  kappa K_OC ~ 0.04\n" } else { "" },
+            if kappa { " + K_OC" } else { "" },
+            if corr {
+                "  correlation car1(RHO) by ARMID\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn model(kappa: bool, corr: bool, extra: usize) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_full_model(&src(kappa, corr, extra))
+            .unwrap()
+            .model
+    }
+
+    /// `main`'s #2122 made `auto` take L-BFGS on this route because its gradient was
+    /// finite differences there (#2101). The adjoint serves kappa with a residual
+    /// `correlation` line exactly, so the route is analytic like its neighbours and `auto`
+    /// takes L-BFGS on the general rule, under FOCE and FOCEI alike; on a counterfactual FD
+    /// gradient all three get BOBYQA again.
+    #[test]
+    fn kappa_with_a_residual_correlation_is_analytic_and_auto_takes_lbfgs() {
+        let on = model(true, true, 0);
+        let kappa_only = model(true, false, 0);
+        let corr_only = model(false, true, 0);
+        for m in [&on, &kappa_only, &corr_only] {
+            assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
+            assert!(analytic_outer_gradient_in_scope(m));
+            for interaction in [true, false] {
+                assert_eq!(
+                    Optimizer::Auto.resolve_auto(m, interaction),
+                    Optimizer::NloptLbfgs
+                );
+            }
+            assert_eq!(
+                Optimizer::Auto.resolve_auto_given_analytic(m, false),
+                Optimizer::Bobyqa
+            );
+        }
+        // The outer loop's own resolver agrees, handed the live predicate (no mixture).
+        assert_eq!(
+            resolve_outer_optimizer(
+                Optimizer::Auto,
+                &on,
+                false,
+                analytic_outer_gradient_in_scope(&on)
+            )
+            .0,
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    /// No finite-difference warning on the route, and none past `main`'s 24-axis
+    /// compartment-free cap either: the adjoint has no axis cap (#2093).
+    #[test]
+    fn no_fd_route_or_axis_cap_warning() {
+        for (k, c, e) in [
+            (true, true, 22),
+            (true, true, 0),
+            (true, false, 22),
+            (false, true, 22),
+        ] {
+            let m = model(k, c, e);
+            assert!(
+                !m.parse_warnings
+                    .iter()
+                    .any(|w| w.contains("finite differences") || w.contains("axis cap")),
+                "kappa={k} corr={c} extra={e}: {:#?}",
+                m.parse_warnings
+            );
+        }
+    }
+}

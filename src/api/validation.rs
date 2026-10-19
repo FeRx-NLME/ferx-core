@@ -4938,13 +4938,31 @@ pub(crate) fn check_profiled_levels(
             "Use `covariance_method = r`, or remove `profile`.",
         ));
     }
-    // PR1 of #1065 parses, checks and reports a profiled block; the solve is PR2.
-    out.push(refuse(
-        "but profiled estimation is not implemented yet (#1065): this release checks the \
-         declaration and nothing more."
-            .to_string(),
-        REMOVE,
-    ));
+    // The profiled outer loop (`estimation::profile`) is an NLopt run over the structural
+    // parameters. It has no trust-region or MMA arm, no global pre-search, and no prior
+    // penalty, so each of those is refused rather than silently not applied.
+    if matches!(options.optimizer, Optimizer::TrustRegion | Optimizer::Mma) {
+        out.push(refuse(
+            format!(
+                "whose outer loop runs `auto`, `bobyqa`, `slsqp` or an L-BFGS; this fit asks \
+                 for `optimizer = {}`.",
+                options.optimizer.label()
+            ),
+            "Choose one of those, or remove `profile`.",
+        ));
+    }
+    if options.global_search {
+        out.push(refuse(
+            "which does not yet run a `global_search` pre-search.".to_string(),
+            "Set `global_search = false`, or remove `profile`.",
+        ));
+    }
+    if !model.priors.is_empty() {
+        out.push(refuse(
+            "which does not yet combine with a parameter prior.".to_string(),
+            "Remove the prior, or remove `profile`.",
+        ));
+    }
     out
 }
 

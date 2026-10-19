@@ -1481,7 +1481,18 @@ fn fit_inner(
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
     let held_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
-    let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
+    // What the covariance step differentiates: a `profile`d block's levels (#1065) are
+    // re-profiled inside its stencil, not stenciled, so its cost and its scale routing
+    // read the structural count.
+    let profiled = model
+        .indiv_param_partials
+        .theta_blocks
+        .profiled_theta_indices();
+    let n_params_pre = held_mask
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| !b && profiled.binary_search(&i).is_err())
+        .count();
 
     // Probe NLopt algorithm availability only when global_search will actually
     // run — otherwise the CRS2-LM warning is misleading for users who never
@@ -2250,6 +2261,21 @@ fn fit_inner(
             EstimationMethod::Vi => {
                 crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)
                     .map_err(EngineError::uncoded)?
+            }
+            // #1065: a `profile`d block takes its own outer loop over the structural
+            // parameters; `check_profiled_levels` has refused every method but foce/focei.
+            _ if !model
+                .indiv_param_partials
+                .theta_blocks
+                .profiled_names()
+                .is_empty() =>
+            {
+                crate::estimation::profile::optimize_profiled(
+                    model,
+                    population,
+                    &stage_params,
+                    &stage_opts,
+                )
             }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };

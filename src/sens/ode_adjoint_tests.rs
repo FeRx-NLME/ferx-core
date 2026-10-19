@@ -2010,7 +2010,12 @@ fn closed_form_iv_infusion_under_bioavailability_matches_reconverged_fd() {
 // ---- Laplace: `l + ½log|∇²_η l|`, exact Hessian ---------------------------------------
 
 /// Production's Laplace subject objective (`n_agq = 1`, exact anchor) at `η`.
-fn laplace_prod(model: &CompiledModel, s: &Subject, params: &ModelParameters, eta: &[f64]) -> f64 {
+pub(super) fn laplace_prod(
+    model: &CompiledModel,
+    s: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> f64 {
     agq_prod(model, s, params, eta, 1, true)
 }
 

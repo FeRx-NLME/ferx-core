@@ -9687,10 +9687,15 @@ impl Optimizer {
     /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
     /// available — the model is in the analytic (adjoint) gradient's scope and the user
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
-    /// otherwise. This mirrors the analytic-vs-FD predicate the outer loop uses
-    /// (see `build_info::gradient_method_outer`), so `auto` lands on the
-    /// gradient-based optimizer exactly when there is an exact gradient to feed
-    /// it (#490).
+    /// otherwise, with one exception that takes L-BFGS on a finite-difference
+    /// gradient: more than [`BOBYQA_MAX_DIM`] free parameters (#1064). Outside it this
+    /// mirrors the analytic-vs-FD predicate the outer loop uses
+    /// (see `build_info::gradient_method_outer`): `auto` takes the
+    /// gradient-based optimizer when there is an exact gradient to feed it, and
+    /// BOBYQA on a finite-difference one, where #490 found it fastest and most
+    /// reliable. (A residual `correlation` line with kappa, which #2122 sent to L-BFGS
+    /// on its finite-difference gradient, is analytic since #2093 and takes the
+    /// general rule.)
     ///
     /// `interaction` is `options.interaction` (`true` for `method = focei`,
     /// `false` for plain `method = foce`) — a custom residual-magnitude model's

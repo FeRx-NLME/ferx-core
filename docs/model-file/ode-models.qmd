@@ -158,7 +158,9 @@ They are named for the `[odes]` surface because that is what they describe:
 mirroring them on an analytical model would reject a legal `TAD` covariate and
 accept a `MACHEPS` that is really a missing data column.
 
-**Time-varying covariates.** Because the initial condition is a pre-record
+### Which record's covariates seed `init(...)` {#init-first-record}
+
+Because the initial condition is a pre-record
 baseline, it is evaluated a single time using the covariate values from the
 subject's **first record**. If a covariate that feeds the `init` expression
 changes later in the record, the initial amount is *not* re-evaluated — the
@@ -168,6 +170,16 @@ covariates. For most models this is exactly what you want, since the baseline
 represents the pre-dose steady state. If you need the starting amount to track
 a covariate value observed mid-record, model it as a state driven by `d/dt`
 rather than as an `init`.
+
+The first record is the subject's first row **in file order, of any kind**: a
+scored observation, an `EVID=2` (or `EVID=0, MDV=1`) row, or a dose — what
+NONMEM uses for `A_0`. When several rows share the subject's first `TIME`, the
+one written first supplies the covariates. A covariate-marker `EVID=2` row
+written before a baseline sample at `TIME 0` therefore seeds the `init` with
+*its* values, not the sample's. `predict()`, `fit()` (both its value and its
+gradient path) and adaptive simulation all apply this one rule; before #2121
+they took the observation in that case, which moved the objective by 49.6 on
+`nonmem_anchor/init_seed_tie_ofv_a`.
 
 A turnover model whose response variable sits at its baseline `KIN/KOUT`
 before any perturbation:
