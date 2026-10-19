@@ -7707,49 +7707,62 @@ fn integration_backs_a_decrement_only_when_every_segment_was_solved() {
     }
 }
 
-/// #2143 review: an exact-path ODE decrement is formed through the integration check (so a
-/// segment the matrix exponential declines withholds it), a closed form's is not (it has no
-/// integrations to count). The #1934 model and its exact ODE twin, at the false stop.
+/// #2143 review: on the exact (matrix-exponential) path, a segment the propagator declines is
+/// integrated at the fit's tolerance, outside the tight re-solve, so it withholds the
+/// decrement. The decline is forced through the solver's test seam
+/// (`FORCE_LINEAR_DECLINE`), set on the one worker of a one-thread pool so every subject's
+/// integration sees it and no other test does. The fixture is the #1934 model's exact ODE
+/// twin at the false stop, both sides in one pool: without the seam the decrement forms
+/// (14.83); with it every segment is declined and integrated, and the decrement is `None`.
+/// The declined pass is otherwise well formed (its gradient is the fit-tolerance
+/// integrated one): with the exact path left unchecked, or the decline clause dropped from
+/// `integration_backs_a_decrement`, it forms a decrement and this test fails.
 #[test]
-fn predicted_remaining_gain_checks_the_exact_paths_integrations() {
+fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment() {
+    use crate::ode::solver::FORCE_LINEAR_DECLINE;
     use crate::parser::model_parser::parse_model_string;
     use crate::read_nonmem_csv;
     use std::path::Path;
 
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
     let opts = focei_options();
-    let point = (
+    let m = parse_model_string(&issue_1934_ode_model(
         6.735588,
         16.155540,
         0.011638,
         23.488333,
         [0.061883, -0.018713, 0.101651],
         0.043717,
+        "auto",
+    ))
+    .expect("fixture parses");
+    assert_eq!(
+        decrement_ode_override(&m, &opts),
+        None,
+        "fixture takes the exact path"
     );
-    let (cl, v1, q, v2, om, sig) = point;
-    let passes = || super::CHECKED_EXACT_PASSES.with(|n| n.get());
-    for (label, src, checked) in [
-        (
-            "closed form",
-            issue_1934_model(cl, v1, q, v2, om, sig),
-            false,
-        ),
-        (
-            "exact ODE",
-            issue_1934_ode_model(cl, v1, q, v2, om, sig, "auto"),
-            true,
-        ),
-    ] {
-        let m = parse_model_string(&src).expect("fixture parses");
-        let before = passes();
-        let got = gain_at(&m, &pop, &opts);
-        assert!(got.is_some(), "{label}: {got:?}");
-        assert_eq!(
-            passes() - before,
-            usize::from(checked),
-            "{label}: checked passes"
-        );
-    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let (exact, declined) = pool.install(|| {
+        let p = &m.default_params;
+        let (x, ehs, _, kappas) = ebes_at(&m, p, &pop, &opts);
+        let exact = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
+        FORCE_LINEAR_DECLINE.set(true);
+        let declined = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
+        FORCE_LINEAR_DECLINE.set(false);
+        (exact, declined)
+    });
+    eprintln!("exact path {exact:?}, every segment declined {declined:?}");
+    assert!(
+        exact.is_some_and(|g| g.is_finite() && !gain_is_negligible(Some(g))),
+        "exact path: {exact:?}"
+    );
+    assert_eq!(
+        declined, None,
+        "a declined segment must withhold the decrement"
+    );
 }
 
 /// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve

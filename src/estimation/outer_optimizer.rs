@@ -2844,10 +2844,6 @@ fn predicted_remaining_gain(
             // A model routed to the exact path is checked too: a segment the matrix
             // exponential declines is integrated at the fit's tolerance (#2143 review).
             let checked = model.honors_ode_solver_opts();
-            #[cfg(test)]
-            if checked {
-                CHECKED_EXACT_PASSES.with(|n| n.set(n.get() + 1));
-            }
             per_subject_outer_gradients_checked(
                 model,
                 population,
@@ -2949,8 +2945,6 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many exact-path decrements were formed through the integration check.
-    static CHECKED_EXACT_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
