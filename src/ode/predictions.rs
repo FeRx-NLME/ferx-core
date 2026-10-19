@@ -7989,9 +7989,11 @@ pub fn ode_predictions_with_states(
 ///
 /// `ipred` is exact (the event-driven path uses per-event PK parameters). The
 /// compartment `states`, however, are derived from a second pass of the dense walk
-/// behind [`ode_dense_solve_states`], whose **disposition** (CL, V, etc.) and `init()`
-/// are the first observation's PK parameters held fixed for the entire timeline. Every
-/// dose-record quantity — absorption kernel, pathway fraction, route lag, zero-order
+/// behind [`ode_dense_solve_states`], whose **disposition** (CL, V, etc.) is the first
+/// observation's PK parameters held fixed for the entire timeline. `init()` is not part of
+/// that approximation: it is seeded from the subject's first record of any kind and
+/// re-seeded at each EVID=3/4 reset from that reset row's own parameters, as `ipred`
+/// seeds it (#2133). Every dose-record quantity — absorption kernel, pathway fraction, route lag, zero-order
 /// `dur`, compartment lag, `F`, `D{n}`/`R{n}` and the SS run-in — is read at its own
 /// dose record (`pk_at_dose`), as `ipred` reads it (#1575). For subjects whose
 /// disposition genuinely varies between observations the states will be approximate.
@@ -8029,8 +8031,10 @@ pub fn ode_predictions_event_driven_with_states(
     // Every dose-record quantity — absorption kernel, pathway fraction, route lag,
     // zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`, the SS run-in — is read at
     // its own dose record (`pk_at_dose`), exactly as the event-driven pass above reads
-    // it (#1575). Only the disposition (CL/V/etc.) and `init()` come from the
-    // first-observation snapshot.
+    // it (#1575). `init()` is seeded from the subject's first record
+    // (`dosing::first_record`, the selector every prediction engine uses) and re-seeded at
+    // each EVID=3/4 reset from that reset's own row, as the event-driven pass does (#2133).
+    // Only the disposition (CL/V/etc.) comes from the first-observation snapshot.
     //
     // For subjects with EVID=3/4 resets but *no* TV covariates, `pk_at_obs` is
     // uniformly filled (every entry identical), so using `first()` is exact.
@@ -8048,9 +8052,19 @@ pub fn ode_predictions_event_driven_with_states(
         .first()
         .map(|p| p.values)
         .unwrap_or([0.0; crate::types::MAX_PK_PARAMS]);
-    let states = ode_dense_solve_states_reading(
+    let first: &[f64] = match first_record(subject, subject.doses.len()) {
+        Some(FirstRecord::Dose(k)) => &pk_at_dose[k].values,
+        Some(FirstRecord::PkOnly(m)) => &pk_at_pk_only[m].values,
+        Some(FirstRecord::Obs(j)) => &pk_at_obs[j].values,
+        None => pk_flat,
+    };
+    let states = ode_dense_solve_states_seeded(
         ode,
         pk_flat,
+        InitReads::PerRecord {
+            first,
+            reset: pk_at_reset,
+        },
         DoseReads::PerDose(pk_at_dose),
         subject,
         &subject.obs_times,
@@ -8134,8 +8148,9 @@ fn build_segment_break_times(
 /// route lag of a built-in input rate, the zero-order `dur`, the compartment lag and `F`,
 /// `D{n}`/`R{n}`, and the SS run-in of an `SS=1` dose.
 ///
-/// The disposition — the parameters the `[odes]` RHS integrates under, and `init()` — is a
-/// separate argument and stays one snapshot. These quantities are properties of the dose
+/// The disposition — the parameters the `[odes]` RHS integrates under — is a separate
+/// argument and stays one snapshot; `init()` is read through [`InitReads`]. These
+/// quantities are properties of the dose
 /// record, so the event-driven engine reads every one of them at `pk_at_dose[k]`; a pass
 /// that read them at its one disposition snapshot instead gave a time-varying covariate on
 /// a dose quantity whatever value it held at that snapshot, a whole-dose error invisible
@@ -8177,6 +8192,48 @@ impl<'a> DoseReads<'a> {
     }
 }
 
+/// Which snapshot the dense walks evaluate `init(state) = expr` at (#2133): at the
+/// integration start, and again at every EVID=3/4 reset.
+///
+/// `init()` is a property of a **record**, not of the disposition: NONMEM evaluates `A_0`
+/// from the `$PK` of the subject's first record ([`crate::dosing::first_record`]) and a
+/// reset re-seeds from its own row (#1133). The state pass used to evaluate both at its one
+/// disposition snapshot, the first observation's, which on a subject whose first record is
+/// a dose or an EVID=2 row (or whose reset carries a different covariate) put every
+/// sdtab state and `[derived]` value off by the seed's ratio while IPRED was right.
+#[derive(Clone, Copy)]
+pub(crate) enum InitReads<'a> {
+    /// `init()` from the disposition snapshot, at the start and at every reset: the
+    /// parameter-static callers, where every record's snapshot is that one.
+    Disposition,
+    /// `init()` from `first` at the integration start and from `reset[r]` at
+    /// `subject.reset_times[r]` (`reset` parallel to it, as `EventPkParams::reset` is).
+    PerRecord {
+        first: &'a [f64],
+        reset: &'a [PkParams],
+    },
+}
+
+impl<'a> InitReads<'a> {
+    /// The integration-start seed.
+    #[inline]
+    fn first(self, disposition: &'a [f64]) -> &'a [f64] {
+        match self {
+            InitReads::Disposition => disposition,
+            InitReads::PerRecord { first, .. } => first,
+        }
+    }
+
+    /// The re-seed at reset `r`.
+    #[inline]
+    fn reset(self, disposition: &'a [f64], r: usize) -> &'a [f64] {
+        match self {
+            InitReads::Disposition => disposition,
+            InitReads::PerRecord { reset, .. } => &reset[r].values,
+        }
+    }
+}
+
 /// Owned per-segment forcings produced by [`apply_segment_boundary`]: everything
 /// `wrap_rhs_with_forcings` needs for one dose segment besides the per-subject
 /// [`PreparedForcings`], returned by value so the caller can build (and borrow into) the
@@ -8200,8 +8257,9 @@ struct SegmentForcings {
 /// state, and a dose must fire at the first break within [`EVENT_MATCH_TOL`] and at no
 /// other.
 ///
-/// `disposition` re-seeds `init()` at an EVID-3/4 reset; an `SS=1` dose's run-in reads its
-/// own record through `dose_reads`, as the event-driven engine's does (#1575).
+/// An EVID-3/4 reset re-seeds `init()` at its own row through `init_reads` (#2133); an
+/// `SS=1` dose's run-in reads its own record through `dose_reads`, as the event-driven
+/// engine's does (#1575).
 #[allow(clippy::too_many_arguments)]
 fn apply_segment_boundary(
     ode: &OdeSpec,
@@ -8210,6 +8268,7 @@ fn apply_segment_boundary(
     dose_f_bio: &[f64],
     zo_windows: &[ZeroOrderWindow],
     disposition: &[f64],
+    init_reads: InitReads<'_>,
     dose_reads: DoseReads<'_>,
     n: usize,
     opts: &OdeSolverOptions,
@@ -8226,11 +8285,17 @@ fn apply_segment_boundary(
     );
     // EVID=3/4 reset: re-seed compartments before processing doses at this time.
     // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
-    for &rt in &subject.reset_times {
-        if (rt - t_start).abs() < EVENT_MATCH_TOL {
-            *u = ode.initial_state(disposition);
-            break;
-        }
+    // Each reset overwrites the state, so of several resets on this break the last row's
+    // seed is the one the event-driven walk leaves behind. A reset that has a break of its
+    // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
+    // precedes it, as an observation between the two rows does in the event-driven walk.
+    // On the final break (`t_end == t_start`) nothing later exists.
+    if let Some(r) = subject
+        .reset_times
+        .iter()
+        .rposition(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start))
+    {
+        *u = ode.initial_state(init_reads.reset(disposition, r));
     }
 
     // SS + lagtime: at the dose *record* time (before the lagged pulse arrives)
@@ -8399,13 +8464,33 @@ pub(crate) fn ode_dense_solve_states_reading(
     subject: &Subject,
     saveat: &[f64],
 ) -> Vec<Vec<f64>> {
+    ode_dense_solve_states_seeded(
+        ode,
+        disposition,
+        InitReads::Disposition,
+        dose_reads,
+        subject,
+        saveat,
+    )
+}
+
+/// [`ode_dense_solve_states_reading`] with `init()` read through `init_reads` (#2133) — at
+/// the subject's first record and at each reset's own row — instead of at `disposition`.
+fn ode_dense_solve_states_seeded(
+    ode: &OdeSpec,
+    disposition: &[f64],
+    init_reads: InitReads<'_>,
+    dose_reads: DoseReads<'_>,
+    subject: &Subject,
+    saveat: &[f64],
+) -> Vec<Vec<f64>> {
     if saveat.is_empty() {
         return vec![];
     }
     let n = ode.n_states;
     let opts = ode.effective_solver_opts();
 
-    let mut u = ode.initial_state(disposition);
+    let mut u = ode.initial_state(init_reads.first(disposition));
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
 
     // Resolve modeled-RATE doses once (#324), each at its own record, before building the
@@ -8512,6 +8597,7 @@ pub(crate) fn ode_dense_solve_states_reading(
             &dose_f_bio,
             &zo_windows,
             disposition,
+            init_reads,
             dose_reads,
             n,
             &opts,
@@ -8704,6 +8790,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &dose_f_bio,
             &zo_windows,
             disposition,
+            InitReads::Disposition,
             dose_reads,
             n,
             &opts,

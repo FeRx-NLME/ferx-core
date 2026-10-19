@@ -266,5 +266,9 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
   the superposition path does not support
   (`W_DERIVED_CMT_TV_ANALYTICAL` warning is emitted).
 - **ODE models with time-varying covariates**: `compartments[i]` is approximate —
-  states are computed with first-observation PK parameters while `IPRED` uses the
-  correct per-event PK (`W_DERIVED_CMT_TV_ODE` warning is emitted).
+  states integrate under the first observation's disposition parameters (`CL`, `V`,
+  …) while `IPRED` uses the correct per-event PK (`W_DERIVED_CMT_TV_ODE` warning is
+  emitted). An `init(state) = expr` seed is *not* part of that approximation: it is
+  evaluated at the subject's first record of any kind (dose, `EVID=2` or
+  observation) and re-evaluated at each `EVID=3`/`4` reset row, exactly as `IPRED`
+  evaluates it, so a covariate that enters only `init()` gives exact states.
