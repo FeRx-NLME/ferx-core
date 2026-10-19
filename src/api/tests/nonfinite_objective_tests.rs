@@ -324,8 +324,9 @@ fn the_demotion_carries_its_documented_details_payload() {
 /// the objective happened to use.
 ///
 /// The reason distinguishes the sentinel from an objective that is merely past the
-/// cutoff (#2038). A proportional error on a prediction of 0 at the residual-SD floor
-/// gives a finite `4.6e14` (measured), which is not the clamp; calling it "at the
+/// cutoff (#2038). A proportional error on a prediction of 0 at the `1e-12` variance
+/// floor scores `DV² × 1e12` per observation, finite: the `4.6e14` here was measured
+/// on N6's fixture before #2039. That is not the clamp, and calling it "at the
 /// divergence sentinel" sent the reader looking for a clamped subject that did not
 /// exist. Both sides of `SUBJECT_SENTINEL_NLL` are listed, so moving the boundary
 /// either way fires.
@@ -1397,38 +1398,33 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
     );
 }
 
-/// **N6 — end to end, one bad record, on the ODE engine.** A negative `WT` on subject
-/// 3's fourth observation only: the ODE engine carries the `NaN` into that record and
+/// **N6 — end to end, one bad record, on both engines.** A negative `WT` on subject
+/// 3's fourth observation only: each engine carries the `NaN` into that record and
 /// every later one, and the sentence names the first of them.
 ///
-/// The closed form is also run, and is asserted on its current answer. It does not
-/// read the time-varying `WT` at that record and serves a finite prediction of 0
-/// there (#2039), which a proportional error scores at about `4.6e14`: so the subject
-/// is named "every IPRED and PRED finite" and the reason is "too large to be a fit".
-/// When #2039 is fixed it becomes the `NaN` case of N5's shape and this arm is
-/// updated with it.
+/// Before #2039 the closed form served a finite prediction of 0 at that record, which
+/// a proportional error scored at about `4.6e14`, so it named the subject "every IPRED
+/// and PRED finite". Since #2039 it serves the `NaN`, and both engines must give the
+/// same sentence. Each failure names its engine.
 #[test]
 fn a_negative_covariate_on_one_record_names_the_record() {
     let pop = warfarin_with_wt(NegativeWt::FourthObservation);
 
-    let ode = evaluate(&wt_power_model(true), &pop);
-    let (message, subjects) = named_subjects(&ode);
-    assert!(
-        message.contains(
-            ": 3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, the \
-             first at TIME 4)."
-        ),
-        "{message}"
-    );
-    assert_eq!(subjects.len(), 1, "only subject 3 is named: {subjects:?}");
-
-    let closed = evaluate(&wt_power_model(false), &pop);
-    let (message, subjects) = named_subjects(&closed);
-    assert!(message.contains("is too large to be a fit"), "{message}");
-    assert!(
-        message.contains(": 3 (contribution ")
-            && message.ends_with(", every IPRED and PRED finite)."),
-        "{message}"
-    );
-    assert_eq!(subjects.len(), 1, "only subject 3 is named: {subjects:?}");
+    for (engine, ode) in [("ODE", true), ("closed form", false)] {
+        let result = evaluate(&wt_power_model(ode), &pop);
+        let (message, subjects) = named_subjects(&result);
+        assert!(
+            message.ends_with(
+                " 1 of 10 subjects have an objective contribution that is itself unusable: \
+                 3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, \
+                 the first at TIME 4)."
+            ),
+            "{engine}: {message}"
+        );
+        assert_eq!(
+            subjects.len(),
+            1,
+            "{engine}: only subject 3 is named: {subjects:?}"
+        );
+    }
 }

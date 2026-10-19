@@ -1835,7 +1835,7 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 /// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
 /// none is, it says so, since that is a different defect: the predictions are finite
 /// and the subject's objective is huge anyway (a proportional error on a prediction
-/// of 0, measured at `4.6e14`).
+/// of 0 scores `DV² × 1e12` per observation at the variance floor).
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
 /// whose position does not match `population` gets no `TIME`.

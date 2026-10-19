@@ -455,8 +455,11 @@ infinite, or at or above the `1e14` cutoff, the fit comes back with
   objective was clamped (one clamped subject alone contributes `2e20`);
 * **too large to be a fit** — finite, past the cutoff and below the sentinel, so
   no subject was clamped and some subject's objective is that large on its own
-  terms. A proportional error on a prediction of `0` does this: the residual SD
-  bottoms out at its floor and the subject scores around `4.6e14`.
+  terms. A proportional error on a prediction of `0` does this: the residual
+  variance bottoms out at its `1e-12` floor, and each such observation scores
+  about `DV² × 1e12`. That passes the cutoff once `|DV|` exceeds 10; below it the
+  objective is merely huge (`DV = 4.4` gives `1.9e13`), and this warning is not
+  raised.
 
 `is_finite()` is deliberately **not** the test. A *repelled* fit — one the
 optimizer walked into a region where an individual contribution blows up — is
@@ -514,7 +517,7 @@ first as written in the data:
 first at TIME 4).
 ```
 
-Here an ODE model's `CL` went non-finite at `TIME 4`, and every later prediction
+Here the model's `CL` went non-finite at `TIME 4`, and every later prediction
 of the subject inherited it, so the first record is where to look, not the
 count. On that record the parameter model (a power of a negative covariate, a
 `log` of zero) or the structural model produced a value the likelihood could not
