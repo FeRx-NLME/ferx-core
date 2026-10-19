@@ -181,6 +181,18 @@ fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
              entry point that ignores its params"
         );
     }
+    // The same for Ω, which sets the η draw: an entry point that drew η from the
+    // initial Ω would otherwise pass whenever the fit left Ω where it started.
+    let (f, d) = (
+        params.omega.matrix[(0, 0)],
+        model.default_params.omega.matrix[(0, 0)],
+    );
+    assert_ne!(
+        f.to_bits(),
+        d.to_bits(),
+        "fitted Ω(ETA_CL) = {f} equals its initial estimate, so this test could not see an \
+         entry point that draws η from the initial Ω"
+    );
 
     let seed = 7;
     let target = population(1);
