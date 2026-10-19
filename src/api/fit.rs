@@ -1491,7 +1491,18 @@ fn fit_inner(
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
     let held_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
-    let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
+    // What the covariance step differentiates: a `profile`d block's levels (#1065) are
+    // re-profiled inside its stencil, not stenciled, so its cost and its scale routing
+    // read the structural count.
+    let profiled = model
+        .indiv_param_partials
+        .theta_blocks
+        .profiled_theta_indices();
+    let n_params_pre = held_mask
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| !b && profiled.binary_search(&i).is_err())
+        .count();
 
     // Probe NLopt algorithm availability only when global_search will actually
     // run — otherwise the CRS2-LM warning is misleading for users who never
@@ -2255,6 +2266,21 @@ fn fit_inner(
                 crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)
                     .map_err(EngineError::uncoded)?
             }
+            // #1065: a `profile`d block takes its own outer loop over the structural
+            // parameters; `check_profiled_levels` has refused every method but foce/focei.
+            _ if !model
+                .indiv_param_partials
+                .theta_blocks
+                .profiled_names()
+                .is_empty() =>
+            {
+                crate::estimation::profile::optimize_profiled(
+                    model,
+                    population,
+                    &stage_params,
+                    &stage_opts,
+                )
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -2521,7 +2547,11 @@ fn fit_inner(
     }
 
     let n_obs = population.n_obs();
-    let n_params = n_params_pre;
+    // #1065: a profiled block's levels are held from the optimizer but estimated from
+    // the data, so they count — the profiled and unprofiled fits of one model report one
+    // `n_parameters` and one BIC.
+    let counted_mask = crate::model_selection::counted_held_mask(model, init_params, &held_mask);
+    let n_params = counted_mask.iter().filter(|&&b| !b).count();
 
     // Parameter priors (#254). `result.ofv` is the clean −2LL that every
     // optimizer reports (the penalty is excluded from it by construction), so
@@ -2564,7 +2594,7 @@ fn fit_inner(
     // Delattre class tally behind the BIC variants (#1177): the same packed
     // held mask `n_params` was counted from, split by segment.
     let bic_inputs =
-        crate::model_selection::bic_inputs_for(model, init_params, &held_mask, n_for_bic);
+        crate::model_selection::bic_inputs_for(model, init_params, &counted_mask, n_for_bic);
     debug_assert_eq!(
         bic_inputs.n_free(),
         n_params,
@@ -3160,6 +3190,7 @@ fn fit_inner(
         cov_eigenvalues,
         cov_condition_number,
         bic_inputs,
+        profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,

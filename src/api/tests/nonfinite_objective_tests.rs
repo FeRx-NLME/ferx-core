@@ -981,6 +981,9 @@ fn every_published_convergence_verdict_is_gated_on_its_objective() {
         // calls the shared gate once inside its own body, hence three calls.
         ("src/estimation/impmap.rs", (2, 3)),
         ("src/estimation/outer_optimizer.rs", (2, 2)),
+        // The profiled outer loop (#1065); its never-solved exit publishes
+        // `converged: false`.
+        ("src/estimation/profile.rs", (1, 1)),
         ("src/estimation/saem.rs", (1, 1)),
         ("src/estimation/trust_region.rs", (1, 1)),
         ("src/estimation/vi/run.rs", (1, 1)),

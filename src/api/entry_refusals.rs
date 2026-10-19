@@ -73,19 +73,6 @@ pub(crate) fn nested_level_simulate_unsupported() -> EngineError {
     )
 }
 
-/// `E_NESTED_LEVEL_CORRELATION_UNSUPPORTED` on a `simulate*` entry point: a nested model
-/// with a residual `correlation … by` line, which `fit()` refuses too (#1082 PR5).
-pub(crate) fn nested_level_correlation_unsupported() -> EngineError {
-    coded(
-        "E_NESTED_LEVEL_CORRELATION_UNSUPPORTED",
-        Some("error_model"),
-        "a residual `correlation … by` line is not yet supported on a model with nested \
-         levels (more than one `level`), in simulation as in the fit. Simulate the levels \
-         without it, or the correlation with a single level."
-            .to_string(),
-    )
-}
-
 /// `E_LEVEL_MIXED_WITH_IOV_COLUMN` on a `simulate*` entry point: a derived `iov_occasion`
 /// rule handed with a nested model, whose groups are its level cells (#1082 PR4). `fit()`
 /// refuses the same rule.

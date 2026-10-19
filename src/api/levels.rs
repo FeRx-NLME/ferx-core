@@ -3941,6 +3941,79 @@ fn level_se(
     }
 }
 
+/// The levels of one `profile`d θ block (#1065) that each subject's scored rows read.
+///
+/// Each subject's objective depends on the structural θ and on these levels only, so
+/// the profile solve differentiates a subject over its own set rather than over the
+/// whole block. Built from the index column [`write_index_column`] wrote — per row
+/// when the index varies within a subject, from the baseline when it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveLevels {
+    pub(crate) block: String,
+    /// Per subject, in population order, the 0-based levels read, ascending.
+    pub(crate) per_subject: Vec<Vec<usize>>,
+}
+
+/// [`ActiveLevels`] for every profiled block of `model`, in declaration order, on a
+/// population whose level columns are written. A block some read of which is not
+/// indexed by the one plain column (`PLACEBO[4 - STUDY]` beside `PLACEBO[STUDY]`,
+/// `PLACEBO[K + 1]`) cannot be read off the data, so every subject is given every
+/// level: a superset is safe, it only costs the solve some work. The parser decides
+/// that over every read (`ThetaBlocks::profiled_index`), not over the plain-column
+/// reads alone, which would name the wrong levels (#2103 review #2).
+pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> Vec<ActiveLevels> {
+    let blocks = &model.indiv_param_partials.theta_blocks;
+    blocks
+        .decls
+        .iter()
+        .filter(|d| d.profiled)
+        .map(|d| {
+            let n_levels = d.spec.levels.len();
+            let column = blocks
+                .profiled_index
+                .iter()
+                .find(|(b, _)| *b == d.name)
+                .and_then(|(_, c)| c.clone());
+            let per_subject = population
+                .subjects
+                .iter()
+                .map(|s| match &column {
+                    Some(c) => subject_levels(s, c, n_levels),
+                    None => (0..n_levels).collect(),
+                })
+                .collect();
+            ActiveLevels {
+                block: d.name.clone(),
+                per_subject,
+            }
+        })
+        .collect()
+}
+
+/// The 0-based levels `subject`'s observation rows read from index column `column`.
+/// A row's own snapshot wins over the baseline, as in the prediction.
+fn subject_levels(subject: &Subject, column: &str, n_levels: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..subject.obs_times.len())
+        .filter_map(|j| {
+            subject
+                .obs_covariates
+                .get(j)
+                .and_then(|m| m.get(column))
+                .or_else(|| subject.covariates.get(column))
+                .copied()
+        })
+        .filter(|v| v.is_finite() && *v >= 1.0 && (v.round() as usize) <= n_levels)
+        .map(|v| v.round() as usize - 1)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 #[path = "tests/theta_levels_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/profiled_levels_tests.rs"]
+mod profiled_levels_tests;

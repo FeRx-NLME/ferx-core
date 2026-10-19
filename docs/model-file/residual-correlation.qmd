@@ -74,7 +74,9 @@ correlation <structure>(THETA) by (COLUMN1, COLUMN2)
   its gradient would then split across two channels.
 - `by` names one or more data columns; their combined value names the block,
   within `ID`. A row whose `by` value is missing is in no block. The columns are
-  required data columns, like any covariate the model reads.
+  required data columns, like any covariate the model reads. On a model with
+  nested levels, `by` may name one level instead
+  ([below](#with-kappa-and-nested-levels)).
 - `ρ` `FIX`ed at `0` drops the line, as a `FIX` zero `block_sigma` off-diagonal
   is dropped: the model is then the independent one, bit for bit. A free `ρ`
   starting at 0 keeps the line.
@@ -114,13 +116,65 @@ The line is fitted by `method = foce` and `focei` only. Refused, each with
 
 - every other method (`saem`, `imp`, `impmap`, `laplace`, `vi`, `gn`, `bayes`,
   and a chain that passes through one), and `n_agq > 1`;
-- inter-occasion random effects (`kappa`) — see the next section;
 - `bloq_method = m3`, FREM, time-to-event / binary / categorical / Markov
   endpoints, `[mixture]`, and SDE (`[diffusion]`) models.
 
 The parser refuses it with a per-CMT or covariate-selected (`if … else`) error
 model, with `iiv_on_ruv`, and next to a `block_sigma`, which is a different
 residual correlation (between sigmas of one record, or of paired records).
+
+Inter-occasion random effects (`kappa`) and nested levels are supported, with
+the one refusal [below](#with-kappa-and-nested-levels).
+
+## With kappa and nested levels
+
+A model with `kappa`, at one level (`iov_column`, or a single `level`) or at
+nested levels, fits the line by FOCE and FOCEI (#1082). The marginal
+linearizes over every random effect of the subject, so `R̃ = H Σ_b Hᵀ + R`
+holds each level's block of `Σ_b` and the line's dense `R`.
+
+**Naming a level in `by`.** On a model with nested levels, `by ARM` naming the
+level `ARM` groups the rows by that level's groups, nested by key: arm 1 of
+study 1 and arm 1 of study 2 are two blocks, as they are two groups of the
+level. A data column groups by its value within `ID`, which would merge them.
+Where the two readings could differ, the line is refused with
+`E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS`, which says what to write:
+
+| `by` | Reads |
+|---|---|
+| a level's name (`by ARM`) | that level's groups |
+| a column no level reads (`by ARMID`) | the column within `ID`, as without levels |
+| the column of the first level, whose parent is `ID` | the column; both readings agree |
+| a level inside a list (`by (STUDY, ARM)`) | refused: write `by ARM` |
+| a level's name that is also a different data column | refused: rename one |
+| the column of a nested level under another name | refused: write the level's name |
+
+**`cs` and a kappa at the same grouping are refused.** A kappa gives the rows
+of each of its groups one shared random effect, which is the correlation `cs`
+estimates (see [Choosing a structure](#choosing-a-structure)). So `cs` whose
+blocks group the observation rows exactly as a kappa-carrying level does is
+refused with `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, whatever the kappa's
+form. The blocks are compared as partitions in every subject, so `cs by ARMID`
+next to `kappa … at ARM` is caught too. `ar1` and `car1` are never refused, and
+neither is `cs` over a grouping no kappa is at.
+
+When the blocks match a kappa-carrying level's groups in **some** subjects but
+not all, the model is identified, from the subjects where they differ, and fits.
+ferx says how many matched, with
+`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`, since ρ and the kappa variance
+are then separated by the other subjects alone. `cs by STUDY` next to a kappa at
+`ARM` is the usual case: the two coincide in every subject whose studies each
+have one arm. A `by` column with a typo that splits one group would otherwise
+switch the refusal off without a word. A subject where the two agree only
+trivially (one observation, or every row its own block) couples no rows under
+`cs` and counts on neither side.
+
+**Validation.** ferx scores NONMEM's own `exact3` optimum
+(`nonmem_anchor/nested_levels_3_ar1/`, sponsor → study → arm, `ARM` repeating
+across studies) with `ar1` at ρ = 0.5 and −0.4, `car1` at 0.6 and a ρ = 0
+control, NONMEM writing the arm's residuals through `L2` and a hand-built
+Cholesky factor: the worst OFV difference is 5.7e-8 and the worst EBE
+difference 1.7e-7 (Linux).
 
 ## Estimation
 
@@ -130,7 +184,14 @@ more rows takes the exact analytic outer gradient of the dense-`R` objective
 subject whose blocks are all single rows keeps the scalar analytic one (for it
 `∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the
 finite-difference outer gradient throughout, as any weighted model with a dense
-`R` does. The covariance step uses the finite-difference Hessian. None of
+`R` does. So does a model with `kappa` (one level or nested): the IOV gradient
+assemblies score a diagonal `R`, so the outer gradient is central differences of
+the OFV, and `optimizer = auto` runs L-BFGS on that gradient rather than
+BOBYQA, which stopped short of the optimum on this route (#2122). Its EBE search runs on central
+differences too, for each subject with a block of two or more rows; the fit's
+warnings say how many ("… use finite-difference inner gradients in the IOV loop
+(residual correlation: N)"). The covariance step uses the finite-difference
+Hessian. None of
 these paths approximates the objective. The dense gradient's `σ` and
 `block_sigma` `ρ` terms are central differences of `R`, exact because `R` is
 quadratic in `σ` and linear in that `ρ` (a stencil that straddles the variance
@@ -148,8 +209,11 @@ it.
   additive endpoint, `cs` with `ρ ≥ 0` is exactly a `kappa` intercept on the arm,
   loaded by `W`, with variance `ρσ²`, plus a residual of variance `(1 − ρ)σ²`:
   measured equal to 2e-10 in OFV. The two are confounded, not complementary, which
-  is why a model may not carry both. Use `cs` when you want the correlation, and
-  negative values, without declaring a random effect.
+  is why a model may not carry both: `cs` over the groups of a kappa-carrying
+  level is refused (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`), for a
+  multiplicative kappa too, whose time course only nearly separates it from
+  `cs`. Use `cs` when you want the correlation, and negative values, without
+  declaring a random effect; with a kappa at the grouping, use `ar1` or `car1`.
 - **`ar1`** is for serial dependence: the correlation decays with the number of
   visits between two rows. On the naproxen data it fits 6 OFV points better than
   `cs` for the same one parameter.

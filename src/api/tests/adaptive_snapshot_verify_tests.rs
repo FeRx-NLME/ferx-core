@@ -587,3 +587,143 @@ fn catches_event_pk_length_mismatch() {
     .expect_err("an over-long event_pk array must be rejected");
     assert!(err.contains("entr"), "explains the length mismatch: {err}");
 }
+
+// ── #1599: the decision covariate row, derived independently of the record index ──
+
+fn row_1599(v: f64) -> HashMap<String, f64> {
+    HashMap::from([("ROW".to_string(), v)])
+}
+
+/// Every kind at one instant, every pair of kinds the order has to break, a same-kind tie of
+/// every kind ALONE at its instant (obs@10 is the only kind on top there; doses@70, EVID=2@80
+/// and resets@60 have nothing above them, so a reversed within-kind order is visible), a
+/// decision just inside the match tolerance, one before the first record, and the decisions
+/// out of time order. `ROW` names the record, so the expected map is the record the rule
+/// should pick.
+fn records_subject_1599() -> Subject {
+    let mut s = tv_subject();
+    s.covariates = row_1599(0.0);
+    s.obs_times = vec![10.0, 10.0, 30.0];
+    s.obs_covariates = vec![row_1599(6.0), row_1599(7.0), row_1599(8.0)];
+    s.observations = vec![0.0; 3];
+    s.obs_cmts = vec![1; 3];
+    s.cens = vec![0; 3];
+    s.occasions = vec![1; 3];
+    s.doses = [10.0, 10.0, 40.0, 50.0, 70.0, 70.0]
+        .iter()
+        .map(|&t| DoseEvent::new(t, 1.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.dose_covariates = vec![
+        row_1599(2.0),
+        row_1599(3.0),
+        row_1599(10.0),
+        row_1599(12.0),
+        row_1599(16.0),
+        row_1599(17.0),
+    ];
+    s.dose_occasions = vec![0; 6];
+    s.pk_only_times = vec![10.0, 20.0, 50.0, 80.0, 80.0];
+    s.pk_only_covariates = vec![
+        row_1599(4.0),
+        row_1599(5.0),
+        row_1599(13.0),
+        row_1599(18.0),
+        row_1599(19.0),
+    ];
+    s.pk_only_occasions = vec![1; 5];
+    s.reset_times = vec![10.0, 25.0, 40.0, 60.0, 60.0];
+    s.reset_covariates = vec![
+        row_1599(1.0),
+        row_1599(9.0),
+        row_1599(11.0),
+        row_1599(14.0),
+        row_1599(15.0),
+    ];
+    s.reset_occasions = vec![1; 5];
+    s
+}
+
+/// The derivation states the rule, so it is pinned against hand-picked records, not
+/// against the index it exists to check. Each row names the regression it catches.
+#[test]
+fn decision_covs_by_scan_picks_the_record_in_force() {
+    let s = records_subject_1599();
+    let cases: [(f64, f64, &str); 12] = [
+        (30.0, 8.0, "a later record replaces an earlier one"),
+        (
+            5.0,
+            0.0,
+            "before the first record: the baseline, not the first record ahead",
+        ),
+        (
+            10.0,
+            7.0,
+            "obs over EVID=2 / dose / reset, and the LAST of two co-timed obs",
+        ),
+        (
+            22.0,
+            5.0,
+            "carried forward from the latest record (EVID=2@20)",
+        ),
+        (25.0, 9.0, "a reset is a record"),
+        (
+            10.0 - 1e-13,
+            7.0,
+            "a record within EVENT_MATCH_TOL after the decision counts",
+        ),
+        (15.0, 7.0, "carried forward across a gap"),
+        (41.0, 10.0, "dose over a co-timed reset"),
+        (50.0, 13.0, "EVID=2 over a co-timed dose"),
+        (60.0, 15.0, "the LAST of two co-timed resets"),
+        (
+            70.0,
+            17.0,
+            "the LAST of two co-timed doses, nothing above them",
+        ),
+        (
+            80.0,
+            19.0,
+            "the LAST of two co-timed EVID=2 rows, nothing above them",
+        ),
+    ];
+    let times: Vec<f64> = cases.iter().map(|c| c.0).collect();
+    let got = super::adaptive::decision_covs_by_scan(&s, &times);
+    for (g, &(t, want, why)) in cases.iter().enumerate() {
+        assert_eq!(got[g]["ROW"], want, "decision at t={t}: {why}");
+    }
+
+    // And the shared index agrees on every one of them (#1599's rule fix included), which
+    // is the check `verify_adaptive_snapshots` makes on every run.
+    let records = crate::ode::predictions::AdaptiveRecordIndex::new(&s, s.doses.len());
+    for (g, &t) in times.iter().enumerate() {
+        let picked = crate::ode::predictions::locf_decision_cov(&records, t, &s, &s.covariates);
+        super::adaptive::check_decision_cov(g, t, got[g], picked)
+            .unwrap_or_else(|e| panic!("index disagrees at t={t}: {e}"));
+    }
+}
+
+/// Every sentence of the mismatch message is asserted, and both sides of the bit gate.
+#[test]
+fn check_decision_cov_rejects_any_bit_difference_and_says_why() {
+    let crcl = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+    assert!(super::adaptive::check_decision_cov(2, 36.0, &crcl(20.0), &crcl(20.0)).is_ok());
+
+    let err = super::adaptive::check_decision_cov(2, 36.0, &crcl(20.0), &crcl(50.0))
+        .expect_err("a different value must be rejected");
+    for part in [
+        "decision 2 at t=36 reads covariate CRCL = 50 from the record index",
+        "an independent scan of the subject's records gives 20",
+        "The controller saw the index's value",
+        "the driver and the frozen replay share that index, so the replay cannot catch it",
+        "(#1599)",
+    ] {
+        assert!(err.contains(part), "missing {part:?} in: {err}");
+    }
+
+    // Bits, not `==`: -0.0 == 0.0 but is a different value to have read.
+    assert!(super::adaptive::check_decision_cov(0, 1.0, &crcl(0.0), &crcl(-0.0)).is_err());
+    // A covariate on one side only.
+    let err = super::adaptive::check_decision_cov(0, 1.0, &crcl(1.0), &HashMap::new())
+        .expect_err("a missing covariate must be rejected");
+    assert!(err.contains("CRCL = absent"), "{err}");
+}

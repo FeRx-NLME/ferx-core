@@ -194,6 +194,7 @@ fn iov_inner_subject_route(
         || model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
         || subject_has_survival_records(subject)
+        || iov_inner_residual_correlation(model, subject)
     {
         return None;
     }
@@ -201,6 +202,23 @@ fn iov_inner_subject_route(
     let n_flat = stacked_width(model.n_eta, model.n_kappa, k_occasions);
     let stacked = vec![0.0; n_flat];
     crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
+}
+
+/// Whether an IOV subject's residuals are correlated across rows by a `correlation … by`
+/// line (#1082 PR5). The analytic IOV inner gradient
+/// (`analytic_eta_nll_gradient_iov_frozen`) differentiates the per-row diagonal data term
+/// and has no dense-`R` form, so such a subject's EBE search runs on central differences
+/// of its (dense) objective. A subject whose blocks are all singletons has a diagonal `R`
+/// and keeps the analytic gradient. Value-free, like `has_cross_observation_residual`: a
+/// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
+pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
+    crate::sens::provider::kappa_residual_correlation_fd_route(model)
+        && crate::stats::residual_error::has_cross_observation_residual(
+            &model.error_spec,
+            subject,
+            &model.default_params.sigma.values,
+            model.residual_cov_theta(&model.default_params.theta),
+        )
 }
 
 fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
@@ -218,6 +236,9 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     }
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
+    }
+    if iov_inner_residual_correlation(model, subject) {
+        return "residual correlation";
     }
     if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
@@ -2642,7 +2663,11 @@ fn find_ebe_iov(
     // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
     // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
     // converge EBEs against an incomplete gradient.
-    let analytic_iov_inner = analytic_iov_inner_supported(model, subject, params);
+    // The `H` Jacobian (`iov_ebe_h_matrix`) stays analytic under a residual correlation:
+    // it is `∂f/∂η`, which `R` does not enter. Only the gradient of the (dense) objective
+    // declines (#1082 PR5).
+    let analytic_iov_inner = analytic_iov_inner_supported(model, subject, params)
+        && !iov_inner_residual_correlation(model, subject);
     // ODE objectives carry the adaptive-solver gradient-noise floor; enable the objective-stall
     // stop only for them — including a closed-form transit/IG + IOV subject the absorption walk
     // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
@@ -2668,6 +2693,8 @@ fn find_ebe_iov(
     // convergence — see the matching note in `find_ebe`.
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
+            #[cfg(test)]
+            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
             return gradient_fd(&obj, p, n_flat);
         }
         let Some(layout) = &layout else {

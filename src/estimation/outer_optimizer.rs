@@ -915,8 +915,9 @@ pub(crate) fn pop_nll(
     per_subject.iter().sum()
 }
 
-/// Shared subject dispatch for separate and fused population evaluations.
-fn subject_nll(
+/// Shared subject dispatch for separate and fused population evaluations, and the
+/// per-subject term the profile solve (#1065) differentiates.
+pub(crate) fn subject_nll(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -1255,7 +1256,7 @@ struct NloptState {
 /// A negative `max_unconverged_frac` disables the fraction trigger (but never the hard
 /// reject). Centralising the predicate keeps the five evaluation sites in this module from
 /// drifting (#603 review #8).
-fn ebe_guard_rejects(
+pub(crate) fn ebe_guard_rejects(
     stats: &InnerLoopStats,
     n_subj: usize,
     raw_ofv: f64,

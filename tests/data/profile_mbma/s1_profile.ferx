@@ -1,0 +1,29 @@
+# #1065 S1: the plan's 100-study x 8-visit placebo model (M6's `plc.ferx`) with the
+# block declared `profile`. Data: `s100t8.csv`, from `simulate_s1.py 100 8`. Unprofiled,
+# the same model is 705 packed coordinates; profiled, the optimizer searches 5.
+
+[parameters]
+  theta TVE0(4.0, -20.0, 20.0)
+  theta TVEMAX(1.0, 0.01, 20.0)
+  theta TVET50(1.0, 0.01, 50.0)
+  theta PLACEBO[STUDY, TIME](0.0) profile
+  omega ETA_EMAX ~ 0.2
+  sigma ADD_ERR ~ 0.05 (variance)
+
+[covariates]
+  TRT categorical
+
+[individual_parameters]
+  EMAX = TVEMAX * exp(ETA_EMAX)
+  ET50 = TVET50
+
+[structural_model]
+  y = TVE0 + PLACEBO - TRT * EMAX * TIME / (TIME + ET50)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

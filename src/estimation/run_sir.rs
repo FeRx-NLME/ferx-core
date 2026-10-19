@@ -1232,16 +1232,14 @@ mod tests {
     }
 
     /// T10 (#1758): the record survives a `.fitrx` round trip, and `run_sir` on
-    /// the reloaded fit repeats the in-fit SIR — to the bit up to the one input
-    /// `.fitrx` stores lossily. `ebes.csv` writes each EBE at 6 dp (#1631), and the EBEs
-    /// warm-start every draw's inner solve, so the reloaded ESS moved by 7.1e-9
-    /// (8.5e-11 relative, measured on macOS arm64). The test pins that this
-    /// rounding is the *whole* gap: the in-memory fit with its EBEs rounded the
-    /// same way gives the reloaded result bit for bit. Without the record the
-    /// draws are scored at df 5, an ESS gap of ~4 (T5's premise), so the 1e-8
-    /// relative bound has ~100× headroom over the measured gap and ~10⁶× margin
-    /// to the defect. Mutation: drop the `settings` wire field (the record
-    /// assertion dies, and `run_sir` scores at df 5).
+    /// the reloaded fit repeats the in-fit SIR bit for bit. The EBEs warm-start every
+    /// draw's inner solve, and since #1847 `ebes.csv` stores them exactly. The premise
+    /// pins that this matters: the same fit with its EBEs rounded to six decimals, as a
+    /// bundle written before #1847 holds them, moves the ESS (by 7.1e-9, 8.5e-11
+    /// relative, measured on macOS arm64). Without the record the draws are scored at
+    /// df 5, an ESS gap of ~4 (T5's premise). Mutations: drop the `settings` wire field
+    /// (the record assertion dies, and `run_sir` scores at df 5); write `ebes.csv` at six
+    /// decimals again (the ESS bit assertion dies).
     #[test]
     fn run_sir_after_a_fitrx_round_trip_repeats_the_in_fit_sir() {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
@@ -1280,31 +1278,29 @@ mod tests {
         )
         .expect("run_sir");
 
-        // The in-memory fit with its EBEs rounded as `ebes.csv` writes them.
+        let ess = out.sir_ess.expect("standalone SIR ran");
+        assert!(ess.is_finite(), "ESS {ess}");
+        assert_eq!(
+            ess.to_bits(),
+            ess_fit.to_bits(),
+            "the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
+        );
+        assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "θ");
+
+        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
+        // stores them, does not repeat it — so the bit identity above is the exact write's.
         let mut rounded = sir_outputs_cleared(&fit);
         for s in &mut rounded.subjects {
             for e in s.eta.iter_mut() {
-                *e = crate::io::output::fmt_num(*e).parse().unwrap();
+                *e = format!("{e:.6}").parse().unwrap();
             }
         }
         let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
-        assert_eq!(
-            out.sir_ess.map(f64::to_bits),
+        assert_ne!(
             control.sir_ess.map(f64::to_bits),
-            "the EBE rounding must be the whole round-trip gap: {:?} vs {:?}",
-            out.sir_ess,
-            control.sir_ess
+            Some(ess_fit.to_bits()),
+            "premise: six-decimal EBEs must move the ESS"
         );
-        assert_eq!(
-            ci_bits(&out.sir_ci_theta),
-            ci_bits(&control.sir_ci_theta),
-            "θ"
-        );
-
-        let ess = out.sir_ess.expect("standalone SIR ran");
-        assert!(ess.is_finite(), "ESS {ess}");
-        let rel = (ess - ess_fit).abs() / ess_fit;
-        assert!(rel <= 1e-8, "ESS {ess} vs in-fit {ess_fit} (rel {rel:e})");
     }
 }
 

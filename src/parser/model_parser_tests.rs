@@ -6232,11 +6232,358 @@ fn covariate_mu_ref_rejects_what_it_cannot_evaluate_per_subject() {
         ),
         (
             "if (SEX == 1) { TV = TVCL } else { TV = TH_X }\nCL = TV * exp(ETA_CL)",
-            "a conditionally assigned local cannot be inlined",
+            "a local an if assigns from a theta is not inlined (#1422)",
         ),
     ] {
         assert!(detect_groups(src, &tn, &en).is_empty(), "{why}: {src}");
     }
+}
+
+// ── #1422: a local assigned in every arm of an `if`, and `min`/`max` of a local ──
+
+/// [`detect_groups`], parsed the way a real `[individual_parameters]` block is:
+/// every assigned name in `defined_vars`, so a local reads as `Variable`, not
+/// as a data covariate of the same name.
+fn detect_groups_with_locals(
+    src: &str,
+    theta_names: &[&str],
+    eta_names: &[&str],
+) -> (Vec<CovariateMuRef>, Vec<Statement>) {
+    let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
+    let probe = parse_block_statements(src, ParseCtx::new(&tn, &en, &[]), StatementMode::Plain)
+        .expect("parses");
+    let locals = assigned_vars_in_order(&probe);
+    let ctx = ParseCtx::new(&tn, &en, &locals);
+    let stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    let groups = detect_covariate_mu_refs(&stmts, &tn, &en, en.len(), &HashSet::new());
+    (groups, stmts)
+}
+
+/// `name` after evaluating the whole block at `eta = 0` — the model's own
+/// reading, which a group's typical value must reproduce.
+fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &str) -> f64 {
+    let covariates: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let mut vars: HashMap<String, f64> = HashMap::new();
+    eval_statements(
+        stmts,
+        theta,
+        &[0.0],
+        &covariates,
+        &mut vars,
+        None,
+        None,
+        &[],
+    );
+    vars[name]
+}
+
+/// A group's typical value at `covs`.
+fn group_typical(g: &CovariateMuRef, theta: &[f64], covs: &[(&str, f64)]) -> f64 {
+    let map: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    eval_typical_value(&g.typical, theta, &map)
+}
+
+/// The issue's melphalan model: `CRCLR` is assigned in both arms of an
+/// `if`/`else`, and `CRCLM = min(CRCLR, 120)` caps it. NONMEM puts
+/// `THETA(7)*LOG(CRCLM/100)` inside `MU_1`; ferx left `CL_CRCL` on the
+/// eta-frozen numerical M-step. Each of the two gaps alone rejects the group
+/// (`covariate_mu_ref_sees_through_a_min_or_max_of_a_local` isolates the
+/// second).
+#[test]
+fn covariate_mu_ref_sees_through_an_if_assigned_local_and_a_min() {
+    let src = "\
+if (AGE >= 17) {
+  CRCLR = (((140 - AGE) * WT) / (72 * SCR)) * 0.85 ^ (1 - SEX)
+} else {
+  CRCLR = 0.413 * HT / SCR
+}
+CRCLM = min(CRCLR, 120)
+CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "CL_CRCL"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0].eta_name, "ETA_CL");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "CL_CRCL"]);
+    assert_eq!(g[0].transform, MuTransform::Log);
+    for c in ["FFM", "AGE", "WT", "SCR", "SEX", "HT"] {
+        assert!(
+            g[0].covariate_names.iter().any(|n| n == c),
+            "{c} in {:?}",
+            g[0].covariate_names
+        );
+    }
+    // The stored typical value is the model's CL at eta = 0 in every cell of
+    // (adult / paediatric arm) × (under / over the 120 cap). A typical value
+    // still reading `CRCLR` would evaluate the local as 0.
+    let theta = [6.0, 0.4];
+    let cells: [(&[(&str, f64)], bool); 4] = [
+        (
+            &[
+                ("AGE", 40.0),
+                ("WT", 70.0),
+                ("SCR", 1.0),
+                ("SEX", 0.0),
+                ("HT", 170.0),
+                ("FFM", 50.0),
+            ],
+            false,
+        ),
+        (
+            &[
+                ("AGE", 30.0),
+                ("WT", 100.0),
+                ("SCR", 0.6),
+                ("SEX", 1.0),
+                ("HT", 180.0),
+                ("FFM", 70.0),
+            ],
+            true,
+        ),
+        (
+            &[
+                ("AGE", 10.0),
+                ("WT", 30.0),
+                ("SCR", 0.5),
+                ("SEX", 1.0),
+                ("HT", 140.0),
+                ("FFM", 25.0),
+            ],
+            false,
+        ),
+        (
+            &[
+                ("AGE", 10.0),
+                ("WT", 30.0),
+                ("SCR", 0.3),
+                ("SEX", 0.0),
+                ("HT", 140.0),
+                ("FFM", 25.0),
+            ],
+            true,
+        ),
+    ];
+    for (covs, capped) in cells {
+        let crclm = block_value(&stmts, &theta, covs, "CRCLM");
+        assert_eq!(
+            crclm == 120.0,
+            capped,
+            "fixture cell {covs:?}: CRCLM = {crclm}"
+        );
+        let want = block_value(&stmts, &theta, covs, "CL");
+        assert!(want.is_finite() && want > 0.0, "{covs:?}: {want}");
+        assert_eq!(group_typical(&g[0], &theta, covs), want, "{covs:?}");
+    }
+}
+
+/// The `WTN` shape of `covmuref_power_numeric_saem_fit.ferx` before #1422 —
+/// the `if` form of `covmuref_power_saem_fit.ferx`'s `(WT/70)^TH_WT`.
+#[test]
+fn covariate_mu_ref_sees_through_the_if_assigned_weight_ratio() {
+    let src = "\
+if (WT > 0) {
+  WTN = WT / 70.0
+} else {
+  WTN = 1.0
+}
+CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)";
+    let (g, _) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_WT"]);
+    assert_eq!(g[0].covariate_names, vec!["WT"]);
+}
+
+/// An `else if` chain folds condition for condition, first true arm winning.
+/// One subject per arm: a fold that paired an arm with the wrong condition
+/// returns another arm's value for at least one of them.
+#[test]
+fn covariate_mu_ref_folds_an_else_if_chain_in_order() {
+    let src = "\
+if (AGE < 2) {
+  MAT = 0.5
+} else if (AGE < 12) {
+  MAT = 0.8
+} else {
+  MAT = 1.0
+}
+CL = TVCL * MAT * (WT / 70) ^ TH_WT * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    let theta = [5.0, 0.75];
+    for age in [1.0, 5.0, 30.0] {
+        let covs = [("AGE", age), ("WT", 35.0)];
+        let want = block_value(&stmts, &theta, &covs, "CL");
+        assert_eq!(group_typical(&g[0], &theta, &covs), want, "AGE = {age}");
+    }
+}
+
+/// The second gap on its own: a two-argument `min`/`max` is the conditional
+/// `if (a <= b) a else b`, and before #1422 substitution stopped at it, so a
+/// cap on a *local* left the local unresolved in both the condition and the arm.
+#[test]
+fn covariate_mu_ref_sees_through_a_min_or_max_of_a_local() {
+    for f in ["min", "max"] {
+        let src = format!(
+            "CRCL2 = CRCL * 1.2\nCRCLM = {f}(CRCL2, 120)\n\
+             CL = TVCL * (CRCLM / 100) ^ TH_CRCL * exp(ETA_CL)"
+        );
+        let (g, stmts) = detect_groups_with_locals(&src, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+        assert_eq!(g.len(), 1, "{f}: {g:?}");
+        assert_eq!(g[0].covariate_names, vec!["CRCL"], "{f}");
+        let theta = [5.0, 0.6];
+        // 1.2 × CRCL straddles the 120 cap: both arms of the conditional.
+        for crcl in [60.0, 150.0] {
+            let covs = [("CRCL", crcl)];
+            let want = block_value(&stmts, &theta, &covs, "CL");
+            assert_eq!(
+                group_typical(&g[0], &theta, &covs),
+                want,
+                "{f}, CRCL = {crcl}"
+            );
+        }
+    }
+}
+
+/// A folded `if` whose condition is compound — `&&`, `||`, `!` and
+/// `present(...)` over locals — is substituted operand by operand through
+/// every connective. The typical value must equal the model's own `CL` on a
+/// grid that flips each sub-condition, so a connective rebuilt as another, an
+/// operand left unsubstituted (a local read as 0), or a `present` dropped
+/// changes the value at some point. `present` reads a *local*: left
+/// unsubstituted, `C` evaluates as 0, which is present, so a missing `CRCL`
+/// at `WT` 60 would take the raised arm. `AGE` is read only under the `!`. `AGE` and `CRCL` reach the group only
+/// through the condition, so the covariate list also pins that the summary
+/// walks every connective.
+#[test]
+fn covariate_mu_ref_substitutes_through_a_compound_condition() {
+    let src = "\
+A = WT / 70
+B = AGE * 1
+C = CRCL * 1
+if (((A > 1) && !(B < 18)) || (present(C) && (A < 0.9))) {
+  F = 1.2
+} else {
+  F = 1.0
+}
+CL = TVCL * F * (WT / 70) ^ TH_WT * exp(ETA_CL)";
+    let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "{g:?}");
+    for c in ["WT", "AGE", "CRCL"] {
+        assert!(
+            g[0].covariate_names.iter().any(|n| n == c),
+            "{c} in {:?}",
+            g[0].covariate_names
+        );
+    }
+    let theta = [5.0, 0.75];
+    let (mut raised, mut plain) = (0, 0);
+    for wt in [60.0, 80.0] {
+        for age in [10.0, 30.0] {
+            for crcl in [f64::NAN, 100.0] {
+                let covs = [("WT", wt), ("AGE", age), ("CRCL", crcl)];
+                let want = block_value(&stmts, &theta, &covs, "CL");
+                let f = block_value(&stmts, &theta, &covs, "F");
+                if f == 1.2 {
+                    raised += 1;
+                } else {
+                    plain += 1;
+                }
+                assert!(want.is_finite(), "{covs:?}: {want}");
+                assert_eq!(group_typical(&g[0], &theta, &covs), want, "{covs:?}");
+            }
+        }
+    }
+    // The grid straddles the condition: both arms are taken.
+    assert!(raised > 0 && plain > 0, "raised {raised}, plain {plain}");
+}
+
+/// Every definition in an [`InlineScope`] is eta-free — `rhs_contains_eta`
+/// skips one without reading it — and a folded `if` local keeps that: one
+/// whose arm or condition reads an eta is not recorded. Asserted on the scope
+/// itself, since a typical value reading such a local is rejected downstream
+/// anyway (its summary notes the eta) and would hide the breach. The
+/// eta-free control is recorded, so the test is not satisfied by a scope that
+/// records nothing.
+#[test]
+fn a_folded_if_local_is_recorded_only_when_eta_free() {
+    let tn: Vec<String> = vec!["TVCL".into()];
+    let en: Vec<String> = vec!["ETA_CL".into()];
+    for (src, want) in [
+        ("if (WT > 0) { X = WT / 70 } else { X = 1 }", true),
+        (
+            "if (WT > 0) { X = WT / 70 * exp(ETA_CL) } else { X = 1 }",
+            false,
+        ),
+        ("if (ETA_CL > 0) { X = WT / 70 } else { X = 1 }", false),
+    ] {
+        let locals = vec!["X".to_string()];
+        let stmts =
+            parse_block_statements(src, ParseCtx::new(&tn, &en, &locals), StatementMode::Plain)
+                .expect("parses");
+        let folded = fold_branch_definitions(&stmts);
+        assert_eq!(folded.len(), 1, "{src}: folded {folded:?}");
+        let mut scope = InlineScope::new(&stmts);
+        scope.record_branch_definition(0, &folded[0].1, &folded[0].2);
+        assert_eq!(scope.defs.contains_key("X"), want, "{src}");
+    }
+}
+
+/// What the #1422 folding still rejects. Each line would be a group if the
+/// local were folded, so each guards one condition of the fold. Every row is
+/// checked before failing, so a mutation names all the rows it leaks.
+#[test]
+fn covariate_mu_ref_rejects_an_if_local_it_cannot_fold() {
+    let tail = "CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)";
+    let tn = ["TVCL", "TH_WT", "TH_F", "TH_BP"];
+    let mut leaked = Vec::new();
+    for (head, why) in [
+        (
+            "if (WT > 0) { WTN = WT / 70.0 * TH_F } else { WTN = 1.0 }",
+            "an arm reads a theta",
+        ),
+        (
+            "if (WT > TH_BP) { WTN = WT / 70.0 } else { WTN = 1.0 }",
+            "the condition reads a theta",
+        ),
+        (
+            "WTN = 1.0\nif (WT > 0) { WTN = WT / 70.0 }",
+            "no else: assigned before the if and in one arm",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { X = 1.0 }",
+            "an arm does not assign it",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { WTN = 1.0 }\nWTN = WT / 50.0",
+            "reassigned after the if: the folded value is stale below",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 } else { if (AGE > 1) { WTN = 1.0 } else { WTN = 0.9 } }",
+            "assigned in a nested if",
+        ),
+        (
+            "if (WT > 0) { if (AGE > 1) { WTN = WT / 70.0 } } else { WTN = 1.0 }",
+            "one arm assigns it only inside a nested if (one per arm by count)",
+        ),
+        (
+            "if (WT > 0) { WTN = WT / 70.0 * TIME } else { WTN = 1.0 }",
+            "TIME varies within a subject",
+        ),
+        (
+            "if (WT > 0) {\n R = WT / 70.0\n WTN = R\n} else {\n R = 1.0\n WTN = R\n}",
+            "an arm reads a local assigned earlier in the same arm",
+        ),
+    ] {
+        let src = format!("{head}\n{tail}");
+        let (g, _) = detect_groups_with_locals(&src, &tn, &["ETA_CL"]);
+        if !g.is_empty() {
+            leaked.push(format!("{why}: {src}\n  → {:?}", g[0].theta_names));
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "recorded a group for:\n{}",
+        leaked.join("\n")
+    );
 }
 
 #[test]
@@ -28406,6 +28753,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         name: "KM".to_string(),
         spec,
         index_covariate: None,
+        profiled: false,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
         .unwrap()
@@ -29831,7 +30179,8 @@ fn reaching_definitions_per_shape() {
     );
 }
 
-/// The pre-#1684 inliner, kept as the oracle for [`InlineScope`]: each
+/// The pre-#1684 inliner, kept as the oracle for [`InlineScope`] (and taught
+/// #1422's substitution into a conditional, condition included): each
 /// definition is resolved where it is written and stored as a full tree, and
 /// a use substitutes a copy (exponential on a diamond, which is why it is
 /// test-only now). One entry per statement: the inlined right-hand side of
@@ -29852,6 +30201,12 @@ fn eager_inlined(stmts: &[Statement]) -> Vec<Option<Expression>> {
             Expression::UnaryFn(name, a) => {
                 Expression::UnaryFn(name.clone(), Box::new(inline(a, defs)))
             }
+            // Condition and arms alike since #1422.
+            Expression::Conditional(c, t, e) => Expression::Conditional(
+                Box::new(map_condition_operands(c, &mut |x| inline(x, defs))),
+                Box::new(inline(t, defs)),
+                Box::new(inline(e, defs)),
+            ),
             _ => expr.clone(),
         }
     }
@@ -29924,13 +30279,13 @@ fn assert_inliner_matches_eager(
 /// #1684 equivalence: on every example model's `[individual_parameters]`, as
 /// the full parse hands them to the scans, the lazy inliner reads the same
 /// tree as the eager one and classifies it the same way. Plus statement-level
-/// shapes the examples lack: a definition inside a conditional (substitution
-/// stops there), a forward reference (it resolves against the definition's
+/// shapes the examples lack: a definition read inside a conditional's arm and
+/// its condition (substituted in both since #1422), a forward reference (it resolves against the definition's
 /// own scope), the written-out logit forms, a chain through a pure alias, and
 /// a product with the definition in the middle (the built typical value
 /// re-associates through it).
-/// Dies under: substitution into a conditional (`frozen` ignored in
-/// `Inlined::resolve`); use-site resolution (`limit` not narrowed to the
+/// Dies under: no substitution into a conditional (`Conditional` dropped
+/// from `Inlined::rewrites_children`); use-site resolution (`limit` not narrowed to the
 /// definition's index); `flatten_chain` not flattening through definitions in
 /// `TypicalParts::build`.
 #[test]
@@ -29966,6 +30321,7 @@ fn the_inliner_matches_the_eager_one() {
     let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
     let shapes = [
         "A = TVV\nB = if (WT > 70) A else TVCL\nCL = B * exp(ETA_CL)",
+        "A = WT / 70\nB = if (A > 1) A else 1\nCL = TVCL * B ^ TH_WT * exp(ETA_CL)",
         "A = FOO\nFOO = TVCL\nCL = A * exp(ETA_CL)",
         "L = TVCL + TH_WT * WT\nCL = 1 / (1 + exp(-(L + ETA_CL)))\nV = 1 / (1 + exp(-L - ETA_V))",
         "L = TVCL\nM = L\nCL = inv_logit(logit(M) + ETA_CL)\nV = exp(log(M * WT) + ETA_V)",
@@ -33381,5 +33737,625 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             })
             .collect();
         run_g::<D2>(name, lean, full, &seq, tafd_of, |t| D2::constant(t - last));
+    }
+}
+
+// ── #1065: `profile` on a θ level block ─────────────────────────────────────
+
+/// An algebraic MBMA model whose placebo block is declared by `decl` and read
+/// as `read` in `BASE`.
+fn profile_model(decl: &str, read: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  {decl}
+  omega ETA_E0 ~ 4.0
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  BASE = TVE0 + {read} + ETA_E0
+
+[structural_model]
+  y = BASE
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+fn profiled_decls(parsed: &ParsedModel) -> Vec<(String, bool)> {
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .map(|d| (d.name.clone(), d.profiled))
+        .collect()
+}
+
+/// Every accepted form parses and marks the block profiled: the column form under
+/// each contrast, the counted form, and any case. An unmarked block is the control.
+#[test]
+fn profile_is_accepted_on_every_level_block_form() {
+    for contrast in [
+        "",
+        ", contrast = none",
+        ", contrast = ref",
+        ", contrast = sum_to_zero_within",
+        ", contrast = sum_to_zero",
+    ] {
+        let text = profile_model(
+            &format!("theta PLACEBO[STUDY, TIME{contrast}](0.0) profile"),
+            "PLACEBO",
+        );
+        let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{contrast}: {e}"));
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{contrast}"
+        );
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0) profile",
+        "theta PLACEBO[3](0.0)   PROFILE",
+    ] {
+        let parsed = parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
+        assert_eq!(
+            profiled_decls(&parsed),
+            [("PLACEBO".to_string(), true)],
+            "{decl}"
+        );
+    }
+    let control =
+        parse_full_model(&profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")).unwrap();
+    assert_eq!(profiled_decls(&control), [("PLACEBO".to_string(), false)]);
+}
+
+/// A profiled block's levels are unbounded, so a `lower ≥ 0` default can never
+/// select log-packing; an unprofiled block keeps the `1e-9 … 1e9` default box.
+#[test]
+fn a_profiled_block_is_unbounded_and_never_log_packed() {
+    let p = parse_full_model(&profile_model(
+        "theta PLACEBO[3](0.5) profile",
+        "PLACEBO[STUDY]",
+    ))
+    .unwrap()
+    .model;
+    let u = parse_full_model(&profile_model("theta PLACEBO[3](0.5)", "PLACEBO[STUDY]"))
+        .unwrap()
+        .model;
+    // θ 0 is TVE0; the three levels follow.
+    for l in 1..=3 {
+        assert_eq!(
+            p.default_params.theta_lower[l],
+            f64::NEG_INFINITY,
+            "level {l}"
+        );
+        assert_eq!(p.default_params.theta_upper[l], f64::INFINITY, "level {l}");
+        assert!(!crate::estimation::parameterization::theta_packs_log(
+            p.default_params.theta_lower[l]
+        ));
+        assert_eq!(u.default_params.theta_lower[l], 1e-9, "control level {l}");
+        assert_eq!(u.default_params.theta_upper[l], 1e9, "control level {l}");
+    }
+}
+
+/// The three declaration refusals, each sentence asserted: a single θ, `FIX`
+/// (inside or after the parentheses, `profile` before or after it), and bounds
+/// (lower only, or both). Every message carries the code prefix and the name.
+#[test]
+fn profile_refuses_a_single_theta_fix_and_bounds() {
+    let err = |decl: &str, read: &str| {
+        parse_full_model(&profile_model(decl, read))
+            .err()
+            .expect("refused")
+    };
+    let single = err("theta PLACEBO(0.0) profile", "PLACEBO");
+    for must in [
+        "E_PROFILE_SCOPE: [parameters] theta PLACEBO: `profile` applies only to a θ level \
+         block (`theta PLACEBO[...]`)",
+        "whose levels are solved for at every step.",
+        "A single θ is searched by the optimizer, so remove `profile`.",
+    ] {
+        assert!(single.contains(must), "missing {must:?} in {single}");
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, FIX) profile",
+        "theta PLACEBO[3](0.0) FIX profile",
+        "theta PLACEBO[3](0.0) profile FIX",
+    ] {
+        let fix = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] is both FIX and `profile`.",
+            "A fixed block has nothing to solve for, so remove one of the two.",
+        ] {
+            assert!(fix.contains(must), "{decl}: missing {must:?} in {fix}");
+        }
+    }
+    for decl in [
+        "theta PLACEBO[3](0.0, -5.0) profile",
+        "theta PLACEBO[3](0.0, -5.0, 5.0) profile",
+    ] {
+        let bounds = err(decl, "PLACEBO[STUDY]");
+        for must in [
+            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has bounds and `profile`.",
+            "A profiled block is solved without constraints, so it takes none: write \
+             `theta PLACEBO[...](init) profile`.",
+        ] {
+            assert!(
+                bounds.contains(must),
+                "{decl}: missing {must:?} in {bounds}"
+            );
+        }
+    }
+}
+
+/// `profile` is peeled off a `theta` line only: on any other declaration it is an
+/// unrecognised word, not a silently accepted one.
+#[test]
+fn profile_is_peeled_off_a_theta_line_only() {
+    assert_eq!(
+        split_profile_modifier("omega ETA ~ 0.1 (variance) profile"),
+        ("omega ETA ~ 0.1 (variance) profile".to_string(), false)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile"),
+        ("theta A[3](0.0)".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0) profile FIX"),
+        ("theta A[3](0.0) FIX".to_string(), true)
+    );
+    assert_eq!(
+        split_profile_modifier("theta A[3](0.0)"),
+        ("theta A[3](0.0)".to_string(), false)
+    );
+    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]").replace(
+        "omega ETA_E0 ~ 4.0",
+        "omega ETA_E0 ~ 4.0 (variance) profile",
+    );
+    assert!(parse_full_model(&text).is_err());
+}
+
+// ── #1065: the route of a `profile`d block (E_PROFILE_NOT_LINEAR) ───────────
+
+/// An algebraic model with a counted `profile` block `PLACEBO[3]` and a second,
+/// unprofiled block `ARMFX[3]` ([`two_profiled`] profiles it too). `indiv` is the `[individual_parameters]` body, `y` the
+/// readout, `error` the `[error_model]` line.
+fn route_model(indiv: &str, y: &str, error: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)
+  theta EMAX(8.0, 0.0, 100.0)
+  theta PLACEBO[3](0.0) profile
+  theta ARMFX[3](0.0, -10.0, 10.0)
+  omega ETA_E0 ~ 4.0
+  omega ETA_EM ~ 0.1
+  sigma ADD_ERR ~ 1.0 FIX
+
+[covariates]
+  STUDY categorical
+  ARM categorical
+  WPSE continuous
+  DOSE continuous
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  y = {y}
+
+[error_model]
+  {error}
+"#
+    )
+}
+
+const ADD: &str = "DV ~ additive(ADD_ERR)";
+
+fn route_err(indiv: &str, y: &str, error: &str) -> String {
+    parse_full_model(&route_model(indiv, y, error))
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal for y = {y}"))
+}
+
+/// The two sentences every route refusal carries, around the class sentence.
+fn assert_route_frame(msg: &str) {
+    for must in [
+        "E_PROFILE_NOT_LINEAR: [parameters] theta PLACEBO[...] is `profile`d, so each \
+         prediction must read it as `c × PLACEBO` plus terms that do not read it, with `c` \
+         taken from the data alone.",
+        "Remove `profile` to estimate the levels as ordinary θ.",
+    ] {
+        assert!(msg.contains(must), "missing {must:?} in {msg}");
+    }
+}
+
+/// Every accepted route: a plain sum (F1), a data coefficient (`× DOSE`, `/ WPSE`,
+/// a literal), through a chain of parameters, and a model nonlinear in η but affine
+/// in the block (F2). The unprofiled `ARMFX` is read nowhere, which is allowed.
+#[test]
+fn profile_accepts_every_affine_route_with_a_data_coefficient() {
+    for (indiv, y) in [
+        ("  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0", "BASE"),
+        ("  BASE = (TVE0 + PLACEBO[STUDY]) / WPSE + ETA_E0", "BASE"),
+        (
+            "  BASE = TVE0 + 2.0 * DOSE * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  PL = 0 - PLACEBO[STUDY] / 2\n  BASE = TVE0 + PL + ETA_E0",
+            "BASE",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  EM = EMAX * exp(ETA_EM)",
+            "BASE - EM * DOSE / (DOSE + 10)",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] * WPSE",
+        ),
+        // A branch assignment the block reaches but `y` never reads is off the route.
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    Z = PLACEBO[STUDY] * \
+             EMAX\n  } else {\n    Z = 0\n  }",
+            "BASE",
+        ),
+    ] {
+        parse_full_model(&route_model(indiv, y, ADD))
+            .unwrap_or_else(|e| panic!("{indiv} / y = {y}: {e}"));
+    }
+    // F1 itself: η and a BTAV κ on `BASE`, `weight = SE`, a `[structural_model]`
+    // intermediate on the readout.
+    let f1 = std::fs::read_to_string("tests/data/mbma_placebo/mbma_placebo.ferx").unwrap();
+    let decl = "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)";
+    assert!(f1.contains(decl), "fixture moved");
+    let f1 = f1.replace(
+        decl,
+        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
+    );
+    parse_full_model(&f1).unwrap_or_else(|e| panic!("F1: {e}"));
+}
+
+/// Through a function, a power, a remainder or an inline `if`: the construct and
+/// the site are named.
+#[test]
+fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
+    for (indiv, y, construct, at) in [
+        (
+            "  BASE = TVE0 * exp(PLACEBO[STUDY]) + ETA_E0",
+            "BASE",
+            "`exp(...)`",
+            "in `BASE` in [individual_parameters]",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY]^2",
+            "a power (`^`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] mod 2",
+            "a remainder (`mod`)",
+            "in the `y` readout",
+        ),
+        (
+            "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
+            "BASE",
+            "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)",
+            "in `BASE` in [individual_parameters]",
+        ),
+    ] {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` reaches `y` through {construct} {at}.");
+        assert!(msg.contains(&here), "missing {here:?} in {msg}");
+    }
+}
+
+/// A parameter on the route assigned inside an `if` branch, whether one branch or
+/// both assign it.
+#[test]
+fn profile_refuses_a_route_through_an_if_branch() {
+    for indiv in [
+        "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        // The carrying assignment sits outside the `if`; a branch overwrites it, so
+        // two definitions reach the read — the gate the case above does not need.
+        "  PL = PLACEBO[STUDY]\n  if (DOSE > 0) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+    ] {
+        let msg = route_err(indiv, "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch, in `PL` \
+                 in [individual_parameters]."
+            ),
+            "{indiv}: {msg}"
+        );
+    }
+}
+
+/// Twice in one prediction (a sum, a product of two reads), scaled by a parameter
+/// or a random effect, or as a divisor.
+#[test]
+fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "BASE + PLACEBO[STUDY]",
+            "Here `PLACEBO` is read twice in one prediction, in the `y` readout.",
+        ),
+        (
+            "  PL = PLACEBO[STUDY]\n  BASE = TVE0 + PL * PL + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is read twice in one prediction, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
+            "BASE",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in `BASE` in [individual_parameters].",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + PLACEBO[STUDY] / exp(ETA_EM)",
+            "Here `PLACEBO` is scaled by a term that reads a parameter, a random effect or a \
+             network output, not only data, in the `y` readout.",
+        ),
+        (
+            "  BASE = TVE0 + ETA_E0 + ETA_EM",
+            "BASE + 1 / PLACEBO[STUDY]",
+            "Here `PLACEBO` is a divisor in the `y` readout.",
+        ),
+    ];
+    for (indiv, y, here) in cases {
+        let msg = route_err(indiv, y, ADD);
+        assert_route_frame(&msg);
+        assert!(msg.contains(here), "y = {y}: missing {here:?} in {msg}");
+    }
+}
+
+/// The residual error reads the block, through `weight =` directly or through a
+/// parameter carrying it. The message says *residual error*, never "nonlinear".
+#[test]
+fn profile_refuses_a_residual_error_that_reads_the_block() {
+    for (indiv, error) in [
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+            "DV ~ additive(ADD_ERR) weight = 1 + PLACEBO[STUDY] * 0",
+        ),
+        (
+            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  W = WPSE + BASE",
+            "DV ~ additive(ADD_ERR) weight = W",
+        ),
+    ] {
+        let msg = route_err(indiv, "BASE", error);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here the residual error reads `PLACEBO`, so its variance would depend on the \
+                 levels."
+            ),
+            "{error}: {msg}"
+        );
+        assert!(!msg.to_lowercase().contains("nonlinear"), "{msg}");
+    }
+}
+
+/// `route_model` with `ARMFX` profiled as well.
+fn two_profiled(text: &str) -> String {
+    text.replace(
+        "theta ARMFX[3](0.0, -10.0, 10.0)",
+        "theta ARMFX[3](0.0) profile",
+    )
+}
+
+/// #2103 review #8: a profiled block no prediction reads has nothing to be solved
+/// from, and is refused by name; the same block unprofiled (the control) parses. The
+/// message is its own, not the route frame, which would tell the user to read the block
+/// "as `c × block`" in a prediction that does not read it at all.
+#[test]
+fn profile_refuses_a_block_no_prediction_reads() {
+    let indiv = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let msg = parse_full_model(&two_profiled(&route_model(indiv, "BASE", ADD)))
+        .err()
+        .expect("refused");
+    assert_eq!(
+        msg,
+        "E_PROFILE_NOT_LINEAR: [parameters] theta ARMFX[...] is `profile`d, but no prediction \
+         reads it, so the data say nothing about its levels. Read it in `y`, or remove the \
+         block."
+    );
+    parse_full_model(&route_model(indiv, "BASE", ADD)).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// One prediction reading two profiled blocks names both.
+#[test]
+fn profile_refuses_a_prediction_reading_two_profiled_blocks() {
+    let msg = parse_full_model(&two_profiled(&route_model(
+        "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
+        "BASE + ARMFX[ARM]",
+        ADD,
+    )))
+    .err()
+    .expect("refused");
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here one prediction reads `PLACEBO` and `ARMFX`, which is profiled too; a \
+             prediction may read only one profiled block."
+        ),
+        "{msg}"
+    );
+}
+
+/// A block reaching `y` through the states of a compartment model.
+#[test]
+fn profile_refuses_a_route_through_the_states() {
+    let text = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[3](0.0) profile
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) + PLACEBO[STUDY]
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+    let msg = parse_full_model(text).err().expect("refused");
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains(
+            "Here `PLACEBO` reaches `y` through the model's states (a compartment or an \
+             `[odes]` equation)."
+        ),
+        "{msg}"
+    );
+}
+
+// ── #2103 review round 1 ────────────────────────────────────────────────────
+
+/// A one-compartment model whose prediction is scaled by `[scaling] <scaling>`;
+/// `SC` is an individual parameter no PK slot reads, so a block in it reaches no
+/// state.
+fn obs_scale_model(sc: &str, scaling: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta PLACEBO[3](0.0) profile
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 0.5
+
+[covariates]
+  STUDY categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  SC = {sc}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  {scaling}
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#
+    )
+}
+
+/// Review #1: a block in an `obs_scale` divisor, directly or through a parameter,
+/// uniform or per-CMT, is a divisor of the prediction and is refused, naming the
+/// key. The control on the same model, `SC = V`, reads the block nowhere: since #2103
+/// review #8 that is refused too, but as unread, never as a divisor, so the pair still
+/// straddles the divisor gate.
+#[test]
+fn profile_refuses_a_block_in_an_obs_scale_divisor() {
+    let control = parse_full_model(&obs_scale_model("V", "obs_scale = SC"))
+        .err()
+        .expect("an unread profiled block is refused");
+    assert!(control.contains("but no prediction reads it"), "{control}");
+    assert!(!control.contains("divisor"), "{control}");
+    for (sc, scaling, label) in [
+        (
+            "V + PLACEBO[STUDY]",
+            "obs_scale = SC",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale = SC + PLACEBO[STUDY]",
+            "`[scaling] obs_scale`",
+        ),
+        (
+            "V",
+            "obs_scale[CMT=1] = V + PLACEBO[STUDY]",
+            "`[scaling] obs_scale[CMT=1]`",
+        ),
+    ] {
+        let msg = parse_full_model(&obs_scale_model(sc, scaling))
+            .err()
+            .unwrap_or_else(|| panic!("{scaling} with SC = {sc} must be refused"));
+        assert_route_frame(&msg);
+        let here = format!("Here `PLACEBO` is a divisor in {label}.");
+        assert!(msg.contains(&here), "{scaling}: missing {here:?} in {msg}");
+    }
+}
+
+/// Review #4: a coefficient chosen by an `if` on data, from literals, is data-only
+/// and accepted; the same shape choosing a θ is refused as a parameter coefficient.
+#[test]
+fn a_coefficient_chosen_by_a_data_condition_is_data_only() {
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data-conditioned literal: {e}"));
+    parse_full_model(&route_model(
+        "  C = 1\n  if (DOSE > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * (if (WPSE > 1) C else 0.5) + ETA_E0",
+        "BASE",
+        ADD,
+    ))
+    .unwrap_or_else(|e| panic!("data inline if: {e}"));
+    let msg = route_err(
+        "  C = 1\n  if (DOSE > 70) {\n    C = EMAX\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert_route_frame(&msg);
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "{msg}"
+    );
+    let msg = route_err(
+        "  C = 1\n  if (TVE0 > 70) {\n    C = 2\n  }\n  BASE = TVE0 + PLACEBO[STUDY] * C + ETA_E0",
+        "BASE",
+        ADD,
+    );
+    assert!(
+        msg.contains("is scaled by a term that reads a parameter, a random effect or a"),
+        "a θ in the condition: {msg}"
+    );
+}
+
+/// Review #5: `max` / `min` / `clamp` are named in the construct sentence, since
+/// the parser writes them as an inline `if`.
+#[test]
+fn a_max_on_the_route_is_named_as_such() {
+    for f in ["max(PLACEBO[STUDY], 0)", "min(PLACEBO[STUDY], 0)"] {
+        let msg = route_err(&format!("  BASE = TVE0 + {f} + ETA_E0"), "BASE", ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(
+                "Here `PLACEBO` reaches `y` through an inline `if` (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
+            ),
+            "{f}: {msg}"
+        );
     }
 }

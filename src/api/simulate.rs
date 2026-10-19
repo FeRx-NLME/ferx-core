@@ -361,11 +361,6 @@ pub(crate) fn validate_iov_simulatable(
     model: &CompiledModel,
     params: &ModelParameters,
 ) -> Result<(), EngineError> {
-    // Nested levels draw per level (#1082 PR4); a residual correlation on them is the
-    // fit's refusal too, until #1082 PR5 composes the two.
-    if model.has_nested_levels() && model.residual_serial.is_some() {
-        return Err(super::entry_refusals::nested_level_correlation_unsupported());
-    }
     if model.n_kappa > 0 && params.omega_iov.is_none() {
         // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
         // message stays #1019's, which names the remedy a rebuilt parameter set needs.

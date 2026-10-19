@@ -4677,7 +4677,7 @@ fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
 /// line-search objectives. Before #2037 every objective built two layouts and every
 /// analytic gradient three or four, so the same searches built hundreds. The bound is
 /// the measured worst plus two. The FD-inner case pins the objective's prediction path
-/// alone: its gradient is FD of that objective, and it records no route.
+/// alone: its gradient is FD of that objective.
 #[test]
 fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     use crate::stats::nested_levels::test_helpers as fx;
@@ -4738,5 +4738,124 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
             builds <= MAX_BUILDS,
             "{label}: {builds} layout builds in one EBE search ({analytic} analytic steps)"
         );
+    }
+}
+
+/// #1082 PR5: an IOV subject whose residuals a `correlation … by` line couples across rows
+/// runs its EBE search on central differences of its (dense) objective, named "residual
+/// correlation"; a subject of the same model whose blocks are all singletons keeps the
+/// analytic gradient. Both sides in one test, read off `agrad` itself.
+///
+/// The cross-row subject's EBE is also checked for stationarity on its own objective: the
+/// analytic IOV gradient differentiates the diagonal data term, so routing it there (the
+/// mutation: drop `iov_inner_residual_correlation` from the `analytic_iov_inner` gate)
+/// both flips the counter and leaves the search at a point that is not a mode of the
+/// objective it scores.
+#[test]
+fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    let src = fx::algebraic()
+        .replace(
+            "  sigma ADD ~ 0.5\n",
+            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
+        )
+        .replace(
+            "  DV ~ additive(ADD)\n",
+            "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
+        );
+    let (m, mut pop) = fx::prepared(&src, 1);
+    // A twin with one observation per arm: every block a singleton, so `R` is diagonal.
+    let mut single = pop.subjects[0].clone();
+    single.id = "SINGLE".into();
+    let keep: Vec<usize> = (0..single.obs_times.len()).step_by(3).collect();
+    let pick = |v: &Vec<f64>| keep.iter().map(|&j| v[j]).collect::<Vec<f64>>();
+    single.obs_times = pick(&single.obs_times);
+    single.observations = pick(&single.observations);
+    single.obs_covariates = keep
+        .iter()
+        .map(|&j| single.obs_covariates[j].clone())
+        .collect();
+    single.obs_cmts = vec![1; keep.len()];
+    single.cens = vec![0; keep.len()];
+    pop.subjects.push(single);
+    crate::stats::nested_levels::assign_level_cells(&m, &mut pop);
+    crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
+    assert_eq!(
+        pop.subjects[0].obs_rgroup,
+        vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]
+    );
+    assert_eq!(pop.subjects[1].obs_rgroup, vec![1, 2, 3, 4, 5]);
+
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let p = &m.default_params;
+    for (i, correlated) in [(0usize, true), (1, false)] {
+        let s = &pop.subjects[i];
+        assert_eq!(
+            iov_inner_residual_correlation(&m, s),
+            correlated,
+            "{}",
+            s.id
+        );
+        assert_eq!(
+            iov_inner_subject_route(&m, s, &p.theta).is_none(),
+            correlated,
+            "{}: the reported route",
+            s.id
+        );
+        if correlated {
+            assert_eq!(iov_fd_reason(&m, s), "residual correlation");
+        }
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{}: {}",
+            s.id,
+            ebe.nll
+        );
+        if correlated {
+            assert!(
+                analytic == 0 && fd >= 3,
+                "{}: {analytic} analytic / {fd} FD",
+                s.id
+            );
+        } else {
+            assert!(
+                analytic >= 3 && fd == 0,
+                "{}: {analytic} analytic / {fd} FD",
+                s.id
+            );
+        }
+        // Stationarity of the objective the search scored, over the compact vector.
+        let layout = crate::stats::nested_levels::NestedLayout::of(&m, s).unwrap();
+        let b = layout.compact(ebe.eta.as_slice(), &ebe.kappas).unwrap();
+        let nll = |b: &[f64]| {
+            crate::stats::likelihood::individual_nll_iov(
+                &m,
+                s,
+                &p.theta,
+                &b[..m.n_eta],
+                &layout.expand(b),
+                &p.omega,
+                p.omega_iov.as_ref(),
+                &p.sigma.values,
+            )
+        };
+        let mut worst = 0.0f64;
+        for c in 0..b.len() {
+            let h = 1e-5;
+            let (mut bp, mut bm) = (b.clone(), b.clone());
+            bp[c] += h;
+            bm[c] -= h;
+            let g = (nll(&bp) - nll(&bm)) / (2.0 * h);
+            assert!(g.is_finite());
+            worst = worst.max(g.abs());
+        }
+        assert!(worst < 1e-4, "{}: |∇| {worst:.3e} at the EBE", s.id);
     }
 }

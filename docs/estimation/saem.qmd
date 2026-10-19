@@ -252,7 +252,7 @@ A covariate mu-reference can also read the theta that **anchors another eta** on
 
 ##### Scope, and when a group is declined
 
-A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
+A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which are then estimated as if it were absent — when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that an `if` assigns in only some of its arms (or from a theta) is not recorded at all; a covariate local every arm of an `if` / `else` assigns, and a `min` / `max` of one, are seen through ([#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422)).
 
 #### Scalar residual-error update
 
@@ -346,9 +346,12 @@ FOCE approximation the fit YAML reports — see below):
 
 On thiotepa every no-ETA theta had ended within a few percent of its initial
 value; after the fix they land where FOCEI lands. The in-repo anchor is
-`covmuref_power` with the weight covariate routed through an `if` block so the
-#619 group detection does not apply and `TH_WT` rides this channel: NONMEM
-SAEM 0.921, ferx 0.332 before (its 0.3 start) and 0.961 after.
+`covmuref_power` with the weight covariate routed through a local assigned
+before an `if` with no `else` and again in its arm, so the #619 group detection
+does not apply and `TH_WT` rides this channel: NONMEM SAEM 0.921, ferx 0.332
+before (its 0.3 start) and 0.961 after. (The fixture wrote a plain `if` / `else`
+until [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422) made that form
+a group; the values it computes are unchanged.)
 
 Two structural remedies remain better than this channel where they apply:
 
@@ -356,12 +359,24 @@ Two structural remedies remain better than this channel where they apply:
   `FIX`). ferx then mu-references it automatically and the exact closed-form
   update takes over.
 * **Write a covariate model in a form #619 can see** — a covariate read from
-  the data directly, not through a conditionally assigned local — so the slope
-  joins the typical value's mu-reference group.
+  the data directly or through a local, including one every arm of an
+  `if` / `else` assigns, rather than one assigned in only some arms — so the
+  slope joins the typical value's mu-reference group.
 
 Otherwise cross-check against [FOCEI](foce.qmd) or [IMPMAP](impmap.qmd), which
 do not depend on this channel.
 :::
+
+##### A theta whose eta the shift cannot use
+
+The "NO associated ETA" advisory above lists only thetas that appear in no
+statement with an eta. A theta that *does* share a parameter with an eta in a
+form the shift cannot use, such as a Box-Cox
+`CL = TVCL * exp((exp(ETA_CL)^LAMBDA - 1) / LAMBDA)` (`log CL` is not linear in
+the eta) or a covariate coefficient no group owns, rides the same numerical
+M-step but gets its own message (#1715): it "carries an ETA, but not as a
+mu-referenced typical value". Keep the transform. Cross-check against
+FOCEI/IMPMAP, or hold it `FIX`. IMP/IMPMAP and FREM conversion split the same way.
 
 ### Averaging a maximiser is not maximising the average {#saem-mstep-jensen}
 
@@ -480,7 +495,7 @@ is why `tests/saem_combined_error.rs` scores it against **simulation truth** rat
 against another estimator.
 
 **Against — the θ half, still open (#1480).** On the #619 `covmuref_power` anchor, whose
-`TH_WT` carries no ETA and therefore moves only through this channel, `score_sa` at the
+`TH_WT` anchors no mu-reference and therefore moves only through this channel, `score_sa` at the
 default 150/250 schedule reaches **0.746** against NONMEM SAEM's 0.921 — outside the
 0.12 window the default solver satisfies. It is slow rather than wrong: at 300/700 it
 lands at **0.9845** (|Δ| 0.063) while `bobyqa` at that same schedule *overshoots* to
@@ -1269,7 +1284,7 @@ rather than assuming the estimator.
 
 With `iiv_on_ruv = ETA`, the residual is $Y = f + \varepsilon \exp(\eta_{\text{RUV}})$, so the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$. This form is invariant to $\eta_{\text{RUV}} \to \eta_{\text{RUV}} - c,\ \sigma \to \sigma\,e^{c}$ — $\sigma$ and a *shift* of $\eta_{\text{RUV}}$ are a degenerate pair. Unlike a mu-referenced structural $\eta$ (whose mean is folded into its typical value $\theta$ each M-step), $\eta_{\text{RUV}}$ has **no typical-value $\theta$**, so nothing absorbs its mean: it drifts along that degenerate direction, and because $\omega_{\text{RUV}}$ is estimated as $\overline{\eta_{\text{RUV}}^2}$ the drift injects a spurious $\text{mean}^2$ term that pumps $\sigma$ and $\omega_{\text{RUV}}$ **up together** — the runaway reported in issue #895 ($\omega_{\text{RUV}}$ toward ~49, $\sigma$ toward its e⁵ ceiling), worst on FREM models with an extreme $\Omega$-diagonal scale range.
 
-ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges to $\omega_{\text{RUV}} \approx 0.28$, $\sigma \approx 0.20$ from both a too-small and a too-large $\sigma$ start (NONMEM: 0.28 / 0.18), where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-centring is applied only when **every** RUV-scaled $\sigma$ component is free to absorb the shift — this keeps each subject's residual variance exactly unchanged. If any residual $\sigma$ component is FIXed (e.g. a fixed additive term of a combined error), scaling only the free component would leave the fixed part uncompensated, so re-centring is skipped and the growth caps below carry the load (a FIXed $\sigma$ already partially pins the mean).
+ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges from both a too-small and a too-large $\sigma$ start, where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-measured on 2026-10-16 from the 5.5×-low start, it reaches $\omega_{\text{RUV}} = 0.269$, $\sigma = 0.174$ and an importance-sampled −2 log L of 6866.6 ± 1.2. NONMEM IMP reports 0.279 / 0.177 / 6852 ([FREM: `iiv_on_ruv`](frem.qmd#frem-iiv-on-ruv), which also covers why FOCEI is not an alternative on that model). Re-centring is applied only when **every** RUV-scaled $\sigma$ component is free to absorb the shift — this keeps each subject's residual variance exactly unchanged. If any residual $\sigma$ component is FIXed (e.g. a fixed additive term of a combined error), scaling only the free component would leave the fixed part uncompensated, so re-centring is skipped and the growth caps below carry the load (a FIXed $\sigma$ already partially pins the mean).
 
 Two growth caps remain as belt-and-braces backstops, both no-ops on a well-behaved fit:
 

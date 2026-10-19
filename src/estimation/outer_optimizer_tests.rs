@@ -7851,3 +7851,94 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
         );
     }
 }
+
+/// #1082 PR5, V6: on an IOV model with a residual `correlation` line, the outer gradient
+/// handed to the optimizer is central differences of the (reconverged) OFV, on FOCE and on
+/// FOCEI. The IOV outer assemblies score a diagonal `R`: FOCEI's declines per subject, but
+/// FOCE's (`subject_packed_gradient_foce_iov`) would differentiate the diagonal `R⁰`, with
+/// no `∂/∂ρ` at all. So the one gate is the structural decline in
+/// `analytic_outer_gradient_in_scope`; the model without the line keeps the analytic
+/// gradient (the straddle, asserted).
+///
+/// Mutation: delete that decline → the FOCE gradient is the diagonal-`R⁰` analytic one, and
+/// its ρ component is 0 against a finite difference of 20.73 (measured). FOCE and FOCEI
+/// give the same number here: with additive error the Gauss–Newton Laplace marginal is the
+/// Sheiner–Beal one (Woodbury), so the two paths differ only in which assembly would run.
+#[test]
+fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    let plain = fx::algebraic();
+    let src = plain
+        .replace(
+            "  sigma ADD ~ 0.5\n",
+            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
+        )
+        .replace(
+            "  DV ~ additive(ADD)\n",
+            "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
+        );
+    let (m, mut pop) = fx::prepared(&src, 1);
+    crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
+    let (m_plain, _) = fx::prepared(&plain, 1);
+    assert!(!crate::sens::provider::analytic_outer_gradient_available(
+        &m
+    ));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(
+        &m_plain
+    ));
+
+    let params = &m.default_params;
+    let crate::estimation::parameterization::PackedStart {
+        packed: x, bounds, ..
+    } = crate::estimation::parameterization::pack_with_bounds(params);
+    let rho = params.theta.len() - 1;
+    assert_eq!(m.residual_serial.as_ref().unwrap().rho_theta, rho);
+    let n = pop.subjects.len();
+    for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
+        let opts = FitOptions {
+            method,
+            interaction: method == EstimationMethod::FoceI,
+            ..FitOptions::default()
+        };
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            &m,
+            &pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            None,
+            0,
+            0,
+        );
+        let g = population_gradient(
+            &x,
+            n,
+            params,
+            &m,
+            &pop,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            &opts,
+            &mut 0,
+            OuterTrial::unknown(),
+            &OuterFdDeclineLog::new(n),
+        );
+        let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
+        assert_eq!(g.len(), fd.len());
+        eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
+        assert!(
+            fd[rho].is_finite() && fd[rho].abs() > 0.1,
+            "{method:?}: ρ is live"
+        );
+        for (k, (a, b)) in g.iter().zip(&fd).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "{method:?}[{k}]");
+            assert!(
+                (a - b).abs() <= 1e-6 * (1.0 + b.abs()),
+                "{method:?}[{k}]: handed {a} vs FD of the OFV {b}"
+            );
+        }
+    }
+}
