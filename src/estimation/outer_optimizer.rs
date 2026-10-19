@@ -3122,7 +3122,7 @@ pub(crate) struct AttemptOutcome {
     /// NLopt returned a bare `Failure`/`ForcedStop` *and*
     /// [`failure_is_converged_plateau`] rejected it: the run quit while its OFV
     /// trace was still descending, at a point that is not a minimum. See
-    /// [`resolve_mid_descent_restart`].
+    /// [`resolve_mid_descent_restart_adopting`].
     pub(crate) mid_descent_stall: bool,
     /// The cold re-solve at the restored point beat the objective the optimizer
     /// minimised there ([`cold_solve_beats_best_seen`]), and the run passes the same
@@ -3152,7 +3152,7 @@ impl AttemptOutcome {
     }
 }
 
-/// Why [`resolve_mid_descent_restart`] restarts a run from its own best point.
+/// Why [`resolve_mid_descent_restart_adopting`] restarts a run from its own best point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestartCause {
     /// NLopt returned a bare `Failure` and the plateau check rejected it: the run quit
@@ -3186,7 +3186,7 @@ pub(crate) enum RestartCause {
 /// improvement to report. That retry is L-BFGS-only: SLSQP is already capped on
 /// every eval, and the derivative-free algorithms never take this step at all.
 ///
-/// **Stall mid-descent** (#1277) — [`resolve_mid_descent_restart`]. A run that
+/// **Stall mid-descent** (#1277) — [`resolve_mid_descent_restart_adopting`]. A run that
 /// *did* leave its start can still die with a bare `Failure` while its OFV is
 /// dropping by hundreds per eval, and the existing retry, gated on `left_init`,
 /// never sees it. Then the optimizer is simply restarted from the best point it
@@ -3292,14 +3292,14 @@ fn optimize_nlopt(
     )
 }
 
-/// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart`], then,
+/// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
 /// while each restart is adopted and itself ends in a basin shift, another basin-shift restart,
 /// at most [`MAX_BASIN_RESTARTS`] more. A restarted leg can trap again as θ moves on; the legs
 /// share one evaluation budget (`RestartLeg::spent_evals`), and a restarted leg's own
 /// `basin_shift` already requires budget left, so the total stays bounded by `outer_maxiter`.
 /// A mid-descent stall keeps its single restart: a second stall reports as a stall. `restart`
 /// returns the restarted result and the restart cause *its* leg ended with. Pure, like
-/// [`resolve_mid_descent_restart`], so every branch is unit-testable without NLopt.
+/// [`resolve_mid_descent_restart_adopting`], so every branch is unit-testable without NLopt.
 fn resolve_restart_chain<T>(
     verbose: bool,
     cancelled: bool,
@@ -3416,17 +3416,8 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// Pulled out as a pure fn — `restart` is handed the stalled result and returns
 /// its successor — so every branch is unit-testable without driving two NLopt
 /// fits.
-fn resolve_mid_descent_restart<T>(
-    verbose: bool,
-    cancelled: bool,
-    first: (T, Option<RestartCause>),
-    restart: impl FnOnce(&T, RestartCause) -> T,
-    ofv_of: impl Fn(&T) -> f64,
-) -> T {
-    resolve_mid_descent_restart_adopting(verbose, cancelled, first, restart, ofv_of).0
-}
-
-/// [`resolve_mid_descent_restart`], also saying whether the restart was adopted.
+///
+/// Returns the reported result and whether it is the restart's (adopted).
 fn resolve_mid_descent_restart_adopting<T>(
     verbose: bool,
     cancelled: bool,
@@ -3473,6 +3464,18 @@ fn resolve_mid_descent_restart_adopting<T>(
     (second, true)
 }
 
+/// [`resolve_mid_descent_restart_adopting`] without the flag: the form the unit tests read.
+#[cfg(test)]
+fn resolve_mid_descent_restart<T>(
+    verbose: bool,
+    cancelled: bool,
+    first: (T, Option<RestartCause>),
+    restart: impl FnOnce(&T, RestartCause) -> T,
+    ofv_of: impl Fn(&T) -> f64,
+) -> T {
+    resolve_mid_descent_restart_adopting(verbose, cancelled, first, restart, ofv_of).0
+}
+
 /// The stall-retry decision behind [`optimize_nlopt`], factored out of the fit
 /// itself so every branch is unit-testable without driving two NLopt runs.
 ///
@@ -3497,7 +3500,7 @@ fn resolve_stall_retry<T>(
         return first;
     }
     let (retry, retry_left_init) = retry();
-    // `ofv_is_valid` for the same reason as in [`resolve_mid_descent_restart`]:
+    // `ofv_is_valid` for the same reason as in [`resolve_mid_descent_restart_adopting`]:
     // `<` alone adopts a `−inf` retry over a finite first attempt. Latent here
     // rather than reported — this retry only runs on a fit that never left its
     // start — but the two resolvers share one adoption rule and having only one
