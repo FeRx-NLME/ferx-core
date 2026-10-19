@@ -507,7 +507,7 @@ fn check_model_data_surfaces_the_new_error() {
 // places (division by ~0 returns 0, `ln`/`sqrt` floor their argument — measured), but `exp`
 // is not clamped, so an exponential covariate model on an unscaled covariate
 // (`ALAG1 = TVLAG*exp(WT)` with `WT` in the hundreds — a real modelling mistake) overflows
-// to `+inf`. Moved here from `tests/dose_attr_finiteness.rs` (#1236): it needs only a
+// to `+inf`. `^` is not guarded either: `(WT / 70)^0.75` is `NaN` for a negative `WT`. Moved here from `tests/dose_attr_finiteness.rs` (#1236): it needs only a
 // `CompiledModel` and a hand-built `Population`.
 
 /// Oral 1-cpt ODE whose depot lag is `TVLAG · exp(WT)` — finite for a small `WT`,
@@ -596,6 +596,64 @@ fn a_finite_lagtime_is_not_rejected() {
         !diags.iter().any(|d| d.code == "E_DOSE_ATTR_NONFINITE"),
         "a finite lag must not be rejected, got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+/// A lag that is a power of a negative covariate is `NaN`, since `^` has no domain guard,
+/// and the message names `^` as a cause next to `exp` (#2040). It used to call `exp`
+/// "the one arithmetic here with no domain guard", which sent the reader of exactly this
+/// case looking for an overflow that is not there.
+///
+/// The cause text is asserted whole, so deleting any one of its three sentences fails
+/// here. Spelled out rather than shared with `validation.rs`, so a change to it has to be
+/// made twice.
+#[test]
+fn a_power_of_a_negative_covariate_is_rejected_and_the_message_names_the_power() {
+    let model = crate::parser::model_parser::parse_full_model(
+        &EXP_LAG_MODEL.replace("TVLAG * exp(WT)", "TVLAG * (WT / 70)^0.75"),
+    )
+    .expect("the power-lag model parses")
+    .model;
+    let pop = population_with_wt(-5.0);
+    assert!(
+        (-5.0f64 / 70.0).powf(0.75).is_nan(),
+        "the fixture must be NaN, or there is nothing to reject"
+    );
+    let diags = crate::api::check_model_data(&model, &pop);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_DOSE_ATTR_NONFINITE")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected E_DOSE_ATTR_NONFINITE, got {:?}",
+                diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        hit.message
+            .contains("is NaN at typical values (subject 1, "),
+        "{}",
+        hit.message
+    );
+    assert!(
+        hit.message.ends_with(
+            "The usual cause is a covariate relation that is undefined at this record. \
+             `exp` and `^` are the two operations here with no domain guard (`/` by ~0 \
+             returns 0, and `ln`/`sqrt` floor their argument), so look for an overflowing \
+             `exp(...)`, such as an exponential covariate model on an unscaled covariate, \
+             or a power of a negative value, such as `(WT / 70)^0.75` with a negative \
+             `WT`. Check this subject's covariate values at that record, and any `TIME` \
+             the expression reads."
+        ),
+        "{}",
+        hit.message
+    );
+    // The control: the same model with a positive `WT` is accepted.
+    let ok = crate::api::check_model_data(&model, &population_with_wt(70.0));
+    assert!(
+        !ok.iter().any(|d| d.code == "E_DOSE_ATTR_NONFINITE"),
+        "{:?}",
+        ok.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }
 

@@ -3325,11 +3325,13 @@ pub(crate) fn typical_dose_snapshots<'a>(
 ///
 /// **What can actually make one non-finite, measured.** The DSL's arithmetic is
 /// domain-guarded where you would expect: `/` returns `0.0` when the denominator is below
-/// `1e-30`, and `ln`/`sqrt` floor their argument. `exp` is not clamped, so an exponential
-/// covariate model on an unscaled covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the
-/// hundreds) overflows to `+inf` — that is the reachable route at typical values, and it
-/// is what the regression test uses. Mid-fit, any θ/η excursion into the same overflow
-/// does it, which is what the engine-side guard covers.
+/// `1e-30`, and `ln`/`sqrt` floor their argument. `exp` and `^` are not guarded, so the
+/// reachable routes at typical values are an exponential covariate model on an unscaled
+/// covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the hundreds), which overflows to
+/// `+inf`, and a power of a covariate that is negative for some subject
+/// (`ALAG1 = TVLAG*(WT/70)^0.75` with `WT < 0`), which is `NaN` (#2040). The regression
+/// tests use one of each. Mid-fit, any θ/η excursion into the same overflow does it,
+/// which is what the engine-side guard covers.
 pub(crate) fn check_dose_attr_finiteness(
     model: &CompiledModel,
     population: &Population,
@@ -3427,12 +3429,15 @@ pub(crate) fn check_dose_attr_finiteness(
                         "E_DOSE_ATTR_NONFINITE",
                         format!(
                             "Dose {what} for compartment {cmt} is {value} at typical values \
-                             (subject {}, {}). {consequence} The usual cause is an \
-                             overflowing `exp(...)` — an exponential covariate model on an \
-                             unscaled covariate — since `exp` is the one arithmetic here with \
-                             no domain guard (`/` by ~0 returns 0, and `ln`/`sqrt` floor their \
-                             argument). Check this subject's covariate values at that record, \
-                             and any `TIME` the expression reads.",
+                             (subject {}, {}). {consequence} The usual cause is a covariate \
+                             relation that is undefined at this record. `exp` and `^` are the \
+                             two operations here with no domain guard (`/` by ~0 returns 0, and \
+                             `ln`/`sqrt` floor their argument), so look for an overflowing \
+                             `exp(...)`, such as an exponential covariate model on an unscaled \
+                             covariate, or a power of a negative value, such as \
+                             `(WT / 70)^0.75` with a negative `WT`. Check this subject's \
+                             covariate values at that record, and any `TIME` the expression \
+                             reads.",
                             subject.id,
                             snap.record_label(),
                         ),

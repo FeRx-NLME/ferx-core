@@ -41,9 +41,9 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 /// Arm A: the depot lag is `TVLAG · exp(WT)`, finite for a small `WT` and `+inf` once
-/// `WT` overflows the exponential. `exp` is the one DSL arithmetic with no domain guard
-/// (`/` by ~0 returns 0, `ln`/`sqrt` floor their argument), so this is the reachable
-/// route to a non-finite attribute at typical values.
+/// `WT` overflows the exponential. `exp` and `^` are the two DSL operations with no domain
+/// guard (`/` by ~0 returns 0, `ln`/`sqrt` floor their argument), so this is one of the
+/// two reachable routes to a non-finite attribute at typical values.
 const TV_COV_LAG_MODEL: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)

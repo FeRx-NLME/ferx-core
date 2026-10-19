@@ -13609,8 +13609,9 @@ fn nan_lagtime_sens_walk_is_non_finite_not_a_panic() {
     // non-finite. `exp` is the reachable overflow: the DSL's `/`, `ln` and `sqrt` are
     // all domain-guarded (division by ~0 returns 0, `ln`/`sqrt` floor their argument),
     // so an exponential covariate model on an unscaled covariate — a real modelling
-    // mistake — is how a lag actually goes non-finite at typical values, and an
-    // optimizer iterate is how it happens mid-fit.
+    // mistake — is one way a lag goes non-finite at typical values (the other is `^` of
+    // a negative value, which is `NaN`), and an optimizer iterate is how it happens
+    // mid-fit.
     let times: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
     assert!(
         times.len() >= 21,
