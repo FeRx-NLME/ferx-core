@@ -2264,3 +2264,148 @@ fn eta_dependent_obs_scale_under_ltbs_on_an_ode_is_analytic() {
         assert!(g < 2e-6, "IOV {name}: {g:.2e}");
     }
 }
+
+/// A 9-occasion IOV subject: 3 η + 3 κ × 9 occasions = 30 stacked random effects, past the
+/// 24-wide bucket that capped the adjoint before the 32 and 48 buckets.
+fn wide_iov_fixture() -> (CompiledModel, Subject) {
+    let src = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  omega ETA_KA ~ 0.1\n  kappa K_CL ~ 0.03\n  kappa K_V ~ 0.02\n  kappa K_KA ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + K_CL)\n  V = TVV * exp(ETA_V + K_V)\n  KA = TVKA * exp(ETA_KA + K_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n";
+    let m = parse_model_string(src).unwrap();
+    let n_occ = 9u32;
+    let mut doses = Vec::new();
+    let mut times = Vec::new();
+    let mut occ = Vec::new();
+    let mut docc = Vec::new();
+    for o in 0..n_occ {
+        let t0 = 24.0 * o as f64;
+        doses.push(DoseEvent::new(t0, 100.0, 1, 0.0, false, 0.0));
+        docc.push(o + 1);
+        for dt in [1.0, 4.0, 12.0] {
+            times.push(t0 + dt);
+            occ.push(o + 1);
+        }
+    }
+    let mut s = subject_shell(doses, &times);
+    s.occasions = occ;
+    s.dose_occasions = docc;
+    let kappas: Vec<Vec<f64>> = (0..n_occ)
+        .map(|o| vec![0.05 * ((o as f64).sin()), -0.04, 0.03])
+        .collect();
+    let preds = crate::pk::predict_iov(
+        &m,
+        &s,
+        &m.default_params.theta,
+        &[0.1, -0.05, 0.08],
+        &kappas,
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin()))
+        .collect();
+    (m, s)
+}
+
+/// A subject wider than 24 stacked random effects is served (the 32 bucket) and its stacked
+/// η-Jacobian matches FD of production's IOV predictor. On a 20-subject population of these,
+/// the FOCEI fit took 2739 s on the reconverged-FD route it used to fall to and 41.5 s on the
+/// exact gradient, at the identical OFV (−1177.955802, Linux, 2 cores).
+#[test]
+fn a_subject_past_24_stacked_random_effects_is_served() {
+    let (m, s) = wide_iov_fixture();
+    let stacked: Vec<f64> = (0..30).map(|k| 0.02 * ((k as f64) * 0.7).sin()).collect();
+    let gap = iov_jacobian_gap(&m, &s, &stacked, "30 stacked");
+    eprintln!("30 stacked: η-Jacobian vs FD {gap:.2e}");
+    // Measured 5.7e-12 on Linux; ~10× headroom.
+    assert!(gap < 6e-11, "{gap:.2e}");
+}
+
+/// The same subject's FOCEI gradient against reconverged FD (77 s in a debug build).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_subject_past_24_stacked_random_effects_matches_reconverged_fd() {
+    let (m, s) = wide_iov_fixture();
+    let g = super::tests::iov_parity(&m, &s, true);
+    eprintln!("30 stacked: FOCEI gradient vs reconverged FD {g:.2e}");
+    // Measured 3.4e-7 on Linux; ~10× headroom.
+    assert!(g < 3.4e-6, "{g:.2e}");
+}
+
+/// A `TAD`-reading RHS under steady-state dosing (#2093): served now that the dual SS run-in
+/// replays production's per-window clocks (`ss_run_in_params`: local time from 0, `TAD` from
+/// the pulse, an infusion's quiet window at `TAD = τ + T_inf`, `TAFD` `NaN`). Pinned on the
+/// values against production's predictor, the gradient against reconverged FD, for an SS bolus
+/// and an SS infusion (whose quiet window is where the anchors differ); the straddle is the
+/// same RHS reading `TIME`, which has no periodic steady state and still declines.
+#[test]
+fn tad_reading_rhs_under_steady_state_is_analytic() {
+    let src = |clock: &str| {
+        ODE_LAG
+            .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+            .replace("theta TVLAG(0.4, 0.01, 5.0)", "theta TVK(0.5, 0.01, 5.0)")
+            .replace("omega ETA_LAG ~ 0.1", "omega ETA_V ~ 0.1")
+            .replace("V = TVV", "V = TVV * exp(ETA_V)\n  KT = TVK")
+            .replace(
+                "d/dt(central) = KA * depot - (CL/V) * central",
+                &format!(
+                    "d/dt(central) = KA * depot - (CL/V) * central * (1 + KT * exp(-0.3 * {clock}))"
+                ),
+            )
+    };
+    for (label, doses) in [
+        (
+            "SS bolus",
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+        ),
+        (
+            "SS infusion",
+            vec![
+                DoseEvent::new(0.0, 100.0, 2, 50.0, true, 12.0),
+                DoseEvent::new(12.0, 100.0, 2, 50.0, false, 0.0),
+            ],
+        ),
+    ] {
+        let m = tight(parse_model_string(&src("TAD")).unwrap());
+        let s = subject(
+            &m,
+            doses.clone(),
+            &[1.0, 3.0, 6.0, 11.5, 13.0, 15.0, 20.0, 24.0],
+            &[0.1, -0.05],
+        );
+        let eta = [0.08, -0.04];
+        let theta = &m.default_params.theta;
+        let rec = crate::sens::provider::subject_eta_grad(&m, &s, theta, &eta)
+            .unwrap_or_else(|| panic!("{label}: TAD under SS must be served"));
+        let prod = crate::pk::compute_predictions_with_tv(&m, &s, theta, &eta);
+        let mut worst = 0.0f64;
+        for (r, p) in rec.iter().zip(&prod) {
+            assert!(r.f.is_finite() && p.is_finite());
+            worst = worst.max((r.f - p).abs() / (1.0 + p.abs()));
+        }
+        eprintln!("{label}: recorder vs production values {worst:.2e}");
+        // Measured 0 (bit-identical) on Linux.
+        assert!(worst < 1e-12, "{label}: values {worst:.2e}");
+        let g = fd_oracle(&m, &s, true);
+        eprintln!("{label}: FOCEI gradient vs reconverged FD {g:.2e}");
+        // Measured 1.2e-6 (bolus) / 1.6e-7 (infusion) on Linux; ~10× headroom on the worse.
+        assert!(g < 1.2e-5, "{label}: gradient {g:.2e}");
+        // The straddle: `TIME` under SS stays on FD.
+        let mt = tight(parse_model_string(&src("TIME")).unwrap());
+        let st = subject(
+            &mt,
+            doses,
+            &[1.0, 3.0, 6.0, 11.5, 13.0, 15.0, 20.0, 24.0],
+            &[0.1, -0.05],
+        );
+        assert!(
+            crate::sens::provider::subject_eta_grad(&mt, &st, &mt.default_params.theta, &eta)
+                .is_none(),
+            "{label}: TIME under SS must decline"
+        );
+    }
+}

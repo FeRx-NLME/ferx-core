@@ -1092,8 +1092,8 @@ fn lu_tsolve(rec: &VLu, c: &mut [f64]) {
 const LU_TAG: usize = 1 << 62;
 
 /// The most components a first-order sweep carries: value plus the widest dispatch
-/// bucket's tangents (`sens::ode_provider::adjoint`'s 24).
-const MAX_NC: usize = 25;
+/// bucket's tangents (`sens::ode_provider::adjoint`'s 48).
+const MAX_NC: usize = 49;
 
 /// Zero the adjoint buffer for `L` lanes and return it for seeding.
 pub(crate) fn vadj_init<const L: usize>() -> &'static mut [f64] {

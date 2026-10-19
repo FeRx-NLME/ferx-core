@@ -40,7 +40,7 @@
 //!
 //! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
 //! subjects with non-Gaussian records, IOV with FREM rows, engine shapes no recorder
-//! serves, and more than 24 random effects (stacked under IOV).
+//! serves, and more than 48 random effects (stacked under IOV).
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
@@ -64,7 +64,7 @@ use nalgebra::{DMatrix, DVector};
 /// `N(N+1)/2` per operation, not any derivative limit.
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
-const WIDTH_BUCKETS: [usize; 9] = [1, 2, 3, 4, 6, 8, 12, 16, 24];
+const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -250,6 +250,8 @@ macro_rules! by_bucket {
             12 => $f::<12, 78>($($arg),*),
             16 => $f::<16, 136>($($arg),*),
             24 => $f::<24, 300>($($arg),*),
+            32 => $f::<32, 528>($($arg),*),
+            48 => $f::<48, 1176>($($arg),*),
             _ => None,
         }
     };
@@ -2438,7 +2440,7 @@ macro_rules! exact_anchor_buckets {
 
 exact_anchor_buckets!(
     taped: (2, 3), (4, 10), (8, 36), (24, 300);
-    declined: (1, 1), (3, 6), (6, 21), (12, 78), (16, 136)
+    declined: (1, 1), (3, 6), (6, 21), (12, 78), (16, 136), (32, 528), (48, 1176)
 );
 
 /// The taped half of [`run_agq`]: the node recordings, the scalar-tape objective, the

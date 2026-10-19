@@ -113,11 +113,12 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// every such model decline #570's shared solve (measured 1.82× on one objective
 /// evaluation) and leave the dense driver, for a property it does not have.
 ///
-/// The **steady-state gates do not follow this narrowing** and must keep asking
-/// `reads_model_time()` directly (`estimation/inner_optimizer.rs`,
-/// `sens/ode_provider.rs`): SS equilibration integrates the *augmented* system,
-/// `__chz` included, and a time-reading hazard line breaks that state's cycle
-/// recurrence just as a time-reading PK line would.
+/// The steady-state gradient gates (`sens/ode_provider.rs`) ask the PK-only
+/// `pk_reads_absolute_time()` (#2093), which is safe only because a joint
+/// PK-TTE subject with an SS dose is declined before them (#1210): SS
+/// equilibration integrates the *augmented* system, `__chz` included, and a
+/// time-reading hazard line breaks that state's cycle recurrence just as a
+/// time-reading PK line would.
 ///
 /// The Form C `readout_program` is deliberately **not** folded in either. Both
 /// engines evaluate the readout under a `ModelTimeGuard`, so a `TIME`-reading

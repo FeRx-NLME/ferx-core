@@ -453,6 +453,26 @@ pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject:
         && subject.has_ss_doses()
 }
 
+/// Whether a steady-state subject's RHS reads a clock the dual SS run-in cannot mirror:
+/// `TIME`/`T` or `TAFD` (no periodic steady state to converge to — production's own values
+/// for them under `SS=1` are #1139's open half), or `TAD` together with a lagged SS dose,
+/// whose pre-arrival phase window has its own anchoring convention (#1126). A `TAD`-only RHS
+/// under unlagged SS dosing is served: `equilibrate_ss_state_g` runs production's per-window
+/// clocks (`ss_run_in_params`), the quiet window included.
+///
+/// Asked of the **PK block** only. The wide (augmented-system) view differs from it only on a
+/// joint PK-TTE model, and every such subject with an SS dose has already been declined by
+/// [`ss_dual_equilibration_out_of_scope`] at both call sites; a wide check here would be a
+/// second gate rejecting the same inputs, so neither could be shown to work.
+fn ss_clock_out_of_scope(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    model: &CompiledModel,
+    subject: &Subject,
+) -> bool {
+    program.pk_reads_absolute_time()
+        || (program.pk_reads_tad() && model.has_lagtime() && subject.has_ss_doses())
+}
+
 /// The pre-#2093 `ode_tvcov_supported` without the retired forward provider's `(θ, η)`
 /// dual-width cap (`MAX_ODE_AXES`): the event-driven walk's subject scope as the adjoint
 /// gradient sees it. The adjoint seeds only the `nη` η-directions, so the cap does not apply.
@@ -711,11 +731,11 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // observation's elapsed time since arrival still shifts with `lag`, and the crossing's
     // post-side flow (first order: `D·δlag`) captures exactly that — mirroring the existing
     // `x⁻ = 0` first-dose reduction.
-    // SS combined with a **non-autonomous RHS** (one that reads `TIME`/`TAFD`/`TAD`) routes
-    // to FD: the SS dual equilibration expands a time-*invariant* pulse train (cycle-relative
-    // time, anchor 0), so a time/TAD-dependent RHS breaks the steady-state cycle recurrence —
-    // the dual walk's monotonic TAD diverges from production's per-interval anchor, giving a
-    // wrong prediction *and* gradient (#473 review #1, verified vs the production predictor).
+    // SS combined with an RHS reading an absolute clock (`TIME`/`T`/`TAFD`), or `TAD` under a
+    // lagged SS dose, routes to FD (`ss_clock_out_of_scope`). A `TAD`-only RHS under unlagged
+    // SS dosing is served since #2093: the dual run-in replays production's per-window clocks
+    // (`equilibrate_ss_state_g`), which is what #473 review #1 found the old monotonic `TAD`
+    // to miss. The history below is the pre-#2093 reasoning.
     //
     // `reads_model_time`, not the bare `uses_time_vars` this gate asked until #1124: a bare
     // `TIME` in the RHS compiles to `Op::PushTime`, which `uses_time_vars` structurally cannot
@@ -741,7 +761,7 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
         && ode
             .rhs_program
             .as_ref()
-            .is_some_and(|p| p.reads_model_time())
+            .is_some_and(|p| ss_clock_out_of_scope(p, model, subject))
     {
         return false;
     }
@@ -1490,7 +1510,7 @@ pub(crate) fn ode_iov_walk_scope(
             .ode_spec
             .as_ref()
             .and_then(|o| o.rhs_program.as_ref())
-            .is_some_and(|p| p.reads_model_time())
+            .is_some_and(|p| ss_clock_out_of_scope(p, model, subject))
     {
         return None;
     }
@@ -1960,18 +1980,27 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
     }
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
-    let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
-        eval_rhs_anchored::<T>(
+    // The run-in's clocks, as production's (`ss_run_in_params`): each window's local time
+    // from `0`, `TAD` from the cycle's pulse — so an infusion's quiet window, which re-opens
+    // its clock at `0` a window `T_inf` after the pulse, reads `TAD = τ + T_inf` — and `TAFD`
+    // `NaN` (it has no periodic steady state). `T_inf` keeps its jet (a modeled or
+    // `F`-scaled window): it is where the quiet window's `TAD` starts.
+    let rhs_anchored_at = |us: &[T], ps: &[T], t: f64, dt: T, pulse: T, du: &mut [T]| {
+        eval_rhs_at_offset::<T>(
             program,
             us,
             ps,
             t,
-            0.0,
-            T::from_f64(0.0),
+            dt,
+            f64::NAN,
+            pulse,
             du,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
+    };
+    let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+        rhs_anchored_at(us, ps, t, T::from_f64(0.0), T::from_f64(0.0), du);
     };
 
     // ---- #914 exact solve: closed-form periodic fixed point (linear disposition). ----
@@ -2021,14 +2050,18 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 // identical to the fallback loop's per-cycle `cross_rate_switch`.
                 let dtinf = inf_window - T::from_f64(t_inf_val);
                 {
-                    let mut base =
-                        |x: &[T], _s: T, out: &mut [T]| bare_rhs(x, params, t_inf_val, out);
+                    let mut base = |x: &[T], s: T, out: &mut [T]| {
+                        rhs_anchored_at(x, params, t_inf_val, s, T::from_f64(0.0), out)
+                    };
                     cross_rate_switch(&mut y, dtinf, cmt_idx, &|_| rate_forcing, false, &mut base);
                 }
                 let quiet_val = dose.ii - t_inf_val;
+                let quiet_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                    rhs_anchored_at(us, ps, t, T::from_f64(0.0), -inf_window, du);
+                };
                 if quiet_val > 0.0 {
                     y = solve_ode_g_certified(
-                        &bare_rhs,
+                        &quiet_rhs,
                         &y,
                         (0.0, quiet_val),
                         params,
@@ -2105,12 +2138,23 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
             // sensitivity is exact, not just the boundary's *value*.
             let dtinf = inf_window - T::from_f64(t_inf_val);
             {
-                let mut base = |x: &[T], _s: T, out: &mut [T]| bare_rhs(x, params, t_inf_val, out);
+                let mut base = |x: &[T], s: T, out: &mut [T]| {
+                    rhs_anchored_at(x, params, t_inf_val, s, T::from_f64(0.0), out)
+                };
                 cross_rate_switch(&mut u, dtinf, cmt_idx, &|_| rate_forcing, false, &mut base);
             }
             if quiet_val > 0.0 {
-                let sol =
-                    solve_ode_g_certified(&bare_rhs, &u, (0.0, quiet_val), params, &saveat_q, opts);
+                let quiet_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                    rhs_anchored_at(us, ps, t, T::from_f64(0.0), -inf_window, du);
+                };
+                let sol = solve_ode_g_certified(
+                    &quiet_rhs,
+                    &u,
+                    (0.0, quiet_val),
+                    params,
+                    &saveat_q,
+                    opts,
+                );
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }

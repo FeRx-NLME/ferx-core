@@ -309,7 +309,7 @@ pub(crate) fn fd_fallback_warning(
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
              (a shape no analytic recorder serves, e.g. an SDE, a per-CMT \
-             `obs_scale`, or more than 24 random effects); their results are correct \
+             `obs_scale`, or more than 48 random effects); their results are correct \
              but slower.{tolerance_note}"
         ))
     } else {

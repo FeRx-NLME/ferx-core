@@ -28441,7 +28441,7 @@ impl OdeRhsProgram {
     /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
     /// the augmented system and a time-dependent hazard line is part of it.
     pub(crate) fn reads_any_model_time(&self) -> bool {
-        self.uses_time_vars || self.reads_time_builtin
+        self.reads_model_time()
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -28494,13 +28494,13 @@ impl OdeRhsProgram {
     /// them: `T`/`TIME` come back with the run-in's cycle-local clock — finite, matching
     /// NONMEM, and not the limit of the model's own dose train — and `TAFD` has no referent
     /// inside the run-in at all and comes back `NaN`. That is what
-    /// `W_STEADY_STATE_ABSOLUTE_TIME` reports, and this is its only caller.
+    /// `W_STEADY_STATE_ABSOLUTE_TIME` reports.
     ///
-    /// **Not a gradient-routing predicate.** The steady-state FD gates in
-    /// [`crate::sens`] ask the *wide* [`Self::reads_model_time`] and must keep doing so:
-    /// they decline the whole non-autonomous family, `TAD` included, and narrowing one to
-    /// this would let a `TAD`-reading steady-state model reach the dual equilibration
-    /// (#1272).
+    /// **Also the steady-state gradient gate** since #2093: the SS FD gates in
+    /// [`crate::sens`] decline this, plus `TAD` under a lagged SS dose. Before #2093 they
+    /// declined the whole non-autonomous family ([`Self::reads_model_time`], #1272); the dual
+    /// run-in now anchors `TAD` per window as the value path does. The PK-only view is enough
+    /// there because a joint PK-TTE subject with an SS dose is declined earlier (#1210).
     ///
     /// Composed from the two accessors rather than the two fields, for the reason given on
     /// [`Self::reads_model_time`]: neither may quietly become dead code.
