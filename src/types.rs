@@ -7031,6 +7031,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
         (WarningSeverity::Critical, WarningCode::ViBadBasin)
+    } else if lower.starts_with("w_covariate_missing") {
+        // #2041: the reader's warning for a covariate column with no value for
+        // some subjects. Ahead of every prose arm, because the message carries
+        // the covariate's name and the subjects' IDs, which are the data's own
+        // spelling: a covariate named `LTBS` or an ID `degenerate` would
+        // otherwise be claimed by an arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("w_absorption_twin_declined") {
         // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
         // the fit that follows is a pure closed form — but the model has silently lost the

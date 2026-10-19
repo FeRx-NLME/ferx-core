@@ -155,6 +155,97 @@ fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
     );
 }
 
+/// The one missing-covariate warning (#2041) the reader raises on `csv`.
+fn missing_wt_warning(csv: &str) -> String {
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let hits: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.contains("has no value for"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "one warning per covariate: {:?}",
+        pop.warnings
+    );
+    hits[0].clone()
+}
+
+/// A dataset of `n` subjects, the last `n_missing` of which have no `WT`.
+fn wt_csv(n: usize, n_missing: usize) -> String {
+    let mut csv = String::from("ID,TIME,DV,EVID,AMT,WT\n");
+    for id in 1..=n {
+        let wt = if id > n - n_missing { "." } else { "70" };
+        csv.push_str(&format!("{id},0,.,1,100,{wt}\n{id},1,5.0,0,.,{wt}\n"));
+    }
+    csv
+}
+
+#[test]
+fn the_missing_covariate_warning_is_coded_and_reads_as_written() {
+    // #2041: the format string was one physical line that kept the source
+    // indentation of its continuation lines, so the message carried two runs of
+    // 14 spaces, and it had no `W_` code to filter it by. It also promised that
+    // the covariate "evaluates to NaN" for those subjects, which `log`, `sqrt`,
+    // `min`, `max` and the comparisons all contradict: each turns the `NaN` into
+    // a finite value (measured in #2040). The whole message is pinned, so every
+    // sentence of it is.
+    let w = missing_wt_warning(&wt_csv(2, 1));
+    assert_eq!(
+        w,
+        "W_COVARIATE_MISSING: covariate WT has no value for 1 of 2 subjects (2), so it is \
+         NaN for them. A relation that reads it is then NaN, which makes the objective \
+         non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, a finite value \
+         with no further warning. Impute the column, exclude the subjects, or guard the \
+         relation with `present(WT)`."
+    );
+    assert!(!w.contains("  "), "no run of spaces: {w:?}");
+}
+
+#[test]
+fn the_missing_covariate_warning_names_five_subjects_then_elides() {
+    // Both sides of the `> 5` gate in one test, so a gate stuck on either
+    // branch fails it.
+    let five = missing_wt_warning(&wt_csv(6, 5));
+    assert!(
+        five.contains("has no value for 5 of 6 subjects (2, 3, 4, 5, 6), so"),
+        "five missing are all named, with no ellipsis: {five}"
+    );
+    let six = missing_wt_warning(&wt_csv(7, 6));
+    assert!(
+        six.contains("has no value for 6 of 7 subjects (2, 3, 4, 5, 6, ...), so"),
+        "six missing name the first five and elide the rest: {six}"
+    );
+}
+
+#[test]
+fn the_missing_covariate_warning_is_data_quality_whatever_the_covariate_is_called() {
+    // Classified on its `W_` token, ahead of the prose arms: the message carries
+    // the covariate's own name, and a column called `DURBIN` would otherwise be
+    // claimed by the Durbin-Watson arm. Without the token arm `WT` falls to
+    // `general`.
+    use crate::types::classify_warning;
+    for name in ["WT", "DURBIN"] {
+        let csv = wt_csv(2, 1).replace("WT", name);
+        let f = write_csv(&csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let w = pop
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("W_COVARIATE_MISSING"))
+            .unwrap_or_else(|| panic!("no W_COVARIATE_MISSING in {:?}", pop.warnings));
+        let entry = classify_warning(w);
+        assert_eq!(
+            entry.category.as_str(),
+            "data_quality",
+            "covariate {name}: {w}"
+        );
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+}
+
 #[test]
 fn declared_covariate_non_numeric_value_is_rejected() {
     // A declared covariate must be numerically coded; a text value is a hard

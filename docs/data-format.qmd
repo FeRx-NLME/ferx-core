@@ -207,6 +207,7 @@ By default, any column not in the standard set above is automatically treated as
 
 - **Time-constant**: The first non-missing value for each subject is used
 - **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: `[individual_parameters]` is re-evaluated at each dose and observation row using that row's covariate values)
+- **Missing for a whole subject**: a covariate column with no value in any of a subject's rows reads as `NaN` for that subject, and the reader reports it once per covariate as **`W_COVARIATE_MISSING`**, naming up to five of the subjects. What a relation that reads the covariate then gives depends on its operations: `NaN` for most, but a finite value through `log`, `sqrt`, `min`, `max` or a comparison (see [`present(...)`](model-file/individual-parameters.qmd#present...-guarding-a-covariate-that-may-be-missing) for the guard)
 
 Covariate names are **case-sensitive**: a column name in the data file must match the name used in `[individual_parameters]` expressions (and in a `[covariates]` block) exactly. (Standard NONMEM columns like `ID`/`TIME` are matched case-insensitively; covariate columns are not.)
 

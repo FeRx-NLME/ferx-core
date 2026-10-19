@@ -1417,8 +1417,11 @@ fn read_nonmem_csv_impl(
 
     // A covariate column that exists but carries no finite value for some
     // subjects is stored as `NaN` (see the per-subject reader). Report it once
-    // per covariate: without a `present(COV)` guard those subjects evaluate the
-    // covariate expression to `NaN`, and the fit will fail on them.
+    // per covariate. Without a `present(COV)` guard what those subjects get
+    // depends on the relation: arithmetic, `^`, `exp` and `logit` keep the
+    // `NaN`, so the objective goes non-finite, while `log`, `sqrt`, `min`, `max`
+    // and the comparisons turn it into a finite value and nothing else warns
+    // (#2041; docs/model-file/individual-parameters.qmd).
     let mut population_warnings = population_warnings;
     for name in &existing_cov_names {
         let missing: Vec<&str> = subjects
@@ -1430,10 +1433,19 @@ fn read_nonmem_csv_impl(
             continue;
         }
         population_warnings.push(format!(
-            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
+            "W_COVARIATE_MISSING: covariate {name} has no value for {} of {} subjects ({}{}), \
+             so it is NaN for them. A relation that reads it is then NaN, which makes the \
+             objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, \
+             a finite value with no further warning. Impute the column, exclude the \
+             subjects, or guard the relation with `present({name})`.",
             missing.len(),
             subjects.len(),
-            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            missing
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             if missing.len() > 5 { ", ..." } else { "" },
         ));
     }
