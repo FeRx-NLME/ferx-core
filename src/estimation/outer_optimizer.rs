@@ -2727,6 +2727,25 @@ fn decrement_ode_override(
     })
 }
 
+/// The incumbent's per-subject EBEs as inner-loop warm starts: `η̂`, then each occasion
+/// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
+/// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
+/// (#2001 review). A subject with no κ cells is its `η̂` alone.
+fn joint_warm_starts(ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> Vec<DVector<f64>> {
+    ehs.iter()
+        .enumerate()
+        .map(|(i, eta)| {
+            let cells = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            DVector::from_iterator(
+                eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
+                eta.iter()
+                    .chain(cells.iter().flat_map(|c| c.iter()))
+                    .copied(),
+            )
+        })
+        .collect()
+}
+
 /// [`bhhh_newton_decrement`] of the objective the optimizer minimises (−2LL plus any prior
 /// or covariate-NN penalty) at packed `x` with EBEs `ehs` / `kappas`, or `None` where it is
 /// not trusted to separate a creep from an optimum.
@@ -2737,13 +2756,15 @@ fn decrement_ode_override(
 /// 0.008, so the closed form's threshold would never let it stop (#2001; before it, the
 /// decrement was withheld from every ODE model, and their fits latched on the OFV window
 /// alone). So both the EBEs and the per-subject gradients are re-solved at the incumbent at
-/// a tight tolerance, the EBEs warm-started from `ehs`, under a scope every worker carries.
+/// a tight tolerance, the EBEs warm-started from `ehs` and `kappas` ([`joint_warm_starts`]),
+/// under a scope every worker carries.
 /// The EBEs too, not only the gradient: an η̂ solved under the integrator's error is not
 /// stationary for the tight objective, and the gradient, formed as if it were, carries the
 /// difference — 2.14 at NONMEM's optimum of the #1934 model under rosenbrock23 with the
 /// gradient alone tightened, 5.7e-7 with both. A pass that cannot be formed (a scope that
-/// cannot be built, a gradient out of scope, a non-finite component) is `None`, which
-/// latches as before #1934.
+/// cannot be built, a re-solve that leaves a subject unconverged or start-rejected, a
+/// gradient out of scope, a non-finite component) is `None`, which latches as before
+/// #1934.
 #[allow(clippy::too_many_arguments)]
 fn predicted_remaining_gain(
     model: &CompiledModel,
@@ -2764,19 +2785,26 @@ fn predicted_remaining_gain(
         Some(ode) => crate::api::with_fit_scope_ode(options, ode, || {
             let params = unpack_params(x, init_params);
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, _, _, kappas) = run_inner_loop_warm_seeded(
+            let warm = joint_warm_starts(ehs, kappas);
+            let (ehs, _, stats, kappas) = run_inner_loop_warm_seeded(
                 model,
                 population,
                 &params,
                 options.inner_maxiter,
                 options.inner_tol,
-                Some(ehs),
+                Some(&warm),
                 Some(&mu_k),
                 0,
                 0,
                 InnerHessianSeed::for_options(options),
                 options,
             );
+            // The decrement assumes every η̂ is a mode; one that did not converge (or a
+            // start the inner loop refused) still yields a finite gradient, formed as if
+            // it were. No decrement then — the latch proceeds as before #1934.
+            if stats.n_unconverged > 0 || stats.n_start_rejected > 0 {
+                return None;
+            }
             per_subject_outer_gradients(model, population, init_params, x, &ehs, &kappas, options)
         })
         .ok()??,

@@ -7495,6 +7495,131 @@ fn decrement_ode_override_tightens_and_keeps_the_fits_other_settings() {
     );
 }
 
+/// [`predicted_remaining_gain`] on `model` at packed `x` with EBEs `ehs` / `kappas`, no
+/// penalty beyond the model's own priors.
+fn gain_with(
+    model: &CompiledModel,
+    pop: &Population,
+    params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    opts: &FitOptions,
+) -> Option<f64> {
+    predicted_remaining_gain(
+        model,
+        pop,
+        params,
+        x,
+        ehs,
+        kappas,
+        &compute_bounds(params),
+        opts,
+        &crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts),
+        &build_prior_set(model, params),
+    )
+}
+
+/// #2001 review: the tight re-solve is warm-started from the incumbent's whole conditional
+/// mode, κ̂ included. The fixture is `warfarin_iov_ode_bloq` under rk45 (its `auto` is
+/// exact and would skip the re-solve), at its initial estimates, where 10 subjects carry a
+/// non-zero κ̂. Measured on Linux x86_64 with `inner_maxiter = 5`: seeded with η̂ and κ̂,
+/// every subject converges (from `inner_maxiter = 1` up); seeded with η̂ alone (κ = 0), all
+/// 10 are unconverged, and stay so up to 5 iterations (7 at 10, none at 50). So at 5 the
+/// joint seed gives a decrement and the η̂-only one cannot.
+#[test]
+fn predicted_remaining_gain_seeds_the_tight_re_solve_with_the_kappas() {
+    let src = std::fs::read_to_string("examples/warfarin_iov_ode_bloq.ferx")
+        .expect("example reads")
+        .replace("[fit_options]", "[fit_options]\n  ode_method = rk45");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_2001_iov_seed_{}_{:?}.ferx",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, src).expect("writes the fixture");
+    let prep = crate::api::prepare_run(
+        path.to_str().expect("utf-8 path"),
+        Some("data/warfarin_iov_bloq.csv"),
+    );
+    let _ = std::fs::remove_file(&path);
+    let prep = prep.expect("prepares");
+    let (model, pop, params) = (&prep.parsed.model, &prep.population, &prep.init_params);
+    let opts = FitOptions {
+        bloq_method: prep.parsed.fit_options.bloq_method,
+        ..focei_options()
+    };
+    assert!(model.n_kappa > 0, "fixture has IOV");
+    assert!(
+        decrement_ode_override(model, &opts).is_some(),
+        "fixture integrates"
+    );
+    let (x, ehs, _, kappas) = ebes_at(model, params, pop, &opts);
+    let live = kappas
+        .iter()
+        .filter(|k| k.iter().any(|v| v.norm() > 1e-6))
+        .count();
+    assert!(
+        live >= 5,
+        "κ̂ must be non-zero, or seeding it is unobservable: {live}"
+    );
+
+    let budget = FitOptions {
+        inner_maxiter: 5,
+        ..opts.clone()
+    };
+    let got = gain_with(model, pop, params, &x, &ehs, &kappas, &budget);
+    eprintln!("IOV ODE, inner_maxiter = 5: {got:?}");
+    assert!(
+        got.is_some_and(f64::is_finite),
+        "seeded from the incumbent's κ̂ the re-solve converges in 5 iterations: {got:?}"
+    );
+}
+
+/// #2001 review: a tight re-solve that leaves a subject unconverged gives no decrement — the
+/// gradient formula assumes every η̂ is a mode, and an unconverged one still yields a
+/// finite gradient. Both sides of the gate in one test: the #1934 model's ODE twin under
+/// rk45 at the false stop, its EBEs replaced by zeros (so the re-solve has real work), is
+/// `None` with `inner_maxiter = 1` and `Some` at the default budget — the false stop's
+/// 14.83, measured on Linux x86_64.
+#[test]
+fn predicted_remaining_gain_is_withheld_when_the_tight_re_solve_does_not_converge() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let m = parse_model_string(&issue_1934_ode_model(
+        6.735588,
+        16.155540,
+        0.011638,
+        23.488333,
+        [0.061883, -0.018713, 0.101651],
+        0.043717,
+        "rk45",
+    ))
+    .expect("fixture parses");
+    let params = &m.default_params;
+    let x = pack_params(params);
+    let zeros = vec![DVector::zeros(m.n_eta); pop.subjects.len()];
+    let opts = focei_options();
+    let starved = FitOptions {
+        inner_maxiter: 1,
+        ..focei_options()
+    };
+    let full = gain_with(&m, &pop, params, &x, &zeros, &[], &opts);
+    let cut = gain_with(&m, &pop, params, &x, &zeros, &[], &starved);
+    eprintln!("default budget {full:?}, inner_maxiter = 1 {cut:?}");
+    assert!(
+        full.is_some_and(|g| g.is_finite() && !gain_is_negligible(Some(g))),
+        "default budget: {full:?}"
+    );
+    assert_eq!(
+        cut, None,
+        "an unconverged re-solve must not form a decrement"
+    );
+}
+
 /// #2001: tightening the gradient alone is not enough; the EBEs are re-solved at the tight
 /// tolerance too. An η̂ solved under the integrator's error is not stationary for the
 /// tight objective, and the outer gradient, formed as if it were, carries the difference.
