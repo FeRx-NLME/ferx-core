@@ -231,6 +231,8 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
         // evaluation exit — plus `CovStepOutcome`'s two constructions live in
         // `covariance.rs`, not here.
         ("src/estimation/outer_optimizer.rs", (3, 3)),
+        // The profiled outer loop (#1065) and its never-solved exit.
+        ("src/estimation/profile.rs", (2, 2)),
         ("src/estimation/saem.rs", (1, 1)),
         ("src/estimation/trust_region.rs", (1, 1)),
         ("src/estimation/vi/run.rs", (1, 1)),

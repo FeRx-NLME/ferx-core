@@ -33905,8 +33905,8 @@ fn profile_is_peeled_off_a_theta_line_only() {
 
 // ── #1065: the route of a `profile`d block (E_PROFILE_NOT_LINEAR) ───────────
 
-/// An algebraic model with a counted `profile` block `PLACEBO[3]` and, optionally,
-/// a second one `ARMFX[3]`. `indiv` is the `[individual_parameters]` body, `y` the
+/// An algebraic model with a counted `profile` block `PLACEBO[3]` and a second,
+/// unprofiled block `ARMFX[3]` ([`two_profiled`] profiles it too). `indiv` is the `[individual_parameters]` body, `y` the
 /// readout, `error` the `[error_model]` line.
 fn route_model(indiv: &str, y: &str, error: &str) -> String {
     format!(
@@ -33915,7 +33915,7 @@ fn route_model(indiv: &str, y: &str, error: &str) -> String {
   theta TVE0(45.0, 0.0, 200.0)
   theta EMAX(8.0, 0.0, 100.0)
   theta PLACEBO[3](0.0) profile
-  theta ARMFX[3](0.0) profile
+  theta ARMFX[3](0.0, -10.0, 10.0)
   omega ETA_E0 ~ 4.0
   omega ETA_EM ~ 0.1
   sigma ADD_ERR ~ 1.0 FIX
@@ -33960,7 +33960,7 @@ fn assert_route_frame(msg: &str) {
 
 /// Every accepted route: a plain sum (F1), a data coefficient (`× DOSE`, `/ WPSE`,
 /// a literal), through a chain of parameters, and a model nonlinear in η but affine
-/// in the block (F2). `ARMFX` is profiled too and read nowhere, which is allowed.
+/// in the block (F2). The unprofiled `ARMFX` is read nowhere, which is allowed.
 #[test]
 fn profile_accepts_every_affine_route_with_a_data_coefficient() {
     for (indiv, y) in [
@@ -34131,14 +34131,43 @@ fn profile_refuses_a_residual_error_that_reads_the_block() {
     }
 }
 
+/// `route_model` with `ARMFX` profiled as well.
+fn two_profiled(text: &str) -> String {
+    text.replace(
+        "theta ARMFX[3](0.0, -10.0, 10.0)",
+        "theta ARMFX[3](0.0) profile",
+    )
+}
+
+/// #2103 review #8: a profiled block no prediction reads has nothing to be solved
+/// from, and is refused by name; the same block unprofiled (the control) parses. The
+/// message is its own, not the route frame, which would tell the user to read the block
+/// "as `c × block`" in a prediction that does not read it at all.
+#[test]
+fn profile_refuses_a_block_no_prediction_reads() {
+    let indiv = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let msg = parse_full_model(&two_profiled(&route_model(indiv, "BASE", ADD)))
+        .err()
+        .expect("refused");
+    assert_eq!(
+        msg,
+        "E_PROFILE_NOT_LINEAR: [parameters] theta ARMFX[...] is `profile`d, but no prediction \
+         reads it, so the data say nothing about its levels. Read it in `y`, or remove the \
+         block."
+    );
+    parse_full_model(&route_model(indiv, "BASE", ADD)).unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// One prediction reading two profiled blocks names both.
 #[test]
 fn profile_refuses_a_prediction_reading_two_profiled_blocks() {
-    let msg = route_err(
+    let msg = parse_full_model(&two_profiled(&route_model(
         "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
         "BASE + ARMFX[ARM]",
         ADD,
-    );
+    )))
+    .err()
+    .expect("refused");
     assert_route_frame(&msg);
     assert!(
         msg.contains(
@@ -34221,11 +34250,16 @@ fn obs_scale_model(sc: &str, scaling: &str) -> String {
 
 /// Review #1: a block in an `obs_scale` divisor, directly or through a parameter,
 /// uniform or per-CMT, is a divisor of the prediction and is refused, naming the
-/// key. The control on the same model, `SC = V`, parses: the pair straddles the gate.
+/// key. The control on the same model, `SC = V`, reads the block nowhere: since #2103
+/// review #8 that is refused too, but as unread, never as a divisor, so the pair still
+/// straddles the divisor gate.
 #[test]
 fn profile_refuses_a_block_in_an_obs_scale_divisor() {
-    parse_full_model(&obs_scale_model("V", "obs_scale = SC"))
-        .unwrap_or_else(|e| panic!("control: {e}"));
+    let control = parse_full_model(&obs_scale_model("V", "obs_scale = SC"))
+        .err()
+        .expect("an unread profiled block is refused");
+    assert!(control.contains("but no prediction reads it"), "{control}");
+    assert!(!control.contains("divisor"), "{control}");
     for (sc, scaling, label) in [
         (
             "V + PLACEBO[STUDY]",

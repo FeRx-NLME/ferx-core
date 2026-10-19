@@ -3948,10 +3948,6 @@ fn level_se(
 /// whole block. Built from the index column [`write_index_column`] wrote — per row
 /// when the index varies within a subject, from the baseline when it does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the profile solve, #1065 PR2")
-)]
 pub(crate) struct ActiveLevels {
     pub(crate) block: String,
     /// Per subject, in population order, the 0-based levels read, ascending.
@@ -3965,10 +3961,6 @@ pub(crate) struct ActiveLevels {
 /// level: a superset is safe, it only costs the solve some work. The parser decides
 /// that over every read (`ThetaBlocks::profiled_index`), not over the plain-column
 /// reads alone, which would name the wrong levels (#2103 review #2).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the profile solve, #1065 PR2")
-)]
 pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> Vec<ActiveLevels> {
     let blocks = &model.indiv_param_partials.theta_blocks;
     blocks

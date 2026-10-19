@@ -1265,3 +1265,67 @@ on macOS arm64), worst relative `IPRED` gap against the `.tab` 2.2e-8 on Linux (
 macOS). `reset_seed` fixes the step size (`THETA(4)
 FIX`): `BASE` is read only at a period start, so no record identifies it. Run folder:
 `~/NONMEMruns/issue1969-param-time/` (`RUN.md`, generators `gen.py` / `gen2.py`).
+
+## Profiled level blocks (#1065)
+
+A `profile`d θ level block is not searched by the optimizer: ferx solves its levels at
+every outer evaluation, by Newton on the total gradient with each EBE re-solved. NONMEM
+has no such solve, so the anchor fits the **same model with every level a `THETA`**, and
+ferx is evaluated at NONMEM's *structural* optimum only (TVE0, EMAX, ET50, Ω, Ω_IOV). ferx
+then finds the 36 free levels itself. One evaluation therefore checks the profile solve,
+the objective, the profiled `R` and the level SEs, against a reference that profiles
+nothing.
+
+`profile_mbma.ctl` / `profile_mbma_fit.ferx`, data `profile_mbma.csv`, all written by
+`simulate_profile_mbma.py` (synthetic, fixed seed): 12 studies × 2 arms × 4 visits, ID =
+study, `y = TVE0 + PLACEBO[study, visit] + κ_arm − TRT·EMAX·exp(η)·t/(t + ET50)`,
+`weight = SE` (`Y = IPRED + SE·EPS(1)`, `$SIGMA 1 FIX`). The block is `sum_to_zero_within`:
+each study's last visit is `−(sum of the other three)` in NONMEM, as ferx lays it out.
+What the existing level-SE anchor (#1890) does not have, and this one does:
+
+- **a κ on the block's rows**: the between-arm κ is an occasion `ETA` (`$OMEGA BLOCK(1)`
+  + `SAME`), so the levels' GLS step goes through `C̃ = HΩHᵀ + R` with κ in `H`;
+- **a prediction nonlinear in η**: `EMAX·exp(η)` on the drug arm, whose sensitivity
+  varies by visit. A random effect whose sensitivity is the same on every row of a study
+  is orthogonal to a within-study sum-to-zero contrast, so the EBE would not move with the
+  levels and the frozen-EBE shortcut the solve avoids would be exact (measured on a
+  first draft with `TVE0·exp(η)`: 1.8e-5 OFV).
+
+NONMEM OBJ **101.911514106** (`anchor`); arm64 101.911514121. `$ESTIMATION … SIGL=12
+NSIG=4` and `$COVARIANCE MATRIX=R SIGL=12`. `nm3` cannot run a `SAME` stream
+(prsame.set), so both configs ran through `nmfe76` directly
+(`~/NONMEMruns/ferx-1065-profile-mbma/`). Results: `results/profile_mbma.{lst,ext,cov,phi}`.
+
+| | NONMEM | ferx (profiled, at NONMEM's structural point) | gap |
+|---|---|---|---|
+| OFV | 101.911514106 | 101.911514155 | 4.9e-8 |
+| 36 free levels | `THETA4–39` | solved | ≤ 8.2e-6 NONMEM SEs |
+| SE TVE0 / EMAX / ET50 | profile likelihood 0.3182 / 0.8692 / 0.5758 | 0.3175 / 0.8627 / 0.5788 | ≤ 7.5e-3 |
+| SE, 36 free levels | `$COV` | profiled `R` level block | ≤ 4.0e-3 |
+| SE, 12 dependent levels | delta method on `$COV` | delta method on the profiled `R` | ≤ 6.4e-3 |
+
+**The structural SEs are compared with NONMEM's profile likelihood, not with its
+`$COV`.** `$COV` here is a finite-difference `R`, and its accuracy follows the
+estimation's precision; ET50 is weakly identified (34% RSE). The first run of this
+stream used `SIGDIGITS=4`, and its `$COV` gave TVE0 / EMAX / ET50 = 0.311 / 0.804 /
+**0.234**. At `SIGL=12` (the committed run, found in review of #2130) it gives 0.3125 /
+0.8514 / 0.5232. The profile is the reference that does not move: NONMEM refits with
+each THETA FIXed at its estimate ±δ and ±2δ, every other parameter re-estimated
+(`results/profile_mbma_profiles.txt`, 15 objectives at `SIGDIGITS=4`, their centre row
+the first run's OBJ). For ET50, ±0.1 and ±0.2 give 0.575 and 0.572, Richardson 0.576; an
+incomplete re-estimation could only bias these low. ferx's unprofiled `R` at the same point
+agrees with its profiled one to 4.7e-3 (`tests/profiled_levels.rs`, C1), so no remaining
+gap is the profile's. The level SEs are compared with the `SIGL=12` `$COV`.
+
+`tests/profiled_levels.rs` (Tier 2, evaluations only) holds the comparison:
+ΔOFV < 2e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 2e-2. Its
+`profiled_levels_fits.rs` twin (`slow-tests`) fits from the model file's inits and lands
+on NONMEM's OBJ.
+
+**A1, the level-SE anchor profiled.** The same file also evaluates
+`level_se_mbma_fit.ferx` (#1890, above) with its block declared `profile`, at
+`level_se_a`'s structural optimum, its 18 free levels solved by ferx: ΔOFV −1.1e-6 (ferx
+below, NONMEM's levels being the end of a three-significant-digit fit), free-level SEs
+within 2.2e-3 of (a), dependent ones within 2.8e-3 of (b) — inside the 3.4e-3 / 4.2e-3
+the unprofiled anchor shows at the same point. Dropping the covariance step's
+`D⁻¹BᵀCov(θ)BD⁻¹` term fails it.
