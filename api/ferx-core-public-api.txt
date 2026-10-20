@@ -136,6 +136,7 @@ pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core:
 pub fn ferx_core::api::read_population_for(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::read_population_with_source(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, source: &ferx_core::DataSource) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>
@@ -4368,6 +4369,13 @@ pub ferx_core::CovariateThetaEstimate::fixed: bool
 pub ferx_core::CovariateThetaEstimate::level: core::option::Option<f64>
 pub ferx_core::CovariateThetaEstimate::name: alloc::string::String
 pub ferx_core::CovariateThetaEstimate::se: core::option::Option<f64>
+#[non_exhaustive] pub struct ferx_core::DataSource
+pub ferx_core::DataSource::bytes: alloc::vec::Vec<u8>
+pub ferx_core::DataSource::hash: alloc::string::String
+pub ferx_core::DataSource::path: core::option::Option<std::path::PathBuf>
+impl ferx_core::DataSource
+pub fn ferx_core::DataSource::from_bytes(bytes: impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn ferx_core::DataSource::read(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, alloc::string::String>
 pub struct ferx_core::DecisionLogEntry
 pub ferx_core::DecisionLogEntry::decision_idx: usize
 pub ferx_core::DecisionLogEntry::draw: usize
@@ -5301,6 +5309,7 @@ pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::opti
 pub fn ferx_core::read_nonmem_csv(path: &std::path::Path, covariate_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>) -> core::result::Result<ferx_core::Population, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv_with_covariates(path: &std::path::Path, decls: &[ferx_core::CovariateDecl], extra_columns: &[alloc::string::String], iov_column: core::option::Option<&str>) -> core::result::Result<(ferx_core::Population, ferx_core::CovariateTable), alloc::string::String>
 pub fn ferx_core::read_population_with(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, data_path: &str) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::read_population_with_source(model: &ferx_core::CompiledModel, settings: &ferx_core::ReaderSettings, source: &ferx_core::DataSource) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::run_covariance(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), ferx_core::diagnostics::EngineError>

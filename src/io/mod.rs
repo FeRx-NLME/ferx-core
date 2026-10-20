@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub(crate) mod data_source;
 pub mod datareader;
 pub mod filter_expr;
 pub(crate) mod fit_estimates;
