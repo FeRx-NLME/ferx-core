@@ -2188,8 +2188,10 @@ fn find_ebe_solve(
     // (~12× slower). So the scan runs on each cold solve only: the pre-flight
     // (`freeze_flat_thetas`), the first evaluation of each optimizer leg (a #1565 basin
     // restart is a new leg, from a fresh all-zero cache) and the final cold re-solve, each
-    // under both Hessian metrics when the policy is seeded (`find_ebe_impl`) — six scans
-    // per subject per fit on `examples/schnider.ferx`, measured, with no restart. The
+    // under both Hessian metrics when the policy is seeded (`find_ebe_impl`). A fit's first
+    // leg skips its scan when the pre-flight froze nothing: it starts at the same point,
+    // from the pre-flight's EBEs (#2076), which removes two of the six scans per subject
+    // per fit that #2014 measured on `examples/schnider.ferx` with no restart. The
     // `global_search` pre-search's probes start from zeros too, but run with
     // `inner_restarts = 0` (`presearch_probe_options`). A subject whose η̂ is
     // exactly zero (no observations: the prior alone) hands zeros back as its next start,
