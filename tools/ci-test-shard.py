@@ -434,15 +434,9 @@ def list_phase(man, prefix, invs, build):
     return failed
 
 
-def run_tests(suite, k, n, p, directory, list_all, build):
-    """Plain `cargo test` for the `slow*` suites, writing `DIR/manifest.tsv`.
-
-    Every invocation is first listed (`--list`, `--list --ignored`), then run with
-    `--no-fail-fast`; a failing invocation does not stop the later ones, and the
-    shard exits non-zero if any failed. `--list-all` also lists every binary of the
-    `slow` suite, for `check-nn`. Lib parts are libtest filters, which `--list`
-    honours, so a filtered part could never be held against its own `--list`:
-    these suites run `--lib-parts 1` only."""
+def test_build(suite, p, build):
+    """`run_tests`' build args, checked against the suite: `(build, extra)`, where
+    `extra` is what follows a second `--` (the harness args, e.g. `--nocapture`)."""
     if p != 1:
         die(f"{suite}: run with --lib-parts 1 — a filtered lib part cannot be "
             f"checked against the binary's own --list")
@@ -459,6 +453,53 @@ def run_tests(suite, k, n, p, directory, list_all, build):
             f"suite's target set excludes {sorted(want)}; change both together")
     if "--no-fail-fast" not in build:
         build = ["--no-fail-fast", *build]
+    return build, extra
+
+
+def run_phase(man, invs, build, extra):
+    """Each invocation run with plain `cargo test`: an `R` row per test outcome and
+    an `S` row per `test result:` line. Returns the invocations that failed."""
+    failed = []
+    for inv in invs:
+        cur = [None]
+
+        def on_line(line, cur=cur):
+            b = binary_of(line)
+            if b is not None:
+                cur[0] = b
+                return
+            if cur[0] is None:
+                return
+            m = OUTCOME.match(line)
+            if m:
+                man.row("R", cur[0], m.group(1), m.group(2))
+                return
+            m = RESULT.match(line)
+            if m:
+                man.row("S", cur[0], *m.groups())
+                cur[0] = None
+
+        if "--" in inv:
+            i = inv.index("--")
+            targets, harness = inv[:i], inv[i + 1:]
+        else:
+            targets, harness = inv, []
+        tail = ["--", *harness, *extra] if harness or extra else []
+        if stream([CARGO, "test", *build, *targets, *tail], on_line) != 0:
+            failed.append(" ".join(targets))
+    return failed
+
+
+def run_tests(suite, k, n, p, directory, list_all, build):
+    """Plain `cargo test` for the `slow*` suites, writing `DIR/manifest.tsv`.
+
+    Every invocation is first listed (`--list`, `--list --ignored`), then run with
+    `--no-fail-fast`; a failing invocation does not stop the later ones, and the
+    shard exits non-zero if any failed. `--list-all` also lists every binary of the
+    `slow` suite, for `check-nn`. Lib parts are libtest filters, which `--list`
+    honours, so a filtered part could never be held against its own `--list`:
+    these suites run `--lib-parts 1` only."""
+    build, extra = test_build(suite, p, build)
     invs = invocations(suite, k, n, p)
     man = Manifest(directory)
     t0 = time.monotonic()
@@ -471,37 +512,10 @@ def run_tests(suite, k, n, p, directory, list_all, build):
     try:
         failed += list_phase(man, "", invs, build)
         if list_all:
-            every = invocations("slow", 1, 1, 1)
-            failed += list_phase(man, "X", every, build)
+            failed += list_phase(man, "X", invocations("slow", 1, 1, 1), build)
         man.row("M", "list_secs", f"{time.monotonic() - t0:.0f}")
         t1 = time.monotonic()
-        for inv in invs:
-            cur = [None]
-
-            def on_line(line, cur=cur):
-                b = binary_of(line)
-                if b is not None:
-                    cur[0] = b
-                    return
-                if cur[0] is None:
-                    return
-                m = OUTCOME.match(line)
-                if m:
-                    man.row("R", cur[0], m.group(1), m.group(2))
-                    return
-                m = RESULT.match(line)
-                if m:
-                    man.row("S", cur[0], *m.groups())
-                    cur[0] = None
-
-            if "--" in inv:
-                i = inv.index("--")
-                targets, harness = inv[:i], inv[i + 1:]
-            else:
-                targets, harness = inv, []
-            tail = ["--", *harness, *extra] if harness or extra else []
-            if stream([CARGO, "test", *build, *targets, *tail], on_line) != 0:
-                failed.append(" ".join(targets))
+        failed += run_phase(man, invs, build, extra)
         man.row("M", "test_secs", f"{time.monotonic() - t1:.0f}")
         status = "failed" if failed else "ok"
     finally:
@@ -521,22 +535,24 @@ class Shard:
         self.summary = {}  # binary -> list of (passed, failed, ignored, filtered, secs)
         self.failed = {}  # binary -> [test]
         for r in rows:
-            t = r[0]
-            if t == "M":
-                self.meta[r[1]] = r[2]
-            elif t == "E":
-                self.expected.add(r[1])
-            elif t in ("B", "XB"):
-                self.lists.setdefault(t[:-1], {}).setdefault(r[1], (set(), set()))
-            elif t in ("L", "I", "XL", "XI"):
-                pre = t[:-1]
-                lst, ign = self.lists.setdefault(pre, {}).setdefault(r[1], (set(), set()))
-                (lst if t[-1] == "L" else ign).add(r[2])
-            elif t == "S":
-                self.summary.setdefault(r[1], []).append(
-                    tuple(int(x) for x in r[2:6]) + (float(r[6]),))
-            elif t == "R" and r[3] == "FAILED":
-                self.failed.setdefault(r[1], []).append(r[2])
+            self.add(r)
+
+    def add(self, r):
+        t = r[0]
+        if t == "M":
+            self.meta[r[1]] = r[2]
+        elif t == "E":
+            self.expected.add(r[1])
+        elif t in ("B", "XB"):
+            self.lists.setdefault(t[:-1], {}).setdefault(r[1], (set(), set()))
+        elif t in ("L", "I", "XL", "XI"):
+            lst, ign = self.lists.setdefault(t[:-1], {}).setdefault(r[1], (set(), set()))
+            (lst if t[-1] == "L" else ign).add(r[2])
+        elif t == "S":
+            self.summary.setdefault(r[1], []).append(
+                tuple(int(x) for x in r[2:6]) + (float(r[6]),))
+        elif t == "R" and r[3] == "FAILED":
+            self.failed.setdefault(r[1], []).append(r[2])
 
 
 def load_shards(directory):
@@ -548,15 +564,15 @@ def gh(level, msg):
     print(f"::{level}::{msg}", flush=True)
 
 
-def check(suite, n, directory, result=None, budget_min=None):
-    """The summary job's verdict over the shards' manifests. Each failed condition
-    is its own `::error::`, naming the condition; exits 1 if any fired."""
+def shard_errors(suite, n, all_shards, result):
+    """`(shards by k, errors)`: the shard jobs' result, foreign or duplicate
+    manifests, missing shards, and shards that did not finish or did not pass."""
     errors = []
     if result is not None and result != "success":
         errors.append(f"the {suite} shard jobs ended '{result}' (a job killed by "
                       f"timeout-minutes reports as cancelled) — see the shard logs")
     shards = {}
-    for s in load_shards(directory):
+    for s in all_shards:
         if s.meta.get("suite") != suite or s.meta.get("n") != str(n):
             errors.append(f"{s.where}: a manifest of suite {s.meta.get('suite')} "
                           f"N={s.meta.get('n')}, not {suite} N={n}")
@@ -575,6 +591,13 @@ def check(suite, n, directory, result=None, budget_min=None):
                           f"(killed at the job's timeout?)")
         elif s.meta.get("status") != "ok":
             errors.append(f"shard {k}/{n} ended '{s.meta.get('status')}'")
+    return shards, errors
+
+
+def placement_errors(suite, shards):
+    """`(binary -> shards that ran it, errors)`: every expected binary on exactly
+    one shard, and no binary outside the suite."""
+    errors = []
     expected = set().union(*(s.expected for s in shards.values())) if shards else set()
     where = {}
     for k, s in sorted(shards.items()):
@@ -587,43 +610,56 @@ def check(suite, n, directory, result=None, budget_min=None):
             errors.append(f"{b}: ran on several shards {ks}")
         if b not in expected:
             errors.append(f"{b}: a shard ran a binary outside the {suite} suite")
+    return where, errors
+
+
+def binary_errors(k, b, listed, s):
+    """One binary on shard k: it ran every test its `--list` names, none
+    filtered, and none failed."""
+    errors = []
+    runs = s.summary.get(b, [])
+    ran = sum(x[0] + x[1] + x[2] for x in runs)
+    filtered = sum(x[3] for x in runs)
+    if listed and ran == 0:
+        errors.append(f"{b}: its --list names {len(listed)} tests but none "
+                      f"ran (shard {k})")
+    elif ran != len(listed) or filtered:
+        errors.append(f"{b}: ran {ran} of the {len(listed)} tests its --list "
+                      f"names, {filtered} filtered out (shard {k})")
+    fails = sum(x[1] for x in runs)
+    if fails:
+        names = " ".join(sorted(s.failed.get(b, []))) or "see the log"
+        errors.append(f"{b}: {fails} test(s) FAILED (shard {k}): {names}")
+    return errors
+
+
+def budget_warnings(n, shards, budget_min):
+    """A shard over 70% of its budget, or a binary over twice its weight, is a
+    warning: the next re-balance, before it is a red night."""
+    w = load_weights("slow")
     for k, s in sorted(shards.items()):
-        for b, (listed, ignored) in sorted(s.lists.get("", {}).items()):
-            runs = s.summary.get(b, [])
-            ran = sum(x[0] + x[1] + x[2] for x in runs)
-            filtered = sum(x[3] for x in runs)
-            if listed and ran == 0:
-                errors.append(f"{b}: its --list names {len(listed)} tests but none "
-                              f"ran (shard {k})")
-            elif ran != len(listed) or filtered:
-                errors.append(f"{b}: ran {ran} of the {len(listed)} tests its --list "
-                              f"names, {filtered} filtered out (shard {k})")
-            fails = sum(x[1] for x in runs)
-            if fails:
-                names = " ".join(sorted(s.failed.get(b, []))) or "see the log"
-                errors.append(f"{b}: {fails} test(s) FAILED (shard {k}): {names}")
-    if budget_min is not None:
-        w = load_weights("slow")
-        for k, s in sorted(shards.items()):
-            secs = float(s.meta.get("elapsed", 0))
-            if secs > 0.7 * budget_min * 60:
-                gh("warning", f"shard {k}/{n} took {secs / 60:.1f} min, over 70% of its "
-                              f"{budget_min} min budget — re-balance or add a shard")
-            unit = 0.0
-            for b, runs in s.summary.items():
-                t = sum(x[4] for x in runs)
-                if b.endswith("[unit]"):
-                    unit += t
-                    continue
-                ref = w.get(b)
-                if ref and t > 2 * ref and t > 60:
-                    gh("warning", f"{b} took {t:.0f} s, over twice its {ref:.0f} s weight "
-                                  f"— refresh tools/ci-test-weights-slow.txt")
-            ref = w.get(UNIT)
-            if ref and unit > 2 * ref and unit > 60:
-                gh("warning", f"the unit tests took {unit:.0f} s, over twice their "
-                              f"{ref:.0f} s weight")
-    lines = [f"| shard | elapsed (min) | binaries | status |", "|---|---|---|---|"]
+        secs = float(s.meta.get("elapsed", 0))
+        if secs > 0.7 * budget_min * 60:
+            gh("warning", f"shard {k}/{n} took {secs / 60:.1f} min, over 70% of its "
+                          f"{budget_min} min budget — re-balance or add a shard")
+        unit = 0.0
+        for b, runs in s.summary.items():
+            t = sum(x[4] for x in runs)
+            if b.endswith("[unit]"):
+                unit += t
+                continue
+            ref = w.get(b)
+            if ref and t > 2 * ref and t > 60:
+                gh("warning", f"{b} took {t:.0f} s, over twice its {ref:.0f} s weight "
+                              f"— refresh tools/ci-test-weights-slow.txt")
+        ref = w.get(UNIT)
+        if ref and unit > 2 * ref and unit > 60:
+            gh("warning", f"the unit tests took {unit:.0f} s, over twice their "
+                          f"{ref:.0f} s weight")
+
+
+def shard_report(suite, n, shards):
+    lines = ["| shard | elapsed (min) | binaries | status |", "|---|---|---|---|"]
     for k, s in sorted(shards.items()):
         lines.append(f"| {k}/{n} | {float(s.meta.get('elapsed', 0)) / 60:.1f} | "
                      f"{len(s.lists.get('', {}))} | {s.meta.get('status', '?')} |")
@@ -632,6 +668,20 @@ def check(suite, n, directory, result=None, budget_min=None):
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(f"### {suite}\n\n{report}\n")
+
+
+def check(suite, n, directory, result=None, budget_min=None):
+    """The summary job's verdict over the shards' manifests. Each failed condition
+    is its own `::error::`, naming the condition; exits 1 if any fired."""
+    shards, errors = shard_errors(suite, n, load_shards(directory), result)
+    where, placed = placement_errors(suite, shards)
+    errors += placed
+    for k, s in sorted(shards.items()):
+        for b, (listed, _) in sorted(s.lists.get("", {}).items()):
+            errors += binary_errors(k, b, listed, s)
+    if budget_min is not None:
+        budget_warnings(n, shards, budget_min)
+    shard_report(suite, n, shards)
     for e in errors:
         gh("error", e)
     if errors:
@@ -813,54 +863,82 @@ def suite_of(name):
     return name
 
 
+def cmd_run(rest):
+    own, build = split_build(rest)
+    pos, p, output, opts = parse_opts(own)
+    if len(pos) != 3:
+        die(__doc__)
+    suite, k, n = suite_of(pos[0]), int(pos[1]), int(pos[2])
+    if suite in TEST_SUITES:
+        run_tests(suite, k, n, p, opts.get("manifest", "manifest"),
+                  opts.get("list-all", False), build)
+    else:
+        run(suite, k, n, p, output or "lcov.info", build)
+
+
+def cmd_invocations(pos, p, output, opts):
+    for inv in invocations(suite_of(pos[0]), int(pos[1]), int(pos[2]), p):
+        print(" ".join(inv))
+
+
+def cmd_plan(pos, p, output, opts):
+    suite, n = suite_of(pos[0]), int(pos[1])
+    filters, binaries, load = plan(suite, n, p)
+    for i in range(n):
+        lib = f"lib part {i + 1}/{p}, " if i < p else ""
+        print(f"shard {i + 1}: {load[i]:6.0f} s, {lib}{len(binaries[i]):3d} binaries: "
+              f"{' '.join(binaries[i][:6])} ...")
+    for i, fs in enumerate(filters[:-1], 1):
+        print(f"lib part {i}: {' '.join(fs)}")
+
+
+def cmd_has_target(pos, p, output, opts):
+    # One `present=true|false` line for `$GITHUB_OUTPUT`: the planner is the
+    # step's command, so an error here fails the step instead of reading false.
+    suite, k, n, name = suite_of(pos[0]), int(pos[1]), int(pos[2]), pos[3]
+    if name not in test_targets(suite):
+        die(f"has-target: `{name}` is not a test target of {suite}")
+    hit = any(inv[i + 1] == name for inv in invocations(suite, k, n, p)
+              for i, a in enumerate(inv[:-1]) if a == "--test")
+    print(f"present={'true' if hit else 'false'}")
+
+
+def cmd_check(pos, p, output, opts):
+    budget = opts.get("budget-min")
+    check(suite_of(pos[0]), int(pos[1]), pos[2], opts.get("result"),
+          float(budget) if budget else None)
+
+
+def cmd_check_nn(pos, p, output, opts):
+    check_nn(pos[0], pos[1], opts.get("list", SLOW_NN_TESTS))
+
+
+def cmd_weights(pos, p, output, opts):
+    weights_from_log(suite_of(pos[0]), pos[1], output=output)
+
+
+# subcommand -> (number of positional args, handler)
+COMMANDS = {
+    "invocations": (3, cmd_invocations),
+    "plan": (2, cmd_plan),
+    "has-target": (4, cmd_has_target),
+    "check": (3, cmd_check),
+    "check-nn": (2, cmd_check_nn),
+    "weights": (2, cmd_weights),
+}
+
+
 def main(argv):
     if len(argv) < 2:
         die(__doc__)
     cmd, rest = argv[1], argv[2:]
     if cmd == "run":
-        own, build = split_build(rest)
-        pos, p, output, opts = parse_opts(own)
-        if len(pos) != 3:
-            die(__doc__)
-        suite, k, n = suite_of(pos[0]), int(pos[1]), int(pos[2])
-        if suite in TEST_SUITES:
-            run_tests(suite, k, n, p, opts.get("manifest", "manifest"),
-                      opts.get("list-all", False), build)
-        else:
-            run(suite, k, n, p, output or "lcov.info", build)
+        cmd_run(rest)
         return
     pos, p, output, opts = parse_opts(rest)
-    if cmd == "invocations" and len(pos) == 3:
-        for inv in invocations(suite_of(pos[0]), int(pos[1]), int(pos[2]), p):
-            print(" ".join(inv))
-    elif cmd == "plan" and len(pos) == 2:
-        suite, n = suite_of(pos[0]), int(pos[1])
-        filters, binaries, load = plan(suite, n, p)
-        for i in range(n):
-            lib = f"lib part {i + 1}/{p}, " if i < p else ""
-            print(f"shard {i + 1}: {load[i]:6.0f} s, {lib}{len(binaries[i]):3d} binaries: "
-                  f"{' '.join(binaries[i][:6])} ...")
-        for i, fs in enumerate(filters[:-1], 1):
-            print(f"lib part {i}: {' '.join(fs)}")
-    elif cmd == "has-target" and len(pos) == 4:
-        # One `present=true|false` line for `$GITHUB_OUTPUT`: the planner is the
-        # step's command, so an error here fails the step instead of reading false.
-        suite, k, n, name = suite_of(pos[0]), int(pos[1]), int(pos[2]), pos[3]
-        if name not in test_targets(suite):
-            die(f"has-target: `{name}` is not a test target of {suite}")
-        hit = any(inv[i + 1] == name for inv in invocations(suite, k, n, p)
-                  for i, a in enumerate(inv[:-1]) if a == "--test")
-        print(f"present={'true' if hit else 'false'}")
-    elif cmd == "check" and len(pos) == 3:
-        budget = opts.get("budget-min")
-        check(suite_of(pos[0]), int(pos[1]), pos[2], opts.get("result"),
-              float(budget) if budget else None)
-    elif cmd == "check-nn" and len(pos) == 2:
-        check_nn(pos[0], pos[1], opts.get("list", SLOW_NN_TESTS))
-    elif cmd == "weights" and len(pos) == 2:
-        weights_from_log(suite_of(pos[0]), pos[1], output=output)
-    else:
+    if cmd not in COMMANDS or len(pos) != COMMANDS[cmd][0]:
         die(__doc__)
+    COMMANDS[cmd][1](pos, p, output, opts)
 
 
 if __name__ == "__main__":
