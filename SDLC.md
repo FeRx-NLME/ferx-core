@@ -171,9 +171,10 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 | Job | Command | Purpose |
 |-----|---------|---------|
 | **Check** | `tools/preflight.sh check` | The five `cargo check` feature sets — `ci`, `ci,survival,slow-tests`, `ci,markov`, `ci,nn,slow-tests`, and the workspace members under `ferx-core/ci`. Covers every feature combo, including the ones no per-PR test job builds (#1157) |
-| **Tests + coverage (core k/4)** | `cargo llvm-cov --workspace --features ferx-core/ci $(tools/ci-test-shard.py args k 4)` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — split by test binary over four runners (#2167); the four shard lists together are `--tests` |
-| **Tests + coverage (core)** | `codecov/codecov-action` on the shard reports | Uploads the four shards' lcov files as one per-PR patch-coverage report (`fast` flag) |
-| **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <each endpoint test file> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
+| **Tests + coverage (core k/6)** | `tools/ci-test-shard.py run core k 6 --lib-parts 2 -- --workspace --features ferx-core/ci …` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — over six runners (#2167): integration binaries whole, the lib unit tests split by module over shards 1–2; the shards together are `--tests` |
+| **Tests + coverage (core)** | `codecov/codecov-action` on the shard reports | Uploads the six shards' lcov files as one per-PR patch-coverage report (`fast` flag) |
+| **Tests + coverage (TTE/CTMM endpoints k/4)** | `tools/ci-test-shard.py run endpoints k 4 --lib-parts 4 -- --features ci,markov,nn …` | Runs the `--lib` unit tests (split by module) and the binaries in `tools/ci-endpoint-tests.txt` under the feature-gated TTE / categorical / CTMM / NN build the base build compiles out |
+| **Tests + coverage (TTE/CTMM endpoints)** | `codecov/codecov-action` on the shard reports | Uploads the four shards' lcov files as one report (`survival` + `markov` + `nn` flags) |
 | **Clippy** | `tools/preflight.sh clippy` | Lint `ferx-core` under `ci,markov,nn` with `--all-targets` (without it a third of the repo — every `#[cfg(test)]` module and all of `tests/` — goes unlinted, #1023), then the workspace members |
 | **Format** | `tools/preflight.sh fmt` | Enforce consistent formatting (`--all`: the workspace members too). `.githooks/pre-commit` runs this same group |
 | **Public API baseline** | `tools/update-public-api.sh --check` | Diff `ferx-core`'s public surface against `api/ferx-core-public-api.txt`; any widening fails until the baseline is regenerated in the same PR (#1114) |
@@ -185,10 +186,13 @@ latter a strict subset of the endpoints job. Both were removed rather than left
 re-paying an ~11 min lib compile for coverage that Codecov already merges in
 from another flag.
 
-The endpoints job's `--test` list is not free-form: `tests/ci_workflow_endpoint_coverage.rs`
-asserts it equals exactly the set of `tests/*.rs` that mention a `survival` or
-`markov` cfg, so the file count above is deliberately left unstated — read the
-list off `ci.yml`, and add to it when you add an endpoint test.
+The endpoints job's binary list (`tools/ci-endpoint-tests.txt`) is not free-form:
+`tests/ci_workflow_endpoint_coverage.rs` asserts it equals exactly the set of
+`tests/*.rs` that mention a `survival`, `markov` or `nn` cfg, so the file count above
+is deliberately left unstated — add to the list when you add an endpoint test.
+`tests/ci_test_shards.rs` pins that the shards of both jobs together run every listed
+binary exactly once and every unit test at least once, and that each required
+`Tests + coverage (…)` check goes red when any of its shards does.
 
 Feature flags belong to the `ferx-core` package, so any command scoped to a
 member or to the whole workspace has to write them package-qualified

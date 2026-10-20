@@ -1276,7 +1276,9 @@ fn the_coverage_jobs_build_the_guarded_profile() {
         let body = job_body(&yml, job);
         let cov: Vec<String> = run_commands(&body)
             .into_iter()
-            .filter(|c| c.contains("cargo llvm-cov"))
+            // Both jobs are sharded (#2167): `ci-test-shard.py run` gets the build
+            // arguments after its `--` and passes them to every `cargo llvm-cov`.
+            .filter(|c| c.contains("cargo llvm-cov") || c.contains("ci-test-shard.py run "))
             .collect();
         assert!(
             !cov.is_empty(),

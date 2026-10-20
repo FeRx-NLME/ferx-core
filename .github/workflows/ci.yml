@@ -58,11 +58,25 @@ jobs:
   # and the set-equality guard below would have to grow an exemption rule to stay
   # satisfiable. One combined feature set keeps that guard a plain set equality.
   #
-  # NOTE: the job's display `name` is deliberately unchanged despite the widened
-  # scope — it is the string branch protection matches on.
+  # Sharded like `coverage-pr` (#2167): its `--lib` run alone was ~1200 s, the
+  # critical path of the whole workflow once `Tests + coverage (core)` was split.
+  # `tools/ci-test-shard.py run endpoints k N --lib-parts P` gives shard k of N its
+  # lib part (libtest module filters; part P runs `--skip` over the others' filters,
+  # so the parts together run every unit test) and its share of the binaries in
+  # `tools/ci-endpoint-tests.txt`; `endpoints-upload` sends the N lcov files to
+  # Codecov as ONE upload under all three flags.
+  #
+  # NOTE: that upload job carries the display name `Tests + coverage (TTE/CTMM
+  # endpoints)`, deliberately unchanged despite the widened scope — it is the string
+  # branch protection matches on.
   endpoints:
-    name: Tests + coverage (TTE/CTMM endpoints)
+    name: Tests + coverage (TTE/CTMM endpoints ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports, like `--no-fail-fast` within one.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # Override the global nightly: the crate has no nightly-only code, so this
     # job builds fine on stable. Stable's rustc version holds for ~6 weeks vs
     # nightly's daily bump, so the instrumented cache (keyed on rustc version)
@@ -95,21 +109,15 @@ jobs:
       # that surface and uploads it under all three flags, which Codecov merges
       # with `fast`/`slow` by summing hits.
       #
-      # Explicit `--test` list instead of `--tests`: the base suite's 122
-      # integration binaries are already run — and already measured — by
-      # `Tests + coverage (core)`, so re-running them here under a second feature
-      # set bought no coverage (Codecov merges flags by summing hits) and cost
-      # ~15 min of instrumented compile.
-      #
-      # The list is EXACTLY the set of `tests/*.rs` that mention a `survival`,
-      # `markov` or `nn` cfg, and `tests/ci_workflow_endpoint_coverage.rs` asserts
-      # that equality — so adding a test file that uses any of those features
-      # without adding it here fails CI instead of silently reading as uncovered.
-      # The Tier-3 files (`tte_convergence`, `categorical_convergence`,
-      # `nn_fit_smoke`, `nn_fit_convergence`) are in the list on purpose: without
-      # `slow-tests` their tests stay `#[ignore]`d, so they cost one cheap compile
-      # each and keep the invariant a plain set equality with no exemption rule to
-      # get wrong.
+      # An explicit binary list (`tools/ci-endpoint-tests.txt`) instead of `--tests`:
+      # the base suite's 122 integration binaries are already run — and already
+      # measured — by `Tests + coverage (core)`, so re-running them here under a
+      # second feature set bought no coverage (Codecov merges flags by summing hits)
+      # and cost ~15 min of instrumented compile. The list is EXACTLY the set of
+      # `tests/*.rs` that mention a `survival`, `markov` or `nn` cfg, and
+      # `tests/ci_workflow_endpoint_coverage.rs` asserts that equality — so adding a
+      # test file that uses any of those features without listing it fails CI
+      # instead of silently reading as uncovered.
       #
       # `--lib` stays because the unit tests for `src/survival`, `src/markov`,
       # `src/nn`, `src/estimation/nn_theta_gradient` and the feature-gated branches
@@ -124,44 +132,50 @@ jobs:
       - name: Generate TTE/CTMM endpoint coverage report
         env:
           FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
+        run: python3 tools/ci-test-shard.py run endpoints ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 4 --output lcov.info -- --no-default-features --features ci,markov,nn --profile ci-cov
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lcov-endpoints-${{ matrix.shard }}
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 3
+
+  # One Codecov upload for all `endpoints` shards, carrying the `Tests + coverage
+  # (TTE/CTMM endpoints)` name the `main-protection` ruleset REQUIRES — the same
+  # construction, for the same reason, as `coverage-pr-upload` below: a skipped job
+  # passes a required check, so `always()` (not `!cancelled()`, which lets a cancelled
+  # shard read green) plus an explicit result check. Still ONE upload per event, which
+  # `after_n_builds` in codecov.yml counts on.
+  endpoints-upload:
+    name: Tests + coverage (TTE/CTMM endpoints)
+    needs: endpoints
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Every test shard passed
+        if: needs.endpoints.result != 'success'
         run: |
-          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-cov \
-            --lib \
-            --test agq \
-            --test branch_only_param_hazard \
-            --test categorical_convergence \
-            --test categorical_smoke \
-            --test cmt_data_selection_scope \
-            --test cmt_endpoint_scope \
-            --test dose_compartment_routing \
-            --test kappa_correlation_auto_lbfgs_fits \
-            --test lagged_zero_order_break_times \
-            --test level_no_gaussian_nonmem_anchor \
-            --test markov_nonmem \
-            --test markov_smoke \
-            --test nn_dcm_smoke \
-            --test nn_fit_convergence \
-            --test nn_fit_smoke \
-            --test nn_regularization \
-            --test non_gaussian_score \
-            --test one_snapshot_dose_reads_survival \
-            --test pktte_prestart_entry \
-            --test pktte_tdep_nonmem_anchor \
-            --test profiled_levels_fits \
-            --test reset_clock_nonmem_anchor \
-            --test sampler_covariance_non_gaussian \
-            --test ss_chz_nonmem_anchor \
-            --test survival_time_dependent_pk \
-            --test tte_convergence \
-            --test tte_smoke \
-            --test vi_dcm_omega_recovery \
-            --test zero_omega_fit \
-            --lcov --output-path lcov.info
+          echo "::error::a \`Tests + coverage (TTE/CTMM endpoints k/N)\` shard ended '${{ needs.endpoints.result }}' — see that job's log"
+          exit 1
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: lcov-endpoints-*
+          path: lcov
+      - name: List the shard reports
+        id: lcov
+        run: |
+          files=$(find lcov -name lcov.info | sort | paste -sd, -)
+          echo "$files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
 
       - name: Upload to Codecov (survival + markov + nn flags)
         uses: codecov/codecov-action@v7
         with:
-          files: lcov.info
+          files: ${{ steps.lcov.outputs.files }}
           flags: survival,markov,nn
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -408,8 +422,11 @@ jobs:
   # Sharded by test binary (#2167): `--tests` ran the ~300 binaries serially, ~44
   # of a ~56 min job. Each matrix runner builds the same instrumented workspace
   # and runs its share — `tools/ci-test-shard.py` balances them from
-  # `tools/ci-test-weights.txt` and reads the target list from `cargo metadata`,
-  # so a new test file is always scheduled. `coverage-pr-upload` then sends the N
+  # `tools/ci-test-weights-core.txt` and reads the target list from `cargo
+  # metadata`, so a new test file is always scheduled. The lib unit tests, one
+  # ~900 s binary that was the floor of shard 1, are split by module over the first
+  # `--lib-parts` shards; the last part runs `--skip` over the other parts'
+  # filters, so the parts together run every unit test. `coverage-pr-upload` then sends the N
   # lcov files to Codecov as ONE `fast` upload, so Codecov sees exactly what the
   # unsharded job sent (no partial-upload patch status). The ~10 min compile is
   # paid per shard: rust-cache holds dependencies only, never ferx-core itself.
@@ -420,7 +437,7 @@ jobs:
       # Every shard reports, like `--no-fail-fast` within one.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     # PRs *and* pushes to `main`. The `push` half matters: the removed `Test` job
     # had no `if:` and so ran on main pushes, and this is now the only job that
     # executes the base suite — without `push` a merge commit would run no tests
@@ -494,12 +511,10 @@ jobs:
         # with the guards off, and arming it there fails them for doing the right thing.
         env:
           FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
-        # The planner runs as its own assignment so `bash -e` sees its exit status.
-        # Inlined as `cargo … $(planner)` a planner error was swallowed and cargo ran
-        # with no target arguments, i.e. its default targets — green, wrong suite.
-        run: |
-          targets=$(python3 tools/ci-test-shard.py args ${{ matrix.shard }} ${{ strategy.job-total }})
-          cargo llvm-cov --workspace --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov $targets --lcov --output-path lcov.info
+        # The planner IS the step's command, so its exit status is the step's. Inlined
+        # as `cargo … $(planner)` a planner error was swallowed and cargo ran with no
+        # target arguments, i.e. its default targets — green, wrong suite (#2168).
+        run: python3 tools/ci-test-shard.py run core ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 2 --output lcov.info -- --workspace --no-default-features --features ferx-core/ci --profile ci-cov
 
       - uses: actions/upload-artifact@v7
         with:
