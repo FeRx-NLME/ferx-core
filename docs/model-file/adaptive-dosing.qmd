@@ -120,6 +120,8 @@ no-op rather than a silent skip.
 ### Running it
 
 ```rust
+use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
+use ferx_core::io::fitrx::load_fit;
 use ferx_core::{parse_full_model_file, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
 use std::path::Path;
 
@@ -129,21 +131,98 @@ let spec = parsed
     .as_ref()
     .ok_or("model has no [adaptive_dosing] block")?;
 
+// The fitted estimates: θ, Ω, σ (and Ω_IOV) from a saved fit of this model.
+let fit = load_fit(Path::new("run1.fitrx"))?.fit;
+let params = fitted_params_from_result(&fit, &parsed.model)?;
+
 // The block owns the schedule and the monitor, so leave `decision_times` and
 // `monitors` empty here (setting either is a typed error); `seed` / `verify` /
-// `max_decisions` still apply.
-let opts = AdaptiveSimulateOptions { seed: Some(42), ..Default::default() };
+// `max_decisions` still apply. The struct is `#[non_exhaustive]`: start from
+// `default()` and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
 
-let result = simulate_adaptive_from_spec(
-    &parsed.model, &population, &parsed.model.default_params, 100, spec, &opts,
-)?;
+let result = simulate_adaptive_from_spec(&parsed.model, &population, &params, 100, spec, &opts)?;
 ```
+
+The simulation runs on whatever parameters you pass. `parsed.model.default_params`
+are the **initial estimates** from `[parameters]`, not a fit's; passing them
+simulates the model as written before estimation. To simulate a fitted model, pass
+`fitted_params_from_result(&fit, &model)`. It takes a `FitResult` from
+[`load_fit`](../file-formats/fitrx.qmd#loading-a-bundle) or straight from `fit()`.
+It returns an error when the fit does not match the model: an Ω, σ or Ω_IOV of
+the wrong shape (`E_PARAM_SHAPE`), or, on a `[mixture]` model with class
+overrides, a fit that does not carry its packed estimate.
+
+On a model with a `theta NAME[...]` level block, or a `[covariate_model]` centre
+taken from the data (`center = median`), first bind the model and the simulated
+population to the fit with `bind_from_fit` and the fit's `data_bindings`.
+Otherwise the fitted θ is read at the wrong level positions, or each covariate is
+centred on the simulated population's statistic instead of the fit's. See
+[Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
+
+Each subject's η is still drawn from the fitted Ω. To simulate known patients at
+their own fitted η instead, see
+[Supplied individual values](#supplied-individual-values).
 
 The block compiles to exactly the controller, monitor, and engine described
 below, so every guarantee in [Monitors](#monitors) and
 [Verification](#verification-on-by-default) applies unchanged, and `result` is
 the same bundled `trajectories` / `ledger` / `decisions`. The lower-level
 programmatic API follows.
+
+### Supplied individual values
+
+A run can simulate known patients at their own η rather than a draw from Ω, for
+example to try a dosing rule on the patients a model was fitted to. Build the η
+with `SuppliedEtas` and hand them to the run through `AdaptiveInputs`:
+
+```rust
+use ferx_core::{simulate_adaptive_from_spec_with_inputs, AdaptiveInputs, SuppliedEtas};
+
+// The fit's empirical Bayes estimates, one row per fitted subject.
+let etas = SuppliedEtas::from_fit(&fit, &parsed.model)?;
+// Or your own: IDs, η names in the model's order, one row per subject.
+// let etas = SuppliedEtas::from_table(ids, names, rows)?;
+
+let inputs = AdaptiveInputs::new(&params).with_etas(&etas);
+let result = simulate_adaptive_from_spec_with_inputs(
+    &parsed.model, &population, &inputs, 100, spec, &opts,
+)?;
+```
+
+`simulate_adaptive_with_inputs` is the same for a programmatic controller. The
+two entry points without `_with_inputs` are `AdaptiveInputs::new(params)` with no
+η supplied.
+
+How supplied η are used:
+
+| Rule | Behaviour |
+|---|---|
+| Matching | By subject ID. A supplied subject that is not in the simulated population is ignored. |
+| A simulated subject with no supplied η | Refused (`E_SUPPLIED_ETAS`), listing the IDs. With `.with_unmatched(UnmatchedSubjects::Draw)` its η is drawn from Ω instead, so known and virtual patients can share one run. |
+| A row | Every η of the model, named and ordered as the model's. There is no partial row: under a block Ω the missing η would need a draw conditional on the given ones. |
+| Replicates | A supplied η is the same in every replicate. κ and the controller's assay (a `Dv` monitor) are still drawn. Adaptive trajectories carry no residual error, so without IOV or an assay the replicates of a supplied subject are identical. |
+| The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
+| The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
+| A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run does not carry the class: it would simulate every subject under class 1. |
+
+A refusal names its cause: IDs and rows that differ in count, a row with the
+wrong number of values or a non-finite one, a repeated ID, η names that are not
+the model's, a fit of another model (`from_fit`), a `[mixture]` model, or an
+unmatched subject.
+
+A supplied η̂ is a point estimate, and the run treats it as exact. For a subject
+with few observations (high shrinkage) that understates how uncertain the
+patient's parameters are, so the spread across replicates is optimistic. Drawing
+η from its posterior instead is
+[#2154](https://github.com/FeRx-NLME/ferx-core/issues/2154); re-estimating η from
+the simulated assays inside the run (a MAP-Bayesian controller) is
+[#2155](https://github.com/FeRx-NLME/ferx-core/issues/2155).
+
+The test that ties this to the fit: with a holding controller and the fit's own
+doses, the run's IPRED at the supplied η̂ equals the fit's IPRED bit for bit, on
+a population ordered differently from the fit's.
 
 ## The controller
 
@@ -271,14 +350,14 @@ use ferx_core::{
     simulate_adaptive, AdaptiveSimulateOptions, ControllerCtx, DoseAction, MonitorSpec, ObserveMode,
 };
 
-let opts = AdaptiveSimulateOptions {
-    seed: Some(42),
-    decision_times: vec![0.0, 24.0, 48.0, 72.0, 96.0],
-    // Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
-    // to titrate on the latent prediction instead.
-    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)],
-    ..Default::default() // verify = true, max_decisions = 10_000
-};
+// `#[non_exhaustive]`: start from `default()` (verify = true,
+// max_decisions = 10_000) and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
+opts.decision_times = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+// Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
+// to titrate on the latent prediction instead.
+opts.monitors = vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)];
 
 // A fresh controller per subject: titrate a trough toward the [10, 20] window.
 let make_controller = || {

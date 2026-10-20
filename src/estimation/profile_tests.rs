@@ -18,6 +18,7 @@ use super::*;
 use crate::types::FitOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -253,6 +254,23 @@ fn a_model_linear_in_its_random_effects_profiles_in_one_newton_step() {
     );
 }
 
+/// The dense oracle's minimum on F2 cut to two studies, started from the template's
+/// levels at the initial parameters: the point D3, the bad start and N2's
+/// `sum_to_zero_within` case each compare against, from the identical model, data and
+/// start. Its FD Hessian is the bulk of each of those tests, so it is computed once
+/// (#2167) — the solves under test still run per test.
+fn f2_oracle() -> &'static (f64, Vec<f64>) {
+    static O: OnceLock<(f64, Vec<f64>)> = OnceLock::new();
+    O.get_or_init(|| {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let layout = layout_of(&p);
+        let o = options(&p);
+        let c = ctx(&p, &layout, &o);
+        let warm = ProfileWarm::from_template(&layout, &p.init_params);
+        oracle_min(&c, &p.init_params, &warm.beta)
+    })
+}
+
 // ── D3: the profile objective is the minimum over the levels ───────────────────────
 
 /// On F2 (nonlinear in η), the solve's objective and levels equal the dense oracle's,
@@ -267,13 +285,14 @@ fn the_profile_objective_is_the_minimum_over_the_levels() {
     let c = ctx(&p, &layout, &o);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let s = c.solve(&p.init_params, &warm).expect("the solve converges");
-    let (o_star, b_star) = oracle_min(&c, &p.init_params, &warm.beta);
+    let (o_star, b_star) = f2_oracle();
+    let o_star = *o_star;
     let frozen = frozen_fixed_point(&c, &p.init_params, &warm.beta);
     assert!(s.ofv.is_finite() && o_star.is_finite() && frozen.is_finite());
     let worst_beta = layout
         .coords
         .iter()
-        .zip(&b_star)
+        .zip(b_star)
         .zip(&s.se_scale)
         .map(|((&k, &b), &se)| ((s.params.theta[k] - b) / se).abs())
         .fold(0.0_f64, |a, v| {
@@ -531,13 +550,12 @@ fn a_bad_start_still_reaches_the_minimum() {
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    let good = ProfileWarm::from_template(&layout, &p.init_params);
     let bad = ProfileWarm {
         beta: vec![BAD_START; layout.coords.len()],
         etas: None,
     };
     let s = c.solve(&p.init_params, &bad).expect("the solve converges");
-    let (o_star, _) = oracle_min(&c, &p.init_params, &good.beta);
+    let o_star = f2_oracle().0;
     eprintln!(
         "backtracking: from {BAD_START} {:.10} vs oracle {:.10} in {} steps",
         s.ofv, o_star, s.iterations
@@ -587,7 +605,11 @@ fn every_contrast_profiles_to_the_minimum() {
         let s = c
             .solve(&p.init_params, &warm)
             .unwrap_or_else(|e| panic!("{contrast}: {e:?}"));
-        let (o_star, _) = oracle_min(&c, &p.init_params, &warm.beta);
+        let o_star = if block == within {
+            f2_oracle().0
+        } else {
+            oracle_min(&c, &p.init_params, &warm.beta).0
+        };
         eprintln!(
             "N2 {contrast}: {} coords, profile {:.10} oracle {:.10}",
             layout.coords.len(),
@@ -601,4 +623,38 @@ fn every_contrast_profiles_to_the_minimum() {
             o_star
         );
     }
+}
+
+// ── Replay: the covariance step's solve failure ────────────────────────────────────
+
+/// `replay_covariance` on a start the profile solve cannot use (a `NaN` level; measured,
+/// the solve fails as `ProfileFailure::Singular`) returns no matrix and the one warning
+/// `profile_solve_failed_msg` builds — and that warning, as emitted, classifies
+/// `covariance_failed` (#2158). The `classify_warning` table in `types_tests.rs` builds its
+/// profile rows from the same function; this test is what ties the function to the call
+/// site, so an inline message put back there (with the prefix reworded, say) fails here.
+#[test]
+fn a_failed_replay_solve_is_a_covariance_failure() {
+    let p = prep(F1, F1_DATA, None, |t| t);
+    let layout = layout_of(&p);
+    let mut params = p.init_params.clone();
+    params.theta[layout.coords[0]] = f64::NAN;
+    let o = FitOptions {
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let out = replay_covariance(&p.parsed.model, &p.population, &params, &[], &o)
+        .expect("F1 profiles a level block");
+    assert!(out.matrix.is_none());
+    assert_eq!(
+        out.warnings,
+        vec![profile_solve_failed_msg(&ProfileFailure::Singular)]
+    );
+    let w = crate::types::classify_warning(&out.warnings[0]);
+    assert_eq!(
+        (w.severity, w.category.as_str()),
+        (crate::types::WarningSeverity::Critical, "covariance_failed"),
+        "{}",
+        out.warnings[0]
+    );
 }

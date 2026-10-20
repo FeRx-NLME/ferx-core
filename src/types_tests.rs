@@ -529,6 +529,207 @@ fn classify_warning_covariance_is_critical() {
     assert_eq!(w.category.as_str(), "covariance_failed");
 }
 
+/// #2158: every covariance-step failure reason emitted in `src/` classifies as
+/// `covariance_failed`, whatever words the reason goes on to use. One row per emit site;
+/// `steals` names the phrase another arm of `classify_warning` matches in that row (empty
+/// when none does), and is asserted present, so a reworded reason that loses it shows up
+/// here rather than leaving the row testing nothing. The four profile rows are the text
+/// `replay_covariance` emits, built by its own `profile_solve_failed_msg`; the rest are
+/// copies of the `src/` literal named in the comment, with a sample interpolation.
+///
+/// The profile rows are the ones the old arm order misfiled: with the
+/// `starts_with("covariance step failed")` arm moved below the `did not converge` arm they
+/// classify `convergence`, and this test fails naming the row.
+#[test]
+fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let profile = |e: ProfileFailure| profile_solve_failed_msg(&e);
+    let rows: Vec<(String, &str)> = vec![
+        // profile.rs `replay_covariance`: `ctx.solve` failed, one row per `ProfileFailure`.
+        (
+            profile(ProfileFailure::NotConverged { criterion: 3.2e-3 }),
+            "did not converge",
+        ),
+        (profile(ProfileFailure::Singular), "did not converge"),
+        (profile(ProfileFailure::LineSearch), "did not converge"),
+        (profile(ProfileFailure::NonFinite), "did not converge"),
+        // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
+        (
+            "Covariance step failed: the profile objective is not finite at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the profile objective is not finite at some \
+             finite-difference point. SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the Hessian of the profile objective is not positive \
+             definite. SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: the Hessian of the objective in the profiled \
+             levels is not positive definite. SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: a profiled level has no curvature at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the objective is not finite at some \
+             finite-difference point of the profiled levels. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `S_SINGULAR_MSG`.
+        (
+            "Covariance step failed: the score cross-product matrix S is \
+             singular or rank-deficient (covariance_method = s); typically fewer subjects than \
+             free parameters, or collinear per-subject scores. Use covariance_method = r or \
+             rsr. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs quadrature score.
+        (
+            "Covariance step failed: could not obtain a converged, finite quadrature score \
+             for subject 7. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs non-finite S.
+        (
+            "Covariance step failed: non-finite score cross-product. SE estimates not \
+             available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `fd_hessian_step` guard.
+        (
+            "Covariance step failed: fd_hessian_step must be positive and finite, got -1. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs Omega at convergence, both descriptors, and the non-finite base OFV.
+        (
+            "Covariance step failed: Omega matrix is not positive definite at convergence \
+             (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
+             SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: Omega matrix is near-singular at convergence \
+             (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: base OFV is non-finite at convergence \
+             (likely numerical overflow or underflow in model evaluation). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs ill-conditioned diagonal.
+        (
+            "Covariance step failed: Hessian has ill-conditioned entries for the following \
+             parameter(s) — theta[CL] (non-finite diagonal). SE estimates not available."
+                .into(),
+            "ill-conditioned",
+        ),
+        // covariance.rs eigen-decomposition failure.
+        (
+            "Covariance step failed: could not compute eigenvalues of the \
+             FD Hessian (Hessian may contain NaN or Inf). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // The chain tag is stripped before the prefix test.
+        (
+            format!("[FOCEI] {}", profile(ProfileFailure::Singular)),
+            "did not converge",
+        ),
+    ];
+    for (msg, steals) in &rows {
+        assert!(
+            msg.to_lowercase().contains(steals),
+            "row no longer contains {steals:?}: {msg}"
+        );
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "covariance_failed"),
+            "{msg}"
+        );
+    }
+}
+
+/// #2158, both sides of the gate in one test: the profiled covariance step's
+/// "…the profile solve did not converge…" is `covariance_failed`, and every
+/// non-convergence warning emitted in `src/` stays `convergence`. The straddle is asserted
+/// too — the covariance row contains "did not converge", so it sits on the convergence
+/// arm's side of the old predicate — so this pair cannot quietly become two rows nothing
+/// separates. Forcing the prefix arm either way reddens it: moved below the convergence arm
+/// the first assert fails; widened from the prefix to `contains("converge")` the second
+/// does.
+#[test]
+fn classify_warning_covariance_prefix_does_not_claim_convergence() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let cov = profile_solve_failed_msg(&ProfileFailure::Singular);
+    assert!(cov.to_lowercase().contains("did not converge"), "{cov}");
+    assert_eq!(
+        classify_warning(&cov).category.as_str(),
+        "covariance_failed"
+    );
+
+    let convergence = [
+        // outer_optimizer.rs, the generic line.
+        "Outer optimization did not converge".to_string(),
+        "[FOCEI] Outer optimization did not converge".to_string(),
+        crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
+        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        // trust_region.rs, the four forms.
+        "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
+         estimates and any standard errors are reported at a non-stationary point; raise \
+         maxiter or improve the starting values."
+            .to_string(),
+        "Trust-region did not converge: no initial progress — every step was rejected from \
+         the first iteration, so the fit never left them. Check the starting values \
+         (`inits_from_nca` helps) and that the model is identifiable on this data."
+            .to_string(),
+        "Trust-region did not converge: line search stalled".to_string(),
+        "Trust-region did not converge: solver stopped without a termination reason".to_string(),
+        // api/fit.rs multi-start.
+        "No multi-start run converged (4 starts); returning best OFV from start 2".to_string(),
+        // dosing.rs SS equilibration.
+        "Steady-state (SS=1) equilibration did not converge within 200 cycles: the per-cycle \
+         carryover is not contracting (ratio ≈ 1.000), indicating no periodic steady state \
+         exists. The returned SS trough is unreliable."
+            .to_string(),
+    ];
+    for msg in &convergence {
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "convergence"),
+            "{msg}"
+        );
+    }
+}
+
 #[test]
 fn classify_warning_flat_parameter_is_warning() {
     let w = classify_warning(

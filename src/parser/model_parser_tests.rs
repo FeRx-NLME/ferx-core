@@ -27460,6 +27460,126 @@ fn the_level_index_producer_and_predicate_share_one_prefix() {
     assert!(!is_level_index_column("STUDY"));
 }
 
+// ── #2166: a `level` line's column is not an undeclared covariate ─────────────
+//
+// `level ARM by ARM in STUDY` names a grouping column, which iov.qmd says needs no
+// `[covariates]` entry. The nested-level columns are registered as data columns
+// only after the undeclared-covariate warning, so the warning lists a level column
+// only when a model expression reads it too — where its type matters as for any
+// covariate.
+
+/// The exact3 anchor model (two nested levels: STUDY in ID, ARM in STUDY).
+const NESTED_LEVELS_3: &str = include_str!("../../nonmem_anchor/nested_levels_3.ferx");
+/// `DOSE` (read by the model) and `NARM` (the arm kappa's weight) are covariates in
+/// their own right: declared, so the level columns are the only candidates left.
+const OTHER_COVS_DECLARED: &str = "\n[covariates]\n  DOSE continuous\n  NARM continuous\n";
+const NESTED_EMAX: &str = "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)";
+
+fn nested_levels_3_with(covariates: &str, emax: &str) -> String {
+    assert!(NESTED_LEVELS_3.contains(NESTED_EMAX), "fixture drifted");
+    format!("{}{covariates}", NESTED_LEVELS_3.replace(NESTED_EMAX, emax))
+}
+
+fn referenced(text: &str) -> Vec<String> {
+    parse_full_model(text)
+        .expect("model parses")
+        .model
+        .referenced_covariates
+}
+
+/// Both sides of the gate on one fixture: ARM read only by its `level` line is not
+/// listed; the same model with ARM also read in [individual_parameters] lists ARM
+/// (and only ARM — STUDY is still read only by its `level` line). Either way both
+/// level columns stay required data columns.
+#[test]
+fn a_nested_level_column_is_reported_only_when_an_expression_also_reads_it() {
+    let level_only = nested_levels_3_with(OTHER_COVS_DECLARED, NESTED_EMAX);
+    let also_read = nested_levels_3_with(
+        OTHER_COVS_DECLARED,
+        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)",
+    );
+    assert_eq!(undeclared_covariates(&level_only), None, "level line only");
+    assert_eq!(
+        undeclared_covariates(&also_read),
+        Some(vec!["ARM".to_string()]),
+        "ARM also read in an expression"
+    );
+    for text in [&level_only, &also_read] {
+        let covs = referenced(text);
+        for col in ["ARM", "STUDY", "NARM"] {
+            assert!(
+                covs.iter().any(|c| c == col),
+                "{col} not a data column: {covs:?}"
+            );
+        }
+    }
+}
+
+/// With no [covariates] block there is no warning to raise, whatever reads the
+/// level columns, and the read set is what it was before #2166.
+#[test]
+fn a_nested_level_model_without_a_covariates_block_is_unchanged() {
+    for emax in [
+        NESTED_EMAX,
+        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)",
+    ] {
+        let text = nested_levels_3_with("", emax);
+        assert_eq!(undeclared_covariates(&text), None, "{emax}");
+        assert_eq!(
+            referenced(&text),
+            ["ARM", "DOSE", "NARM", "STUDY"],
+            "{emax}"
+        );
+    }
+}
+
+/// One level is today's IOV spelled out (`iov_column`), never registered as a
+/// covariate: no warning from the `level` line alone, the warning when an
+/// expression reads the occasion column.
+#[test]
+fn a_single_level_column_is_reported_only_when_an_expression_also_reads_it() {
+    let model = |cl: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(2.0, 0.01, 20.0)\n  theta TVV(8.0, 0.1, 500.0)\n  \
+             omega ETA_CL ~ 0.04\n  level OCC by OCC in ID\n  kappa K_CL ~ 0.02 at OCC\n  \
+             sigma PROP_ERR ~ 0.02\n\n\
+             [individual_parameters]\n  {cl}\n  V = TVV\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n\n\
+             [covariates]\n  WT continuous\n"
+        )
+    };
+    let level_only = model("CL = TVCL * exp(ETA_CL + K_CL)");
+    let also_read = model("CL = TVCL * exp(ETA_CL + K_CL + 0.01 * OCC)");
+    assert_eq!(undeclared_covariates(&level_only), None, "level line only");
+    assert_eq!(
+        undeclared_covariates(&also_read),
+        Some(vec!["OCC".to_string()]),
+        "OCC also read in an expression"
+    );
+}
+
+/// [derived] still sees a nested-level column as a covariate although it is
+/// registered after the warning: naming a derived column after one is flagged.
+#[test]
+fn a_derived_column_named_after_a_nested_level_column_still_shadows_it() {
+    let text = format!(
+        "{}\n[derived]\n  ARM = IPRED\n",
+        nested_levels_3_with(OTHER_COVS_DECLARED, NESTED_EMAX)
+    );
+    let warnings = parse_full_model(&text)
+        .expect("model parses")
+        .model
+        .parse_warnings;
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`ARM` shadows a covariate")
+                && w.contains("W_DERIVED_COVARIATE_SHADOW")),
+        "{warnings:?}"
+    );
+}
+
 // ── #1636: a θ level block read in a Form-C readout ───────────────────────────
 //
 // A level block read in `[scaling] y` (or a compartment-free `y`) is lifted into a

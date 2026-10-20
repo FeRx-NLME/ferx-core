@@ -1003,6 +1003,16 @@ pub(crate) fn optimize_profiled(
     }
 }
 
+/// The warning `replay_covariance` returns when the profile solve at the estimates fails.
+/// A function rather than an inline `format!` so the `classify_warning` table test
+/// (`types_tests.rs`) classifies the text this site emits, not a copy of it (#2158).
+pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
+    format!(
+        "Covariance step failed: the profile solve did not converge at the \
+         estimates ({e:?}). SE estimates not available."
+    )
+}
+
 /// The covariance step of a profiled fit, re-run on its estimates (`run_covariance`), or
 /// `None` when `model` profiles nothing. The levels are re-profiled from the fit's own
 /// values first, so a reloaded fit gets the step the fit ran — not the unprofiled `R`
@@ -1052,10 +1062,7 @@ pub(crate) fn replay_covariance(
             return Some(CovStepOutcome {
                 matrix: None,
                 wall_time_secs: 0.0,
-                warnings: vec![format!(
-                    "Covariance step failed: the profile solve did not converge at the \
-                     estimates ({e:?}). SE estimates not available."
-                )],
+                warnings: vec![profile_solve_failed_msg(&e)],
                 sir_fallback_proposal: None,
                 method: None,
             })
