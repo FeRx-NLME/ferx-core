@@ -6,8 +6,8 @@
 //! `TVV_S = 7.7377`. On the unit NLopt scale every identity θ gets, BOBYQA's first
 //! probes put the volume negative and it stopped at −205.9732, SLSQP at −198.9491
 //! and L-BFGS at −269.4658 (macOS arm64, `badfdd5e`), each with `converged = true`.
-//! The flat-θ pre-flight now probes such a θ at half and one and a half times its
-//! value and, when the three objectives put its minimizer within ten times |θ₀|,
+//! The flat-θ pre-flight now probes such a θ at two nearby points inside its bounds
+//! and, when the three objectives put its minimizer within ten times |θ₀|,
 //! divides it by its initial magnitude (`identity_theta_scales`).
 //!
 //! The control is `two_cpt_oral_cov` with both covariate exponents started at 0.001:

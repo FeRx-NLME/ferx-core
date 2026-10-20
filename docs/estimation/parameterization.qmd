@@ -77,20 +77,25 @@ Whether that matters depends on what the θ is. A volume written in small units
 at `0.001` is usually an O(1) slope and needs unit-sized moves.
 
 The value alone cannot tell the two apart, so before the outer optimizer starts,
-each free identity-packed θ with $0 < |\theta_0| < 0.1$ is moved to
-$\theta_0(1 \mp h)$, $h = 0.5$ (less when the upper side would leave the bounds),
-and the objective re-evaluated at both points (two extra inner solves per such θ).
-The three objectives give a Newton step along that θ,
+each free identity-packed θ with $0 < |\theta_0| < 0.1$ is evaluated at two more
+points inside its declared bounds — $\theta_0 \mp \delta$ with
+$\delta = |\theta_0|/2$, or, when θ₀ sits near a bound, $\theta_0 + \delta$ and
+$\theta_0 + 2\delta$ on the side with room (two extra inner solves per such θ).
+The quadratic through the three equally spaced points $x_0 < x_1 < x_2$ has its
+minimizer at
 
 $$
-\frac{|\Delta\theta|}{|\theta_0|} = \frac{h\,|f_+ - f_-|}{2\,(f_+ - 2f_0 + f_-)},
+x^* = x_1 - \delta\,\frac{f_2 - f_0}{2\,(f_0 - 2f_1 + f_2)},
 $$
 
-and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when that step
-is at most 10: the minimizer is predicted within a few times the θ's own size.
-Otherwise — and when the second difference shows no positive curvature above
-$10^{-6}(1 + |f_0|)$ — it keeps the unit scale. A probe whose objective is `NaN` or
-diverged scales the θ, since a move of its own size already breaks the fit.
+and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when
+$|x^* - \theta_0| \le 10\,|\theta_0|$: the minimizer is predicted within a few
+times the θ's own size. Otherwise — and when the second difference shows no
+positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale.
+A probe the optimizer could not take — a `NaN` or diverged objective, or one the
+EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
+or a hard-rejected start) — scales the θ, since a move of its own size already
+leaves the feasible region. A start the guard rejects is not probed.
 
 The statistic is a ratio of objective differences, so the decision does not change
 when every likelihood contribution is repeated — more subjects, or more

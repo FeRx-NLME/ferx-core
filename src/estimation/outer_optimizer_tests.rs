@@ -9159,7 +9159,8 @@ fn quadratic_probe(
 ///
 /// `NEAR` and `NEG_NEAR` have their minimizers within a few `|θ₀|` (0.23 and 0.5), so
 /// only they are scaled, by `|θ₀|` (the `abs` pinned by `NEG_NEAR`). `FAR` (649 `|θ₀|`)
-/// and `NEG_FAR` (41) keep scale 1. Each candidate is probed at `θ₀·(1 ∓ ½)`;
+/// and `NEG_FAR` (41) keep scale 1. Each candidate is probed at `θ₀ ∓ ½|θ₀|`, lower
+/// point first;
 /// `TVCL`, `HELD`, `ZERO` and `AT_GATE` are never probed.
 #[test]
 fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size() {
@@ -9196,10 +9197,10 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
         (1, 1.5e-5),
         (2, 0.0005),
         (2, 0.0015),
-        (6, -1e-3),
         (6, -3e-3),
-        (7, -0.025),
+        (6, -1e-3),
         (7, -0.075),
+        (7, -0.025),
     ];
     assert_eq!(probed.len(), want.len(), "{probed:?}");
     for ((i, v), (wi, wv)) in probed.iter().zip(want) {
@@ -9243,13 +9244,12 @@ fn identity_theta_scales_edges() {
     assert_eq!(with(50.0 + tol / 2.0, 50.0 + tol / 2.0), vec![]);
     assert_eq!(with(50.0 + tol, 50.0 + tol), vec![(0, 1e-3)]);
 
-    // The box: room for h = 0.018 < 0.05 away from zero probes nothing; room for
-    // 0.2 probes with h = 0.18 (0.9 × room).
+    // No room on either side for a spacing of 0.05·|θ₀|: nothing is probed.
     let mut probed = Vec::new();
-    let tight = identity_theta_scales(
+    let boxed = identity_theta_scales(
         &[1e-3],
-        &[-1.0],
-        &[1.02e-3],
+        &[0.99e-3],
+        &[1.01e-3],
         |_| false,
         || 50.0,
         |_, v| {
@@ -9257,23 +9257,122 @@ fn identity_theta_scales_edges() {
             f64::NAN
         },
     );
-    assert_eq!((tight, probed.len()), (vec![], 0));
-    let roomy = identity_theta_scales(
-        &[-1e-3],
-        &[-1.2e-3],
-        &[1.0],
-        |_| false,
-        || 50.0,
-        |_, v| {
-            probed.push(v);
-            f64::NAN
-        },
+    assert_eq!((boxed, probed.len()), (vec![], 0));
+}
+
+/// `identity_probe_points` keeps every probe inside the declared box, equally spaced
+/// and through θ₀, over a grid of starts and boxes that includes a negative-only box,
+/// a positive-only one, θ₀ on either bound, and boxes tight on one side (#2159
+/// review: the first version probed `θ₀·(1 − h)`, above a negative upper bound).
+#[test]
+fn identity_probe_points_stay_in_the_box() {
+    let cases = [
+        // (θ₀, lower, upper, central?)
+        (1e-3, -1.0, 1.0, true),
+        (-1e-3, -1.0, 1.0, true),
+        (-1e-3, -5.0, -0.0009, false), // negative-only, near its upper bound
+        (1e-3, -5.0, 1e-3, false),     // at its upper (outward) bound
+        (-1e-3, -1e-3, 5.0, false),    // at its lower (outward) bound
+        (1e-3, 0.99e-3, 5.0, false),   // tight below
+        (1e-5, -5e-4, 5e-4, true),
+        (0.05, -0.06, 0.051, false),
+    ];
+    for (t, lo, hi, central) in cases {
+        let p = identity_probe_points(t, lo, hi).unwrap_or_else(|| panic!("{t} in [{lo}, {hi}]"));
+        assert!(
+            p.iter().all(|&x| (lo..=hi).contains(&x)),
+            "{p:?} outside [{lo}, {hi}]"
+        );
+        assert!(p.contains(&t), "{p:?} misses θ₀ = {t}");
+        let (d0, d1) = (p[1] - p[0], p[2] - p[1]);
+        assert!(
+            d0 > 0.0 && (d0 - d1).abs() <= 1e-12 * d0,
+            "{p:?} not equally spaced"
+        );
+        assert!(d0 >= IDENTITY_PROBE_MIN_FRACTION * t.abs(), "{p:?}");
+        assert_eq!(p[1] == t, central, "{p:?} for {t} in [{lo}, {hi}]");
+    }
+    assert_eq!(identity_probe_points(1e-3, 0.99e-3, 1.01e-3), None);
+}
+
+/// The two boxes the review named, end to end through the decision: a negative-only
+/// box (`theta X(-0.001, -5, -0.0009)`) whose minimizer is at -1.2e-3, and a θ
+/// started on its outward bound (`(0.001, -5, 0.001)`) whose minimizer is inward at
+/// 8e-4. Both are scaled, and no probe leaves the box.
+#[test]
+fn identity_theta_scales_handles_one_sided_boxes() {
+    for (t, lo, hi, m) in [(-1e-3, -5.0, -0.0009, -1.2e-3), (1e-3, -5.0, 1e-3, 8e-4)] {
+        let f = quadratic_probe(&[t], &[m], 1e9, 1.0, 50.0);
+        let mut probed = Vec::new();
+        let got = identity_theta_scales(
+            &[t],
+            &[lo],
+            &[hi],
+            |_| false,
+            || 50.0,
+            |i, v| {
+                probed.push(v);
+                f(i, v)
+            },
+        );
+        assert_eq!(got, vec![(0, t.abs())], "θ₀ = {t} in [{lo}, {hi}]");
+        assert_eq!(probed.len(), 2);
+        assert!(probed.iter().all(|&v| (lo..=hi).contains(&v)), "{probed:?}");
+    }
+}
+
+/// `identity_probe_objective` is the objective the optimizer sees: the value, or the
+/// `1e20` wall when the EBE guard rejects the point — more than
+/// `max_unconverged_frac` of the subjects unconverged, or any hard-rejected start —
+/// or the value is not finite.
+#[test]
+fn identity_probe_objective_applies_the_ebe_guard() {
+    let stats = |n_unconverged: usize, n_start_rejected: usize| InnerLoopStats {
+        n_unconverged,
+        n_fallback: 0,
+        n_start_rejected,
+    };
+    let at = |raw: f64, s: InnerLoopStats| identity_probe_objective(raw, &s, 20, 0.1);
+    assert_eq!(
+        at(-100.0, stats(2, 0)),
+        -100.0,
+        "2 of 20 is the bar, not past it"
     );
-    assert_eq!(roomy, vec![(0, 1e-3)]);
-    assert!(
-        (probed[0] + 0.82e-3).abs() < 1e-15 && (probed[1] + 1.18e-3).abs() < 1e-15,
-        "{probed:?}"
-    );
+    assert_eq!(at(-100.0, stats(3, 0)), 1e20, "3 of 20 crosses 0.1");
+    assert_eq!(at(-100.0, stats(0, 1)), 1e20, "a hard-rejected start");
+    assert_eq!(at(f64::NAN, stats(0, 0)), 1e20);
+}
+
+/// A probe point only the EBE guard rejects decides the scale as the optimizer would
+/// see it. The objective is a slope whose minimizer is 649 `|θ₀|` away — unit scale
+/// on its likelihood alone — but at the upper probe 3 of 20 subjects fail to
+/// converge (`max_unconverged_frac = 0.1`): the optimizer could not take that move,
+/// so the θ is scaled. With 2 of 20 unconverged (at the bar) it keeps scale 1.
+#[test]
+fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
+    let f = quadratic_probe(&[1e-3], &[0.65], 13.8, 1.0, -1000.0);
+    for (unconverged_at_upper, want) in [(2usize, vec![]), (3, vec![(0, 1e-3)])] {
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-5.0],
+            &[5.0],
+            |_| false,
+            || -1000.0,
+            |i, v| {
+                let n_unconverged = if v > 1e-3 { unconverged_at_upper } else { 0 };
+                let s = InnerLoopStats {
+                    n_unconverged,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                };
+                identity_probe_objective(f(i, v), &s, 20, 0.1)
+            },
+        );
+        assert_eq!(
+            got, want,
+            "{unconverged_at_upper} unconverged at the upper probe"
+        );
+    }
 }
 
 /// The base objective is evaluated only when there is a candidate, and a start whose
@@ -9652,4 +9751,42 @@ fn a_mixture_probe_sees_the_penalized_objective() {
         mixture_identity_theta_scales(&model, &pop, &model.default_params, &opts),
         vec![(2, 1e-5), (4, 0.001)]
     );
+}
+
+/// The pre-flight hands the inner loop's statistics to the guard (#2159 review). On
+/// the warfarin fixture with the inner solve starved to one iteration, some subjects
+/// stop unconverged at the start: with `max_unconverged_frac = 0` the optimizer
+/// would refuse the start itself, so nothing is probed and `TVV_S` keeps scale 1;
+/// with the guard off (`1.0`) the same starved solves still scale it.
+#[test]
+fn preflight_reads_the_ebe_guard_on_real_solves() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let scales = |max_unconverged_frac: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            inner_maxiter: 1,
+            max_unconverged_frac,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+        )
+        .identity_scales
+    };
+    assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
+    assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }
