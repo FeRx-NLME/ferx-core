@@ -341,8 +341,10 @@ struct FlatThetaPreflight {
     frozen: Option<(ModelParameters, Vec<String>)>,
     /// The EBEs of the pre-flight's cold inner solve, at the packed and clamped
     /// initial estimate — the point an optimizer's first evaluation solves at
-    /// again when nothing is frozen (#2076). `None` when the pre-flight solved
-    /// nothing (every theta already fixed).
+    /// again when nothing is frozen (#2076). Each is a converged mode, so the
+    /// first evaluation takes them as warm starts whatever their values
+    /// ([`InnerSolvePolicy::init_is_mode`]). `None` when the pre-flight solved
+    /// nothing (every theta already fixed) or any subject did not converge.
     etas: Option<Vec<DVector<f64>>>,
 }
 
@@ -391,7 +393,9 @@ fn freeze_flat_thetas(
     // optimizer iteration would run, so the pre-flight costs roughly one iteration.
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let cold_etas = vec![DVector::zeros(n_eta); n_subj];
-    let (ehs, hms, _stats, kappas) = run_inner_loop_warm_seeded(
+    // `run_inner_loop_warm_seeded`'s solve, with each subject's convergence read back: the
+    // EBEs are handed to the first evaluation only if every subject reached a mode.
+    let (ehs, hms, _stats, kappas, converged) = run_inner_loop_warm_map(
         model,
         population,
         &params,
@@ -401,8 +405,12 @@ fn freeze_flat_thetas(
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
-        InnerHessianSeed::for_options(options),
-        options,
+        InnerSolvePolicy {
+            seed: InnerHessianSeed::for_options(options),
+            ..InnerSolvePolicy::for_stage(options, model)
+        },
+        None,
+        |_, ebe| ebe.converged && !ebe.hard_reject,
     );
     let frozen = 'freeze: {
         let mut grad_eval_idx = 0usize;
@@ -532,9 +540,14 @@ fn freeze_flat_thetas(
         }
         Some((frozen, warnings))
     };
+    // A subject that stopped short of a mode (`inner_maxiter` exhausted, or rejected) is
+    // not a warm start the first evaluation may skip the cold solve for: it would carry a
+    // partial descent into the warm path, skip the second Hessian metric and the
+    // multi-start, and change the first objective. Then all are dropped, so the first
+    // evaluation repeats the cold solve exactly as before #2076.
     FlatThetaPreflight {
         frozen,
-        etas: Some(ehs),
+        etas: converged.iter().all(|&c| c).then_some(ehs),
     }
 }
 
@@ -1027,7 +1040,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, mu_k, None, schedules, cancel,
+        model, population, params, options, prev_etas, mu_k, None, schedules, false, cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1073,6 +1086,9 @@ fn run_inner_loop_and_nll_prepared(
     mu_k: Option<&[f64]>,
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
+    // `prev_etas` are converged modes at `params` ([`InnerSolvePolicy::init_is_mode`]):
+    // only the first evaluation seeded from the flat-theta pre-flight passes `true` (#2076).
+    init_is_mode: bool,
     // Polled per subject (#574). Only a caller whose guard keeps a hard-rejected pass
     // out of every accepted state passes `Some`: the NLopt objective and the global
     // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
@@ -1092,7 +1108,10 @@ fn run_inner_loop_and_nll_prepared(
         // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
         // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
         // would be a full provider pass per subject thrown away.
-        let policy = agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some());
+        let policy = InnerSolvePolicy {
+            init_is_mode,
+            ..agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some())
+        };
         let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
                 (ebe.terminal_hessian.clone(), ebe.nll)
@@ -1192,6 +1211,7 @@ fn run_inner_loop_and_nll_prepared(
     }
     let policy = InnerSolvePolicy {
         accelerate_exact_outer: true,
+        init_is_mode,
         ..InnerSolvePolicy::for_stage(options, model)
     };
     let finish_subject =
@@ -1250,6 +1270,10 @@ fn run_inner_loop_and_nll_prepared(
 /// State passed through NLopt's user-data mechanism
 struct NloptState {
     cached_etas: Vec<DVector<f64>>,
+    /// `cached_etas` are the flat-theta pre-flight's converged modes at this leg's start,
+    /// still unconsumed: the next inner pass takes them as warm starts whatever their
+    /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
+    cached_etas_are_modes: bool,
     cached_h_mats: Vec<DMatrix<f64>>,
     /// Mixture per-class EBE warm-start cache `[class][subject]` (#977 Phase 3).
     /// Empty for non-mixture models.
@@ -1581,6 +1605,7 @@ fn new_nlopt_state(
 ) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
+        cached_etas_are_modes: false,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: f64::INFINITY,
@@ -3964,6 +3989,7 @@ fn optimize_nlopt_once(
         .filter(|e| restart.is_none() && optimizer_start_s == x0_start_s && e.len() == n_subj)
     {
         state.cached_etas = etas.to_vec();
+        state.cached_etas_are_modes = true;
     }
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
@@ -4176,6 +4202,7 @@ fn optimize_nlopt_once(
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
                     Some(&schedule_cache),
+                    std::mem::take(&mut state.cached_etas_are_modes),
                     options.cancel.as_ref(),
                 );
             contribs = nll_i.iter().map(|v| 2.0 * v).collect();
@@ -5587,6 +5614,11 @@ fn optimize_bfgs(
         Some(etas) if etas.len() == n_subj => etas.to_vec(),
         _ => vec![DVector::zeros(n_eta); n_subj],
     };
+    // Whether `cached_etas` still holds those converged modes, unconsumed: the first
+    // `fdfg` call takes them as warm starts whatever their values
+    // ([`InnerSolvePolicy::init_is_mode`]) and clears the flag.
+    let cached_etas_are_modes =
+        std::cell::Cell::new(first_eval_etas.is_some_and(|e| e.len() == n_subj));
 
     // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
     // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but
@@ -5666,6 +5698,7 @@ fn optimize_bfgs(
             Some(&mu_k),
             None,
             None,
+            cached_etas_are_modes.take(),
             None, // the built-in BFGS loop polls between iterations (#574)
         );
         let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();

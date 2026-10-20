@@ -832,6 +832,7 @@ fn test_invert_psd_with_floor_empty() {
 fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
+        cached_etas_are_modes: false,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
@@ -8963,73 +8964,159 @@ fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
     );
 }
 
-/// #2076, both sides of the "same point" gate end to end, per optimizer family. Each fit
-/// is compared with the same optimizer run directly from a cold cache on the parameters
-/// `optimize_population` hands it. With nothing frozen the pre-flight's multi-starts
-/// stand in for the first evaluation's, so the fit costs exactly the cold run; with a
-/// theta frozen the pre-flight's EBEs are dropped, and the fit costs the pre-flight on
-/// top of the cold run.
+/// One #2076 measurement: the flat-theta pre-flight on its own, `optimize_population`,
+/// and the same optimizer run directly from a cold cache on the parameters
+/// `optimize_population` hands it, each with the multi-starts it ran.
+struct PreflightReuse {
+    preflight: FlatThetaPreflight,
+    pre_n: usize,
+    fit_n: usize,
+    cold_n: usize,
+}
+
+fn measure_preflight_reuse(
+    model: &CompiledModel,
+    pop: &Population,
+    optimizer: Optimizer,
+    inner_maxiter: usize,
+) -> PreflightReuse {
+    use crate::types::{EstimationMethod, FitOptions};
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        optimizer,
+        outer_maxiter: 1,
+        inner_maxiter,
+        inner_restarts: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let declines = || OuterFdDeclineLog::new(pop.subjects.len());
+    let (preflight, pre_n) = count_multistarts(|| {
+        freeze_flat_thetas(model, pop, &model.default_params, &opts, &declines())
+    });
+    let (fit, fit_n) =
+        count_multistarts(|| optimize_population(model, pop, &model.default_params, &opts));
+    assert!(fit.ofv.is_finite(), "{optimizer:?}: non-finite OFV");
+    let init = preflight
+        .frozen
+        .as_ref()
+        .map_or(&model.default_params, |(p, _)| p);
+    let cold_n = count_multistarts(|| match optimizer {
+        Optimizer::Bobyqa => optimize_nlopt(model, pop, init, &opts, &declines(), None),
+        Optimizer::Bfgs => optimize_bfgs(model, pop, init, &opts, &declines(), None),
+        _ => crate::estimation::trust_region::optimize_trust_region(model, pop, init, &opts),
+    })
+    .1;
+    assert!(
+        pre_n >= pop.subjects.len(),
+        "{optimizer:?}: the pre-flight must reach the multi-start gate ({pre_n})"
+    );
+    PreflightReuse {
+        preflight,
+        pre_n,
+        fit_n,
+        cold_n,
+    }
+}
+
+const REUSE_OPTIMIZERS: [Optimizer; 3] =
+    [Optimizer::Bobyqa, Optimizer::Bfgs, Optimizer::TrustRegion];
+
+/// #2076, both sides of the "same point" gate end to end, per optimizer family. With
+/// nothing frozen the pre-flight's multi-starts stand in for the first evaluation's, so
+/// the fit costs exactly the cold run; with a theta frozen the pre-flight's EBEs are
+/// dropped, and the fit costs the pre-flight on top of the cold run.
 #[test]
 fn optimize_population_reuses_preflight_etas_only_when_nothing_is_frozen() {
-    use crate::types::{EstimationMethod, FitOptions, Optimizer};
     let pop = make_population(4);
-    for optimizer in [Optimizer::Bobyqa, Optimizer::Bfgs, Optimizer::TrustRegion] {
-        let opts = FitOptions {
-            method: EstimationMethod::Foce,
-            optimizer,
-            outer_maxiter: 1,
-            inner_restarts: 1,
-            run_covariance_step: false,
-            verbose: false,
-            ..FitOptions::default()
-        };
-        let declines = || OuterFdDeclineLog::new(pop.subjects.len());
-        let cold_run = |model: &CompiledModel, init: &ModelParameters| {
-            count_multistarts(|| match optimizer {
-                Optimizer::Bobyqa => optimize_nlopt(model, &pop, init, &opts, &declines(), None),
-                Optimizer::Bfgs => optimize_bfgs(model, &pop, init, &opts, &declines(), None),
-                _ => {
-                    crate::estimation::trust_region::optimize_trust_region(model, &pop, init, &opts)
-                }
-            })
-            .1
-        };
-        let preflight_and_fit = |model: &CompiledModel| {
-            let (pre, pre_n) = count_multistarts(|| {
-                freeze_flat_thetas(model, &pop, &model.default_params, &opts, &declines())
-            });
-            let (fit, fit_n) = count_multistarts(|| {
-                optimize_population(model, &pop, &model.default_params, &opts)
-            });
-            assert!(fit.ofv.is_finite(), "{optimizer:?}: non-finite OFV");
-            let init = pre.frozen.map(|(p, _)| p);
-            let cold_n = cold_run(model, init.as_ref().unwrap_or(&model.default_params));
-            (init.is_some(), pre_n, fit_n, cold_n)
-        };
-
-        let (frozen, pre_n, fit_n, cold_n) = preflight_and_fit(&make_model());
-        assert!(!frozen, "every theta of make_model is live");
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 200);
         assert!(
-            pre_n >= pop.subjects.len(),
-            "{optimizer:?}: gate not reached"
+            m.preflight.frozen.is_none(),
+            "every theta of make_model is live"
         );
+        assert!(m.preflight.etas.is_some(), "{optimizer:?}: seed withheld");
         assert_eq!(
-            fit_n, cold_n,
+            m.fit_n, m.cold_n,
             "{optimizer:?}: the first evaluation re-ran the multi-start \
-             (pre-flight {pre_n}, fit {fit_n}, cold run {cold_n})"
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n, m.fit_n, m.cold_n
         );
 
-        let (frozen, pre_n, fit_n, cold_n) = preflight_and_fit(&make_flat_tvv_model());
-        assert!(frozen, "the flat TVV must be frozen");
+        let m = measure_preflight_reuse(&make_flat_tvv_model(), &pop, optimizer, 200);
+        assert!(m.preflight.frozen.is_some(), "the flat TVV must be frozen");
+        assert_eq!(
+            m.fit_n,
+            m.pre_n + m.cold_n,
+            "{optimizer:?}: a frozen fit must solve its first evaluation cold \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n,
+            m.fit_n,
+            m.cold_n
+        );
+    }
+}
+
+/// #2076 review: a subject with no observations has the prior's mode, η̂ = 0 exactly,
+/// which the value test alone reads as the cold placeholder. The pre-flight certifies it
+/// as a mode (`InnerSolvePolicy::init_is_mode`), so the first evaluation does not re-scan
+/// it either, and the fit still costs exactly the cold run.
+#[test]
+fn an_exactly_zero_preflight_mode_still_skips_the_first_eval_multistart() {
+    let mut pop = make_population(4);
+    let empty = &mut pop.subjects[3];
+    empty.id = "EMPTY".into();
+    empty.obs_times.clear();
+    empty.observations.clear();
+    empty.obs_cmts.clear();
+    empty.cens.clear();
+    empty.occasions.clear();
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 200);
+        let etas = m.preflight.etas.as_ref().expect("every subject converged");
         assert!(
-            pre_n >= pop.subjects.len(),
-            "{optimizer:?}: gate not reached"
+            etas[3].iter().all(|&v| v == 0.0),
+            "fixture: the empty subject's mode must be exactly zero, got {:?}",
+            etas[3]
+        );
+        assert!(
+            etas[0].iter().any(|&v| v != 0.0),
+            "fixture: an informed subject's mode must be nonzero"
         );
         assert_eq!(
-            fit_n,
-            pre_n + cold_n,
-            "{optimizer:?}: a frozen fit must solve its first evaluation cold \
-             (pre-flight {pre_n}, fit {fit_n}, cold run {cold_n})"
+            m.fit_n, m.cold_n,
+            "{optimizer:?}: the zero-mode subject was re-scanned on the first evaluation \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n, m.fit_n, m.cold_n
+        );
+    }
+}
+
+/// #2076 review: a pre-flight subject that exhausts `inner_maxiter` stopped on a partial
+/// descent, not a mode. Handing it over would make the first evaluation warm — no second
+/// Hessian metric, no multi-start, a fresh iteration budget — and change the first
+/// objective. So the pre-flight withholds every EBE, and the fit pays the pre-flight on
+/// top of the cold run, as before #2076. The converged side of the same gate is
+/// `optimize_population_reuses_preflight_etas_only_when_nothing_is_frozen`.
+#[test]
+fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
+    let pop = make_population(4);
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 1);
+        assert!(m.preflight.frozen.is_none());
+        assert!(
+            m.preflight.etas.is_none(),
+            "{optimizer:?}: an unconverged pre-flight must not seed the first evaluation"
+        );
+        assert_eq!(
+            m.fit_n,
+            m.pre_n + m.cold_n,
+            "{optimizer:?}: the first evaluation must solve cold \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n,
+            m.fit_n,
+            m.cold_n
         );
     }
 }

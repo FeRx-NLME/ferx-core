@@ -1570,6 +1570,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                init_is_mode: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1631,6 +1632,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                init_is_mode: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1656,6 +1658,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                init_is_mode: false,
             },
             true,
         )
@@ -1728,6 +1731,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
         screen: 0,
+        init_is_mode: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -4139,9 +4143,12 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
 /// must multi-start exactly as `None` does, and a genuine warm start must not.
 #[test]
 fn an_all_zero_start_runs_the_guarded_multistart_like_none() {
-    assert!(!is_warm_start(None));
-    assert!(!is_warm_start(Some(&[0.0, 0.0, 0.0])));
-    assert!(is_warm_start(Some(&[0.0, 0.5, 0.0])));
+    assert!(!is_warm_start(None, false));
+    assert!(!is_warm_start(Some(&[0.0, 0.0, 0.0]), false));
+    assert!(is_warm_start(Some(&[0.0, 0.5, 0.0]), false));
+    // #2076: a certified mode is warm even when it is exactly zero, and `None` stays cold.
+    assert!(is_warm_start(Some(&[0.0, 0.0, 0.0]), true));
+    assert!(!is_warm_start(None, true));
 
     let (model, subject) = flipflop_fixture(true);
     let params = &model.default_params;
