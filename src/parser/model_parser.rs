@@ -16764,6 +16764,17 @@ fn parse_parameters(
             let (default_lower, default_upper) = if profiled {
                 check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
                 (f64::NEG_INFINITY, f64::INFINITY)
+            } else if matches!(
+                &block,
+                Some(ThetaBlockSpec::Columns { contrast, .. })
+                    if *contrast != LevelContrast::Unconstrained
+            ) {
+                // #2174: a constrained block's free θ are contrast coefficients, which
+                // have no sign, and its init must be 0 (`validate_constrained_level_init`).
+                // The positive box below would log-pack a θ that starts at 0, so its
+                // default is sign-free. `auto` never resolves to `none`, so whether a
+                // block is constrained is fixed here, by its declaration.
+                (-1e9, 1e9)
             } else {
                 (1e-9, 1e9)
             };

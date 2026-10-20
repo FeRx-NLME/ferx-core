@@ -611,6 +611,124 @@ fn constrained_blocks_reject_unrepresentable_broadcast_initializers() {
     );
 }
 
+/// `no_eta_model()` with the `PLACEBO` declaration replaced by `decl`, bound on
+/// `population(2, 2)`: four levels, so a constrained block has three free θ at 1..4.
+fn bind_placebo(decl: &str) -> Result<CompiledModel, String> {
+    let text = no_eta_model().replace("PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", decl);
+    bind(&text, &mut population(2, 2))
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// #2174: a constrained level block with no bounds written takes the sign-free box
+/// `(-1e9, 1e9)`, since its free θ are contrast coefficients and its init must be 0.
+/// Before, the positive default `(1e-9, 1e9)` refused `(0.0)` and `(0.0) FIX` ("bounds
+/// must include 0 (got 0.000000001..1000000000)"), and would have log-packed a θ that
+/// starts at 0. Bounds, packed start and FIX flags are bit-identical to the written
+/// `(0.0, -1e9, 1e9)`. The controls, in the same test: `contrast = none` and a count
+/// block keep the positive box and log packing, and a written lower bound keeps its
+/// refusal byte for byte.
+///
+/// Mutations — revert the arm: `(0.0)` is refused; apply it to every block: the
+/// `contrast = none` lower becomes `-1e9`; key it on FIX instead of the contrast:
+/// `(0.0)` is refused.
+#[test]
+fn a_constrained_block_without_written_bounds_takes_a_sign_free_box() {
+    use crate::estimation::parameterization::{pack_with_bounds, theta_packs_log};
+    let default = bind_placebo("PLACEBO[STUDY, TIME](0.0)").expect("(0.0) binds");
+    let written = bind_placebo("PLACEBO[STUDY, TIME](0.0, -1000000000.0, 1000000000.0)").unwrap();
+    let p = &default.default_params;
+    assert_eq!(&p.theta_lower[1..4], &[-1e9; 3]);
+    assert_eq!(&p.theta_upper[1..4], &[1e9; 3]);
+    assert!(p.theta_lower[1..4].iter().all(|l| !theta_packs_log(*l)));
+    let w = &written.default_params;
+    assert_eq!(bits(&p.theta_lower), bits(&w.theta_lower));
+    assert_eq!(bits(&p.theta_upper), bits(&w.theta_upper));
+    assert_eq!(bits(&p.theta), bits(&w.theta));
+    let (sd, sw) = (pack_with_bounds(p), pack_with_bounds(w));
+    assert_eq!(bits(&sd.packed), bits(&sw.packed), "packed start");
+    assert_eq!(
+        bits(&sd.bounds.lower),
+        bits(&sw.bounds.lower),
+        "packed lower"
+    );
+    assert_eq!(
+        bits(&sd.bounds.upper),
+        bits(&sw.bounds.upper),
+        "packed upper"
+    );
+
+    let fixed = bind_placebo("PLACEBO[STUDY, TIME](0.0) FIX").expect("(0.0) FIX binds");
+    let f = &fixed.default_params;
+    assert_eq!(&f.theta[1..4], &[0.0; 3]);
+    assert!(f.theta_fixed[1..4].iter().all(|x| *x));
+
+    let none = bind_placebo("PLACEBO[STUDY, TIME, contrast = none](0.5)").unwrap();
+    let n = &none.default_params;
+    assert_eq!(&n.theta_lower[1..5], &[1e-9; 4], "contrast = none");
+    assert!(theta_packs_log(n.theta_lower[1]));
+    let count = no_eta_model()
+        .replace("PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", "PLACEBO[3](0.5)")
+        .replace("CL = TVCL + PLACEBO", "CL = TVCL + PLACEBO[STUDY]");
+    let count = parse_full_model(&count).expect("a count block");
+    let c = &count.model.default_params;
+    assert_eq!(&c.theta_lower[1..4], &[1e-9; 3], "count block");
+    assert!(theta_packs_log(c.theta_lower[1]));
+
+    // A written bound is checked as written, with the default upper as before.
+    let err = bind_placebo("PLACEBO[STUDY, TIME](0.0, 0.5)").unwrap_err();
+    assert!(
+        err.ends_with(
+            "theta PLACEBO[...]: constrained level bounds must include 0 (got 0.5..1000000000)"
+        ),
+        "{err}"
+    );
+}
+
+/// #2174 T5b: the default box changes no number. One objective evaluation at the
+/// same θ, with a live contrast, is bit-identical between `(0.0)` and the written
+/// `(0.0, -1e9, 1e9)` — the spelling measured equal to `(0.0, -50.0, 50.0)`, which
+/// `nonmem_anchor/profile_mbma*` anchors, in every printed digit.
+///
+/// Mutation — revert the arm: `(0.0)` is refused.
+#[test]
+fn a_sign_free_default_box_scores_as_the_written_one() {
+    let mut pop = population(2, 2);
+    let ofv = |decl: &str, pop: &Population| -> f64 {
+        let m = bind_placebo(decl).expect("binds");
+        let p = &m.default_params;
+        let mut theta = p.theta.clone();
+        theta[1..4].copy_from_slice(&[0.3, -0.2, 0.1]);
+        let eta = vec![0.0; p.omega.matrix.nrows()];
+        let total: f64 = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                crate::stats::likelihood::individual_nll(
+                    &m,
+                    s,
+                    &theta,
+                    &eta,
+                    &p.omega,
+                    &p.sigma.values,
+                )
+            })
+            .sum();
+        assert!(total.is_finite(), "{decl}: {total}");
+        total
+    };
+    // Bind the population once for its index column; both models index it alike.
+    bind(&no_eta_model(), &mut pop).unwrap();
+    let a = ofv("PLACEBO[STUDY, TIME](0.0)", &pop);
+    let b = ofv(
+        "PLACEBO[STUDY, TIME](0.0, -1000000000.0, 1000000000.0)",
+        &pop,
+    );
+    assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+}
+
 #[test]
 fn unconstrained_blocks_keep_broadcast_init_and_fix_semantics() {
     let text = no_eta_model()
