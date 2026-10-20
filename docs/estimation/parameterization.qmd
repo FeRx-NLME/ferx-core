@@ -77,24 +77,40 @@ Whether that matters depends on what the θ is. A volume written in small units
 at `0.001` is usually an O(1) slope and needs unit-sized moves.
 
 The value alone cannot tell the two apart, so before the outer optimizer starts,
-each free identity-packed θ with $0 < |\theta_0| < 0.1$ is moved to half its
-initial value and the objective re-evaluated (one extra inner solve per such θ).
-If that moves the OFV by more than 0.03 units **per subject**, the θ is divided by
-$|\theta_0|$ in the optimizer's scale vector; otherwise it keeps the unit scale.
-The bar is per subject so that a larger dataset, whose OFV differences grow with
-it, does not change the decision for a θ whose minimizer it does not change. This
-applies to `bobyqa`, `slsqp`, `nlopt_lbfgs` and `mma` under the default
-`parameter_scaling = auto` and under `abs`, `[mixture]` models included (probed on
-the mixture objective); `none` and `rescale2` keep their own vectors.
+each free identity-packed θ with $0 < |\theta_0| < 0.1$ is moved to
+$\theta_0(1 \mp h)$, $h = 0.5$ (less when the upper side would leave the bounds),
+and the objective re-evaluated at both points (two extra inner solves per such θ).
+The three objectives give a Newton step along that θ,
+
+$$
+\frac{|\Delta\theta|}{|\theta_0|} = \frac{h\,|f_+ - f_-|}{2\,(f_+ - 2f_0 + f_-)},
+$$
+
+and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when that step
+is at most 10: the minimizer is predicted within a few times the θ's own size.
+Otherwise — and when the second difference shows no positive curvature above
+$10^{-6}(1 + |f_0|)$ — it keeps the unit scale. A probe whose objective is `NaN` or
+diverged scales the θ, since a move of its own size already breaks the fit.
+
+The statistic is a ratio of objective differences, so the decision does not change
+when every likelihood contribution is repeated — more subjects, or more
+observations per subject — which multiplies the objective without moving its
+minimizer. The objective probed is the one the optimizer minimises: parameter
+priors and the covariate-NN regularizer are included, so a θ whose small moves a
+tight prior makes matter is scaled. This applies to `bobyqa`, `slsqp`,
+`nlopt_lbfgs` and `mma` under the default `parameter_scaling = auto` and under
+`abs`, `[mixture]` models included (probed on the mixture objective); `none` and
+`rescale2` keep their own vectors.
 
 Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5`
 (macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS
 at −269.47, each reporting convergence; all three now reach the minimum,
-−286.0042, the same as the plain model from `TVV = 10`. Halving `TVV_S` moves the
-OFV by 31.4 over 10 subjects (3.1 per subject). On `two_cpt_oral_cov` with both
-covariate exponents started at `0.001`, halving either moves it by under 0.01 over
-30 subjects (≤ 3e-4 per subject), so neither is rescaled and all three optimizers
-still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with
+−286.0042, the same as the plain model from `TVV = 10`. The probes predict
+`TVV_S`'s minimizer 0.12·|θ₀| away (second difference 124). On `two_cpt_oral_cov`
+with both covariate exponents started at `0.001` the second differences are
+6.3e-6 and 1.1e-5, under the 1.0e-3 floor at OFV −1033 (read anyway, the
+predicted steps are 708 and 261·|θ₀|), so neither is rescaled and all three
+optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with
 the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
 301.58, its plain model's minimum.
 

@@ -599,13 +599,30 @@ fn freeze_flat_thetas(
             init_params.theta_fixed.get(i).copied().unwrap_or(false)
                 || frozen.as_ref().is_some_and(|(fp, _)| fp.theta_fixed[i])
         };
+        // The probe sees the objective the optimizer minimises, penalties included;
+        // the flat-θ probe above keeps the clean −2LL, since a θ only a prior reaches
+        // is still unmapped.
+        let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+        let priors = build_prior_set(model, init_params);
+        let with_theta = |i: usize, value: f64| {
+            let mut p = params.clone();
+            p.theta[i] = value;
+            p
+        };
         identity_theta_scales(
             &params.theta,
             &init_params.theta_lower,
+            &init_params.theta_upper,
             held,
-            n_subj,
-            base_ofv,
-            reconverged_ofv,
+            || penalized_identity_probe(base_ofv(), &params, &nn_reg, &priors),
+            |i, value| {
+                penalized_identity_probe(
+                    reconverged_ofv(i, value),
+                    &with_theta(i, value),
+                    &nn_reg,
+                    &priors,
+                )
+            },
         )
     } else {
         Vec::new()
@@ -621,25 +638,26 @@ fn freeze_flat_thetas(
 /// is a candidate for [`identity_theta_scales`]'s probe (#2159). Above it the NLopt
 /// scale of 1 is within a factor of ten of the θ's own size.
 const NEAR_ZERO_IDENTITY_THETA: f64 = 0.1;
-/// The probe moves a candidate θ to this fraction of its initial value: half its own
-/// size, toward zero. It stays inside the declared bounds by construction, since a
-/// negative lower bound puts zero in the box and the start is in it.
+/// The probes move a candidate θ to `θ₀·(1 ∓ h)` with `h` this, or less when
+/// `θ₀·(1 + h)` would leave the box. `θ₀·(1 − h)` lies between zero and θ₀, inside
+/// the box by construction (a negative lower bound puts zero in it).
 const IDENTITY_PROBE_FRACTION: f64 = 0.5;
-/// A probe that moves the objective by more than this many OFV units **per subject**
-/// marks the θ as one whose natural scale is its own magnitude.
+/// Below this `h` the box leaves no room for a probe away from zero, and the θ keeps
+/// the unit scale.
+const IDENTITY_PROBE_MIN_FRACTION: f64 = 0.05;
+/// A candidate is scaled when the minimizer the probes predict lies within this many
+/// multiples of `|θ₀|` of the start.
 ///
-/// Per subject, not in total: the question is a coordinate's natural scale, which a
-/// population replicated `k` times keeps (same minimizer) while its OFV and every
-/// probe's ΔOFV grow `k`-fold. An absolute threshold would flip a slope to the
-/// harmful magnitude scale on a large enough dataset (#2159 review).
-///
-/// Measured at the issue's two kinds of near-zero θ (macOS arm64): halving
-/// warfarin's `TVV_S` (`V = TVV_S / 1e-6`, θ₀ = 1e-5) moves the OFV by 31.4 over
-/// 10 subjects, 3.1 per subject; halving either covariate exponent of
-/// `two_cpt_oral_cov` started at 0.001 (0.65 and ≈ 0.3 at the minimum) moves it by
-/// 0.0056–0.0090 over 30 subjects, 1.9e-4–3.0e-4 per subject. The threshold sits
-/// two orders of magnitude from each.
-const IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT: f64 = 0.03;
+/// Measured at the issue's two kinds of near-zero θ (macOS arm64, FOCEI objective
+/// at the start, `h = ½`): warfarin's `TVV_S` (`V = TVV_S / 1e-6`, θ₀ = 1e-5) has a
+/// second difference of 124 and predicts its minimizer 0.12·|θ₀| away (it is
+/// 0.23·|θ₀| away, at 7.74e-6); in the two-class `mixture_iv` model the same volume
+/// predicts 0.02·|θ₀|. `two_cpt_oral_cov`'s covariate exponents started at 0.001
+/// have second differences of 6.3e-6 and 1.1e-5, under the 1.0e-3 noise floor at
+/// OFV −1033, so they keep scale 1 before the bar is consulted; read anyway, their
+/// predicted steps are 708 and 261 `|θ₀|` (the minimizers are 0.65 and ≈ 0.3). The
+/// bar sits about two orders of magnitude from each side.
+const IDENTITY_MAX_PREDICTED_STEP: f64 = 10.0;
 
 /// The near-zero identity-packed θ the NLopt outer loop divides by their initial
 /// magnitude, as `(θ index, |θ₀|)` (#2159).
@@ -654,27 +672,44 @@ const IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT: f64 = 0.03;
 /// Dividing every such θ by |θ₀| is wrong the other way: a covariate exponent started
 /// at 0.001 is usually an O(1) slope, and scaling it by 0.001 cost BOBYQA 14 OFV
 /// units on `two_cpt_oral_cov`. The value alone cannot tell the two apart; the
-/// objective can. So each candidate — free, identity-packed, `0 < |θ₀| <`
-/// [`NEAR_ZERO_IDENTITY_THETA`] — is moved to `IDENTITY_PROBE_FRACTION · θ₀` with the
-/// EBEs re-solved (`probe_ofv`), and scaled only when that relative move changes the
-/// objective by more than [`IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT`] per subject
-/// (`n_subjects`): the θ's size is then the size of the moves that matter. A probe
-/// whose objective is not a number counts as sensitive. One extra inner solve per
-/// candidate.
+/// objective can. Each candidate — free, identity-packed, `0 < |θ₀| <`
+/// [`NEAR_ZERO_IDENTITY_THETA`] — is moved to `θ₀·(1 − h)` and `θ₀·(1 + h)`
+/// ([`IDENTITY_PROBE_FRACTION`]) with the EBEs re-solved (`probe_ofv`), and the
+/// three objectives give a Newton step to the minimizer along that θ:
+///
+/// ```text
+/// |step| / |θ₀| = h · |f₊ − f₋| / (2 · (f₊ − 2f₀ + f₋))
+/// ```
+///
+/// It is scaled when that step is at most [`IDENTITY_MAX_PREDICTED_STEP`]·|θ₀|: the
+/// moves that matter are then of the θ's own size. The statistic is a **ratio of
+/// objective differences**, so it does not change when every likelihood contribution
+/// is repeated `k` times — more subjects, or more observations per subject — which
+/// multiplies the objective by `k` and leaves its minimizer where it was (#2159
+/// review: a cut on the size of a ΔOFV, total or per subject, does change).
+///
+/// The θ keeps the unit scale when the second difference shows no positive curvature
+/// above `1e-6·(1 + |f₀|)` — the flat-θ probe's "objective unchanged" tolerance,
+/// relative so that it scales with the objective too — since a step predicted from
+/// noise says nothing. A probe whose objective is not valid ([`ofv_is_valid`]: `NaN`
+/// or diverged) means a move of the θ's own size breaks the fit, and the θ is scaled.
+/// Two extra objective evaluations per candidate.
 ///
 /// `held(i)` is true for a θ the optimizer does not move (fixed, or frozen by the
 /// flat-θ pre-flight). `base_ofv` is the objective at the start, asked for only when
-/// there is a candidate; a start whose own objective is not valid
-/// ([`ofv_is_valid`]) says nothing about scale, and nothing is probed.
+/// there is a candidate; a start whose own objective is not valid says nothing about
+/// scale, and nothing is probed. Both objectives must be the one the optimizer
+/// minimises, penalties included (`penalized_identity_probe`).
 fn identity_theta_scales(
     theta: &[f64],
     theta_lower: &[f64],
+    theta_upper: &[f64],
     held: impl Fn(usize) -> bool,
-    n_subjects: usize,
     base_ofv: impl FnOnce() -> f64,
     mut probe_ofv: impl FnMut(usize, f64) -> f64,
 ) -> Vec<(usize, f64)> {
-    let candidates: Vec<usize> = (0..theta.len().min(theta_lower.len()))
+    let n = theta.len().min(theta_lower.len()).min(theta_upper.len());
+    let candidates: Vec<usize> = (0..n)
         .filter(|&i| {
             let magnitude = theta[i].abs();
             !held(i)
@@ -683,23 +718,56 @@ fn identity_theta_scales(
                 && magnitude < NEAR_ZERO_IDENTITY_THETA
         })
         .collect();
-    if candidates.is_empty() || n_subjects == 0 {
+    if candidates.is_empty() {
         return Vec::new();
     }
-    let min_delta = IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT * n_subjects as f64;
     let base = base_ofv();
     if !ofv_is_valid(base) {
         return Vec::new();
     }
-    candidates
-        .into_iter()
-        .filter(|&i| {
-            let delta = (probe_ofv(i, IDENTITY_PROBE_FRACTION * theta[i]) - base).abs();
-            // `!(… <= …)`, so a `NaN` probe counts as sensitive.
-            !(delta <= min_delta)
-        })
-        .map(|i| (i, theta[i].abs()))
-        .collect()
+    let mut scales = Vec::new();
+    for i in candidates {
+        let t = theta[i];
+        let magnitude = t.abs();
+        // Room away from zero, as a fraction of |θ₀|.
+        let room = if t > 0.0 {
+            theta_upper[i] - t
+        } else {
+            t - theta_lower[i]
+        } / magnitude;
+        let h = IDENTITY_PROBE_FRACTION.min(0.9 * room);
+        if !(h >= IDENTITY_PROBE_MIN_FRACTION) {
+            continue;
+        }
+        let f_minus = probe_ofv(i, t * (1.0 - h));
+        let f_plus = probe_ofv(i, t * (1.0 + h));
+        if !ofv_is_valid(f_minus) || !ofv_is_valid(f_plus) {
+            scales.push((i, magnitude));
+            continue;
+        }
+        let curvature = f_plus - 2.0 * base + f_minus;
+        if !(curvature > 1e-6 * (1.0 + base.abs())) {
+            continue;
+        }
+        let predicted_step = h * (f_plus - f_minus).abs() / (2.0 * curvature);
+        if predicted_step <= IDENTITY_MAX_PREDICTED_STEP {
+            scales.push((i, magnitude));
+        }
+    }
+    scales
+}
+
+/// The objective the outer optimizer minimises at `params`, from its clean −2LL:
+/// plus the covariate-NN regularizer and the parameter-prior penalty, exactly as the
+/// NLopt objective closure adds them. The #2159 probe must see a θ whose small moves
+/// a tight prior or the NN penalty makes matter (#2159 review).
+fn penalized_identity_probe(
+    clean_ofv: f64,
+    params: &ModelParameters,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> f64 {
+    clean_ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(&pack_params(params))
 }
 
 /// [`identity_theta_scales`] on the K-fold mixture objective (#2159).
@@ -707,9 +775,9 @@ fn identity_theta_scales(
 /// The flat-θ pre-flight is skipped for a mixture (its gradient is the
 /// single-population one), but the scale question is the same and the mixture runs
 /// on the same NLopt optimizers, so the probe evaluates the objective the optimizer
-/// minimises, [`crate::estimation::mixture::mixture_ofv`], at the packed and clamped
-/// start and at each probe. One mixture evaluation for the base and one per
-/// candidate, and none when there is no candidate.
+/// minimises, [`crate::estimation::mixture::mixture_ofv`] plus the penalties, at the
+/// packed and clamped start and at each probe. One mixture evaluation for the base
+/// and two per candidate, and none when there is no candidate.
 fn mixture_identity_theta_scales(
     model: &CompiledModel,
     population: &Population,
@@ -723,14 +791,18 @@ fn mixture_identity_theta_scales(
     } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let params = unpack_params(&x, init_params);
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
     let ofv_at = |p: &ModelParameters| {
-        crate::estimation::mixture::mixture_ofv(model, population, p, options, None).ofv
+        let clean =
+            crate::estimation::mixture::mixture_ofv(model, population, p, options, None).ofv;
+        penalized_identity_probe(clean, p, &nn_reg, &priors)
     };
     identity_theta_scales(
         &params.theta,
         &init_params.theta_lower,
+        &init_params.theta_upper,
         |i| init_params.theta_fixed.get(i).copied().unwrap_or(false),
-        population.subjects.len(),
         || ofv_at(&params),
         |i, value| {
             let mut p = params.clone();

@@ -9135,101 +9135,145 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
 
 // ── identity_theta_scales: near-zero identity-packed θ (#2159) ───────────
 
-/// The candidate filter and the decision, against a fake objective whose response to
-/// each probe is set per θ. θ in order: `[TVCL 0.2 (log-packed), SMALL_SENS 1e-5,
-/// SMALL_FLAT 0.001, HELD 1e-5, ZERO 0, AT_GATE 0.1, NEG_SENS -2e-3, NEG_FLAT -0.05]`.
+/// A fake objective, quadratic in each θ separately: `f = base + w·k·(v − m)²` minus
+/// its value at the start, with `k` a replication factor. Its Newton step from the
+/// three probes is exact, so the decision is pinned without solver noise.
+fn quadratic_probe(
+    theta: &[f64],
+    minimizers: &[f64],
+    weight: f64,
+    k: f64,
+    base: f64,
+) -> impl Fn(usize, f64) -> f64 {
+    let theta = theta.to_vec();
+    let minimizers = minimizers.to_vec();
+    move |i, v| {
+        let m = minimizers[i];
+        base + k * weight * ((v - m).powi(2) - (theta[i] - m).powi(2))
+    }
+}
+
+/// The candidate filter and the decision. θ in order: `[TVCL 0.2 (log-packed),
+/// NEAR 1e-5 (minimizer 7.74e-6), FAR 0.001 (minimizer 0.65), HELD 1e-5, ZERO 0,
+/// AT_GATE 0.1, NEG_NEAR -2e-3 (minimizer -3e-3), NEG_FAR -0.05 (minimizer 2.0)]`.
 ///
-/// Ten subjects, so the bar is `10 × 0.03 = 0.3` OFV units. Only `SMALL_SENS` and
-/// `NEG_SENS` move the objective past it when halved, so only they are
-/// scaled, by `|θ₀|` (the `abs` is pinned by `NEG_SENS`). Each candidate is probed once,
-/// at half its own value; `TVCL` (log-packed), `HELD`, `ZERO` and `AT_GATE` (`|θ₀|` not
-/// below 0.1) are never probed.
+/// `NEAR` and `NEG_NEAR` have their minimizers within a few `|θ₀|` (0.23 and 0.5), so
+/// only they are scaled, by `|θ₀|` (the `abs` pinned by `NEG_NEAR`). `FAR` (649 `|θ₀|`)
+/// and `NEG_FAR` (41) keep scale 1. Each candidate is probed at `θ₀·(1 ∓ ½)`;
+/// `TVCL`, `HELD`, `ZERO` and `AT_GATE` are never probed.
 #[test]
-fn identity_theta_scales_scales_only_a_near_zero_theta_the_objective_sees() {
+fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size() {
     let theta = [0.2, 1e-5, 0.001, 1e-5, 0.0, 0.1, -2e-3, -0.05];
-    let lower = [0.001, -5e-4, -5.0, -5e-4, -1.0, -1.0, -1.0, -1.0];
-    let base = -180.0;
-    // ΔOFV each θ's probe returns; `f64::NAN` for one that must never be probed.
-    let response = [
+    let minimizers = [
         f64::NAN,
-        92.6,
-        0.009,
+        7.74e-6,
+        0.65,
         f64::NAN,
         f64::NAN,
         f64::NAN,
-        5.0,
-        0.2,
+        -3e-3,
+        2.0,
     ];
+    let lower = [0.001, -5e-4, -5.0, -5e-4, -1.0, -1.0, -1.0, -5.0];
+    let upper = [10.0, 5e-4, 5.0, 5e-4, 1.0, 1.0, 1.0, 5.0];
+    // Weight 1e12: halving `NEAR` costs 25 OFV units, well above the noise floor.
+    let f = quadratic_probe(&theta, &minimizers, 1e12, 1.0, -180.0);
     let mut probed = Vec::new();
     let got = identity_theta_scales(
         &theta,
         &lower,
+        &upper,
         |i| i == 3,
-        10,
-        || base,
-        |i, value| {
-            probed.push((i, value));
-            base + response[i]
+        || -180.0,
+        |i, v| {
+            probed.push((i, v));
+            f(i, v)
         },
     );
     assert_eq!(got, vec![(1, 1e-5), (6, 2e-3)]);
-    assert_eq!(
-        probed,
-        vec![(1, 0.5e-5), (2, 0.0005), (6, -1e-3), (7, -0.025)],
-        "each candidate is probed once, at half its value"
-    );
-}
-
-/// The decision's edges: a probe that lowers the objective counts like one that raises
-/// it, a change of exactly the per-subject bar times the subject count does not scale
-/// (strict `>`),
-/// and a `NaN` probe — a relative move the objective cannot even score — does.
-#[test]
-fn identity_theta_scales_reads_the_size_of_the_change_and_scales_on_nan() {
-    const N: usize = 7;
-    let bar = IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT * N as f64;
-    let decide =
-        |delta: f64| identity_theta_scales(&[1e-3], &[-1.0], |_| false, N, || 0.0, |_, _| delta);
-    assert_eq!(decide(-3.0), vec![(0, 1e-3)], "a fall is sensitive too");
-    assert_eq!(decide(bar), vec![]);
-    assert_eq!(decide(bar * 1.01), vec![(0, 1e-3)]);
-    assert_eq!(decide(f64::NAN), vec![(0, 1e-3)], "NaN is sensitive");
-    assert_eq!(
-        identity_theta_scales(&[1e-3], &[-1.0], |_| false, 0, || 10.0, |_, _| f64::NAN),
-        vec![],
-        "no subjects, no decision"
-    );
-}
-
-/// Replicating a population `k` times multiplies its OFV and every probe's ΔOFV by `k`
-/// without moving the minimizer, so it must not change which θ are scaled (#2159
-/// review). The slope's response is `two_cpt_oral_cov`'s measured THETA_WT ΔOFV
-/// (0.0090 over 30 subjects) and the volume's warfarin's `TVV_S` (31.4 over 10). At
-/// `k = 200` the slope's total, 1.8, is past the 1.0 an absolute bar used; per
-/// subject it is still 3.0e-4.
-#[test]
-fn identity_theta_scales_is_invariant_to_replicating_the_population() {
-    for k in [1usize, 200, 10_000] {
-        let kf = k as f64;
-        let slope = identity_theta_scales(
-            &[0.001],
-            &[-5.0],
-            |_| false,
-            30 * k,
-            || -1033.3637 * kf,
-            |_, _| (-1033.3637 + 0.0090) * kf,
+    let want = [
+        (1, 0.5e-5),
+        (1, 1.5e-5),
+        (2, 0.0005),
+        (2, 0.0015),
+        (6, -1e-3),
+        (6, -3e-3),
+        (7, -0.025),
+        (7, -0.075),
+    ];
+    assert_eq!(probed.len(), want.len(), "{probed:?}");
+    for ((i, v), (wi, wv)) in probed.iter().zip(want) {
+        assert_eq!(*i, wi);
+        assert!(
+            (v - wv).abs() <= 1e-12 * wv.abs(),
+            "θ{i}: probed {v:e}, want {wv:e}"
         );
-        assert_eq!(slope, vec![], "slope, k = {k}");
-        let volume = identity_theta_scales(
-            &[1e-5],
-            &[-5e-4],
-            |_| false,
-            10 * k,
-            || -182.6667 * kf,
-            |_, _| (-182.6667 + 31.4) * kf,
-        );
-        assert_eq!(volume, vec![(0, 1e-5)], "volume, k = {k}");
     }
+}
+
+/// The decision's edges, on one candidate θ₀ = 1e-3 in `(-1, 1)`.
+#[test]
+fn identity_theta_scales_edges() {
+    let decide = |minimizer: f64| {
+        let f = quadratic_probe(&[1e-3], &[minimizer], 1e6, 1.0, 50.0);
+        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, f)
+    };
+    // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
+    assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
+    assert_eq!(decide(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
+    assert_eq!(decide(1e-3 + 10.1e-3), vec![], "past the bar");
+
+    let with = |f_minus: f64, f_plus: f64| {
+        identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_, v| if v < 1e-3 { f_minus } else { f_plus },
+        )
+    };
+    assert_eq!(with(f64::NAN, 50.0), vec![(0, 1e-3)], "a NaN probe scales");
+    assert_eq!(with(50.0, 2e20), vec![(0, 1e-3)], "a diverged probe scales");
+    assert_eq!(with(49.0, 49.0), vec![], "concave: no step to trust");
+    assert_eq!(with(49.0, 51.0), vec![], "linear: no curvature");
+    // A curvature at the tolerance, 1e-6·(1 + 50), is noise; twice it is not — and
+    // with no gradient the predicted step is zero.
+    let tol = 1e-6 * 51.0;
+    assert_eq!(with(50.0 + tol / 2.0, 50.0 + tol / 2.0), vec![]);
+    assert_eq!(with(50.0 + tol, 50.0 + tol), vec![(0, 1e-3)]);
+
+    // The box: room for h = 0.018 < 0.05 away from zero probes nothing; room for
+    // 0.2 probes with h = 0.18 (0.9 × room).
+    let mut probed = Vec::new();
+    let tight = identity_theta_scales(
+        &[1e-3],
+        &[-1.0],
+        &[1.02e-3],
+        |_| false,
+        || 50.0,
+        |_, v| {
+            probed.push(v);
+            f64::NAN
+        },
+    );
+    assert_eq!((tight, probed.len()), (vec![], 0));
+    let roomy = identity_theta_scales(
+        &[-1e-3],
+        &[-1.2e-3],
+        &[1.0],
+        |_| false,
+        || 50.0,
+        |_, v| {
+            probed.push(v);
+            f64::NAN
+        },
+    );
+    assert_eq!(roomy, vec![(0, 1e-3)]);
+    assert!(
+        (probed[0] + 0.82e-3).abs() < 1e-15 && (probed[1] + 1.18e-3).abs() < 1e-15,
+        "{probed:?}"
+    );
 }
 
 /// The base objective is evaluated only when there is a candidate, and a start whose
@@ -9240,15 +9284,40 @@ fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start
     let none = identity_theta_scales(
         &[0.2, 0.5],
         &[0.001, -1.0],
+        &[1.0, 1.0],
         |_| false,
-        1,
         || panic!("no candidate, so no base"),
         no_probe,
     );
     assert_eq!(none, vec![]);
     for base in [2e20, f64::NAN] {
-        let got = identity_theta_scales(&[1e-3], &[-1.0], |_| false, 1, || base, no_probe);
+        let got = identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || base, no_probe);
         assert_eq!(got, vec![], "base {base}");
+    }
+}
+
+/// Repeating every likelihood contribution `k` times — whole subjects, or each
+/// observation within a subject — multiplies the objective, and every difference
+/// of it, by `k` and leaves the minimizer where it was, so it must not change which
+/// θ are scaled (#2159 review, both rounds). The two θ are the issue's: a volume
+/// whose minimizer is 0.23 `|θ₀|` away and a slope whose is 649 `|θ₀|` away, with
+/// curvatures giving warfarin- and `two_cpt_oral_cov`-sized ΔOFVs at `k = 1`. A cut
+/// on a ΔOFV's size, total or per subject, flips the slope at some `k`: at `k = 1e4`
+/// its halving ΔOFV is ~90.
+#[test]
+fn identity_theta_scales_is_invariant_to_replicating_likelihood_contributions() {
+    let theta = [1e-5, 0.001];
+    let minimizers = [7.74e-6, 0.65];
+    let lower = [-5e-4, -5.0];
+    let upper = [5e-4, 5.0];
+    for k in [1.0, 200.0, 1e4, 1e7] {
+        let base = -1033.3637 * k;
+        // Weights: halving the volume and the slope costs ~30 and ~0.009 OFV units at k = 1.
+        let volume = quadratic_probe(&theta, &minimizers, 3e11, k, base);
+        let slope = quadratic_probe(&theta, &minimizers, 13.8, k, base);
+        let f = |i: usize, v: f64| if i == 0 { volume(i, v) } else { slope(i, v) };
+        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, f);
+        assert_eq!(got, vec![(0, 1e-5)], "k = {k}");
     }
 }
 
@@ -9401,9 +9470,9 @@ fn bobyqa_reads_the_identity_theta_scale() {
 /// times (6000 subjects): the same minimizer, so the slopes must still keep scale 1
 /// (#2159 review). Under the absolute 1.0-unit bar the first version used, the
 /// replicated ΔOFVs (≈ 1.8 and 1.1) both crossed it and the slopes got the 0.001
-/// scale the issue measured costing BOBYQA 14 OFV units. ~20 s in a debug build
-/// (6000 cold inner solves, three times), so nightly; the per-PR twin is
-/// `identity_theta_scales_is_invariant_to_replicating_the_population`.
+/// scale the issue measured costing BOBYQA 14 OFV units. ~40 s in a debug build
+/// (6000 cold inner solves per evaluation), so nightly; the per-PR twin is
+/// `identity_theta_scales_is_invariant_to_replicating_likelihood_contributions`.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -9508,5 +9577,79 @@ fn a_mixture_is_probed_on_its_own_objective() {
         mixture_identity_theta_scales(&model, &pop, p, &opts),
         vec![(2, 1e-5)],
         "TVV_S is scaled, BWT and the zero MIXL are not"
+    );
+}
+
+/// The probe sees the objective the optimizer minimises, priors included (#2159
+/// review). `two_cpt_oral_cov`'s `THETA_WT` started at 0.001 keeps scale 1 on the
+/// clean −2LL (`preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope`);
+/// with a `prior(0.0012, rse = 10%)` (sd 1.2e-4) its penalized minimizer sits 0.2
+/// `|θ₀|` away and the halving probes' second difference is ≈ 35, so it is scaled.
+/// `THETA_CRCL`, with no prior, is not.
+#[test]
+fn preflight_probes_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("example reads");
+    let src = src
+        .replace(
+            "theta THETA_WT(0.6, 0.01, 5.0)",
+            "theta THETA_WT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+        )
+        .replace(
+            "theta THETA_CRCL(0.3, 0.01, 5.0)",
+            "theta THETA_CRCL(0.001, -5.0, 5.0)",
+        );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(got.identity_scales, vec![(5, 0.001)], "THETA_WT is scaled");
+}
+
+/// The mixture path adds the penalties too: the mixture fixture's `BWT`, unscaled on
+/// the clean objective (`a_mixture_is_probed_on_its_own_objective`), is scaled under
+/// the same tight prior.
+#[test]
+fn a_mixture_probe_sees_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = NEAR_ZERO_V_MIXTURE.replace(
+        "theta BWT(0.001, -5.0, 5.0)",
+        "theta BWT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, &model.default_params, &opts),
+        vec![(2, 1e-5), (4, 0.001)]
     );
 }
