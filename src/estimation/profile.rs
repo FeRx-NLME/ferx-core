@@ -50,8 +50,8 @@ use crate::estimation::outer_optimizer::{
     OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, pack_with_bounds, theta_packs_log, unpack_params, PackedBounds,
-    PackedStart,
+    clamp_to_bounds, compute_mu_k, pack_with_bounds, packed_fixed_mask, theta_packs_log,
+    unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
 use crate::types::{
@@ -1003,7 +1003,8 @@ pub(crate) fn optimize_profiled(
     }
 }
 
-/// The warning `replay_covariance` returns when the profile solve at the estimates fails.
+/// The warning `covariance_at_estimate` returns when the profile solve at the estimates
+/// fails, on the inline `fit()` step and on `replay_covariance` alike.
 /// A function rather than an inline `format!` so the `classify_warning` table test
 /// (`types_tests.rs`) classifies the text this site emits, not a copy of it (#2158).
 pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
@@ -1046,7 +1047,7 @@ pub(crate) fn replay_covariance(
         });
     }
     let hold = hold_template(&layout, params);
-    let PackedStart { fixed, .. } = pack_with_bounds(&hold);
+    let fixed = packed_fixed_mask(&hold);
     let free: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
     let ctx = ProfileCtx {
         model,
@@ -1148,6 +1149,8 @@ impl ProfileCtx<'_> {
                 }
             }
         };
+        // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
+        // overwrite is a bitwise no-op; it matters only when the re-solve moves the levels.
         let mut x_hat = x.to_vec();
         for &k in &layout.coords {
             x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
