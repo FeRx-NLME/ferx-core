@@ -534,7 +534,8 @@ fn classify_warning_covariance_is_critical() {
 /// `steals` names the phrase another arm of `classify_warning` matches in that row (empty
 /// when none does), and is asserted present, so a reworded reason that loses it shows up
 /// here rather than leaving the row testing nothing. The four profile rows are the text
-/// `replay_covariance` emits, built by its own `profile_solve_failed_msg`; the rest are
+/// `covariance_at_estimate` emits (inline and on replay), built by its own
+/// `profile_solve_failed_msg`; the rest are
 /// copies of the `src/` literal named in the comment, with a sample interpolation.
 ///
 /// The profile rows are the ones the old arm order misfiled: with the
@@ -545,7 +546,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
     use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
     let profile = |e: ProfileFailure| profile_solve_failed_msg(&e);
     let rows: Vec<(String, &str)> = vec![
-        // profile.rs `replay_covariance`: `ctx.solve` failed, one row per `ProfileFailure`.
+        // profile.rs `covariance_at_estimate`: `ctx.solve` failed, one row per `ProfileFailure`.
         (
             profile(ProfileFailure::NotConverged { criterion: 3.2e-3 }),
             "did not converge",

@@ -66,10 +66,12 @@ use nalgebra::{DMatrix, DVector};
 /// of their own warm-started mode solves. With both of those in place, every engine with
 /// an inline step — FOCE, FOCEI, Laplace, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP and VI —
 /// is repeated **bit for bit**, in memory and reloaded from a bundle `save_fit` wrote,
-/// which stores the EBEs exactly (#1847). A bundle saved before #1847 stored them to six
-/// decimals: such a reloaded fit runs from the cold solve, as it always did, which repeats
-/// FOCE / FOCEI / `gn_hybrid` exactly and the warm-started engines to finite-difference
-/// noise (about 1e-7 relative on the SEs). Bayes has no inline step to repeat.
+/// which stores the EBEs exactly (#1847). So is a fit with a `profile`d level block,
+/// whose step re-profiles the levels from the reported estimates (#2173). A bundle saved
+/// before #1847 stored them to six decimals: such a reloaded fit runs from the cold
+/// solve, as it always did, which repeats FOCE / FOCEI / `gn_hybrid` exactly and the
+/// warm-started engines to finite-difference noise (about 1e-7 relative on the SEs).
+/// Bayes has no inline step to repeat.
 ///
 /// # Failure semantics
 ///
@@ -276,7 +278,7 @@ fn run_covariance_scoped(
         sir_fallback_proposal: _,
         method: covariance_method,
     } = crate::estimation::profile::replay_covariance(
-        model_ref, pop_ref, &params, &eta_hats, options,
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, options,
     )
     .unwrap_or_else(|| {
         run_covariance_step_inner(

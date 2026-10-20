@@ -653,8 +653,15 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
         covariance_method: CovarianceMethod::Hessian,
         ..options(&p)
     };
-    let out = replay_covariance(&p.parsed.model, &p.population, &params, &[], &o)
-        .expect("F1 profiles a level block");
+    let out = replay_covariance(
+        &p.parsed.model,
+        &p.population,
+        &params,
+        &pack_with_bounds(&params).packed,
+        &[],
+        &o,
+    )
+    .expect("F1 profiles a level block");
     assert!(out.matrix.is_none());
     assert_eq!(
         out.warnings,
