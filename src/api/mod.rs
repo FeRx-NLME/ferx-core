@@ -42,6 +42,8 @@ pub(crate) use validation::{
 };
 pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
+#[cfg(all(test, feature = "markov"))]
+pub(crate) use validation::check_ctmm_time_dependent_pk;
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use validation::check_survival_time_dependent_pk;
 
@@ -404,6 +406,10 @@ mod sim_zero_omega_tests;
 #[cfg(all(test, feature = "survival"))]
 #[path = "tests/survival_time_dependent_pk_tests.rs"]
 mod survival_time_dependent_pk_tests;
+// #1918: the same freeze on a drug-driven CTMM generator's `[odes]` solve.
+#[cfg(all(test, feature = "markov"))]
+#[path = "tests/ctmm_time_dependent_pk_tests.rs"]
+mod ctmm_time_dependent_pk_tests;
 
 // #898: a precondition failure on a non-`fit()` entry point is an `Err` carrying `fit()`'s
 // text, not a panic.

@@ -4320,18 +4320,138 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     None
 }
 
+/// Reject a model whose **time-inhomogeneous (drug-driven) CTMM generator** reads a
+/// `TIME`-dependent disposition — the #1853 freeze on the `[markov_model]` endpoint (#1918).
+///
+/// `markov::endpoint`'s inhomogeneous scorer solves the subject's `[odes]` system under one
+/// `$PK` snapshot, `(model.pk_param_fn)(…, 0.0)`, and samples the states the transition
+/// intensities read from that solve. Every dose-record quantity is read at its own dose
+/// record (#1575), exactly as on the hazard pass, so what stays frozen is again the
+/// disposition the RHS integrates and `init()`. The intensity expressions themselves cannot
+/// read `TIME`, directly or through an `[individual_parameters]` value — the parser refuses
+/// that — so the RHS/`init()` route is the only one left open, and the one this closes.
+///
+/// Measured on a 1-cpt IV model, `CL = TVCL·(1 + KT·TIME)`, `V = 10`, a 100 mg bolus and
+/// both intensities scaled by `central/V` (so `P(Δt) = expm(Q₀·∫C)` in closed form): the
+/// CTMM `−log L` is **bit-identical** at `KT = 0` and `KT = 0.05` (3.3747459385), matching
+/// the frozen-`CL` closed form (3.3747459877) to the scorer's sub-grid error, while the
+/// per-record convention the Gaussian walk uses gives 3.3778309; `central(20)` is 13.53
+/// under the freeze against 3.68 per record. The `TIME` coefficient has no influence on the
+/// transition term at all.
+///
+/// The predicate is [`check_survival_time_dependent_pk`]'s, per parameter and per endpoint:
+/// the dependency slice is the union of
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every
+/// state the generator reads, so a `TIME`-dependent parameter that cannot reach any of them
+/// (a state the generator never sees, a dose-record quantity) is not refused. A
+/// time-**homogeneous** CTMM reads no ODE state and returns `None` — it never solves the
+/// `[odes]` system. Fails closed, as the hazard check does, on a model whose compiled
+/// programs were stripped.
+#[cfg(feature = "markov")]
+pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<String> {
+    use crate::types::EndpointLikelihood;
+    // Every inhomogeneous CTMM endpoint with the ODE states its generator reads, in CMT
+    // order so the message is deterministic.
+    let mut ctmms: Vec<(usize, Vec<usize>)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, e)| match e {
+            EndpointLikelihood::Ctmm {
+                generator_states, ..
+            } if !generator_states.is_empty() => {
+                Some((*cmt, generator_states.iter().map(|&(_, idx)| idx).collect()))
+            }
+            _ => None,
+        })
+        .collect();
+    ctmms.sort_unstable();
+    let first_cmt = ctmms.first().map(|(cmt, _)| *cmt)?;
+    let unanalysable = |what: &str, how: &str| -> Option<String> {
+        Some(format!(
+            "[markov_model] on CMT={first_cmt}: this model carries a drug-driven \
+             (time-inhomogeneous) CTMM generator, whose [odes] solve runs under the individual \
+             parameters frozen at their TIME=0 values, but it has no {what}, so whether that \
+             freeze applies cannot be determined (#1918). Every model parsed from a `.ferx` \
+             file carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
+             through `parse_model_string` / `parse_model_file`{how}."
+        ))
+    };
+    let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
+        return unanalysable(
+            "compiled `[odes]` program (`OdeSpec::rhs_program`)",
+            ", or make the transition intensities state-free",
+        );
+    };
+    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+        return unanalysable(
+            "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
+            " rather than replacing that field with `IndivParamPartials::empty()`",
+        );
+    };
+    let reads_time = program.params_reading_time();
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
+    for (cmt, states) in ctmms {
+        // What the generator's states depend on: the union of each one's backward slice.
+        let mut slice: Vec<bool> = Vec::new();
+        for s in states {
+            let one = rhs.chz_dependency_slice(s);
+            if slice.len() < one.len() {
+                slice.resize(one.len(), false);
+            }
+            for (acc, x) in slice.iter_mut().zip(one) {
+                *acc |= x;
+            }
+        }
+        for (i, name) in model.indiv_param_names.iter().enumerate() {
+            if !reads_time.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
+                continue;
+            }
+            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
+            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
+            let site = match (in_rhs, in_init) {
+                (true, true) => "the [odes] RHS and an init(...) seed read",
+                (true, false) => "the [odes] RHS reads",
+                (false, true) => "an [odes] init(...) seed reads",
+                (false, false) => continue,
+            };
+            return Some(format!(
+                "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) CTMM \
+                 generator reads model states solved with the individual parameters frozen at \
+                 their TIME=0 values, but `{name}` reads the `TIME` built-in and {site} it. A \
+                 TIME-dependent disposition on a state-driven transition intensity is not yet \
+                 supported (#1918): the Gaussian predictions evaluate `[individual_parameters]` \
+                 at every record while the CTMM pass keeps the TIME=0 value. Hold `{name}` \
+                 constant in TIME for now."
+            ));
+        }
+    }
+    None
+}
+
 /// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`
 /// report: `E_ENDPOINT_TIME_DEPENDENT_PK`, block `event_model` (#1774). One code for every
 /// text, the two fail-closed arms included: each says the hazard pass would read a
 /// TIME-dependent disposition at its TIME=0 snapshot, or cannot rule that out. A function of
 /// the model alone, so `ferx check` reports it without `--data`.
+///
+/// Also carries [`check_ctmm_time_dependent_pk`] under the same code, on block
+/// `markov_model` (#1918) — the same freeze on the CTMM endpoint — so `fit()` and
+/// `ferx check` refuse it through the one call they already make.
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
-    check_survival_time_dependent_pk(model)
-        .map(|m| {
-            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model")]
-        })
-        .unwrap_or_default()
+    let mut diags: Vec<Diagnostic> = check_survival_time_dependent_pk(model)
+        .map(|m| Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model"))
+        .into_iter()
+        .collect();
+    #[cfg(feature = "markov")]
+    diags.extend(
+        check_ctmm_time_dependent_pk(model).map(|m| {
+            Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("markov_model")
+        }),
+    );
+    diags
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
