@@ -98,15 +98,18 @@ jobs:
   # Sunday cron or a dispatch asking for it, `core` otherwise. A run therefore has
   # exactly one sharded leg, so `needs.shards.result` below is that leg's alone.
   #
-  # Budgets are derived from the #2182 plan's measurements, not picked. A worst-case
-  # runner compiles in 21 min (cold cache, slow machine: `fcad163d`) and runs tests
-  # 1.81x slower than a fast one. The heaviest core shard holds the lib unit tests,
-  # 10.5 fast test-min, so 21 + 1.81 x 10.5 = 40 min; at 70% use that is a 60-min
-  # inner budget, and growth has ~18 min before a worst-case runner reds. `full-nn`
-  # adds nn's ~11 lib-min and the 3.4-min DCM VI fits to a shard: 21 + 1.81 x 25 =
-  # 66 min, / 0.7 = 95. Each job ceiling adds 15 min for checkout, toolchain and
-  # cache restore. `summary` warns when a shard passes 70% of its budget, so the next
-  # rebalance arrives as a warning, not as a red night.
+  # Budgets come from measurement, not from a model. LPT balances the four core shards
+  # to ~18 test-min each, so no shard is the "lib shard"; what varies is the runner.
+  # Over 12 core shard runs on the #2182 dispatches the worst shard took 35.5 min
+  # (39451120193, shard 2: compile 8.9 min, tests 26.6 min — a slow draw, running
+  # ~1.7x its weights). Put that slowest test run behind a worst-case compile, a cold
+  # cache on a slow machine (21 min for the whole workspace on `fcad163d`, ~15.5 for
+  # a shard's share of it per the plan's M8), and a shard takes 42 min: 70% of a
+  # 60-min inner budget. The full-nn budget (95) is the same construction with nn's
+  # extra lib tests on one shard, and stays unmeasured until a full-nn run lands.
+  # Each job ceiling adds 15 min for checkout, toolchain and cache restore. `summary`
+  # warns when a shard passes 70% of its budget, so the next rebalance arrives as a
+  # warning, not as a red night.
   shards:
     name: Slow regression tests (${{ matrix.leg }} ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
