@@ -3367,8 +3367,8 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
         "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
     )
     .expect("parse one-level IOV");
-    // A dose without an occasion label is outside the closed-form walk's scope; labelled,
-    // the one-level search runs on the analytic gradient.
+    // Labelled, the one-level search runs on the analytic gradient (an unlabelled dose
+    // does too since #2065; `an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_…`).
     let mut labelled = make_iov_subject();
     labelled.dose_occasions = vec![1];
     // `(label, model, subject, takes the analytic gradient)`.
@@ -4583,5 +4583,182 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
         let f2 = fd_at(h / 2.0);
         let fd = (4.0 * f2 - f1) / 3.0;
         approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
+}
+
+/// #2065: the one-level IOV models of the unlabelled-dose tests, one per engine, each in a
+/// static and a per-event spelling. `(1 + 0·TIME)` is the IEEE identity on `CL`, so the
+/// two spellings predict alike, but reading `TIME` sends each walk down its per-record
+/// seeding (`iov_walk_per_event`, the adjoint's `per_record`) instead of the shared
+/// per-group one, and both branches of each walk carry the new κ = 0 arm.
+fn unlabelled_dose_models() -> Vec<(&'static str, CompiledModel)> {
+    let header = "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n";
+    let tail = "[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n";
+    let closed = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n";
+    let ode = "[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n";
+    let cl = "  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n";
+    let cl_time = "  CL = TVCL * exp(ETA_CL + KAPPA_CL) * (1 + 0 * TIME)\n  V = TVV\n";
+    let mut out = Vec::new();
+    for (label, structural, params) in [
+        ("closed form", closed, cl),
+        ("closed form, per event", closed, cl_time),
+        ("ode", ode, cl),
+        ("ode, per event", ode, cl_time),
+    ] {
+        let m = crate::parser::model_parser::parse_model_string(&format!(
+            "{header}{params}{structural}{tail}"
+        ))
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(m.is_ode_based(), label.starts_with("ode"), "{label}");
+        assert_eq!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&m),
+            label.ends_with("per event"),
+            "{label}"
+        );
+        out.push((label, m));
+    }
+    out
+}
+
+/// #2065: three doses, 12 h apart, the third with no occasion label (`dose_occasions`
+/// shorter than `doses`, reachable only from a `Subject` built in memory). It lands at
+/// t = 24 on the residual of the first two, and occasion 0 has no κ group, so production
+/// evaluates it under κ = 0 while the observations after it read occasion 2's κ.
+fn unlabelled_dose_subject(model: &CompiledModel) -> Subject {
+    let mut s = make_iov_subject();
+    s.doses = [0.0, 12.0, 24.0]
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.obs_times = vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 34.0];
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 2, 2, 2];
+    s.obs_cmts = vec![1; 9];
+    s.cens = vec![0; 9];
+    s.dose_occasions = vec![1, 2];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1],
+        &[vec![0.15], vec![-0.2]],
+    );
+    s.observations = preds.iter().map(|p| p * 0.9).collect();
+    s
+}
+
+/// #2065: a dose with no occasion label runs its IOV EBE search on the analytic gradient
+/// on both engines, read off `agrad` itself (`IOV_AGRAD_ROUTE`). Before the fix the ODE
+/// walk's `seed_iov_events` declined such a dose (`dose_occasions.get(d)?`) and every
+/// step fell back to FD — 37 of 37 on this fixture's one-dose ancestor — while the fit
+/// still reported the analytic route.
+///
+/// The fixture is live on the field: labelling the third dose `2` (the neighbour's κ
+/// instead of κ = 0) moves every prediction after it, asserted first, so a walk that
+/// handed the dose any group's κ would be differentiating a different prediction.
+#[test]
+fn an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_on_both_engines() {
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    for (label, m) in unlabelled_dose_models() {
+        let s = unlabelled_dose_subject(&m);
+        let theta = &m.default_params.theta;
+        let kappas = [vec![0.15], vec![-0.2]];
+        let unlabelled = crate::pk::predict_iov(&m, &s, theta, &[0.1], &kappas);
+        let mut labelled = s.clone();
+        labelled.dose_occasions = vec![1, 2, 2];
+        let neighbour = crate::pk::predict_iov(&m, &labelled, theta, &[0.1], &kappas);
+        for j in 0..s.obs_times.len() {
+            let moved = (unlabelled[j] - neighbour[j]).abs() > 1e-3 * neighbour[j];
+            assert_eq!(
+                moved,
+                s.obs_times[j] > 24.0,
+                "{label}: obs {j} at t = {}",
+                s.obs_times[j]
+            );
+        }
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(&m, &s, &m.default_params, 200, 1e-8, None, None, 0, &stage);
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        // `is_finite()` alone passes the `1e20` refusal sentinel.
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{label}: EBE objective {}",
+            ebe.nll
+        );
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{label}: {analytic} analytic / {fd} FD steps on the unlabelled-dose subject"
+        );
+    }
+}
+
+/// #2065: the inner walks' `∂f/∂[η, κ₁, κ₂]` on the unlabelled-dose subject match central
+/// FD of production `predict_iov`, the function the objective scores, on both engines and
+/// both seeding branches. The unlabelled dose is κ = 0 in production; a walk that seeded it
+/// under a group's κ instead (the neighbour's, say) would put a non-zero entry in that
+/// κ's column for the observations after t = 24 and differ from FD there. The walk is
+/// the adjoint's `exact_obs_grads_in`, which the inner gradient
+/// (`analytic_eta_nll_gradient_iov_frozen`) reads.
+#[test]
+fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engines() {
+    // Measured worst |walk − FD| / (1 + |FD|): 3.0e-10 closed form, 1.5e-10 ODE (h = 1e-6
+    // central differences, macOS arm64); the bound keeps ~300× headroom. Seeding the
+    // dose under occasion 2's κ instead — mutated on each walk's new arm, both branches —
+    // is caught first by the value check: obs 6 reads 2.3626 against `predict_iov`'s 2.3354.
+    const TOL: f64 = 1e-7;
+    for (label, m) in unlabelled_dose_models() {
+        let s = unlabelled_dose_subject(&m);
+        let theta = &m.default_params.theta;
+        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s)
+            .unwrap_or_else(|| panic!("{label}: no layout"));
+        assert_eq!(
+            layout.n_groups(),
+            2,
+            "{label}: occasions 1 and 2, no group for 0"
+        );
+        let stacked = [0.1, 0.15, -0.2];
+        let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+            &m,
+            &s,
+            Some(&layout),
+            theta,
+            &stacked,
+        )
+        .unwrap_or_else(|| panic!("{label}: the walk declined the unlabelled dose"));
+        let pred =
+            |x: &[f64]| crate::pk::predict_iov(&m, &s, theta, &x[..1], &[vec![x[1]], vec![x[2]]]);
+        let f0 = pred(&stacked);
+        let mut worst = 0.0f64;
+        for (j, row) in rows.iter().enumerate() {
+            assert!(row.f.is_finite(), "{label}: obs {j} value");
+            assert!(
+                (row.f - f0[j]).abs() <= 1e-12 * f0[j].abs(),
+                "{label}: obs {j} walk value {} vs predict_iov {}",
+                row.f,
+                f0[j]
+            );
+        }
+        for p in 0..stacked.len() {
+            let h = 1e-6;
+            let (mut xp, mut xm) = (stacked, stacked);
+            xp[p] += h;
+            xm[p] -= h;
+            let (fp, fm) = (pred(&xp), pred(&xm));
+            for (j, row) in rows.iter().enumerate() {
+                let fd = (fp[j] - fm[j]) / (2.0 * h);
+                let err = (row.df_deta[p] - fd).abs() / (1.0 + fd.abs());
+                assert!(err.is_finite(), "{label}: obs {j} axis {p}");
+                worst = worst.max(err);
+                assert!(
+                    err < TOL,
+                    "{label}: ∂f[{j}]/∂x[{p}] walk {} vs FD of predict_iov {fd} ({err:.3e})",
+                    row.df_deta[p]
+                );
+            }
+        }
+        assert!(worst > 0.0, "{label}: no FD comparison ran");
     }
 }

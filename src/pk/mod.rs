@@ -375,7 +375,7 @@ fn fill_iov_record_params(
 ) {
     dose.reserve_exact(subject.doses.len());
     dose.extend((0..subject.doses.len()).map(|d| {
-        let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+        let occ = dose_row_occasion(subject, d);
         pk_params_at_time(
             model,
             theta,
@@ -992,6 +992,28 @@ pub(crate) fn pk_only_row_occasion(subject: &Subject, m: usize) -> Option<u32> {
         return Some(occ);
     }
     record_occasion_before(subject, subject.pk_only_times.get(m).copied()?)
+}
+
+/// The occasion label to evaluate dose `d`'s `$PK` under on the IOV path (#2065) — the
+/// one spelling every IOV engine reads, production [`predict_iov`] and both `sens/` walks.
+///
+/// The dose's own label, else 0. The CSV reader labels every dose whenever an `OCC`
+/// column exists, so the fallback is reachable only from a `Subject` built in memory
+/// with fewer `dose_occasions` than doses. Occasion 0 then names no κ group unless some
+/// other record carries it, and such a dose runs under κ = 0 ([`dose_row_group`]).
+pub(crate) fn dose_row_occasion(subject: &Subject, d: usize) -> u32 {
+    subject.dose_occasions.get(d).copied().unwrap_or(0)
+}
+
+/// The κ group of dose `d` ([`dose_row_occasion`] through `occ_to_k`), as the `sens/`
+/// walks seed it. `None` is the κ = 0 dose, where production's `combined_for` lands on
+/// a miss — the treatment [`pk_only_row_group`] gives an ungrouped pk-only row.
+pub(crate) fn dose_row_group(
+    subject: &Subject,
+    d: usize,
+    occ_to_k: &std::collections::HashMap<u32, usize>,
+) -> Option<usize> {
+    occ_to_k.get(&dose_row_occasion(subject, d)).copied()
 }
 
 /// The κ group of pk-only row `m` ([`pk_only_row_occasion`] through `occ_to_k`), as the
