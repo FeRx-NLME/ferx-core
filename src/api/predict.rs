@@ -456,6 +456,11 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 
 /// Compute survival function predictions for TTE endpoints.
 ///
+/// Thin wrapper over [`predict_survival_diag`] that discards the diagnostics
+/// ([`SurvivalPredictionOutput::warnings`]), as [`predict`] wraps [`predict_diag`]. Use the
+/// `_diag` form when a parse warning, a data-reader finding, a model/data check or an ODE
+/// solver diagnostic must be surfaced (#2164).
+///
 /// For each subject and each TTE CMT in `model.endpoints`, evaluates the
 /// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
 /// `time_grid` using population typical values (η = 0). When the model has
@@ -491,6 +496,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// data lacks: model-wide, as `predict_diag` checks it, so the selector of a
 /// covariate-selected `[error_model]` is required though this entry never reads it
 /// (`E_MISSING_COVARIATE`). These are the only checks it makes.
+///
+/// Exactly the `Err` of [`predict_survival_diag`] for the same input.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,
@@ -498,6 +505,77 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Result<Vec<SurvivalPredictionResult>, EngineError> {
+    predict_survival_diag(model, population, params, time_grid).map(|out| out.results)
+}
+
+/// The rows [`predict_survival`] returns, plus the diagnostics it discards (#2164) — the
+/// survival twin of [`PredictionOutput`].
+///
+/// `warnings` carries the same non-fit diagnostics bundle [`PredictionOutput::warnings`] does
+/// (`api::postfit::non_fit_diagnostics`; `docs/warnings.qmd#non-fit-bundle`): parse warnings,
+/// data-reader warnings through the one reader filter `fit()` and `ferx check` use (so a
+/// compartment-free TTE model is not told about `W_NO_DOSES` / `W_CMT_DEFAULTED`), the
+/// model/data checks, experimental-feature notices, and — for a model that integrates an ODE,
+/// such as an ODE-accumulated (joint PK-TTE) hazard — the `W_ODE_SOLVER_DIAGNOSTICS` of this
+/// pass, preceded by this pass's steady-state (`SS=1`) equilibration non-convergence note when
+/// it produced one. Empty for a clean prediction on a well-formed model.
+///
+/// `Default` and `#[non_exhaustive]` for the reason [`PredictionOutput`] has them: a further
+/// field alongside `warnings` is then an additive change.
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SurvivalPredictionOutput {
+    /// Exactly what [`predict_survival`] returns.
+    pub results: Vec<SurvivalPredictionResult>,
+    /// Non-fatal model/data and ODE-solver findings for this pass. See the struct docs for
+    /// what the bundle contains.
+    pub warnings: Vec<String>,
+}
+
+/// [`predict_survival`] with the diagnostics attached (#2164) — the survival twin of
+/// [`predict_diag`].
+///
+/// Returns exactly what [`predict_survival`] returns in `results`, bit for bit. Like
+/// [`predict_diag`], it clears the process-global SS non-convergence sink on entry and drains
+/// it into `warnings` on exit, so a note left by an earlier call is never reported as this
+/// pass's.
+///
+/// # Errors
+///
+/// The `Err`s documented on [`predict_survival`], in the same order; [`predict_survival`]
+/// returns exactly this function's `Err`.
+#[cfg(feature = "survival")]
+pub fn predict_survival_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    time_grid: &[f64],
+) -> Result<SurvivalPredictionOutput, EngineError> {
+    // The order `predict_diag` uses (#867, #1652): start the sink clean, then drain it ahead
+    // of the rest of the bundle.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+    let (results, stats) = predict_survival_rows(model, population, params, time_grid)?;
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(super::non_fit_diagnostics(
+        model,
+        population,
+        params,
+        &stats,
+        super::SolverStatsPhase::PredictSurvival,
+    ));
+    Ok(SurvivalPredictionOutput { results, warnings })
+}
+
+/// The checks and rows of [`predict_survival_diag`], plus the ODE-solver counters its
+/// integrations deposited.
+#[cfg(feature = "survival")]
+fn predict_survival_rows(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    time_grid: &[f64],
+) -> Result<(Vec<SurvivalPredictionResult>, crate::ode::OdeSolverStats), EngineError> {
     // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
@@ -549,82 +627,89 @@ pub fn predict_survival(
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
-    for subject in &population.subjects {
-        // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
-        // distributional summaries, at the typical values (η = 0). Analytic families
-        // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
-        // from the integrated CHZ state and h(t) from its derivative. The all-cause
-        // survival and CIF need every cause's H(t), so collect all causes up front.
-        #[allow(clippy::type_complexity)]
-        let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
-        for (&cmt, endpoint) in &model.endpoints {
-            let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
+    // The subject loop is serial, so one scope on the calling thread sees every integration
+    // (`with_solver_stats`); a closed-form hazard on a model that integrates nothing opens none.
+    let ((), stats) = super::with_solver_stats(model, || {
+        for subject in &population.subjects {
+            // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
+            // distributional summaries, at the typical values (η = 0). Analytic families
+            // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
+            // from the integrated CHZ state and h(t) from its derivative. The all-cause
+            // survival and CIF need every cause's H(t), so collect all causes up front.
+            #[allow(clippy::type_complexity)]
+            let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
+            for (&cmt, endpoint) in &model.endpoints {
+                let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
+                    continue;
+                };
+                match hazard {
+                    crate::types::HazardSpec::Analytic { .. } => {
+                        let Some((family, params_vec)) = tte_cause_params(
+                            endpoint,
+                            &params.theta,
+                            &zero_eta,
+                            &subject.covariates,
+                        ) else {
+                            continue;
+                        };
+                        let mut h_row = Vec::with_capacity(time_grid.len());
+                        let mut cum_row = Vec::with_capacity(time_grid.len());
+                        for &t in time_grid {
+                            let (h_val, cum_h) = hazard_and_cum_hazard(family, t, &params_vec);
+                            h_row.push(h_val);
+                            cum_row.push(cum_h);
+                        }
+                        let t_median = median_survival(family, &params_vec);
+                        let t_mean = mean_survival(family, &params_vec);
+                        rows.push((cmt, h_row, cum_row, t_median, t_mean));
+                    }
+                    crate::types::HazardSpec::OdeAccumulated { chz_state } => {
+                        if model.ode_spec.is_none() {
+                            continue;
+                        }
+                        // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
+                        // likelihood via `crate::survival::ode_cumhaz_hazard`.
+                        let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
+                            model,
+                            subject,
+                            *chz_state,
+                            &params.theta,
+                            &zero_eta,
+                            time_grid,
+                        );
+                        // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
+                        // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
+                        // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
+                        let t_median = grid_median_from_cumhaz(time_grid, &cum_row);
+                        rows.push((cmt, h_row, cum_row, t_median, f64::NAN));
+                    }
+                }
+            }
+            if rows.is_empty() {
                 continue;
-            };
-            match hazard {
-                crate::types::HazardSpec::Analytic { .. } => {
-                    let Some((family, params_vec)) =
-                        tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
-                    else {
-                        continue;
-                    };
-                    let mut h_row = Vec::with_capacity(time_grid.len());
-                    let mut cum_row = Vec::with_capacity(time_grid.len());
-                    for &t in time_grid {
-                        let (h_val, cum_h) = hazard_and_cum_hazard(family, t, &params_vec);
-                        h_row.push(h_val);
-                        cum_row.push(cum_h);
-                    }
-                    let t_median = median_survival(family, &params_vec);
-                    let t_mean = mean_survival(family, &params_vec);
-                    rows.push((cmt, h_row, cum_row, t_median, t_mean));
-                }
-                crate::types::HazardSpec::OdeAccumulated { chz_state } => {
-                    if model.ode_spec.is_none() {
-                        continue;
-                    }
-                    // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
-                    // likelihood via `crate::survival::ode_cumhaz_hazard`.
-                    let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
-                        model,
-                        subject,
-                        *chz_state,
-                        &params.theta,
-                        &zero_eta,
-                        time_grid,
-                    );
-                    // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
-                    // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
-                    // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
-                    let t_median = grid_median_from_cumhaz(time_grid, &cum_row);
-                    rows.push((cmt, h_row, cum_row, t_median, f64::NAN));
+            }
+
+            let chz: Vec<Vec<f64>> = rows.iter().map(|r| r.2.clone()).collect();
+            let (cif, s_all) = cif_curves(&chz);
+
+            for (k, (cmt, h_row, cum_row, t_median, t_mean)) in rows.iter().enumerate() {
+                for (i, &t) in time_grid.iter().enumerate() {
+                    results.push(SurvivalPredictionResult {
+                        id: subject.id.clone(),
+                        cmt: *cmt,
+                        time: t,
+                        survival: (-cum_row[i]).exp(),
+                        cum_hazard: cum_row[i],
+                        hazard: h_row[i],
+                        cif: cif[k][i],
+                        survival_all: s_all[i],
+                        median_survival: *t_median,
+                        mean_survival: *t_mean,
+                    });
                 }
             }
         }
-        if rows.is_empty() {
-            continue;
-        }
+    });
 
-        let chz: Vec<Vec<f64>> = rows.iter().map(|r| r.2.clone()).collect();
-        let (cif, s_all) = cif_curves(&chz);
-
-        for (k, (cmt, h_row, cum_row, t_median, t_mean)) in rows.iter().enumerate() {
-            for (i, &t) in time_grid.iter().enumerate() {
-                results.push(SurvivalPredictionResult {
-                    id: subject.id.clone(),
-                    cmt: *cmt,
-                    time: t,
-                    survival: (-cum_row[i]).exp(),
-                    cum_hazard: cum_row[i],
-                    hazard: h_row[i],
-                    cif: cif[k][i],
-                    survival_all: s_all[i],
-                    median_survival: *t_median,
-                    mean_survival: *t_mean,
-                });
-            }
-        }
-    }
-
-    Ok(results)
+    Ok((results, stats))
 }

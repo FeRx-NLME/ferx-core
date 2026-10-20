@@ -94,6 +94,9 @@ pub fn ferx_core::SuppliedEtas::from_table(ids: alloc::vec::Vec<alloc::string::S
 pub fn ferx_core::SuppliedEtas::get(&self, id: &str) -> core::option::Option<&[f64]>
 pub fn ferx_core::SuppliedEtas::ids(&self) -> &[alloc::string::String]
 pub fn ferx_core::SuppliedEtas::names(&self) -> &[alloc::string::String]
+#[non_exhaustive] pub struct ferx_core::api::SurvivalPredictionOutput
+pub ferx_core::api::SurvivalPredictionOutput::results: alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
+pub ferx_core::api::SurvivalPredictionOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::api::SurvivalPredictionResult
 pub ferx_core::api::SurvivalPredictionResult::cif: f64
 pub ferx_core::api::SurvivalPredictionResult::cmt: usize
@@ -131,6 +134,7 @@ pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &fe
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::read_population_for(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
@@ -5212,6 +5216,9 @@ pub fn ferx_core::SuppliedEtas::from_table(ids: alloc::vec::Vec<alloc::string::S
 pub fn ferx_core::SuppliedEtas::get(&self, id: &str) -> core::option::Option<&[f64]>
 pub fn ferx_core::SuppliedEtas::ids(&self) -> &[alloc::string::String]
 pub fn ferx_core::SuppliedEtas::names(&self) -> &[alloc::string::String]
+#[non_exhaustive] pub struct ferx_core::SurvivalPredictionOutput
+pub ferx_core::SurvivalPredictionOutput::results: alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
+pub ferx_core::SurvivalPredictionOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::SurvivalPredictionResult
 pub ferx_core::SurvivalPredictionResult::cif: f64
 pub ferx_core::SurvivalPredictionResult::cmt: usize
@@ -5303,6 +5310,7 @@ pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_co
 pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
 pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>

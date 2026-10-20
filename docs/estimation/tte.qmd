@@ -276,7 +276,11 @@ compartments** so the data reader can route Gaussian rows and TTE rows unambiguo
 `predict_survival()` returns `S(t)` / `H(t)` / `h(t)` for the endpoint by integrating
 the same augmented system at the typical values (its `mean_survival` is `NaN` — an
 `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
-the cumulative-hazard grid).
+the cumulative-hazard grid). `predict_survival_diag()` returns the same rows together
+with the diagnostics `predict_diag()` carries — parse and data-reader warnings, the
+model/data checks, and the ODE-solver diagnostics of that integration
+([#2164](https://github.com/FeRx-NLME/ferx-core/issues/2164); see
+[the non-fit bundle](../warnings.qmd#non-fit-bundle)).
 
 **A hazard time at or before the subject's first record.** A `TENTRY` (left truncation) or
 an interval-censored left bound below the start of the integration contributes nothing:
