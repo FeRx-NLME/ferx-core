@@ -346,21 +346,23 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     let nan = T::from_f64(f64::NAN);
     let mut state = [zero, zero];
     let mut arrived = vec![false; doses.len()];
-    // Set at the first `NaN` disposition or open dose kernel. From there the state is
-    // `NaN`, as an integrator's would be, and the tilting terms are not evaluated: their
-    // `mgf` `debug_assert` rejects a `NaN` rate (#386).
+    // Set at the first interval of positive length whose disposition or open dose kernel
+    // is `NaN`. From there the state is `NaN`, as an integrator's would be, and the
+    // tilting terms are not evaluated: their `mgf` `debug_assert` rejects a `NaN` rate
+    // (#386). A record that governs no elapsed time (the first record, or one co-timed
+    // with the previous event) poisons nothing, as on the event-driven and ODE engines:
+    // its disposition never acts. A `NaN` `V` on an observation is still read as `NaN`
+    // by the readout's division.
     let mut poisoned = false;
     let mut cur_t = schedule.events[0].time;
     for (i, ev) in schedule.events.iter().enumerate() {
         let pk_now = gov[i];
-        if !poisoned && pk_now.is_some_and(|p| disposition_is_nan(two_cpt, p)) {
-            poisoned = true;
-        }
         if ev.time > cur_t && !poisoned {
-            poisoned = doses
-                .iter()
-                .zip(&arrived)
-                .any(|(d, &a)| a && kernel_is_nan(d));
+            poisoned = pk_now.is_some_and(|p| disposition_is_nan(two_cpt, p))
+                || doses
+                    .iter()
+                    .zip(&arrived)
+                    .any(|(d, &a)| a && kernel_is_nan(d));
         }
         if poisoned {
             state = [nan, nan];

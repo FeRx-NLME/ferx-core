@@ -1088,3 +1088,70 @@ fn walk_and_static_closed_form_agree_on_a_constant_nan_clearance() {
         );
     }
 }
+
+/// #2134 review: a `NaN` disposition on a record that governs no elapsed time — here the
+/// first dose record, whose interval has zero length — never acts, so it must poison
+/// nothing. The event-driven and ODE engines advance to the next record on that record's
+/// own (finite) snapshot; the walk once set its poison flag from any record's snapshot
+/// and served the whole profile `NaN`. Every prediction and state must equal the clean
+/// walk bit for bit.
+///
+/// Mutation (run): check `disposition_is_nan(pk_now)` before the `ev.time > cur_t` test
+/// → every row dies with an all-`NaN` profile.
+#[test]
+fn a_nan_disposition_on_a_record_governing_no_interval_poisons_nothing() {
+    use crate::types::{PK_IDX_CL, PK_IDX_V, PK_IDX_V2};
+    for (model, subject, _) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        assert!(
+            subject.doses[0].time < subject.obs_times[0],
+            "{name}: premise — the first dose record opens the timeline"
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let obs = vec![pk; subject.obs_times.len()];
+        let mut clean_states = Vec::new();
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &obs,
+            &[],
+            Some(&mut clean_states),
+        )
+        .expect("inside the domain");
+        let two_cpt = matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg);
+        let mut slots = vec![("CL", PK_IDX_CL), ("V", PK_IDX_V)];
+        if two_cpt {
+            slots.push(("V2", PK_IDX_V2));
+        }
+        for (label, idx) in slots {
+            let mut at_dose = dose.clone();
+            at_dose[0].values[idx] = f64::NAN;
+            let mut states = Vec::new();
+            let preds = absorption_walk_predictions(
+                model.pk_model,
+                &subject,
+                &at_dose,
+                &obs,
+                &[],
+                Some(&mut states),
+            )
+            .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, (p, c)) in preds.iter().zip(&clean).enumerate() {
+                assert!(
+                    *c > 0.0 && p.to_bits() == c.to_bits(),
+                    "{name} {label} = NaN on the first dose record only: record {j} must keep \
+                     {c}, not {p}"
+                );
+                assert_eq!(states[j], clean_states[j], "{name} {label}: states {j}");
+            }
+        }
+    }
+}
