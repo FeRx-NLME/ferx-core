@@ -272,22 +272,29 @@ fn codecov_waits_for_every_report_of_an_event() {
     );
     let uploaders: Vec<(String, Option<String>)> = top_level_keys(&ci, "jobs")
         .into_iter()
-        .filter_map(|job| {
+        .flat_map(|job| {
             let body = job_body(&job);
-            let at = body.find("codecov/codecov-action@")?;
-            // The evaluator reads job-level conditions only, so an upload step must
-            // carry none of its own.
-            let step_start = body[..at].rfind("\n      - ").unwrap_or(0);
-            let step_end = body[at..].find("\n      - ").map_or(body.len(), |i| at + i);
-            assert!(
-                !body[step_start..step_end].contains("\n        if:"),
-                "job `{job}`'s Codecov step has its own `if:`, which this table ignores"
-            );
             let cond = body
                 .lines()
                 .find(|l| l.starts_with("    if:"))
                 .map(|l| l.trim().to_owned());
-            Some((job, cond))
+            // One row per upload STEP, so a second upload in one job counts twice.
+            let rows: Vec<_> = body
+                .match_indices("codecov/codecov-action@")
+                .map(|(at, _)| {
+                    // The evaluator reads job-level conditions only, so an upload step
+                    // must carry none of its own.
+                    let step_start = body[..at].rfind("\n      - ").unwrap_or(0);
+                    let step_end = body[at..].find("\n      - ").map_or(body.len(), |i| at + i);
+                    assert!(
+                        !body[step_start..step_end].contains("\n        if:"),
+                        "job `{job}` has a Codecov step with its own `if:`, which this \
+                         table ignores"
+                    );
+                    (job.clone(), cond.clone())
+                })
+                .collect();
+            rows
         })
         .collect();
     assert!(
