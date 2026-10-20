@@ -540,7 +540,7 @@ and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV equals NONMEM's (âˆ
 
 #### Compare against `$COV SIGL=12`, not the default {#nonmem-cov-precision}
 
-NONMEM builds its R-matrix by finite differences, at a precision `$COVARIANCE` inherits from `$ESTIMATION` unless `SIGL` is set. At the default that matrix can be 20â€“27% off **at the same optimum**, so a gap between ferx's and NONMEM's SEs is not evidence against either until NONMEM's side has been re-run at a higher `SIGL`. On the nested-levels anchor (`nonmem_anchor/nested_levels_3*`, three variability levels, FOCEI; [#2177](https://github.com/FeRx-NLME/ferx-core/issues/2177)), both NONMEM runs converge to the same OBJ, 107.04357104523862, and differ only in `$COV` (and a dropped `$TABLE`):
+NONMEM builds its R-matrix by finite differences, at a precision `$COVARIANCE` inherits from `$ESTIMATION` unless `SIGL` is set. At the default that matrix can be up to 27% off its own `SIGL=12` result **at the same optimum** (ETA_SP below; the table compares ferx against each column), so a gap between ferx's and NONMEM's SEs is not evidence against either until NONMEM's side has been re-run at a higher `SIGL`. On the nested-levels anchor (`nonmem_anchor/nested_levels_3*`, three variability levels, FOCEI; [#2177](https://github.com/FeRx-NLME/ferx-core/issues/2177)), both NONMEM runs converge to the same OBJ, 107.04357104523862, and differ only in `$COV` (and a dropped `$TABLE`):
 
 | Parameter | ferx SE (analytic R) | NONMEM `MATRIX=R` | rel. diff | NONMEM `MATRIX=R SIGL=12` | rel. diff |
 |-----------|---------|---------|--------|---------|--------|
