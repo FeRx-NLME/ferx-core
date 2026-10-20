@@ -3523,6 +3523,96 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() 
     }
 }
 
+/// #2209: an IOV model with a residual `weight =` and a `correlation … by` line reports the
+/// analytic inner gradient its search runs on. The cross-row subject stays on the adjoint
+/// kernel's exact gradient (`iov_inner_residual_correlation`), the singleton-block twin on
+/// the per-row one; neither takes an FD step, and no FD-fallback warning is raised. The
+/// same model under `gradient = fd` reports FD. Kills: re-adding the magnitude × dense
+/// clause to `analytic_inner_common_bail` (label FD, subject route `None`);
+/// `inner_reports_analytic_model` forced `true` (the `gradient = fd` arm).
+#[test]
+fn an_iov_weighted_correlated_residual_reports_the_analytic_inner_gradient() {
+    use crate::build_info::{gradient_method_inner, GradientMethodKind, BUILD_INFO};
+    use crate::stats::nested_levels::test_helpers as fx;
+    let src = fx::algebraic()
+        .replace(
+            "  sigma ADD ~ 0.5\n",
+            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
+        )
+        .replace(
+            "[individual_parameters]\n",
+            "[covariates]\n  NARM continuous\n[individual_parameters]\n",
+        )
+        .replace(
+            "  DV ~ additive(ADD)\n",
+            "  DV ~ additive(ADD) weight = NARM\n  correlation ar1(RHO) by ARM\n",
+        );
+    let (m, mut pop) = fx::prepared(&src, 1);
+    assert!(m.has_custom_ruv_magnitude() && m.residual_is_dense());
+    let mut single = pop.subjects[0].clone();
+    single.id = "SINGLE".into();
+    let keep: Vec<usize> = (0..single.obs_times.len()).step_by(3).collect();
+    let pick = |v: &Vec<f64>| keep.iter().map(|&j| v[j]).collect::<Vec<f64>>();
+    single.obs_times = pick(&single.obs_times);
+    single.observations = pick(&single.observations);
+    single.obs_covariates = keep
+        .iter()
+        .map(|&j| single.obs_covariates[j].clone())
+        .collect();
+    single.obs_cmts = vec![1; keep.len()];
+    single.cens = vec![0; keep.len()];
+    pop.subjects.push(single);
+    crate::stats::nested_levels::assign_level_cells(&m, &mut pop);
+    crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
+
+    assert_eq!(
+        gradient_method_inner(&BUILD_INFO, &m),
+        GradientMethodKind::Analytic
+    );
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let p = &m.default_params;
+    assert_eq!(fd_fallback_warning(&m, &pop, &p.theta), None);
+    for (i, correlated) in [(0usize, true), (1, false)] {
+        let s = &pop.subjects[i];
+        assert_eq!(
+            iov_inner_residual_correlation(&m, s),
+            correlated,
+            "{}",
+            s.id
+        );
+        assert!(
+            iov_inner_subject_route(&m, s, &p.theta).is_some(),
+            "{}: the reported route",
+            s.id
+        );
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{}: {}",
+            s.id,
+            ebe.nll
+        );
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{}: {analytic} analytic / {fd} FD",
+            s.id
+        );
+    }
+
+    let (mut forced, _) = fx::prepared(&src, 1);
+    forced.gradient_method = GradientMethod::Fd;
+    assert_eq!(
+        gradient_method_inner(&BUILD_INFO, &forced),
+        GradientMethodKind::FiniteDifferences
+    );
+}
+
 /// #2093 review (round 2): `gradient = fd` takes the IOV inner search off every exact
 /// route. The adjoint kernel's `exact_inner_gradient_in` sat behind the non-analytic arm
 /// unconditionally, so a forced-FD fit ran the exact gradient while every report said FD.

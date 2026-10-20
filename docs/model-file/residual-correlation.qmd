@@ -182,9 +182,9 @@ difference 1.7e-7 (Linux).
 more rows takes the exact analytic outer gradient of the dense-`R` objective
 (#1960), `∂R/∂ρ` included, under both `method = focei` and `method = foce`, and a
 subject whose blocks are all single rows keeps the scalar analytic one (for it
-`∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the
-finite-difference outer gradient throughout, as any weighted model with a dense
-`R` does. A model with `kappa` (one level or nested) takes the exact analytic
+`∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the exact
+analytic outer gradient and the exact inner gradient as well, with the weight
+in `R` (#2209). A model with `kappa` (one level or nested) takes the exact analytic
 gradient too (#2101): its IOV marginal is the dense-`R` objective over the stacked
 `[η, κ]` system, which the adjoint gradient differentiates as it does a model
 without `kappa`, on FOCE and FOCEI, and the covariance step takes the exact

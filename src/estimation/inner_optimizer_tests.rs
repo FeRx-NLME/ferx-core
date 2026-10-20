@@ -4372,13 +4372,13 @@ fn gradient_fd_keeps_the_inner_search_and_h_off_the_exact_routes() {
     let subj = &pop.subjects[0];
     let params = model.default_params.clone();
     model.gradient_method = GradientMethod::Fd;
-    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
     let ebe = find_ebe(&model, subj, &params, 200, 1e-8, None, None, 0);
-    let (exact, fd) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    let (analytic, exact, fd) = INNER_AGRAD_ROUTE.with(|c| c.get());
     assert!(ebe.nll.is_finite(), "{}", ebe.nll);
     assert!(
-        exact == 0 && fd > 0,
-        "gradient = fd: {exact} exact / {fd} FD steps"
+        analytic == 0 && exact == 0 && fd > 0,
+        "gradient = fd: {analytic} analytic / {exact} exact / {fd} FD steps"
     );
     // H at the same EBE: the FD Jacobian, not the exact one bit for bit.
     let exact_j = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
@@ -4792,4 +4792,216 @@ fn lbfgs_scales_its_identity_first_step_like_dense_bfgs() {
     let g0 = [-1e6f64, 2e6];
     let gn = (g0[0] * g0[0] + g0[1] * g0[1]).sqrt();
     assert!((t[0] + g0[0] / gn).abs() < 1e-12 && (t[1] + g0[1] / gn).abs() < 1e-12);
+}
+
+/// #2209: a residual magnitude (`weight =`, or a θ in the magnitude) combined with a dense
+/// `R` (`correlation`, `block_sigma`) is served exactly by the dense-`R` inner kernel,
+/// which has threaded the per-observation multiplier since #627. The model-level label,
+/// the banner and the route all read one predicate, so they must agree on it.
+mod weighted_dense_residual_inner {
+    use super::*;
+    use crate::build_info::{gradient_method_inner, GradientMethodKind, BUILD_INFO};
+    use crate::types::{DoseEvent, Population, Subject};
+
+    const BASE: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  theta RHO(0.5, -0.4, 0.95) FIX\n  theta TH_M(1.7, 0.1, 10.0) FIX\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[covariates]\n  W continuous\n  ARM continuous\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n";
+
+    /// `(cell, error-model lines, gradient = fd)`. The first three are the weighted dense
+    /// cells #2209 is about; then the two single-feature controls; then the forced-FD twin.
+    const CELLS: &[(&str, &str, bool)] = &[
+        (
+            "weight x correlation",
+            "  DV ~ combined(PROP_ERR, ADD_ERR) weight = W\n  correlation ar1(RHO) by ARM\n",
+            false,
+        ),
+        (
+            "weight x block_sigma",
+            "  DV ~ combined(PROP_ERR, ADD_ERR) weight = W\n",
+            false,
+        ),
+        (
+            "theta-magnitude x correlation",
+            "  DV ~ combined(PROP_ERR * TH_M, ADD_ERR)\n  correlation ar1(RHO) by ARM\n",
+            false,
+        ),
+        (
+            "correlation alone",
+            "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation ar1(RHO) by ARM\n",
+            false,
+        ),
+        (
+            "weight alone",
+            "  DV ~ combined(PROP_ERR, ADD_ERR) weight = W\n",
+            false,
+        ),
+        (
+            "weight x correlation, gradient = fd",
+            "  DV ~ combined(PROP_ERR, ADD_ERR) weight = W\n  correlation ar1(RHO) by ARM\n",
+            true,
+        ),
+    ];
+
+    fn model_for(cell: &str, error: &str, fd: bool) -> CompiledModel {
+        let mut src = BASE.replace("  DV ~ combined(PROP_ERR, ADD_ERR)\n", error);
+        if cell.contains("block_sigma") {
+            src = src.replace(
+                "  sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n",
+                "  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 0.25] FIX\n",
+            );
+        }
+        let mut model = crate::parser::model_parser::parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("{cell}: parse: {e}"));
+        if fd {
+            // What `fit()` sets from `gradient = fd` before the inner loop runs.
+            model.gradient_method = GradientMethod::Fd;
+        }
+        model
+    }
+
+    /// One-cpt IV, doses at 0 and 12 (residual drug present at the second), two
+    /// interleaved arms, and a per-row weight that is live in the objective.
+    fn subject_for(model: &CompiledModel) -> Subject {
+        let times = [0.5, 2.0, 6.0, 12.5, 14.0, 18.0, 24.0];
+        let arms = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0];
+        let ws = [1.0, 2.0, 3.0, 4.0, 5.0, 2.5, 1.5];
+        let n = times.len();
+        let mut s = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: times.to_vec(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            obs_covariates: arms
+                .iter()
+                .zip(ws)
+                .map(|(a, w)| HashMap::from([("ARM".to_string(), *a), ("W".to_string(), w)]))
+                .collect(),
+            cens: vec![0; n],
+            ..Default::default()
+        };
+        s.obs_rgroup = crate::stats::residual_error::residual_groups(model, &s);
+        let theta = &model.default_params.theta;
+        let preds = crate::pk::compute_predictions_with_tv(model, &s, theta, &[0.1, -0.05]);
+        s.observations = preds
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v * 1.15 + if i % 2 == 0 { 0.3 } else { -0.3 })
+            .collect();
+        s
+    }
+
+    /// T1: label, banner and route per cell, in one test so a gate stuck on either
+    /// value fails. Kills: re-adding the magnitude × dense clause to
+    /// `analytic_inner_common_bail` (label FD, `exact > 0`); `inner_reports_analytic_model`
+    /// forced `true` (the `gradient = fd` cell); dropping the analytic-arm increment
+    /// (`analytic == 0`).
+    #[test]
+    fn weighted_dense_residual_reports_and_runs_the_analytic_inner_gradient() {
+        for &(cell, error, fd) in CELLS {
+            let model = model_for(cell, error, fd);
+            let s = subject_for(&model);
+            if cell.contains("weight") || cell.contains("magnitude") {
+                assert!(model.has_custom_ruv_magnitude(), "{cell}: magnitude live");
+            }
+            if cell.contains("correlation") || cell.contains("block_sigma") {
+                assert!(model.residual_is_dense(), "{cell}: dense R");
+            }
+            let label = gradient_method_inner(&BUILD_INFO, &model);
+            let pop = Population {
+                subjects: vec![s.clone()],
+                covariate_names: Vec::new(),
+                dv_column: "DV".to_string(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: Vec::new(),
+            };
+            let requested = if fd {
+                GradientMethod::Fd
+            } else {
+                GradientMethod::Auto
+            };
+            let banner = gradient_route_summary(&model, &pop, requested);
+            INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+            let ebe = find_ebe_for_stage(
+                &model,
+                &s,
+                &model.default_params,
+                200,
+                1e-8,
+                None,
+                None,
+                0,
+                &crate::types::FitOptions::default(),
+            );
+            let (analytic, exact, fdn) = INNER_AGRAD_ROUTE.with(|c| c.get());
+            assert!(ebe.nll.is_finite(), "{cell}: nll {}", ebe.nll);
+            if fd {
+                assert_eq!(label, GradientMethodKind::FiniteDifferences, "{cell}");
+                assert!(
+                    banner.starts_with("FD  [requested: FD]"),
+                    "{cell}: {banner}"
+                );
+                assert!(
+                    analytic == 0 && exact == 0 && fdn > 0,
+                    "{cell}: {analytic} analytic / {exact} exact / {fdn} FD steps"
+                );
+            } else {
+                assert_eq!(label, GradientMethodKind::Analytic, "{cell}");
+                assert!(
+                    banner.starts_with("analytic (Dual2)  [requested: auto]"),
+                    "{cell}: {banner}"
+                );
+                assert!(
+                    analytic > 0 && exact == 0 && fdn == 0,
+                    "{cell}: {analytic} analytic / {exact} exact / {fdn} FD steps"
+                );
+            }
+        }
+    }
+
+    /// T2: the dense-`R` inner kernel against central FD of `individual_nll` at a
+    /// nonzero η, on the three weighted dense cells. Kills: building the kernel's `R`
+    /// without the magnitude multiplier (`mult → None`).
+    #[test]
+    fn weighted_dense_residual_inner_gradient_matches_fd() {
+        let eta = [0.17, -0.11];
+        let mut worst = 0.0_f64;
+        for &(cell, error, fd) in &CELLS[..3] {
+            assert!(!fd);
+            let model = model_for(cell, error, false);
+            let s = subject_for(&model);
+            let p = &model.default_params;
+            let g =
+                analytic_eta_nll_gradient(&model, &s, &p.theta, &eta, &p.omega, &p.sigma.values)
+                    .unwrap_or_else(|| panic!("{cell}: the dense kernel serves the subject"));
+            let nll = |e: &[f64]| {
+                crate::stats::likelihood::individual_nll(
+                    &model,
+                    &s,
+                    &p.theta,
+                    e,
+                    &p.omega,
+                    &p.sigma.values,
+                )
+            };
+            for k in 0..eta.len() {
+                let h = 1e-5;
+                let (mut a, mut b) = (eta.to_vec(), eta.to_vec());
+                a[k] += h;
+                b[k] -= h;
+                let want = (nll(&a) - nll(&b)) / (2.0 * h);
+                // Finite first: `f64::max` would discard a NaN and keep the rows that worked.
+                assert!(g[k].is_finite() && want.is_finite(), "{cell}[{k}]");
+                let rel = (g[k] - want).abs() / (1.0 + want.abs());
+                eprintln!("{cell}[{k}]: kernel {} FD {want} rel {rel:.3e}", g[k]);
+                worst = worst.max(rel);
+            }
+        }
+        // Measured worst 6.1e-10 (θ-magnitude × correlation, macOS arm64); 1e-7 is
+        // ~160× headroom. With `mult` dropped from the kernel's `R` it fails.
+        eprintln!("worst relative gap {worst:.3e}");
+        assert!(worst < 1e-7, "worst relative gap {worst:.3e}");
+    }
 }

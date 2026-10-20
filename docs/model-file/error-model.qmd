@@ -352,7 +352,7 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   (value and direct-θ derivative), on both the non-IOV and IOV paths. Since #2093
   the outer gradient is exact under FOCE, FOCEI and Laplace with any number of θ.
   With a correlated residual (`block_sigma`, `correlation`) the inner EBE gradient
-  takes magnitude-aware finite differences.
+  is exact too: the dense-`R` kernel threads the same multiplier (#2209).
 - **The direct-θ channel and the other estimators.** When the magnitude
   expression names a θ, that θ moves the residual variance *directly* as well as
   through the prediction. SAEM's M-step carries both (it differences the whole
