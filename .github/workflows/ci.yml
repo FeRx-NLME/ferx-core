@@ -27,6 +27,21 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal
+      - name: Drop the runner image's stable toolchain from the cache key (#2184)
+        # rust-cache hashes EVERY installed toolchain into its key (`rustup toolchain
+        # list`), including the stable the runner image ships, so while a new image rolls
+        # out two runners on the same nightly get different keys. Measured over the last 40
+        # runs on main (2026-10-17..20): 4 of 160 jobs in `check`/`clippy`/`rustdoc`/
+        # `public-api` missed for that reason alone — e3fb3d1e's Clippy and Public API
+        # (image 20261018.339, stable 1.99.1) next to Check and Rustdoc hitting on
+        # 20261012.334 (1.99.0), and a66b5788 the other way round. Nothing in these jobs
+        # uses stable (`RUSTUP_TOOLCHAIN` is nightly workflow-wide), so it goes; the jobs
+        # that build WITH stable keep it, since there it is the toolchain. `rustup default`
+        # first, so the default never names a removed toolchain; the uninstall exits 0 when
+        # an image ships no stable. Same step as slow-tests.yml (#2185).
+        run: |
+          rustup default nightly
+          rustup toolchain uninstall stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -234,6 +249,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal -c clippy
+      - name: Drop the runner image's stable toolchain from the cache key (#2184)
+        # See the same step in the `check` job.
+        run: |
+          rustup default nightly
+          rustup toolchain uninstall stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -258,6 +278,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal
+      - name: Drop the runner image's stable toolchain from the cache key (#2184)
+        # See the same step in the `check` job.
+        run: |
+          rustup default nightly
+          rustup toolchain uninstall stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -302,6 +327,14 @@ jobs:
           echo "pinned toolchain: $toolchain"
           rustup toolchain install "$toolchain" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - name: Drop the runner image's stable toolchain from the cache key (#2184)
+        # See the same step in the `check` job. The pinned nightly never moves, so before
+        # this the runner image was the only input besides Cargo.lock and the manifests that
+        # could change this job's key (931d38c8 → 1f12a6f1 on e3fb3d1e). The default is the
+        # pin itself (exported above), not a bare `nightly`, which this job never installs.
+        run: |
+          rustup default "$RUSTUP_TOOLCHAIN"
+          rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@v2
         with:
           # rustdoc JSON build; own key so it does not churn the `ci` cache.
