@@ -634,8 +634,8 @@ to) is configured in the [`[scaling]`](scaling.qmd) block.
 ## Covariate-selected error models (`if/else`)
 
 Per-CMT dispatch keys on the dataset's `CMT` column. When two endpoints share
-the *same* compartment/readout but need different residual error — a classic
-example is a **free-vs-total** assay, where both measurements are the same
+the *same* compartment/readout but need different residual error — e.g. a
+**free-vs-total** assay, where both measurements are the same
 concentration readout but carry different proportional error — select the error
 model with an arbitrary covariate `if/else` instead, exactly as the
 [`[scaling]`](scaling.qmd) block selects a readout (Form C):
@@ -682,22 +682,23 @@ Rules and restrictions:
 
 - **Analytical *and* ODE models.** Unlike per-CMT error (ODE-only), covariate
   selection works on closed-form analytical PK models too — the selection is a
-  per-observation covariate constant, so it flows through the same analytic
-  FOCE/FOCEI σ-gradient channel once the endpoint is chosen.
+  per-observation constant, so the analytic FOCE/FOCEI σ-gradient applies once
+  the endpoint is chosen.
 - **A final `else` is required** so every observation maps to a declared error
   model (no silent fall-through).
 - **The selector covariate is a required data column.** A covariate named in a
   condition must be present in the data, or `fit()` fails with
-  `E_MISSING_COVARIATE` (it is never silently read as 0). Declaring it in
+  `E_MISSING_COVARIATE` (never read as 0). So do `predict_survival()` and
+  `predict_categorical()`, which never read it
+  ([why](../warnings.qmd#entry-point-covariates)). Declaring it in
   [`[covariates]`](covariates.qmd) is recommended.
 - **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
   optimizers, SAEM, and importance sampling — every likelihood/gradient path
   dispatches on the selected endpoint.
 - **`block_sigma` correlated residuals are supported** together with a
-  covariate-selected error model (#669). Each observation resolves to a branch
-  per row, loads that branch's sigmas, and rows sharing a subject time and
-  occasion pick up the `block_sigma` cross covariance in the dense residual `R`
-  — exactly the pairing rule used for per-CMT endpoints. Two co-temporal rows
+  covariate-selected error model (#669). Each row loads its branch's sigmas,
+  and rows sharing a subject time and occasion get the `block_sigma` cross
+  covariance in the dense residual `R`, as per-CMT endpoints do. Two co-temporal rows
   resolving to *different* branches (e.g. a total `FREE=0` and an unbound
   `FREE=1` measurement of the same sample) get the honest cross-branch
   covariance `ρ·σ_i·σ_j` from each row's own loadings. The method restrictions

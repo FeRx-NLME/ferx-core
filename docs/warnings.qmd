@@ -98,6 +98,13 @@ a function that returns `Result`*, so a caller matching on `Err` never saw the
 failure. The panic text also carried a wrapper sentence around the diagnostic;
 that wording is gone.
 
+#### "Covariates present" is model-wide {#entry-point-covariates}
+
+On every entry point, "covariates present" asks for every covariate the model
+reads, including one only another endpoint reads. So the selector of a
+covariate-selected `[error_model]` is required by `predict_survival()` and
+`predict_categorical()` too, though neither reads the Gaussian residual (#1798).
+
 #### A skipped draw is not a refusal
 
 One deliberate exception: inside `simulate_with_uncertainty()`, a parameter

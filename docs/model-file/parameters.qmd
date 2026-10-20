@@ -92,8 +92,13 @@ Put **data columns** in the brackets instead of a count and the block declares
 **one level per observed combination** of them, discovered when the data is
 bound. With `contrast = none`, the `(init, lower, upper)` triple broadcasts to
 every level. Constrained forms estimate contrast coefficients and derive one
-level per contrast group, so they require `init = 0`; `FIX` then fixes the
-whole block at zero. Bounds apply to the free coefficients, not to a derived
+level per contrast group, so they require `init = 0` and bounds with 0
+strictly inside them: a bound *at* 0, as in `(0.0, 0.0, 5.0)`, would hold every
+coefficient to one sign and is refused, unless the block is `FIX`, whose bounds do
+nothing. `FIX` fixes the whole block at zero. Without written bounds a
+constrained block takes `-1e9` to `1e9`, since a contrast coefficient has no
+sign, so `(0.0)` and `(0.0) FIX` are complete declarations; `contrast = none`
+keeps the positive default θ box. Bounds apply to the free coefficients, not to a derived
 negative sum, which can lie outside them. Free coefficients are named after
 their combination, so estimates report as
 `PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time as written
