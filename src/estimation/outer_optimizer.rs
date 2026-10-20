@@ -271,9 +271,10 @@ pub fn optimize_population(
     let frozen_params;
     //
     // The same pre-flight probes each near-zero identity-packed θ for the NLopt scale
-    // vector (#2159, `identity_theta_scales`). Only the NLopt optimizers read the
-    // result, and an explicit `none` / `rescale2` keeps its own vector, so nothing is
-    // probed otherwise.
+    // vector (#2159, `identity_theta_scales`); a mixture, which skips the flat-θ
+    // pre-flight, is probed on its own objective (`mixture_identity_theta_scales`).
+    // Only the NLopt optimizers read the result, and an explicit `none` / `rescale2`
+    // keeps its own vector, so nothing is probed otherwise.
     let probe_identity_scales = matches!(
         resolved,
         Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma | Optimizer::Bobyqa
@@ -283,7 +284,12 @@ pub fn optimize_population(
     );
     let (init_params, preflight_warnings, first_eval_etas, identity_scales) =
         if init_params.mixture.is_some() {
-            (init_params, Vec::new(), None, Vec::new())
+            let scales = if probe_identity_scales {
+                mixture_identity_theta_scales(model, population, init_params, options)
+            } else {
+                Vec::new()
+            };
+            (init_params, Vec::new(), None, scales)
         } else {
             let preflight = freeze_flat_thetas(
                 model,
@@ -597,6 +603,7 @@ fn freeze_flat_thetas(
             &params.theta,
             &init_params.theta_lower,
             held,
+            n_subj,
             base_ofv,
             reconverged_ofv,
         )
@@ -618,16 +625,21 @@ const NEAR_ZERO_IDENTITY_THETA: f64 = 0.1;
 /// size, toward zero. It stays inside the declared bounds by construction, since a
 /// negative lower bound puts zero in the box and the start is in it.
 const IDENTITY_PROBE_FRACTION: f64 = 0.5;
-/// A probe that moves the objective by more than this many OFV units marks the θ as
-/// one whose natural scale is its own magnitude.
+/// A probe that moves the objective by more than this many OFV units **per subject**
+/// marks the θ as one whose natural scale is its own magnitude.
+///
+/// Per subject, not in total: the question is a coordinate's natural scale, which a
+/// population replicated `k` times keeps (same minimizer) while its OFV and every
+/// probe's ΔOFV grow `k`-fold. An absolute threshold would flip a slope to the
+/// harmful magnitude scale on a large enough dataset (#2159 review).
 ///
 /// Measured at the issue's two kinds of near-zero θ (macOS arm64): halving
-/// warfarin's `TVV_S` (`V = TVV_S / 1e-6`, θ₀ = 1e-5) moves the OFV by ≈ 100 (a
-/// 1.5× move: 92.6 from θ₀, 40.7 at the optimum), while moving either covariate
-/// exponent of `two_cpt_oral_cov` started at 0.001 (true values 0.65 and ≈ 0.3) by
-/// half itself moves it by 0.006–0.009. The threshold sits two orders of magnitude
-/// from each.
-const IDENTITY_PROBE_MIN_DELTA_OFV: f64 = 1.0;
+/// warfarin's `TVV_S` (`V = TVV_S / 1e-6`, θ₀ = 1e-5) moves the OFV by 31.4 over
+/// 10 subjects, 3.1 per subject; halving either covariate exponent of
+/// `two_cpt_oral_cov` started at 0.001 (0.65 and ≈ 0.3 at the minimum) moves it by
+/// 0.0056–0.0090 over 30 subjects, 1.9e-4–3.0e-4 per subject. The threshold sits
+/// two orders of magnitude from each.
+const IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT: f64 = 0.03;
 
 /// The near-zero identity-packed θ the NLopt outer loop divides by their initial
 /// magnitude, as `(θ index, |θ₀|)` (#2159).
@@ -645,9 +657,10 @@ const IDENTITY_PROBE_MIN_DELTA_OFV: f64 = 1.0;
 /// objective can. So each candidate — free, identity-packed, `0 < |θ₀| <`
 /// [`NEAR_ZERO_IDENTITY_THETA`] — is moved to `IDENTITY_PROBE_FRACTION · θ₀` with the
 /// EBEs re-solved (`probe_ofv`), and scaled only when that relative move changes the
-/// objective by more than [`IDENTITY_PROBE_MIN_DELTA_OFV`]: the θ's size is then the
-/// size of the moves that matter. A probe whose objective is not a number counts as
-/// sensitive. One extra inner solve per candidate.
+/// objective by more than [`IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT`] per subject
+/// (`n_subjects`): the θ's size is then the size of the moves that matter. A probe
+/// whose objective is not a number counts as sensitive. One extra inner solve per
+/// candidate.
 ///
 /// `held(i)` is true for a θ the optimizer does not move (fixed, or frozen by the
 /// flat-θ pre-flight). `base_ofv` is the objective at the start, asked for only when
@@ -657,6 +670,7 @@ fn identity_theta_scales(
     theta: &[f64],
     theta_lower: &[f64],
     held: impl Fn(usize) -> bool,
+    n_subjects: usize,
     base_ofv: impl FnOnce() -> f64,
     mut probe_ofv: impl FnMut(usize, f64) -> f64,
 ) -> Vec<(usize, f64)> {
@@ -669,9 +683,10 @@ fn identity_theta_scales(
                 && magnitude < NEAR_ZERO_IDENTITY_THETA
         })
         .collect();
-    if candidates.is_empty() {
+    if candidates.is_empty() || n_subjects == 0 {
         return Vec::new();
     }
+    let min_delta = IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT * n_subjects as f64;
     let base = base_ofv();
     if !ofv_is_valid(base) {
         return Vec::new();
@@ -681,10 +696,48 @@ fn identity_theta_scales(
         .filter(|&i| {
             let delta = (probe_ofv(i, IDENTITY_PROBE_FRACTION * theta[i]) - base).abs();
             // `!(… <= …)`, so a `NaN` probe counts as sensitive.
-            !(delta <= IDENTITY_PROBE_MIN_DELTA_OFV)
+            !(delta <= min_delta)
         })
         .map(|i| (i, theta[i].abs()))
         .collect()
+}
+
+/// [`identity_theta_scales`] on the K-fold mixture objective (#2159).
+///
+/// The flat-θ pre-flight is skipped for a mixture (its gradient is the
+/// single-population one), but the scale question is the same and the mixture runs
+/// on the same NLopt optimizers, so the probe evaluates the objective the optimizer
+/// minimises, [`crate::estimation::mixture::mixture_ofv`], at the packed and clamped
+/// start and at each probe. One mixture evaluation for the base and one per
+/// candidate, and none when there is no candidate.
+fn mixture_identity_theta_scales(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<(usize, f64)> {
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
+    clamp_to_bounds(&mut x, &bounds);
+    let params = unpack_params(&x, init_params);
+    let ofv_at = |p: &ModelParameters| {
+        crate::estimation::mixture::mixture_ofv(model, population, p, options, None).ofv
+    };
+    identity_theta_scales(
+        &params.theta,
+        &init_params.theta_lower,
+        |i| init_params.theta_fixed.get(i).copied().unwrap_or(false),
+        population.subjects.len(),
+        || ofv_at(&params),
+        |i, value| {
+            let mut p = params.clone();
+            p.theta[i] = value;
+            ofv_at(&p)
+        },
+    )
 }
 
 /// Evaluate the population objective at the initial parameters without running

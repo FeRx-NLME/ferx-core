@@ -9139,7 +9139,8 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
 /// each probe is set per θ. θ in order: `[TVCL 0.2 (log-packed), SMALL_SENS 1e-5,
 /// SMALL_FLAT 0.001, HELD 1e-5, ZERO 0, AT_GATE 0.1, NEG_SENS -2e-3, NEG_FLAT -0.05]`.
 ///
-/// Only `SMALL_SENS` and `NEG_SENS` move the objective when halved, so only they are
+/// Ten subjects, so the bar is `10 × 0.03 = 0.3` OFV units. Only `SMALL_SENS` and
+/// `NEG_SENS` move the objective past it when halved, so only they are
 /// scaled, by `|θ₀|` (the `abs` is pinned by `NEG_SENS`). Each candidate is probed once,
 /// at half its own value; `TVCL` (log-packed), `HELD`, `ZERO` and `AT_GATE` (`|θ₀|` not
 /// below 0.1) are never probed.
@@ -9164,6 +9165,7 @@ fn identity_theta_scales_scales_only_a_near_zero_theta_the_objective_sees() {
         &theta,
         &lower,
         |i| i == 3,
+        10,
         || base,
         |i, value| {
             probed.push((i, value));
@@ -9179,17 +9181,55 @@ fn identity_theta_scales_scales_only_a_near_zero_theta_the_objective_sees() {
 }
 
 /// The decision's edges: a probe that lowers the objective counts like one that raises
-/// it, a change of exactly `IDENTITY_PROBE_MIN_DELTA_OFV` does not scale (strict `>`),
+/// it, a change of exactly the per-subject bar times the subject count does not scale
+/// (strict `>`),
 /// and a `NaN` probe — a relative move the objective cannot even score — does.
 #[test]
 fn identity_theta_scales_reads_the_size_of_the_change_and_scales_on_nan() {
-    let decide = |delta: f64| {
-        identity_theta_scales(&[1e-3], &[-1.0], |_| false, || 10.0, |_, _| 10.0 + delta)
-    };
+    const N: usize = 7;
+    let bar = IDENTITY_PROBE_MIN_DELTA_OFV_PER_SUBJECT * N as f64;
+    let decide =
+        |delta: f64| identity_theta_scales(&[1e-3], &[-1.0], |_| false, N, || 0.0, |_, _| delta);
     assert_eq!(decide(-3.0), vec![(0, 1e-3)], "a fall is sensitive too");
-    assert_eq!(decide(IDENTITY_PROBE_MIN_DELTA_OFV), vec![]);
-    assert_eq!(decide(IDENTITY_PROBE_MIN_DELTA_OFV * 1.01), vec![(0, 1e-3)]);
+    assert_eq!(decide(bar), vec![]);
+    assert_eq!(decide(bar * 1.01), vec![(0, 1e-3)]);
     assert_eq!(decide(f64::NAN), vec![(0, 1e-3)], "NaN is sensitive");
+    assert_eq!(
+        identity_theta_scales(&[1e-3], &[-1.0], |_| false, 0, || 10.0, |_, _| f64::NAN),
+        vec![],
+        "no subjects, no decision"
+    );
+}
+
+/// Replicating a population `k` times multiplies its OFV and every probe's ΔOFV by `k`
+/// without moving the minimizer, so it must not change which θ are scaled (#2159
+/// review). The slope's response is `two_cpt_oral_cov`'s measured THETA_WT ΔOFV
+/// (0.0090 over 30 subjects) and the volume's warfarin's `TVV_S` (31.4 over 10). At
+/// `k = 200` the slope's total, 1.8, is past the 1.0 an absolute bar used; per
+/// subject it is still 3.0e-4.
+#[test]
+fn identity_theta_scales_is_invariant_to_replicating_the_population() {
+    for k in [1usize, 200, 10_000] {
+        let kf = k as f64;
+        let slope = identity_theta_scales(
+            &[0.001],
+            &[-5.0],
+            |_| false,
+            30 * k,
+            || -1033.3637 * kf,
+            |_, _| (-1033.3637 + 0.0090) * kf,
+        );
+        assert_eq!(slope, vec![], "slope, k = {k}");
+        let volume = identity_theta_scales(
+            &[1e-5],
+            &[-5e-4],
+            |_| false,
+            10 * k,
+            || -182.6667 * kf,
+            |_, _| (-182.6667 + 31.4) * kf,
+        );
+        assert_eq!(volume, vec![(0, 1e-5)], "volume, k = {k}");
+    }
 }
 
 /// The base objective is evaluated only when there is a candidate, and a start whose
@@ -9201,12 +9241,13 @@ fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start
         &[0.2, 0.5],
         &[0.001, -1.0],
         |_| false,
+        1,
         || panic!("no candidate, so no base"),
         no_probe,
     );
     assert_eq!(none, vec![]);
     for base in [2e20, f64::NAN] {
-        let got = identity_theta_scales(&[1e-3], &[-1.0], |_| false, || base, no_probe);
+        let got = identity_theta_scales(&[1e-3], &[-1.0], |_| false, 1, || base, no_probe);
         assert_eq!(got, vec![], "base {base}");
     }
 }
@@ -9353,5 +9394,119 @@ fn bobyqa_reads_the_identity_theta_scale() {
         !(unit.ofv < -200.0),
         "unit: OFV {} — the fixture no longer needs the scale",
         unit.ofv
+    );
+}
+
+/// `two_cpt_oral_cov` with both exponents at 0.001 and every subject repeated 200
+/// times (6000 subjects): the same minimizer, so the slopes must still keep scale 1
+/// (#2159 review). Under the absolute 1.0-unit bar the first version used, the
+/// replicated ΔOFVs (≈ 1.8 and 1.1) both crossed it and the slopes got the 0.001
+/// scale the issue measured costing BOBYQA 14 OFV units. ~20 s in a debug build
+/// (6000 cold inner solves, three times), so nightly; the per-PR twin is
+/// `identity_theta_scales_is_invariant_to_replicating_the_population`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn preflight_keeps_a_near_zero_slope_unscaled_on_a_replicated_population() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    for i in [5, 6] {
+        model.default_params.theta[i] = 0.001;
+        model.default_params.theta_lower[i] = -5.0;
+    }
+    let mut pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    let originals = pop.subjects.clone();
+    const K: usize = 200;
+    pop.subjects = (0..K)
+        .flat_map(|r| {
+            originals.iter().map(move |s| {
+                let mut s = s.clone();
+                s.id = format!("{}_{r}", s.id);
+                s
+            })
+        })
+        .collect();
+    assert_eq!(pop.subjects.len(), 30 * K);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(
+        got.identity_scales,
+        vec![],
+        "a replicated slope keeps scale 1"
+    );
+}
+
+/// The issue's small-unit volume inside a two-class mixture
+/// (`tests/nonmem/mixture_iv.csv`, 30 subjects), next to a weight exponent started
+/// at 0.001. The flat-θ pre-flight never runs for a mixture, so the probe has its own
+/// path on the mixture objective: `TVV_S` is scaled, the exponent is not.
+#[cfg(test)]
+const NEAR_ZERO_V_MIXTURE: &str = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.001, -5.0, 5.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV_S / 1e-6 * (WT / 70)^BWT
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn a_mixture_is_probed_on_its_own_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_MIXTURE).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let p = &model.default_params;
+    assert!(p.mixture.is_some());
+    assert_eq!(p.theta_names[2], "TVV_S");
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, p, &opts),
+        vec![(2, 1e-5)],
+        "TVV_S is scaled, BWT and the zero MIXL are not"
     );
 }

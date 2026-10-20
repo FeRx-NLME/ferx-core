@@ -15,6 +15,12 @@
 //! −1199.3264 (the issue's measurement). The `parameter_scaling = none` arm keeps the
 //! all-ones vector and must still stop short: it shows the fixture has the defect.
 //!
+//! A `[mixture]` model skips the flat-θ pre-flight, so it is probed on its own
+//! objective: `tests/nonmem/mixture_iv.csv`'s two-class model with
+//! `V = TVV_S / 1e-6` stopped at 303.0625 under BOBYQA (`converged = true`) and
+//! 308.9238 under SLSQP, against the 301.5820 the plain model (`V = TVV`, NONMEM's
+//! 301.5820 too) reaches.
+//!
 //! Gate: full fits to convergence, skipped in the default PR job.
 //!
 //!   cargo test --features slow-tests --test identity_theta_near_zero
@@ -68,6 +74,35 @@ fn run(src: &str, data: &str, optimizer: Optimizer, scaling: ParameterScaling) -
         ..parsed.fit_options.clone()
     };
     fit(&parsed.model, &pop, &parsed.model.default_params, &options).expect("fit runs")
+}
+
+const MIXTURE: &str = r#"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV_S / 1e-6
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+[fit_options]
+  covariance = false
+"#;
+/// The plain mixture model's minimum (`V = TVV`, θ₀ = 10; the NONMEM anchor in
+/// `tests/mixture_nonmem.rs` is 301.5820 too).
+const MIXTURE_MIN: f64 = 301.5820;
+
+fn mixture(optimizer: Optimizer, scaling: ParameterScaling) -> FitResult {
+    run(MIXTURE, "tests/nonmem/mixture_iv.csv", optimizer, scaling)
 }
 
 fn warfarin(optimizer: Optimizer, scaling: ParameterScaling) -> FitResult {
@@ -124,6 +159,27 @@ fn an_explicit_none_still_stops_short_on_the_fixture() {
         "parameter_scaling = none reached {:.4}: the fixture no longer shows the defect",
         r.ofv
     );
+    // Measured 303.0625 with the probe off.
+    let r = mixture(Optimizer::Bobyqa, ParameterScaling::None);
+    assert!(
+        r.ofv > MIXTURE_MIN + 0.5,
+        "mixture, parameter_scaling = none reached {:.4}: the fixture no longer shows the \
+         defect",
+        r.ofv
+    );
+}
+
+/// A mixture with the small-unit volume reaches the plain model's minimum.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_mixture_reaches_the_minimum_from_a_near_zero_identity_theta() {
+    for opt in [Optimizer::Bobyqa, Optimizer::Slsqp] {
+        let r = mixture(opt, ParameterScaling::Auto);
+        assert_at_min(&r, MIXTURE_MIN, &format!("mixture {opt:?}"));
+    }
 }
 
 /// The rule must not move a near-zero O(1) slope off the unit scale: both covariate

@@ -79,19 +79,24 @@ at `0.001` is usually an O(1) slope and needs unit-sized moves.
 The value alone cannot tell the two apart, so before the outer optimizer starts,
 each free identity-packed θ with $0 < |\theta_0| < 0.1$ is moved to half its
 initial value and the objective re-evaluated (one extra inner solve per such θ).
-If that moves the OFV by more than 1 unit, the θ is divided by $|\theta_0|$ in the
-optimizer's scale vector; otherwise it keeps the unit scale. This applies to
-`bobyqa`, `slsqp`, `nlopt_lbfgs` and `mma` under the default
-`parameter_scaling = auto` and under `abs`; `none` and `rescale2` keep their own
-vectors.
+If that moves the OFV by more than 0.03 units **per subject**, the θ is divided by
+$|\theta_0|$ in the optimizer's scale vector; otherwise it keeps the unit scale.
+The bar is per subject so that a larger dataset, whose OFV differences grow with
+it, does not change the decision for a θ whose minimizer it does not change. This
+applies to `bobyqa`, `slsqp`, `nlopt_lbfgs` and `mma` under the default
+`parameter_scaling = auto` and under `abs`, `[mixture]` models included (probed on
+the mixture objective); `none` and `rescale2` keep their own vectors.
 
 Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5`
 (macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS
 at −269.47, each reporting convergence; all three now reach the minimum,
 −286.0042, the same as the plain model from `TVV = 10`. Halving `TVV_S` moves the
-OFV by ≈ 100. On `two_cpt_oral_cov` with both covariate exponents started at
-`0.001`, halving either moves the OFV by under 0.01, so neither is rescaled and
-all three optimizers still reach −1199.3264.
+OFV by 31.4 over 10 subjects (3.1 per subject). On `two_cpt_oral_cov` with both
+covariate exponents started at `0.001`, halving either moves it by under 0.01 over
+30 subjects (≤ 3e-4 per subject), so neither is rescaled and all three optimizers
+still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with
+the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
+301.58, its plain model's minimum.
 
 ## Bounds
 
