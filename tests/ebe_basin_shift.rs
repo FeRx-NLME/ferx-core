@@ -33,6 +33,12 @@
 //! #1527 to every digit quoted below; the restarted leg ends at −79.1679 with #1527 and at
 //! −79.1691 without it.
 //!
+//! **And again with #2093.** Since a curvature-free inner first step is bounded and fallback
+//! EBEs meet `inner_tol`, that subset goes straight to its optimum (−79.1679) and never traps.
+//! Subjects 5, 9, 49, 69, 106, 115, 130, 142, 156 and 174 — the one trap in 60 seeded
+//! 10-subject draws from `mm_n200.csv` (`random.Random(1565)`) — do: a genuine secondary mode,
+//! caught by the mid-leg basin probe at the trapped leg's 33rd evaluation.
+//!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
 //! file pins what a fit publishes.
@@ -76,11 +82,11 @@ fn quoted_pair(message: &str) -> (f64, f64) {
     (cold, best)
 }
 
-/// The restart path. The trapped leg ends after 44 evaluations at a point whose cold
-/// re-solve scores −74.973431, below what the optimizer saw there; the run is restarted
-/// from it — its first inner solve is cold — and reaches −79.1679, 4.2 below the trapped
-/// leg. A refit started from those estimates reproduces −79.168, so this is the optimum
-/// and not another trap.
+/// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
+/// evaluations, at a point whose cold re-solve scores 17.0648, below what the optimizer saw
+/// there; the run is restarted from it — its first inner solve is cold — and converges at
+/// 11.5047, 5.56 below the trapped leg's cold objective, with no gap left for the end-of-leg
+/// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
     let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", None);
@@ -99,16 +105,26 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
             )
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
+    // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
+    // with any rounding-level change to the gradient, while the basin it identifies sits 5.56
+    // above the optimum (11.5047) — over 250× the band.
+    let cold = notice
+        .message
+        .split("cold OFV = ")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        notice.message.contains("cold OFV = -74.973431"),
-        "the notice names the trapped leg's cold objective: {}",
+        (cold - 17.065).abs() < 0.02,
+        "the notice names the trapped leg's cold objective (≈ 17.065): {}",
         notice.message
     );
 
     assert!(
-        result.ofv < -79.1,
-        "expected the restart to reach the optimum (−79.1679); the trapped leg's cold \
-         objective is −74.9734. Got {}",
+        result.ofv < 11.6,
+        "expected the restart to reach the optimum (11.5047); the trapped leg's cold \
+         objective is ≈ 17.065. Got {}",
         result.ofv
     );
     assert!(
@@ -126,14 +142,14 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
     );
 }
 
-/// The no-restart path. At `maxiter = 4` (a 36-evaluation budget) the first leg spends
-/// its budget at a trapped point — one subject in the higher mode — so there is no budget
-/// left to restart on. Before #1565 such a fit reported `converged = true`; the gap must
-/// surface as a warning and a non-converged fit. (`maxiter = 5` no longer reaches this
-/// arm on this subset: its first leg stops after 44 of 45 evaluations and restarts.)
+/// The no-restart path. At `maxiter = 3` (a 27-evaluation budget, under the probe's first
+/// check at 32) the first leg spends its budget at a trapped point — one subject in the
+/// higher mode — so there is no budget left to restart on. Before #1565 such a fit reported
+/// `converged = true`; the gap must surface as a warning and a non-converged fit.
+/// (`maxiter = 4` no longer reaches this arm on this subset: the end-of-leg check restarts it.)
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(4));
+    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(3));
 
     let warning = result
         .warnings_structured
@@ -163,8 +179,10 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        (best - cold - 7.9121).abs() < 1e-3,
-        "measured gap 7.9121 (best-seen −67.0614, cold −74.9734): got {best} vs {cold}"
+        // Measured 9.9982 (best-seen 26.9989, cold 17.0007); a band, since the sixth decimal
+        // follows the rounding.
+        (best - cold - 10.0).abs() < 0.02,
+        "measured gap ≈ 10.00 (best-seen ≈ 27.00, cold ≈ 17.00): got {best} vs {cold}"
     );
     assert!(
         !result.converged,

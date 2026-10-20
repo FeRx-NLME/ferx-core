@@ -409,7 +409,7 @@ fn a_gaussian_observation_on_a_tte_model_is_still_validated() {
 /// PK-TTE dataset a subject can legitimately carry dose records and a TTE record
 /// but no PK sample (an early dropout, or a TTE-only arm) — and the PK path
 /// still runs for it, because the event-driven walk is driven by the event
-/// schedule and the FOCE/FOCEI sensitivity provider runs per subject regardless.
+/// schedule and the FOCE/FOCEI analytic gradient runs per subject regardless.
 /// A per-subject exemption let exactly this subject carry an unroutable dose
 /// straight back into the panics, which is strictly worse than the bug #375
 /// reports. Subject 1 supplies the PK samples; subject 2 is the dangerous one.
@@ -594,7 +594,7 @@ fn a_gaussian_bearing_subject_on_a_tte_model_still_predicts_finite() {
 }
 
 /// The IOV (`n_kappa > 0`) prediction and sensitivity funnels — `predict_iov` and the
-/// IOV analytic sensitivity providers — are structural peers of the non-IOV funnel and
+/// IOV analytic gradient path — are structural peers of the non-IOV funnel and
 /// must decline the exempt subject in lockstep. Surfaced by the PR #924 adversarial
 /// review: the original fix gated only the non-IOV path, so an analytical IOV model
 /// still panicked in the walk (value: `event_driven.rs`; gradient: `sens/propagate.rs`).

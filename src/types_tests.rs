@@ -291,7 +291,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
 fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
     // Analytical PK model with `gradient = auto` → exact FOCE gradient is
     // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
-    let m = test_helpers::analytical_model(GradientMethod::Auto);
+    let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m, true),
         Optimizer::NloptLbfgs,
@@ -3240,8 +3240,9 @@ mod theta_block_scale_guards {
     use crate::io::output::compact_theta_blocks;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
 
-    /// A gather model with `len` levels — an FD-gradient model by construction
-    /// (the analytic provider caps at `MAX_SCALE_AXES` axes).
+    /// A gather model with `len` levels. (Written when a wide one was an
+    /// FD-gradient model by construction — the pre-#2093 forward provider capped
+    /// at `MAX_SCALE_AXES` axes; the adjoint has no θ-count cap.)
     fn wide_model(len: usize) -> crate::types::CompiledModel {
         let content = format!(
             r#"
@@ -3396,43 +3397,6 @@ mod theta_block_scale_guards {
         ] {
             assert_eq!(opt.resolve_auto(&model, true), opt);
         }
-    }
-
-    #[test]
-    fn a_wide_gather_model_bails_out_of_the_analytic_dual_ladder() {
-        // The `Dual2<M>` dispatch runs `1..=MAX_SCALE_AXES` axes. A
-        // several-hundred-θ block is past the table, and the contract there is
-        // a clean decline — the caller then finite-differences that subject —
-        // never a truncation to the first 24 axes, which would be a wrong
-        // gradient nothing else in the tree could contradict.
-        let model = wide_model(400);
-        let prog = model
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .expect("program");
-        let theta = vec![1.0; model.n_theta];
-        let cov = std::collections::HashMap::from([("PLA_IDX".to_string(), 1.0)]);
-        assert!(crate::sens::ode_provider::param_derivatives_at_cov(
-            prog,
-            &model,
-            &cov,
-            &theta,
-            &[0.0]
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn a_narrow_gather_model_stays_in_analytic_sens_scope() {
-        // The gather itself must not knock a model out of scope — `∂f/∂θ_k`
-        // through it is exact under `Dual2` (pinned against finite differences
-        // in `sens::provider::tests::theta_gather_sens`).
-        let model = wide_model(3);
-        assert!(
-            crate::sens::provider::sens_supported(&model),
-            "a gather is analytically differentiable; only the axis count gates dispatch"
-        );
     }
 
     #[test]
@@ -3988,8 +3952,9 @@ fn pk_slot_rows_omit_an_unbound_individual_parameter() {
             !rows.iter().any(|&(_, i)| i == s_pos),
             "{label}: S owns no slot, so it must contribute no row: {rows:?}"
         );
-        // One row per slot — what `seed_dim_from_slots` (last row per slot wins)
-        // needs to be unambiguous.
+        // One row per slot — what `indiv_param_for_pk_slot`'s `find` by slot needs to
+        // be unambiguous (and what the pre-#2093 `seed_dim_from_slots`, last row per
+        // slot wins, needed).
         let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
         let n = slots.len();
         slots.sort_unstable();
@@ -4037,123 +4002,12 @@ fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
     assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
 }
 
-/// #1899: the structural invariants [`CompiledModel::pk_slot_rows`] has to hold on
-/// every model shape its two consumers meet, asserted as a property rather than
-/// re-derived per call site:
-///
-/// * **one row per slot** — what `seed_dim_from_slots` (last row per slot wins)
-///   needs to be unambiguous, and the whole point of the lookup;
-/// * **every name index in range** — the consumers pair a row with `tv[i]` /
-///   `sel_flat[i * n_eta ..]`, both of length `indiv_param_names.len()`;
-/// * **bounded by the program's own pair list**, which is what
-///   `sens::provider::closed_form_slot_count_supported` caps at the
-///   `const_dispatch!` table width.
-///
-/// Note what is deliberately **not** asserted: `rows.len() <= pk_indices.len()`.
-/// Review r2 #4 found it false — `pk one_cpt_iv(cl=D1, v=V)` alongside `D1 = …`
-/// gives `D1` both a role slot and a modeled-dose slot, three rows for two names
-/// — so the last case below pins that shape and the *real* bound instead. The
-/// consumers never index by row count, only by slot, so the inequality was a
-/// convenience claim rather than a requirement, and asserting a false one would
-/// have been worse than asserting none.
-///
-/// The shapes are the five that put a name somewhere other than a plain `pk(...)`
-/// role: an analytical modeled-duration `D{n}` (a real slot above `PK_IDX_LAGTIME`
-/// that `pk_indices` records as the placeholder), a Form C `y` readout and a Form B
-/// `obs_scale` (spare slots from #650 / #1898), the ODE layout (every name real),
-/// and a name carrying a role *and* a modeled-dose slot.
-#[test]
-fn pk_slot_rows_hold_their_invariants_on_every_slot_source() {
-    let cases: [(&str, &str); 5] = [
-        (
-            "analytical modeled duration",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  \
-             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
-             D1 = TVD1 * exp(ETA_D1)\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "Form C y readout",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVB(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  BASE = TVB\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [scaling]\n  y = central / V + BASE\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "Form B obs_scale",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             theta TVS(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  S = TVS\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-             [scaling]\n  obs_scale = S\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            "ODE layout",
-            "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KE = CL / V\n\
-             [structural_model]\n  ode(states=[central])\n\
-             [odes]\n  d/dt(central) = -KE * central\n\
-             [scaling]\n  y = central / V\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-        (
-            // Review r2 #4: `D1` is bound to the `cl` role *and* carries a
-            // modeled-duration slot, so it owns two rows. The exact rows are
-            // asserted in `pk_slot_rows_give_one_name_both_of_its_slots`.
-            "role plus modeled dose on one name",
-            "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-             omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
-             [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
-             [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
-        ),
-    ];
-    for (label, src) in cases {
-        let m = crate::parser::model_parser::parse_model_string(src)
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let rows = m.pk_slot_rows();
-        // The real bound: the rows are a subset of the program's own pair list,
-        // which `closed_form_slot_count_supported` caps for the fallback.
-        let prog_pairs = m
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .expect("a parsed model carries a program")
-            .pk_slots()
-            .len();
-        assert!(
-            rows.len() <= prog_pairs,
-            "{label}: rows must be a subset of the program's pairs: {} vs {prog_pairs}",
-            rows.len()
-        );
-        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
-        let n = slots.len();
-        slots.sort_unstable();
-        slots.dedup();
-        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
-        for &(_, i) in &rows {
-            assert!(
-                i < m.indiv_param_names.len(),
-                "{label}: name index {i} is past {} names",
-                m.indiv_param_names.len()
-            );
-        }
-    }
-}
-
 /// #1899: an analytical **modeled-duration** `D1` owns a real PK slot above
 /// `PK_IDX_LAGTIME` that `pk_indices` records as the placeholder `0` — CL's slot —
 /// so it is the same defect as an unbound intermediate's, on a parameter that
 /// drives the infusion window. Pins that the rows give it its own slot and leave
-/// `CL`'s to `CL`. The gradient consequence is asserted against FD in
-/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row`.
+/// `CL`'s to `CL`. The gradient consequence was asserted against FD in the pre-#2093
+/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row` (retired in #2093).
 #[test]
 fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
     let m = crate::parser::model_parser::parse_model_string(
@@ -4201,9 +4055,9 @@ fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
 ///
 /// This is the **only** check on the slot-9 row (review r4 #2): the companion
 /// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
-/// asserts FD parity for the `cl` row, but on the plain bolus it runs that row is
-/// the only one `η_D1` reaches the prediction through, so zeroing the slot-9
-/// derivative alone would leave its parity unchanged.
+/// (retired in #2093) asserted FD parity for the `cl` row, but on the plain bolus it ran
+/// that row is the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would have left its parity unchanged.
 #[test]
 fn pk_slot_rows_give_one_name_both_of_its_slots() {
     let m = crate::parser::model_parser::parse_model_string(
@@ -4271,17 +4125,14 @@ fn pk_slot_rows_keeps_its_range_guard() {
     );
 }
 
-// ── #2122: `auto` on the kappa + residual-correlation FD route ───────────────
+// ── #2122 / #2101: kappa with a residual `correlation` line is analytic ──────────────────
 mod kappa_correlation_auto_route {
     use crate::estimation::outer_optimizer::resolve_outer_optimizer;
-    use crate::sens::provider::{
-        analytic_outer_gradient_in_scope, kappa_residual_correlation_fd_route,
-    };
+    use crate::sens::provider::analytic_outer_gradient_in_scope;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM};
 
     /// A one-level compartment-free model, optionally with a kappa, a
-    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ to push the
-    /// axis count (`n_theta + n_eta + n_kappa`) past the 24-axis cap.
+    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ.
     fn src(kappa: bool, corr: bool, extra: usize) -> String {
         let extras: String = (0..extra)
             .map(|i| format!("  theta X{i}(1.0, 0.0, 10.0)\n"))
@@ -4309,166 +4160,61 @@ mod kappa_correlation_auto_route {
             .model
     }
 
-    /// Both sides of the predicate in one test. The counterfactual
-    /// `resolve_auto_given_analytic(m, false)` is "what does `auto` pick on an FD
-    /// gradient": BOBYQA off the route, L-BFGS on it. Every fixture is under
-    /// `BOBYQA_MAX_DIM`, so the #1064 arm cannot be what supplies L-BFGS.
+    /// `main`'s #2122 made `auto` take L-BFGS on this route because its gradient was
+    /// finite differences there (#2101). The adjoint serves kappa with a residual
+    /// `correlation` line exactly, so the route is analytic like its neighbours and `auto`
+    /// takes L-BFGS on the general rule, under FOCE and FOCEI alike; on a counterfactual FD
+    /// gradient all three get BOBYQA again.
     #[test]
-    fn auto_takes_lbfgs_on_the_kappa_correlation_route_and_nowhere_else() {
+    fn kappa_with_a_residual_correlation_is_analytic_and_auto_takes_lbfgs() {
         let on = model(true, true, 0);
         let kappa_only = model(true, false, 0);
         let corr_only = model(false, true, 0);
         for m in [&on, &kappa_only, &corr_only] {
             assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
+            assert!(analytic_outer_gradient_in_scope(m));
+            for interaction in [true, false] {
+                assert_eq!(
+                    Optimizer::Auto.resolve_auto(m, interaction),
+                    Optimizer::NloptLbfgs
+                );
+            }
+            assert_eq!(
+                Optimizer::Auto.resolve_auto_given_analytic(m, false),
+                Optimizer::Bobyqa
+            );
         }
-        // The straddle itself: exactly one fixture is on the route.
-        assert!(kappa_residual_correlation_fd_route(&on));
-        assert!(!kappa_residual_correlation_fd_route(&kappa_only));
-        assert!(!kappa_residual_correlation_fd_route(&corr_only));
-        // The route is FD (the scope gate reads the same predicate); the other two
-        // keep the analytic gradient and with it L-BFGS.
-        assert!(!analytic_outer_gradient_in_scope(&on));
-        assert!(analytic_outer_gradient_in_scope(&kappa_only));
-        assert!(analytic_outer_gradient_in_scope(&corr_only));
-        for m in [&on, &kappa_only, &corr_only] {
-            assert_eq!(Optimizer::Auto.resolve_auto(m, true), Optimizer::NloptLbfgs);
-        }
-        // On an FD gradient the two off-route models still get BOBYQA.
+        // The outer loop's own resolver agrees, handed the live predicate (no mixture).
         assert_eq!(
-            Optimizer::Auto.resolve_auto_given_analytic(&on, false),
-            Optimizer::NloptLbfgs,
-            "kappa + correlation on FD must take L-BFGS (#2122)"
-        );
-        assert_eq!(
-            Optimizer::Auto.resolve_auto_given_analytic(&kappa_only, false),
-            Optimizer::Bobyqa,
-            "kappa without a correlation line: unchanged"
-        );
-        assert_eq!(
-            Optimizer::Auto.resolve_auto_given_analytic(&corr_only, false),
-            Optimizer::Bobyqa,
-            "a correlation line without kappa: unchanged"
-        );
-        // The outer loop's own resolver agrees (no mixture).
-        assert_eq!(
-            resolve_outer_optimizer(Optimizer::Auto, &on, false, false).0,
+            resolve_outer_optimizer(
+                Optimizer::Auto,
+                &on,
+                false,
+                analytic_outer_gradient_in_scope(&on)
+            )
+            .0,
             Optimizer::NloptLbfgs
         );
     }
 
+    /// No finite-difference warning on the route, and none past `main`'s 24-axis
+    /// compartment-free cap either: the adjoint has no axis cap (#2093).
     #[test]
-    fn an_explicit_optimizer_is_honoured_on_the_route() {
-        let on = model(true, true, 0);
-        for opt in [
-            Optimizer::Bobyqa,
-            Optimizer::Slsqp,
-            Optimizer::Mma,
-            Optimizer::TrustRegion,
-            Optimizer::Bfgs,
+    fn no_fd_route_or_axis_cap_warning() {
+        for (k, c, e) in [
+            (true, true, 22),
+            (true, true, 0),
+            (true, false, 22),
+            (false, true, 22),
         ] {
-            assert_eq!(opt.resolve_auto(&on, true), opt);
-            assert_eq!(resolve_outer_optimizer(opt, &on, false, false), (opt, None));
-        }
-    }
-
-    const CAP_HEAD: &str = "past the 24-axis cap of the analytic gradient path, so it falls \
-                            back to finite differences.";
-    const CAP_SLOWER: &str = "The fit is correct, only slower.";
-    const CAP_REDUCE: &str = "Reduce the number of simultaneously estimated parameters, or FIX \
-                              the ones you are not estimating.";
-    const CAP_NOT_RESTORE: &str = "Reducing the number of estimated parameters would not \
-                                   restore the analytic gradient: the residual correlation \
-                                   line with kappa is finite-difference only as well (see the \
-                                   [error_model] warning).";
-    const ROUTE_REASON: &str = "[error_model]: a residual `correlation` line together with \
-                                kappa has no analytic gradient yet, so the FOCE/FOCEI outer \
-                                gradient uses finite differences (#2101).";
-    const ROUTE_ADVICE: &str = "Avoid `optimizer = bobyqa` on this route: on an MBMA model it \
-                                stopped short of the optimum, at a different objective for \
-                                each starting value of the correlation (#2122).";
-
-    fn has(m: &crate::types::CompiledModel, s: &str) -> bool {
-        m.parse_warnings.iter().any(|w| w.contains(s))
-    }
-
-    /// The warnings' input space is (over the axis cap?) × (kappa?) × (correlation?).
-    /// Each sentence is asserted on its own, present where it is true and absent
-    /// where it is not, so deleting or mis-gating any one sentence reddens a cell.
-    #[test]
-    fn fd_route_warnings_name_the_reason_in_every_cell() {
-        // 22 extra θ: 25 θ + 1 η (+ 1 κ), past the cap with or without the κ.
-        let over = 22;
-        // ((kappa, corr, extra), cap, slower + reduce, would-not-restore, route)
-        let cells = [
-            ((true, true, over), true, false, true, true),
-            ((true, false, over), true, true, false, false),
-            ((false, true, over), true, true, false, false),
-            ((true, true, 0), false, false, false, true),
-            ((true, false, 0), false, false, false, false),
-            ((false, true, 0), false, false, false, false),
-        ];
-        for ((k, c, e), cap, old_tail, not_restore, route) in cells {
             let m = model(k, c, e);
-            let cell = format!("kappa={k} corr={c} extra={e}: {:#?}", m.parse_warnings);
-            assert_eq!(has(&m, CAP_HEAD), cap, "cap sentence, {cell}");
-            assert_eq!(has(&m, CAP_SLOWER), old_tail, "'only slower', {cell}");
-            assert_eq!(has(&m, CAP_REDUCE), old_tail, "'reduce', {cell}");
-            assert_eq!(
-                has(&m, CAP_NOT_RESTORE),
-                not_restore,
-                "'would not restore', {cell}"
+            assert!(
+                !m.parse_warnings
+                    .iter()
+                    .any(|w| w.contains("finite differences") || w.contains("axis cap")),
+                "kappa={k} corr={c} extra={e}: {:#?}",
+                m.parse_warnings
             );
-            assert_eq!(has(&m, ROUTE_REASON), route, "route reason, {cell}");
-            assert_eq!(has(&m, ROUTE_ADVICE), route, "route advice, {cell}");
-        }
-    }
-
-    /// A closed-form PK and an ODE model with IOV: the route warning is not tied to the
-    /// compartment-free cap block (#2127 review finding 1, killed by moving the push
-    /// inside `if is_algebraic`). Each structure is checked on the route and off it.
-    #[test]
-    fn the_route_warning_fires_on_compartment_models_too() {
-        let structures = [
-            (
-                "pk one_cpt_iv",
-                "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n",
-            ),
-            (
-                "ode",
-                "[structural_model]\n  ode(states=[central])\n\
-                 [odes]\n  d/dt(central) = -(CL/V) * central\n\
-                 [scaling]\n  y = central / V\n",
-            ),
-        ];
-        for (name, structure) in structures {
-            for corr in [true, false] {
-                let src = format!(
-                    "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
-                     theta RHO(0.3, 0.0, 0.9)\n  omega ETA_CL ~ 0.09\n  kappa K_CL ~ 0.04\n  \
-                     sigma ADD ~ 0.25\n\
-                     [individual_parameters]\n  CL = TVCL * exp(ETA_CL + K_CL)\n  V = TVV\n\
-                     {structure}\
-                     [error_model]\n  DV ~ additive(ADD)\n{}\
-                     [fit_options]\n  iov_column = OCC\n",
-                    if corr {
-                        "  correlation car1(RHO) by OCC\n"
-                    } else {
-                        ""
-                    },
-                );
-                let m = crate::parser::model_parser::parse_full_model(&src)
-                    .unwrap()
-                    .model;
-                assert!(!m.is_algebraic(), "{name}: has compartments");
-                assert_eq!(kappa_residual_correlation_fd_route(&m), corr, "{name}");
-                let cell = format!("{name} corr={corr}: {:#?}", m.parse_warnings);
-                assert_eq!(has(&m, ROUTE_REASON), corr, "route reason, {cell}");
-                assert_eq!(has(&m, ROUTE_ADVICE), corr, "route advice, {cell}");
-                assert!(
-                    !has(&m, CAP_HEAD),
-                    "no cap warning off the algebraic path, {cell}"
-                );
-            }
         }
     }
 }

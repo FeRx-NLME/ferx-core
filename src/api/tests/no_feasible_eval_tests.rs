@@ -156,6 +156,13 @@ fn two_subjects() -> Population {
     }
 }
 
+/// The inner budget that starves this fixture: every trial's EBEs come back unconverged, so the
+/// EBE guard rejects every outer trial. It was 3 (and 1 on the BOBYQA arm) until #2093. Since
+/// then the fallback certificate takes the Newton step it computes, within the caller's
+/// `inner_maxiter`, and on this one-η closed form one step reaches the mode, so any budget of 1
+/// or more converges the EBE and the run is feasible. At 0 nothing moves the start.
+const STARVED: usize = 0;
+
 /// `inner_maxiter` is the only thing that differs between the two arms below.
 /// `parse_model_string` drops a `[fit_options]` block, so every option the fit
 /// depends on is set here rather than in the model text.
@@ -242,7 +249,7 @@ const OMEGA_MIDPOINT: f64 = 1.0;
 fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
     let model = starvable_model();
     let pop = two_subjects();
-    let result = fit(&model, &pop, &model.default_params, &opts(3)).expect("fit");
+    let result = fit(&model, &pop, &model.default_params, &opts(STARVED)).expect("fit");
 
     // (1) The fixture still produces the defect's input: the guard really did reject
     //     on unconverged subjects.
@@ -568,7 +575,7 @@ fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
     let options = FitOptions {
         optimizer: Optimizer::Mma,
         outer_maxiter: 1,
-        ..opts(3)
+        ..opts(STARVED)
     };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
@@ -766,7 +773,7 @@ fn an_infeasible_run_writes_no_checkpoint() {
         &model,
         &pop,
         &model.default_params,
-        &opts(3),
+        &opts(STARVED),
     );
     crate::io::checkpoint::abandon();
 
@@ -828,7 +835,7 @@ fn an_infeasible_derivative_free_run_also_reports_its_start() {
     let pop = two_subjects();
     let options = FitOptions {
         optimizer: Optimizer::Bobyqa,
-        ..opts(1)
+        ..opts(STARVED)
     };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
@@ -930,7 +937,7 @@ fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
         1e12 + 37.0,
     );
 
-    let options = resuming_opts(&path, 3);
+    let options = resuming_opts(&path, STARVED);
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
     crate::io::checkpoint::abandon();
     crate::io::checkpoint::remove(&path);

@@ -2541,10 +2541,10 @@ fn classify_indiv_params(
                 // must not produce an `EtaParamInfo`. `__ferx_ro_eta{k} = ETA(k)` is a bare
                 // `Expression::Eta`, which `classify_expr` has no pattern for, so it would fall
                 // to the `Custom` arm below and surface in `FitResult.eta_param_info` (hence
-                // ferx-r's parameter table) under a name the user never wrote. Worse, a single
-                // `Custom` entry flips `resolve_param_derivs` / `subject_eta_grad`'s
+                // ferx-r's parameter table) under a name the user never wrote. Worse (before
+                // #2093), a single `Custom` entry flipped the retired `resolve_param_derivs`
                 // "all LogNormal" fallback to `None`, dropping the whole model to FD whenever
-                // the program path is unavailable. Applies to both engines: the ODE half of
+                // the program path was unavailable. Applies to both engines: the ODE half of
                 // this desugaring has appended such statements since #631, and
                 // `classify_indiv_params` runs after both append sites (PR #950 review #4).
                 if is_synthetic_readout_param(param_name) {
@@ -3045,10 +3045,10 @@ fn leaf_scales(
     out
 }
 
-/// Whether the closed-form log-normal η chain the sensitivity providers fall
-/// back to is **exact** for this model (#1669 review finding 1).
+/// Whether the closed-form log-normal η chain the pre-#2093 forward sensitivity
+/// providers fell back to is **exact** for this model (#1669 review finding 1).
 ///
-/// That chain (`lognormal_param_derivatives`) computes `∂p_i/∂η_k =
+/// That chain (the retired `lognormal_param_derivatives`) computed `∂p_i/∂η_k =
 /// p_i · sel_flat[i, k]`, i.e. it assumes every individual parameter is
 /// `g(θ, cov) · exp(η)` with its one BSV η written directly in its own
 /// assignment and recorded in `eta_map`. It used to be gated on "every
@@ -4276,7 +4276,7 @@ pub fn parse_full_model_with(
     // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
     // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
     // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
-    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // mapped PK slot out of the individual-parameter program's `pk_slots_ref`, so
     // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
     // follow-up). Rewriting the binding to reference the synthetic parameter makes the
     // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
@@ -5036,8 +5036,8 @@ pub fn parse_full_model_with(
         // their allocated slot instead of aliasing `CL` via the `unwrap_or(0)`.
         // The modeled-dose `D{cmt}`/`R{cmt}` pairs (#324) are skipped: they were
         // never in `pk_param_map`, so this vector has always given them `0`, and
-        // `analytical_supported` keys its FD routing on the slots it sees here —
-        // keeping them out keeps that routing exactly as it was.
+        // the pre-#2093 `analytical_supported` predicate keyed its FD routing on the
+        // slots it saw here — keeping them out keeps this vector exactly as it was.
         let modeled: Vec<usize> = analytical_modeled_slots.iter().map(|(_, s)| *s).collect();
         (0..indiv_var_names.len())
             .map(|var_slot| {
@@ -5848,7 +5848,7 @@ pub fn parse_full_model_with(
         // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the user
         // omitted `obs_cmt=`) with the parsed Single/PerCmt readout. Analytic
         // (#650): store the readout on `model.analytic_readout`, where the
-        // closed-form predictor and the analytic sensitivity provider pick it up
+        // closed-form predictor and the adjoint gradient pick it up
         // (analytical models have `ode_spec == None`).
         if let Some(new_readout) = output_fn {
             if is_ode_model {
@@ -5909,49 +5909,6 @@ pub fn parse_full_model_with(
 
         register_referenced_covariates(&mut model.referenced_covariates, scaling_covariates);
         model.scaling = scaling;
-    }
-
-    // A compartment-free model past the analytic axis cap (#811) routes to finite
-    // differences. That is correct, just slower — but silently slower: nothing else
-    // tells the user, and "my fit got sluggish when I added a covariate effect" is
-    // not a debuggable symptom. Name both numbers so the cause is visible, and say
-    // which direction to move.
-    //
-    // A residual `correlation` line with kappa is a second, independent FD route
-    // (#2101). On it the cap warning's advice is wrong — shrinking the parameter count
-    // leaves the gradient FD — and so is "only slower" (#2122: BOBYQA stopped at a
-    // different OFV per start ρ), so that cell names the cap alone and defers to the
-    // route's own warning, which also covers a model under the cap or with ODEs.
-    let kappa_corr_fd = crate::sens::provider::kappa_residual_correlation_fd_route(&model);
-    if is_algebraic {
-        let axes = model.n_theta + model.n_eta + model.n_kappa;
-        let cap = crate::sens::algebraic::MAX_ALGEBRAIC_AXES;
-        if axes > cap {
-            let tail = if kappa_corr_fd {
-                "Reducing the number of estimated parameters would not restore the analytic \
-                 gradient: the residual correlation line with kappa is finite-difference only \
-                 as well (see the [error_model] warning)."
-            } else {
-                "The fit is correct, only slower. Reduce the number of simultaneously \
-                 estimated parameters, or FIX the ones you are not estimating."
-            };
-            model.parse_warnings.push(format!(
-                "[structural_model]: this model estimates {axes} parameters (theta + eta{}), \
-                 past the {cap}-axis cap of the analytic gradient path, so it falls back to \
-                 finite differences. {tail} See issue #811.",
-                if model.n_kappa > 0 { " + kappa" } else { "" },
-            ));
-        }
-    }
-    if kappa_corr_fd {
-        model.parse_warnings.push(
-            "[error_model]: a residual `correlation` line together with kappa has no analytic \
-             gradient yet, so the FOCE/FOCEI outer gradient uses finite differences (#2101). \
-             Avoid `optimizer = bobyqa` on this route: on an MBMA model it stopped short of the \
-             optimum, at a different objective for each starting value of the correlation \
-             (#2122)."
-                .to_string(),
-        );
     }
 
     // Covariate-selected [error_model] (issue #658): the selector's covariates
@@ -11048,7 +11005,7 @@ fn parse_scaling_key(key: &str) -> Result<(&str, Option<usize>), String> {
 ///
 /// Single source of truth for the `obs_scale` (issue #367) and `init` amount
 /// (issue #524) programs — they share the same axis layout, so they must lower
-/// identically or the analytic provider would differentiate the two on
+/// identically or the analytic gradient would differentiate the two on
 /// inconsistent ABIs. A `Variable(name)` (an individual parameter) → var slot `i`
 /// (flat PK slot `pk_indices[i]`); covariates → sorted cov slots; θ/η are read
 /// directly from the seed duals. The input `expr` is cloned, so the caller keeps
@@ -11197,7 +11154,7 @@ fn build_obs_scale_spec(
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
     // Differentiable scale program (issue #367): compile the same expression to
-    // bytecode so the analytic sensitivity provider can differentiate `f / scale`
+    // bytecode so the analytic (adjoint) gradient can differentiate `f / scale`
     // exactly instead of finite-differencing the opaque closure. Shared lowering
     // with the `init` amount program (issue #524) — see `compile_scale_deriv_program`.
     let deriv = Some(compile_scale_deriv_program(
@@ -11349,7 +11306,7 @@ fn build_init_amount_fn(
     // Build the differentiable `A₀` program from a (possibly resolved) expression
     // AST. Shares the `obs_scale` lowering (`compile_scale_deriv_program`) so the
     // init impulse and the scale divisor differentiate on the same ABI; this lets
-    // the analytic sensitivity provider differentiate the init impulse exactly
+    // the analytic (adjoint) gradient differentiate the init impulse exactly
     // (issue #524) instead of finite-differencing `amount_fn`.
     let build_deriv = |expr: &Expression| -> ScaleDerivProgram {
         compile_scale_deriv_program(expr, theta_names, eta_names, indiv_var_names, pk_indices)
@@ -11707,7 +11664,7 @@ pub(crate) fn build_y_output_fn(
     // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
     // back to `Variable(synthetic_name)`. The readout then compiles to `Op::PushVar`
     // and its θ/η dependence rides the individual-parameter sensitivity chain — so the
-    // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
+    // analytic gradient serves it instead of dropping the subject to FD. Any θ/η left
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
     visit_expr_nodes(&expr, &mut |e| {
@@ -11970,7 +11927,7 @@ fn parse_scaling_block(
     let mut y_per_cmt: HashMap<usize, crate::ode::PerCmtReadout> = HashMap::new();
     // Sensitivity program for the uniform `y = <expr>` readout (issue #367). The
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
-    // so the analytic-sensitivity provider can differentiate each endpoint.
+    // so the analytic (adjoint) gradient can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
     let mut scaling_covariates: Vec<String> = Vec::new();
     // Synthetic readout parameters the `y` lines read after the #486/#1636 rewrite.
@@ -12276,7 +12233,10 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
     // Detect the `ode_template NAME(params)` line (and reject mixing it with a
     // `pk`/`ode(...)` disposition) in a scope that releases the immutable borrow
     // before the block rewrites below.
-    let tmpl_re = Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap();
+    static TMPL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap()
+    });
+    let tmpl_re = &*TMPL_RE;
     let (model_name, params_str) = {
         let struct_lines = match extracted.unnamed.get("structural_model") {
             Some(l) => l,
@@ -12724,9 +12684,13 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
 fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     // ode(obs_cmt=central, states=[depot, central])   — classic form
     // ode(states=[depot, central])                    — Form C: requires [scaling] y = ...
-    let with_obs =
-        Regex::new(r"ode\(\s*obs_cmt\s*=\s*(\w+)\s*,\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
-    let without_obs = Regex::new(r"ode\(\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
+    static WITH_OBS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"ode\(\s*obs_cmt\s*=\s*(\w+)\s*,\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap()
+    });
+    let with_obs = &*WITH_OBS_RE;
+    static WITHOUT_OBS_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"ode\(\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap());
+    let without_obs = &*WITHOUT_OBS_RE;
     for line in lines {
         if let Some(caps) = with_obs.captures(line) {
             let obs_cmt = caps[1].to_string();
@@ -14659,6 +14623,77 @@ fn build_ode_spec(
             (*state_idx, params)
         })
         .collect();
+    // Each `init(state) = …` compiled to the readout's evaluator, so a dual walk seeds the
+    // initial state by evaluating the expression itself on its own number type — exact,
+    // where the opaque `init_fn` closure could only be differenced. The layout mirrors
+    // that closure: states (all 0 at the time origin) then individual parameters, every
+    // name under each case the closure binds; `MACHEPS` is its constant; covariates are
+    // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
+    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
+    // comes from the class being evaluated) or a name the layout does not bind.
+    let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
+        .then(|| {
+            let mut var_idx: HashMap<String, usize> = HashMap::new();
+            for (i, n) in state_names.iter().enumerate() {
+                var_idx.insert(n.clone(), i);
+                var_idx.insert(n.to_lowercase(), i);
+            }
+            for (i, n) in indiv_names_owned.iter().enumerate() {
+                for v in [n.clone(), n.to_uppercase(), n.to_lowercase()] {
+                    var_idx.insert(v, state_count + i);
+                }
+            }
+            init_specs
+                .iter()
+                .map(|(state_idx, expr)| {
+                    let mut e = expr.clone();
+                    let mut mixnum = false;
+                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
+                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
+                            *node = Expression::Literal(f64::EPSILON)
+                        }
+                        Expression::MixNum => mixnum = true,
+                        _ => {}
+                    });
+                    resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
+                    let mut unresolved = false;
+                    visit_expr_nodes(&e, &mut |node| {
+                        if matches!(node, Expression::VariableIdx(usize::MAX)) {
+                            unresolved = true;
+                        }
+                    });
+                    if mixnum || unresolved {
+                        return None;
+                    }
+                    let bc = compile_bytecode(&e);
+                    let dual_evaluable = !bc.ops.iter().any(|op| {
+                        matches!(
+                            op,
+                            Op::PushTheta(_)
+                                | Op::PushEta(_)
+                                | Op::PushThetaGather(_)
+                                | Op::PushNnOutput(_, _)
+                        )
+                    });
+                    let prog = OdeOutputProgram {
+                        bc,
+                        n_states: state_count,
+                        n_indiv: indiv_count,
+                        indiv_to_pk: indiv_to_params_slot.clone(),
+                        cov_names: Vec::new(),
+                        dual_evaluable,
+                    };
+                    dual_evaluable.then_some((*state_idx, prog))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
+    // A bare `TIME` reads the model-time thread-local (`Op::PushTime`, #610), which is an
+    // `f64`; the time slot holds the same clock. Reading the slot instead lets a dual
+    // evaluation carry a time offset (`OdeRhsProgram::eval_rhs_g`'s `dt`) through every
+    // clock spelling, which the moving-boundary flows need; the `f64` value is unchanged.
+    // The flags above were read off the original statements.
+    rewrite_push_time_to_slot(&mut stmts_owned, time_slot);
     // Lift the parameter-only subexpressions out of the RK stages. Individual
     // parameters and `MACHEPS` are the slots that stay fixed across the calls of
     // one integration; `build_rhs_hoist` drops any the program itself assigns.
@@ -14677,7 +14712,7 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
     );
-    let rhs_program = OdeRhsProgram {
+    let mut rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
         state_count,
@@ -14695,12 +14730,20 @@ fn build_ode_spec(
         has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         init_indiv_reads,
+        init_program,
         hoist: rhs_hoist,
         binding,
+        columns: None,
     };
 
-    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
-        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+    // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
+    // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
+    let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
+        Some(h) => &h.stmts,
+        None => &stmts_owned,
+    });
+    let rhs_eval = std::sync::Arc::new(
+        move |u: &[f64], params: &[f64], t: f64, sink: RhsSink<'_>| -> bool {
             // The RHS always reserves two trailing slots for dose-time anchors:
             // TAFD at MAX_PK_PARAMS and TAD at MAX_PK_PARAMS + 1. Passing a bare
             // PkParams::values array (which ends at MAX_PK_PARAMS) turns either
@@ -14797,16 +14840,6 @@ fn build_ode_spec(
                     }
                 }
 
-                // Reset du so a state without a firing d/dt this iteration
-                // (e.g. inside an untaken if-branch) gets 0.0 rather than
-                // stale memory. The lean binding proved every path writes all
-                // `state_count` of them; a `du` of another length keeps the reset.
-                if binding.zero || du.len() != state_count {
-                    for slot in du.iter_mut() {
-                        *slot = 0.0;
-                    }
-                }
-
                 let empty_theta: [f64; 0] = [];
                 let empty_eta: [f64; 0] = [];
                 let empty_cov: [f64; 0] = [];
@@ -14831,18 +14864,58 @@ fn build_ode_spec(
                     }
                     None => &stmts_owned,
                 };
-                eval_statements_indexed_with_stack(
-                    run_stmts,
-                    &empty_theta,
-                    &empty_eta,
-                    &empty_cov,
-                    &mut scratch.rhs_vars,
-                    Some(du),
-                    &empty_nn_outputs,
-                    &mut scratch.bc_stack,
-                );
-            });
-        });
+                match sink {
+                    RhsSink::Value(du) => {
+                        // Reset du so a state without a firing d/dt this iteration
+                        // (e.g. inside an untaken if-branch) gets 0.0 rather than
+                        // stale memory. The lean binding proved every path writes all
+                        // `state_count` of them; a `du` of another length keeps the reset.
+                        if binding.zero || du.len() != state_count {
+                            for slot in du.iter_mut() {
+                                *slot = 0.0;
+                            }
+                        }
+                        eval_statements_indexed_with_stack(
+                            run_stmts,
+                            &empty_theta,
+                            &empty_eta,
+                            &empty_cov,
+                            &mut scratch.rhs_vars,
+                            Some(du),
+                            &empty_nn_outputs,
+                            &mut scratch.bc_stack,
+                        );
+                        true
+                    }
+                    RhsSink::Columns { cols, out } => {
+                        rhs_lanes_ok
+                            && eval_rhs_columns(
+                                run_stmts,
+                                &scratch.rhs_vars,
+                                &u[..copy_n],
+                                state_count,
+                                cols,
+                                out,
+                            )
+                    }
+                }
+            })
+        },
+    );
+    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> = {
+        let e = rhs_eval.clone();
+        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+            e(u, params, t, RhsSink::Value(du));
+        })
+    };
+    let rhs_columns: Option<RhsColumnsFn> = rhs_lanes_ok.then(|| -> RhsColumnsFn {
+        Box::new(
+            move |u: &[f64], params: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
+                rhs_eval(u, params, t, RhsSink::Columns { cols, out })
+            },
+        )
+    });
+    rhs_program.columns = rhs_columns;
 
     // Build the init_fn closure from the extracted `init(state) = expr`
     // directives. It mirrors the RHS variable binding: each individual parameter
@@ -15506,12 +15579,16 @@ fn strip_line_comment(line: &str) -> &str {
 /// Shared by `parse_model_name` (the preamble reader) and `extract_blocks` (the
 /// in-block guard) so the two cannot disagree on what a declaration looks like.
 fn model_name_declaration(trimmed: &str) -> Option<&str> {
-    let re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
+    static MODEL_NAME_DECLARATION_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap());
+    let re = &*MODEL_NAME_DECLARATION_RE;
     re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
 }
 
 fn parse_model_name(content: &str) -> Result<String, String> {
-    let header_re = Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap();
+    static HEADER_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap());
+    let header_re = &*HEADER_RE;
     let mut name: Option<String> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = strip_line_comment(line).trim();
@@ -15575,7 +15652,9 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
     // Anchor on the whole line so things like `states=[central]` inside an
     // ODE structural definition aren't misread as a block-tag opener.
-    let block_re = Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap();
+    static BLOCK_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap());
+    let block_re = &*BLOCK_RE;
 
     // current_target: either an unnamed block name, or a (block_type, instance) pair.
     enum BlockTarget {
@@ -16051,16 +16130,21 @@ fn parse_mixture_block(
 ) -> Result<crate::types::MixtureSpec, String> {
     use crate::types::{MixingExpr, MixtureClassOverride, MixtureSpec};
 
-    let nsub_re = Regex::new(r"(?i)^nsub\s*=\s*(\d+)$").unwrap();
-    let mix_re = Regex::new(r"(?i)^(logit|p)\s*\(\s*(\d+)\s*\)\s*=\s*(.+)$").unwrap();
+    static NSUB_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^nsub\s*=\s*(\d+)$").unwrap());
+    let nsub_re = &*NSUB_RE;
+    static MIX_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^(logit|p)\s*\(\s*(\d+)\s*\)\s*=\s*(.+)$").unwrap()
+    });
+    let mix_re = &*MIX_RE;
     // `omega(k) NAME ~ var [FIX] [(sd|var)] [FIX]` — mirrors the base omega/sigma
     // regexes in `parse_parameters`, prefixed with the `(k)` class selector.
-    let ov_re = Regex::new(
-        &format!(
+    static OV_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let ov_re = &*OV_RE;
 
     let mut nsub: Option<usize> = None;
     let mut mixing: Vec<MixingExpr> = Vec::new();
@@ -16592,10 +16676,10 @@ fn parse_parameters(
     // — `PL = PLACEBO[PLA_IDX]` — so declaration and use match. What makes
     // hundreds of levels tractable is that the reference is a *gather*, which
     // occupies a single `PkParams` slot rather than one per level.
-    let theta_re = Regex::new(
-        r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",
-    )
-    .unwrap();
+    static THETA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?\s*$",).unwrap()
+    });
+    let theta_re = &*THETA_RE;
 
     // omega NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -16617,12 +16701,12 @@ fn parse_parameters(
     // `~ 0.002 (ſd)` with `ferx check` reporting VALID (#1388 review round 3 #3).
     // The grammar and the read-back now agree, and `(ſd)` is an unrecognized
     // line. Every tag group splices the one `SCALE_TAG_GROUP`.
-    let omega_re = Regex::new(
-        &format!(
+    static OMEGA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let omega_re = &*OMEGA_RE;
 
     // block_omega (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     //
@@ -16640,12 +16724,12 @@ fn parse_parameters(
     // (#1388 review round 3 #8). Group 3 is `FIX`; group 5, a `FIX` after the
     // tag, sits *inside* the tag group so both `] FIX (sd)` and `] (sd) FIX`
     // classify while `] FIX FIX` — no tag at all — still matches nothing.
-    let block_omega_re = Regex::new(
-        &format!(
+    static BLOCK_OMEGA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_omega_re = &*BLOCK_OMEGA_RE;
 
     // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
     //
@@ -16653,12 +16737,12 @@ fn parse_parameters(
     // converted to fixed correlations so the existing positive sigma
     // parameterization remains intact.
     // Same group layout as `block_omega_re`, tag in group 4.
-    let block_sigma_re = Regex::new(
-        &format!(
+    static BLOCK_SIGMA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_sigma_re = &*BLOCK_SIGMA_RE;
 
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -16668,30 +16752,30 @@ fn parse_parameters(
     // and likelihood code (which work in SD) need no changes.
     // FIX may appear before or after the scale annotation (same group layout
     // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
-    let sigma_re = Regex::new(
-        &format!(
+    static SIGMA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let sigma_re = &*SIGMA_RE;
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
-    let kappa_re = Regex::new(
-        &format!(
+    static KAPPA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let kappa_re = &*KAPPA_RE;
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     // Same group layout as `block_omega_re`, tag in group 4.
-    let block_kappa_re = Regex::new(
-        &format!(
+    static BLOCK_KAPPA_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!(
             r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
-        ),
-    )
-    .unwrap();
+        ),).unwrap()
+    });
+    let block_kappa_re = &*BLOCK_KAPPA_RE;
 
     // level NAME by COLUMN in PARENT  (#1082: a nested variability level below ID)
     let level_re = Regex::new(r"(?i)^\s*level\s+(\w+)\s+by\s+(\w+)\s+in\s+(\w+)\s*$").unwrap();
@@ -16775,6 +16859,17 @@ fn parse_parameters(
             let (default_lower, default_upper) = if profiled {
                 check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
                 (f64::NEG_INFINITY, f64::INFINITY)
+            } else if matches!(
+                &block,
+                Some(ThetaBlockSpec::Columns { contrast, .. })
+                    if *contrast != LevelContrast::Unconstrained
+            ) {
+                // #2174: a constrained block's free θ are contrast coefficients, which
+                // have no sign, and its init must be 0 (`validate_constrained_level_init`).
+                // The positive box below would log-pack a θ that starts at 0, so its
+                // default is sign-free. `auto` never resolves to `none`, so whether a
+                // block is constrained is fixed here, by its declaration.
+                (-1e9, 1e9)
             } else {
                 (1e-9, 1e9)
             };
@@ -16824,7 +16919,7 @@ fn parse_parameters(
                             let binding = level_bindings.get(&name);
                             if let Some(binding) = binding {
                                 validate_constrained_level_init(
-                                    &name, binding, init, lower, upper,
+                                    &name, binding, init, lower, upper, fixed,
                                 )?;
                             }
                             let (levels, theta_names) = match binding {
@@ -17454,12 +17549,21 @@ fn build_level_rules(
 /// shared initializer can therefore represent every level only at zero; the
 /// declared bounds apply to the remaining free contrast coefficients, not to
 /// the derived negative sum.
+///
+/// The free coefficients start at 0 and have no sign, so 0 must lie strictly inside
+/// their bounds (#2178 review r1 #3). A bound *at* 0 holds every coefficient to one
+/// sign and starts the fit on that bound; at a lower bound of 0 the coefficients are
+/// also log-packed (`theta_packs_log`), so they start at the packing floor, not at 0.
+/// With this rule no constrained free θ is ever log-packed. A `FIX` block is not
+/// estimated, so its bounds neither constrain nor pack anything, and it is exempt
+/// from that rule (#2178 review r2 #5).
 fn validate_constrained_level_init(
     name: &str,
     binding: &LevelBinding,
     init: f64,
     lower: f64,
     upper: f64,
+    fixed: bool,
 ) -> Result<(), String> {
     if binding.contrast == LevelContrast::Unconstrained {
         return Ok(());
@@ -17475,7 +17579,22 @@ fn validate_constrained_level_init(
             "theta {name}[...]: constrained level bounds must include 0 (got {lower}..{upper})"
         ));
     }
-    Ok(())
+    let (side, inside) = if fixed {
+        return Ok(());
+    } else if lower == 0.0 {
+        ("lower", "below")
+    } else if upper == 0.0 {
+        ("upper", "above")
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "theta {name}[...]: a constrained level block's {side} bound cannot be 0 (got \
+         {lower}..{upper}). Its free θ are contrast coefficients, which start at 0 and have \
+         no sign, so a bound at 0 holds every one of them to one sign and starts the fit on \
+         that bound. Write no bounds for the sign-free default (-1e9..1e9), or a {side} \
+         bound {inside} 0."
+    ))
 }
 
 // --- Build omega matrix from diagonal + block specs ---
@@ -18080,7 +18199,9 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
     // read `zpk one_cpt_iv(cl=CL, v=V)` as a valid `one_cpt_iv` declaration
     // (#811). `classify_structural_line` rejects such a line before this runs;
     // the anchor keeps the two from drifting.
-    let pk_re = Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap();
+    static PK_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap());
+    let pk_re = &*PK_RE;
 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
@@ -18604,7 +18725,9 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
                 .to_string(),
         );
     }
-    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap();
+    static LOG_LHS_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap());
+    let log_lhs_re = &*LOG_LHS_RE;
     if log_lhs_re.is_match(body) {
         return Err(
             "[error_model] log-transform-both-sides (`log(DV) ~ …`) is not supported inside a \
@@ -18612,7 +18735,9 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
                 .to_string(),
         );
     }
-    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap();
+    static PARSE_ERROR_ENDPOINT_BODY_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap());
+    let re = &*PARSE_ERROR_ENDPOINT_BODY_RE;
     let caps = re.captures(body).ok_or_else(|| {
         format!(
             "[error_model] expected a single `DV ~ TYPE(...)` statement inside an if/else branch, \
@@ -18929,11 +19054,13 @@ const CORRELATION_KINDS: &[(&str, crate::types::ResidualSerialKind)] = &[
 fn split_correlation_line(
     lines: &[String],
 ) -> Result<(Vec<String>, Option<CorrelationDecl>), String> {
-    let head = Regex::new(r"(?i)^\s*correlation\b").unwrap();
-    let full = Regex::new(
-        r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",
-    )
-    .unwrap();
+    static HEAD_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*correlation\b").unwrap());
+    let head = &*HEAD_RE;
+    static FULL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",).unwrap()
+    });
+    let full = &*FULL_RE;
     let mut rest = Vec::with_capacity(lines.len());
     let mut decl: Option<CorrelationDecl> = None;
     for line in lines {
@@ -19084,18 +19211,27 @@ fn parse_error_model_inner(
     // expressions with their own nested parens — `combined(PROP*(if (TIME>24)
     // T else 1), ADD)` (#484) — survive intact; top-level commas are split out
     // below with `split_top_level_args`.
-    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
+    static PARSE_ERROR_MODEL_INNER_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap());
+    let re = &*PARSE_ERROR_MODEL_INNER_RE;
     // LTBS LHS `log(DV) ~ TYPE(SIGMA)` — captures the logged data column,
     // the error type, and the sigma list.
-    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
-    let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
+    static LOG_LHS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap()
+    });
+    let log_lhs_re = &*LOG_LHS_RE;
+    static CMT_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap());
+    let cmt_re = &*CMT_RE;
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them,
     // and the `power(...)` exponent expression when the line is that form.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
     // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
-    let iiv_re = Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap();
+    static IIV_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
+    let iiv_re = &*IIV_RE;
     let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
@@ -19748,7 +19884,7 @@ fn compile_ruv_mag_deriv_program(
     // front — so without a reserved slot here, `resolve_expr_indices` would map
     // `MACHEPS` to `VariableIdx(usize::MAX)`, which silently evaluates to `0.0`
     // instead of `f64::EPSILON` (mirrors the ODE var builder's `macheps_slot`).
-    // Slot 2 = `TAD` (#1182), fed per observation by `theta_grad`.
+    // Slot 2 = `TAD` (#1182), fed per observation through `eval_g`'s `tad` argument.
     let mut var_idx: HashMap<String, usize> = [
         ("MACHEPS".to_string(), 1),
         ("macheps".to_string(), 1),
@@ -20281,7 +20417,7 @@ fn build_pk_param_fn(
     // #650: merge readout-referenced non-structural individual parameters into the
     // structural mapping, so they are written by the closure below AND land in the
     // program's `pk_var_slots` (line 9142 clones `pk_assignment_mapping`) — giving
-    // the analytic sensitivity provider their exact `∂/∂(θ,η)` for the readout.
+    // the analytic (adjoint) gradient their exact `∂/∂(θ,η)` for the readout.
     for (var_name, pk_slot) in readout_extra_slots {
         if let Some(var_slot) = var_idx
             .get(var_name)
@@ -20352,7 +20488,7 @@ fn build_pk_param_fn(
         // slots (#486). The latter are not read by the closed-form kernels, but the
         // analytic-sensitivity chain needs their `∂/∂(θ,η)` (+ 2nd order) rows so the
         // event-driven walk can seed the modeled infusion rate/window dual
-        // (`pk_slot_dual_outer` looks the slot up in `pk_slots`). Appended after the
+        // (the adjoint's `taped_params` maps the slot through `pk_var_slots`). Appended after the
         // structural slots so the row order stays stable; empty for a model with no
         // modeled dose, so this is a no-op there. A fixed-dose subject of such a model
         // routes to superposition, where the extra slot is seeded but unread (its
@@ -21456,43 +21592,12 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
 
 thread_local! {
     /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
-    /// evaluator. See [`ModelNnGuard`].
+    /// evaluator. Its installer (`ModelNnGuard`) was retired with the forward provider
+    /// (#2093), so it is empty in practice; the adjoint supplies NN outputs on its own
+    /// number type through `ModelNnDualGuard`.
     static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
-
-/// RAII guard supplying `[covariate_nn]` outputs to
-/// [`eval_statements_g`] for the duration of a scope, mirroring
-/// [`ModelTimeGuard`] for the `TIME` built-in.
-///
-/// # Why a thread-local rather than a parameter
-///
-/// `Op::PushNnOutput` needs the network's forward output, which the `f64`
-/// `pk_param_fn` closure already computes once per call from its captured NN
-/// handles. The generic evaluator has no such closure — it is handed a compiled
-/// [`IndivParamProgram`], which carries statements and layout but no network — so
-/// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
-/// slice and pushed **0.0**. An NN output silently read as zero is precisely the
-/// class of defect AGENTS.md's routing rule exists to prevent, and it was reachable
-/// the moment any gate stopped excluding `[covariate_nn]` models from a
-/// program-driven analytic path.
-///
-/// Threading a parameter instead would touch eight recursive call sites in the hot
-/// inner-loop evaluator. `TIME` faced the same choice and resolved it the same way,
-/// so this follows the established seam rather than inventing a second convention.
-///
-/// # What it is *not* for
-///
-/// On its own, the outputs are lifted as **constants** on every dual axis. That is
-/// exact for `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a
-/// way to get `∂/∂θ` for NN weights — those derivatives are zero under this guard
-/// alone, which is why only η-gradient paths may use it bare. The θ-chain for the
-/// weights comes from one of two places: the fixed-η estimators use
-/// [`crate::estimation::nn_theta_gradient`]; the FOCE/FOCEI event-driven walk pairs this
-/// guard with a [`ModelNnAxisGuard`], which seeds each output on a dual axis of its own
-/// so `∂p/∂z` falls out of the program walk and is chained to the weights through the
-/// network's backprop Jacobian (#1300).
-pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
 
 thread_local! {
     /// First dual axis of the `[covariate_nn]` output block for the generic evaluator,
@@ -21509,7 +21614,8 @@ fn current_nn_axis_base() -> Option<usize> {
 /// RAII guard that makes the generic evaluator seed every `[covariate_nn]` output as an
 /// **independent dual variable**: output `flat` (networks in `covariate_nns` order, each
 /// network's outputs in declaration order) lands on axis `base + flat`. Pair it with a
-/// [`ModelNnGuard`] supplying the outputs' values at the same covariate snapshot.
+/// source of the outputs' values at the same covariate snapshot (the retired
+/// `ModelNnGuard` before #2093).
 ///
 /// This is how the FOCE/FOCEI TV-cov walk gets an exact `∂p/∂z` (and the mixed
 /// `∂²p/∂η∂z`) from one `Dual2` program evaluation, to be chained to the weight thetas
@@ -21524,14 +21630,6 @@ fn current_nn_axis_base() -> Option<usize> {
 pub(crate) struct ModelNnAxisGuard(Option<usize>);
 
 impl ModelNnAxisGuard {
-    /// Seed NN outputs on axes `base..base + n_outputs_total` for the current thread,
-    /// restoring the previous setting on drop.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter(base: usize) -> Self {
-        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(Some(base)));
-        ModelNnAxisGuard(prev)
-    }
-
     /// Lift NN outputs as constants again for the guard's scope, restoring the previous
     /// setting on drop. For a value pass that runs *inside* a seeded evaluation over a
     /// jet-free type — the `Dual2<0>` cov-static fold in `eval_cov_static_f64` — where a
@@ -21548,72 +21646,47 @@ impl Drop for ModelNnAxisGuard {
     }
 }
 
-impl ModelNnGuard {
-    /// Install `outputs` for the current thread, restoring the previous value on drop.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
-        let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
-        ModelNnGuard(prev)
-    }
+thread_local! {
+    /// `[covariate_nn]` outputs on a dual number type, set by [`ModelNnDualGuard`].
+    static MODEL_NN_DUAL: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
+}
 
-    /// Compute and install every `[covariate_nn]` block's forward output at this
-    /// `(theta, covariates)` point, or `None` when the model has no network (in which
-    /// case the evaluator's empty default is already correct and no guard is needed).
-    ///
-    /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
-    /// gradient path differentiates around is the value the prediction path produced.
-    ///
-    /// A `forward_raw` failure `panic!`s, exactly as `pk_param_fn` does on the same call.
-    /// It zero-fills an absent covariate, so the only ways it can fail are a mis-sized
-    /// weight slice or an input/layer count mismatch — wiring bugs, not runtime conditions.
-    /// Defaulting the block to `vec![]` instead would make `Op::PushNnOutput` read every
-    /// output as `0.0` in a release build, which is the silent-zero defect this guard
-    /// exists to prevent.
-    #[cfg(feature = "nn")]
-    pub(crate) fn enter_for(
-        model: &crate::types::CompiledModel,
-        theta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Option<Self> {
-        if model.covariate_nns.is_empty() {
-            return None;
-        }
-        let outputs: Vec<Vec<f64>> = model
-            .covariate_nns
-            .iter()
-            .map(|nn| {
-                let n_w = nn.mapper.mlp().n_weights();
-                let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                nn.mapper.forward_raw(w, covariates).expect(
-                    "NN forward_raw failed in ModelNnGuard::enter_for: this indicates a \
-                     wiring bug (wrong weight slice or input/layer count), not a \
-                     recoverable condition",
-                )
-            })
-            .collect();
-        Some(Self::enter(outputs))
-    }
+/// Output `out_i` of network `nn_i` from a live [`ModelNnDualGuard`] of type `T`.
+#[inline]
+fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
+    MODEL_NN_DUAL.with(|cell| {
+        cell.borrow()
+            .as_ref()?
+            .downcast_ref::<Vec<Vec<T>>>()?
+            .get(nn_i as usize)?
+            .get(out_i as usize)
+            .copied()
+    })
+}
 
-    #[cfg(not(feature = "nn"))]
-    pub(crate) fn enter_for(
-        _model: &crate::types::CompiledModel,
-        _theta: &[f64],
-        _covariates: &HashMap<String, f64>,
-    ) -> Option<Self> {
-        None
+/// RAII guard installing `[covariate_nn]` outputs computed on the evaluator's own number
+/// type — the network evaluated over taped weights — so the generic evaluator reads them
+/// with their derivatives, in place of the `f64` constants the retired `ModelNnGuard`
+/// installed before #2093.
+#[cfg(feature = "nn")]
+pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
+
+#[cfg(feature = "nn")]
+impl ModelNnDualGuard {
+    pub(crate) fn enter<T: 'static>(outputs: Vec<Vec<T>>) -> Self {
+        ModelNnDualGuard(MODEL_NN_DUAL.with(|cell| cell.replace(Some(Box::new(outputs)))))
     }
 }
 
-impl Drop for ModelNnGuard {
+#[cfg(feature = "nn")]
+impl Drop for ModelNnDualGuard {
     fn drop(&mut self) {
-        MODEL_NN_OUTPUTS.with(|cell| {
-            *cell.borrow_mut() = std::mem::take(&mut self.0);
-        });
+        MODEL_NN_DUAL.with(|cell| *cell.borrow_mut() = self.0.take());
     }
 }
 
-/// Run `f` with the ambient NN outputs borrowed. Empty unless a [`ModelNnGuard`] is
-/// live on this thread.
+/// Run `f` with the ambient NN outputs borrowed. Empty unless something has filled
+/// `MODEL_NN_OUTPUTS` on this thread (its installer, `ModelNnGuard`, was retired in #2093).
 fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
     MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
 }
@@ -26406,6 +26479,73 @@ fn eval_bytecode(
     nn_outputs: &[Vec<f64>],
     stack: &mut Vec<f64>,
 ) -> f64 {
+    // One lane cannot disagree with itself at a jump, so the `None` arm is unreachable.
+    eval_bytecode_lanes(bc, theta, eta, covariates, vars, nn_outputs, stack).unwrap_or(f64::NAN)
+}
+
+/// A value of the `f64` bytecode VM: one `f64`, or `K` of them evaluated in lockstep
+/// ([`eval_bytecode_lanes`]). Every operation applies the scalar `f64` expression lane by lane,
+/// so a lane's result is bit-identical to the scalar evaluation of the same inputs.
+pub(crate) trait Lane: Copy {
+    fn splat(x: f64) -> Self;
+    fn map(self, f: impl Fn(f64) -> f64) -> Self;
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self;
+    /// `Some(b)` when `f(lane)` is `b` in every lane, `None` when the lanes disagree.
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool>;
+}
+
+impl Lane for f64 {
+    #[inline(always)]
+    fn splat(x: f64) -> Self {
+        x
+    }
+    #[inline(always)]
+    fn map(self, f: impl Fn(f64) -> f64) -> Self {
+        f(self)
+    }
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self {
+        f(self, o)
+    }
+    #[inline(always)]
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool> {
+        Some(f(self))
+    }
+}
+
+impl<const N: usize> Lane for [f64; N] {
+    #[inline(always)]
+    fn splat(x: f64) -> Self {
+        [x; N]
+    }
+    #[inline(always)]
+    fn map(self, f: impl Fn(f64) -> f64) -> Self {
+        self.map(f)
+    }
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f64, f64) -> f64) -> Self {
+        std::array::from_fn(|i| f(self[i], o[i]))
+    }
+    #[inline(always)]
+    fn all_same(self, f: impl Fn(f64) -> bool) -> Option<bool> {
+        let first = f(self[0]);
+        self[1..].iter().all(|&x| f(x) == first).then_some(first)
+    }
+}
+
+/// [`eval_bytecode`] over [`Lane`] values: `vars` (the only per-lane input) carries one value
+/// per lane, everything else is shared. `None` when the lanes take different branches at a
+/// jump — the caller evaluates those lanes one at a time instead.
+#[inline]
+fn eval_bytecode_lanes<L: Lane>(
+    bc: &Bytecode,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[L],
+    nn_outputs: &[Vec<f64>],
+    stack: &mut Vec<L>,
+) -> Option<L> {
     stack.clear();
     stack.reserve(bc.max_stack);
     let mut pc: usize = 0;
@@ -26438,16 +26578,30 @@ fn eval_bytecode(
             unsafe { *buf.add(len) }
         }};
     }
+    macro_rules! unary {
+        ($f:expr) => {{
+            let v = pop!();
+            push!(v.map($f));
+        }};
+    }
+    macro_rules! binary {
+        ($f:expr) => {{
+            let b = pop!();
+            let a = pop!();
+            push!(a.zip(b, $f));
+        }};
+    }
+    let bool01 = |c: bool| if c { 1.0 } else { 0.0 };
 
     while pc < ops.len() {
         match ops[pc] {
-            Op::PushConst(i) => push!(consts[i as usize]),
-            Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushTime => push!(current_model_time()),
-            Op::PushMixNum => push!(current_mixture_class() as f64),
-            Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(0.0)),
-            Op::PushCov(i) => push!(covariates.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushConst(i) => push!(L::splat(consts[i as usize])),
+            Op::PushTheta(i) => push!(L::splat(theta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushEta(i) => push!(L::splat(eta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushTime => push!(L::splat(current_model_time())),
+            Op::PushMixNum => push!(L::splat(current_mixture_class() as f64)),
+            Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(L::splat(0.0))),
+            Op::PushCov(i) => push!(L::splat(covariates.get(i as usize).copied().unwrap_or(0.0))),
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
@@ -26460,154 +26614,60 @@ fn eval_bytecode(
                         );
                         0.0
                     });
-                push!(v);
+                push!(L::splat(v));
             }
             Op::PushThetaGather(g) => {
                 let raw = pop!();
                 let v = match bc.gathers.get(g as usize) {
-                    Some(spec) => eval_gather(spec, theta, raw),
+                    Some(spec) => raw.map(|r| eval_gather(spec, theta, r)),
                     None => {
                         debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
-                        f64::NAN
+                        L::splat(f64::NAN)
                     }
                 };
                 push!(v);
             }
-            Op::Add => {
-                let b = pop!();
-                let a = pop!();
-                push!(a + b);
-            }
-            Op::Sub => {
-                let b = pop!();
-                let a = pop!();
-                push!(a - b);
-            }
-            Op::RSub => {
-                let b = pop!();
-                let a = pop!();
-                push!(b - a);
-            }
-            Op::Mul => {
-                let b = pop!();
-                let a = pop!();
-                push!(a * b);
-            }
-            Op::Div => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.abs() < 1e-30 { 0.0 } else { a / b });
-            }
-            Op::Pow => {
-                let e = pop!();
-                let b = pop!();
-                push!(b.powf(e));
-            }
-            Op::Mod => {
-                let b = pop!();
-                let a = pop!();
-                push!(if b.abs() < 1e-30 {
-                    0.0
-                } else {
-                    a.rem_euclid(b)
-                });
-            }
-            Op::Exp => {
-                let v = pop!();
-                push!(v.exp());
-            }
-            Op::Ln => {
-                let v = pop!();
-                let v = if v >= 1e-30 { v } else { 1e-30 };
-                push!(v.ln());
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                let v = if v >= 0.0 { v } else { 0.0 };
-                push!(v.sqrt());
-            }
-            Op::Abs => {
-                let v = pop!();
-                push!(v.abs());
-            }
-            Op::Floor => {
-                let v = pop!();
-                push!(v.floor());
-            }
-            Op::Ceil => {
-                let v = pop!();
-                push!(v.ceil());
-            }
-            Op::Round => {
-                let v = pop!();
-                push!(v.round());
-            }
-            Op::InvLogit => {
-                let v = pop!();
-                let r = if v >= 0.0 {
-                    1.0 / (1.0 + (-v).exp())
-                } else {
-                    let e = v.exp();
-                    e / (1.0 + e)
-                };
-                push!(r);
-            }
-            Op::Logit => {
-                let v = pop!();
+            Op::Add => binary!(|a, b| a + b),
+            Op::Sub => binary!(|a, b| a - b),
+            Op::RSub => binary!(|a, b| b - a),
+            Op::Mul => binary!(|a, b| a * b),
+            Op::Div => binary!(|a, b| if b.abs() < 1e-30 { 0.0 } else { a / b }),
+            Op::Pow => binary!(|b, e| b.powf(e)),
+            Op::Mod => binary!(|a, b| if b.abs() < 1e-30 {
+                0.0
+            } else {
+                a.rem_euclid(b)
+            }),
+            Op::Exp => unary!(|v| v.exp()),
+            Op::Ln => unary!(|v| (if v >= 1e-30 { v } else { 1e-30 }).ln()),
+            Op::Sqrt => unary!(|v| (if v >= 0.0 { v } else { 0.0 }).sqrt()),
+            Op::Abs => unary!(|v| v.abs()),
+            Op::Floor => unary!(|v| v.floor()),
+            Op::Ceil => unary!(|v| v.ceil()),
+            Op::Round => unary!(|v| v.round()),
+            Op::InvLogit => unary!(|v| if v >= 0.0 {
+                1.0 / (1.0 + (-v).exp())
+            } else {
+                let e = v.exp();
+                e / (1.0 + e)
+            }),
+            Op::Logit => unary!(|v| {
                 let clamped = v.clamp(1e-15, 1.0 - 1e-15);
-                push!((clamped / (1.0 - clamped)).ln());
-            }
-            Op::CmpLt => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l < r { 1.0 } else { 0.0 });
-            }
-            Op::CmpLe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l <= r { 1.0 } else { 0.0 });
-            }
-            Op::CmpGt => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l > r { 1.0 } else { 0.0 });
-            }
-            Op::CmpGe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l >= r { 1.0 } else { 0.0 });
-            }
-            Op::CmpEq => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l == r { 1.0 } else { 0.0 });
-            }
-            Op::CmpNe => {
-                let r = pop!();
-                let l = pop!();
-                push!(if l != r { 1.0 } else { 0.0 });
-            }
-            Op::LogicAnd => {
-                let b = pop!();
-                let a = pop!();
-                push!(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::LogicOr => {
-                let b = pop!();
-                let a = pop!();
-                push!(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::LogicNot => {
-                let v = pop!();
-                push!(if v == 0.0 { 1.0 } else { 0.0 });
-            }
-            Op::IsPresent => {
-                let v = pop!();
-                push!(if v.is_nan() { 0.0 } else { 1.0 });
-            }
+                (clamped / (1.0 - clamped)).ln()
+            }),
+            Op::CmpLt => binary!(|l, r| bool01(l < r)),
+            Op::CmpLe => binary!(|l, r| bool01(l <= r)),
+            Op::CmpGt => binary!(|l, r| bool01(l > r)),
+            Op::CmpGe => binary!(|l, r| bool01(l >= r)),
+            Op::CmpEq => binary!(|l, r| bool01(l == r)),
+            Op::CmpNe => binary!(|l, r| bool01(l != r)),
+            Op::LogicAnd => binary!(|a, b| bool01(a != 0.0 && b != 0.0)),
+            Op::LogicOr => binary!(|a, b| bool01(a != 0.0 || b != 0.0)),
+            Op::LogicNot => unary!(|v| bool01(v == 0.0)),
+            Op::IsPresent => unary!(|v| bool01(!v.is_nan())),
             Op::JumpIfFalse(target) => {
                 let v = pop!();
-                if v == 0.0 {
+                if v.all_same(|x| x == 0.0)? {
                     pc = target as usize;
                     continue;
                 }
@@ -26628,11 +26688,11 @@ fn eval_bytecode(
         len == 1,
         "eval_bytecode: bytecode finished at stack depth {len}, expected 1",
     );
-    if len > 0 {
+    Some(if len > 0 {
         unsafe { *buf.add(len - 1) }
     } else {
-        0.0
-    }
+        L::splat(0.0)
+    })
 }
 
 impl Op {
@@ -26756,6 +26816,11 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::PushMixNum => push!(k(current_mixture_class() as f64)),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
+            // Outputs the caller computed on this number type (`ModelNnDualGuard`: the
+            // adjoint's recordings, the network over taped weights) are read as they are.
+            Op::PushNnOutput(nn_i, out_i) if nn_dual_output::<T>(nn_i, out_i).is_some() => {
+                push!(nn_dual_output::<T>(nn_i, out_i).expect("checked by the guard"));
+            }
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
@@ -26771,7 +26836,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                 // A live [`ModelNnAxisGuard`] seeds every network output on its own dual
                 // axis (`base + flat output index`), so `∂p/∂z` comes out of the same walk
                 // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
-                // always was (exact for `∂/∂η` — see `ModelNnGuard`).
+                // always was (exact for `∂/∂η`).
                 match current_nn_axis_base() {
                     Some(base) => {
                         let flat: usize = nn_outputs
@@ -26780,8 +26845,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                             .map(Vec::len)
                             .sum::<usize>()
                             + out_i as usize;
-                        // The caller owns the width budget (`nn_param_derivatives_at_cov`
-                        // dispatches on exactly `n_base + n_eta + n_z`); an axis past the jet
+                        // The caller owns the width budget (the pre-#2093
+                        // `nn_param_derivatives_at_cov`, retired in #2093, dispatched on exactly
+                        // `n_base + n_eta + n_z`); an axis past the jet
                         // is a wiring bug, and `var`'s bounds check fails it loudly rather
                         // than lifting the output to a constant, which would report a zero
                         // `∂/∂z` as analytic. The zero-width cov-static value pass runs with
@@ -27108,17 +27174,16 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
 ) {
-    // `[covariate_nn]` outputs come from the ambient `ModelNnGuard`, not from a
-    // parameter — see that type for why, and for the invariant that they are lifted as
-    // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
+    // `[covariate_nn]` outputs come from the ambient `MODEL_NN_OUTPUTS` thread-local, not
+    // from a parameter, and are lifted as constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
     // Empty when no guard is live, which is correct for every model without a network.
     //
     // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
     // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
     // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
     // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
-    // `ModelNnGuard` may be entered or dropped beneath it; none is (guards are installed by
-    // the sensitivity provider, outside this call).
+    // NN guard may be entered or dropped beneath it; none is (the adjoint installs its
+    // `ModelNnDualGuard` outside this call).
     with_nn_outputs(|nn| {
         eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
     })
@@ -27320,6 +27385,34 @@ fn cond_reads_time_builtin(c: &Condition) -> bool {
 /// expressions, and `if` conditions / branch bodies alike. A condition is as
 /// load-bearing as an assignment here: `if (TIME > 6) { … }` makes the system
 /// non-autonomous even though no statement outside the branch mentions `TIME`.
+/// Replace every `Op::PushTime` in compiled RHS statements with a read of the time slot,
+/// which the RHS binding seeds with the same integrator clock (see the call site).
+fn rewrite_push_time_to_slot(stmts: &mut [Statement], time_slot: usize) {
+    for st in stmts.iter_mut() {
+        match st {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                for op in bc.ops.iter_mut() {
+                    if matches!(op, Op::PushTime) {
+                        *op = Op::PushVar(time_slot as u32);
+                    }
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches.iter_mut() {
+                    rewrite_push_time_to_slot(body, time_slot);
+                }
+                if let Some(eb) = else_body.as_deref_mut() {
+                    rewrite_push_time_to_slot(eb, time_slot);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn stmts_read_time_builtin(stmts: &[Statement]) -> bool {
     stmts.iter().any(|s| match s {
         Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
@@ -27913,6 +28006,100 @@ fn rhs_lift_eval_g<T: crate::sens::num::vm::VmNum>(
     eval_bytecode_g::<T>(bc, &[], &[], &[], vars, &[], stack)
 }
 
+/// `f(u + δ_c·e_{j_c})` for each `(j_c, δ_c)` in `cols`, written to `out[c·n .. (c+1)·n]`:
+/// the columns of a forward-difference Jacobian, bit-identical to `n` scalar RHS calls.
+/// `false` when the lanes could not be evaluated together (they disagree at a branch).
+pub(crate) type RhsColumnsFn =
+    Box<dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + Send + Sync>;
+
+/// What the shared ODE RHS binding feeds: the scalar `du`, or batched FD columns.
+enum RhsSink<'a> {
+    Value(&'a mut [f64]),
+    Columns {
+        cols: &'a [(usize, f64)],
+        out: &'a mut [f64],
+    },
+}
+
+/// Lanes per pass of [`eval_rhs_columns`].
+const RHS_LANES: usize = 8;
+
+thread_local! {
+    /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
+    static RHS_LANE_SCRATCH: std::cell::RefCell<(
+        Vec<[f64; RHS_LANES]>,
+        Vec<[f64; RHS_LANES]>,
+        Vec<[f64; RHS_LANES]>,
+    )> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
+/// Whether every statement is a straight-line bytecode assignment, the shape
+/// [`eval_rhs_columns`] runs on lanes (an `If` statement's branch is per lane).
+fn stmts_lane_evaluable(stmts: &[Statement]) -> bool {
+    stmts
+        .iter()
+        .all(|s| matches!(s, Statement::AssignBc(..) | Statement::DiffEqBc(..)))
+}
+
+/// [`RhsColumnsFn`] over a bound RHS: `vars` is the scalar binding at the base state `u`
+/// (parameters, time slots and lifted values included), and each lane replaces one state
+/// slot by `u_j + δ` — the value a scalar call on the perturbed state binds there — and
+/// runs `stmts`, so every lane performs the scalar evaluation's operations exactly.
+fn eval_rhs_columns(
+    stmts: &[Statement],
+    vars: &[f64],
+    u: &[f64],
+    n: usize,
+    cols: &[(usize, f64)],
+    out: &mut [f64],
+) -> bool {
+    if out.len() < cols.len() * n || cols.iter().any(|&(j, _)| j >= u.len()) {
+        return false;
+    }
+    RHS_LANE_SCRATCH.with(|cell| {
+        let (lv, ldu, stack) = &mut *cell.borrow_mut();
+        for (chunk_i, chunk) in cols.chunks(RHS_LANES).enumerate() {
+            lv.clear();
+            lv.extend(vars.iter().map(|&v| [v; RHS_LANES]));
+            // Unused lanes repeat the chunk's first column.
+            for l in 0..RHS_LANES {
+                let (j, d) = chunk[l.min(chunk.len() - 1)];
+                lv[j][l] = u[j] + d;
+            }
+            ldu.clear();
+            ldu.resize(n, [0.0; RHS_LANES]);
+            for st in stmts {
+                match st {
+                    Statement::AssignBc(idx, bc) => {
+                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
+                            return false;
+                        };
+                        if let Some(slot) = lv.get_mut(*idx) {
+                            *slot = v;
+                        }
+                    }
+                    Statement::DiffEqBc(i, bc) => {
+                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
+                            return false;
+                        };
+                        if let Some(slot) = ldu.get_mut(*i) {
+                            *slot = v;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            for (l, _) in chunk.iter().enumerate() {
+                let c = chunk_i * RHS_LANES + l;
+                for i in 0..n {
+                    out[c * n + i] = ldu[i][l];
+                }
+            }
+        }
+        true
+    })
+}
+
 pub struct OdeRhsProgram {
     stmts: Vec<Statement>,
     n_vars_total: usize,
@@ -27962,6 +28149,9 @@ pub struct OdeRhsProgram {
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
     hoist: Option<RhsHoist>,
+    /// The f64 RHS at many single-state perturbations in one lane pass
+    /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
+    columns: Option<RhsColumnsFn>,
     /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
     /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
@@ -27987,11 +28177,40 @@ pub struct OdeRhsProgram {
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
     init_indiv_reads: Vec<(usize, Vec<usize>)>,
+    /// Each `init(state) = …` as `(state, program)`, evaluable over any dual type — the
+    /// exact initial state a dual walk seeds (`None`: no init, or one the compiled form
+    /// cannot express). Recorded here for the same reason as `init_indiv_reads`.
+    init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
     binding: RhsBindingPlan,
 }
 
 impl OdeRhsProgram {
+    /// The batched FD-column evaluator of the f64 RHS, when the program runs on lanes.
+    pub(crate) fn rhs_columns(&self) -> Option<&RhsColumnsFn> {
+        self.columns.as_ref()
+    }
+
+    /// The initial state `init(...)` sets, evaluated over `T` from the PK-parameter
+    /// vector `params` (states other than the seeded ones, and every state at the origin,
+    /// read 0): the exact counterpart of `OdeSpec::init_fn` on a dual walk. `None` when
+    /// the model's inits have no compiled form.
+    pub(crate) fn init_state_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        params: &[T],
+        n_states: usize,
+    ) -> Option<Vec<T>> {
+        let progs = self.init_program.as_ref()?;
+        let zeros = vec![T::from_f64(0.0); n_states];
+        let empty = HashMap::new();
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        let mut out = zeros.clone();
+        for (idx, prog) in progs {
+            out[*idx] = prog.eval_output_g(&zeros, params, &empty, &mut vars, &mut stack);
+        }
+        Some(out)
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
@@ -28003,11 +28222,10 @@ impl OdeRhsProgram {
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
-    /// [`Self::reads_model_time`] instead: neither this flag nor
-    /// [`Self::uses_time_vars`] alone covers all four spellings, and pairing them
-    /// by hand at each call site is how #1124's gap survived (`ode_tvcov_supported`
-    /// paired them; the SS gate did not, and its own test worked *around* the gap
-    /// by spelling the term `T`).
+    /// [`Self::reads_model_time`] instead: neither this flag nor [`Self::uses_time_vars`] alone
+    /// covers all four spellings, and pairing them by hand at each call site is how #1124's gap
+    /// survived (the pre-#2093 `ode_tvcov_supported` paired them; the SS gate did not, and its own
+    /// test worked *around* the gap by spelling the term `T`).
     pub(crate) fn reads_time_builtin(&self) -> bool {
         self.reads_time_builtin
     }
@@ -28270,7 +28488,7 @@ impl OdeRhsProgram {
     /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
     /// the augmented system and a time-dependent hazard line is part of it.
     pub(crate) fn reads_any_model_time(&self) -> bool {
-        self.uses_time_vars || self.reads_time_builtin
+        self.reads_model_time()
     }
 
     /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
@@ -28323,13 +28541,13 @@ impl OdeRhsProgram {
     /// them: `T`/`TIME` come back with the run-in's cycle-local clock — finite, matching
     /// NONMEM, and not the limit of the model's own dose train — and `TAFD` has no referent
     /// inside the run-in at all and comes back `NaN`. That is what
-    /// `W_STEADY_STATE_ABSOLUTE_TIME` reports, and this is its only caller.
+    /// `W_STEADY_STATE_ABSOLUTE_TIME` reports.
     ///
-    /// **Not a gradient-routing predicate.** The steady-state FD gates in
-    /// [`crate::sens`] ask the *wide* [`Self::reads_model_time`] and must keep doing so:
-    /// they decline the whole non-autonomous family, `TAD` included, and narrowing one to
-    /// this would let a `TAD`-reading steady-state model reach the dual equilibration
-    /// (#1272).
+    /// **Also the steady-state gradient gate** since #2093: the SS FD gates in
+    /// [`crate::sens`] decline this, plus `TAD` under a lagged SS dose. Before #2093 they
+    /// declined the whole non-autonomous family ([`Self::reads_model_time`], #1272); the dual
+    /// run-in now anchors `TAD` per window as the value path does. The PK-only view is enough
+    /// there because a joint PK-TTE subject with an SS dose is declined earlier (#1210).
     ///
     /// Composed from the two accessors rather than the two fields, for the reason given on
     /// [`Self::reads_model_time`]: neither may quietly become dead code.
@@ -28367,6 +28585,7 @@ impl OdeRhsProgram {
         t: f64,
         tafd: f64,
         tad: T,
+        dt: T,
         du: &mut [T],
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
@@ -28401,12 +28620,12 @@ impl OdeRhsProgram {
         }
         if b.seed_time {
             if let Some(d) = vars.get_mut(self.time_slot) {
-                *d = T::from_f64(t);
+                *d = T::from_f64(t) + dt;
             }
         }
         if b.seed_tafd {
             if let Some(d) = vars.get_mut(self.tafd_slot) {
-                *d = T::from_f64(tafd);
+                *d = T::from_f64(tafd) + dt;
             }
         }
         if b.seed_tad {
@@ -28443,7 +28662,7 @@ impl OdeRhsProgram {
 }
 
 /// Does this compiled expression's value vary across the dual axes the
-/// sensitivity providers differentiate — i.e. does it read η, *any* θ, an NN
+/// analytic gradient differentiates — i.e. does it read η, *any* θ, an NN
 /// output, or a variable already known to be dynamic? Reading only covariates,
 /// literals, and other cov-static variables makes it cov-static (foldable to a
 /// constant). See [`compute_cov_static_mask`] (#485).
@@ -28543,8 +28762,8 @@ fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
 }
 
 /// Classify each individual-parameter var slot as **cov-static** (`true`): its
-/// value is constant across every (θ, η) axis the analytic sensitivity providers
-/// differentiate, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
+/// value is constant across every (θ, η) axis the analytic gradient
+/// differentiates, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
 /// computed once in plain `f64` instead of carrying it through dual arithmetic
 /// (#485). A slot is cov-static iff every assignment to it reads only covariates,
 /// literals, and other cov-static slots, AND it is never assigned under an `if`
@@ -28777,8 +28996,7 @@ impl CtmmGeneratorProgram {
     }
 
     /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k` (the same axis convention
-    /// [`IndivParamProgram::eval_param_duals`] uses).
+    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
     ///
     /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
     /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
@@ -28960,17 +29178,16 @@ fn build_ctmm_generator_program(
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
-/// analytic-sensitivity provider can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
-/// **analytically** — by evaluating the same statements over `Dual2<M>` seeded on
-/// (θ, η) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
+/// analytic gradient can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
+/// **analytically** — by evaluating the same statements over a dual or tape type
+/// seeded on (θ, η) (`eval_params_g`) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
 /// f64 binding in the `pk_param_fn` closure.
 #[derive(Debug, Clone)]
 pub struct IndivParamProgram {
     stmts: Vec<Statement>,
     n_vars: usize,
     /// Per var-slot mask: `true` = the slot is cov-static (constant across every
-    /// θ / η dual axis), so [`eval_param_duals`](Self::eval_param_duals) and
-    /// [`eval_param_eta_grad`](Self::eval_param_eta_grad) compute it once in `f64`
+    /// θ / η dual axis), so [`eval_params_g`](Self::eval_params_g) computes it once in `f64`
     /// and seed it as a dual constant instead of re-running the (often pow/exp/log
     /// heavy) covariate kernel under dual arithmetic every call (#485). Empty when
     /// no slot is foldable, in which case both paths run exactly as before.
@@ -28978,10 +29195,9 @@ pub struct IndivParamProgram {
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
-    /// `pk_var_slots` projected to just the PK slots — the [`pk_slots`](Self::pk_slots)
-    /// value, cached at construction so the hot analytic paths borrow it via
-    /// [`pk_slots_ref`](Self::pk_slots_ref) instead of re-collecting a `Vec` on every
-    /// per-gradient evaluation (#534 review #2).
+    /// `pk_var_slots` projected to just the PK slots, cached at construction so the hot
+    /// analytic paths borrow it via [`pk_slots_ref`](Self::pk_slots_ref) instead of
+    /// re-collecting a `Vec` on every per-gradient evaluation (#534 review #2).
     pk_slot_indices: Vec<usize>,
     /// User-declared θ count the individual parameters can reference.
     n_theta: usize,
@@ -29006,10 +29222,6 @@ pub struct IndivParamProgram {
 }
 
 impl IndivParamProgram {
-    /// Dual width needed to seed every (θ, η) axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
     /// User-declared θ count the individual parameters reference (the dual seed
     /// dimension of η axis `k` is `n_theta_axis() + k`).
     pub(crate) fn n_theta_axis(&self) -> usize {
@@ -29020,19 +29232,8 @@ impl IndivParamProgram {
         self.n_eta
     }
 
-    /// The PK slot each row of [`eval_param_duals`](Self::eval_param_duals) /
-    /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program) corresponds
-    /// to, in the program's own (analytical: alphabetical-by-PK-name; ODE:
-    /// declaration) order. The analytical provider uses this to pair each `∂p/∂·`
-    /// row with the right slot of the 8-slot PK gradient — `pk_var_slots` order is
-    /// NOT `CompiledModel.pk_indices` (declaration) order.
-    pub(crate) fn pk_slots(&self) -> Vec<usize> {
-        self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
-    }
-
-    /// Borrowing form of [`pk_slots`](Self::pk_slots): the PK-slot list cached at
-    /// construction, for hot paths that only read it (no per-call `Vec`). Identical
-    /// contents to `pk_slots()` (#534 review #2).
+    /// The PK-slot list cached at construction (`pk_var_slots` projected to its PK slots),
+    /// for hot paths that only read it (no per-call `Vec`, #534 review #2).
     pub(crate) fn pk_slots_ref(&self) -> &[usize] {
         &self.pk_slot_indices
     }
@@ -29059,7 +29260,7 @@ impl IndivParamProgram {
             .collect()
     }
 
-    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots`](Self::pk_slots),
+    /// The resolved `(pk_slot, var_slot)` pairs behind [`pk_slots_ref`](Self::pk_slots_ref),
     /// in the same order. **One entry per resolved slot, not per parameter**: the
     /// `pk(...)` role bindings, the spare slots the readout / `obs_scale` / `init`
     /// readers draw (#650, #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on
@@ -29077,107 +29278,41 @@ impl IndivParamProgram {
         &self.pk_var_slots
     }
 
-    /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
-    /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
-    /// individual parameter (declaration order), whose `grad`/`hess` are the exact
-    /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
-    ///
-    /// The absolute-axis layout of [`eval_param_duals_cols`](Self::eval_param_duals_cols)
-    /// (`theta_cols = None`).
-    pub(crate) fn eval_param_duals<const M: usize>(
+    /// Evaluate the individual parameters over any VM number type, from θ and η already
+    /// seeded by the caller (a forward dual's axes, or tape leaves). Returns one value
+    /// per [`pk_var_slots`](Self::pk_var_slots) entry, in that order. The single
+    /// evaluator behind the adjoint gradient's taped parameters.
+    pub(crate) fn eval_params_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Vec<crate::sens::dual2::Dual2<M>> {
-        self.eval_param_duals_cols::<M>(theta, eta, covariates, None, self.n_theta)
-    }
-
-    /// Column-chunked twin of [`eval_param_duals`](Self::eval_param_duals): seed the
-    /// program's θ on a **θ-column chunk's** axes rather than on absolute ones, so a
-    /// program wider than the dual dispatch can be evaluated one chunk at a time (#1907).
-    ///
-    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the chunk
-    /// does not carry enters as a **constant**. That is exact per chunk: forward-mode axes
-    /// never interact, so the chunk that owns a column supplies its derivative, and the
-    /// η block every chunk carries comes out entry for entry the same. `eta_axis_base` is
-    /// the dual axis of `eta[0]` (`cols.len()` for a chunked caller, `n_theta` for an
-    /// absolute one). `theta_cols = None` is the absolute layout `θ_m → m` — the
-    /// pre-chunking behaviour, seed for seed — the same contract as
-    /// `ScaleDerivProgram::eval_scale_dual_cols`.
-    pub(crate) fn eval_param_duals_cols<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        theta_cols: Option<&[usize]>,
-        eta_axis_base: usize,
-    ) -> Vec<crate::sens::dual2::Dual2<M>> {
-        use crate::sens::dual2::Dual2;
-        // θ index → dual axis. Only the program's own θ axes (`0..n_theta`, the
-        // user-declared thetas) are seeded, under either layout. A `theta` slice longer
-        // than that carries generated `[covariate_nn]` weights, which reach the program
-        // through `Op::PushNnOutput` and never through `PushTheta`; seeding them here would
-        // put them on the axes `η` and the NN-output block occupy (`n_theta + k`, see
-        // `ModelNnAxisGuard`). For a program whose θ axis count equals the model's — every
-        // non-NN caller — the absolute layout is the former `m < M` bound exactly.
-        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
-            None => (0..theta.len())
-                .map(|m| (m < self.n_theta).then_some(m))
-                .collect(),
-            Some(_) => vec![None; theta.len()],
-        };
-        if let Some(cols) = theta_cols {
-            for (c, &m) in cols.iter().enumerate() {
-                if m < self.n_theta && m < theta_axis.len() {
-                    theta_axis[m] = Some(c);
-                }
-            }
-        }
-        let theta_d: Vec<Dual2<M>> = theta
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| match theta_axis[m] {
-                Some(ax) if ax < M => Dual2::var(v, ax),
-                _ => Dual2::constant(v),
-            })
-            .collect();
-        let eta_d: Vec<Dual2<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                let dim = eta_axis_base + k;
-                if dim < M {
-                    Dual2::var(v, dim)
-                } else {
-                    Dual2::constant(v)
-                }
-            })
-            .collect();
+    ) -> Vec<T> {
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
             .map(|n| covariates.get(n).copied().unwrap_or(0.0))
             .collect();
-        let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual2<M>> = Vec::new();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
-        // plain f64, seed them as dual constants (zero gradient/Hessian — exactly
-        // what they carry), and skip their (pow/exp/log heavy) re-derivation in the
-        // Dual2 walk. `skip` empty ⇒ original full-dual path.
+        // plain f64, seed them as constants (zero derivatives — exactly what they
+        // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
+        // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
-            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+            let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
-                    vars[v] = Dual2::constant(static_vals[v]);
+                    vars[v] = T::from_f64(static_vals[v]);
                 }
             }
         }
-        eval_statements_g::<Dual2<M>>(
+        eval_statements_g::<T>(
             &self.stmts,
-            &theta_d,
-            &eta_d,
+            theta,
+            eta,
             &cov_vec,
             &mut vars,
             None,
@@ -29186,7 +29321,7 @@ impl IndivParamProgram {
         );
         self.pk_var_slots
             .iter()
-            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0)))
             .collect()
     }
 
@@ -29277,70 +29412,11 @@ impl IndivParamProgram {
         vars.truncate(self.n_top_level_vars);
         vars
     }
-
-    /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
-    /// (`η_k → var(·, k)`, θ held constant): the light first-order counterpart of
-    /// [`eval_param_duals`](Self::eval_param_duals) for the inner η-gradient (#410).
-    /// Returns one `Dual1<M>` per individual parameter (declaration order); its
-    /// `grad` is the exact `∂p/∂η`. Avoids the θ-axes and the second-order Hessian
-    /// the `Dual2` path computes. Requires `M ≥ n_eta_axis()`.
-    pub(crate) fn eval_param_eta_grad<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<crate::sens::dual1::Dual1<M>> {
-        use crate::sens::dual1::Dual1;
-        let theta_d: Vec<Dual1<M>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
-        let eta_d: Vec<Dual1<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                if k < M {
-                    Dual1::var(v, k)
-                } else {
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual1<M>> = Vec::new();
-        // Cov-static fold (#485): same as the Dual2 path — cov-static slots are a
-        // fortiori η-independent, so seeding them as Dual1 constants is exact.
-        let skip: &[bool] = &self.cov_static_mask;
-        if !skip.is_empty() {
-            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
-            for (v, &is_static) in skip.iter().enumerate() {
-                if is_static {
-                    vars[v] = Dual1::constant(static_vals[v]);
-                }
-            }
-        }
-        eval_statements_g::<Dual1<M>>(
-            &self.stmts,
-            &theta_d,
-            &eta_d,
-            &cov_vec,
-            &mut vars,
-            None,
-            &mut stack,
-            skip,
-        );
-        self.pk_var_slots
-            .iter()
-            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual1::constant(0.0)))
-            .collect()
-    }
 }
 
 /// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
-/// exposed so the analytic-sensitivity provider can evaluate the readout
-/// (e.g. `central / V1`) over `Dual2<N>` — turning the integrated dual state and
+/// exposed so the analytic (adjoint) gradient can evaluate the readout
+/// (e.g. `central / V1`) over a dual or tape type — turning the integrated dual state and
 /// the dual PK parameters into the scaled observable with exact derivatives
 /// (issue #367, Option A). Mirrors the f64 readout closure in `build_y_output_fn`.
 pub struct OdeOutputProgram {
@@ -29453,7 +29529,7 @@ impl OdeOutputProgram {
 /// over `Dual2<M>` seeded on (θ, η): θ/η references read the seed duals directly;
 /// individual-parameter references read `vars[i]`, where var slot `i` is fed by
 /// the provider as a dual for flat PK slot `var_to_pk_slot[i]` (value + ∂p/∂(θ,η));
-/// covariates are constants. This lets the analytic sensitivity provider
+/// covariates are constants. This lets the analytic (adjoint) gradient
 /// differentiate the scaled prediction `f / scale` exactly instead of falling back
 /// to finite differences for `ExpressionScale` models. Mirrors [`OdeOutputProgram`].
 pub struct ScaleDerivProgram {
@@ -29468,10 +29544,6 @@ pub struct ScaleDerivProgram {
 }
 
 impl ScaleDerivProgram {
-    /// Dual width needed to seed every (θ, η) axis.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
     pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
     }
@@ -29483,153 +29555,26 @@ impl ScaleDerivProgram {
         &self.var_to_pk_slot
     }
 
-    /// Evaluate the scale over `Dual2<M>` seeded on (θ, η): `θ_m → var(·, m)`,
-    /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
-    /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
-    /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
-    ///
-    /// The absolute-axis layout of [`eval_scale_dual_cols`](Self::eval_scale_dual_cols)
-    /// (`theta_cols = None`).
-    pub(crate) fn eval_scale_dual<const M: usize>(
+    /// Evaluate the scale over any VM number type, from caller-seeded θ, η and
+    /// individual-parameter values (`var_vals[i]` for var slot `i`, as in
+    /// the pre-#2093 `eval_scale_dual`). The single evaluator behind the
+    /// adjoint gradient's taped scale.
+    pub(crate) fn eval_scale_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual2::Dual2<M>],
-    ) -> crate::sens::dual2::Dual2<M> {
-        self.eval_scale_dual_cols::<M>(theta, eta, cov, var_duals, None, self.n_theta)
-    }
-
-    /// Column-chunked twin of [`eval_scale_dual`](Self::eval_scale_dual): seed the
-    /// program's direct θ / η references on a **θ-column chunk's** axes rather than on
-    /// absolute ones.
-    ///
-    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the
-    /// chunk does not carry enters as a **constant**, which is exactly right per chunk —
-    /// forward-mode axes never interact, so the chunk that owns that column supplies its
-    /// derivative. `eta_axis_base` is the dual axis of `eta[0]` (the chunk's stacked
-    /// block starts right after its θ columns, so `cols.len()` for a chunked caller and
-    /// `n_theta` for an absolute one). `theta_cols = None` is the absolute layout
-    /// `θ_m → m`, i.e. the pre-chunking behaviour entry for entry (#1339).
-    pub(crate) fn eval_scale_dual_cols<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual2::Dual2<M>],
-        theta_cols: Option<&[usize]>,
-        eta_axis_base: usize,
-    ) -> crate::sens::dual2::Dual2<M> {
-        use crate::sens::dual2::Dual2;
-        // θ index → dual axis. `None` is the identity; a chunk maps only the columns it
-        // carries and leaves every other θ a constant.
-        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
-            None => (0..theta.len()).map(Some).collect(),
-            Some(_) => vec![None; theta.len()],
-        };
-        if let Some(cols) = theta_cols {
-            for (c, &m) in cols.iter().enumerate() {
-                if m < theta_axis.len() {
-                    theta_axis[m] = Some(c);
-                }
-            }
-        }
-        let theta_d: Vec<Dual2<M>> = theta
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| match theta_axis[m] {
-                Some(ax) if ax < M => Dual2::var(v, ax),
-                _ => Dual2::constant(v),
-            })
-            .collect();
-        let eta_d: Vec<Dual2<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                let dim = eta_axis_base + k;
-                if dim < M {
-                    Dual2::var(v, dim)
-                } else {
-                    Dual2::constant(v)
-                }
-            })
-            .collect();
+        var_vals: &[T],
+    ) -> T {
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        let mut stack: Vec<Dual2<M>> = Vec::new();
-        eval_bytecode_g::<Dual2<M>>(
-            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
-        )
-    }
-
-    /// First-order η-only evaluation: returns `value` and `∂/∂η_k` on axis `k` over
-    /// `Dual1<N>` (`N = n_eta`). θ and individual-param vars enter as constants
-    /// except the seeded η axes, so this drops the θ axes and the `Dual2` Hessian
-    /// that [`eval_scale_dual`](Self::eval_scale_dual) carries. Used by the inner
-    /// init-amount gradient, whose EBE loop consumes only `∂A₀/∂η` (#524 follow-up).
-    pub(crate) fn eval_scale_dual1<const N: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        cov: &HashMap<String, f64>,
-        var_duals: &[crate::sens::dual1::Dual1<N>],
-    ) -> crate::sens::dual1::Dual1<N> {
-        use crate::sens::dual1::Dual1;
-        // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset). The ODE inner gate caps
-        // `n_eta`, not `n_theta + n_eta` (#1804), and the IOV outer evaluates the scale
-        // in θ-column chunks (#1907), so either route can reach this call with more θ
-        // or η values than the common stack buffers hold. Those take heap `Vec`s (the
-        // fixed-size buffers alone would panic on the `[..len]` slices); ordinary narrow
-        // models keep the stack fast path from #534. (`cov_vec` / bytecode `stack`
-        // lengths are not axis-bounded, so they stay on the heap.)
-        const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
-        let seed_eta = |k: usize, v: f64| {
-            if k < N {
-                Dual1::var(v, k)
-            } else {
-                Dual1::constant(v)
-            }
-        };
-        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
-        let theta_heap: Vec<Dual1<N>>;
-        let theta_d: &[Dual1<N>] = if theta.len() <= CAP {
-            for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
-                *d = Dual1::constant(v);
-            }
-            &theta_buf[..theta.len()]
-        } else {
-            theta_heap = theta.iter().map(|&v| Dual1::constant(v)).collect();
-            &theta_heap
-        };
-        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
-        let eta_heap: Vec<Dual1<N>>;
-        let eta_d: &[Dual1<N>] = if eta.len() <= CAP {
-            for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
-                *d = seed_eta(k, v);
-            }
-            &eta_buf[..eta.len()]
-        } else {
-            eta_heap = eta
-                .iter()
-                .enumerate()
-                .map(|(k, &v)| seed_eta(k, v))
-                .collect();
-            &eta_heap
-        };
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| cov.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
-        let mut stack: Vec<Dual1<N>> = Vec::new();
-        eval_bytecode_g::<Dual1<N>>(
-            &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+        let mut stack: Vec<T> = Vec::new();
+        eval_bytecode_g::<T>(
+            &self.bc, theta, eta, &cov_vec, var_vals, &empty_nn, &mut stack,
         )
     }
 }
@@ -29648,42 +29593,21 @@ pub struct RuvMagDerivProgram {
     cov_names: Vec<String>,
 }
 
-/// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
-/// (same const-generic-dispatch convention as `MAX_SCALE_AXES` / `MAX_ODE_AXES`,
-/// but set higher — the magnitude program's bytecode evaluator is cheap to
-/// monomorphize, and covering realistic large-θ population models keeps the
-/// magnitude direct-θ channel analytic rather than dropping to FD, #486). A model
-/// with more thetas than this falls back to FD for the magnitude's direct-θ
-/// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
-/// against this constant when a custom magnitude is active.
-pub(crate) const MAX_RUV_MAG_AXES: usize = 32;
-
 impl RuvMagDerivProgram {
-    /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
-    /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
-    /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match
-    /// the program's own `n_theta` (caller falls back to FD).
-    pub(crate) fn theta_grad(
+    /// The magnitude (or exponent) at `theta` over any VM number type — `θ` carrying
+    /// whatever derivative structure the caller seeded (tape leaves for the adjoint
+    /// gradient) — with the observation's covariates and raw TIME, as the runtime
+    /// closure evaluates it. `None` on a θ-count mismatch.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
+        theta: &[T],
         cov: &HashMap<String, f64>,
         time: f64,
         tad: f64,
-    ) -> Option<Vec<f64>> {
-        use crate::sens::dual1::Dual1;
+    ) -> Option<T> {
         if theta.len() != self.n_theta {
             return None;
         }
-        if theta.is_empty() {
-            return Some(Vec::new());
-        }
-        // Mirror the runtime `RuvMagFn` closure's `TIME`/`time` covariate-map
-        // injection: a legacy pre-built expression may still carry `TIME` as an
-        // `Expression::Covariate` node (parsed models use the `Expression::Time`
-        // built-in, read directly from `time` via `Op::PushTime`, and never reach
-        // this branch) — without it, such a `cov_name` would look up the
-        // observation's covariate map (which never carries a literal "TIME" key)
-        // and silently default to `0.0` instead of the actual observation time.
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
@@ -29695,75 +29619,25 @@ impl RuvMagDerivProgram {
                 }
             })
             .collect();
-        // `theta_d`/`prog_vars` are exactly `$n`-sized at each dispatch arm (unlike
-        // `ScaleDerivProgram::eval_scale_dual1`'s padded-to-N buffers), so a plain
-        // stack array avoids the sibling's per-call heap `Vec` for the axis-bounded
-        // pieces (#486 review); `cov_vec`/`stack` stay on the heap, matching that
-        // sibling's own precedent — they are not axis-bounded.
-        macro_rules! run {
-            ($n:literal) => {{
-                let mut theta_d = [Dual1::<$n>::constant(0.0); $n];
-                for (m, d) in theta_d.iter_mut().enumerate() {
-                    *d = Dual1::var(theta[m], m);
-                }
-                // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS;
-                // slot 2 = TAD (#1182). All θ-constant.
-                let prog_vars = [
-                    Dual1::<$n>::constant(1.0),
-                    Dual1::<$n>::constant(f64::EPSILON),
-                    Dual1::<$n>::constant(tad),
-                ];
-                let empty_nn: Vec<Vec<f64>> = Vec::new();
-                let mut stack: Vec<Dual1<$n>> = Vec::new();
-                let d = with_model_time(time, || {
-                    eval_bytecode_g::<Dual1<$n>>(
-                        &self.bc,
-                        &theta_d,
-                        &[],
-                        &cov_vec,
-                        &prog_vars,
-                        &empty_nn,
-                        &mut stack,
-                    )
-                });
-                d.grad.to_vec()
-            }};
-        }
-        Some(match theta.len() {
-            1 => run!(1),
-            2 => run!(2),
-            3 => run!(3),
-            4 => run!(4),
-            5 => run!(5),
-            6 => run!(6),
-            7 => run!(7),
-            8 => run!(8),
-            9 => run!(9),
-            10 => run!(10),
-            11 => run!(11),
-            12 => run!(12),
-            13 => run!(13),
-            14 => run!(14),
-            15 => run!(15),
-            16 => run!(16),
-            17 => run!(17),
-            18 => run!(18),
-            19 => run!(19),
-            20 => run!(20),
-            21 => run!(21),
-            22 => run!(22),
-            23 => run!(23),
-            24 => run!(24),
-            25 => run!(25),
-            26 => run!(26),
-            27 => run!(27),
-            28 => run!(28),
-            29 => run!(29),
-            30 => run!(30),
-            31 => run!(31),
-            32 => run!(32),
-            _ => return None,
-        })
+        // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS; slot 2 = TAD (#1182).
+        let prog_vars = [
+            T::from_f64(1.0),
+            T::from_f64(f64::EPSILON),
+            T::from_f64(tad),
+        ];
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<T> = Vec::new();
+        Some(with_model_time(time, || {
+            eval_bytecode_g::<T>(
+                &self.bc,
+                theta,
+                &[],
+                &cov_vec,
+                &prog_vars,
+                &empty_nn,
+                &mut stack,
+            )
+        }))
     }
 }
 
@@ -30345,12 +30219,12 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
-    /// The compiled individual-parameter program, so the analytical PK
-    /// sensitivity provider can obtain exact `∂p/∂(θ,η)` by evaluating it over
-    /// `Dual2` seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
+    /// The compiled individual-parameter program, so the analytic (adjoint)
+    /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
+    /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
     /// θ chain and the log-normal-only `sel` η chain (issue #367). Unlike the
     /// `d_d_theta`/`d_d_eta` symbolic partials (reserved, no runtime consumer),
-    /// this field IS consumed at runtime by `sens::provider`. `None` for
+    /// this field IS consumed at runtime by `sens::provider` and the adjoint. `None` for
     /// hand-built fixtures and when no `[individual_parameters]` block exists;
     /// the ODE provider reads its own copy from `ode_spec`.
     pub(crate) indiv_param_program: Option<IndivParamProgram>,
@@ -30362,7 +30236,7 @@ pub struct IndivParamPartials {
     /// variable, so nothing in `pk_indices` records it — the model-level
     /// predicates ([`crate::CompiledModel::has_lagtime`]) read it from here
     /// (#1359 follow-up: with a literal lag `has_lagtime()` was `false`, and the
-    /// analytic sensitivity provider ran the lag-free walk against a production
+    /// pre-#2093 analytic sensitivity provider ran the lag-free walk against a production
     /// predictor that applied the lag — measured 120 % apart at the first
     /// post-dose sample). Empty for ODE / compartment-free models and for
     /// hand-built fixtures.
@@ -30380,8 +30254,9 @@ pub struct IndivParamPartials {
     pub(crate) bound_from_fit: bool,
     /// Whether the closed-form log-normal η chain (`pk · sel_flat`) is exact
     /// for this model, computed by `lognormal_eta_chain_exact`. `None` for
-    /// hand-built fixtures, which have no statements to measure: the providers
-    /// then keep the older rule, "every `eta_param_info` entry is `LogNormal`".
+    /// hand-built fixtures, which have no statements to measure: the pre-#2093
+    /// forward providers then kept the older rule, "every `eta_param_info` entry is
+    /// `LogNormal`". No reader remains since the adjoint replaced them.
     pub(crate) lognormal_eta_chain: Option<bool>,
     /// The nested variability levels (#1082), read through
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most

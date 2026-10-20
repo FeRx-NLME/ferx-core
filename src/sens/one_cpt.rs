@@ -321,7 +321,7 @@ pub fn one_cpt_transit_conc_g<T: PkNum>(
 }
 
 /// Inverse-Gaussian counterpart to [`one_cpt_conc_g`] for the analytic `one_cpt_ig`
-/// model (#790), used by the sensitivity provider — a thin `DoseEvent` wrapper over
+/// model (#790), used by the analytic gradient path — a thin `DoseEvent` wrapper over
 /// [`one_cpt_ig_amt_g`] with `F` baked into the kernel. Generic over [`PkNum`] so
 /// prediction (`T = f64`) and the `Dual2` sensitivity share one definition.
 pub fn one_cpt_ig_conc_g<T: PkNum>(

@@ -90,7 +90,7 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 }
 
 /// The same equivalence on the gradient path. The fixture above has no η on `H0`
-/// and a constant hazard, so it never asks the analytic provider for `∂H/∂η`
+/// and a constant hazard, so it never asks the analytic gradient for `∂H/∂η`
 /// through the promoted slot. Here `H0` carries `ETA_H` on both arms and the
 /// hazard is drug-driven, so the inner EBE search and the outer FOCEI gradient
 /// both differentiate through it. The two spellings must give the same OFV and

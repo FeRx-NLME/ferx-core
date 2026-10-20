@@ -2438,6 +2438,16 @@ const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 /// path has no cold solve; a run with no feasible evaluation has no best-seen) or a
 /// non-finite one, which [`ColdSolveVerdict::NonFinite`] and
 /// [`gate_converged_on_objective`] already own.
+/// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
+/// — a logarithmic number of cold passes per leg, none before the trajectory has had a
+/// chance to settle (#2093).
+fn basin_probe_due(feasible_evals: usize) -> bool {
+    feasible_evals >= BASIN_PROBE_FIRST && feasible_evals.is_power_of_two()
+}
+
+/// The first feasible evaluation at which [`basin_probe_due`] fires.
+const BASIN_PROBE_FIRST: usize = 32;
+
 fn cold_solve_beats_best_seen(cold_ofv: Option<f64>, best_seen_ofv: Option<f64>) -> Option<f64> {
     let (cold, best) = (cold_ofv?, best_seen_ofv?);
     if !cold.is_finite() || !best.is_finite() {
@@ -2649,7 +2659,7 @@ fn per_subject_outer_gradients_checked(
     if !per_subject_outer_gradients_in_scope(model, options) {
         return None;
     }
-    let iov = crate::sens::provider::iov_sens_supported(model);
+    let iov = model.n_kappa > 0;
     population
         .subjects
         .par_iter()
@@ -3125,7 +3135,7 @@ pub(crate) struct AttemptOutcome {
     /// NLopt returned a bare `Failure`/`ForcedStop` *and*
     /// [`failure_is_converged_plateau`] rejected it: the run quit while its OFV
     /// trace was still descending, at a point that is not a minimum. See
-    /// [`resolve_mid_descent_restart`].
+    /// [`resolve_mid_descent_restart_adopting`].
     pub(crate) mid_descent_stall: bool,
     /// The cold re-solve at the restored point beat the objective the optimizer
     /// minimised there ([`cold_solve_beats_best_seen`]), and the run passes the same
@@ -3155,7 +3165,7 @@ impl AttemptOutcome {
     }
 }
 
-/// Why [`resolve_mid_descent_restart`] restarts a run from its own best point.
+/// Why [`resolve_mid_descent_restart_adopting`] restarts a run from its own best point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RestartCause {
     /// NLopt returned a bare `Failure` and the plateau check rejected it: the run quit
@@ -3189,7 +3199,7 @@ pub(crate) enum RestartCause {
 /// improvement to report. That retry is L-BFGS-only: SLSQP is already capped on
 /// every eval, and the derivative-free algorithms never take this step at all.
 ///
-/// **Stall mid-descent** (#1277) — [`resolve_mid_descent_restart`]. A run that
+/// **Stall mid-descent** (#1277) — [`resolve_mid_descent_restart_adopting`]. A run that
 /// *did* leave its start can still die with a bare `Failure` while its OFV is
 /// dropping by hundreds per eval, and the existing retry, gated on `left_init`,
 /// never sees it. Then the optimizer is simply restarted from the best point it
@@ -3236,7 +3246,12 @@ fn optimize_nlopt(
         || attempt(init_params, true),
         |(result, _)| penalized(result),
     );
-    resolve_mid_descent_restart(
+    // #2093: a basin-shift restart may itself end in a basin shift (the restarted leg's
+    // warm EBEs can be trapped again as θ moves on), so it is re-run while each restart is
+    // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
+    // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
+    // A mid-descent stall keeps its single restart: a second stall reports as a stall.
+    resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -3252,7 +3267,7 @@ fn optimize_nlopt(
             // answers is "are the reported estimates still on top of the values the
             // user supplied", and that reference does not move when the optimizer
             // is restarted (#1277 review).
-            let (mut restarted, _) = optimize_nlopt_once(
+            let (mut restarted, restarted_outcome) = optimize_nlopt_once(
                 model,
                 population,
                 &stalled.params,
@@ -3284,11 +3299,57 @@ fn optimize_nlopt(
                     basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
                 }
             });
-            restarted
+            (restarted, restarted_outcome.restart_cause())
         },
         penalized,
     )
 }
+
+/// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
+/// while each restart is adopted and itself ends in a basin shift, another basin-shift restart,
+/// at most [`MAX_BASIN_RESTARTS`] more. A restarted leg can trap again as θ moves on; the legs
+/// share one evaluation budget (`RestartLeg::spent_evals`), and a restarted leg's own
+/// `basin_shift` already requires budget left, so the total stays bounded by `outer_maxiter`.
+/// A mid-descent stall keeps its single restart: a second stall reports as a stall. `restart`
+/// returns the restarted result and the restart cause *its* leg ended with. Pure, like
+/// [`resolve_mid_descent_restart_adopting`], so every branch is unit-testable without NLopt.
+fn resolve_restart_chain<T>(
+    verbose: bool,
+    cancelled: bool,
+    first: (T, Option<RestartCause>),
+    mut restart: impl FnMut(&T, RestartCause) -> (T, Option<RestartCause>),
+    ofv_of: impl Fn(&T) -> f64,
+) -> T {
+    let (mut current, mut cause) = first;
+    let mut basin_restarts = 0usize;
+    loop {
+        let mut next_cause = None;
+        let (next, adopted) = resolve_mid_descent_restart_adopting(
+            verbose,
+            cancelled,
+            (current, cause),
+            |stalled, c| {
+                let (restarted, its_cause) = restart(stalled, c);
+                next_cause = its_cause;
+                restarted
+            },
+            &ofv_of,
+        );
+        current = next;
+        match next_cause {
+            Some(RestartCause::BasinShift) if adopted && basin_restarts < MAX_BASIN_RESTARTS => {
+                basin_restarts += 1;
+                cause = Some(RestartCause::BasinShift);
+            }
+            _ => return current,
+        }
+    }
+}
+
+/// How many basin-shift restarts [`optimize_nlopt`] runs at most after the first (#2093).
+/// Each must be adopted and the legs share the fit's budget, so this only bounds the work
+/// on a fit whose warm EBEs keep re-trapping.
+const MAX_BASIN_RESTARTS: usize = 3;
 
 /// Restart a run that stopped mid-descent from the best point it reached, and
 /// report whichever attempt ended lower (#1277).
@@ -3336,8 +3397,10 @@ fn optimize_nlopt(
 ///   objective's 1e20 short-circuit rather than at a minimum and would look like
 ///   a stall to every test here.
 ///
-/// There is exactly one restart — a second stall reports as a stall, which is
-/// the honest signal and caps what this adds at one extra optimization. (The
+/// There is exactly one restart for a stall — a second stall reports as a stall, which
+/// is the honest signal and caps what this adds at one extra optimization. A basin-shift
+/// restart may repeat ([`optimize_nlopt`], `MAX_BASIN_RESTARTS`, #2093), on the same
+/// shared budget. (The
 /// ceiling for the whole of [`optimize_nlopt`] is three, since the `left_init`
 /// retry can fire first and hand its own result here.)
 ///
@@ -3366,19 +3429,21 @@ fn optimize_nlopt(
 /// Pulled out as a pure fn — `restart` is handed the stalled result and returns
 /// its successor — so every branch is unit-testable without driving two NLopt
 /// fits.
-fn resolve_mid_descent_restart<T>(
+///
+/// Returns the reported result and whether it is the restart's (adopted).
+fn resolve_mid_descent_restart_adopting<T>(
     verbose: bool,
     cancelled: bool,
     first: (T, Option<RestartCause>),
     restart: impl FnOnce(&T, RestartCause) -> T,
     ofv_of: impl Fn(&T) -> f64,
-) -> T {
+) -> (T, bool) {
     let (first, cause) = first;
     let Some(cause) = cause else {
-        return first;
+        return (first, false);
     };
     if cancelled {
-        return first;
+        return (first, false);
     }
     let second = restart(&first, cause);
     // `ofv_is_valid` before the comparison, not `<` alone. A strict `<` rejects
@@ -3397,7 +3462,7 @@ fn resolve_mid_descent_restart<T>(
             RestartCause::BasinShift => second_ofv <= first_ofv,
         };
     if !adopt {
-        return first;
+        return (first, false);
     }
     if verbose {
         let why = match cause {
@@ -3409,7 +3474,19 @@ fn resolve_mid_descent_restart<T>(
              reached OFV = {second_ofv:.6}.",
         );
     }
-    second
+    (second, true)
+}
+
+/// [`resolve_mid_descent_restart_adopting`] without the flag: the form the unit tests read.
+#[cfg(test)]
+fn resolve_mid_descent_restart<T>(
+    verbose: bool,
+    cancelled: bool,
+    first: (T, Option<RestartCause>),
+    restart: impl FnOnce(&T, RestartCause) -> T,
+    ofv_of: impl Fn(&T) -> f64,
+) -> T {
+    resolve_mid_descent_restart_adopting(verbose, cancelled, first, restart, ofv_of).0
 }
 
 /// The stall-retry decision behind [`optimize_nlopt`], factored out of the fit
@@ -3436,7 +3513,7 @@ fn resolve_stall_retry<T>(
         return first;
     }
     let (retry, retry_left_init) = retry();
-    // `ofv_is_valid` for the same reason as in [`resolve_mid_descent_restart`]:
+    // `ofv_is_valid` for the same reason as in [`resolve_mid_descent_restart_adopting`]:
     // `<` alone adopts a `−inf` retry over a finite first attempt. Latent here
     // rather than reported — this retry only runs on a fit that never left its
     // start — but the two resolvers share one adoption rule and having only one
@@ -4382,7 +4459,63 @@ fn optimize_nlopt_once(
             stagnation_latched_cl.store(true, Ordering::Relaxed);
             latch_overrode_veto_cl.store(state.latch_overrode_veto, Ordering::Relaxed);
         }
-        if state.stagnation_stopped && verbose {
+        // #2093: a basin probe *during* the leg. The end-of-leg cold re-solve (#1565) is the
+        // only place a warm-start trap was detected, so a leg minimising against EBEs some
+        // subjects hold in a higher individual mode ran until NLopt itself gave up.
+        // Measured on `examples/warfarin_dcm.ferx`: 302 evaluations crawling −311 → −314
+        // while a cold solve at the incumbent scored −520, and the restart then spent the
+        // rest of the budget. On a geometric schedule of feasible evaluations (32, 64,
+        // 128, …: a logarithmic number of cold passes per leg) the same cold solve the
+        // end-of-leg check runs is scored at the incumbent; when it beats the best seen by
+        // that check's own margin ([`cold_solve_beats_best_seen`]), the leg stops through
+        // the stagnation early-return and the end-of-leg check files the basin-shift
+        // restart. A leg whose probe finds nothing continues on a bit-identical trajectory.
+        let mut basin_probe_stopped = false;
+        if !state.stagnation_stopped && !guarded && init_params.mixture.is_none() {
+            let feasible = plateau_tracker_cl.lock().unwrap().2;
+            if basin_probe_due(feasible) {
+                let incumbent = best_solve_cl
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|inc| inc.xs.clone());
+                let best = best_seen_cl.lock().unwrap().get().map(|b| b.ofv_clean);
+                if let Some(xs_inc) = incumbent {
+                    let x_inc: Vec<f64> = xs_inc.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                    let p = unpack_params(&x_inc, init_params);
+                    let mu_k = compute_mu_k(model, &p.theta, options.mu_referencing);
+                    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+                        model,
+                        population,
+                        &p,
+                        options.inner_maxiter,
+                        options.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        options.min_obs_for_convergence_check as usize,
+                        options.inner_restarts,
+                        InnerHessianSeed::for_options(options),
+                        options,
+                    );
+                    let cold =
+                        2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options);
+                    if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
+                        state.stagnation_stopped = true;
+                        basin_probe_stopped = true;
+                        if verbose {
+                            eprintln!(
+                                "Eval {:>4}: basin probe — a cold re-solve at the best point \
+                                 scores {cold:.6}, {gap:.4} below the best seen; ending this \
+                                 leg for a basin-shift restart.",
+                                state.n_evals,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The basin probe prints its own reason; this one would misstate it.
+        if state.stagnation_stopped && verbose && !basin_probe_stopped {
             eprintln!(
                 "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
                  last window. Whether this is convergence is decided after the \
@@ -5090,7 +5223,8 @@ fn optimize_nlopt_once(
     // *after* `stalled_mid_descent` is read, which must keep meaning "bare `Failure`
     // the plateau check rejected": folding this in would also fire the "stopped
     // mid-descent with its budget spent" advice on a run that did nothing of the kind.
-    // `optimize_nlopt` restarts such a run once ([`RestartCause::BasinShift`]); this
+    // `optimize_nlopt` restarts such a run ([`RestartCause::BasinShift`], repeated up to
+    // `MAX_BASIN_RESTARTS` times since #2093); this
     // warning reaches the user only if that restart is not adopted or not possible.
     let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
     if let (Some(gap), Some(cold), Some(best)) = (basin_gap, cold_ofv, best_seen_ofv) {
@@ -5567,7 +5701,8 @@ fn optimize_bfgs(
     // objective), so it engages for both FOCE and FOCEI on analytical models;
     // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
     // unavailable it degrades to plain warm-start from prior η̂.
-    let use_predictor = crate::sens::provider::sens_supported(model)
+    let use_predictor = model.n_kappa == 0
+        && crate::sens::ode_provider::adjoint::model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -5579,6 +5714,7 @@ fn optimize_bfgs(
             init_params,
             &x_anchor_real,
             &cached_etas,
+            options.interaction,
         )
     } else {
         None
@@ -5697,6 +5833,7 @@ fn optimize_bfgs(
                 init_params,
                 &x_new_real,
                 &cached_etas,
+                options.interaction,
             );
             x_anchor_real = x_new_real;
         }
@@ -6134,45 +6271,28 @@ fn subject_fixed_ebe_gradient(
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
-/// One cause today: a residual covariance correlated across observation rows (a paired
-/// `block_sigma`, or a `correlation` line) on a subject the dense assembly cannot serve.
-/// The scalar assembly serves only a diagonal residual covariance (`corr_residual_diag`
-/// declines on this same predicate), and the pairing depends on the data alone, so such
-/// a subject declines at every evaluation. For it the held-EBE gradient is not an
-/// occasional stand-in but the **only** gradient it ever contributes, and its missing
-/// EBE-response term then biases every step: on `fluconazole_radboudumc`, where all 31
-/// subjects have paired total/unbound rows, L-BFGS stalled at `‖g‖ ≈ 655` and OFV
-/// 807.88–810.28, against 738.05 with the reconverged gradient (NONMEM: 734.64).
-///
-/// Since #1960 FOCEI and FOCE serve those subjects with the exact dense assembly
-/// (`sens_outer_gradient_dense`) whenever [`dense_outer_supported`] holds, so for them a
-/// decline is parameter-dependent (a non-PD `R`, `R̃`, `H̃` or inner Hessian at a blown-up
-/// trial) and takes the same held-EBE salvage as any other. Two cases stay structural:
-/// a model the dense assembly excludes, and a subject the sensitivity provider itself
-/// cannot serve (`subject_sensitivities` is `None` — e.g. a rate-defined infusion under
-/// `F ≠ 1`, #419). The provider's subject gates are scope, not numerics, so its `None`
+/// For such a subject the held-EBE gradient would not be an occasional stand-in but the
+/// **only** gradient it ever contributes, and its missing EBE-response term then biases
+/// every step (on `fluconazole_radboudumc`, before the dense assembly served its paired
+/// rows, L-BFGS stalled at `‖g‖ ≈ 655`, OFV 807.88–810.28 against 738.05; NONMEM 734.64).
+/// The adjoint's kernel scores dense residual covariances itself, so the one structural
+/// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-///
-/// [`dense_outer_supported`]: crate::estimation::sens_outer_gradient::dense_outer_supported
 fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
     init_params: &ModelParameters,
     eta_hat: &[f64],
 ) -> bool {
-    crate::stats::residual_error::has_cross_observation_residual(
-        &model.error_spec,
+    // A subject no recorder can serve declines at every evaluation, as a model-level
+    // exclusion does; any other decline is numerical (a non-PD factor at a trial point).
+    crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        model,
         subject,
-        &init_params.sigma.values,
-        model.residual_cov_at(init_params),
-    ) && (!crate::estimation::sens_outer_gradient::dense_outer_supported(model)
-        || crate::sens::provider::subject_sensitivities(
-            model,
-            subject,
-            &init_params.theta,
-            eta_hat,
-        )
-        .is_none())
+        &init_params.theta,
+        eta_hat,
+    )
+    .is_none()
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed`]:
@@ -6448,8 +6568,8 @@ fn subject_reconverged_fd_gradient_iov(
 }
 
 /// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or
-/// `None` when this subject does not get one — either because the sensitivity provider
-/// (or the `prepare` assembly behind it) declined the subject's data shape at runtime,
+/// `None` when this subject does not get one — either because the adjoint
+/// (`subject_adjoint_packed_gradient`) declined the subject's data shape at runtime,
 /// or because a component came back non-finite. Both cases route the subject to
 /// [`subject_fixed_ebe_gradient`], so they are one gate, not two.
 ///
@@ -6808,16 +6928,16 @@ fn declined_subject_gradient(
 ///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
 ///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
 /// - **The outer *assembly* declines away from the mode for a second reason.**
-///   `prepare_stacked` needs the true inner Hessian `H` to be positive-definite
-///   (`invert_inner_hessian`), which holds at the EBE and routinely fails elsewhere:
-///   measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10
-///   subjects (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider
-///   serves all 10 and all 10 are analytic at their EBEs. That gate is a *precondition*
-///   detector rather than a matrix-shape check — see `invert_inner_hessian` for why
-///   widening it to nonsingular (#1513) is wrong and what it measures — but for this
-///   function's purposes the consequence is the same: a zero-η probe would announce four
-///   fallbacks that a fit serving these subjects at their EBEs never takes. Pinned by
-///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`.
+///   The adjoint's `mode_solve` needs `η̂` stationary and the exact inner Hessian `H`
+///   nonsingular (an indefinite `H` only within `MODE_STATIONARY_TOL` of stationarity),
+///   which holds at the EBE and routinely fails elsewhere. Measured before #2093 on the
+///   bundled `examples/warfarin.ferx` + `data/warfarin.csv` against the forward provider's
+///   positive-definite gate, 4 of the 10 subjects (ids 2, 4, 7, 10) failed it at `η = 0`
+///   while all 10 were analytic at their EBEs (the retired
+///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`).
+///   For this function's purposes the consequence is the same: a zero-η probe would announce
+///   fallbacks that a fit serving these subjects at their EBEs never takes. The off-mode
+///   decline is pinned by `mode_solve_declines_an_indefinite_hessian_off_the_mode`.
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
@@ -6855,7 +6975,7 @@ impl OuterFdDeclineLog {
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
     /// Called from the rayon workers, hence `Relaxed` — the log is read once, after
     /// every gradient evaluation has been joined.
-    fn record(&self, i: usize) {
+    pub(crate) fn record(&self, i: usize) {
         if let Some(flag) = self.declined.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -6863,7 +6983,7 @@ impl OuterFdDeclineLog {
 
     /// Mark declined subject `i` as a structural decline (#1536). Rayon workers,
     /// `Relaxed`, as above.
-    fn record_structural(&self, i: usize) {
+    pub(crate) fn record_structural(&self, i: usize) {
         if let Some(flag) = self.structural.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -6913,7 +7033,7 @@ impl OuterFdDeclineLog {
 /// too: an IOV subject is reconverged (correct, slower); a non-IOV subject takes the
 /// held-EBE gradient (cheap, omits the EBE-response term), and the remedy is
 /// `reconverge_gradient_interval`, which the IOV route ignores. The route is read from the
-/// model here — `n_kappa > 0` is exactly when `iov_sens_supported` sends the gradient to
+/// model here — `n_kappa > 0` is exactly when the dispatch sends the gradient to
 /// `population_gradient_sens_iov_mixed` — rather than passed in, so no caller can pair a
 /// log with the wrong sentence.
 ///
@@ -6943,12 +7063,9 @@ pub(crate) fn outer_fd_fallback_warning(
          `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
          evaluation.";
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
-         their residuals are correlated across observation rows (a paired `block_sigma` or \
-         a `correlation` line) and the analytic outer gradient cannot serve them: the model \
-         pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
-         (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
-         subject's dosing is outside the analytic sensitivities; those gradients include \
-         the EBE-response term but are slower.";
+         no analytic recorder serves them: their data shape is outside the recorders' scope \
+         at every parameter point (for example a steady-state infusion under a lag time on \
+         the event walk). Those gradients include the EBE-response term but are slower.";
     // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.
@@ -6979,8 +7096,8 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a data shape outside the sensitivity provider's \
-         scope, or a trial point where it could not be formed) and {consequence} The reported \
+         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
+         point where it could not be formed) and {consequence} The reported \
          outer gradient method is the model-level route, not the per-subject one.{skipped}"
     ))
 }
@@ -6989,8 +7106,8 @@ pub(crate) fn outer_fd_fallback_warning(
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
 /// every subject inside the provider's scope, and a per-subject
 /// [`subject_fixed_ebe_gradient`] for each subject outside it (or whose analytic
-/// gradient came back non-finite). This replaces the all-or-nothing
-/// [`population_gradient_sens`]: previously a single out-of-scope subject forced
+/// gradient came back non-finite). This replaced the all-or-nothing
+/// `population_gradient_sens` (since retired): previously a single out-of-scope subject forced
 /// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block left the variance components pinned at their start and stalled
 /// SLSQP/L-BFGS/MMA above the derivative-free optimum
@@ -7359,6 +7476,7 @@ fn population_gradient_with_agq_evaluation(
             options,
             reconverge,
             agq_evaluation,
+            Some(declines),
         ) {
             return g;
         }
@@ -7372,12 +7490,12 @@ fn population_gradient_with_agq_evaluation(
     // (`subject_packed_gradient_foce`, censored rows excluded from R̃ and added as
     // `−logΦ`) paths, so M3 takes the analytic path like any other fit.
     let force_reconverge = reconverge;
-    // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
-    // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
+    // Analytic gradient (Almquist 2015 Eq. 23, via the adjoint
+    // `subject_adjoint_packed_gradient`): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
-    // supersedes both branches below where it applies. Gated to the supported
-    // analytical PK scope (1-/2-/3-cpt); `population_gradient_sens` returns `None`
-    // (→ the existing FD/Laplace path) if any subject is outside provider scope.
+    // supersedes both branches below where it applies. Gated on
+    // `analytic_outer_gradient_available`; a subject the adjoint declines takes a
+    // per-subject salvage inside the mixed assembly (#466, #1529).
     // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
     // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
     // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
@@ -7391,11 +7509,11 @@ fn population_gradient_with_agq_evaluation(
     // IOV-analytical models route to the dedicated stacked-η / block-Ω assembly
     // (both FOCEI and FOCE — see the interaction branch below). Their gradient
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
-    // separately from the non-IOV `sens_supported` path.
-    // Covers both the closed-form analytical IOV provider and the ODE IOV provider
-    // (RHS-program models); both produce the stacked-η / block-Ω assembly the IOV
-    // gradient entry points consume (#439 ODE IOV).
-    let iov_analytic = crate::sens::provider::iov_sens_supported(model);
+    // separately from the non-IOV path.
+    // The adjoint serves both closed-form analytical and ODE (RHS-program) IOV models
+    // on the stacked `[η, κ]` width (`subject_width`); both feed the stacked-η /
+    // block-Ω assembly the IOV gradient entry points consume (#439 ODE IOV).
+    let iov_analytic = model.n_kappa > 0;
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.

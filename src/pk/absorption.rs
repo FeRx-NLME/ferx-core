@@ -258,7 +258,7 @@ pub enum InputRateKind {
 
 impl InputRateKind {
     /// Whether this kind's input-rate forcing has been lifted to `PkNum`/`Dual2`
-    /// so the analytic ODE sensitivity provider (`sens/ode_provider.rs`) can
+    /// so the analytic ODE walks (`sens/ode_provider.rs`, recorded by the adjoint) can
     /// evaluate it over dual numbers; otherwise a model using it stays on the FD
     /// fallback. Inverse-Gaussian (#430 slice 1), transit (#430 slice 2, via the
     /// `ln_gamma` `Dual2` rule = digamma/trigamma), and Weibull (Phase 2 — its
@@ -366,7 +366,7 @@ impl InputRateForcing {
     /// Read this forcing's argument `i` from the flat individual-parameter
     /// vector `params`, falling back to `dflt` if the slot is absent. Generic
     /// over `T: PkNum` so the same reader serves the `f64` prediction path and
-    /// the `Dual2<N>` sensitivity provider (`params` is then the dual
+    /// the dual-number gradient path (`params` is then the dual
     /// individual-parameter vector).
     #[inline]
     fn arg<T: PkNum>(&self, params: &[T], i: usize, dflt: f64) -> T {
@@ -468,7 +468,7 @@ impl InputRateForcing {
     }
 
     /// Build the prepared input-rate constants over `T: PkNum` (e.g.
-    /// `T = Dual2<N>` for the analytic ODE sensitivity provider, #430) from the
+    /// a dual type for the analytic ODE walks, #430) from the
     /// individual-parameter vector `params` — laid out identically to the `f64`
     /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
     /// per-kind argument defaults match `prepare`, so the lifted constants
@@ -476,7 +476,7 @@ impl InputRateForcing {
     /// return `Some`: the smooth densities (inverse-Gaussian, transit, Weibull,
     /// first-order) pointwise, and [`InputRateKind::ZeroOrder`] via its `dur` jet —
     /// its moving-boundary `∂/∂dur` is delivered as a rate-off saltation by the
-    /// analytic provider (#530), not FD. [`InputRateKind::supported_over_dual`] gates which kinds
+    /// analytic ODE walk (#530), not FD. [`InputRateKind::supported_over_dual`] gates which kinds
     /// reach here and is pinned consistent with this `match` by
     /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
@@ -494,7 +494,7 @@ impl InputRateForcing {
                 self.arg(params, 1, 1.0),
             )),
             // Lifted (#530): the pointwise `dur` jet carries the smooth magnitude
-            // term; the analytic provider's `integrate_g` delivers the window as a
+            // term; the analytic ODE walk's `integrate_g` delivers the window as a
             // per-segment constant and injects the rate-off saltation at the cutoff
             // for the moving-boundary term. The `dur` field threads `∂/∂dur` into both.
             InputRateKind::ZeroOrder => {
@@ -512,7 +512,7 @@ impl InputRateForcing {
 /// ODE hot path. Built once per dose record by [`InputRateForcing::prepare`];
 /// [`Self::rate`] then costs only the `tad`/`dose`-dependent arithmetic per dose.
 /// Generic over the numeric type `T`: `T = f64` for predictions, `T = Dual2<N>`
-/// for the analytic ODE sensitivity provider (#430). The default `T = f64` keeps
+/// (or another dual type) for the analytic ODE walks (#430). The default `T = f64` keeps
 /// every existing scalar call site (`PreparedInputRate`) unchanged.
 #[derive(Debug, Clone, Copy)]
 pub enum PreparedInputRate<T = f64> {
@@ -651,7 +651,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// Generic over `T` (the `sens/` `*_g<T>` convention). The pointwise `rate`
     /// below carries the smooth *magnitude* part of `∂R_in/∂dur` via the `dur`/
     /// `inv_dur` jets; the moving-boundary part at the `tad = dur` cutoff is supplied
-    /// separately by the analytic provider's rate-off saltation (`integrate_g`, #530),
+    /// separately by the analytic ODE walk's rate-off saltation (`integrate_g`, #530),
     /// so a `zero_order()` model is now served analytically
     /// ([`InputRateKind::supported_over_dual`] = `true`).
     #[inline]
@@ -836,15 +836,58 @@ impl<T: PkNum> PreparedInputRate<T> {
         (g_hi - g_lo) * dose / t_inf
     }
 
+    /// `R_in(τ)` just after onset, for a `τ` of **value zero** whose jet is the onset's own
+    /// shift: the kernel's right-hand continuation through `τ = 0`, which [`Self::rate`]'s
+    /// `tad ≤ 0` guard cannot give. The moving-boundary flows of the analytic ODE walk
+    /// (`sens/ode_provider.rs`) integrate the post-onset side over that jet-only interval.
+    ///
+    /// Exact to every order where the kernel is analytic at the onset: `FirstOrder`, the pure
+    /// first-order `Transit n = 0` and `Weibull β = 1` arms (fixed shape), and the onsets that
+    /// vanish to fourth order (`Transit n ≥ 4`, `Weibull β ≥ 5`, `InverseGaussian`). Elsewhere
+    /// the kernel is `∝ τ^p` with a non-integer or estimated `p`, so its onset has no Taylor
+    /// series; the value and slope ([`Self::rate_at_zero`], [`Self::rate_dtad_at_zero`]) are
+    /// exact through second order, and a type carrying higher derivatives
+    /// (`!PkNum::TAYLOR2_EXACT`) gets `NaN` there, so its recording declines rather than
+    /// truncating.
+    pub(crate) fn rate_onset_continued(&self, tau: T, dose: T) -> T {
+        if dose.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        let exp_decay = |k: T| dose * k * (-(k * tau)).exp();
+        match *self {
+            PreparedInputRate::FirstOrder { ka } => return exp_decay(ka),
+            PreparedInputRate::Transit { ktr, n, .. } if n.val() <= 0.0 && n.is_constant() => {
+                return exp_decay(ktr);
+            }
+            PreparedInputRate::Transit { n, .. } if n.val() >= 4.0 => return T::from_f64(0.0),
+            PreparedInputRate::Weibull { beta, c0, .. }
+                if beta.val() == 1.0 && beta.is_constant() =>
+            {
+                return exp_decay(c0.exp());
+            }
+            PreparedInputRate::Weibull { beta, .. } if beta.val() >= 5.0 => {
+                return T::from_f64(0.0);
+            }
+            PreparedInputRate::InverseGaussian { .. } | PreparedInputRate::ZeroOrder { .. } => {
+                return T::from_f64(0.0);
+            }
+            _ => {}
+        }
+        if !T::TAYLOR2_EXACT && !tau.is_constant() {
+            return T::from_f64(f64::NAN);
+        }
+        self.rate_at_zero(dose) + self.rate_dtad_at_zero(dose) * tau
+    }
+
     /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
-    /// value, needed by the event-driven ODE sensitivity walk to inject an exact
-    /// rate-on **saltation** when a dose's own arrival is a moving boundary (an
-    /// estimated lagtime, #486): [`Self::rate`]'s domain guard returns a flat zero
-    /// *at* `tad = 0` by convention ("not yet started"), so the jump at onset is
-    /// computed here, separately, and injected once at the dose event (see
-    /// `inject_rate_saltation` in `sens/ode_provider.rs`) — the continuous
-    /// `∂R_in/∂lag` for `tad > 0` still flows through [`Self::rate`] itself when
-    /// `tad` carries the lag sensitivity.
+    /// value. [`Self::rate`]'s domain guard returns a flat zero *at* `tad = 0` by
+    /// convention ("not yet started"), so the onset is computed here, separately. The
+    /// event-driven ODE sensitivity walk crosses a dose's moving arrival (an estimated
+    /// lagtime, #486) with the all-orders continuation [`Self::rate_onset_continued`],
+    /// which falls back to this value plus [`Self::rate_dtad_at_zero`]'s slope where the
+    /// kernel has no Taylor series at the onset — the continuous `∂R_in/∂lag` for
+    /// `tad > 0` still flows through [`Self::rate`] itself when `tad` carries the lag
+    /// sensitivity.
     ///
     /// `Transit` vanishes at onset for any `n > 0` (the Γ-density `n·ln(tad) → −∞`
     /// dominates) and degenerates to `ktr·dose` at `n = 0` (pure first-order);
@@ -853,7 +896,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
     /// for shape `β < 1` (an integrable spike, not a finite jump) — callers must
     /// exclude that combination rather than call this (see
-    /// `ode_analytical_supported`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
+    /// `ode_walk_model_scope`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
     /// handled entirely by its separate moving-window mechanism (#530), not this
     /// path.
     #[inline]
@@ -890,11 +933,11 @@ impl<T: PkNum> PreparedInputRate<T> {
     }
 
     /// The right-hand limit `lim_{tad→0⁺} ∂R_in/∂tad(tad, dose)` — the forcing's
-    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value).
-    /// Needed by the rate-on saltation's second-order (curvature) term: a moving
-    /// absorption boundary (estimated lagtime, #486) that carries IIV lands the
-    /// δ²-in-`δlag` correction in the checked `d²f/∂η²` Hessian block, and that
-    /// coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
+    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value). Together
+    /// they are [`Self::rate_onset_continued`]'s second-order fallback where the kernel has
+    /// no Taylor series at the onset. A moving absorption boundary (estimated lagtime, #486)
+    /// that carries IIV lands a δ²-in-`δlag` term in the checked `d²f/∂η²` Hessian block,
+    /// whose coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
     /// **plus** the forcing's own explicit time-variation at the onset (#880). For a
     /// **constant**-rate forcing (infusion, zero-order window) this slope is zero, so
     /// the old `½·jg`-only coefficient was already exact there; it is the decaying
@@ -902,8 +945,8 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// analytic Hessian (near sign-mirror of FD).
     ///
     /// This is the companion to the jump in the **second** time-derivative `ẍ` at the
-    /// onset, which the saltation's `δlag²` term needs — NOT only to a jump in the onset
-    /// **value** `ẋ`. So it is non-zero in two cases:
+    /// onset, which a boundary crossing's second-order (`δlag²`) term needs — NOT only to a
+    /// jump in the onset **value** `ẋ`. So it is non-zero in two cases:
     /// - a **finite-value-jump** onset (`rate_at_zero ≠ 0`): `FirstOrder` (`−dose·ka²`),
     ///   the degenerate `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull`
     ///   `β = 1` (`−dose/Td²`); and
@@ -916,7 +959,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// limitation, leaving those Hessians on FD — for the **singular** `Transit`
     /// `0 < n < 1` (slope →`+∞`, no finite companion). `Weibull` `β < 1` diverges
     /// (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
-    /// (`ode_analytical_supported`) keeps `Weibull` on the FD fallback. The `Transit`
+    /// (`ode_walk_model_scope`) keeps `Weibull` on the FD fallback. The `Transit`
     /// `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64` equality
     /// (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
@@ -1940,9 +1983,9 @@ mod tests {
     /// Drift tripwire: `InputRateKind::supported_over_dual` (the gate the ODE
     /// provider reads) must agree with whether `prepare_dual` actually lifts the
     /// kind. A kind marked supported but returning `None` would let
-    /// `ode_analytical_supported` admit the model, then the `?` in
-    /// `integrate_subject_duals` silently bails the whole subject to FD with no
-    /// error. Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
+    /// `ode_walk_model_scope` admit the model, then the `prepare_dual` call in the
+    /// ODE walk (`prepare_dual_forcing`) would panic on a subject the gate promised it could serve (before
+    /// #2093 the `?` in `integrate_subject_duals` silently bailed it to FD). Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
     #[test]
     fn supported_over_dual_agrees_with_prepare_dual() {
         const ALL_KINDS: &[InputRateKind] = &[
@@ -2218,11 +2261,12 @@ mod tests {
     }
 
     /// Direct Tier-1 coverage of every `rate_at_zero` match arm (#486 review): the
-    /// function's only caller (the event-driven walk's onset saltation, gated on
-    /// `has_lagtime`) currently reaches just `Transit`/`InverseGaussian`/`FirstOrder`
-    /// (`ode_analytical_supported`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
-    /// that combination), so the `Weibull` and `ZeroOrder` arms — and `Transit`'s
-    /// degenerate `n ≤ 0` case — are otherwise never exercised, direct or indirect.
+    /// function's only caller (`rate_onset_continued`'s fallback, read by the event-driven
+    /// walk's onset crossing, gated on `has_lagtime`) currently reaches just
+    /// `Transit`/`InverseGaussian`/`FirstOrder` (`ode_walk_model_scope`'s lagtime gate
+    /// excludes `Weibull`/`ZeroOrder` from that combination), so the `Weibull` and
+    /// `ZeroOrder` arms — and `Transit`'s degenerate `n ≤ 0` case — are otherwise never
+    /// exercised, direct or indirect.
     /// Pinning them here means a future gate relaxation that makes one of them live
     /// inherits a regression test instead of shipping untested.
     #[test]
@@ -2308,7 +2352,8 @@ mod tests {
     }
 
     /// #880: `rate_dtad_at_zero` is the onset **slope** companion to `rate_at_zero`,
-    /// feeding the rate-on saltation's δlag² (curvature) term. For the finite-jump
+    /// feeding `rate_onset_continued`'s second-order fallback (the rate-on crossing's δlag²
+    /// curvature term). For the finite-jump
     /// (first-order-like) arms it must equal the one-sided derivative of [`Self::rate`]
     /// at `tad → 0⁺`; for the vanishing-onset arms it is 0. Cross-checked against a
     /// forward difference of `rate` at a small `tad` so the closed forms can't drift

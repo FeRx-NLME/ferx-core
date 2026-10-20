@@ -9,13 +9,17 @@
 //! made #1790's `run_covariance` bit-identity flake on `main` once a concurrent test fitted
 //! with another solver.
 //!
-//! Fixture: warfarin, FOCEI, covariance step, analytic (`Dual2`) inner gradients,
+//! Fixture: `two_cpt_oral_cov`, FOCEI, covariance step, analytic (`Dual2`) inner gradients,
 //! measured via `gradient_method_inner` (fit A with `inner_optimizer = lbfgs`). Mutation: drop the inner half of the scope `run_covariance`
 //! opens (score under `FitOptions::default()`'s inner settings) → T4 (i) dies here, and the
 //! `inner_optimizer` row and T10 in `run_covariance_scoring_record.rs` (measured on #1847;
 //! before #1847 it was T4 (ii) and T5, which since then start from the fit's own EBEs, where
 //! the default dense BFGS and L-BFGS reconverge to the same bits, see T4); write a fit's inner
 //! settings to a process global again → T4 (iii) dies.
+//!
+//! Warfarin served until #2093: with the step-scaled first inner iterate, Nelder–Mead and
+//! L-BFGS reconverge warfarin's EBEs to the same covariance bits, so T4 (i) lost its
+//! straddle. `two_cpt_oral_cov` keeps the two solvers' covariances distinct (measured).
 
 use ferx_core::{fit, prepare_run, run_covariance, FitOptions, FitResult, InnerOptimizer};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,8 +34,11 @@ struct Fixture {
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        let prep =
-            prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv")).expect("prepare");
+        let prep = prepare_run(
+            "examples/two_cpt_oral_cov.ferx",
+            Some("data/two_cpt_oral_cov.csv"),
+        )
+        .expect("prepare");
         let lbfgs = FitOptions {
             verbose: false,
             method: ferx_core::EstimationMethod::FoceI,
@@ -108,8 +115,8 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
         "(iii) a later Nelder–Mead fit changed run_covariance's inner solver"
     );
     // The premise uses the solver the leak would bring in. Since #1847 the step starts from
-    // the fit's own EBEs, and from there dense BFGS (`Auto` on warfarin) and L-BFGS reconverge
-    // to the same bits. On this fixture's analytic-Hessian route the step reconverges once, at
+    // the fit's own EBEs, and from there dense BFGS (`Auto` here) and L-BFGS reconverge
+    // to the same bits. On warfarin (the fixture before #2093) the analytic-Hessian route reconverges once, at
     // the centre: 8 of 10 warm starts already meet the tolerance, and the other 2 move by
     // ≤1.9e-9 with identical steps under both solvers (measured on #2092). So only a
     // materially different solver can move the covariance. Before #1847 `Auto` did, through

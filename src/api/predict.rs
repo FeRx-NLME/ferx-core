@@ -355,7 +355,9 @@ pub struct PredictionResult {
 /// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
 /// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
 /// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
-/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the data lacks
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the model reads anywhere that the
+/// data lacks: model-wide, as `predict_diag` checks it, so the selector of a
+/// covariate-selected `[error_model]` is required though this entry never reads it
 /// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
@@ -485,7 +487,9 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
 /// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
 /// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
-/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the data lacks
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the model reads anywhere that the
+/// data lacks: model-wide, as `predict_diag` checks it, so the selector of a
+/// covariate-selected `[error_model]` is required though this entry never reads it
 /// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_survival(

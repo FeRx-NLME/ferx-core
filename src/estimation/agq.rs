@@ -79,10 +79,9 @@ use rayon::prelude::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
-use crate::estimation::importance_sampling::{build_proposal, proposal_from_regularised_anchor};
+use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
-use crate::sens::provider::SubjectSens;
 use crate::stats::likelihood::individual_nll_into_prepared_with_schedule;
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
@@ -95,7 +94,7 @@ pub const MAX_AGQ_NODES: usize = 21;
 static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
     [const { OnceLock::new() }; MAX_AGQ_NODES];
 
-fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64], &'static [f64]) {
+pub(crate) fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64], &'static [f64]) {
     assert!((1..=MAX_AGQ_NODES).contains(&n));
     let (nodes, weights, log_weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| {
         let (nodes, weights) = gauss_hermite(n);
@@ -112,10 +111,6 @@ fn cached_log_weights_enabled() -> bool {
             .map(|v| v != "1")
             .unwrap_or(true)
     })
-}
-
-fn node_score_fusion_supported(model: &CompiledModel) -> bool {
-    model.ode_spec.is_none() && analytic_score_supported(model)
 }
 
 fn laplace_one_point_fast_enabled() -> bool {
@@ -136,18 +131,6 @@ fn laplace_mode_nll_reuse_enabled() -> bool {
     })
 }
 
-/// Benchmark-only A/B switch for reusing the exact anchor's base sensitivity jet in
-/// `deta_hat/dx`. Both routes call the same response assembly; the disabled route merely
-/// rebuilds the identical jet first.
-fn laplace_eta_dx_base_jet_reuse_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_LAPLACE_ETA_DX_BASE_JET_REUSE")
-            .map(|v| v != "1")
-            .unwrap_or(true)
-    })
-}
-
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
 /// [`crate::api::check_model_options`]. The tensor rule costs one full likelihood
 /// evaluation per node per subject per outer iteration, so the grid — not the node count —
@@ -162,105 +145,6 @@ const NLL_SENTINEL: f64 = 1e20;
 /// Work already produced by the immediately preceding inner solve at the same
 /// population parameters and mode: optional exact curvature plus the mode NLL.
 pub(crate) type TerminalLaplaceWork = (Option<DMatrix<f64>>, f64);
-
-/// Relative step for central-differencing the grid-response term (and the mixed
-/// `∂²nll/∂η∂x` in [`eta_dx`]).
-///
-/// **Truncation-dominated, not noise-dominated** — the opposite of the intuition. It
-/// differences `log|H|`, which curves sharply in the packed coordinates, so a "safe" large
-/// step is catastrophic: `1e-2` puts the θ gradient 5× off, `1e-3` still 4%. The `H` inside
-/// is itself finite-differenced, but its error floor turns out to sit well below where
-/// truncation bites, so the step wants to be *small*. Measured on warfarin, the answer is
-/// converged by `1e-4` and unchanged at `1e-5`. Calibrated by
-/// `analytic_gradient_matches_fd_at_every_node_count`, which would catch a regression here
-/// immediately.
-const AGQ_GRID_FD_STEP: f64 = 1e-5;
-
-/// A/B override for the grid-response route, read once from `FERX_AGQ_GRID_RESPONSE`.
-///
-/// `fd` forces [`fd_grid_response`] for both anchors; `analytic` forces
-/// [`analytic_grid_response`] for both (where in scope); unset leaves the **per-anchor**
-/// default in [`use_analytic_grid_response`]. Exists so the two routes can be timed in the
-/// same binary, on the same fit — a separate baseline build would confound the measurement
-/// with the compiler's inlining decisions and a cold cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GridResponseOverride {
-    Auto,
-    ForceFd,
-    ForceAnalytic,
-}
-
-fn grid_response_override() -> GridResponseOverride {
-    static E: std::sync::OnceLock<GridResponseOverride> = std::sync::OnceLock::new();
-    *E.get_or_init(|| match std::env::var("FERX_AGQ_GRID_RESPONSE") {
-        Err(_) => GridResponseOverride::Auto,
-        Ok(v) => match v.as_str() {
-            "fd" => GridResponseOverride::ForceFd,
-            "analytic" => GridResponseOverride::ForceAnalytic,
-            // A typo here (e.g. "analytical") must not silently fall back to `Auto`: that
-            // makes the "candidate" arm of an A/B benchmark identical to the baseline and
-            // reports "no difference" — exactly the failure mode this variable exists to
-            // avoid.
-            other => panic!("FERX_AGQ_GRID_RESPONSE must be \"fd\" or \"analytic\", got {other:?}"),
-        },
-    })
-}
-
-/// Whether the analytic grid response is the default for this anchor, absent an override.
-///
-/// **Both anchors now default to analytic (#1335).** They used to default oppositely.
-///
-/// [`HessianAnchor::GaussNewton`] → [`crate::estimation::focei_htilde_dx`] needs no third
-/// order at all: `H̃` is bilinear in first-order sensitivities, so its derivative comes from
-/// the *second*-order blocks the plain provider already returns — one extra
-/// `subject_sensitivities` call, independent of `n_free`, in place of the FD route's
-/// `2·n_free` full anchor rebuilds. This has always been default-on.
-///
-/// [`HessianAnchor::Exact`] → [`crate::estimation::laplace_h_deriv`] genuinely needs the
-/// third-order jet (`H` carries the `Aⱼ`-weighted curvature term `H̃` does not), so it pays
-/// the covariance provider's `1 + 2(n_theta + n_eta)`-evaluation sweep — materially more work
-/// per call than a plain anchor rebuild, against materially fewer calls. That trade sat close
-/// enough to parity that an early measurement on the **diagonal-Ω** fixture came out +34%
-/// *slower*, which is why this route was opt-in; a later session on the same fixture came out
-/// ~14% faster. Both were real. The deciding measurement was the one nobody had run: the
-/// **block-Ω** case, where the call-count gap is wide (`2·n_free = 20` FD rebuilds vs
-/// `1 + 2(n_theta + d) = 13` provider evaluations). On the diagonal fixture,
-/// `n_free = n_theta + d + n_sigma = 7` gives 14 FD rebuilds versus 13 provider evaluations.
-/// Those are similar counts of different work units, not equal costs by construction.
-///
-/// Measured on `plans/laplace-sensitivity-speed/` (5 interleaved reps, `ci-test`,
-/// `RAYON_NUM_THREADS=1`, commit `f2434247`), `fd` → `analytic` provider time:
-///
-/// | fixture | calls | provider time | reps won | outer iters |
-/// |---|---|---|---|---|
-/// | diagonal Ω, closed-form | 6840 → 6460 | 0.0586s → 0.0556s (−5%) | 4/5 | 37 → 37 |
-/// | block Ω (3×3) | 11520 → 8160 | 0.0880s → 0.0670s (−24%) | 5/5 | 47 → 47 |
-/// | ODE | 10270 → 6470 | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 |
-///
-/// Every arm matched OFV at the console's four-decimal precision. Derivative correctness
-/// is checked separately by `analytic_grid_response_matches_the_fd_route` and the
-/// `laplace_h_deriv` parity tests; rounded OFVs do not establish gradient equivalence. The
-/// diagonal case remains inconclusive across sessions, with one rep of five
-/// still favouring `fd`. Block-Ω measured a 24% win at equal outer-iteration counts,
-/// making it a closer comparison without establishing identical optimiser trajectories. The
-/// ODE row has different iteration counts (56 → 37); both its call and time totals reflect
-/// different optimiser trajectories and do not isolate per-iteration cost.
-///
-/// Deliberately an environment variable and not a `[fit_options]` key: both routes compute the
-/// same derivative and differ only in cost, so there is nothing for a *user* to choose. It is
-/// **kept, not removed, now that `Auto` no longer branches**, because it is the harness
-/// `plans/laplace-sensitivity-speed/bench.sh` drives and the only way to re-measure a decision
-/// this doc records as session-sensitive. Costs one `OnceLock` read when unset — the same
-/// mechanism as [`crate::sens::provider::profile_report`]'s `FERX_PROFILE`.
-/// Takes no anchor argument, now that the answer does not depend on one: a parameter the body
-/// ignores would read as "this is still anchor-scoped" to the next person. `analytic_grid_response`
-/// still dispatches on the anchor internally, and still declines per-anchor to the FD route.
-fn use_analytic_grid_response() -> bool {
-    match grid_response_override() {
-        GridResponseOverride::ForceFd => false,
-        GridResponseOverride::ForceAnalytic | GridResponseOverride::Auto => true,
-    }
-}
 
 /// Number of nodes in the tensor grid, saturating at [`usize::MAX`] rather than
 /// overflowing — callers compare against [`MAX_AGQ_GRID`] and reject long before that.
@@ -340,36 +224,39 @@ pub(crate) struct Stack {
 static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Subject-local AGQ work that an outer objective evaluation can hand directly
-/// to the gradient requested by the same optimizer callback.
-struct PreparedGrid {
-    h: DMatrix<f64>,
-    regularised_anchor: Option<crate::estimation::agq_cov_hessian::RegularisedAnchor>,
-    /// The one-node Laplace grid is exactly the separately retained `b_hat`
-    /// with unit weight, so its node and weight vectors need no allocations.
-    one_point: bool,
-    /// Row-major quadrature modes (`n_grid × d`) in one allocation.
-    bs: Vec<f64>,
-    softmax: Vec<f64>,
-    /// Row-major fixed-node scores (`n_grid × packed_width`) produced alongside
-    /// the node likelihoods.  Keeping this single matrix avoids recomputing jets;
-    /// gradient assembly consumes it directly without a second weighted matrix.
-    node_scores: Option<Vec<f64>>,
-    base_jet: Option<SubjectSens>,
-}
-
-enum PreparedSubject {
-    Grid {
-        stack: Stack,
-        b_hat: Vec<f64>,
-        grid: PreparedGrid,
-    },
-}
-
 /// AGQ population objective and matching gradient computed from the same subject-local grids.
 pub(crate) struct PopulationEvaluation {
     pub(crate) nll: f64,
     gradient: Option<Vec<f64>>,
+    /// How each subject's score was formed, in subject order (for the outer FD-fallback
+    /// warning).
+    routes: Vec<ScoreRoute>,
+}
+
+/// How [`SubjectScoreContext::score_routed`] formed a subject's score.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScoreRoute {
+    /// The adjoint's exact `dFᵢ/dx`.
+    Exact,
+    /// The adjoint's held-EBE score (no EBE response):
+    /// `adjoint::subject_adjoint_held_ebe_score`.
+    HeldEbe,
+    /// The reconverged finite-difference score.
+    Reconverged,
+}
+
+impl ScoreRoute {
+    /// Record a non-exact route for subject `i` in the outer FD-fallback log.
+    fn record(self, log: &crate::estimation::outer_optimizer::OuterFdDeclineLog, i: usize) {
+        match self {
+            ScoreRoute::Exact => {}
+            ScoreRoute::HeldEbe => log.record(i),
+            ScoreRoute::Reconverged => {
+                log.record(i);
+                log.record_structural(i);
+            }
+        }
+    }
 }
 
 impl Stack {
@@ -467,8 +354,8 @@ impl Stack {
 
     /// Same dispatch as [`Stack::nll_at`], but takes the `err_keys`/`ruv_mult`/scratch as
     /// caller-hoisted arguments instead of computing or allocating them per call. The hot
-    /// per-node sweep in [`agq_nodes_and_terms`] hoists these once for the whole grid (the
-    /// same hoist `node_nll_gradient` gets); routing both call shapes through this one
+    /// per-node sweep in [`agq_terms`] hoists these once for the whole grid; routing both
+    /// call shapes through this one
     /// IOV/non-IOV branch keeps a single copy of the dispatch instead of two that must be
     /// kept in sync.
     #[allow(clippy::too_many_arguments)]
@@ -606,95 +493,20 @@ fn fd_posterior_hessian(
     h
 }
 
-/// Both anchor Hessians, from **one** [`score_core`](crate::estimation::sens_outer_gradient::score_core)
-/// sweep. That function already assembles both matrices from a single provider evaluation:
-///
-/// * `htilde` = `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` — the first-order (Almquist) FOCEI Hessian; and
-/// * `h_inner` = `Ω⁻¹ + Σⱼ (∂²Lⱼ/∂f² aⱼaⱼᵀ + ∂Lⱼ/∂f Aⱼ)` — the **exact** conditional Hessian
-///   `∂²nll/∂b²`, which additionally carries the `∂²f/∂b²` term Gauss-Newton drops.
-///
-/// `None` when the model is outside the provider's scope, or `score_core` declines this
-/// subject at runtime (off-diagonal correlated residual, magnitude × M3-censored).
-fn score_core_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-) -> Option<(
-    crate::estimation::sens_outer_gradient::ScoreCore,
-    crate::sens::provider::SubjectSens,
-)> {
-    // The jet is the stacked (η, κ) one under IOV, so this serves both regimes.
-    let sens = if stack.is_iov() {
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b_hat)?
-    } else {
-        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
-    };
-    let core = crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        stack.d(),
-        &stack.omega_joint_inv,
-        b_hat,
-        model.residual_error_eta,
-    )?;
-    // The jet is returned, not dropped, so the Laplace derivative sweep can use it as its base
-    // instead of recomputing this exact call (#1344 item 2). Most callers ignore it.
-    Some((core, sens))
-}
-
-/// [`anchor_hessian`] plus the base jet, for the one caller that can use it.
-///
-/// The gradient path needs both the anchor *and* — on the `Exact` arm — the base jet that built
-/// it, because `laplace_h_deriv`'s sweep would otherwise recompute the identical
-/// `subject_sensitivities(model, subject, theta, b_hat)` call as its own base. Surfacing it here
-/// removes one of the sweep's `1 + 2·n_eta` evaluations.
-///
-/// This is a second spelling of the `Exact` dispatch, not a second implementation: both arms go
-/// through [`score_core_at`], so the Hessian is the same matrix `anchor_hessian` would return,
-/// and anything that is not "`Exact`, non-IOV, in scope" falls straight through to it. A jet is
-/// offered **only** for the non-IOV `Exact` case — under IOV `score_core_at` builds the stacked
-/// `(η, κ)` jet, which is not what a `covariance_sensitivities(iov = false)` sweep wants, and
-/// `subject_h_inner_dx` declines IOV anyway.
-fn anchor_hessian_and_base_jet(
-    anchor: HessianAnchor,
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> Option<(DMatrix<f64>, Option<crate::sens::provider::SubjectSens>)> {
-    if matches!(anchor, HessianAnchor::Exact) && !stack.is_iov() && analytic_score_supported(model)
-    {
-        if let Some((core, jet)) = score_core_at(model, subject, params, stack, b_hat) {
-            return Some((core.h_inner, Some(jet)));
-        }
-    }
-    anchor_hessian(
-        anchor, model, subject, params, stack, b_hat, scratch, schedule,
-    )
-    .map(|h| (h, None))
-}
-
 /// The Hessian that scales the quadrature grid and enters `½log|H|`, per the anchor.
 ///
 /// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`. This is
-///   Laplace / adaptive GH quadrature. Taken **analytically** from `score_core`'s `h_inner`
-///   where the provider reaches, and from the `2d²+1`-evaluation
-///   [`fd_posterior_hessian`] sweep only outside it (TTE, categorical, and the two
-///   per-subject `score_core` declines) — where FD is the only thing that works, since the
-///   likelihood has no `PkNum` twin.
+///   Laplace / adaptive GH quadrature. Taken **analytically** from the unified recording
+///   (`adjoint::exact_inner_hessian`) wherever it serves the subject, and from the
+///   `2d²+1`-evaluation [`fd_posterior_hessian`] sweep only outside it (TTE, categorical),
+///   whose likelihood has no `PkNum` twin.
 /// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃`, the *same* Hessian FOCEI's own
 ///   objective and gradient use, so `focei` with `n_agq > 1` is a genuine quadrature
 ///   refinement of FOCEI.
 ///
 /// **The two anchors stay different matrices — that is the estimator distinction.** Sharing
-/// `score_core` unifies the *computation*, not the result: `laplace, n_agq = 1` is NONMEM
+/// one recorder (the adjoint's `run_agq`, `Objective::Agq { exact }`) unifies the
+/// *computation*, not the result: `laplace, n_agq = 1` is NONMEM
 /// `LAPLACIAN INTER` and `focei, n_agq = 1` is plain FOCEI, and it is exactly the anchor that
 /// separates them. Reading `htilde` here for `Exact` would silently turn Laplace into FOCEI
 /// while it kept reporting Laplace OFVs.
@@ -715,24 +527,20 @@ fn anchor_hessian(
 ) -> Option<DMatrix<f64>> {
     match anchor {
         HessianAnchor::Exact => {
-            // Gate on the **model-level** predicate before attempting the provider: an
-            // out-of-scope model (TTE, categorical — precisely the ones quadrature exists
-            // for) would otherwise pay a doomed `subject_sensitivities` + `score_core` call
-            // on every evaluation before falling back.
-            if analytic_score_supported(model) {
-                if let Some((core, _jet)) = score_core_at(model, subject, params, stack, b_hat) {
-                    return Some(core.h_inner);
-                }
+            // The exact Hessian from the unified recording (every engine it serves), before
+            // any finite difference.
+            if let Some(h) = crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                model, subject, params, b_hat,
+            ) {
+                return Some(h);
             }
             Some(fd_posterior_hessian(
                 model, subject, params, stack, b_hat, scratch, schedule,
             ))
         }
-        HessianAnchor::GaussNewton => Some(
-            score_core_at(model, subject, params, stack, b_hat)?
-                .0
-                .htilde,
-        ),
+        HessianAnchor::GaussNewton => {
+            crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, b_hat)
+        }
     }
 }
 
@@ -764,13 +572,10 @@ pub(crate) fn agq_subject_nll(
         nodes,
         log_weights,
         anchor,
-        false,
-        None,
         schedule,
         None,
         None,
     )
-    .0
 }
 
 /// Same as the body [`agq_subject_nll`] delegates to, but `schedule` is now a caller-supplied
@@ -791,12 +596,10 @@ fn agq_subject_evaluate(
     nodes: &[f64],
     log_weights: &[f64],
     anchor: HessianAnchor,
-    retain_gradient_work: bool,
-    score_template: Option<&ModelParameters>,
     schedule: Option<&pk::event_driven::EventSchedule>,
     terminal_hessian: Option<&DMatrix<f64>>,
     terminal_mode_nll: Option<f64>,
-) -> (f64, Option<PreparedGrid>) {
+) -> f64 {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
     let local_schedule = if schedule.is_none() {
@@ -810,12 +613,13 @@ fn agq_subject_evaluate(
     // conditional likelihood itself. (The formula below would agree — an empty tensor
     // product is the single empty node — but there is no Σ to factor, so short-circuit.)
     if d == 0 {
-        let nll = stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
-        return (nll, None);
+        return stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
     }
 
-    let anchor_work = if !retain_gradient_work && matches!(anchor, HessianAnchor::Exact) {
-        terminal_hessian.cloned().map(|h| (h, None)).or_else(|| {
+    let h = matches!(anchor, HessianAnchor::Exact)
+        .then(|| terminal_hessian.cloned())
+        .flatten()
+        .or_else(|| {
             anchor_hessian(
                 anchor,
                 model,
@@ -826,51 +630,19 @@ fn agq_subject_evaluate(
                 &mut scratch,
                 schedule,
             )
-            .map(|h| (h, None))
-        })
-    } else if retain_gradient_work {
-        anchor_hessian_and_base_jet(
-            anchor,
-            model,
-            subject,
-            params,
-            stack,
-            b_hat,
-            &mut scratch,
-            schedule,
-        )
-    } else {
-        anchor_hessian(
-            anchor,
-            model,
-            subject,
-            params,
-            stack,
-            b_hat,
-            &mut scratch,
-            schedule,
-        )
-        .map(|h| (h, None))
-    };
-    let Some((h, base_jet)) = anchor_work else {
-        // Gauss-Newton anchor out of the provider's scope (guarded up front by
+        });
+    let Some(h) = h else {
+        // Gauss-Newton anchor out of the recorder's scope (guarded up front by
         // `check_model_options`, so this is only reachable if that guard is bypassed).
-        return (NLL_SENTINEL, None);
+        return NLL_SENTINEL;
     };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
     // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
     // *consistent* (any invertible scale integrates to the same limit); it only costs
     // nodes-worth of efficiency, which is the right failure mode.
-    let regularised_anchor = retain_gradient_work
-        .then(|| crate::estimation::agq_cov_hessian::regularised_anchor(&h))
-        .flatten();
-    let proposal = regularised_anchor
-        .as_ref()
-        .map(proposal_from_regularised_anchor)
-        .or_else(|| build_proposal(&h, &stack.omega_joint_inv, d));
-    let Some(proposal) = proposal else {
-        return (NLL_SENTINEL, None);
+    let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
+        return NLL_SENTINEL;
     };
 
     // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
@@ -885,22 +657,10 @@ fn agq_subject_evaluate(
             |nll| nll,
         );
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
-        if !nll.is_finite() {
-            return (NLL_SENTINEL, None);
-        }
-        let prepared = retain_gradient_work.then(|| PreparedGrid {
-            h,
-            regularised_anchor,
-            one_point: true,
-            bs: Vec::new(),
-            softmax: Vec::new(),
-            node_scores: None,
-            base_jet,
-        });
-        return (nll, prepared);
+        return if nll.is_finite() { nll } else { NLL_SENTINEL };
     }
 
-    let (bs, mut terms, node_scores) = agq_nodes_and_terms(
+    let terms = agq_terms(
         model,
         subject,
         params,
@@ -911,42 +671,20 @@ fn agq_subject_evaluate(
         &proposal,
         &mut scratch,
         schedule,
-        retain_gradient_work,
-        score_template.filter(|_| node_score_fusion_supported(model)),
     );
-
-    let lse = logsumexp(&terms);
-    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - lse;
+    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - logsumexp(&terms);
     if nll.is_finite() {
-        let prepared = retain_gradient_work.then(|| {
-            for term in &mut terms {
-                *term = (*term - lse).exp();
-            }
-            PreparedGrid {
-                h,
-                regularised_anchor,
-                one_point: false,
-                bs,
-                softmax: terms,
-                node_scores,
-                base_jet,
-            }
-        });
-        (nll, prepared)
+        nll
     } else {
-        (NLL_SENTINEL, None)
+        NLL_SENTINEL
     }
 }
 
-/// Sweep the tensor grid once, returning every log-term and, when `retain_nodes`
-/// is true, each node's `η_j`.
-///
-/// The single place the grid is materialised. The objective ([`agq_subject_nll`]) reduces
-/// the terms with `logsumexp`; the gradient ([`agq_subject_packed_gradient`]) additionally
-/// needs the `η_j` themselves and turns the same terms into softmax weights. Objective-only
-/// callers leave them unmaterialized, avoiding one heap allocation per quadrature point.
+/// Sweep the tensor grid once, returning every log-term `log w + ‖z‖² − l(b_j)` — the one
+/// place the grid is materialised; the objective ([`agq_subject_nll`]) reduces the terms
+/// with `logsumexp`.
 #[allow(clippy::too_many_arguments)]
-fn agq_nodes_and_terms(
+fn agq_terms(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -957,23 +695,10 @@ fn agq_nodes_and_terms(
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
-    retain_nodes: bool,
-    score_template: Option<&ModelParameters>,
-) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+) -> Vec<f64> {
     let d = stack.d();
     let n = nodes.len();
-    let cap = grid_size(n, d);
-    let mut bs = if retain_nodes {
-        Vec::with_capacity(cap * d)
-    } else {
-        Vec::new()
-    };
-    let mut terms = Vec::with_capacity(cap);
-    let score_width = score_template
-        .map(crate::estimation::parameterization::packed_len)
-        .unwrap_or(0);
-    let mut node_scores = score_template.map(|_| vec![0.0; cap * score_width]);
-    let mut score_valid = score_template.is_some();
+    let mut terms = Vec::with_capacity(grid_size(n, d));
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -985,7 +710,6 @@ fn agq_nodes_and_terms(
     let mut pred_recycle = Vec::new();
     let mut eta_work = DVector::zeros(stack.n_eta);
     let mut prior_work = DVector::zeros(stack.n_eta);
-
     loop {
         let mut log_w = 0.0;
         let mut z_sq = 0.0;
@@ -1001,66 +725,23 @@ fn agq_nodes_and_terms(
         for k in 0..d {
             b[k] = b_hat[k] + step[k];
         }
-
-        let node_index = terms.len();
-        let mut empty_score = [];
-        let node_score = node_scores.as_mut().map_or(&mut empty_score[..], |scores| {
-            let start = node_index * score_width;
-            &mut scores[start..start + score_width]
-        });
-        node_score.fill(0.0);
-        let fused = match score_template {
-            Some(template) => fused_node_nll_and_score(
-                model,
-                subject,
-                params,
-                template,
-                stack,
-                &b,
-                &mut pred_recycle,
-                node_score,
-            ),
-            _ => None,
-        };
-        let nll = if let Some(nll) = fused {
-            nll
-        } else {
-            stack.nll_at_with_recycle(
-                model,
-                subject,
-                params,
-                &b,
-                scratch,
-                schedule,
-                err_keys.as_deref(),
-                ruv_mult.as_deref(),
-                &mut pred_recycle,
-                &mut eta_work,
-                &mut prior_work,
-            )
-        };
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
-        if fused.is_none() && score_template.is_some() {
-            score_valid &= accumulate_fixed_eta_packed_gradient(
-                model,
-                subject,
-                params,
-                score_template.expect("checked above"),
-                stack,
-                &b,
-                1.0,
-                node_score,
-            )
-            .is_some();
-        }
-        let term = log_w + z_sq - nll;
-        terms.push(term);
-        if retain_nodes {
-            bs.extend_from_slice(&b);
-        }
-
+        let nll = stack.nll_at_with_recycle(
+            model,
+            subject,
+            params,
+            &b,
+            scratch,
+            schedule,
+            err_keys.as_deref(),
+            ruv_mult.as_deref(),
+            &mut pred_recycle,
+            &mut eta_work,
+            &mut prior_work,
+        );
+        terms.push(log_w + z_sq - nll);
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
         while k < d {
@@ -1072,31 +753,20 @@ fn agq_nodes_and_terms(
             k += 1;
         }
         if k == d {
-            break;
+            return terms;
         }
     }
-    (bs, terms, if score_valid { node_scores } else { None })
 }
 
-/// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
-///
-/// A thin entry point over [`agq_subject_nll`] that owns the `Stack` and the Gauss-Hermite rule,
-/// so callers outside this module can evaluate the objective the covariance differentiates. #251's
-/// finite-difference oracle needs exactly this: differencing `F_i` in packed space is the only
-/// check that sees the whole assembly, including the `√2` node scaling that the `n_agq = 1`
-/// reduction cannot (its node is `z = 0`).
-///
-/// `#[cfg(test)]` because it genuinely has no production caller — the objective is reached through
-/// [`agq_population_nll`] there. Shipping it unconditionally would emit a `dead_code` warning on
-/// every downstream build, which is the exact complaint PR #955's review raised against the first
-/// version of `agq_cov_hessian`.
+/// [`agq_subject_nll`] under a chosen Hessian anchor (`Exact` is Laplace's).
 #[cfg(test)]
-pub(crate) fn agq_subject_objective(
+pub(crate) fn agq_subject_objective_anchored(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     eta_hat: &[f64],
     n_agq: usize,
+    anchor: HessianAnchor,
 ) -> f64 {
     let stack = Stack::new(model, params, 0);
     let (nodes, weights) = gauss_hermite(n_agq);
@@ -1109,81 +779,9 @@ pub(crate) fn agq_subject_objective(
         eta_hat,
         &nodes,
         &log_weights,
-        HessianAnchor::GaussNewton,
+        anchor,
         None,
     )
-}
-
-/// The quadrature abscissae `z_j` and their softmax weights `π_j` for one subject, on exactly the
-/// grid the objective evaluates.
-///
-/// #251's analytic covariance differentiates `F`, so it must contract against *these* weights —
-/// the ones the fit actually used — not a freshly-normalised set. Returning both from a single
-/// sweep is what guarantees `z_j` and `π_j` refer to the same node.
-///
-/// `None` when the subject is outside the Gauss-Newton anchor's scope, matching
-/// [`agq_subject_nll`]'s own bail.
-pub(crate) fn subject_grid_and_weights(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta_hat: &[f64],
-    nodes: &[f64],
-    weights: &[f64],
-) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
-    let n_occ = if model.n_kappa > 0 {
-        crate::stats::stacked_layout::group_count(subject)
-    } else {
-        0
-    };
-    let stack = Stack::new(model, params, n_occ);
-    let d = stack.d();
-    if d == 0 || eta_hat.len() != d {
-        return None;
-    }
-    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let schedule = cacheable_schedule(model, subject);
-    let h = anchor_hessian(
-        HessianAnchor::GaussNewton,
-        model,
-        subject,
-        params,
-        &stack,
-        eta_hat,
-        &mut scratch,
-        schedule.as_ref(),
-    )?;
-    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
-    let (_bs, terms, _) = agq_nodes_and_terms(
-        model,
-        subject,
-        params,
-        &stack,
-        eta_hat,
-        nodes,
-        &log_weights,
-        &proposal,
-        &mut scratch,
-        schedule.as_ref(),
-        false,
-        None,
-    );
-    let lse = logsumexp(&terms);
-    if !lse.is_finite() {
-        return None;
-    }
-    let pi: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
-    // Only covariance needs the abscissae. Reconstruct them in the same tested order
-    // instead of allocating a second coordinate vector on every objective sweep.
-    let zs = (0..terms.len())
-        .map(|j| {
-            let mut z = vec![0.0; d];
-            grid_z_at(j, nodes, d, &mut z);
-            z
-        })
-        .collect();
-    Some((zs, pi))
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
@@ -1281,13 +879,10 @@ fn agq_population_nll_impl(
                 nodes,
                 log_weights,
                 anchor,
-                false,
-                None,
                 schedule,
                 terminal_work.and_then(|all| all[i].0.as_ref()),
                 terminal_work.map(|all| all[i].1),
             )
-            .0
         })
         .collect();
     per_subject.iter().sum()
@@ -1370,10 +965,9 @@ fn agq_population_evaluate_impl(
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, false)
-        .with_parallel_grid(population.subjects.len() < rayon::current_num_threads());
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
-    let per_subject: Vec<(f64, Option<Vec<f64>>)> = population
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>)> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -1388,7 +982,7 @@ fn agq_population_evaluate_impl(
                 None
             };
             let schedule = cached_schedule.or(local_schedule.as_ref());
-            let (nll, grid) = agq_subject_evaluate(
+            let nll = agq_subject_evaluate(
                 model,
                 subject,
                 params,
@@ -1397,20 +991,11 @@ fn agq_population_evaluate_impl(
                 &nodes,
                 &log_weights,
                 anchor,
-                true,
-                Some(template),
                 schedule,
                 None,
                 terminal_work.map(|all| all[i].1),
             );
-            let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
-            let score = context.score_with_prepared(
-                subject,
-                eta_hats[i].as_slice(),
-                subj_kappas,
-                prepared,
-                schedule,
-            );
+            let score = context.score_routed(subject, eta_hats[i].as_slice(), subj_kappas, true);
             (nll, score)
         })
         .collect();
@@ -1418,13 +1003,21 @@ fn agq_population_evaluate_impl(
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
         |mut result, (_, score)| -> Option<Vec<f64>> {
-            for (out, g) in result.iter_mut().zip(score.as_ref()?) {
+            for (out, g) in result.iter_mut().zip(&score.as_ref()?.0) {
                 *out += 2.0 * g;
             }
             Some(result)
         },
     );
-    PopulationEvaluation { nll, gradient }
+    let routes = per_subject
+        .iter()
+        .map(|(_, s)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
+        .collect();
+    PopulationEvaluation {
+        nll,
+        gradient,
+        routes,
+    }
 }
 
 /// Assemble the stacked mode `b̂ = [η̂, κ̂₁ … κ̂_K]` from what the shared inner loop already
@@ -1438,54 +1031,15 @@ fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
     b
 }
 
-// ---------------------------------------------------------------------------
-// Analytic outer gradient
-// ---------------------------------------------------------------------------
+// # The analytic outer gradient
 //
-// # The identity
-//
-// AGQ's per-subject objective is `F = (d/2)·logπ + ½·log|H| − LSE`, and the node
-// log-terms are `t_j = log w_j + ‖z_j‖² − nll(η_j)`. Differentiating w.r.t. the packed
-// population parameters `x` with the **nodes held fixed** (η̂ and H constant), the first
-// two terms drop out and the third is a softmax:
-//
-// ```text
-//   ∂F/∂x  =  −∂LSE/∂x  =  Σ_j ŵ_j · ∂nll(η_j; x)/∂x ,     ŵ_j = exp(t_j) / Σ_k exp(t_k)
-// ```
-//
-// The `ŵ_j` are exactly the posterior weights at the nodes, so this is the **Fisher /
-// Louis identity**: `∂(−log ∫e^{−nll})/∂x = E_{p(η|y)}[∂nll/∂x]`, with the quadrature
-// supplying the expectation. Each `∂nll(η_j)/∂x` is a *fixed-η* gradient — no EBE re-solve,
-// no `log|H̃|` term, no EBE-response — which the `Dual2` provider already gives us exactly.
-//
-// # The grid also moves, and that term is not optional
-//
-// The nodes are built from `(η̂(x), H(x))`, so the total derivative also carries
-// `∂F/∂η̂ · dη̂/dx` and `∂F/∂H · dH/dx`. Both **vanish in the exact-quadrature limit** — an
-// exactly-integrated `∫exp(−nll)` does not care where you centre or how you scale the grid;
-// it is a change of variables — so they are identically the quadrature error's sensitivity,
-// and the explicit `½·log|H|` term cancels against the nodes' `H`-dependence rather than
-// either vanishing alone.
-//
-// At finite `n` they do not vanish, and they are **not** small. The fixed-node score alone,
-// measured against a finite-difference of the real objective on warfarin, is **26% wrong at
-// n = 1** (where the rule *is* Laplace and the cancellation fails completely), 0.8% at n = 3.
-// So [`grid_response_correction`] supplies the term, and the gradient is the exact total
-// derivative at every `n_agq`, n = 1 included: 0.17% / 0.16% / 0.002% / 0.0006% at
-// n = 1/3/5/7, i.e. at the FD reference's own noise floor.
-//
-// The subtlety that makes or breaks it: `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice** —
-// explicitly through θ/Ω/σ, and implicitly through the mode. Differencing only the explicit
-// half is not a partial improvement, it is *worse than omitting the term* (26% → 62%). The
-// mode must be moved along `dη̂/dx` too. See [`grid_response_correction`].
-//
-// # Cost
-//
-// The score is one `subject_sensitivities` call per node — the same order as one objective
-// evaluation. The correction adds `2·n_free` Hessian rebuilds and grid sweeps, with **no**
-// inner re-solve (that is what `dη̂/dx` buys). The `reconverged_fd_gradient` it replaces
-// costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
-// inner loop.
+// Every subject's `dF/dx` comes from the adjoint (`sens::ode_provider::adjoint::run_agq`):
+// at the mode, `Ψ = F − wᵀ∇_η l` with `w = H⁻¹∇_η F`, its partial derivative at fixed `η̂`
+// the total derivative. The node displacement `b_j = η̂ + √2·L⁻ᵀz_j` and the anchor `H_a`
+// sit on the reverse tape, so the grid response — 26% of the gradient at `n_agq = 1`,
+// 0.8% at 3, on warfarin — is differentiated with the fixed-node score, with no Hessian
+// rebuild and no inner re-solve. A subject outside the adjoint's scope takes the
+// reconverged per-subject finite difference (`SubjectScoreContext::finite_difference_score`).
 
 /// Alias kept for `build_info::gradient_method_outer`, which reports scope by model.
 /// Identical to [`analytic_score_supported`] — the predicate is purely model-level.
@@ -1493,1526 +1047,58 @@ pub fn analytic_score_supported_model(model: &CompiledModel) -> bool {
     analytic_score_supported(model)
 }
 
-/// Whether the AGQ/Laplace analytic score applies to `model`.
-///
-/// This is **the same predicate FOCE/FOCEI gate on** — a single call to
-/// [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available),
-/// with no separate copy. That is deliberate and load-bearing for scope parity: widening the
-/// analytic scope (a new PK model, a new endpoint family, a relaxed magnitude bound) in that
-/// one function extends FOCE, FOCEI, AGQ and Laplace **together**, with no per-estimator list
-/// here to drift out of step (#251).
-///
-/// It already covers IOV without a separate arm. `analytic_outer_gradient_available`'s final
-/// clause is `sens_supported(model) || iov_sens_supported(model)`, and `sens_supported` is
-/// always false under IOV (both `analytical_supported` and `ode_analytical_supported` bail on
-/// `n_kappa != 0`), so for an IOV model it reduces exactly to `iov_sens_supported` AND the
-/// shared `!fd` / `!has_non_gaussian` / magnitude bails — the whole IOV scope
-/// (`iov_sens_supported` itself folds in the closed-form, ODE-IOV and transit-via-ODE-twin
-/// cases). The earlier hand-replicated IOV arm (#251 review #9) was therefore pure redundancy
-/// and a drift hazard; delegating supersedes it.
+/// Whether the AGQ/Laplace analytic score applies to `model`: **the same predicate
+/// FOCE/FOCEI gate on** ([`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available)),
+/// with no separate copy, so widening the adjoint's scope extends FOCE, FOCEI, AGQ and Laplace
+/// together (#251). Model-level only: a subject the adjoint declines at run time takes the
+/// per-subject finite-difference score.
 pub fn analytic_score_supported(model: &CompiledModel) -> bool {
-    let provider = crate::sens::provider::analytic_outer_gradient_available(model);
-    // Everything the FOCE/FOCEI outer gradient can do analytically, the AGQ/Laplace score
-    // can now do too: the per-observation residual chain comes from the SAME
-    // `sens_outer_gradient::score_core`, so M3-BLOQ, `iiv_on_ruv`, a custom / time-varying
-    // σ magnitude, LTBS and a correlated residual all ride the analytic path rather than
-    // falling back to the fixed-b FD score. Scope parity holds by construction — there is
-    // no per-family list here to drift out of step with `analytic_outer_gradient_available`.
-    //
-    // FREM included: a covariate pseudo-observation row is scored against `θ[ti] + η[ei]`
-    // with the dedicated `EPSCOV` variance, and BOTH halves are now threaded through the
-    // shared machinery — the jet by `provider::apply_frem_pseudo_obs_jet`, the variance by
-    // `score_core`'s FREM override. (This was a live defect in the FOCE/FOCEI outer
-    // gradient too, not only a missing AGQ capability: the analytic gradient was
-    // differentiating the PK likelihood on rows the objective scores as covariate
-    // pseudo-observations. It went unnoticed because FREM models are conventionally fit
-    // with SAEM, which never asks for that gradient.)
-    //
-    // Two runtime (per-subject, not caught by this model-level predicate) declines still
-    // land on FD: a genuinely off-diagonal correlated subject, and magnitude ×
-    // M3-censored — both inside `score_core`, returning `None`. `accumulate_fixed_eta_
-    // packed_gradient` falls back to `accumulate_fixed_b_packed_gradient_fd` for just
-    // that subject when this happens, not the whole population (#251 review #8).
-    provider
+    crate::sens::provider::analytic_outer_gradient_available(model)
 }
 
-/// AGQ always drives the outer loop with its **own** gradient — for every model, and at every
-/// `n_agq`.
-///
-/// There is deliberately no scope gate here. The two ingredients both work universally:
-///
-/// * the fixed-η score is analytic where the provider reaches
-///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   (`accumulate_fixed_b_packed_gradient_fd`) — the latter is correct for any likelihood
-///   ferx can evaluate, including TTE and categorical; and
-/// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
-///   provider reaches and finite-differenced otherwise (`eta_dx`).
-///
-/// Crucially **neither path re-solves the inner loop**, which is the cost that makes
-/// `reconverged_fd_gradient` expensive. Letting the models AGQ exists for — non-Gaussian
-/// endpoints, which are precisely the ones outside the `Dual2` provider — fall back to that
-/// gradient would have made the headline use case the slow one.
-///
-/// **Node-count independent.** With `grid_response_correction` supplying the `∂Φ/∂H·dH/dx`
-/// term, the gradient is the exact total derivative at every `n_agq`, `n_agq = 1` included
-/// (where that term is exactly `½·d log|H|/dx`, the Laplace log-determinant).
+/// Whether AGQ/Laplace supplies its own outer gradient for `model` — always: each
+/// subject's score is the adjoint's exact `dFᵢ/dx` where it serves the subject (every block,
+/// `block_sigma`'s ρ included) and the per-subject finite-difference score
+/// (`SubjectScoreContext::finite_difference_score`) where it does not, a non-Gaussian
+/// endpoint's subjects among them. So a gradient-based optimizer stays available for the
+/// models AGQ exists for. Kept as a predicate so a model class with no gradient at all has
+/// one place to opt out. Which subjects were analytic is reported per fit (the outer FD
+/// fallback warning), and [`analytic_score_supported`] is the model-level scope.
 pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
-    // Kept as a predicate (rather than inlining `true`) so a future model class that genuinely
-    // cannot supply `∂nll/∂x` at fixed η has one place to opt out; `population_gradient`'s
-    // `reconverged_fd_gradient` fallback stays wired up behind it.
-    //
-    // #847: an **estimated** `block_sigma` off-diagonal is exactly such a class. The AGQ score
-    // assembles θ / Ω / σ / Ω_iov blocks and nothing else — neither
-    // `accumulate_fixed_eta_packed_gradient` nor the fixed-b FD salvage
-    // (`accumulate_fixed_b_packed_gradient_fd`, which differences only the θ and σ coordinates)
-    // writes the trailing ρ slot. The quadrature objective *does* depend on ρ (`Stack::nll_at`
-    // scores at `params.residual_correlations`), so returning a gradient with a hard zero
-    // there would leave the optimizer no reason to move ρ and let it report convergence at a
-    // point that is not stationary in it. Declining sends AGQ/Laplace to
-    // `reconverged_fd_gradient`, which differences every free packed coordinate — slower, and
-    // correct. A `FIX`ed block is unaffected: its ρ carries no free coordinate to miss.
-    //
-    // Extending the score with a ρ block is tracked in #1216 alongside the estimator-threading
-    // work; until then this is the loud fallback AGENTS.md asks a scope gap to take.
-    !model
-        .default_params
-        .residual_correlation_fixed
-        .iter()
-        .any(|&fixed| !fixed)
-}
-
-/// Finite-differenced θ/σ score at a **fixed η** — the universal fallback when the analytic
-/// chain rule does not apply (TTE, categorical, M3, LTBS, FREM, `block_sigma`, ODE models).
-///
-/// Central-differences `individual_nll(η; θ, σ)` in the *packed* coordinates, so the log-θ and
-/// log-σ chain rules come out automatically. The Ω block is **not** redone here: it is closed
-/// form from the η-prior and the caller has already accumulated it exactly.
-///
-/// Predictions are σ-independent, so the σ perturbations reuse nothing extra — each is one
-/// likelihood evaluation. No inner re-solve, which is the whole point.
-#[allow(clippy::too_many_arguments)]
-fn accumulate_fixed_b_packed_gradient_fd(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    b: &[f64],
-    weight: f64,
-    n_theta: usize,
-    sigma_start: usize,
-    out: &mut [f64],
-) -> Option<()> {
-    use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
-
-    let x = pack_params(params);
-    let fixed = packed_fixed_mask(template);
-    let n_sigma = params.sigma.values.len();
-    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let schedule = cacheable_schedule(model, subject);
-
-    let mut nll_at = |p: &ModelParameters| -> f64 {
-        stack.nll_at(model, subject, p, b, &mut scratch, schedule.as_ref())
-    };
-
-    // θ and σ coordinates only — the Ω block is exact in closed form and already added.
-    let coords = (0..n_theta).chain(sigma_start..sigma_start + n_sigma);
-    for k in coords {
-        if fixed[k] {
-            continue;
-        }
-        let h = 1e-6 * (1.0 + x[k].abs());
-        let mut xp = x.clone();
-        let mut xm = x.clone();
-        xp[k] += h;
-        xm[k] -= h;
-        let d = (nll_at(&unpack_params(&xp, template)) - nll_at(&unpack_params(&xm, template)))
-            / (2.0 * h);
-        if !d.is_finite() {
-            return None;
-        }
-        out[k] += weight * d;
-    }
-    Some(())
-}
-
-/// Packed gradient of `individual_nll` at a **fixed** `eta`, accumulated as
-/// `out += weight · ∂nll(η)/∂x`.
-///
-/// This is the fixed-η score: the θ block via the provider's exact `∂f/∂θ` chained through
-/// `∂nll/∂f`, the σ block in closed form, and the Ω block from the η-prior alone
-/// (`½(−zzᵀ + Ω⁻¹)`, mapped to Cholesky-packed space by the shared
-/// [`crate::estimation::parameterization::chol_pack`]). Deliberately carries **no**
-/// `log|H̃|` and **no** EBE-response term — those belong to the Laplace marginal, not to
-/// `nll(η)` at a fixed η.
-///
-/// Returns `None` only when this subject's Ω block itself could not be formed. A subject
-/// the *provider* declines is salvaged in place by `accumulate_fixed_b_packed_gradient_fd`
-/// (see the comment at that fallback), so a scope gap no longer drops the whole population
-/// to `reconverged_fd_gradient` the way the all-or-nothing `population_gradient_sens` did
-/// (#251 review #8).
-fn accumulate_fixed_eta_packed_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    eta: &[f64],
-    weight: f64,
-    out: &mut [f64],
-) -> Option<()> {
-    accumulate_fixed_eta_packed_gradient_with_sens(
-        model, subject, params, template, stack, eta, weight, None, out,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn accumulate_fixed_eta_packed_gradient_with_sens(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    eta: &[f64],
-    weight: f64,
-    precomputed_sens: Option<SubjectSens>,
-    out: &mut [f64],
-) -> Option<()> {
-    use crate::estimation::parameterization::theta_packs_log;
-
-    let b = eta; // the integration variable: η, or the stacked [η, κ₁..κ_K] under IOV
-    let n_obs = subject.observations.len();
-    let n_theta = params.theta.len();
-    let n_sigma = params.sigma.values.len();
-    let n_eta = stack.n_eta;
-    let (eta_part, kappas) = stack.split(b);
-
-    // ── Ω block ──────────────────────────────────────────────────────────────────────
-    // From the η-prior `½(ηᵀΩ⁻¹η + log|Ω|)`, the only place Ω enters `nll` at a fixed b:
-    //   ∂/∂Ω [½ ηᵀΩ⁻¹η] = −½·zzᵀ   and   ∂/∂Ω [½ log|Ω|] = ½·Ω⁻¹,   z = Ω⁻¹η.
-    // Data-independent, so it is accumulated even for a subject with no observations.
-    let z = &params.omega.inv * nalgebra::DVector::from_column_slice(eta_part);
-    let mut m_omega = DMatrix::zeros(n_eta, n_eta);
-    for r in 0..n_eta {
-        for c in 0..n_eta {
-            m_omega[(r, c)] = 0.5 * (-z[r] * z[c] + params.omega.inv[(r, c)]);
-        }
-    }
-    let omega_start = n_theta;
-    let og = crate::estimation::parameterization::chol_pack(
-        &m_omega,
-        &params.omega.chol,
-        params.omega.diagonal,
-    );
-    for (k, &v) in og.iter().enumerate() {
-        out[omega_start + k] += weight * v;
-    }
-    let sigma_start = omega_start + og.len();
-
-    // ── Ω_iov block ──────────────────────────────────────────────────────────────────
-    // The κ prior is `½(Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov|)` — the *same* shape as the η
-    // prior, but summed over the K occasions, which share one Ω_iov:
-    //   ∂/∂Ω_iov = ½·(−Σ_k z_k z_kᵀ + K·Ω_iov⁻¹),   z_k = Ω_iov⁻¹κ_k.
-    // Mapped to Cholesky-packed space by the same `chol_pack`. This is the only block that
-    // is genuinely new under IOV; θ and σ are unchanged (see below).
-    let iov_start = sigma_start + n_sigma;
-    if stack.is_iov() {
-        let iov = params
-            .omega_iov
-            .as_ref()
-            .expect("stack.is_iov() ⟹ omega_iov present");
-        let k_occ = kappas.len();
-        let n_iov = stack.n_kappa;
-        let mut m_iov = DMatrix::zeros(n_iov, n_iov);
-        for kap in &kappas {
-            let zk = &iov.inv * nalgebra::DVector::from_column_slice(kap);
-            for r in 0..n_iov {
-                for c in 0..n_iov {
-                    m_iov[(r, c)] -= 0.5 * zk[r] * zk[c];
-                }
-            }
-        }
-        for r in 0..n_iov {
-            for c in 0..n_iov {
-                m_iov[(r, c)] += 0.5 * (k_occ as f64) * iov.inv[(r, c)];
-            }
-        }
-        let ig = crate::estimation::parameterization::chol_pack(&m_iov, &iov.chol, iov.diagonal);
-        for (k, &v) in ig.iter().enumerate() {
-            out[iov_start + k] += weight * v;
-        }
-    }
-
-    // No data term at all — neither a Gaussian row nor a non-Gaussian record. `n_obs` counts
-    // only `subject.observations`, the Gaussian rows; a TTE / `[binary_model]` / CTMM subject
-    // keeps its likelihood in `obs_records`, so gating on `n_obs` alone returned the Ω block
-    // and dropped the θ score of every such subject (#1781) — the AGQ twin of #1744. That made
-    // `method = laplace` stall on `examples/tte_exponential.ferx` (OFV 166.647 under L-BFGS
-    // against 166.527 under BOBYQA) and its `S` matrix read SE(TVLAMBDA) ≈ 0.2 for ≈ 0.008.
-    if n_obs == 0 && subject.obs_records.is_empty() {
-        return Some(());
-    }
-
-    // Off the analytic score's scope (a non-Gaussian endpoint, M3, LTBS, an ODE model, …):
-    // finite-difference the θ and σ blocks of `nll` at this **fixed b** instead. Still no
-    // inner re-solve — that is the expensive thing, and neither path does one — so AGQ keeps
-    // its own gradient for *every* model rather than dropping to `reconverged_fd_gradient`.
-    // This matters most for exactly the endpoints AGQ exists to serve: TTE and categorical
-    // are outside the `Dual2` provider, and it would be perverse for them to be the slow case.
-    if !analytic_score_supported(model) {
-        return accumulate_fixed_b_packed_gradient_fd(
-            model,
-            subject,
-            params,
-            template,
-            stack,
-            b,
-            weight,
-            n_theta,
-            sigma_start,
-            out,
-        );
-    }
-
-    // Exact ∂f/∂θ at *this* b. Neither provider entry point assumes the mode — the η = η̂
-    // requirement in `sens_outer_gradient` lives in its `theta_block`, not here. The IOV
-    // entry point takes the *stacked* (η, κ) vector and returns the same `ObsSens`, so
-    // everything below is identical for both.
-    //
-    // `analytic_score_supported` is a *model*-level scope check; `score_core` (and, more
-    // rarely, the sensitivity provider itself) can still decline a specific *subject* at
-    // runtime — a genuinely off-diagonal correlated residual, or magnitude × an
-    // M3-censored row. Falling through those `?`s used to propagate `None` out of this
-    // whole function, which `agq_population_gradient` treats as "any subject declined" and
-    // answers by dropping the **entire population** onto `reconverged_fd_gradient` — the
-    // `2·n_free` full-objective, every-subject-inner-resolve fallback this module exists to
-    // avoid. FOCE/FOCEI stopped doing that population-wide bail for exactly this cost
-    // (`population_gradient_sens_mixed`'s per-subject salvage — held-EBE since #1529);
-    // AGQ's fixed-b FD score is this function's own equivalent per-subject
-    // salvage, and it is already right here — the Ω/Ω_iov block above is unaffected by
-    // which θ/σ path runs, so falling back for just this subject is exactly the state
-    // `accumulate_fixed_b_packed_gradient_fd`'s own docs assume it's called in (#251
-    // review #8).
-    let sens = precomputed_sens.or_else(|| {
-        if stack.is_iov() {
-            crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
-        } else {
-            crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
-        }
-    });
-    let Some(sens) = sens else {
-        return accumulate_fixed_b_packed_gradient_fd(
-            model,
-            subject,
-            params,
-            template,
-            stack,
-            b,
-            weight,
-            n_theta,
-            sigma_start,
-            out,
-        );
-    };
-
-    // The per-observation scalar likelihood chain. `score_core` is the half of
-    // `sens_outer_gradient::prepare_stacked` that does NOT build the FOCEI `log|H̃|`
-    // machinery, so a node pays no Cholesky inverse — and it already carries the
-    // M3-censored (`−logΦ(z)`), `iiv_on_ruv`, custom-σ-magnitude, LTBS and
-    // correlated-residual chains that this function used to hand-roll for the plain
-    // Gaussian case alone. That hand-rolled chain is why AGQ used to gate those five
-    // families onto the fixed-b FD score even though FOCE/FOCEI had them analytic.
-    //
-    // `n_eta` is the STACKED dimension and `Ω⁻¹` the stacked prior precision, so IOV needs
-    // no special case: `ObsSens` is already stacked, and `η_ruv` lives in the BSV block, so
-    // `residual_error_eta` stays a valid stacked index (the same argument the IOV caller of
-    // `prepare_stacked` makes).
-    let core = crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        stack.d(),
-        &stack.omega_joint_inv,
-        b,
-        model.residual_error_eta,
-    );
-    let Some(core) = core else {
-        return accumulate_fixed_b_packed_gradient_fd(
-            model,
-            subject,
-            params,
-            template,
-            stack,
-            b,
-            weight,
-            n_theta,
-            sigma_start,
-            out,
-        );
-    };
-    let et = &core.et;
-
-    // θ block. Two channels:
-    //
-    //  (a) through the prediction — `∂L/∂f · ∂f/∂θ`. `ErrTerms` defines `α = 2·∂L/∂f` for
-    //      EVERY endpoint family (for a censored row it is `2·g1` off the `−logΦ` kernel),
-    //      so `½α` is the residual chain the old code spelled out for Gaussian only.
-    //
-    //  (b) DIRECT — a custom / time-varying σ magnitude `mult(θ)` makes `R` depend on θ
-    //      without passing through `f`, contributing `∂L/∂R · ∂R/∂θ`. This term was not
-    //      approximated before, it was ABSENT: the θ gradient of a magnitude model was
-    //      simply missing a channel. `score_core` declines magnitude × M3 upstream, so the
-    //      quantified `∂L/∂R` below is the only form needed here.
-    for m in 0..n_theta {
-        let mut d = 0.0;
-        for j in 0..n_obs {
-            d += 0.5 * et[j].alpha * sens.obs[j].df_dtheta[m];
-            if !et[j].dr_dtheta.is_empty() {
-                let (r, eps) = (et[j].r, et[j].eps);
-                d += 0.5 * (r - eps * eps) / (r * r) * et[j].dr_dtheta[m];
-            }
-        }
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
-        out[m] += weight * d * dtheta_dx;
-    }
-
-    // σ block, log-packed. σ reaches `nll` only through the residual variance, so this is a
-    // closed-form scalar computation at fixed `f` — no model evaluation, no inner solve.
-    let g_sigma = crate::estimation::sens_outer_gradient::data_sigma_gradient(
-        model, subject, params, &sens, &core,
-    );
-    for k in 0..n_sigma {
-        out[sigma_start + k] += weight * g_sigma[k] * params.sigma.values[k];
-    }
-
-    Some(())
-}
-
-/// Score one analytic quadrature node from a single full sensitivity jet.
-/// The jet's prediction values score the likelihood, then the same owned jet
-/// supplies the fixed-node packed score. `None` keeps the established two-pass
-/// fallback for model/subject combinations outside the analytic provider.
-fn fused_node_nll_and_score(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    b: &[f64],
-    preds: &mut Vec<f64>,
-    score: &mut [f64],
-) -> Option<f64> {
-    // On ODE grids the cheap value pass can identify posterior-underflow nodes and the
-    // established score loop then skips their expensive sensitivity integrations. Eager
-    // fusion has to differentiate before it knows that weight, which is a net regression.
-    if !node_score_fusion_supported(model) {
-        return None;
-    }
-    let sens = if stack.is_iov() {
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
-    } else {
-        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
-    };
-    let sens = sens?;
-    preds.clear();
-    preds.extend(sens.obs.iter().map(|obs| obs.f));
-    if preds.len() != subject.observations.len() {
-        return None;
-    }
-    let eta = &b[..stack.n_eta];
-    let data_nll = crate::stats::likelihood::conditional_obs_nll_from_preds(
-        model,
-        subject,
-        preds,
-        &params.theta,
-        &params.sigma.values,
-        model.residual_cov_at(params),
-        eta,
-        stack.is_iov(),
-    );
-    // Keep node scoring allocation-free outside the sensitivity provider.  The established
-    // likelihood path reuses a `DVector` scratch for this quadratic; constructing a fresh
-    // vector here would erase much of the allocation benefit of fusing the value pass.
-    let prior_quad = b.iter().enumerate().fold(0.0, |sum, (row, &b_row)| {
-        sum + b_row
-            * b.iter()
-                .enumerate()
-                .map(|(col, &b_col)| stack.omega_joint_inv[(row, col)] * b_col)
-                .sum::<f64>()
-    });
-    let mut prior_log_det = params.omega.log_det;
-    if stack.is_iov() {
-        prior_log_det += stack.n_occ as f64 * params.omega_iov.as_ref()?.log_det;
-    }
-    let nll = data_nll + 0.5 * (prior_quad + prior_log_det);
-    if !nll.is_finite() {
-        return None;
-    }
-    debug_assert_eq!(
-        score.len(),
-        crate::estimation::parameterization::packed_len(template)
-    );
-    score.fill(0.0);
-    accumulate_fixed_eta_packed_gradient_with_sens(
-        model,
-        subject,
-        params,
-        template,
-        stack,
-        b,
-        1.0,
-        Some(sens),
-        score,
-    )?;
-    Some(nll)
-}
-
-/// The **grid response**: movement of both the anchor and the mode, omitted by the fixed-node score.
-///
-/// Writing `F = Φ(x, η̂(x), H(x, η̂(x)))`, the total derivative is
-///
-/// ```text
-///   dF/dx = ∂Φ/∂x|_grid       ← the fixed-node score
-///         + ∂Φ/∂H · dH/dx     ← this function
-///         + ∂Φ/∂η̂ · dη̂/dx    ← this function too
-/// ```
-///
-/// The finite-grid posterior-mean score `∂Φ/∂η̂ = Σ_j ŵ_j ∇_η nll(η_j)` is generally
-/// nonzero. Bartlett's identity for an exact integral cannot remove this term from a finite
-/// quadrature rule. At one node it vanishes by mode stationarity; the anchor still has its
-/// own mode dependence. Both responses are retained below.
-///
-/// It is computed by central-differencing `Φ` in `x` **through the grid alone**: the grid
-/// (`η̂`, `H`) is rebuilt at the perturbed parameters while `nll` stays at the original ones,
-/// which isolates the response term from the direct dependence already covered analytically.
-///
-/// **`H` depends on `x` twice, and both halves matter.** The selected anchor varies with
-/// `x` explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(x)`. Differencing only
-/// the explicit half is not a partial improvement — it is **worse than omitting the term
-/// entirely** (26% → 62% on warfarin at n = 1), because the two halves substantially cancel.
-/// So the mode is moved too, along the exact analytic `dη̂/dx` from
-/// [`crate::estimation::sens_outer_gradient::subject_eta_dx`] (the implicit-function
-/// derivative `−H⁻¹·∂²nll/∂η∂x`, which the EBE predictor already relies on). That is what
-/// keeps this **free of any inner re-solve**: it costs `2·n_free` Hessian rebuilds and grid
-/// sweeps, not the `2·n_free` *full population objective* evaluations `reconverged_fd_gradient`
-/// pays.
-///
-/// A fully analytic `dH/dx` would need `∂³nll/∂η²∂θ`; the provider stops at `∂²f/∂η∂θ`, so
-/// this third order is finite-differenced. `analytic_gradient_matches_fd_at_every_node_count`
-/// measures the result against a finite-difference of the real objective.
-///
-/// At `n_agq = 1` the grid objective collapses to `½·log|H|` (the single node sits at η̂), so
-/// this reduces to `½·d log|H|/dx` — precisely the Laplace log-determinant term FOCE/FOCEI
-/// carry analytically.
-///
-/// # The node-response term is analytic, not a grid re-sweep
-///
-/// Writing `Φ = ½log|Σ⁻¹| − logΣⱼexp(tⱼ)` with `tⱼ = log wⱼ + ‖zⱼ‖² − nll(bⱼ; x₀)` and
-/// `bⱼ(x) = b̂(x) + √2·Σ^{1/2}(H(x))·zⱼ`, the exact derivative separates:
-///
-/// ```text
-///   dΦ/dx_k = ½·d log|Σ⁻¹|/dx_k  +  Σⱼ softmaxⱼ · ⟨ ∂nll/∂b|_{bⱼ} , dbⱼ/dx_k ⟩
-/// ```
-///
-/// because `nll` is held at `x₀` — only the node *positions* move. Two consequences:
-///
-/// * `∂nll/∂b|_{bⱼ}` is the **inner EBE gradient**, one call per node, and it does not depend
-///   on `k` — so it is computed **once** and reused across every packed coordinate.
-/// * `x ↦ (log|Σ⁻¹|, bⱼ)` is a cheap *analytic* map (a Cholesky and `d` back-solves per node,
-///   no likelihood), so finite-differencing **it** costs no predictions at all.
-///
-/// That replaces `2·n_free · G` likelihood evaluations with `G` gradient evaluations plus
-/// `2·n_free` Hessian rebuilds — the dominant cost at `n_agq > 1`, where `G = n_agq^d` grows
-/// as a tensor product (243 nodes at `d = 5, n = 3`). It also removes the *only* place the
-/// old code differenced a **finite-differenced** quantity in `x`: with the analytic `h_inner`
-/// anchor, `H` is exact and the remaining FD is of an exact function.
-///
-/// Uses the `phi_grid` re-sweep when the per-node gradient is unavailable. If a perturbed
-/// anchor/proposal or any correction is invalid, returns `None`: the outer dispatcher then
-/// finite-differences the complete quadrature objective with the same anchor. It must never
-/// silently omit a coordinate's grid response and return a partial gradient.
-#[allow(clippy::too_many_arguments)]
-fn grid_response_correction(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    anchor: HessianAnchor,
-    parallel_grid: bool,
-    h: &DMatrix<f64>,
-    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
-    x: &[f64],
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    bs: &[f64],
-    softmax: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    base_jet: Option<crate::sens::provider::SubjectSens>,
-    out: &mut [f64],
-) -> Option<()> {
-    use crate::estimation::parameterization::packed_fixed_mask;
-
-    let d = stack.d();
-    let fixed = packed_fixed_mask(template);
-
-    // `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice**: explicitly through θ/Ω/σ, and
-    // implicitly through the mode `η̂(x)`. Differencing only the explicit half is not a
-    // partial improvement — it is *wrong*, and measurably worse than omitting the term
-    // (26% → 62% on warfarin at n = 1). So the mode is moved too, along the exact analytic
-    // `dη̂/dx` (the implicit-function-theorem derivative `−H⁻¹·∂²nll/∂η∂x`, which the
-    // sensitivity provider already supplies and the EBE predictor already relies on). No
-    // inner re-solve is needed.
-    let db_dx = eta_dx(
-        model,
-        subject,
-        params,
-        template,
-        stack,
-        x,
-        b_hat,
-        base_jet
-            .as_ref()
-            .filter(|_| laplace_eta_dx_base_jet_reuse_enabled()),
-        scratch,
-        schedule,
-    )?;
-
-    // `∂nll/∂b` at every base node — the node-response factor. Independent of `k`, so this is
-    // the whole per-node likelihood cost of the correction, paid once instead of `2·n_free`
-    // times. `None` if any node is out of the inner provider's scope; the loop then takes the
-    // `phi_grid` re-sweep for every coordinate (all-or-nothing, matching the anchor).
-    // Hoisted once for the whole sweep — see `node_nll_gradient`. The scratch buffers below
-    // are reused across every node instead of allocated fresh per call, the same hoist
-    // `mult`/`err_keys` already get (this loop runs up to `MAX_AGQ_GRID` times per subject).
-    let mult = model.ruv_obs_mult(subject, &params.theta);
-    let err_keys = model.error_spec.obs_keys(subject);
-    let node_grads: Option<Vec<Vec<f64>>> = if parallel_grid {
-        bs.par_chunks(d)
-            .map_init(
-                || {
-                    (
-                        Vec::new(),
-                        DVector::zeros(model.n_eta),
-                        DVector::zeros(model.n_eta),
-                    )
-                },
-                |(obs_grad_recycle, eta_work, prior_work), b| {
-                    node_nll_gradient(
-                        model,
-                        subject,
-                        params,
-                        stack,
-                        b,
-                        schedule,
-                        mult.as_deref(),
-                        err_keys.as_ref(),
-                        obs_grad_recycle,
-                        eta_work,
-                        prior_work,
-                    )
-                },
-            )
-            .collect()
-    } else {
-        let mut obs_grad_recycle = Vec::new();
-        let mut eta_work = DVector::zeros(model.n_eta);
-        let mut prior_work = DVector::zeros(model.n_eta);
-        bs.chunks_exact(d)
-            .map(|b| {
-                node_nll_gradient(
-                    model,
-                    subject,
-                    params,
-                    stack,
-                    b,
-                    schedule,
-                    mult.as_deref(),
-                    err_keys.as_ref(),
-                    &mut obs_grad_recycle,
-                    &mut eta_work,
-                    &mut prior_work,
-                )
-            })
-            .collect()
-    };
-
-    // Assemble `dH/dx` (or `dH̃/dx`) in closed form instead of rebuilding the anchor at
-    // `x ± h` for every free coordinate. Both anchors take this route by default (#1335; see
-    // `use_analytic_grid_response` for the measurement that moved `Exact` onto it);
-    // `FERX_AGQ_GRID_RESPONSE=fd` forces the sweep below for benchmarking.
-    // Declines — leaving `out` untouched — outside its narrower scope, or when the
-    // regularised anchor is ill-conditioned; the FD sweep below then runs exactly as before,
-    // which is why that sweep is not dead code and must keep working.
-    if use_analytic_grid_response() {
-        if let Some(gs) = node_grads.as_ref() {
-            if analytic_grid_response(
-                anchor,
-                model,
-                subject,
-                params,
-                template,
-                stack,
-                h,
-                retained_anchor,
-                x,
-                b_hat,
-                nodes,
-                &db_dx,
-                gs,
-                softmax,
-                base_jet,
-                out,
-            )
-            .is_some()
-            {
-                return Some(());
-            }
-        }
-    }
-
-    fd_grid_response(
-        model,
-        subject,
-        params,
-        template,
-        stack,
-        anchor,
-        x,
-        b_hat,
-        nodes,
-        log_weights,
-        &db_dx,
-        node_grads.as_deref(),
-        softmax,
-        &fixed,
-        scratch,
-        schedule,
-        out,
-    )
-}
-
-/// The **baseline** grid response: rebuild the anchor at `x ± h` for every free packed
-/// coordinate and difference the resulting `(log|Σ⁻¹|, bⱼ)` map.
-///
-/// Split out from [`grid_response_correction`] so the two routes can be invoked
-/// independently — `analytic_grid_response_matches_the_fd_route` compares them at identical
-/// inputs, which is the only way to see that the analytic route is doing the same job rather
-/// than quietly declining, and it is also the A/B switch a benchmark harness needs.
-///
-/// Correct for every anchor and every model in the AGQ scope; the analytic route is a
-/// narrower, cheaper specialisation, not a replacement.
-#[allow(clippy::too_many_arguments)]
-fn fd_grid_response(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    anchor: HessianAnchor,
-    x: &[f64],
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    db_dx: &[nalgebra::DVector<f64>],
-    node_grads: Option<&[Vec<f64>]>,
-    softmax: &[f64],
-    fixed: &[bool],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    out: &mut [f64],
-) -> Option<()> {
-    use crate::estimation::parameterization::unpack_params;
-
-    let d = stack.d();
-    let mut z = vec![0.0f64; d];
-    let (mut off_p, mut off_m) = (vec![0.0f64; d], vec![0.0f64; d]);
-
-    for k in 0..x.len() {
-        if fixed[k] {
-            continue;
-        }
-        // Truncation-dominated: `Φ` differences `log|H|`, which curves sharply in the packed
-        // coordinates, so the step wants to be *small* (see `AGQ_GRID_FD_STEP`). With the
-        // analytic `h_inner` anchor there is no FD error floor underneath it to trade against.
-        let step = AGQ_GRID_FD_STEP * (1.0 + x[k].abs());
-        let mut xp = x.to_vec();
-        let mut xm = x.to_vec();
-        xp[k] += step;
-        xm[k] -= step;
-
-        // The mode moves with the parameters: b̂(x ± h) ≈ b̂ ± h · db̂/dx_k.
-        let ep: Vec<f64> = (0..b_hat.len())
-            .map(|i| b_hat[i] + step * db_dx[k][i])
-            .collect();
-        let em: Vec<f64> = (0..b_hat.len())
-            .map(|i| b_hat[i] - step * db_dx[k][i])
-            .collect();
-
-        let pp = unpack_params(&xp, template);
-        let pm = unpack_params(&xm, template);
-        // Ω_joint moves with the parameters too, so rebuild the stack at each perturbed point.
-        let sp = Stack::new(model, &pp, stack.n_occ);
-        let sm = Stack::new(model, &pm, stack.n_occ);
-        let (Some(hp), Some(hm)) = (
-            anchor_hessian(anchor, model, subject, &pp, &sp, &ep, scratch, schedule),
-            anchor_hessian(anchor, model, subject, &pm, &sm, &em, scratch, schedule),
-        ) else {
-            return None; // let the caller difference the full quadrature objective
-        };
-        // A non-finite anchor can otherwise be hidden by build_proposal's prior-scale
-        // fallback. It is not a usable input to the grid derivative.
-        if hp.iter().chain(hm.iter()).any(|v| !v.is_finite()) {
-            return None;
-        }
-
-        // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
-        // analytically by the fixed-η score — but the grid (centre and scale) is the
-        // perturbed one, which is exactly the response term we are after.
-        let r = match node_grads {
-            // Analytic node response: difference only the cheap `x ↦ (log|Σ⁻¹|, bⱼ)` map and
-            // contract each node's displacement with its own `∂nll/∂b`. No likelihood
-            // evaluations inside this loop at all.
-            Some(gs) => {
-                let (Some(prop_p), Some(prop_m)) = (
-                    build_proposal(&hp, &sp.omega_joint_inv, d),
-                    build_proposal(&hm, &sm.omega_joint_inv, d),
-                ) else {
-                    return None;
-                };
-                let mut acc =
-                    0.5 * (prop_p.log_det_inv_scale - prop_m.log_det_inv_scale) / (2.0 * step);
-                for (j, g) in gs.iter().enumerate() {
-                    if softmax[j] == 0.0 {
-                        continue; // underflowed node — contributes nothing
-                    }
-                    grid_z_at(j, nodes, d, &mut z);
-                    prop_p.apply_l_sigma(&z, &mut off_p, std::f64::consts::SQRT_2);
-                    prop_m.apply_l_sigma(&z, &mut off_m, std::f64::consts::SQRT_2);
-                    let mut dot = 0.0;
-                    for i in 0..d {
-                        // dbⱼ/dx_k = db̂/dx_k + √2·d(Σ^{1/2})/dx_k · zⱼ, both differenced here.
-                        let dbj = ((ep[i] + off_p[i]) - (em[i] + off_m[i])) / (2.0 * step);
-                        dot += g[i] * dbj;
-                    }
-                    acc += softmax[j] * dot;
-                }
-                acc
-            }
-            // Out of the inner provider's scope: difference the grid objective itself.
-            None => {
-                let phip = phi_grid(
-                    model,
-                    subject,
-                    params,
-                    stack,
-                    &ep,
-                    nodes,
-                    log_weights,
-                    &hp,
-                    &sp.omega_joint_inv,
-                    scratch,
-                    schedule,
-                );
-                let phim = phi_grid(
-                    model,
-                    subject,
-                    params,
-                    stack,
-                    &em,
-                    nodes,
-                    log_weights,
-                    &hm,
-                    &sm.omega_joint_inv,
-                    scratch,
-                    schedule,
-                );
-                let (Some(phip), Some(phim)) = (phip, phim) else {
-                    return None;
-                };
-                (phip - phim) / (2.0 * step)
-            }
-        };
-        if !r.is_finite() {
-            return None;
-        }
-        out[k] += r;
-    }
-    Some(())
-}
-
-/// The grid response with **no finite difference in `x` at all** — the same quantity
-/// [`grid_response_correction`]'s loop assembles, from the analytic `dH/dx`.
-///
-/// The FD loop differences two things per coordinate: `log|Σ⁻¹| = log|S|` (`S = H + Λ`, the
-/// jittered matrix `build_proposal` actually factors) and the node positions
-/// `bⱼ = b̂ + √2·L⁻ᵀzⱼ`. Both are smooth functions of `S`, so given `S_k = dS/dx_k` they are
-/// closed forms — and the jitter is linear on each branch, so
-/// [`RegularisedAnchor::propagate`] carries `dH/dx_k` to `S_k` exactly:
-///
-/// ```text
-///   ½·d log|S|/dx_k = ½·tr(S⁻¹ S_k)
-///   dbⱼ/dx_k        = db̂/dx_k + √2·M_k·zⱼ ,   M_k = −M L_kᵀ M,  L_k = L·Φ(L⁻¹S_kL⁻ᵀ)
-/// ```
-///
-/// The factor algebra is [`crate::estimation::agq_cov_hessian`]'s, reused rather than
-/// re-derived: `M`/`M_k` here must be the *same* `Σ^{1/2}` and `√2` that
-/// [`agq_nodes_and_terms`] placed the nodes with, or placement and displacement would
-/// disagree and present as a small gradient error rather than a failure.
-///
-/// `None` — with `out` untouched — whenever the anchor is not differentiable
-/// ([`crate::estimation::agq_cov_hessian::regularised_anchor`] declines at a jitter branch
-/// crossing or a non-PD `S`), is too ill-conditioned for `S⁻¹` to be contracted against its
-/// own derivative, or the model is outside the scope of the per-anchor `dH/dx` provider this
-/// dispatches to: [`crate::estimation::laplace_h_deriv::subject_h_inner_dx`] for
-/// [`HessianAnchor::Exact`], and — for [`HessianAnchor::GaussNewton`] —
-/// [`crate::estimation::focei_htilde_dx::subject_htilde_dx_iov`] under IOV
-/// (`stack.is_iov()`) or [`crate::estimation::focei_htilde_dx::subject_htilde_dx`] otherwise.
-/// `stack.omega_joint_inv` is passed to both `GaussNewton` arms unconditionally — it is
-/// already the joint matrix under IOV and the bare block otherwise, so neither callee ever
-/// receives a reduced view of it.
-#[allow(clippy::too_many_arguments)]
-fn analytic_grid_response(
-    anchor: HessianAnchor,
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    h: &DMatrix<f64>,
-    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
-    x: &[f64],
-    b_hat: &[f64],
-    nodes: &[f64],
-    db_dx: &[nalgebra::DVector<f64>],
-    node_grads: &[Vec<f64>],
-    softmax: &[f64],
-    base_jet: Option<crate::sens::provider::SubjectSens>,
-    out: &mut [f64],
-) -> Option<()> {
-    use crate::estimation::agq_cov_hessian::regularised_anchor;
-    use crate::estimation::parameterization::packed_fixed_mask;
-
-    let d = stack.d();
-    let owned_reg;
-    let reg = if let Some(retained) = retained_anchor {
-        retained
-    } else {
-        owned_reg = regularised_anchor(h)?;
-        &owned_reg
-    };
-    // `tr(S⁻¹S_k)` contracts `S⁻¹` once here rather than twice as the covariance Hessian
-    // does, so this screen is stricter than it needs to be — but an anchor that fails it is
-    // one whose `½log|H|` term is not identified anyway, and the FD route is the honest
-    // answer there.
-    if !reg.is_well_conditioned() {
-        return None;
-    }
-    // The two anchors need genuinely different derivatives — `H` (exact, third order) vs
-    // `H̃` (Gauss-Newton, second order only) — but everything past `dH/dx` (the jitter
-    // propagation, the factor differential, the node displacement) is anchor-agnostic, so
-    // it stays one shared tail below.
-    let dh = match anchor {
-        HessianAnchor::Exact => crate::estimation::laplace_h_deriv::subject_h_inner_dx(
-            model,
-            subject,
-            params,
-            template,
-            &stack.omega_joint_inv,
-            x,
-            b_hat,
-            db_dx,
-            base_jet,
-        )?,
-        HessianAnchor::GaussNewton if stack.is_iov() => {
-            crate::estimation::focei_htilde_dx::subject_htilde_dx_iov(
-                model,
-                subject,
-                params,
-                template,
-                &stack.omega_joint_inv,
-                x,
-                b_hat,
-                db_dx,
-            )?
-        }
-        HessianAnchor::GaussNewton => crate::estimation::focei_htilde_dx::subject_htilde_dx(
-            model,
-            subject,
-            params,
-            template,
-            &stack.omega_joint_inv,
-            x,
-            b_hat,
-            db_dx,
-        )?,
-    };
-
-    let fixed = packed_fixed_mask(template);
-
-    // ── weighted node moments, computed once rather than per coordinate (#1333) ──────────
-    //
-    // Each free coordinate's node contribution is
-    //
-    //     Σ_j w_j Σ_i g_j[i] · ( db_dx[k][i] + √2 Σ_c M_k[i,c] z_j[c] )
-    //
-    // in which `g_j`, `w_j` and `z_j` are properties of the *grid*, not of `k`. Both node
-    // sums therefore hoist out of the coordinate loop:
-    //
-    //     v[i]   = Σ_j w_j g_j[i]
-    //     A[i,c] = Σ_j w_j g_j[i] z_j[c]
-    //     term_k = v·db_dx[k] + √2 Σ_{i,c} A[i,c] M_k[i,c]
-    //
-    // which takes the contraction from `O(p·Q·d²)` to `O(Q·d² + p·d²)` for `p` free
-    // coordinates and `Q = n_agq^d` nodes. It does **not** reduce the `Q` node gradients
-    // themselves — those are the caller's `node_grads`, and on an expensive ODE model they,
-    // not this contraction, are the bill.
-    //
-    // The regrouping reassociates the node sum, so the result moves by rounding; it is not
-    // bit-identical to the per-coordinate form. `the_moment_form_matches_the_per_node_sum`
-    // measures the realised difference and `analytic_grid_response_matches_the_fd_route`
-    // remains the correctness oracle against the independent FD route.
-    let (v, a) = node_moments(d, nodes, node_grads, softmax);
-    // One-node specialization: the one-point Gauss–Hermite rule sits at `z = 0` exactly, so
-    // every `A[i,c]` is exactly `0.0` and the displacement term contributes nothing. Skipping
-    // it skips the **five d×d matrix products** behind `M_k` — three in `factor_derivative`,
-    // two in `node_scale_derivative` — which the per-coordinate form computed for every free
-    // coordinate and then multiplied by zero.
-    //
-    // Both anchors default to analytic (#1335). The one-node fast path is therefore
-    // reached by default for in-scope `laplace` fits (`Exact`, `n_agq = 1`). The usual
-    // `focei, n_agq > 1` caller uses `GaussNewton` with nonzero node displacement and
-    // benefits from the moment hoist above. Analytic declines still use the FD fallback.
-    //
-    // Gated on `A` rather than on `nodes.len() == 1`, which makes the skip sound for *any*
-    // grid: it fires only when every `A[i,c]` is exactly `0.0`, and then the term it drops is
-    // exactly `0.0` too. Correctness therefore does not depend on what the one-point rule's
-    // node is — a grid whose every node underflowed takes the same path.
-    //
-    // What the node value decides is whether the one-node route *reaches* the fast path at
-    // all. If Golub–Welsch's `n = 1` eigenvalue ever came back as `1e-17` rather than `0.0`,
-    // every `A[i,c]` would be a denormal instead of a zero, the skip would stop firing, and
-    // the five matrix products would quietly come back with no test failing.
-    // `the_one_point_rule_reaches_the_displacement_free_path` is that missing failure.
-    //
-    // One observable difference, stated rather than assumed away: if `M_k` were non-finite
-    // while the trace term stayed finite, the old form reached `0.0 * inf = NaN` and declined
-    // to the FD route, where this returns the (correct) displacement-free value. That needs an
-    // overflow inside the matrix products on an anchor that already passed
-    // `is_well_conditioned`, since a non-finite `dh[k]` poisons `solved` and the trace first.
-    let displaced = a.iter().any(|&x| x != 0.0);
-
-    // Accumulate into a scratch buffer, not `out`: a late non-finite coordinate must leave
-    // the caller free to take the FD route with nothing already added (the same
-    // all-or-nothing contract the FD loop's `return None`s carry).
-    let mut acc_all = vec![0.0f64; x.len()];
-    for k in 0..x.len() {
-        if fixed[k] {
-            continue;
-        }
-        let s_k = reg.propagate(&dh[k]);
-        let solved = reg.chol.solve(&s_k);
-        let mut acc = 0.5 * (0..d).map(|i| solved[(i, i)]).sum::<f64>();
-
-        for i in 0..d {
-            acc += v[i] * db_dx[k][i];
-        }
-        if displaced {
-            let m_k = reg.node_scale_derivative(&reg.factor_derivative(&s_k));
-            let mut disp = 0.0;
-            for i in 0..d {
-                for c in 0..d {
-                    disp += a[(i, c)] * m_k[(i, c)];
-                }
-            }
-            acc += std::f64::consts::SQRT_2 * disp;
-        }
-        if !acc.is_finite() {
-            return None;
-        }
-        acc_all[k] = acc;
-    }
-    for (o, a) in out.iter_mut().zip(acc_all.iter()) {
-        *o += a;
-    }
-    Some(())
-}
-
-/// The two weighted node moments the grid-response contraction needs (#1333):
-///
-/// ```text
-/// v[i]   = Σ_j w_j g_j[i]
-/// A[i,c] = Σ_j w_j g_j[i] z_j[c]
-/// ```
-///
-/// Neither depends on the packed coordinate, so computing them once turns the response's
-/// `O(p·Q·d²)` contraction into `O(Q·d² + p·d²)` — see [`analytic_grid_response`], which is
-/// the only caller and where the algebra is derived.
-///
-/// `w_j == 0.0` nodes are skipped rather than added, matching the per-coordinate form this
-/// replaced: an underflowed node contributes nothing, and letting a `0.0 * inf` through would
-/// turn one into a `NaN` that declines the whole subject to the FD route.
-///
-/// A *pure* function of the grid, so `the_moment_form_matches_the_per_node_sum` can measure
-/// the reassociation against a direct per-node sum without building a model — and so that the
-/// production path and that test share one implementation of the moments rather than two.
-/// `the_one_point_rule_reaches_the_displacement_free_path` pins that `A` really is exactly
-/// zero for the one-point rule, which is what keeps `method = laplace` on the fast path.
-fn node_moments(
-    d: usize,
-    nodes: &[f64],
-    node_grads: &[Vec<f64>],
-    softmax: &[f64],
-) -> (Vec<f64>, DMatrix<f64>) {
-    let mut v = vec![0.0f64; d];
-    let mut a = DMatrix::<f64>::zeros(d, d);
-    let mut z = vec![0.0f64; d];
-    for (j, g) in node_grads.iter().enumerate() {
-        if softmax[j] == 0.0 {
-            continue;
-        }
-        grid_z_at(j, nodes, d, &mut z);
-        for i in 0..d {
-            let wg = softmax[j] * g[i];
-            v[i] += wg;
-            for c in 0..d {
-                a[(i, c)] += wg * z[c];
-            }
-        }
-    }
-    (v, a)
-}
-
-/// `zⱼ` for tensor-grid node `j`, reconstructed from its mixed-radix index.
-///
-/// [`agq_nodes_and_terms`] enumerates the grid with a mixed-radix counter whose **digit 0
-/// increments fastest**, so node `j` has `idx[k] = (j / nᵏ) mod n`. Recomputing it here (rather
-/// than storing every `zⱼ`) keeps the grid-response term allocation-free at `MAX_AGQ_GRID`
-/// nodes. `grid_z_at_matches_the_sweep_enumeration` pins the two orderings together — they
-/// must not drift, or each node's displacement would be contracted with another node's
-/// gradient.
-#[inline]
-fn grid_z_at(j: usize, nodes: &[f64], d: usize, out: &mut [f64]) {
-    let n = nodes.len();
-    let mut rem = j;
-    for slot in out.iter_mut().take(d) {
-        *slot = nodes[rem % n];
-        rem /= n;
-    }
-}
-
-/// `∂nll/∂b` at one quadrature node — the **inner EBE gradient**, which is exactly the
-/// derivative the node-response term contracts against.
-///
-/// This is the same entry point the inner loop minimises with, so the gradient and the `nll`
-/// [`Stack::nll_at`] scores are consistent by construction rather than by a second derivation.
-/// `None` outside the provider's scope; the caller then falls back to the grid re-sweep.
-///
-/// `schedule` and `mult` are **hoisted by the caller** and threaded through, because this runs
-/// once per quadrature node — up to [`MAX_AGQ_GRID`] times per subject. The bare
-/// `analytic_eta_nll_gradient` rebuilds the `EventSchedule` and recomputes the residual-magnitude
-/// multiplier on every call, which is per-call setup the inner BFGS loop already learned to
-/// hoist (#449 re-review #6); paying it per node made the sweep several times its own cost.
-#[allow(clippy::too_many_arguments)]
-fn node_nll_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b: &[f64],
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    mult: Option<&[Vec<f64>]>,
-    err_keys: &[usize],
-    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
-    eta_work: &mut DVector<f64>,
-    prior_work: &mut DVector<f64>,
-) -> Option<Vec<f64>> {
-    // A TTE / binary / count record has no analytic η-channel, and the inner gradient below
-    // would return the prior (plus any CTMM block) without it. Decline, so the grid response
-    // takes its finite-difference re-sweep, which scores every record (#1781).
-    if !crate::estimation::inner_optimizer::non_gaussian_eta_grad_served(model, subject) {
-        return None;
-    }
-    if stack.is_iov() {
-        let iov = params.omega_iov.as_ref()?;
-        crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov(
-            model,
-            subject,
-            &params.theta,
-            b,
-            &params.omega,
-            iov,
-            &params.sigma.values,
-            mult,
-        )
-    } else {
-        crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule(
-            model,
-            subject,
-            &params.theta,
-            b,
-            &params.omega,
-            &params.sigma.values,
-            // AGQ holds ρ at the declaration; `params` carries it (#847).
-            model.residual_cov_at(params),
-            schedule,
-            mult,
-            err_keys,
-            obs_grad_recycle,
-            eta_work,
-            prior_work,
-            // AGQ integrates the conditional likelihood (#1722: only FOCE freezes V).
-            None,
-        )
-    }
-}
-
-/// `dη̂/dx` — how the EBE mode moves with the population parameters, per packed coordinate.
-///
-/// From the implicit function theorem: η̂ solves `∇_η nll(η̂; x) = 0`, so
-///
-/// ```text
-///   dη̂/dx = −H⁻¹ · ∂²nll/∂η∂x ,     H = ∂²nll/∂η²|_{η̂}
-/// ```
-///
-/// Uses the provider's exact version
-/// ([`crate::estimation::sens_outer_gradient::subject_eta_dx`]) where it applies, and
-/// otherwise finite-differences the mixed term `∂²nll/∂η∂x` directly — perturb `x`, take the
-/// η-gradient at the *same* η̂, solve against `H`. That costs `2·n_free · 2·d` likelihood
-/// evaluations and, critically, **no inner re-solve**: it is the derivative of the mode, not a
-/// re-computation of it. So models outside the provider (TTE, categorical, ODE) still get the
-/// cheap gradient rather than dropping to `reconverged_fd_gradient`.
-#[allow(clippy::too_many_arguments)]
-fn eta_dx(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    x: &[f64],
-    b_hat: &[f64],
-    base_jet: Option<&crate::sens::provider::SubjectSens>,
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> Option<Vec<nalgebra::DVector<f64>>> {
-    use crate::estimation::parameterization::{packed_fixed_mask, unpack_params};
-
-    // `db̂/dx` from the provider — the stacked (η, κ) entry point under IOV, the η-only one
-    // otherwise. Both are the exact implicit-function derivative `−H_inner⁻¹·∂²nll/∂b∂x`, and
-    // neither re-solves the inner loop: this is the *derivative* of the mode, not a
-    // recomputation of it. The finite difference below is the fallback for models outside the
-    // provider's scope, and uses the same exact `H` the grid is scaled by.
-    if analytic_score_supported(model) {
-        let exact = if stack.is_iov() {
-            crate::estimation::sens_outer_gradient::subject_eta_dx_iov(
-                model, subject, template, x, b_hat,
-            )
-        } else {
-            match base_jet {
-                Some(sens) => crate::estimation::sens_outer_gradient::subject_eta_dx_from_sens(
-                    model, subject, params, template, x, b_hat, sens,
-                ),
-                None => crate::estimation::sens_outer_gradient::subject_eta_dx(
-                    model, subject, template, x, b_hat,
-                ),
-            }
-        };
-        if let Some(v) = exact {
-            return Some(v);
-        }
-    }
-
-    let d = stack.d();
-    let h_mat = fd_posterior_hessian(model, subject, params, stack, b_hat, scratch, schedule);
-    let h_inv = h_mat.clone().try_inverse()?;
-    let fixed = packed_fixed_mask(template);
-
-    // ∇_b nll(b̂; p) — central differences in the stacked variable, at the given parameters.
-    let mut eta_grad = |p: &ModelParameters, out: &mut [f64]| {
-        let mut e = b_hat.to_vec();
-        for i in 0..d {
-            let step = (f64::EPSILON.powf(0.25) * stack.prior_sd[i]).max(1e-5);
-            e[i] = b_hat[i] + step;
-            let fp = stack.nll_at(model, subject, p, &e, scratch, schedule);
-            e[i] = b_hat[i] - step;
-            let fm = stack.nll_at(model, subject, p, &e, scratch, schedule);
-            e[i] = b_hat[i];
-            out[i] = (fp - fm) / (2.0 * step);
-        }
-    };
-
-    let mut out = vec![nalgebra::DVector::zeros(d); x.len()];
-    let (mut gp, mut gm) = (vec![0.0f64; d], vec![0.0f64; d]);
-    for k in 0..x.len() {
-        if fixed[k] {
-            continue;
-        }
-        let step = AGQ_GRID_FD_STEP * (1.0 + x[k].abs());
-        let mut xp = x.to_vec();
-        let mut xm = x.to_vec();
-        xp[k] += step;
-        xm[k] -= step;
-        eta_grad(&unpack_params(&xp, template), &mut gp);
-        eta_grad(&unpack_params(&xm, template), &mut gm);
-        // ∂²nll/∂η∂x_k, then dη̂/dx_k = −H⁻¹ · that.
-        let mixed =
-            nalgebra::DVector::from_iterator(d, (0..d).map(|i| (gp[i] - gm[i]) / (2.0 * step)));
-        out[k] = -(&h_inv * mixed);
-    }
-    Some(out)
-}
-
-/// `Φ_grid(H)` — the part of the AGQ objective that depends on `x` *only* through `H`:
-/// `½·log|H| − logΣexp_j[ log w_j + ‖z_j‖² − nll(η̂ + √2·Σ^{1/2}(H)·z_j ; x₀) ]`.
-///
-/// `nll` is evaluated at the **original** `params`, so differencing this in `x` isolates the
-/// grid's response to `H` from the direct `x`-dependence that
-/// [`accumulate_fixed_eta_packed_gradient`] already covers analytically. The `(d/2)·logπ`
-/// constant cancels in the difference and is omitted.
-#[allow(clippy::too_many_arguments)]
-fn phi_grid(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    h_mat: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> Option<f64> {
-    let d = stack.d();
-    let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_bs, terms, _) = agq_nodes_and_terms(
-        model,
-        subject,
-        params,
-        stack,
-        b_hat,
-        nodes,
-        log_weights,
-        &proposal,
-        scratch,
-        schedule,
-        false,
-        None,
-    );
-    let lse = logsumexp(&terms);
-    lse.is_finite()
-        .then(|| 0.5 * proposal.log_det_inv_scale - lse)
+    let _ = model;
+    true
 }
 
 /// Analytic packed gradient of the AGQ objective for one subject: the posterior-weighted
-/// average of fixed-η scores over the quadrature nodes, **plus** the grid-response term
-/// [`grid_response_correction`] that makes it the exact total derivative at every `n_agq`
-/// (see the module note above).
+/// average of fixed-η scores over the quadrature nodes, **plus** the grid-response term that
+/// makes it the exact total derivative at every `n_agq` — both recorded on the adjoint's
+/// tape (`adjoint::run_agq`, see the module note above).
 ///
 /// `out` is the population accumulator; this adds `∂F_i/∂x` into it.
-#[allow(clippy::too_many_arguments)]
 fn agq_subject_packed_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    params: &ModelParameters,
     template: &ModelParameters,
-    stack: &Stack,
     x: &[f64],
     b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
+    n_agq: usize,
     anchor: HessianAnchor,
-    parallel_grid: bool,
     out: &mut [f64],
 ) -> Option<()> {
-    let d = stack.d();
-    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let schedule = cacheable_schedule(model, subject);
-
-    if d == 0 {
-        return accumulate_fixed_eta_packed_gradient(
-            model, subject, params, template, stack, b_hat, 1.0, out,
-        );
-    }
-
-    let (h, base_jet) = anchor_hessian_and_base_jet(
-        anchor,
-        model,
-        subject,
-        params,
-        stack,
-        b_hat,
-        &mut scratch,
-        schedule.as_ref(),
-    )?;
-    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
-
-    // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
-    // and the scores are computed on exactly the same nodes the objective used.
-    let (bs, terms, _) = agq_nodes_and_terms(
-        model,
-        subject,
-        params,
-        stack,
-        b_hat,
-        nodes,
-        log_weights,
-        &proposal,
-        &mut scratch,
-        schedule.as_ref(),
-        true,
-        None,
-    );
-    let lse = logsumexp(&terms);
-    if !lse.is_finite() {
+    // AGQ (either anchor, any node count) by the adjoint (`sens::ode_provider::adjoint`).
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient, Objective};
+    let objective = Objective::Agq {
+        n_agq,
+        exact: matches!(anchor, HessianAnchor::Exact),
+    };
+    let g = subject_adjoint_gradient(model, subject, template, x, b_hat, objective)?;
+    if g.len() != out.len() || !g.iter().all(|v| v.is_finite()) {
         return None;
     }
-
-    // Posterior (softmax) weights, materialised once: the fixed-node score averages against
-    // them here, and the grid-response term contracts each node's displacement against the
-    // same values — so both differentiate the grid the objective actually evaluated.
-    let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
-
-    finish_agq_subject_gradient(
-        model,
-        subject,
-        params,
-        template,
-        stack,
-        x,
-        b_hat,
-        nodes,
-        log_weights,
-        anchor,
-        parallel_grid,
-        &h,
-        None,
-        &bs,
-        &softmax,
-        None,
-        &mut scratch,
-        schedule.as_ref(),
-        base_jet,
-        out,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_agq_subject_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    stack: &Stack,
-    x: &[f64],
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    anchor: HessianAnchor,
-    parallel_grid: bool,
-    h: &DMatrix<f64>,
-    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
-    bs: &[f64],
-    softmax: &[f64],
-    node_scores: Option<&[f64]>,
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    base_jet: Option<SubjectSens>,
-    out: &mut [f64],
-) -> Option<()> {
-    if let Some(scores) = node_scores {
-        debug_assert_eq!(scores.len(), softmax.len() * out.len());
-        for ((score, b_j), &weight) in scores
-            .chunks_exact(out.len())
-            .zip(bs.chunks_exact(stack.d()))
-            .zip(softmax)
-        {
-            if !accumulate_weighted_node_score(score, weight, out) {
-                accumulate_fixed_eta_packed_gradient(
-                    model, subject, params, template, stack, b_j, weight, out,
-                )?;
-            }
-        }
-    } else if parallel_grid {
-        let d = stack.d();
-        let score_width = out.len();
-        let mut node_scores = vec![0.0; softmax.len() * score_width];
-        node_scores
-            .par_chunks_mut(score_width)
-            .zip(bs.par_chunks(d))
-            .zip(softmax.par_iter())
-            .try_for_each(|((score, b_j), &w)| {
-                if w != 0.0 {
-                    accumulate_fixed_eta_packed_gradient(
-                        model, subject, params, template, stack, b_j, w, score,
-                    )?;
-                }
-                Some(())
-            })?;
-        // Preserve the former node-major summation order exactly.
-        for score in node_scores.chunks_exact(score_width) {
-            for (dst, value) in out.iter_mut().zip(score) {
-                *dst += *value;
-            }
-        }
-    } else {
-        for (b_j, &w) in bs.chunks_exact(stack.d()).zip(softmax.iter()) {
-            if w == 0.0 {
-                continue; // exp underflow — contributes nothing to the average
-            }
-            accumulate_fixed_eta_packed_gradient(
-                model, subject, params, template, stack, b_j, w, out,
-            )?;
-        }
+    for (o, v) in out.iter_mut().zip(&g) {
+        *o += v;
     }
-
-    // …plus the grid's response to H — the only term the fixed-node score omits, and the
-    // whole of the gap at n_agq = 1 (where it is exactly ½·d log|H|/dx).
-    grid_response_correction(
-        model,
-        subject,
-        params,
-        template,
-        stack,
-        anchor,
-        parallel_grid,
-        h,
-        retained_anchor,
-        x,
-        b_hat,
-        nodes,
-        log_weights,
-        bs,
-        softmax,
-        scratch,
-        schedule,
-        base_jet,
-        out,
-    )?;
     Some(())
-}
-
-/// Add one retained node score without letting an underflowed posterior tail
-/// contaminate the subject gradient. Returns `false` when the caller must
-/// recompute a non-finite, nonzero-weight score through the established fallback.
-fn accumulate_weighted_node_score(score: &[f64], weight: f64, out: &mut [f64]) -> bool {
-    if weight == 0.0 {
-        return true;
-    }
-    if !score.iter().all(|value| value.is_finite()) {
-        return false;
-    }
-    for (dst, &value) in out.iter_mut().zip(score) {
-        *dst += weight * value;
-    }
-    true
 }
 
 /// Shared quadrature inputs for subject scores. No synthetic population or optimizer
@@ -3023,14 +1109,12 @@ pub(crate) struct SubjectScoreContext<'a> {
     x: &'a [f64],
     options: &'a crate::types::FitOptions,
     bounds: &'a crate::estimation::parameterization::PackedBounds,
-    params: ModelParameters,
     nodes: Vec<f64>,
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     /// Per-coordinate FD step floors (#2147): `|θ₀|` for a small identity-packed θ.
     fd_floors: Vec<f64>,
     force_fd: bool,
-    parallel_grid: bool,
 }
 
 impl<'a> SubjectScoreContext<'a> {
@@ -3050,7 +1134,6 @@ impl<'a> SubjectScoreContext<'a> {
             x,
             options,
             bounds,
-            params: crate::estimation::parameterization::unpack_params(x, template),
             nodes: nodes.to_vec(),
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
@@ -3059,111 +1142,74 @@ impl<'a> SubjectScoreContext<'a> {
                 &model.default_params.theta,
             ),
             force_fd: force_fd || !analytic_gradient_available(model),
-            parallel_grid: false,
         }
     }
 
-    fn with_parallel_grid(mut self, enabled: bool) -> Self {
-        self.parallel_grid = enabled;
-        self
-    }
-
-    /// Negative-log-likelihood score, with per-subject numerical salvage.
+    /// Negative-log-likelihood score: the exact `dFᵢ/dx`, else the reconverged
+    /// finite-difference score. The covariance step's form, which never takes a held-EBE
+    /// score into `S`.
     pub(crate) fn score(
         &self,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
     ) -> Option<Vec<f64>> {
-        self.score_with_prepared(subject, eta, kappas, None, None)
+        self.score_routed(subject, eta, kappas, false)
+            .map(|(g, _)| g)
     }
 
-    fn score_with_prepared(
+    /// [`Self::score`], and with `held_ok` the optimizer's salvage between the two: a
+    /// subject whose mode identity the adjoint declines takes the held-EBE score
+    /// ([`ScoreRoute::HeldEbe`]) rather than `2·n_x` EBE re-solves — what FOCE/FOCEI do with
+    /// the same subject. Not under IOV, whose FOCEI salvage is the reconverged one.
+    pub(crate) fn score_routed(
         &self,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
-        prepared: Option<PreparedSubject>,
-        schedule: Option<&pk::event_driven::EventSchedule>,
-    ) -> Option<Vec<f64>> {
+        held_ok: bool,
+    ) -> Option<(Vec<f64>, ScoreRoute)> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
         }
+        let joint_warm = stack_mode(eta, kappas);
         if !self.force_fd {
-            let mut g = vec![0.0; self.x.len()];
-            let analytic = if let Some(prepared) = prepared {
-                self.prepared_score(subject, prepared, schedule, &mut g)
-            } else {
-                let stack = Stack::new(self.model, &self.params, kappas.len());
-                let b = stack_mode(eta, kappas);
-                agq_subject_packed_gradient(
-                    self.model,
-                    subject,
-                    &self.params,
-                    self.template,
-                    &stack,
-                    self.x,
-                    &b,
-                    &self.nodes,
-                    &self.log_weights,
-                    self.options.hessian_anchor(),
-                    self.parallel_grid,
-                    &mut g,
-                )
+            // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
+            use crate::sens::ode_provider::adjoint::{
+                subject_adjoint_gradient, subject_adjoint_held_ebe_score, Objective,
             };
-            if analytic.is_some() && g.iter().all(|v| v.is_finite()) {
-                for (g, fixed) in g.iter_mut().zip(&self.fixed) {
+            let objective = Objective::Agq {
+                n_agq: self.nodes.len(),
+                exact: matches!(self.options.hessian_anchor(), HessianAnchor::Exact),
+            };
+            let accept = |g: Option<Vec<f64>>| {
+                let mut g = g?;
+                if g.len() != self.x.len() || !g.iter().all(|v| v.is_finite()) {
+                    return None;
+                }
+                for (v, fixed) in g.iter_mut().zip(&self.fixed) {
                     if *fixed {
-                        *g = 0.0;
+                        *v = 0.0;
                     }
                 }
-                return Some(g);
+                Some(g)
+            };
+            let args = (self.model, subject, self.template, self.x, &joint_warm[..]);
+            if let Some(g) = accept(subject_adjoint_gradient(
+                args.0, args.1, args.2, args.3, args.4, objective,
+            )) {
+                return Some((g, ScoreRoute::Exact));
+            }
+            if held_ok && self.model.n_kappa == 0 {
+                if let Some(g) = accept(subject_adjoint_held_ebe_score(
+                    args.0, args.1, args.2, args.3, args.4, objective,
+                )) {
+                    return Some((g, ScoreRoute::HeldEbe));
+                }
             }
         }
-        let joint_warm = stack_mode(eta, kappas);
         self.finite_difference_score(subject, &joint_warm)
-    }
-
-    fn prepared_score(
-        &self,
-        subject: &Subject,
-        prepared: PreparedSubject,
-        schedule: Option<&pk::event_driven::EventSchedule>,
-        out: &mut [f64],
-    ) -> Option<()> {
-        match prepared {
-            PreparedSubject::Grid { stack, b_hat, grid } => {
-                let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-                let one_weight = [1.0];
-                let (bs, softmax) = if grid.one_point {
-                    (b_hat.as_slice(), one_weight.as_slice())
-                } else {
-                    (grid.bs.as_slice(), grid.softmax.as_slice())
-                };
-                finish_agq_subject_gradient(
-                    self.model,
-                    subject,
-                    &self.params,
-                    self.template,
-                    &stack,
-                    self.x,
-                    &b_hat,
-                    &self.nodes,
-                    &self.log_weights,
-                    self.options.hessian_anchor(),
-                    self.parallel_grid,
-                    &grid.h,
-                    grid.regularised_anchor.as_ref(),
-                    bs,
-                    softmax,
-                    grid.node_scores.as_deref(),
-                    &mut scratch,
-                    schedule,
-                    grid.base_jet,
-                    out,
-                )
-            }
-        }
+            .map(|g| (g, ScoreRoute::Reconverged))
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -3243,29 +1289,37 @@ pub(crate) fn population_gradient_mixed(
     options: &crate::types::FitOptions,
     force_fd: bool,
     evaluation: Option<PopulationEvaluation>,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> Option<Vec<f64>> {
     if let Some(evaluation) = evaluation {
+        if let Some(log) = declines {
+            for (i, route) in evaluation.routes.iter().enumerate() {
+                route.record(log, i);
+            }
+        }
         return evaluation.gradient;
     }
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd)
-        .with_parallel_grid(population.subjects.len() < rayon::current_num_threads());
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
     let scores: Vec<_> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            context.score_with_prepared(
+            context.score_routed(
                 subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                None,
-                None,
+                true,
             )
         })
         .collect();
     let mut result = vec![0.0; x.len()];
-    for score in scores {
-        for (out, g) in result.iter_mut().zip(score?) {
+    for (i, score) in scores.into_iter().enumerate() {
+        let (score, route) = score?;
+        if let Some(log) = declines {
+            route.record(log, i);
+        }
+        for (out, g) in result.iter_mut().zip(score) {
             *out += 2.0 * g;
         }
     }
@@ -3291,32 +1345,17 @@ pub fn agq_population_gradient(
     anchor: HessianAnchor,
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
-    let (nodes, weights) = gauss_hermite(n_nodes);
-    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let parallel_grid = population.subjects.len() < rayon::current_num_threads();
-
+    let _ = params;
     let per_subject: Vec<Option<Vec<f64>>> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let mut g = vec![0.0f64; n_packed];
             agq_subject_packed_gradient(
-                model,
-                subject,
-                params,
-                template,
-                &stack,
-                x,
-                &b_hat,
-                &nodes,
-                &log_weights,
-                anchor,
-                parallel_grid,
-                &mut g,
+                model, subject, template, x, &b_hat, n_nodes, anchor, &mut g,
             )
             .map(|()| g)
         })
@@ -3381,176 +1420,13 @@ mod tests {
 
     use crate::parser::model_parser::parse_model_string;
 
-    #[test]
-    fn audit_invalid_perturbed_anchor_declines_the_gradient() {
-        use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::parameterization::pack_params;
-        let source = M3_MODEL.replace("TVCL(0.2,", "TVCL(0.2000001,").replace(
-            "CL = TVCL * exp(ETA_CL)",
-            "CL = (TVCL - 0.2)^0.5 * exp(ETA_CL)",
-        );
-        let model = parse_model_string(&source).unwrap();
-        let params = &model.default_params;
-        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
-        let ebe = find_ebe(&model, &subject, params, 200, 1e-11, None, None, 0);
-        let x = pack_params(params);
-        let stack = Stack::new(&model, params, 0);
-        let mut xm = x.clone();
-        xm[0] -= AGQ_GRID_FD_STEP * (1.0 + x[0].abs());
-        let pm = crate::estimation::parameterization::unpack_params(&xm, params);
-        let sm = Stack::new(&model, &pm, 0);
-        let mut scratch = pk::EventPkParams::default();
-        let hm = anchor_hessian(
-            HessianAnchor::GaussNewton,
-            &model,
-            &subject,
-            &pm,
-            &sm,
-            ebe.eta.as_slice(),
-            &mut scratch,
-            None,
-        );
-        assert!(
-            hm.is_none_or(|h| h.iter().any(|v| !v.is_finite())),
-            "fixture must actually have an invalid perturbed anchor"
-        );
-        let (nodes, weights) = gauss_hermite(3);
-        let lw: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-        let base = agq_subject_nll(
-            &model,
-            &subject,
-            params,
-            &stack,
-            ebe.eta.as_slice(),
-            &nodes,
-            &lw,
-            HessianAnchor::GaussNewton,
-            None,
-        );
-        assert!(
-            base.is_finite() && base < NLL_SENTINEL,
-            "base quadrature must be valid"
-        );
-        // `agq_subject_packed_gradient` no longer exercises this precondition directly for
-        // `GaussNewton`: that anchor's grid response now defaults to the analytic
-        // `focei_htilde_dx` route (#251), which differentiates at the BASE point and never
-        // evaluates at the invalid perturbed `xm` at all — so it succeeds here, correctly,
-        // rather than declining. What this audit actually guards — `fd_grid_response`'s own
-        // invalid-perturbed-anchor detection — is still live production code (reached
-        // whenever the analytic route declines, or under `FERX_AGQ_GRID_RESPONSE=fd`), so
-        // drive it directly rather than through the anchor-dependent auto-dispatch.
-        let mut scratch2 = pk::EventPkParams::with_capacity_for(&subject);
-        let schedule = cacheable_schedule(&model, &subject);
-        let h = anchor_hessian(
-            HessianAnchor::GaussNewton,
-            &model,
-            &subject,
-            params,
-            &stack,
-            ebe.eta.as_slice(),
-            &mut scratch2,
-            schedule.as_ref(),
-        )
-        .expect("base anchor must be valid — only the perturbed point is invalid");
-        let proposal = build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
-        let (bs, terms, _) = agq_nodes_and_terms(
-            &model,
-            &subject,
-            params,
-            &stack,
-            ebe.eta.as_slice(),
-            &nodes,
-            &lw,
-            &proposal,
-            &mut scratch2,
-            schedule.as_ref(),
-            true,
-            None,
-        );
-        let lse = logsumexp(&terms);
-        let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
-        let db_dx = eta_dx(
-            &model,
-            &subject,
-            params,
-            params,
-            &stack,
-            &x,
-            ebe.eta.as_slice(),
-            None,
-            &mut scratch2,
-            schedule.as_ref(),
-        )
-        .expect("base mode response");
-        let mult = model.ruv_obs_mult(&subject, &params.theta);
-        let err_keys = model.error_spec.obs_keys(&subject);
-        let mut obs_grad_recycle = Vec::new();
-        let mut eta_work = DVector::zeros(model.n_eta);
-        let mut prior_work = DVector::zeros(model.n_eta);
-        let node_grads: Vec<Vec<f64>> = bs
-            .chunks_exact(stack.d())
-            .map(|b| {
-                node_nll_gradient(
-                    &model,
-                    &subject,
-                    params,
-                    &stack,
-                    b,
-                    schedule.as_ref(),
-                    mult.as_deref(),
-                    err_keys.as_ref(),
-                    &mut obs_grad_recycle,
-                    &mut eta_work,
-                    &mut prior_work,
-                )
-                .expect("node gradient")
-            })
-            .collect();
-        let fixed = crate::estimation::parameterization::packed_fixed_mask(params);
-        let mut out = vec![0.0; x.len()];
-        assert!(
-            fd_grid_response(
-                &model,
-                &subject,
-                params,
-                params,
-                &stack,
-                HessianAnchor::GaussNewton,
-                &x,
-                ebe.eta.as_slice(),
-                &nodes,
-                &lw,
-                &db_dx,
-                Some(&node_grads),
-                &softmax,
-                &fixed,
-                &mut scratch2,
-                schedule.as_ref(),
-                &mut out,
-            )
-            .is_none(),
-            "an invalid perturbed anchor must not silently lose its grid response"
-        );
-        // A population-level "the fallback is reconverge-interval-independent" check used to
-        // live here. Its premise was that this fixture makes the analytic per-subject grid
-        // response fail *unconditionally*, so `population_gradient` always lands on the same
-        // explicit FD-of-quadrature fallback regardless of `reconverge_gradient_interval`.
-        // That premise is gone: `GaussNewton`'s grid response now defaults to
-        // `focei_htilde_dx`, which — as established just above — succeeds on this fixture
-        // (it never evaluates at the invalid perturbed point at all). So `population_gradient`
-        // now takes the primary analytic branch, where `reconverge_gradient_interval`
-        // legitimately changes the result (it changes how often the EBE is reconverged before
-        // scoring), and the two settings are not expected to agree. Comparing them here would
-        // no longer be auditing a fallback path; it would be asserting a coincidence.
-    }
-
     // --- Phase 0 (#251): the analytic fixed-b score reaches full FOCE/FOCEI scope -------
     //
     // AGQ's score used to hand-roll a *Gaussian-only* residual chain, so five endpoint
     // families that FOCE/FOCEI already handled analytically (M3-BLOQ, `iiv_on_ruv`, a
     // custom sigma magnitude, LTBS, correlated residual) fell back to the fixed-b FD score.
-    // It now shares `sens_outer_gradient::score_core`, so the chain is the SAME one
-    // FOCE/FOCEI uses and the per-family gates are gone.
+    // It now shares the adjoint recorder (`sens::ode_provider::adjoint`), so the chain is the
+    // SAME one FOCE/FOCEI uses and the per-family gates are gone.
     //
     // The reference below is a central difference of `Stack::nll_at` at a **fixed, non-mode
     // b**. That matters: it differences the exact conditional NLL the AGQ objective
@@ -3617,42 +1493,6 @@ mod tests {
   DV ~ log_additive(ADD_ERR)
 "#;
 
-    /// FREM: 3 PK etas + 2 covariate etas under one block Ω, with the covariate θs and the
-    /// `EPSCOV` σ left **free** so the gradient test actually exercises those channels (the
-    /// shipped `examples/warfarin_frem.ferx` fixes them, which would mask the very terms
-    /// under test). `EPSCOV` is also given a sane magnitude rather than the near-zero value
-    /// a production FREM model uses to pin `η_cov` to the observed covariate.
-    const FREM_MODEL: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  theta TV_WT(72.0, 1.0, 500.0)
-  theta TV_AGE(37.6, 1.0, 200.0)
-
-  block_omega (ETA_CL, ETA_V, ETA_KA, ETA_WT_FREM, ETA_AGE_FREM) = [
-    0.09,
-    0.0, 0.04,
-    0.0, 0.0, 0.30,
-    0.0, 0.0, 0.0, 111.56,
-    0.0, 0.0, 0.0, 0.0, 99.38
-  ]
-
-  sigma PROP_ERR ~ 0.02
-  sigma EPSCOV   ~ 0.30
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  frem_predictions = TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200
-  frem_sigma       = EPSCOV
-"#;
-
     /// A subject with realistic nonzero residuals, built from the model at a reference eta.
     fn score_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         use crate::types::DoseEvent;
@@ -3688,27 +1528,6 @@ mod tests {
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
         subject.observations = preds.iter().map(|p| p * 0.85).collect();
         subject
-    }
-
-    #[test]
-    fn retained_node_score_skips_zero_weight_before_finite_check() {
-        let mut out = [2.0, -3.0];
-        assert!(accumulate_weighted_node_score(
-            &[f64::NAN, f64::INFINITY],
-            0.0,
-            &mut out,
-        ));
-        assert_eq!(out, [2.0, -3.0]);
-
-        assert!(!accumulate_weighted_node_score(
-            &[f64::NAN, 1.0],
-            0.5,
-            &mut out,
-        ));
-        assert_eq!(out, [2.0, -3.0]);
-
-        assert!(accumulate_weighted_node_score(&[4.0, -2.0], 0.25, &mut out,));
-        assert_eq!(out, [3.0, -3.5]);
     }
 
     #[test]
@@ -3780,6 +1599,7 @@ mod tests {
                 &options,
                 false,
                 None,
+                None,
             )
             .expect("uncached gradient");
             let fused = population_gradient_mixed(
@@ -3793,6 +1613,7 @@ mod tests {
                 &options,
                 false,
                 Some(evaluation),
+                None,
             )
             .expect("fused gradient");
             assert_eq!(fused.len(), uncached.len());
@@ -3803,693 +1624,6 @@ mod tests {
                      fused={fused:e}, uncached={uncached:e}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn fused_iov_node_reuses_the_jet_without_changing_value_or_score() {
-        use crate::estimation::parameterization::{pack_params, packed_len};
-        use crate::io::datareader::read_nonmem_csv;
-        use crate::parser::model_parser::parse_model_file;
-        use std::path::Path;
-
-        let model = parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("model");
-        let population =
-            read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC")).expect("data");
-        let subject = &population.subjects[0];
-        let params = &model.default_params;
-        let n_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
-        let stack = Stack::new(&model, params, n_occ);
-        let b = vec![0.03; stack.d()];
-        let mut preds = Vec::new();
-        let mut fused_score = vec![0.0; packed_len(params)];
-        let fused_nll = fused_node_nll_and_score(
-            &model,
-            subject,
-            params,
-            params,
-            &stack,
-            &b,
-            &mut preds,
-            &mut fused_score,
-        )
-        .expect("IOV analytic fusion");
-
-        let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-        let schedule = cacheable_schedule(&model, subject);
-        let established_nll =
-            stack.nll_at(&model, subject, params, &b, &mut scratch, schedule.as_ref());
-        assert!((fused_nll - established_nll).abs() <= 1e-13 * (1.0 + established_nll.abs()));
-
-        let mut established_score = vec![0.0; pack_params(params).len()];
-        accumulate_fixed_eta_packed_gradient(
-            &model,
-            subject,
-            params,
-            params,
-            &stack,
-            &b,
-            1.0,
-            &mut established_score,
-        )
-        .expect("established IOV score");
-        for (fused, established) in fused_score.iter().zip(&established_score) {
-            assert!((fused - established).abs() <= 1e-13 * (1.0 + established.abs()));
-        }
-    }
-
-    #[test]
-    fn fused_node_preserves_raw_negative_prediction_likelihood() {
-        use crate::estimation::parameterization::packed_len;
-
-        let model = parse_model_string(
-            r#"
-[parameters]
-  theta BASE(1.0, 0.01, 10.0)
-  omega ETA_BASE ~ 0.1
-  sigma ADD ~ 1.0 (variance)
-[individual_parameters]
-  E0 = BASE + ETA_BASE
-[structural_model]
-  y = E0 - 10
-[error_model]
-  DV ~ additive(ADD)
-"#,
-        )
-        .unwrap();
-        let params = &model.default_params;
-        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0]);
-        let stack = Stack::new(&model, params, 0);
-        let b = vec![0.03];
-        let mut preds = Vec::new();
-        let mut score = vec![0.0; packed_len(params)];
-        let fused = fused_node_nll_and_score(
-            &model, &subject, params, params, &stack, &b, &mut preds, &mut score,
-        )
-        .expect("analytic fusion");
-        assert!(
-            preds.iter().all(|&f| f < 0.0),
-            "fixture must exercise raw negatives: {preds:?}"
-        );
-
-        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
-        let established = stack.nll_at(&model, &subject, params, &b, &mut scratch, None);
-        assert!(
-            (fused - established).abs() <= 1e-13 * (1.0 + established.abs()),
-            "fused={fused:e}, established={established:e}"
-        );
-    }
-
-    #[test]
-    fn underfilled_parallel_grid_score_is_bitwise_identical() {
-        use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::parameterization::{compute_bounds, pack_params};
-        use crate::types::{EstimationMethod, FitOptions};
-
-        let model = parse_model_string(M3_MODEL).unwrap();
-        let template = &model.default_params;
-        let x = pack_params(template);
-        let subject = score_subject(
-            &model,
-            &template.theta,
-            &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        );
-        let ebe = find_ebe(&model, &subject, template, 200, 1e-11, None, None, 0);
-        assert!(ebe.converged);
-        let bounds = compute_bounds(template);
-        let options = FitOptions {
-            method: EstimationMethod::FoceI,
-            n_agq: 3,
-            ..FitOptions::default()
-        };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            let context = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false);
-            let serial = context
-                .score(&subject, ebe.eta.as_slice(), &[])
-                .expect("serial score");
-            let parallel = context
-                .with_parallel_grid(true)
-                .score(&subject, ebe.eta.as_slice(), &[])
-                .expect("parallel score");
-            assert_eq!(serial.len(), parallel.len());
-            for (coordinate, (serial, parallel)) in serial.iter().zip(&parallel).enumerate() {
-                assert_eq!(
-                    serial.to_bits(),
-                    parallel.to_bits(),
-                    "packed coordinate {coordinate} changed"
-                );
-            }
-        });
-    }
-
-    /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
-    /// that is deliberately NOT the mode, since the score is a property of `nll(b; x)`
-    /// alone and must hold everywhere, not only at the EBE.
-    fn assert_fixed_b_score_matches_fd(
-        model: &CompiledModel,
-        subject: &Subject,
-        template: &ModelParameters,
-        b: &[f64],
-        tol: f64,
-        label: &str,
-    ) {
-        use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
-
-        let x = pack_params(template);
-        let params = unpack_params(&x, template);
-        let stack = Stack::new(model, &params, usize::from(model.n_kappa > 0));
-        assert!(
-            analytic_score_supported(model),
-            "{label}: expected the ANALYTIC score path, got the FD fallback"
-        );
-
-        let mut analytic = vec![0.0f64; x.len()];
-        accumulate_fixed_eta_packed_gradient(
-            model,
-            subject,
-            &params,
-            template,
-            &stack,
-            b,
-            1.0,
-            &mut analytic,
-        )
-        .unwrap_or_else(|| panic!("{label}: analytic score declined"));
-
-        let fixed = packed_fixed_mask(template);
-        let mut scratch = crate::pk::EventPkParams::default();
-        let mut nll_at_x = |xv: &[f64]| -> f64 {
-            let p = unpack_params(xv, template);
-            let st = Stack::new(model, &p, stack.n_occ);
-            st.nll_at(model, subject, &p, b, &mut scratch, None)
-        };
-
-        for k in 0..x.len() {
-            if fixed[k] {
-                continue;
-            }
-            let h = 1e-6 * (1.0 + x[k].abs());
-            let (mut xp, mut xm) = (x.clone(), x.clone());
-            xp[k] += h;
-            xm[k] -= h;
-            let fd = (nll_at_x(&xp) - nll_at_x(&xm)) / (2.0 * h);
-            let scale = fd.abs().max(analytic[k].abs()).max(1.0);
-            assert!(
-                (analytic[k] - fd).abs() / scale < tol,
-                "{label}: coord {k}: analytic {} vs FD {} (rel {:.2e})",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / scale
-            );
-        }
-    }
-
-    /// The analytic grid response must (a) actually engage on an in-scope model and (b)
-    /// return what the finite-difference baseline returns — for **both** anchors, including
-    /// [`HessianAnchor::GaussNewton`], the one this PR turns on by default.
-    ///
-    /// Both halves matter, and the end-to-end
-    /// `tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count` sees neither: it
-    /// passes identically whether the analytic route runs or silently declines to the FD
-    /// route it is compared against. So this drives `analytic_grid_response` and
-    /// `fd_grid_response` directly, at the same anchor, mode response and node gradients, and
-    /// asserts the analytic one returned `Some` before comparing. Parameterising over both
-    /// anchors (rather than testing `Exact` alone) matters more for `GaussNewton`: it is the
-    /// default-on route, so a later tightening of `subject_htilde_dx`'s scope gate or of
-    /// `is_well_conditioned` that made it decline on every real model would otherwise pass the
-    /// whole suite silently and revert the entire performance claim to the `2·n_free` FD
-    /// sweep.
-    ///
-    /// The tolerance is set by the **FD** side, not the analytic one: `AGQ_GRID_FD_STEP` is
-    /// `1e-5`, so its truncation on `log|H|` is around `1e-6` relative — which is why this is
-    /// `1e-5` and not tighter. The analytic route is the more accurate of the two here (the
-    /// dedicated `laplace_h_deriv`/`focei_htilde_dx` parity tests measure `dH/dx`/`dH̃/dx`
-    /// themselves against a finer-grained reference).
-    #[test]
-    fn analytic_grid_response_matches_the_fd_route() {
-        use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
-
-        let model = parse_model_string(M3_MODEL).expect("parse");
-        let theta = [0.22, 11.0, 1.4];
-        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-
-        let x = pack_params(&template);
-        let params = unpack_params(&x, &template);
-        let stack = Stack::new(&model, &params, 0);
-        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
-        let b_hat = ebe.eta.as_slice();
-        let fixed = packed_fixed_mask(&template);
-
-        for anchor in [HessianAnchor::Exact, HessianAnchor::GaussNewton] {
-            // `n_agq = 1` (Laplace, where the response *is* the whole `½·d log|H|/dx` term)
-            // and `n_agq = 3` (where `M_k·z_j` node displacement is live and `z = 0` no longer
-            // hides the factor algebra).
-            for n in [1usize, 3usize] {
-                let (nodes, log_weights) = gauss_hermite(n);
-                let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
-                let schedule = cacheable_schedule(&model, &subject);
-                let h = anchor_hessian(
-                    anchor,
-                    &model,
-                    &subject,
-                    &params,
-                    &stack,
-                    b_hat,
-                    &mut scratch,
-                    schedule.as_ref(),
-                )
-                .expect("anchor Hessian");
-                let proposal =
-                    build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
-                let (bs, terms, _) = agq_nodes_and_terms(
-                    &model,
-                    &subject,
-                    &params,
-                    &stack,
-                    b_hat,
-                    &nodes,
-                    &log_weights,
-                    &proposal,
-                    &mut scratch,
-                    schedule.as_ref(),
-                    true,
-                    None,
-                );
-                let lse = logsumexp(&terms);
-                let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
-
-                let db_dx = eta_dx(
-                    &model,
-                    &subject,
-                    &params,
-                    &template,
-                    &stack,
-                    &x,
-                    b_hat,
-                    None,
-                    &mut scratch,
-                    schedule.as_ref(),
-                )
-                .expect("mode response");
-                let mult = model.ruv_obs_mult(&subject, &params.theta);
-                let err_keys = model.error_spec.obs_keys(&subject);
-                let mut obs_grad_recycle = Vec::new();
-                let mut eta_work = DVector::zeros(model.n_eta);
-                let mut prior_work = DVector::zeros(model.n_eta);
-                let node_grads: Vec<Vec<f64>> = bs
-                    .chunks_exact(stack.d())
-                    .map(|b| {
-                        node_nll_gradient(
-                            &model,
-                            &subject,
-                            &params,
-                            &stack,
-                            b,
-                            schedule.as_ref(),
-                            mult.as_deref(),
-                            err_keys.as_ref(),
-                            &mut obs_grad_recycle,
-                            &mut eta_work,
-                            &mut prior_work,
-                        )
-                        .expect("node gradient")
-                    })
-                    .collect();
-
-                let mut analytic = vec![0.0f64; x.len()];
-                analytic_grid_response(
-                    anchor,
-                    &model,
-                    &subject,
-                    &params,
-                    &template,
-                    &stack,
-                    &h,
-                    None,
-                    &x,
-                    b_hat,
-                    &nodes,
-                    &db_dx,
-                    &node_grads,
-                    &softmax,
-                    None,
-                    &mut analytic,
-                )
-                .unwrap_or_else(|| {
-                    panic!("the analytic route must engage on an in-scope model ({anchor:?})")
-                });
-
-                let mut fd = vec![0.0f64; x.len()];
-                fd_grid_response(
-                    &model,
-                    &subject,
-                    &params,
-                    &template,
-                    &stack,
-                    anchor,
-                    &x,
-                    b_hat,
-                    &nodes,
-                    &log_weights,
-                    &db_dx,
-                    Some(&node_grads),
-                    &softmax,
-                    &fixed,
-                    &mut scratch,
-                    schedule.as_ref(),
-                    &mut fd,
-                )
-                .expect("the FD baseline must be available");
-
-                let scale = fd.iter().fold(1e-3f64, |m, v| m.max(v.abs()));
-                for k in 0..x.len() {
-                    assert!(
-                        (analytic[k] - fd[k]).abs() / scale < 1e-5,
-                        "{anchor:?}, n_agq = {n}, coord {k}: analytic {} vs FD {} (scale {scale})",
-                        analytic[k],
-                        fd[k]
-                    );
-                }
-            }
-        }
-    }
-
-    /// Absent an override, the analytic grid response is the default (#1335). The `Exact`
-    /// anchor is the half that changed; `GaussNewton` was always analytic.
-    ///
-    /// There is deliberately no per-anchor assertion, because there is no longer a per-anchor
-    /// decision: [`use_analytic_grid_response`] takes no anchor. A test that passed one in
-    /// would be asserting against a parameter the body ignores.
-    ///
-    /// The two *forced* arms are not tested here. [`grid_response_override`] memoizes the
-    /// environment in a `OnceLock`, so setting `FERX_AGQ_GRID_RESPONSE` from inside one test of
-    /// a shared binary would leak into every other test's view of it — and into this one's.
-    /// `plans/laplace-sensitivity-speed/bench.sh` exercises those arms as separate processes,
-    /// which is the only way to do it honestly.
-    #[test]
-    fn the_analytic_grid_response_is_the_default() {
-        assert!(
-            use_analytic_grid_response(),
-            "the analytic grid response is the default for both anchors (#1335); if this fails,              check whether FERX_AGQ_GRID_RESPONSE is set in the environment running the suite"
-        );
-    }
-
-    /// The FD route must stay reachable: a model outside `laplace_h_deriv`'s scope (here an
-    /// M3-censored row) has to decline rather than assemble a plausible wrong `dH/dx`.
-    ///
-    /// `analytic_grid_response` has two earlier, anchor-agnostic declines
-    /// (`regularised_anchor`, `!is_well_conditioned()`) before it ever reaches the
-    /// `Exact` → `subject_h_inner_dx` dispatch this test names. Asserting only
-    /// `analytic_grid_response(...).is_none()` cannot tell "declined at the M3 scope gate"
-    /// apart from "declined at the conditioning screen" — both leave `out` untouched. So this
-    /// pins the intended gate directly by also calling `subject_h_inner_dx` itself, the way
-    /// the sibling module's `censored_rows_decline` does.
-    #[test]
-    fn out_of_scope_models_decline_to_the_fd_grid_response() {
-        use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::laplace_h_deriv::subject_h_inner_dx;
-        use crate::estimation::parameterization::{pack_params, unpack_params};
-        use crate::types::BloqMethod;
-
-        let mut model = parse_model_string(M3_MODEL).expect("parse");
-        model.bloq_method = BloqMethod::M3;
-        let theta = [0.22, 11.0, 1.4];
-        let mut subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let n = subject.observations.len();
-        subject.cens[n - 1] = 1;
-
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-        let x = pack_params(&template);
-        let params = unpack_params(&x, &template);
-        let stack = Stack::new(&model, &params, 0);
-        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
-        let b_hat = ebe.eta.as_slice();
-        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
-        let h = anchor_hessian(
-            HessianAnchor::Exact,
-            &model,
-            &subject,
-            &params,
-            &stack,
-            b_hat,
-            &mut scratch,
-            None,
-        )
-        .expect("exact anchor");
-        let (nodes, _lw) = gauss_hermite(1);
-        let db_dx = vec![nalgebra::DVector::zeros(stack.d()); x.len()];
-
-        assert!(
-            subject_h_inner_dx(
-                &model,
-                &subject,
-                &params,
-                &template,
-                &stack.omega_joint_inv,
-                &x,
-                b_hat,
-                &db_dx,
-                None,
-            )
-            .is_none(),
-            "the M3-censored row must decline at laplace_h_deriv's own scope gate, not at a \
-             conditioning screen further down"
-        );
-
-        let node_grads = vec![vec![0.0f64; stack.d()]];
-        let mut out = vec![0.0f64; x.len()];
-        assert!(
-            analytic_grid_response(
-                HessianAnchor::Exact,
-                &model,
-                &subject,
-                &params,
-                &template,
-                &stack,
-                &h,
-                None,
-                &x,
-                b_hat,
-                &nodes,
-                &db_dx,
-                &node_grads,
-                &[1.0],
-                None,
-                &mut out,
-            )
-            .is_none(),
-            "an M3 censored row must decline to the FD grid response"
-        );
-        assert!(
-            out.iter().all(|&v| v == 0.0),
-            "a declining analytic route must not partially accumulate into `out`"
-        );
-    }
-
-    /// M3-BLOQ. Was gated to the FD score; FOCE/FOCEI have had it analytic since #486.
-    #[test]
-    fn fixed_b_score_is_analytic_and_exact_under_m3() {
-        use crate::types::BloqMethod;
-        let mut model = parse_model_string(M3_MODEL).expect("parse");
-        model.bloq_method = BloqMethod::M3;
-        let theta = [0.22, 11.0, 1.4];
-        let mut subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let n = subject.observations.len();
-        subject.cens[n - 1] = 1;
-        subject.cens[n - 2] = 1;
-
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-        assert_fixed_b_score_matches_fd(
-            &model,
-            &subject,
-            &template,
-            &[0.05, -0.03, 0.08],
-            1e-6,
-            "M3",
-        );
-    }
-
-    /// `iiv_on_ruv` -- eta enters the residual VARIANCE directly (`df/deta_ruv = 0`), a
-    /// channel the old Gaussian chain had no term for at all.
-    #[test]
-    fn fixed_b_score_is_analytic_and_exact_under_iiv_on_ruv() {
-        let model = parse_model_string(RUV_MODEL).expect("parse");
-        assert!(
-            model.residual_error_eta.is_some(),
-            "fixture must set iiv_on_ruv"
-        );
-        let theta = [0.22, 11.0, 1.4];
-        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-        assert_fixed_b_score_matches_fd(
-            &model,
-            &subject,
-            &template,
-            &[0.05, -0.03, 0.08, 0.06],
-            1e-6,
-            "iiv_on_ruv",
-        );
-    }
-
-    /// LTBS. The provider already returns the log-transformed jet
-    /// (`apply_ltbs_transform_outer`), so the shared chain needs no LTBS special case --
-    /// this pins that.
-    #[test]
-    fn fixed_b_score_is_analytic_and_exact_under_ltbs() {
-        let model = parse_model_string(LTBS_MODEL).expect("parse");
-        assert!(model.log_transform, "log_additive must set LTBS");
-        let theta = [0.22, 11.0, 1.4];
-        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-        assert_fixed_b_score_matches_fd(
-            &model,
-            &subject,
-            &template,
-            &[0.05, -0.03, 0.08],
-            1e-6,
-            "LTBS",
-        );
-    }
-
-    /// FREM covariate pseudo-observations. REGRESSION TEST — this fails without the jet +
-    /// variance fix, and it fails for FOCE/FOCEI too, not just AGQ.
-    ///
-    /// `individual_nll` scores a `fremtype > 0` row against a completely different model:
-    /// prediction `θ[ti] + η[ei]` (not the PK model's `f`) and variance `EPSCOV²` (not
-    /// `error_spec.variance_at(f)`). The sensitivity provider returned the ordinary PK jet
-    /// for those rows and `prepare_stacked` read the ordinary variance, so the analytic
-    /// outer gradient was differentiating a likelihood the objective never evaluates.
-    /// Latent because FREM is conventionally fit with SAEM, which never asks for it.
-    ///
-    /// The FD reference here is a central difference of the real conditional NLL at a fixed
-    /// `b`, so it exercises exactly the likelihood the objective uses — including the
-    /// pseudo-observation rows.
-    #[test]
-    fn frem_pseudo_obs_rows_get_the_right_analytic_score() {
-        use crate::types::DoseEvent;
-        use std::collections::HashMap;
-
-        let model = parse_model_string(FREM_MODEL).expect("parse");
-        let fc = model.frem_config.as_ref().expect("fixture must be FREM");
-        assert_eq!(model.n_eta, 5, "3 PK etas + 2 covariate etas");
-        assert!(
-            analytic_score_supported_model(&model),
-            "FREM must now take the ANALYTIC score path"
-        );
-
-        // Two PK rows plus one pseudo-observation per covariate (FREMTYPE 100 / 200).
-        let mut fts: Vec<u16> = fc.fremtype_to_indices.keys().copied().collect();
-        fts.sort_unstable();
-        assert_eq!(fts.len(), 2, "fixture has WT and AGE pseudo-obs");
-
-        let theta = &model.default_params.theta;
-        let pk_times = [1.0, 6.0, 24.0];
-        let n = pk_times.len() + fts.len();
-        let mut subject = Subject {
-            obs_rgroup: Vec::new(),
-            id: "1".to_string(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: pk_times
-                .iter()
-                .copied()
-                .chain(fts.iter().map(|_| 0.0))
-                .collect(),
-            obs_raw_times: Vec::new(),
-            observations: vec![0.0; n],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cens: vec![0; n],
-            occasions: vec![1; n],
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: pk_times
-                .iter()
-                .map(|_| 0u16)
-                .chain(fts.iter().copied())
-                .collect(),
-            obs_records: vec![],
-        };
-        // PK rows: realistic residuals off the model. Pseudo-obs rows: the covariate value,
-        // offset from θ so the residual is nonzero.
-        let eta_ref = vec![0.1, -0.05, 0.15, 0.0, 0.0];
-        let preds = crate::pk::compute_predictions_with_tv(&model, &subject, theta, &eta_ref);
-        for j in 0..pk_times.len() {
-            subject.observations[j] = preds[j] * 0.85;
-        }
-        for (k, &ft) in fts.iter().enumerate() {
-            let (ti, _ei) = fc.fremtype_to_indices[&ft];
-            subject.observations[pk_times.len() + k] = theta[ti] * 1.10;
-        }
-
-        let template = model.default_params.clone();
-        let b = [0.05, -0.03, 0.08, 1.5, -2.0];
-        assert_fixed_b_score_matches_fd(&model, &subject, &template, &b, 1e-6, "FREM");
-
-        // The INNER η-gradient has the same root cause and is the more damaging half: it
-        // sets the EBEs. `analytic_eta_nll_gradient` fed `residual_inner_obs` the PK
-        // prediction and the PK variance on pseudo-observation rows, so the mode it drove
-        // to was not the mode of the likelihood being integrated.
-        let params = model.default_params.clone();
-        let analytic = crate::estimation::inner_optimizer::analytic_eta_nll_gradient(
-            &model,
-            &subject,
-            &params.theta,
-            &b,
-            &params.omega,
-            &params.sigma.values,
-        )
-        .expect("FREM inner gradient must be analytic");
-
-        let mut scratch = crate::pk::EventPkParams::default();
-        for k in 0..b.len() {
-            let h = 1e-6 * (1.0 + b[k].abs());
-            let (mut bp, mut bm) = (b.to_vec(), b.to_vec());
-            bp[k] += h;
-            bm[k] -= h;
-            let nll = |e: &[f64], s: &mut crate::pk::EventPkParams| {
-                crate::stats::likelihood::individual_nll_into_with_schedule(
-                    &model,
-                    &subject,
-                    &params.theta,
-                    e,
-                    &params.omega,
-                    &params.sigma.values,
-                    &params.residual_correlations,
-                    s,
-                    None,
-                )
-            };
-            let fd = (nll(&bp, &mut scratch) - nll(&bm, &mut scratch)) / (2.0 * h);
-            let scale = fd.abs().max(analytic[k].abs()).max(1.0);
-            assert!(
-                (analytic[k] - fd).abs() / scale < 1e-6,
-                "FREM inner grad η{k}: analytic {} vs FD {}",
-                analytic[k],
-                fd
-            );
         }
     }
 
@@ -4509,210 +1643,6 @@ mod tests {
                 "{label} must take the analytic score path"
             );
         }
-    }
-
-    /// [`grid_z_at`] must reproduce **exactly** the node ordering [`agq_nodes_and_terms`]
-    /// sweeps.
-    ///
-    /// The grid-response term contracts node `j`'s displacement against node `j`'s stored
-    /// `∂nll/∂b` and node `j`'s softmax weight. If the two enumerations ever drift, every node
-    /// would be paired with *another* node's gradient — each individually valid, so the result
-    /// stays finite and plausible while being a wrong gradient. That is exactly the failure
-    /// class this module's "share one sweep" rule exists to prevent, and reconstructing `zⱼ`
-    /// from the index (rather than storing it) is the one place the rule is enforced by
-    /// agreement rather than by construction. Hence this test.
-    #[test]
-    fn grid_z_at_matches_the_sweep_enumeration() {
-        for (n, d) in [(1usize, 1usize), (3, 1), (2, 3), (3, 4), (5, 2), (4, 3)] {
-            let (nodes, _w) = gauss_hermite(n);
-            // The mixed-radix counter from `agq_nodes_and_terms`, digit 0 fastest.
-            let mut idx = vec![0usize; d];
-            let mut j = 0usize;
-            let mut got = vec![0.0f64; d];
-            loop {
-                let expect: Vec<f64> = (0..d).map(|k| nodes[idx[k]]).collect();
-                grid_z_at(j, &nodes, d, &mut got);
-                assert_eq!(got, expect, "n={n} d={d}: node {j} z-vector");
-                j += 1;
-                let mut k = 0;
-                while k < d {
-                    idx[k] += 1;
-                    if idx[k] < n {
-                        break;
-                    }
-                    idx[k] = 0;
-                    k += 1;
-                }
-                if k == d {
-                    break;
-                }
-            }
-            assert_eq!(j, grid_size(n, d), "n={n} d={d}: swept node count");
-        }
-    }
-
-    /// The one-point rule must put **exactly** `0.0` in every `A[i,c]`, because that — not
-    /// `nodes.len() == 1` — is what puts `method = laplace` on the displacement-free path and
-    /// saves the five d×d matrix products per free coordinate (#1333).
-    ///
-    /// Deliberately `== 0.0` and not a tolerance. A tolerance is the wrong assertion here: a
-    /// `1e-17` node is numerically indistinguishable from zero *for the objective* yet flips
-    /// `a.iter().any(|&x| x != 0.0)` to `true` and silently restores the whole cost. The
-    /// existing `gauss_hermite_matches_known_rules` asserts the node to `1e-14`, which is the
-    /// right bar for the quadrature and cannot see this.
-    ///
-    /// The `n = 3` half is the straddle: it must be non-zero, or the assertion above would
-    /// also pass on a `node_moments` that had been broken to return zero always, and the skip
-    /// would then drop a live displacement term at every `n_agq`.
-    #[test]
-    fn the_one_point_rule_reaches_the_displacement_free_path() {
-        for d in [1usize, 2, 3] {
-            let (nodes, _w) = gauss_hermite(1);
-            assert_eq!(
-                nodes,
-                vec![0.0],
-                "the one-point Gauss-Hermite node must be exactly 0.0"
-            );
-            // One node, unit weight, a gradient with no zeros in it — so a non-zero `A` could
-            // only come from `z`.
-            let grads = vec![(1..=d).map(|i| i as f64).collect::<Vec<f64>>()];
-            let (v, a) = node_moments(d, &nodes, &grads, &[1.0]);
-            assert!(
-                a.iter().all(|&x| x == 0.0),
-                "d={d}: A must be exactly zero at one node, got {a}"
-            );
-            // …and `v` must still carry the weighted gradient, or the coordinate term would
-            // lose its `v·db_dx[k]` half and this test would be passing on a dead moment pair.
-            assert_eq!(v, grads[0], "d={d}: v must be the weighted node gradient");
-
-            let (nodes3, w3) = gauss_hermite(3);
-            let softmax3: Vec<f64> = {
-                let total: f64 = w3.iter().sum();
-                w3.iter().map(|w| w / total).collect()
-            };
-            let n_grid = grid_size(3, d);
-            let grads3: Vec<Vec<f64>> = (0..n_grid)
-                .map(|j| (1..=d).map(|i| (i + j) as f64).collect())
-                .collect();
-            let weights3: Vec<f64> = (0..n_grid)
-                .map(|j| {
-                    let mut idx = j;
-                    let mut w = 1.0;
-                    for _ in 0..d {
-                        w *= softmax3[idx % 3];
-                        idx /= 3;
-                    }
-                    w
-                })
-                .collect();
-            let (_v3, a3) = node_moments(d, &nodes3, &grads3, &weights3);
-            assert!(
-                a3.iter().any(|&x| x != 0.0),
-                "d={d}: A must be live at n_agq = 3, or the one-node assertion proves nothing"
-            );
-        }
-    }
-
-    /// The moment form is an exact regrouping of the per-node sum, so the two may differ only
-    /// by floating-point reassociation (#1333). This measures by how much.
-    ///
-    /// The naive side is written out here rather than kept in production: that is what makes
-    /// this a reference rather than a second copy of the formula nobody diffs. The tolerance
-    /// is the measured worst relative error with headroom — see the assertion.
-    ///
-    /// **This and `analytic_grid_response_matches_the_fd_route` do not cover each other**, and
-    /// the mutations say so rather than the prose guessing. Transposing `m_k` in
-    /// `analytic_grid_response`'s contraction reddens the FD route and leaves this green,
-    /// because this assembles the contraction itself and never calls that function; dropping
-    /// the `z` factor inside [`node_moments`] reddens both, because that *is* shared. So this
-    /// test pins the moments and the regrouping algebra, the FD test pins the production
-    /// assembly around them, and removing either leaves a real defect class unobserved.
-    #[test]
-    fn the_moment_form_matches_the_per_node_sum() {
-        use std::f64::consts::SQRT_2;
-
-        let mut worst = 0.0f64;
-        for (n, d) in [(1usize, 1usize), (3, 1), (3, 2), (3, 3), (5, 2), (2, 3)] {
-            let (nodes, w) = gauss_hermite(n);
-            let total: f64 = w.iter().sum();
-            let softmax_1d: Vec<f64> = w.iter().map(|x| x / total).collect();
-            let n_grid = grid_size(n, d);
-
-            // Deliberately ugly magnitudes: a reassociation test on values that are all ~1.0
-            // measures the best case rather than the realistic one.
-            let grads: Vec<Vec<f64>> = (0..n_grid)
-                .map(|j| {
-                    (0..d)
-                        .map(|i| 1e3 * ((j * 7 + i * 13) as f64).sin() + 1e-4)
-                        .collect()
-                })
-                .collect();
-            let softmax: Vec<f64> = (0..n_grid)
-                .map(|j| {
-                    let mut idx = j;
-                    let mut p = 1.0;
-                    for _ in 0..d {
-                        p *= softmax_1d[idx % n];
-                        idx /= n;
-                    }
-                    p
-                })
-                .collect();
-            let db: Vec<f64> = (0..d).map(|i| 0.25 * (i as f64 + 1.0) - 1e5).collect();
-            let m_k =
-                DMatrix::<f64>::from_fn(d, d, |i, c| 7.5 * ((i * 3 + c * 5) as f64).cos() - 1e-3);
-
-            // The moment form, exactly as `analytic_grid_response` assembles it.
-            let (v, a) = node_moments(d, &nodes, &grads, &softmax);
-            let mut moment = (0..d).map(|i| v[i] * db[i]).sum::<f64>();
-            let mut disp = 0.0;
-            for i in 0..d {
-                for c in 0..d {
-                    disp += a[(i, c)] * m_k[(i, c)];
-                }
-            }
-            moment += SQRT_2 * disp;
-
-            // The per-node form this replaced.
-            let mut naive = 0.0;
-            let mut z = vec![0.0f64; d];
-            for (j, g) in grads.iter().enumerate() {
-                if softmax[j] == 0.0 {
-                    continue;
-                }
-                grid_z_at(j, &nodes, d, &mut z);
-                let mut dot = 0.0;
-                for i in 0..d {
-                    let mut dbj = db[i];
-                    for c in 0..d {
-                        dbj += SQRT_2 * m_k[(i, c)] * z[c];
-                    }
-                    dot += g[i] * dbj;
-                }
-                naive += softmax[j] * dot;
-            }
-
-            assert!(
-                moment.is_finite() && naive.is_finite(),
-                "n={n} d={d}: fixture produced a non-finite term ({moment}, {naive}); the \
-                 relative comparison below would absorb it"
-            );
-            let scale = naive.abs().max(1.0);
-            worst = worst.max((moment - naive).abs() / scale);
-        }
-        // **Measured**, not reasoned: the worst realised relative error across the six grids
-        // above is `1.680e-15` (printed below; `cargo test -- --nocapture` to re-read it),
-        // i.e. a handful of ULP, which is what an exact regrouping should cost. The bound is
-        // that number with ~60× headroom, for a target whose `sin`/`cos` — used to build the
-        // fixture — round differently. It is still ~1e10 tighter than the `1e-5` the FD-parity
-        // oracle uses, so a genuine algebra error in the regrouping cannot hide under it: a
-        // transposed `m_k` index moves this to ~1e-1.
-        println!("worst realised moment-vs-per-node relative error: {worst:.3e}");
-        assert!(
-            worst < 1e-13,
-            "the moment regrouping should differ from the per-node sum only by \
-             reassociation; worst relative error was {worst:.3e}"
-        );
     }
 
     /// Golub–Welsch must reproduce the textbook physicists' Hermite rule.
@@ -5279,131 +2209,6 @@ mod tests {
                 {
                     assert_eq!(fresh.to_bits(), reused.to_bits());
                 }
-            }
-        }
-    }
-
-    /// #1781 — the AGQ twins of #1744. A subject whose records are all non-Gaussian (TTE events
-    /// in `obs_records`, no Gaussian `observations`) lost its data term from the quadrature
-    /// gradient twice over: the fixed-b score returned before its θ block whenever
-    /// `subject.observations` was empty, and the grid response contracted each node against an
-    /// inner `∂nll/∂b` that was the Ω prior alone. Two halves, both on
-    /// `examples/tte_exponential.ferx`'s 30 event-only subjects at (approximately) the exact
-    /// marginal's minimum, λ = 0.0338, ω² = 0.0715:
-    ///
-    /// 1. the fixed-b score's θ coordinate against a central difference of `Stack::nll_at`
-    ///    at a non-mode `b` — before the fix it was exactly 0 against an FD of ≈ −0.7;
-    /// 2. the population gradient against a central difference of the reconverged AGQ OFV at
-    ///    1, 3 and 7 nodes — the total derivative an optimizer and the covariance step's `S`
-    ///    consume. With the first fix alone it read (θ, ω) = (1.008, 2.441) at seven nodes
-    ///    against an FD of (0.0257, 0.0003), and (0.869, 4.727) at one node against
-    ///    (0.0109, −0.0692); before either, `method = laplace` with L-BFGS stalled at OFV
-    ///    166.647 (BOBYQA: 166.527).
-    ///
-    /// Mutation-checked: restoring the `n_obs == 0` early return kills half 1 (θ score 0 vs
-    /// FD −0.670); dropping the `non_gaussian_eta_grad_served` guard in `node_nll_gradient`
-    /// kills half 2 (0.869 vs 0.0109 at one node). Bounds are measured (Linux x86_64,
-    /// `|g − fd| / max(|fd|, 1)`): worst 1.6e-6 at three and seven nodes, bound 1e-5; at one
-    /// node 8.5e-4 on θ, bound 2e-3. The one-node gap was not isolated here; the exact-anchor
-    /// Hessian of a TTE subject is itself finite-differenced, whose θ-roughness #1778
-    /// measured, and is the likeliest source.
-    #[cfg(feature = "survival")]
-    #[test]
-    fn an_event_only_subject_keeps_its_theta_score() {
-        use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
-        let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
-        let model = parse_model_string(
-            &src.replace("theta TVLAMBDA(0.05,", "theta TVLAMBDA(0.0338,")
-                .replace("omega ETA_LAMBDA ~ 0.09", "omega ETA_LAMBDA ~ 0.0715"),
-        )
-        .expect("parse");
-        let (pop, _) = crate::api::read_population_for(
-            &model,
-            &None,
-            "data/tte_exponential.csv",
-            None,
-            None,
-            None,
-            &[],
-        )
-        .expect("data");
-        let template = &model.default_params;
-        let x = pack_params(template);
-        let fixed = packed_fixed_mask(template);
-        let params = unpack_params(&x, template);
-        assert!(
-            pop.subjects
-                .iter()
-                .all(|s| s.observations.is_empty() && !s.obs_records.is_empty()),
-            "precondition: every subject is event-only"
-        );
-
-        // Half 1 — the fixed-b score.
-        let subject = &pop.subjects[0];
-        let stack = Stack::new(&model, &params, 0);
-        let b = [0.3];
-        let mut g = vec![0.0; x.len()];
-        accumulate_fixed_eta_packed_gradient(
-            &model, subject, &params, template, &stack, &b, 1.0, &mut g,
-        )
-        .expect("score");
-        let mut scratch = crate::pk::EventPkParams::default();
-        let mut nll = |xv: &[f64]| {
-            let p = unpack_params(xv, template);
-            Stack::new(&model, &p, 0).nll_at(&model, subject, &p, &b, &mut scratch, None)
-        };
-        let h = 1e-6 * (1.0 + x[0].abs());
-        let (mut xp, mut xm) = (x.clone(), x.clone());
-        xp[0] += h;
-        xm[0] -= h;
-        let fd = (nll(&xp) - nll(&xm)) / (2.0 * h);
-        assert!(
-            fd.abs() > 0.1,
-            "precondition: θ moves this subject's likelihood: {fd}"
-        );
-        assert!(
-            (g[0] - fd).abs() < 1e-9 * fd.abs().max(1.0),
-            "θ score {} vs FD {fd}",
-            g[0]
-        );
-
-        // Half 2 — the population gradient against the reconverged objective.
-        let ofv = |xv: &[f64], n: usize| {
-            let p = unpack_params(xv, template);
-            let (e, _, _, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
-                &model, &pop, &p, 500, 1e-12, None, None, 0, 0,
-            );
-            2.0 * agq_population_nll(&model, &pop, &p, &e, &[], n, HessianAnchor::Exact)
-        };
-        let (ehs, _, _, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
-        );
-        for (n, tol) in [(1usize, 2e-3), (3, 1e-5), (7, 1e-5)] {
-            let g = agq_population_gradient(
-                &model,
-                &pop,
-                &params,
-                template,
-                &x,
-                &ehs,
-                &[],
-                n,
-                HessianAnchor::Exact,
-            )
-            .expect("gradient");
-            for k in (0..x.len()).filter(|&k| !fixed[k]) {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let (mut xp, mut xm) = (x.clone(), x.clone());
-                xp[k] += h;
-                xm[k] -= h;
-                let fd = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
-                assert!(g[k].is_finite() && fd.is_finite(), "n = {n}, coord {k}");
-                let err = (g[k] - fd).abs() / fd.abs().max(1.0);
-                eprintln!(
-                    "n = {n}, coord {k}: gradient {:.8} FD {fd:.8} rel {err:.2e}",
-                    g[k]
-                );
-                assert!(err < tol, "n = {n}, coord {k}: {} vs FD {fd}", g[k]);
             }
         }
     }

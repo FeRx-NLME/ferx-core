@@ -113,11 +113,12 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// every such model decline #570's shared solve (measured 1.82× on one objective
 /// evaluation) and leave the dense driver, for a property it does not have.
 ///
-/// The **steady-state gates do not follow this narrowing** and must keep asking
-/// `reads_model_time()` directly (`estimation/inner_optimizer.rs`,
-/// `sens/ode_provider.rs`): SS equilibration integrates the *augmented* system,
-/// `__chz` included, and a time-reading hazard line breaks that state's cycle
-/// recurrence just as a time-reading PK line would.
+/// The steady-state gradient gates (`sens/ode_provider.rs`) ask the PK-only
+/// `pk_reads_absolute_time()` (#2093), which is safe only because a joint
+/// PK-TTE subject with an SS dose is declined before them (#1210): SS
+/// equilibration integrates the *augmented* system, `__chz` included, and a
+/// time-reading hazard line breaks that state's cycle recurrence just as a
+/// time-reading PK line would.
 ///
 /// The Form C `readout_program` is deliberately **not** folded in either. Both
 /// engines evaluate the readout under a `ModelTimeGuard`, so a `TIME`-reading
@@ -289,7 +290,7 @@ pub(crate) fn effective_model_for_eval<'a>(
 }
 
 /// The IOV peer of [`effective_model_for_eval`]: the model serving an IOV subject at
-/// `(θ, [η_bsv, κ₁ … κ_K])`, the stacked layout the IOV sensitivity providers and the
+/// `(θ, [η_bsv, κ₁ … κ_K])`, the stacked layout the IOV analytic gradient (adjoint) and the
 /// covariance sweep carry (occasions in [`crate::stats::likelihood::iov_occasion_groups`]
 /// order). A walk-eligible transit/IG subject stays on the closed form when the absorption
 /// walk serves it at those parameters and goes to the twin otherwise — the decision
@@ -513,8 +514,8 @@ pub(crate) fn divide_by_obs_scale(pred: f64, scale: f64) -> f64 {
 /// (`subject.obs_cov(i)`) so a per-row flag like `FREE` selects the right branch.
 /// On a time-varying-covariate subject (or a `TIME`-builtin model) the readout's
 /// individual parameters are re-evaluated **per observation** — matching NONMEM's
-/// per-record `$ERROR` and the per-observation snapshot the analytic sensitivity
-/// provider differentiates (`run_obs_tvcov`), so the prediction and its gradient
+/// per-record `$ERROR` and the per-observation snapshot the adjoint's closed-form event
+/// recorder differentiates (`record_analytic_events`), so the prediction and its gradient
 /// linearise about the same point. Otherwise one subject-static snapshot drives
 /// every row.
 ///
@@ -589,7 +590,7 @@ pub fn apply_analytic_readout(
         // model-time thread-local; `OdeReadout::eval` enters this observation's time
         // as the guard (#1028), so the readout evaluates `TIME` at the observation
         // here exactly as it does on the ODE predictor path. A no-op for a readout
-        // that does not reference `TIME`; the analytic providers set the matching
+        // that does not reference `TIME`; the analytic dual walks set the matching
         // guard around their own readout eval, keeping FD parity. `readout_time` is
         // the raw data-file clock — the `$ERROR` convention, which differs from the
         // integrator timeline only under stacked reset occasions.
@@ -5069,8 +5070,8 @@ mod tests {
     /// inside the integrator against the per-observation parameter snapshot, which is
     /// also NONMEM's per-record `$ERROR` convention. It is the only oracle that
     /// catches this — a `Dual2`-vs-FD parity test passes against the wrong function,
-    /// because the analytic sensitivity path was seeded to match it (see
-    /// `iov_form_c_kappa_baseline_readout_provider_matches_fd`).
+    /// because the analytic sensitivity path was seeded to match it (see the pre-#2093
+    /// `iov_form_c_kappa_baseline_readout_provider_matches_fd`, retired in #2093).
     ///
     /// The decomposition is checked too: `y − central/V` must equal `BASE` evaluated
     /// at *that observation's* κ, which pins the fix to the per-occasion parameter

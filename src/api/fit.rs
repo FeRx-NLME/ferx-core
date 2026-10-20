@@ -439,7 +439,7 @@ pub(crate) fn nn_regularization_unapplied_warning(
     .filter(|(_, l)| *l > 0.0)
     .map(|(k, _)| k)
     .collect();
-    if set.is_empty() || !model_has_covariate_nn(model) {
+    if set.is_empty() || !model.has_covariate_nn() {
         return None;
     }
     let last = *chain.last()?;
@@ -455,16 +455,6 @@ pub(crate) fn nn_regularization_unapplied_warning(
         if set.len() == 1 { "is" } else { "are" },
         last.label(),
     ))
-}
-
-#[cfg(feature = "nn")]
-fn model_has_covariate_nn(model: &CompiledModel) -> bool {
-    !model.covariate_nns.is_empty()
-}
-
-#[cfg(not(feature = "nn"))]
-fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
-    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -1522,6 +1512,12 @@ fn fit_inner(
         n_params_pre,
         options,
         !model.priors.is_empty(),
+        crate::estimation::covariance::analytic_r_expected(
+            model,
+            population,
+            options,
+            init_params.mixture.is_some(),
+        ),
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
@@ -1568,7 +1564,7 @@ fn fit_inner(
     );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
-    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // (but not all) subjects fall outside the analytic (adjoint) scope, surface
     // it through warnings (not just the startup banner) per the AGENTS.md rule.
     if chain.iter().any(|m| {
         matches!(

@@ -246,10 +246,10 @@ fn assert_analytic_ran(result: &FitResult, case: &str) {
 #[test]
 fn assert_analytic_ran_sees_a_runtime_decline() {
     // The case `assert_analytic_ran` exists for: the model-level label reads
-    // "analytic" while the provider declines a subject at run time. A
-    // rate-defined infusion under an `F` (the #419 decline, as in
-    // `tests/outer_gradient_fd_fallback_warning.rs`) on subject 1 of the counted
-    // form does that. A gather-free slot and the wide-block ladder do not: the
+    // "analytic" while the adjoint declines a subject at run time. An oral model with a
+    // lag time, and subject 1 of the counted form given a steady-state infusion into the
+    // depot, does that: the infusion routes the subject to the event walk, which declines
+    // an SS infusion under a lag (as in `tests/outer_gradient_fd_fallback_warning.rs`). A gather-free slot and the wide-block ladder do not: the
     // column-chunked jet keeps a 26-level block analytic, and
     // `reconverge_gradient_interval` forces FD without logging a decline.
     let form = &FORMS[0];
@@ -258,14 +258,26 @@ fn assert_analytic_ran_sees_a_runtime_decline() {
         .replace("V = TVV * exp(ETA_V)", "V = TVV * exp(ETA_V)\n  F = TVF")
         .replace(
             "pk one_cpt_iv(cl=CL, v=V)",
-            "pk one_cpt_iv(cl=CL, v=V, f=F)",
+            "pk one_cpt_oral(cl=CL, v=V, ka=1.5, lagtime=0.4, f=F)",
         );
     assert!(
-        text.matches("TVF").count() == 2 && text.contains("f=F"),
+        text.matches("TVF").count() == 2 && text.contains("lagtime=0.4, f=F"),
         "every edit must take: {text}"
     );
-    let data = DATA.replacen("1,0,.,1,100,1,0,1,1\n", "1,0,.,1,100,1,50,1,1\n", 1);
-    assert_ne!(data, DATA, "subject 1's dose must become an infusion");
+    // `SS`/`II` columns for every row; subject 1's dose becomes an SS infusion.
+    let data: String = DATA
+        .lines()
+        .enumerate()
+        .map(|(i, l)| match (i, l) {
+            (0, h) => format!("{h},SS,II\n"),
+            (_, "1,0,.,1,100,1,0,1,1") => "1,0,.,1,100,1,50,1,1,1,24\n".to_string(),
+            (_, r) => format!("{r},0,0\n"),
+        })
+        .collect();
+    assert!(
+        data.contains("1,0,.,1,100,1,50,1,1,1,24\n"),
+        "subject 1's dose must become an SS infusion"
+    );
     let result = fit_on(&text, &data);
     assert!(
         result.gradient_method_outer.starts_with("analytic"),
@@ -337,18 +349,22 @@ fn a_gathered_theta_fits_exactly_like_its_directly_read_twin() {
             form.name,
             gathered.ofv
         );
-        assert_eq!(
-            gathered.ofv.to_bits(),
-            direct.ofv.to_bits(),
+        // Not bit for bit since #486: the adjoint tapes each model's own program, and the
+        // twin's `+ 0 * TVV` reads TVV directly — another θ axis and a `Shift` node on the
+        // tape — so the reverse sweep accumulates in a different order. Measured 68 ULP
+        // (1.5e-14 relative) on the OFV; 1e-12 is ~70× that. The defect this pair exists for (a
+        // frozen gather-only block) moves the fit by ≥ 1e-3, so the bound still sees it.
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+        assert!(
+            rel(gathered.ofv, direct.ofv) < 1e-12,
             "{}: OFV {:.17e} vs twin {:.17e}",
             form.name,
             gathered.ofv,
             direct.ofv
         );
         for (a, b) in gathered.theta.iter().zip(&direct.theta) {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
+            assert!(
+                a.is_finite() && rel(*a, *b) < 1e-12,
                 "{}: θ {:?} vs twin {:?}",
                 form.name,
                 gathered.theta,

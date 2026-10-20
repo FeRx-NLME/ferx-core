@@ -1605,9 +1605,9 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
 /// differentiate — and that is the point. The analytic IOV scope is very wide: probing it
 /// while writing this test, closed-form 1-cpt, **ODE**, `iiv_on_ruv`, and ODE +
 /// `iiv_on_ruv` IOV models are *all* served analytically, despite comments in
-/// `iov_analytical_supported` suggesting some are not (that predicate gates the outer
-/// assembly; the inner gradient reaches ODE subjects through
-/// `ode_subject_eta_grad_iov`). Picking any of those as the "out of scope" fixture would
+/// the pre-#2093 `iov_analytical_supported` suggesting some were not (that predicate gated
+/// the outer assembly; the adjoint, `model_in_scope` / `recorder_in_scope`, now serves both
+/// loops). Picking any of those as the "out of scope" fixture would
 /// have produced a test that passed for the wrong reason today and silently stopped
 /// testing anything tomorrow. A model with nothing to differentiate cannot drift into
 /// scope.
@@ -1624,12 +1624,12 @@ fn iov_shell_fixture() -> (CompiledModel, Population, ModelParameters) {
     (shell, population, params)
 }
 
-/// VI_PLAN §10.5(4): an IOV model the analytic provider declines must fall back to
+/// VI_PLAN §10.5(4): an IOV model the analytic (adjoint) gradient declines must fall back to
 /// finite differences **loudly**, and `vi_eta_grad = analytic` must refuse it.
 ///
 /// [`eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly`] pins this for the
 /// non-IOV path, but the IOV path reaches its gradient through a different function
-/// (`analytic_eta_nll_gradient_iov` → `subject_eta_grad_iov`) with its own `None` branch.
+/// (`analytic_eta_nll_gradient_iov` → `adjoint::exact_obs_grads_in`) with its own `None` branch.
 /// Without this test the IOV coverage is entirely positive-direction — every other IOV
 /// test asserts `n_fd_subjects == 0` — so a scope gap that silently returned a *wrong*
 /// stacked gradient rather than declining would go unnoticed. That failure mode is worse
