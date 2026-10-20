@@ -8413,6 +8413,16 @@ fn parse_binary_model_block(
         "binary_model",
     )?;
 
+    // The same predictor in dual-evaluable form, for the analytic inner gradient (#2024).
+    // `None` keeps the endpoint on FD (see `build_endpoint_expr_program`).
+    let lp_program = build_endpoint_expr_program(
+        &lp_exprs,
+        &needed_indiv_stmts,
+        &lp_covariates,
+        theta_names.len(),
+        eta_names.len(),
+    );
+
     // Build the lp_fn closure over (θ, η, covariates). Expression nodes hold only indices, so
     // they are safe to move; `TIME` resolves via the model-time guard `binary_data_term` sets
     // per record.
@@ -8429,6 +8439,7 @@ fn parse_binary_model_block(
         EndpointLikelihood::Binary {
             link,
             lp_fn,
+            lp_program,
             lp_covariates: lp_covariates.clone(),
         },
         lp_covariates,
@@ -29050,63 +29061,24 @@ impl CtmmGeneratorProgram {
         eta: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
-        use crate::sens::dual1::Dual1;
         debug_assert_eq!(M, self.n_axes());
-        let theta_d: Vec<Dual1<M>> = theta
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| {
-                if m < M {
-                    Dual1::var(v, m)
-                } else {
-                    // A θ the intensities cannot reference anyway (the program is sized by
-                    // the model's declared θ count, so this is unreachable in practice).
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
-        let eta_d: Vec<Dual1<M>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                let dim = self.n_theta + k;
-                if dim < M {
-                    Dual1::var(v, dim)
-                } else {
-                    // IOV kappas are appended past the BSV η block and are rejected in an
-                    // intensity at parse, so they are correctly seeded as constants here.
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-
-        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual1<M>> = Vec::new();
-        eval_statements_g::<Dual1<M>>(
+        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
+        let jets = eval_endpoint_jets::<M>(
             &self.stmts,
-            &theta_d,
-            &eta_d,
-            &cov_vec,
-            &mut vars,
-            None,
-            &mut stack,
-            &[],
+            self.n_vars,
+            &rate_bcs,
+            &self.cov_names,
+            self.n_theta,
+            theta,
+            eta,
+            covariates,
         );
 
         let s = self.n_states;
         let n_axes = self.n_axes();
         let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
         let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
-        for (j, k, bc) in &self.rates {
-            let rate = eval_bytecode_g::<Dual1<M>>(
-                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
-            );
+        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
             q[(*j, *k)] += rate.value;
             q[(*j, *j)] -= rate.value;
             for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
@@ -29136,8 +29108,50 @@ fn build_ctmm_generator_program(
     if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
         return None;
     }
+    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
+    let (stmts, n_vars, bcs) =
+        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    let rates: Vec<(usize, usize, Bytecode)> = transitions
+        .iter()
+        .zip(bcs)
+        .map(|((j, k, _), bc)| (*j, *k, bc))
+        .collect();
 
-    // Var slots for the `[individual_parameters]` values the intensities read, in the
+    Some(CtmmGeneratorProgram {
+        stmts,
+        n_vars,
+        rates,
+        n_states,
+        cov_names: generator_covariates.to_vec(),
+        n_theta,
+        n_eta,
+    })
+}
+
+/// Widest `(θ, η)` axis count an [`EndpointExprProgram`]'s dual dispatch specializes.
+/// Above this, [`EndpointExprProgram::eval_duals`] returns `None` and the endpoint keeps
+/// its finite-difference gradient — a fallback, never a wrong answer. The same cap as the
+/// CTMM generator's, so both reuse one set of `Dual1<M>` instantiations.
+#[cfg(feature = "survival")]
+pub(crate) const MAX_ENDPOINT_AXES: usize = 24;
+
+/// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
+/// compile each of `exprs` to bytecode against them — the shared front half of every
+/// dual-evaluable endpoint program ([`CtmmGeneratorProgram`], [`EndpointExprProgram`]).
+///
+/// Returns `(resolved statements, var-slot count, one bytecode per expression)`, or `None`
+/// when any expression or needed statement reads an identifier we cannot bind. An
+/// unresolved `Variable`/`Covariate` leaf lowers to a constant `0.0` in `compile_bytecode`
+/// (its documented fall-through). That is survivable for a *value* path that never sees
+/// one, but here it would hand back a confidently wrong gradient, so refuse the program
+/// instead and let FD serve the endpoint.
+#[cfg(feature = "survival")]
+fn compile_endpoint_exprs(
+    exprs: &[&Expression],
+    needed_indiv_stmts: &[Statement],
+    covariates: &[String],
+) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
+    // Var slots for the `[individual_parameters]` values the expressions read, in the
     // order they are assigned (so a later value may read an earlier one).
     let var_names = assigned_vars_in_order(needed_indiv_stmts);
     let var_idx: HashMap<String, usize> = var_names
@@ -29146,16 +29160,12 @@ fn build_ctmm_generator_program(
         .map(|(i, n)| (n.clone(), i))
         .collect();
     let n_vars = var_names.len();
-    let cov_idx: HashMap<String, usize> = generator_covariates
+    let cov_idx: HashMap<String, usize> = covariates
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
         .collect();
 
-    // An unresolved `Variable`/`Covariate` leaf lowers to a constant `0.0` in
-    // `compile_bytecode` (its documented fall-through). That is survivable for a *value*
-    // path that never sees one, but here it would hand back a confidently wrong gradient,
-    // so refuse the program instead and let FD serve the endpoint.
     let resolvable = |e: &Expression| -> bool {
         let mut ok = true;
         visit_expr_nodes(e, &mut |node: &Expression| match node {
@@ -29165,7 +29175,7 @@ fn build_ctmm_generator_program(
         });
         ok
     };
-    if !transitions.iter().all(|(_, _, e)| resolvable(e)) {
+    if !exprs.iter().all(|e| resolvable(e)) {
         return None;
     }
     let mut indiv_ok = true;
@@ -29179,21 +29189,197 @@ fn build_ctmm_generator_program(
     let mut stmts: Vec<Statement> = needed_indiv_stmts.to_vec();
     resolve_variable_indices(&mut stmts, &var_idx, &cov_idx, None);
 
-    let rates: Vec<(usize, usize, Bytecode)> = transitions
+    let bcs: Vec<Bytecode> = exprs
         .iter()
-        .map(|(j, k, expr)| {
-            let mut e = expr.clone();
+        .map(|expr| {
+            let mut e = (*expr).clone();
             resolve_expr_indices(&mut e, &var_idx, &cov_idx);
-            (*j, *k, compile_bytecode(&e))
+            compile_bytecode(&e)
         })
         .collect();
+    Some((stmts, n_vars, bcs))
+}
 
-    Some(CtmmGeneratorProgram {
+/// Evaluate a compiled endpoint program over `Dual1<M>` — θ_m on axis `m`, η_k on axis
+/// `n_theta + k` — and return one jet per output bytecode. The shared back half of
+/// [`CtmmGeneratorProgram::eval_generator_duals`] and [`EndpointExprProgram::eval_duals`].
+///
+/// A `TIME` leaf (`Op::PushTime`) reads the model-time thread-local, so a caller that
+/// needs a per-record time wraps the call in `with_model_time`, exactly as the `f64`
+/// value path does.
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+fn eval_endpoint_jets<const M: usize>(
+    stmts: &[Statement],
+    n_vars: usize,
+    outputs: &[&Bytecode],
+    cov_names: &[String],
+    n_theta: usize,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Vec<crate::sens::dual1::Dual1<M>> {
+    use crate::sens::dual1::Dual1;
+    let theta_d: Vec<Dual1<M>> = theta
+        .iter()
+        .enumerate()
+        .map(|(m, &v)| {
+            if m < n_theta && m < M {
+                Dual1::var(v, m)
+            } else {
+                // A θ the expressions cannot reference anyway (the program is sized by
+                // the model's declared θ count, so this is unreachable in practice).
+                Dual1::constant(v)
+            }
+        })
+        .collect();
+    let eta_d: Vec<Dual1<M>> = eta
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| {
+            let dim = n_theta + k;
+            if dim < M {
+                Dual1::var(v, dim)
+            } else {
+                // IOV kappas are appended past the BSV η block and are rejected in an
+                // endpoint expression at parse, so they are correctly seeded as constants.
+                Dual1::constant(v)
+            }
+        })
+        .collect();
+    let cov_vec: Vec<f64> = cov_names
+        .iter()
+        .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+        .collect();
+
+    let mut vars = vec![Dual1::<M>::constant(0.0); n_vars];
+    let mut stack: Vec<Dual1<M>> = Vec::new();
+    eval_statements_g::<Dual1<M>>(
+        stmts,
+        &theta_d,
+        &eta_d,
+        &cov_vec,
+        &mut vars,
+        None,
+        &mut stack,
+        &[],
+    );
+    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    outputs
+        .iter()
+        .map(|bc| {
+            eval_bytecode_g::<Dual1<M>>(
+                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
+            )
+        })
+        .collect()
+}
+
+/// Compiled, **dual-evaluable** scalar expressions of a non-Gaussian endpoint over
+/// `(θ, η, covariates)` — the `[binary_model]` linear predictor today (#2024 phase 1),
+/// shaped so the closed-form hazard parameters of `[event_model]` can follow.
+///
+/// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
+/// the value, which is why the binary data term was finite-differenced end-to-end. This
+/// snapshot carries the same expressions in *resolved* bytecode form so they can be
+/// replayed over `Dual1<M>` with θ and η seeded, yielding exact `∂/∂(θ, η)`. It is the
+/// [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
+/// `compile_endpoint_exprs` and `eval_endpoint_jets`.
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone)]
+pub struct EndpointExprProgram {
+    /// Resolved `[individual_parameters]` statements the outputs read, in dependency
+    /// order (already restricted to the transitively-referenced subset).
+    stmts: Vec<Statement>,
+    /// Var-slot count the statements above write into.
+    n_vars: usize,
+    /// One compiled expression per output (a binary endpoint has exactly one: `lp`).
+    outputs: Vec<Bytecode>,
+    /// Covariate names in the endpoint's own order, for the cov slice.
+    cov_names: Vec<String>,
+    n_theta: usize,
+    /// BSV η count. IOV kappas are rejected in an endpoint expression at parse.
+    n_eta: usize,
+}
+
+#[cfg(feature = "survival")]
+impl EndpointExprProgram {
+    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+
+    /// Value and `∂/∂(θ, η)` of every output at a covariate snapshot (and at the current
+    /// model time, for a `TIME` leaf). Each entry is `(value, grad)` with `grad` laid out
+    /// θ₀..θ_{T−1}, η₀..η_{E−1}, length [`n_axes`](Self::n_axes).
+    ///
+    /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
+    /// FD gradient rather than a wrong one.
+    pub(crate) fn eval_duals(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<(f64, Vec<f64>)>> {
+        macro_rules! disp {
+            ($($m:literal),+) => {
+                match self.n_axes() {
+                    $($m => Some(self.eval_duals_n::<$m>(theta, eta, covariates)),)+
+                    _ => None,
+                }
+            };
+        }
+        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    }
+
+    fn eval_duals_n<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<(f64, Vec<f64>)> {
+        debug_assert_eq!(M, self.n_axes());
+        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
+        eval_endpoint_jets::<M>(
+            &self.stmts,
+            self.n_vars,
+            &outs,
+            &self.cov_names,
+            self.n_theta,
+            theta,
+            eta,
+            covariates,
+        )
+        .into_iter()
+        .map(|d| (d.value, d.grad.to_vec()))
+        .collect()
+    }
+}
+
+/// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
+/// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
+/// expression cannot be represented exactly (an identifier we cannot bind) or the
+/// `(θ, η)` width is zero or past the dual dispatch cap.
+#[cfg(feature = "survival")]
+fn build_endpoint_expr_program(
+    exprs: &[&Expression],
+    needed_indiv_stmts: &[Statement],
+    covariates: &[String],
+    n_theta: usize,
+    n_eta: usize,
+) -> Option<EndpointExprProgram> {
+    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_ENDPOINT_AXES {
+        return None;
+    }
+    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    Some(EndpointExprProgram {
         stmts,
         n_vars,
-        rates,
-        n_states,
-        cov_names: generator_covariates.to_vec(),
+        outputs,
+        cov_names: covariates.to_vec(),
         n_theta,
         n_eta,
     })

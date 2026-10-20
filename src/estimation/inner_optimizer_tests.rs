@@ -5005,3 +5005,386 @@ mod weighted_dense_residual_inner {
         assert!(worst < 1e-7, "worst relative gap {worst:.3e}");
     }
 }
+
+/// `[binary_model]` on the analytic inner route (#2024 phase 1): the logit data term's
+/// exact η-gradient `(p − y)·∂lp/∂η`, its routing, and its fold into the full inner gradient.
+#[cfg(feature = "survival")]
+mod binary_inner {
+    use crate::types::{CompiledModel, EventType, ObsRecord, Population, Subject};
+
+    /// Endpoint-only mixed-effects logistic with **two** live η: an intercept on the log-odds
+    /// scale (`ETA_I`) and one inside a log-normal slope on `TIME` (`ETA_S`), so `∂lp/∂η_S`
+    /// differs per record and the per-record model-time scoping is on the path. `X` is a
+    /// baseline covariate (the predictor takes no time-varying one). An endpoint-only model
+    /// takes no `[individual_parameters]`; the joint fixture below covers that route.
+    const ENDPOINT_ONLY: &str = r"
+[parameters]
+  theta TH0(-0.3, -10.0, 10.0)
+  theta THX(0.6, -10.0, 10.0)
+  theta THT(0.4, -10.0, 10.0)
+  omega ETA_I ~ 0.3
+  omega ETA_S ~ 0.2
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X + THT * exp(ETA_S) * TIME + ETA_I
+";
+
+    fn parse(src: &str) -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(src).expect("parse")
+    }
+
+    fn binary_records() -> Vec<ObsRecord> {
+        [(0.5, 0), (1.0, 1), (2.0, 1), (3.0, 0), (4.5, 1)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 3,
+            })
+            .collect()
+    }
+
+    fn subject() -> Subject {
+        Subject {
+            id: "1".into(),
+            obs_records: binary_records(),
+            covariates: [("X".to_string(), 1.3)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn inner_grad(model: &CompiledModel, subject: &Subject, eta: &[f64]) -> Option<Vec<f64>> {
+        let params = &model.default_params;
+        let err_keys = model.error_spec.obs_keys(subject);
+        super::super::analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(params),
+            None,
+            None,
+            err_keys.as_ref(),
+            &mut Vec::new(),
+            &mut nalgebra::DVector::zeros(model.n_eta),
+            &mut nalgebra::DVector::zeros(model.n_eta),
+            None,
+        )
+    }
+
+    /// Central FD of `individual_nll` — the exact objective the EBE search minimizes —
+    /// asserted coordinate by coordinate against the analytic inner gradient. The worst
+    /// realised gap is printed so the bound below stays measured.
+    fn assert_inner_grad_matches_fd(model: &CompiledModel, subject: &Subject, eta: &[f64]) {
+        let params = &model.default_params;
+        let g = inner_grad(model, subject, eta).expect("subject is in analytic scope");
+        let nll = |e: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                model,
+                subject,
+                &params.theta,
+                e,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        let h = 1e-6;
+        let mut worst = 0.0_f64;
+        for k in 0..eta.len() {
+            let mut ep = eta.to_vec();
+            let mut em = eta.to_vec();
+            ep[k] += h;
+            em[k] -= h;
+            let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+            assert!(
+                g[k].is_finite() && fd.is_finite(),
+                "η[{k}]: {} vs {fd}",
+                g[k]
+            );
+            let gap = (g[k] - fd).abs();
+            worst = worst.max(gap);
+            // FD truncation + cancellation at h = 1e-6 on an O(1) objective is ~1e-9;
+            // measured worst 5.1e-9 (joint fixture), so 1e-6 is ~200× headroom.
+            assert!(
+                gap < 1e-6,
+                "η = {eta:?}, axis {k}: analytic {}, FD {fd}",
+                g[k]
+            );
+        }
+        eprintln!("binary inner grad worst |analytic − FD| at η = {eta:?}: {worst:.3e}");
+    }
+
+    /// The endpoint kernel alone: value equals `discrete_subject_nll` (same sum, other
+    /// evaluator) and the η-gradient matches a central FD of it, on both η.
+    #[test]
+    fn discrete_subject_eta_grad_matches_fd() {
+        let model = parse(ENDPOINT_ONLY);
+        let s = subject();
+        let theta = &model.default_params.theta;
+        for eta in [[0.0, 0.0], [-0.4, 0.35], [0.7, -0.5]] {
+            let (v, g) = crate::categorical::discrete_subject_eta_grad(&model, &s, theta, &eta)
+                .expect("binary endpoint has a dual program");
+            let want = crate::categorical::discrete_subject_nll(&model, &s, theta, &eta);
+            assert!(
+                (v - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "{v} vs {want}"
+            );
+            let h = 1e-6;
+            for k in 0..2 {
+                let mut ep = eta;
+                let mut em = eta;
+                ep[k] += h;
+                em[k] -= h;
+                let fd = (crate::categorical::discrete_subject_nll(&model, &s, theta, &ep)
+                    - crate::categorical::discrete_subject_nll(&model, &s, theta, &em))
+                    / (2.0 * h);
+                assert!(fd.abs() > 1e-3, "η[{k}] must be live on the term: FD {fd}");
+                assert!(
+                    (g[k] - fd).abs() < 1e-7,
+                    "η = {eta:?}, axis {k}: analytic {}, FD {fd}",
+                    g[k]
+                );
+            }
+        }
+    }
+
+    /// An overflowed predictor scores the flat `1e20` repellent, which has no derivative:
+    /// the kernel must decline (→ FD for that point) rather than return the score of an
+    /// infinite `lp`. The finite twin at the same η is served, so the decline is the
+    /// predictor's doing.
+    #[test]
+    fn an_overflowed_predictor_declines_instead_of_scoring() {
+        let model = parse(ENDPOINT_ONLY);
+        let s = subject();
+        let mut theta = model.default_params.theta.clone();
+        assert!(
+            crate::categorical::discrete_subject_eta_grad(&model, &s, &theta, &[0.0, 0.0])
+                .is_some()
+        );
+        theta[2] = 1e308; // THT · TIME overflows to +∞
+        assert!(
+            crate::categorical::discrete_subject_nll(&model, &s, &theta, &[0.0, 0.0]) >= 1e20,
+            "fixture precondition: the value path repels"
+        );
+        assert!(
+            crate::categorical::discrete_subject_eta_grad(&model, &s, &theta, &[0.0, 0.0])
+                .is_none()
+        );
+    }
+
+    /// The route must actually change: before #2024 every subject with a binary record
+    /// declined the analytic inner gradient, on both the model-level report and the
+    /// per-subject gate.
+    #[test]
+    fn endpoint_only_binary_takes_the_analytic_inner_route() {
+        let model = parse(ENDPOINT_ONLY);
+        assert!(super::super::analytic_inner_grad_supported_model(&model));
+        assert!(super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        assert_eq!(
+            super::super::resolve_gradient_method(&model, &subject()),
+            super::super::InnerGradientMethod::Analytic
+        );
+    }
+
+    #[test]
+    fn endpoint_only_inner_gradient_matches_fd_of_individual_nll() {
+        let model = parse(ENDPOINT_ONLY);
+        let s = subject();
+        for eta in [[0.0, 0.0], [-0.4, 0.35], [0.7, -0.5]] {
+            assert_inner_grad_matches_fd(&model, &s, &eta);
+        }
+    }
+
+    /// Joint PK + binary: the same η (`ETA_CL`) is live on the Gaussian concentration rows
+    /// *and* on the log-odds (through `CL`), and a second η sits only on the binary term.
+    /// The full inner gradient — prior + Gaussian + binary — must match FD of the joint
+    /// objective, which is what fails if the binary block is dropped or double-counted.
+    #[test]
+    fn joint_pk_binary_inner_gradient_matches_fd_of_individual_nll() {
+        let src = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+            theta TH0(-0.4, -10.0, 10.0)\n  theta THC(0.8, -10.0, 10.0)\n  \
+            omega ETA_CL ~ 0.09\n  omega ETA_B ~ 0.25\n  sigma PROP ~ 0.1 (sd)\n\
+            [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+            [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[binary_model]\n  cmt   = 3\n  \
+            logit = TH0 + THC * log(CL) + ETA_B\n[error_model]\n  DV ~ proportional(PROP)\n";
+        let model = parse(src);
+        let pop = joint_population(&model);
+        let s = &pop.subjects[0];
+        assert!(!s.obs_times.is_empty() && !s.obs_records.is_empty());
+        assert!(super::super::analytic_inner_grad_supported(&model, s));
+        for eta in [[0.0, 0.0], [0.25, -0.3], [-0.3, 0.6]] {
+            assert_inner_grad_matches_fd(&model, s, &eta);
+        }
+    }
+
+    fn joint_population(model: &CompiledModel) -> Population {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv = dir.path().join("joint.csv");
+        let mut body = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV\n");
+        body.push_str("1,0,.,1,100,1,1\n");
+        for (t, y) in [(1.0, 1), (2.0, 0), (4.0, 1), (8.0, 0)] {
+            let conc = 10.0 * (-0.1_f64 * t).exp() * 1.05;
+            body.push_str(&format!("1,{t},{conc},0,.,1,0\n"));
+            body.push_str(&format!("1,{t},{y},0,.,3,0\n"));
+        }
+        std::fs::write(&csv, body).expect("write csv");
+        crate::api::read_population_for(model, &None, csv.to_str().unwrap(), None, None, None, &[])
+            .expect("routed read")
+            .0
+    }
+
+    /// A model carrying both a `[binary_model]` and an `[event_model]`. Its binary term is
+    /// served; its TTE term is not.
+    fn binary_plus_tte() -> CompiledModel {
+        parse(
+            "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  \
+             omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  logit = TH0 + ETA_I\n\
+             [event_model]\n  cmt    = 4\n  family = exponential\n  \
+             scale  = TVLAMBDA * exp(ETA_I)\n",
+        )
+    }
+
+    fn event_record() -> ObsRecord {
+        ObsRecord::Event {
+            time: 6.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 4,
+        }
+    }
+
+    /// "Every term served" is per record: binary-only rows are admitted on a model that
+    /// also declares a TTE endpoint, while a subject carrying one event record — alone or
+    /// beside binary rows — declines to FD. Mutating the predicate to admit any
+    /// `DiscreteState`-or-other record turns the mixed arm red; admitting every record
+    /// turns the event-only arm red too.
+    #[test]
+    fn a_subject_with_an_unserved_term_declines_to_fd() {
+        let model = binary_plus_tte();
+        let served = |recs: Vec<ObsRecord>| {
+            let s = Subject {
+                id: "1".into(),
+                obs_records: recs,
+                ..Default::default()
+            };
+            (
+                super::super::non_gaussian_eta_grad_served(&model, &s),
+                super::super::analytic_inner_grad_supported(&model, &s),
+            )
+        };
+        assert_eq!(served(binary_records()), (true, true), "binary-only");
+        let mut mixed = binary_records();
+        mixed.push(event_record());
+        assert_eq!(served(mixed), (false, false), "binary + event");
+        assert_eq!(served(vec![event_record()]), (false, false), "event-only");
+    }
+
+    /// HMC and VI call `analytic_eta_nll_gradient` directly, without the inner loop's up-front
+    /// routing check. For an endpoint-only subject carrying a TTE record, the function used to
+    /// return the Ω prior alone (no Gaussian rows, so nothing for the provider to compute) — a
+    /// gradient missing the whole hazard term. It must decline instead. The binary-only twin
+    /// on the same model straddles the gate.
+    #[test]
+    fn direct_callers_cannot_get_a_gradient_missing_the_tte_term() {
+        let model = binary_plus_tte();
+        let params = &model.default_params;
+        let mk = |recs: Vec<ObsRecord>| Subject {
+            id: "1".into(),
+            obs_records: recs,
+            ..Default::default()
+        };
+        let direct = |s: &Subject| {
+            super::super::analytic_eta_nll_gradient(
+                &model,
+                s,
+                &params.theta,
+                &[0.1],
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        assert!(
+            direct(&mk(binary_records())).is_some(),
+            "binary-only is served"
+        );
+        assert!(
+            direct(&mk(vec![event_record()])).is_none(),
+            "TTE must decline"
+        );
+    }
+
+    /// The FD-fallback warning counts the route `find_ebe` takes, not the Gaussian
+    /// recorder's verdict alone. On this endpoint-only model the recorder serves no
+    /// subject (there is no structural model), so the old probe reported "2 of 2" — both
+    /// the binary-only subject that runs analytic and the TTE subject that runs FD. It must
+    /// count only the TTE subject, and stay silent for an all-binary population.
+    #[test]
+    fn fd_fallback_warning_counts_the_route_that_runs() {
+        let model = binary_plus_tte();
+        let theta = &model.default_params.theta;
+        let mk = |recs: Vec<ObsRecord>| Subject {
+            id: "1".into(),
+            obs_records: recs,
+            ..Default::default()
+        };
+        let pop = |subjects| Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let w = super::super::fd_fallback_warning(
+            &model,
+            &pop(vec![mk(binary_records()), mk(vec![event_record()])]),
+            theta,
+        )
+        .expect("a population with one TTE subject warns");
+        assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(super::super::fd_fallback_warning(
+            &model,
+            &pop(vec![mk(binary_records()), mk(binary_records())]),
+            theta
+        )
+        .is_none());
+    }
+
+    /// A binary predictor past the dual dispatch cap has no program: it reports FD on the
+    /// model-level predicate and takes FD on the per-subject gate, so the reported route
+    /// cannot drift from the one that runs.
+    #[test]
+    fn program_less_binary_stays_fd() {
+        let n_th = 24; // + 1 η = 25 axes > MAX_ENDPOINT_AXES (24)
+        let mut src = String::from("[parameters]\n");
+        for i in 1..=n_th {
+            src += &format!("  theta T{i}(0.01, -6.0, 3.0)\n");
+        }
+        src += "  omega ETA_I ~ 0.1\n[binary_model]\n  cmt   = 3\n  logit = ETA_I + ";
+        src += &(1..=n_th)
+            .map(|i| format!("T{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        src += "\n";
+        let model = parse(&src);
+        assert_eq!(
+            model.n_theta + model.n_eta,
+            25,
+            "fixture must exceed the cap"
+        );
+        assert!(!crate::categorical::all_binary_endpoints_analytic(&model));
+        assert!(!super::super::analytic_inner_grad_supported_model(&model));
+        assert!(!super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+    }
+}
