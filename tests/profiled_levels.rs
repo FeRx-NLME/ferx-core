@@ -145,13 +145,22 @@ fn at_nonmem_optimum(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::Prepa
     (p, f)
 }
 
+/// The profiled `at_nonmem_optimum(true, None)`, evaluated once for the three tests that
+/// read it. Each evaluation carries the covariance step, and three identical copies running
+/// on parallel test threads made this the slowest binary in `Tests + coverage (core)`
+/// (661 s, #2167).
+fn profiled_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
+    static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
+    F.get_or_init(|| at_nonmem_optimum(true, None))
+}
+
 // ── A2: NONMEM, every level a THETA ─────────────────────────────────────────────
 
 #[test]
 fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
     let (est, se) = ext("profile_mbma.ext");
     let cov = cov_thetas("profile_mbma.cov", 39);
-    let (p, f) = at_nonmem_optimum(true, None);
+    let (p, f) = profiled_at_nonmem_optimum();
     let model = &p.parsed.model;
     assert_eq!(model.n_theta, 39, "3 structural θ and 36 free levels");
     assert_eq!(f.profiled_blocks, ["PLACEBO"]);
@@ -290,7 +299,7 @@ const A2_LEVEL_SE: f64 = 2e-2;
 /// matrix rather than the exact Hessian.
 #[test]
 fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
-    let (_, prof) = at_nonmem_optimum(true, None);
+    let (_, prof) = profiled_at_nonmem_optimum();
     let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta));
     assert!(
         (prof.ofv - plain.ofv).abs() < 1e-6,
@@ -365,7 +374,7 @@ const C1_CORR_BOUND: f64 = 2.5e-2;
 /// 41-coordinate stencil the profile avoids (at 800 levels, routed to `s`).
 #[test]
 fn run_covariance_replays_the_profiled_step() {
-    let (p, f) = at_nonmem_optimum(true, None);
+    let (p, f) = profiled_at_nonmem_optimum();
     let opts = FitOptions {
         verbose: false,
         ..p.parsed.fit_options.clone()

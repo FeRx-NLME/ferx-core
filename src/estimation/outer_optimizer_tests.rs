@@ -1640,6 +1640,287 @@ fn test_latched_stop_needs_plateau_check() {
     assert!(!latched_stop_needs_plateau_check(false, false, false));
 }
 
+/// #1782: only a BOBYQA *tolerance* stop is polished — `FtolReached`, `XtolReached`,
+/// or the bare `Success` its trust radius reaching `rhoend` returns. Each `false` row names a stop
+/// the polish must leave alone: a gradient method (whose default stops are the
+/// unreachable 1e-12 ones), a spent budget, a bare `Failure` (the plateau check's),
+/// a stagnation latch (forced, also the plateau check's), and a cancelled run.
+#[test]
+fn test_bobyqa_stop_needs_polish() {
+    use nlopt::{Algorithm, FailState, SuccessState};
+    let ok = |s| Ok((s, 0.0));
+    let bob = Algorithm::Bobyqa;
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        false,
+        false
+    ));
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::XtolReached),
+        false,
+        false
+    ));
+    // `rho` reaching `rhoend` — BOBYQA's ordinary trust-radius stop.
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::Success),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::StopValReached),
+        false,
+        false
+    ));
+    for algo in [Algorithm::Lbfgs, Algorithm::Slsqp, Algorithm::Mma] {
+        assert!(!bobyqa_stop_needs_polish(
+            algo,
+            &ok(SuccessState::FtolReached),
+            false,
+            false
+        ));
+    }
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::MaxEvalReached),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &Err((FailState::Failure, 0.0)),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        true,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        false,
+        true
+    ));
+}
+
+/// The BOBYQA trust radius: 0.5 in scaled space, capped at half a narrow box and
+/// floored at 1e-6 for a degenerate (fixed) one.
+#[test]
+fn test_bobyqa_initial_step() {
+    let step = bobyqa_initial_step(&[-10.0, 0.0, 1.0], &[10.0, 0.4, 1.0]);
+    assert_eq!(step, vec![0.5, 0.2, 1e-6]);
+}
+
+/// Every exit of the #1782 polish loop, on fake legs. `R` is a status code: `1` is
+/// a tolerance stop (needs polish), anything else is not. Each leg returns a fresh
+/// code so the test can see *which* leg's return came back — the last one's.
+#[test]
+fn test_drive_polish_legs_exits() {
+    let tol = |r: &u32| *r == 1;
+    let big = || 1000u32;
+
+    // Not a tolerance stop: nothing runs.
+    let mut calls = 0;
+    let (r, end) = drive_polish_legs(7u32, POLISH_MIN_GAIN, tol, big, |_| {
+        calls += 1;
+        None
+    });
+    assert_eq!((r, end, calls), (7, PolishEnd::NotNeeded, 0));
+
+    // One leg that stops on something else: *its* return decides, not the first's.
+    let (r, end) = drive_polish_legs(1u32, POLISH_MIN_GAIN, tol, big, |_| Some((5, 0.3)));
+    assert_eq!((r, end), (5, PolishEnd::Settled));
+
+    // A leg that stops on tolerance but gained ≤ POLISH_MIN_GAIN: settled; a NaN gain
+    // settles too rather than counting as descent.
+    for gain in [POLISH_MIN_GAIN, 0.0, f64::NAN] {
+        let mut calls = 0;
+        let (r, end) = drive_polish_legs(1u32, POLISH_MIN_GAIN, tol, big, |_| {
+            calls += 1;
+            Some((1, gain))
+        });
+        assert_eq!((r, end, calls), (1, PolishEnd::Settled, 1), "gain {gain}");
+    }
+
+    // Still improving after MAX_POLISH_LEGS: the cap, with the last gain.
+    let mut calls = 0;
+    let (_, end) = drive_polish_legs(1u32, POLISH_MIN_GAIN, tol, big, |_| {
+        calls += 1;
+        Some((1, 0.5 + calls as f64))
+    });
+    assert_eq!(calls, MAX_POLISH_LEGS);
+    assert_eq!(
+        end,
+        PolishEnd::LegCapReached {
+            last_gain: 0.5 + MAX_POLISH_LEGS as f64
+        }
+    );
+
+    // A tolerance stop with no budget left: not settled, and no leg runs.
+    let mut calls = 0;
+    let (r, end) = drive_polish_legs(
+        1u32,
+        POLISH_MIN_GAIN,
+        tol,
+        || 0,
+        |_| {
+            calls += 1;
+            None
+        },
+    );
+    assert_eq!((r, end, calls), (1, PolishEnd::BudgetSpent, 0));
+
+    // A leg that improves, then the budget runs out with a tolerance stop pending.
+    let left = std::cell::Cell::new(10u32);
+    let (_, end) = drive_polish_legs(
+        1u32,
+        POLISH_MIN_GAIN,
+        tol,
+        || left.get(),
+        |l| {
+            assert_eq!(l, 10, "the leg is handed what is left");
+            left.set(0);
+            Some((1, 2.0))
+        },
+    );
+    assert_eq!(end, PolishEnd::BudgetSpent);
+
+    // A leg that cannot start (#1617: nothing feasible): left to the other paths.
+    let (r, end) = drive_polish_legs(1u32, POLISH_MIN_GAIN, tol, big, |_| None);
+    assert_eq!((r, end), (1, PolishEnd::Skipped));
+}
+
+/// The leg-cap warning names the cap and the gain, and says what to do.
+#[test]
+fn test_polish_leg_cap_warning() {
+    let w = polish_leg_cap_warning(0.25);
+    assert!(w.contains(&format!("{MAX_POLISH_LEGS} polish legs")), "{w}");
+    assert!(w.contains("2.500e-1"), "{w}");
+    assert!(w.contains("not reported as converged"), "{w}");
+    assert!(w.contains("gradient-based optimizer"), "{w}");
+}
+
+/// End to end through `optimize_nlopt_once`, the production wiring of #1782. On
+/// `examples/one_cpt_iv.ferx` FOCEI / BOBYQA the first leg stops on a tolerance and
+/// the polish runs. Then the same fit is re-run with the evaluation budget ending
+/// (a) exactly where the first leg stopped, so no polish leg can start, and (b) a few
+/// evaluations later, so a polish leg starts and runs out (BOBYQA needs `2n + 1`
+/// evaluations just to rebuild its model). Neither may report `converged`: (a) is
+/// the `BudgetSpent` override, (b) is the last leg's status deciding — a call site
+/// that kept the first leg's tolerance stop would report both as converged.
+#[test]
+fn test_polish_is_wired_and_an_unfinished_polish_is_not_converged() {
+    use crate::estimation::outer_optimizer::{
+        optimize_nlopt_once, OuterFdDeclineLog, EVAL_BUDGET_OVERRIDE, FIRST_LEG_EVALS,
+        POLISH_MIN_GAIN_OVERRIDE,
+    };
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let run_with = |opts: &FitOptions, budget: Option<u32>| {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
+        FIRST_LEG_EVALS.with(|c| c.set(None));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        (
+            out.0,
+            FIRST_LEG_EVALS.with(|c| c.get()).expect("first leg ran"),
+        )
+    };
+    let run = |budget: Option<u32>| run_with(&opts, budget);
+
+    let (full, first_leg) = run(None);
+    eprintln!(
+        "full: converged {} OFV {:.6} evals {} (first leg {first_leg})",
+        full.converged, full.ofv, full.n_iterations
+    );
+    assert!(full.converged, "the unconstrained fit converges");
+    assert!(
+        full.n_iterations > first_leg,
+        "a polish leg must run after the first tolerance stop ({} evals, first leg {first_leg})",
+        full.n_iterations
+    );
+
+    for (label, budget) in [
+        ("no polish budget", first_leg),
+        ("polish runs out", first_leg + 3),
+    ] {
+        let (r, again) = run(Some(budget as u32));
+        assert_eq!(
+            again, first_leg,
+            "{label}: same first leg under a larger-or-equal budget"
+        );
+        eprintln!(
+            "{label}: converged {} OFV {:.6} evals {} warnings {:?}",
+            r.converged, r.ofv, r.n_iterations, r.warnings
+        );
+        assert!(
+            !r.converged,
+            "{label}: an unfinished polish is not converged"
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("evaluation budget")),
+            "{label}: the budget is named: {:?}",
+            r.warnings
+        );
+    }
+    // (c) The leg cap: with every leg counted as still descending, the polish stops at
+    // `MAX_POLISH_LEGS` and the fit must say so rather than report its tolerance stop.
+    POLISH_MIN_GAIN_OVERRIDE.with(|o| o.set(Some(f64::NEG_INFINITY)));
+    // The stagnation guard is off for this run: on this model it latches a polish leg
+    // (measured: the fit settles at 247 evals with it on), and a latched stop belongs
+    // to the plateau check, not to the polish loop.
+    let unguarded = FitOptions {
+        stagnation_guard: false,
+        ..opts.clone()
+    };
+    let (capped, _) = run_with(&unguarded, None);
+    POLISH_MIN_GAIN_OVERRIDE.with(|o| o.set(None));
+    eprintln!(
+        "leg cap: converged {} evals {} warnings {:?}",
+        capped.converged, capped.n_iterations, capped.warnings
+    );
+    assert!(
+        !capped.converged,
+        "a polish stopped by the leg cap is not converged"
+    );
+    assert!(
+        capped
+            .warnings
+            .iter()
+            .any(|w| w.contains(&format!("after {MAX_POLISH_LEGS} polish legs"))),
+        "the leg cap is named: {:?}",
+        capped.warnings
+    );
+}
+
 /// End to end through `optimize_nlopt_once`, the production wiring of #1530: on
 /// `examples/one_cpt_iv.ferx` FOCEI / L-BFGS the short window latches, and the
 /// latched stop's `converged` comes from the plateau check, not NLopt's forced

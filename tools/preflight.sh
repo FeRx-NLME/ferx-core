@@ -469,7 +469,7 @@ group_public_api() {
 }
 
 group_debug_assertions() {
-  CI_JOB="Tests + coverage (core) / Tests + coverage (TTE/CTMM endpoints)"
+  CI_JOB="Tests + coverage (core k/4) / Tests + coverage (TTE/CTMM endpoints)"
   # #344, as folded into #1248. The `debug_assert!` guards used to be dead in
   # every CI job: `ci-test` and `ci-fast` both `inherits = "release"`, so all ~180
   # of them compiled to nothing. That was not theoretical — a real off-by-one in
