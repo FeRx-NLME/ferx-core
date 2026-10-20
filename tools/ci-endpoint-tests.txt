@@ -18,6 +18,7 @@ categorical_convergence
 categorical_smoke
 cmt_data_selection_scope
 cmt_endpoint_scope
+ctmm_time_dependent_pk
 dose_compartment_routing
 kappa_correlation_auto_lbfgs_fits
 lagged_zero_order_break_times
