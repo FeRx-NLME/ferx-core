@@ -801,6 +801,14 @@ pub(crate) struct InnerSolvePolicy {
     /// scan (#2013, `FitOptions::inner_screen`). `0`, the `Default`, is the historical
     /// solve with no screen.
     pub(crate) screen: usize,
+    /// The pass's `eta_init` are converged modes already solved at these same parameters,
+    /// so a subject handed one is a warm start whatever its values ([`is_warm_start`]).
+    /// Without it an all-zero `eta_init` reads as the cold placeholder, which is right
+    /// everywhere but here: a subject whose mode is exactly zero (no informative
+    /// observations, an unused random effect) would be re-scanned. Set only on the first
+    /// outer evaluation seeded from the flat-theta pre-flight's EBEs (#2076); `false`, the
+    /// `Default`, otherwise.
+    pub(crate) init_is_mode: bool,
 }
 
 impl InnerSolvePolicy {
@@ -816,6 +824,7 @@ impl InnerSolvePolicy {
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
             screen: options.inner_screen,
+            init_is_mode: false,
         }
     }
 }
@@ -1757,7 +1766,7 @@ fn find_ebe_impl(
     //
     // An all-zero "warm" start is a cold placeholder (the outer loop's first evaluation and
     // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
-    let genuinely_warm = is_warm_start(eta_init);
+    let genuinely_warm = is_warm_start(eta_init, policy.init_is_mode);
     let normal = solve(false).expect("an unforced solve always returns a result");
     if genuinely_warm || policy.seed == InnerHessianSeed::None {
         return normal;
@@ -1774,8 +1783,12 @@ fn find_ebe_impl(
 /// mode", so testing `is_none()` alone misreads every one of them as warm. The guarded
 /// multi-start did exactly that until #2014, and never ran before an estimating fit's final
 /// cold re-solve. Every cold/warm decision in the inner solve goes through this one test.
-fn is_warm_start(eta_init: Option<&[f64]>) -> bool {
-    eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0))
+///
+/// `init_is_mode` ([`InnerSolvePolicy::init_is_mode`]) is the caller's certificate that
+/// `eta_init` is a converged mode at these parameters, which makes any `Some` warm, zeros
+/// included (#2076).
+fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
+    eta_init.is_some_and(|w| init_is_mode || w.iter().any(|&v| v != 0.0))
 }
 
 /// Minimum objective improvement for a cold seeded solve to replace the unseeded one (see
@@ -2041,7 +2054,7 @@ fn find_ebe_solve(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
-    let warm_start = is_warm_start(eta_init);
+    let warm_start = is_warm_start(eta_init, policy.init_is_mode);
     let seed =
         (seed_kind != InnerHessianSeed::None && dense_bfgs_route && (warm_start || cold_seed))
             .then(|| {
@@ -2188,8 +2201,10 @@ fn find_ebe_solve(
     // (~12× slower). So the scan runs on each cold solve only: the pre-flight
     // (`freeze_flat_thetas`), the first evaluation of each optimizer leg (a #1565 basin
     // restart is a new leg, from a fresh all-zero cache) and the final cold re-solve, each
-    // under both Hessian metrics when the policy is seeded (`find_ebe_impl`) — six scans
-    // per subject per fit on `examples/schnider.ferx`, measured, with no restart. The
+    // under both Hessian metrics when the policy is seeded (`find_ebe_impl`). A fit's first
+    // leg skips its scan when the pre-flight froze nothing: it starts at the same point,
+    // from the pre-flight's EBEs (#2076), which removes two of the six scans per subject
+    // per fit that #2014 measured on `examples/schnider.ferx` with no restart. The
     // `global_search` pre-search's probes start from zeros too, but run with
     // `inner_restarts = 0` (`presearch_probe_options`). A subject whose η̂ is
     // exactly zero (no observations: the prior alone) hands zeros back as its next start,
@@ -2206,7 +2221,7 @@ fn find_ebe_solve(
     // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
     // It is still taken — it is strictly lower, so likely in the better basin.
     let mut screen_moved = false;
-    if restarts > 0 && !is_warm_start(eta_init) {
+    if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         // ── Sobol screen (`[fit_options] inner_screen`, #2013) ──────────────
