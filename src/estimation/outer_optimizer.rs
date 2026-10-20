@@ -269,19 +269,43 @@ pub fn optimize_population(
     // scan. When a theta is frozen the start point is rebuilt from a different
     // template, so the EBEs are dropped and the first evaluation solves cold as before.
     let frozen_params;
-    let (init_params, preflight_warnings, first_eval_etas) = if init_params.mixture.is_some() {
-        (init_params, Vec::new(), None)
-    } else {
-        let preflight =
-            freeze_flat_thetas(model, population, init_params, options, &preflight_declines);
-        match preflight.frozen {
-            Some((fp, w)) => {
-                frozen_params = fp;
-                (&frozen_params, w, None)
+    //
+    // The same pre-flight probes each near-zero identity-packed θ for the NLopt scale
+    // vector (#2159, `identity_theta_scales`). Only the NLopt optimizers read the
+    // result, and an explicit `none` / `rescale2` keeps its own vector, so nothing is
+    // probed otherwise.
+    let probe_identity_scales = matches!(
+        resolved,
+        Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma | Optimizer::Bobyqa
+    ) && matches!(
+        options.parameter_scaling,
+        ParameterScaling::Auto | ParameterScaling::Abs
+    );
+    let (init_params, preflight_warnings, first_eval_etas, identity_scales) =
+        if init_params.mixture.is_some() {
+            (init_params, Vec::new(), None, Vec::new())
+        } else {
+            let preflight = freeze_flat_thetas(
+                model,
+                population,
+                init_params,
+                options,
+                &preflight_declines,
+                probe_identity_scales,
+            );
+            match preflight.frozen {
+                Some((fp, w)) => {
+                    frozen_params = fp;
+                    (&frozen_params, w, None, preflight.identity_scales)
+                }
+                None => (
+                    init_params,
+                    Vec::new(),
+                    preflight.etas,
+                    preflight.identity_scales,
+                ),
             }
-            None => (init_params, Vec::new(), preflight.etas),
-        }
-    };
+        };
     let first_eval_etas = first_eval_etas.as_deref();
 
     let mut result = match resolved {
@@ -297,6 +321,7 @@ pub fn optimize_population(
             options,
             &declines,
             first_eval_etas,
+            &identity_scales,
         ),
         Optimizer::Bfgs | Optimizer::Lbfgs => optimize_bfgs(
             model,
@@ -346,6 +371,10 @@ struct FlatThetaPreflight {
     /// ([`InnerSolvePolicy::init_is_mode`]). `None` when the pre-flight solved
     /// nothing (every theta already fixed) or any subject did not converge.
     etas: Option<Vec<DVector<f64>>>,
+    /// `(θ index, scale)` for each near-zero identity-packed θ the NLopt outer loop
+    /// divides by its initial magnitude — see [`identity_theta_scales`] (#2159).
+    /// Empty unless the caller asked for the probe.
+    identity_scales: Vec<(usize, f64)>,
 }
 
 /// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
@@ -369,6 +398,7 @@ fn freeze_flat_thetas(
     init_params: &ModelParameters,
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
+    probe_identity_scales: bool,
 ) -> FlatThetaPreflight {
     let n_theta = init_params.theta.len();
     // Nothing to freeze if every theta is already fixed.
@@ -376,6 +406,7 @@ fn freeze_flat_thetas(
         return FlatThetaPreflight {
             frozen: None,
             etas: None,
+            identity_scales: Vec::new(),
         };
     }
 
@@ -412,6 +443,35 @@ fn freeze_flat_thetas(
         None,
         |_, ebe| ebe.converged && !ebe.hard_reject,
     );
+    // The objective at the start, and at the start with one θ moved and the EBEs
+    // re-solved: shared by the flat-θ probe below and `identity_theta_scales`. Both
+    // are needed only when one of them has a candidate, so the base is evaluated
+    // once, on first use.
+    let base_cell = std::cell::OnceCell::new();
+    let base_ofv = || {
+        *base_cell.get_or_init(|| {
+            2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
+        })
+    };
+    let reconverged_ofv = |theta_i: usize, value: f64| -> f64 {
+        let mut p = params.clone();
+        p.theta[theta_i] = value;
+        let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
+        let (e, h, _s, k) = run_inner_loop_warm_seeded(
+            model,
+            population,
+            &p,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&cold_etas),
+            Some(&mu),
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+            InnerHessianSeed::for_options(options),
+            options,
+        );
+        2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
+    };
     let frozen = 'freeze: {
         let mut grad_eval_idx = 0usize;
         let grad = population_gradient(
@@ -469,26 +529,6 @@ fn freeze_flat_thetas(
         // freezing an identifiable theta pins it at its initial value and biases every
         // other estimate. The probe costs one inner solve per candidate (candidates
         // are rare), on top of the pre-flight gradient eval.
-        let base_ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        let reconverged_ofv = |theta_i: usize, value: f64| -> f64 {
-            let mut p = params.clone();
-            p.theta[theta_i] = value;
-            let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
-            let (e, h, _s, k) = run_inner_loop_warm_seeded(
-                model,
-                population,
-                &p,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&cold_etas),
-                Some(&mu),
-                options.min_obs_for_convergence_check as usize,
-                options.inner_restarts,
-                InnerHessianSeed::for_options(options),
-                options,
-            );
-            2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
-        };
         // True ⇒ moving this theta changes the objective ⇒ it is identifiable, not flat.
         let moves_objective = |i: usize| -> bool {
             let ti = params.theta[i];
@@ -505,7 +545,8 @@ fn freeze_flat_thetas(
             if (probe - ti).abs() <= 1e-12 {
                 return true;
             }
-            (reconverged_ofv(i, probe) - base_ofv).abs() > 1e-6 * (1.0 + base_ofv.abs())
+            let base = base_ofv();
+            (reconverged_ofv(i, probe) - base).abs() > 1e-6 * (1.0 + base.abs())
         };
         let flat: Vec<usize> = candidates
             .into_iter()
@@ -545,10 +586,105 @@ fn freeze_flat_thetas(
     // partial descent into the warm path, skip the second Hessian metric and the
     // multi-start, and change the first objective. Then all are dropped, so the first
     // evaluation repeats the cold solve exactly as before #2076.
+    // #2159: probed at the same start, after the flat-θ freeze so a θ it froze is not
+    // probed again.
+    let identity_scales = if probe_identity_scales {
+        let held = |i: usize| {
+            init_params.theta_fixed.get(i).copied().unwrap_or(false)
+                || frozen.as_ref().is_some_and(|(fp, _)| fp.theta_fixed[i])
+        };
+        identity_theta_scales(
+            &params.theta,
+            &init_params.theta_lower,
+            held,
+            base_ofv,
+            reconverged_ofv,
+        )
+    } else {
+        Vec::new()
+    };
     FlatThetaPreflight {
         frozen,
         etas: converged.iter().all(|&c| c).then_some(ehs),
+        identity_scales,
     }
+}
+
+/// An identity-packed θ (negative lower bound) whose initial magnitude is below this
+/// is a candidate for [`identity_theta_scales`]'s probe (#2159). Above it the NLopt
+/// scale of 1 is within a factor of ten of the θ's own size.
+const NEAR_ZERO_IDENTITY_THETA: f64 = 0.1;
+/// The probe moves a candidate θ to this fraction of its initial value: half its own
+/// size, toward zero. It stays inside the declared bounds by construction, since a
+/// negative lower bound puts zero in the box and the start is in it.
+const IDENTITY_PROBE_FRACTION: f64 = 0.5;
+/// A probe that moves the objective by more than this many OFV units marks the θ as
+/// one whose natural scale is its own magnitude.
+///
+/// Measured at the issue's two kinds of near-zero θ (macOS arm64): halving
+/// warfarin's `TVV_S` (`V = TVV_S / 1e-6`, θ₀ = 1e-5) moves the OFV by ≈ 100 (a
+/// 1.5× move: 92.6 from θ₀, 40.7 at the optimum), while moving either covariate
+/// exponent of `two_cpt_oral_cov` started at 0.001 (true values 0.65 and ≈ 0.3) by
+/// half itself moves it by 0.006–0.009. The threshold sits two orders of magnitude
+/// from each.
+const IDENTITY_PROBE_MIN_DELTA_OFV: f64 = 1.0;
+
+/// The near-zero identity-packed θ the NLopt outer loop divides by their initial
+/// magnitude, as `(θ index, |θ₀|)` (#2159).
+///
+/// An identity-packed θ gets scale 1 in the NLopt scale vector. Started at 1e-5,
+/// that is a coordinate whose useful moves are five orders of magnitude below the
+/// optimizer's unit step and its stopping tolerances: BOBYQA's first probes put
+/// warfarin's `TVV_S` (`V = TVV_S / 1e-6`) at a negative volume and the fit stops at
+/// OFV −205.97 against −286.00, SLSQP at −198.95, L-BFGS at −269.47, each reporting
+/// convergence.
+///
+/// Dividing every such θ by |θ₀| is wrong the other way: a covariate exponent started
+/// at 0.001 is usually an O(1) slope, and scaling it by 0.001 cost BOBYQA 14 OFV
+/// units on `two_cpt_oral_cov`. The value alone cannot tell the two apart; the
+/// objective can. So each candidate — free, identity-packed, `0 < |θ₀| <`
+/// [`NEAR_ZERO_IDENTITY_THETA`] — is moved to `IDENTITY_PROBE_FRACTION · θ₀` with the
+/// EBEs re-solved (`probe_ofv`), and scaled only when that relative move changes the
+/// objective by more than [`IDENTITY_PROBE_MIN_DELTA_OFV`]: the θ's size is then the
+/// size of the moves that matter. A probe whose objective is not a number counts as
+/// sensitive. One extra inner solve per candidate.
+///
+/// `held(i)` is true for a θ the optimizer does not move (fixed, or frozen by the
+/// flat-θ pre-flight). `base_ofv` is the objective at the start, asked for only when
+/// there is a candidate; a start whose own objective is not valid
+/// ([`ofv_is_valid`]) says nothing about scale, and nothing is probed.
+fn identity_theta_scales(
+    theta: &[f64],
+    theta_lower: &[f64],
+    held: impl Fn(usize) -> bool,
+    base_ofv: impl FnOnce() -> f64,
+    mut probe_ofv: impl FnMut(usize, f64) -> f64,
+) -> Vec<(usize, f64)> {
+    let candidates: Vec<usize> = (0..theta.len().min(theta_lower.len()))
+        .filter(|&i| {
+            let magnitude = theta[i].abs();
+            !held(i)
+                && !theta_packs_log(theta_lower[i])
+                && magnitude > 0.0
+                && magnitude < NEAR_ZERO_IDENTITY_THETA
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let base = base_ofv();
+    if !ofv_is_valid(base) {
+        return Vec::new();
+    }
+    candidates
+        .into_iter()
+        .filter(|&i| {
+            let delta = (probe_ofv(i, IDENTITY_PROBE_FRACTION * theta[i]) - base).abs();
+            // `!(… <= …)`, so a `NaN` probe counts as sensitive.
+            !(delta <= IDENTITY_PROBE_MIN_DELTA_OFV)
+        })
+        .map(|i| (i, theta[i].abs()))
+        .collect()
 }
 
 /// Evaluate the population objective at the initial parameters without running
@@ -3284,6 +3420,7 @@ fn optimize_nlopt(
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
     first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
 ) -> OuterResult {
     // The attempts minimised the *penalized* objective (covariate-NN
     // regularization, parameter priors), so they are ranked on it too:
@@ -3311,6 +3448,7 @@ fn optimize_nlopt(
             declines,
             None,
             first_eval_etas,
+            identity_scales,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -3354,6 +3492,7 @@ fn optimize_nlopt(
                     spent_evals: stalled.n_iterations,
                 }),
                 None,
+                identity_scales,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -3820,6 +3959,7 @@ fn optimize_nlopt_once(
     declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
 ) -> (OuterResult, AttemptOutcome) {
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
@@ -3889,7 +4029,7 @@ fn optimize_nlopt_once(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+    let mut scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
         ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
         // Magnitude scaling, but disabled when an identity-packed theta is present
         // (covariate effects with `theta_lower < 0`): `compute_scale` leaves those
@@ -3913,6 +4053,13 @@ fn optimize_nlopt_once(
             }
         }
     };
+    // #2159: a near-zero identity θ whose objective moves with its relative size is
+    // divided by its initial magnitude, whatever the strategy chose above (all ones
+    // whenever an identity θ is present). θ occupy the first packed slots
+    // (`pack_params`). The caller probes only under `auto` / `abs`.
+    for &(i, s) in identity_scales {
+        scale[i] = s;
+    }
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].

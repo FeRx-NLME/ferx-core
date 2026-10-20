@@ -67,6 +67,32 @@ parameters, and neural-network weights. Log-packing those would clamp them at
 boundary), so declaring a lower bound of exactly zero does not silently change
 the parameterization.
 
+#### An identity-packed θ started near zero {#identity-theta-near-zero}
+
+An identity-packed θ reaches the NLopt outer optimizers on its natural scale, so
+one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of
+magnitude below the optimizer's unit step and its stopping tolerances (#2159).
+Whether that matters depends on what the θ is. A volume written in small units
+(`V = TVV_S / 1e-6`) does need moves of its own size; a covariate exponent started
+at `0.001` is usually an O(1) slope and needs unit-sized moves.
+
+The value alone cannot tell the two apart, so before the outer optimizer starts,
+each free identity-packed θ with $0 < |\theta_0| < 0.1$ is moved to half its
+initial value and the objective re-evaluated (one extra inner solve per such θ).
+If that moves the OFV by more than 1 unit, the θ is divided by $|\theta_0|$ in the
+optimizer's scale vector; otherwise it keeps the unit scale. This applies to
+`bobyqa`, `slsqp`, `nlopt_lbfgs` and `mma` under the default
+`parameter_scaling = auto` and under `abs`; `none` and `rescale2` keep their own
+vectors.
+
+Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5`
+(macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS
+at −269.47, each reporting convergence; all three now reach the minimum,
+−286.0042, the same as the plain model from `TVV = 10`. Halving `TVV_S` moves the
+OFV by ≈ 100. On `two_cpt_oral_cov` with both covariate exponents started at
+`0.001`, halving either moves the OFV by under 0.01, so neither is rescaled and
+all three optimizers still reach −1199.3264.
+
 ## Bounds
 
 `compute_bounds()` returns a box in packed space:
