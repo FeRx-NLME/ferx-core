@@ -236,12 +236,11 @@ field_row!(
 /// `options` instead of `stage_opts` → dies.
 ///
 /// On `warfarin_iov`, not `warfarin`. The step re-solves the EBEs only at θ̂, warm from the
-/// fit's own, and stops on the gradient norm; on warfarin those warm EBEs are one BFGS step
-/// from a mode well inside 1e-8, so the covariances at 1e-5 and 1e-8 differ by a worst
-/// relative 2e-9 on Linux aarch64 and 1e-11–4e-10 on native macOS arm64 across
-/// `outer_maxiter` 2–6 — and by nothing at 3 on macOS, where this premise failed. On
-/// `warfarin_iov` the same pair differs by 2e-7–2.2e-6 at every budget from 2 to 6, on
-/// both platforms.
+/// fit's own, and stops on the gradient norm. On warfarin the covariances at 1e-5 and 1e-8
+/// differ by a worst relative 1.7e-9–2.4e-9 on Linux aarch64 and 2.5e-11–4.2e-10 on native
+/// macOS arm64 across `outer_maxiter` 2–6 — and by nothing at 3 on macOS, where this
+/// premise failed. On `warfarin_iov` the same pair differs by 2.0e-7–2.2e-6 at every budget
+/// from 2 to 6, on both platforms.
 #[test]
 fn inner_tol() {
     let with = FitOptions {
