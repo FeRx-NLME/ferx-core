@@ -1738,6 +1738,7 @@ fn find_ebe_impl(
             eta_init,
             mu_k,
             policy.ebe_variance,
+            policy.init_is_mode,
         );
     }
 
@@ -2564,6 +2565,7 @@ fn find_ebe_iov(
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
     ebe_variance: EbeVariance,
+    init_is_mode: bool,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -2812,7 +2814,13 @@ fn find_ebe_iov(
     let has_informative_warm_start = eta_init
         .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
         .unwrap_or(false);
+    // A start certified as the mode at `params` (`InnerSolvePolicy::init_is_mode`, the
+    // pre-flight EBEs handed to the first outer evaluation since #2202) is not a degenerate
+    // warm start, whatever its NLL: a high NLL there is the objective at the mode, not a
+    // stale start far from it. Rejecting it hard-rejected every subject of an ODE+IOV fit
+    // whose initial estimate sits far from the data, so the fit never moved (#2212).
     if has_informative_warm_start
+        && !init_is_mode
         && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
     {
         let bsv_eta: Vec<f64> = x[..n_eta]

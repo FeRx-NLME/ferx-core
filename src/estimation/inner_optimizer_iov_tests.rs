@@ -989,6 +989,107 @@ fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
     assert!(reject_ode_iov_inner_start(&transit_iov, 20, f64::NAN));
 }
 
+/// #2212: since #2202 the first outer evaluation is warm-started from the pre-flight EBEs with
+/// `InnerSolvePolicy::init_is_mode`. The ODE+IOV degenerate-warm-start guard must not reject a
+/// start certified as the mode — on a fit whose initial estimate sits far from the data the NLL
+/// *at the mode* clears the threshold, and rejecting it hard-rejected every subject, so the fit
+/// never moved. Both sides of the gate, at the same subject and the same start.
+#[test]
+fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+    // Observations ~80× the prediction (≈10), so the NLL near any reachable mode is far
+    // above the 4-observation threshold of 1000.
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 25.0, 30.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![800.0, 600.0, 700.0, 500.0],
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    // Stacked layout [η_CL, η_V, κ_occ1, κ_occ2]; nonzero, so it is an informative warm start.
+    let warm = [0.05, 0.0, 0.0, 0.0];
+    let start_nll = individual_nll_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &warm[..2],
+        &[vec![warm[2]], vec![warm[3]]],
+        &params.omega,
+        params.omega_iov.as_ref(),
+        &params.sigma.values,
+    );
+    // The straddle: the start is on the rejecting side of the guard.
+    assert!(
+        reject_ode_iov_inner_start(&model, subject.obs_times.len(), start_nll),
+        "fixture drift: start NLL {start_nll} must clear the reject threshold"
+    );
+
+    // Through `find_ebe_cached`, the outer loop's entry, so the policy's hand-off to the IOV
+    // branch is under test as well as the gate itself.
+    let solve = |init_is_mode: bool| {
+        find_ebe_cached(
+            &model,
+            &subject,
+            &params,
+            200,
+            1e-5,
+            Some(&warm),
+            None,
+            0,
+            None,
+            InnerSolvePolicy {
+                init_is_mode,
+                ..InnerSolvePolicy::default()
+            },
+        )
+    };
+    let stale = solve(false);
+    assert!(
+        stale.hard_reject && stale.nll == start_nll,
+        "an uncertified warm start this far from the data must still be hard-rejected \
+         (hard_reject={}, nll={} vs start {start_nll})",
+        stale.hard_reject,
+        stale.nll
+    );
+    let mode = solve(true);
+    assert!(
+        !mode.hard_reject,
+        "#2212: a start certified as the mode must be solved, not hard-rejected"
+    );
+    assert!(
+        mode.nll.is_finite() && mode.nll < start_nll,
+        "the certified start must be optimised: nll {} vs start {start_nll}",
+        mode.nll
+    );
+}
+
 #[test]
 fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // #814: the inner objective-stall stop (#555) must key off the *effective* model, not the
@@ -2523,6 +2624,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         None,
         None,
         EbeVariance::Conditional,
+        false,
     );
     assert!(
         !ebe.converged && ebe.used_fallback,
@@ -2546,6 +2648,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         None,
         None,
         EbeVariance::Conditional,
+        false,
     );
     assert!(full.converged, "reference solve must converge");
     assert!(
@@ -3080,6 +3183,7 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
             None,
             None,
             EbeVariance::Conditional,
+            false,
         );
         let mut stacked: Vec<f64> = r.eta.as_slice().to_vec();
         for k in &r.kappas {
