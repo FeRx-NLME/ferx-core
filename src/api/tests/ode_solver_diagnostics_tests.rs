@@ -745,7 +745,7 @@ fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
 }
 
 /// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
-/// `ode_inner_grad_supported_model` is false and the sweep has nothing to do.
+/// the sweep's `model.ode_spec.is_none()` guard fires and it has nothing to do.
 fn closed_form_model() -> CompiledModel {
     parse_model_string(
         r#"
@@ -766,7 +766,7 @@ fn closed_form_model() -> CompiledModel {
     .expect("parse")
 }
 
-/// An **FD fit** must sweep nothing (#1207 review). `ode_inner_grad_supported_model` describes
+/// An **FD fit** must sweep nothing (#1207 review). `adjoint::recorder_in_scope` describes
 /// the ODE provider's analytical reach and says nothing about `gradient_method`, so gating on
 /// it alone swept a dual solve for a fit that computed every gradient by finite differences —
 /// and then reported solver counters from a code path that fit never took.

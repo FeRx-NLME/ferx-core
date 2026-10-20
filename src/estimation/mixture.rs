@@ -311,7 +311,7 @@ pub(crate) fn mixture_ofv_with_modes(
 /// Returns `None` (→ the caller falls back to FD of the mixture OFV) when the
 /// gradient is out of analytic scope: a non-diagonal base Omega, the `p`
 /// (direct-probability) mixing form, inter-occasion variability (κ), or any
-/// subject/class the per-subject sensitivity provider declines.
+/// subject/class the per-subject adjoint gradient (`per_subject_packed_gradients`) declines.
 pub fn mixture_gradient(
     model: &CompiledModel,
     population: &Population,
@@ -328,7 +328,7 @@ pub fn mixture_gradient(
     }
     // Inter-occasion variability (#985): the packed vector carries a κ (`omega_iov`)
     // segment between σ and the per-class override tail, and the per-class
-    // sensitivity provider does not yet emit κ-slot gradients for a mixture. Rather
+    // mixture assembly does not yet place κ-slot gradients. Rather
     // than assemble a partial gradient with wrong override-slot offsets, route the
     // whole IOV-mixture objective to central FD (`mixture_gradient_fd`, which packs
     // through the authoritative `pack_params` layout).
@@ -1388,7 +1388,7 @@ mod tests {
     }
 
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
-    // branch) so the per-subject analytic sensitivity provider is in scope — the
+    // branch) so the per-subject analytic (adjoint) gradient is in scope — the
     // parity test then exercises the real analytic gradient (softmax mixing
     // slots, base + per-class-override Ω/σ slots). A `MIXNUM`-conditional model
     // is out of analytic scope and takes the FD route (see `mixture_gradient`).

@@ -61,7 +61,7 @@
 use ferx_core::ode::predictions::ode_dense_solve_states;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::{compute_event_pk_params, compute_predictions_with_states};
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     predict, read_nonmem_csv, simulate_adaptive, AdaptiveSimulateOptions, CompiledModel, Population,
@@ -343,15 +343,15 @@ fn via_dense_states(model: &CompiledModel, pop: &Population) -> Vec<(String, f64
 }
 
 /// The dual ODE walk's value (`integrate_tvcov_g`) on every subject but ID 5, asserting each
-/// one stays on the analytic provider: an FD-routed subject would make this leg FD-of-f64 and
+/// one stays on `subject_eta_grad`'s dual walk: an FD-routed subject would make this leg FD-of-f64 and
 /// blind to the dual walk. ID 5 (`SS` infusion × lag) is declined to FD by design (#1128).
 fn via_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let eta = vec![0.0; model.n_eta];
     let mut out = Vec::new();
     for s in pop.subjects.iter().filter(|s| s.id != "5") {
-        let sens = ode_subject_sensitivities(model, s, &model.default_params.theta, &eta)
+        let sens = subject_eta_grad(model, s, &model.default_params.theta, &eta)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        for (t, o) in s.obs_times.iter().zip(sens.obs) {
+        for (t, o) in s.obs_times.iter().zip(sens) {
             out.push((s.id.clone(), *t, o.f));
         }
     }

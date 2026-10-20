@@ -13,7 +13,7 @@
 //!   which stores the EBEs exactly since #1847 — the claim there is bit identity too. A
 //!   bundle written before #1847, at six decimals, is `run_covariance_per_engine.rs`'s.
 //! - **non-cold reported** (`inner_maxiter = 7`): the warm-started trajectory reaches
-//!   warfarin's FOCEI optimum, but seven inner iterations from η = 0 do not, so the cold
+//!   `two_cpt_oral_cov`'s FOCEI optimum, but seven inner iterations from η = 0 do not, so the cold
 //!   solve scores *worse* and a non-cold candidate is reported. Both covariance methods: the
 //!   default `r` reads the EBEs only as its warm start, the score cross-product (`s`) reads
 //!   their `H` as well.
@@ -21,10 +21,16 @@
 //! The split is a budget, not a trajectory: both rows stop at the same OFV at `outer_maxiter`
 //! 30 and 200 (macOS arm64; the starved row reports `converged = false` there), and the cold
 //! solve is then a fixed number of steps from a fixed start at that point. On macOS arm64 and
-//! Linux x86_64 both rows reach OFV −286.0042 (to the premise's 1e-3) and the
-//! `inner_maxiter = 7` row reports the cold solve worse — by 20.58 OFV units on macOS arm64.
+//! Linux x86_64 warfarin's rows reached OFV −286.0042 (to the premise's 1e-3) and the
+//! `inner_maxiter = 7` row reported the cold solve worse — by 20.58 OFV units on macOS arm64.
 //! An earlier fixture split cold from warm with an ODE step cap, and its arm flipped between
 //! the two platforms.
+//!
+//! Fixture since #2093: `two_cpt_oral_cov`. #2093's step-scaled first inner iterate lets
+//! seven iterations from η = 0 reach warfarin's EBEs, so the warfarin row stopped reporting
+//! a non-cold candidate. Measured over `inner_maxiter` 1..=10 on four examples (Linux
+//! x86_64): `two_cpt_oral_cov`, `warfarin_if` and `mm_oral` each reach their full-budget
+//! optimum with the cold-worse arm at 7; `two_cpt_oral_cov` reaches −1199.3264 there.
 //!
 //! `run_covariance` is handed the fit's own options, as a caller repeating the step would: a
 //! different `inner_maxiter` changes the cold solve it compares the reported EBEs against.
@@ -52,12 +58,18 @@ struct Fitted {
 /// The inner budget at which the cold re-solve falls short of the warm trajectory.
 const STARVED_INNER: usize = 7;
 
-/// Warfarin under FOCEI with `inner_maxiter` (`None` = the default). `arm` is a phrase of
+/// `two_cpt_oral_cov`'s FOCEI optimum.
+const OPTIMUM: f64 = -1199.3264;
+
+/// `two_cpt_oral_cov` under FOCEI with `inner_maxiter` (`None` = the default). `arm` is a phrase of
 /// the `W_EBE_START_DEPENDENT` warning that names the row's arm, or `None` for no warning.
 fn fitted(inner_maxiter: Option<usize>, method: CovarianceMethod, arm: Option<&str>) -> Fitted {
     let what = format!("inner_maxiter = {inner_maxiter:?}, {method:?}");
-    let prep = prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
-        .unwrap_or_else(|e| panic!("{what}: prepare: {e}"));
+    let prep = prepare_run(
+        "examples/two_cpt_oral_cov.ferx",
+        Some("data/two_cpt_oral_cov.csv"),
+    )
+    .unwrap_or_else(|e| panic!("{what}: prepare: {e}"));
     let (model, population, init) = (prep.parsed.model, prep.population, prep.init_params);
     let defaults = FitOptions::default();
     let options = FitOptions {
@@ -77,8 +89,8 @@ fn fitted(inner_maxiter: Option<usize>, method: CovarianceMethod, arm: Option<&s
         fit.gradient_method_inner
     );
     assert!(
-        (fit.ofv - (-286.0042)).abs() < 1e-3,
-        "{what}: premise — the fit reaches warfarin's FOCEI optimum (−286.0042), got {}",
+        (fit.ofv - OPTIMUM).abs() < 1e-3,
+        "{what}: premise — the fit reaches the FOCEI optimum ({OPTIMUM}), got {}",
         fit.ofv
     );
     let warning = fit

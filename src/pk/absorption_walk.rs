@@ -404,8 +404,8 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     Some(preds)
 }
 
-/// The closed-form event walk for the analytic-sensitivity providers
-/// (`crate::sens::provider`'s IOV and TV-covariate walks, outer `Dual2` and inner `Dual1`):
+/// The closed-form event walk for the analytic-sensitivity walks
+/// (`crate::sens::provider`'s IOV and TV-covariate walks, over a dual number type):
 /// the absorption walk for a transit/IG model, the ordinary event-driven walk
 /// ([`crate::sens::propagate::event_driven_sens_with_doses_g`]) for every other one. One
 /// dispatch for all four callers, so none of them can reach a transit/IG model with the

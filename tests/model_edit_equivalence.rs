@@ -577,10 +577,41 @@ fn michaelis_menten_elimination_is_the_hand_written_ode_model() {
 
 {ODE_TWIN_TAIL}"
     );
-    // The one ODE case that iterates: it is the variant the NONMEM anchor
-    // covers, so the optimizer path over a generated `[odes]` model is
-    // exercised on the model whose numbers are anchored externally.
-    assert_same_model(&generated, &hand);
+    // The same objective, bit for bit: θ/η names, `predict()` and the OFV at the start.
+    assert_same_model_at(&generated, &hand, 0);
+    // The one ODE case that iterates: it is the variant the NONMEM anchor covers, so the
+    // optimizer path over a generated `[odes]` model is exercised on the model whose
+    // numbers are anchored externally. Not compared bit for bit after iterating (#486):
+    // the adjoint tapes each model's own RHS, and `ode_template`'s spelling of the depot
+    // term rounds the tangents differently from the hand-written one — per-subject
+    // gradients agree to 1.4e-13 (`sens::ode_adjoint_tests::
+    // mm_template_and_hand_written_gradients_agree_per_subject`), both exact against
+    // reconverged FD — and an unconverged two-iteration fit amplifies that chaotically
+    // (measured 4e-3 OFV; run to convergence the two land 5.7e-4 OFV apart on this
+    // weakly identified KM, the generated one lower). What iterating must show is that the
+    // generated model's optimizer path runs and improves the objective.
+    let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("dataset must load");
+    for (name, src) in [
+        ("generated", generated.as_str()),
+        ("hand-written", hand.as_str()),
+    ] {
+        let model = parse_full_model(src).expect("model parses").model;
+        let at = |outer_maxiter: usize| {
+            let opts = FitOptions {
+                outer_maxiter,
+                run_covariance_step: false,
+                ..FitOptions::default()
+            };
+            fit(&model, &pop, &model.default_params, &opts)
+                .unwrap_or_else(|e| panic!("{name}: fit must not error: {e}"))
+                .ofv
+        };
+        let (start, after) = (at(0), at(2));
+        assert!(
+            after.is_finite() && after < start,
+            "{name}: two iterations must improve the OFV: {start} -> {after}"
+        );
+    }
 }
 
 #[test]

@@ -300,8 +300,10 @@ fn ipred_at_nonmem_ebes_matches_nonmem() {
 /// per segment in the value engine (M1), giving every dose dose 0's kernel (M7), or a
 /// `PreparedForcings::get` that ignores the dose (M11) reddens
 /// `ipred_at_nonmem_ebes_matches_nonmem`. A per-segment forcing on the `Dual2` walk (M2)
-/// reddens 15 `sens::` unit tests, among them `iov_absorption_kappa_lands_on_the_dose_occasion`
-/// and both `…_onset_on_a_covariate_record_returns_a_one_sided_derivative` fixtures.
+/// reddened 15 `sens::` unit tests in that sweep, among them
+/// `iov_absorption_kappa_lands_on_the_dose_occasion` and both
+/// `…_onset_on_a_covariate_record_returns_a_one_sided_derivative` fixtures — forward-provider
+/// tests retired in #2093.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

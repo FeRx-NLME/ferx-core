@@ -58,6 +58,9 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
 pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
     debug_assert_eq!(m.len(), n * n, "coefficient matrix must be n×n row-major");
     debug_assert_eq!(piv.len(), n, "pivot vector must have length n");
+    if let Some(ok) = T::lu_factor_hook(m, piv, n) {
+        return ok;
+    }
     // Singular tolerance relative to the largest value-part magnitude, floored at 1.0 so a
     // uniformly small-entry system is not spuriously rejected.
     let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
@@ -113,6 +116,9 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
 pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
     debug_assert_eq!(m.len(), n * n, "factorization must be n×n row-major");
     debug_assert_eq!(b.len(), n, "right-hand side must have length n");
+    if T::lu_solve_hook(m, piv, n, b) {
+        return;
+    }
     for col in 0..n {
         let p = piv[col];
         if p != col {

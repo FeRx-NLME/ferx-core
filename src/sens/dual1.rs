@@ -51,6 +51,11 @@ impl<const N: usize> Dual1<N> {
         Dual1 { value, grad }
     }
 
+    /// `φ(self)` with value `v = φ(x)` and `d1 = φ′(x)` (first order: `φ″` is unused).
+    pub fn lift2(self, v: f64, d1: f64, _d2: f64) -> Self {
+        Dual1::chain1(v, d1, &self.grad)
+    }
+
     /// `exp(self)`: `u = e^x`, `u' = u·x'`.
     pub fn exp(self) -> Self {
         let v = self.value.exp();

@@ -490,9 +490,10 @@ const A1_SE: f64 = 1e-2;
 
 // ── EBE convergence: counted and guarded, as unprofiled (#2130 review #2) ──────────
 
-/// A starved inner solve (`inner_maxiter = 12` on F1: 4 subjects unconverged, 11 Nelder–Mead
-/// fallbacks, measured; fewer iterations fail the profile solve outright) leaves EBEs
-/// unconverged. The profiled fit
+/// A starved inner solve (`inner_maxiter = 0` on F1: no step from the start, 6 subjects
+/// unconverged, measured) leaves EBEs unconverged. Since #2093's step-scaled first iterate a
+/// single inner iteration already converges every F1 subject at this point (measured over
+/// budgets 1..=12), so only the zero budget still starves it. The profiled fit
 /// publishes that count, and the unprofiled loop's EBE guard applies to it: under
 /// `max_unconverged_frac = 0` the evaluation is rejected and no objective is reported,
 /// while under `1.0` (the guard off) the same evaluation is accepted. The pair straddles
@@ -505,7 +506,7 @@ fn a_profiled_fit_counts_and_guards_unconverged_ebes() {
             verbose: false,
             outer_maxiter: 0,
             run_covariance_step: false,
-            inner_maxiter: 12,
+            inner_maxiter: 0,
             max_unconverged_frac: frac,
             ..p.parsed.fit_options.clone()
         };

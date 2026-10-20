@@ -527,12 +527,15 @@ this engine is, and switch automatically once a block makes the problem large:
   its model grows quadratically in the parameter count; above 64 free
   coordinates `auto` takes `nlopt_lbfgs` instead, whose finite-difference cost
   is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
-- **Covariance.** The default `covariance_method = r` builds a
-  finite-difference Hessian that re-converges every subject's EBEs at each of
-  `2n²` objective evaluations — around 1.3 million population objectives at 800
-  parameters. Above 100 free coordinates a *defaulted* covariance method routes
-  to the score cross-product (`covariance_method = s`, one pass) with a warning.
-  Setting `covariance_method = r` explicitly forces it, and says what it costs.
+- **Covariance.** The default `covariance_method = r` builds the exact analytic
+  R-matrix, one pass per subject, wherever it is in scope (see
+  [Covariance step warnings](../warnings.qmd#codes-covariance)), and keeps it at any parameter
+  count. Outside that scope `R` is a finite-difference Hessian that re-converges
+  every subject's EBEs at each of `2n²` objective evaluations — around 1.3
+  million population objectives at 800 parameters — so above 100 free
+  coordinates a *defaulted* covariance method routes to the score cross-product
+  (`covariance_method = s`, one pass) with a warning. Setting
+  `covariance_method = r` explicitly forces it, and says what it costs.
 
 A block of 20 or more coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console.
@@ -551,10 +554,11 @@ when ferx freezes a θ with no effect on the objective), so a block can also be 
 To read a dependent level's value, standard error or SIR interval, use
 `theta_level_values` ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
-Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
-the dual-number path — so a *small* level block keeps the analytic gradient.
-Past the engine's 24-axis dual dispatch, a large block falls back to finite
-differences per subject, which is why the guards above matter.
+Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact on the
+adjoint's tape — and the adjoint's cost does not grow with the number of θ, so a
+level block of any size keeps the exact gradient (#2093). Before that, a block past
+the forward provider's 24-axis dual dispatch fell back to finite differences per
+subject; the guards above still matter for the size of the estimation problem.
 
 #### Profiled level blocks
 

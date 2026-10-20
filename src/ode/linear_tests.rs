@@ -677,4 +677,27 @@ fn every_dual_overrides_jet_max_abs() {
     let x = Dual2::<1>::var(1.0, 0);
     assert_eq!(through_trait(x * x * x), 6.0); // ∂ = 3x² = 3, ∂² = 6x = 6: the Hessian counts
     assert!(through_trait(Dual2::<1>::var(1.0, 0) * Dual2::<1>::from_f64(f64::NAN)).is_nan());
+
+    // The adjoint's duals (#486): the η-tangent tape type, and the covariance Hessian's
+    // nested forward-over-reverse pair. The reverse-only `R` has no local jet.
+    use crate::sens::rtape::{DualH, DualT, R};
+    use crate::sens::vtape::DualV;
+    let mut v = DualV::<2, 3>::constant(1.0);
+    v.g = [0.5, -3.0];
+    v.h = [0.0, 4.0, 0.0];
+    assert_eq!(through_trait(v), 4.0, "DualV: the Hessian payload counts");
+    v.h[0] = f64::NAN;
+    assert!(through_trait(v).is_nan(), "DualV: NaN is not discarded");
+    assert_eq!(through_trait(R::c(7.0)), 0.0);
+    let mut t = DualT::<2, f64>::constant(1.0);
+    t.g = [2.0, -5.0];
+    assert_eq!(through_trait(t), 5.0, "DualT");
+    let mut h = DualH::<1, 1, DualT<1, f64>>::constant(1.0);
+    h.g[0].v = 0.25;
+    h.h[0].g = [-6.0];
+    assert_eq!(
+        through_trait(h),
+        6.0,
+        "DualH: the base's jet of a Hessian entry counts"
+    );
 }

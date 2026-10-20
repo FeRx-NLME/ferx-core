@@ -184,15 +184,14 @@ more rows takes the exact analytic outer gradient of the dense-`R` objective
 subject whose blocks are all single rows keeps the scalar analytic one (for it
 `∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the
 finite-difference outer gradient throughout, as any weighted model with a dense
-`R` does. So does a model with `kappa` (one level or nested): the IOV gradient
-assemblies score a diagonal `R`, so the outer gradient is central differences of
-the OFV, and `optimizer = auto` runs L-BFGS on that gradient rather than
-BOBYQA, which stopped short of the optimum on this route (#2122). Its EBE search runs on central
-differences too, for each subject with a block of two or more rows; the fit's
-warnings say how many ("… use finite-difference inner gradients in the IOV loop
-(residual correlation: N)"). The covariance step uses the finite-difference
-Hessian. None of
-these paths approximates the objective. The dense gradient's `σ` and
+`R` does. A model with `kappa` (one level or nested) takes the exact analytic
+gradient too (#2101): its IOV marginal is the dense-`R` objective over the stacked
+`[η, κ]` system, which the adjoint gradient differentiates as it does a model
+without `kappa`, on FOCE and FOCEI, and the covariance step takes the exact
+analytic R-matrix. Its EBE search runs on the exact gradient of the dense inner
+objective. Checked against central differences of the reconverged OFV and of the
+gradient, and against the NONMEM anchor above. None of these paths approximates
+the objective. The dense gradient's `σ` and
 `block_sigma` `ρ` terms are central differences of `R`, exact because `R` is
 quadratic in `σ` and linear in that `ρ` (a stencil that straddles the variance
 floor declines instead), and the finite-difference paths are only slower.

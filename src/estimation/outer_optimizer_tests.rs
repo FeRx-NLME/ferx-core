@@ -5889,7 +5889,7 @@ mod outer_fd_fallback {
 
     /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
     /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
-    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// so the adjoint outer gradient (`subject_adjoint_packed_gradient`) declines that subject while every bolus-dosed one stays
     /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
     /// a property of the records — which is what makes it a stable fixture.
     const WARFARIN_F: &str = r#"
@@ -5898,6 +5898,7 @@ mod outer_fd_fallback {
   theta TVV(10.0, 0.1, 500.0)
   theta TVKA(1.5, 0.01, 50.0)
   theta TVF(0.7, 0.05, 1.0)
+  theta TVLAG(0.5, 0.01, 5.0)
 
   omega ETA_CL ~ 0.09
   omega ETA_V  ~ 0.04
@@ -5910,9 +5911,10 @@ mod outer_fd_fallback {
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
   F  = TVF
+  ALAG = TVLAG
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -5929,8 +5931,10 @@ mod outer_fd_fallback {
         }
     }
 
-    /// The analytic subject, and a twin whose bolus is replaced by a rate-defined
-    /// infusion the outer provider declines under `F ≠ 1`.
+    /// The analytic subject, and a twin whose bolus is replaced by a steady-state
+    /// infusion into the depot. An oral infusion routes the subject to the event walk,
+    /// and the walk declines an SS infusion under a lag time
+    /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
     fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
@@ -5940,7 +5944,7 @@ mod outer_fd_fallback {
         analytic.id = "IN_SCOPE".into();
         let mut declining = pop.subjects[0].clone();
         declining.id = "OUT_OF_SCOPE".into();
-        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0)];
         (model, analytic, declining)
     }
 
@@ -5980,26 +5984,6 @@ mod outer_fd_fallback {
         log
     }
 
-    /// Fixture precondition, asserted rather than assumed: the two subjects must land on
-    /// *opposite* sides of the provider gate. Without this the warning test below is
-    /// satisfied by a population where both decline (or neither does).
-    #[test]
-    fn fixture_subjects_straddle_the_provider_gate() {
-        let (model, analytic, declining) = analytic_and_declining();
-        let theta = &model.default_params.theta;
-        let zeros = vec![0.0; model.n_eta];
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &analytic, theta, &zeros)
-                .is_some(),
-            "in-scope subject must be served by the provider"
-        );
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &declining, theta, &zeros)
-                .is_none(),
-            "modeled-duration subject must be declined by the provider"
-        );
-    }
-
     /// The warning counts the subjects the assembly actually salvaged, and names one.
     /// Mutations that must redden it: dropping the `declines.record(i)` call, or reporting
     /// the first subject rather than the first *declining* one.
@@ -6036,7 +6020,12 @@ mod outer_fd_fallback {
     fn consequence_sentence_follows_the_salvage_route() {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
-        let log = record_one_gradient_eval(&model, &pop);
+        // A numerical (held-EBE) decline of subject 1, built directly: the fixture's real
+        // decline is structural (never servable), which takes the reconverged salvage on
+        // both sides of the gate and so cannot straddle the remedy sentence. The real
+        // evaluation is `warns_with_count_and_example_subject`'s.
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
         // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
         // read from the model inside the warning, so pairing the same log with each model
         // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
@@ -6090,12 +6079,9 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             their residuals are correlated across observation rows (a paired `block_sigma` or \
-             a `correlation` line) and the analytic outer gradient cannot serve them: the model \
-             pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
-             (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
-             subject's dosing is outside the analytic sensitivities; those gradients include \
-             the EBE-response term but are slower.";
+             no analytic recorder serves them: their data shape is outside the recorders' scope \
+             at every parameter point (for example a steady-state infusion under a lag time on \
+             the event walk). Those gradients include the EBE-response term but are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
@@ -6252,84 +6238,6 @@ mod outer_fd_fallback {
         for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
             assert_eq!(structural_fill(nll), DeclinedFill::Zero, "nll = {nll}");
         }
-    }
-
-    /// #1960 straddle of [`is_structural_decline`]: a subject whose `block_sigma` pairs two
-    /// rows is a structural decline exactly when the dense assembly cannot serve it — on a
-    /// model outside `dense_outer_supported`, or because the sensitivity provider declines
-    /// the subject itself (a rate-defined infusion under `F ≠ 1`, #419) — and never for an
-    /// unpaired subject. Every cell is asserted, so dropping any of the three conditions
-    /// (the pairing, the dense-scope carve-out, the provider decline) reddens it.
-    #[test]
-    fn structural_decline_is_a_cross_row_residual_the_dense_assembly_cannot_serve() {
-        const SRC: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(0.7, 0.05, 1.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n  KA = TVKA\n  F  = TVF\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n";
-        let model = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
-        assert!(crate::estimation::sens_outer_gradient::dense_outer_supported(&model));
-        let mut outside = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
-        // A dense-scope exclusion the sensitivity provider still serves (IOV would not
-        // do: the provider declines it too, so the two clauses would cover for each other
-        // and dropping the dense one would leave this test green).
-        outside.bloq_method = crate::types::BloqMethod::M3;
-        assert!(!crate::estimation::sens_outer_gradient::dense_outer_supported(&outside));
-
-        let subject = |times: &[f64]| {
-            let n = times.len();
-            let (_, analytic, _) = analytic_and_declining();
-            let mut s = analytic;
-            s.obs_times = times.to_vec();
-            s.obs_raw_times = Vec::new();
-            s.observations = vec![1.0; n];
-            s.obs_cmts = vec![1; n];
-            s.cens = vec![0; n];
-            s.occasions = vec![1; n];
-            s.obs_l2 = Vec::new();
-            s.obs_covariates = (0..n)
-                .map(|j| std::collections::HashMap::from([("FREE".into(), (j % 2) as f64)]))
-                .collect();
-            s
-        };
-        let paired = subject(&[1.0, 1.0, 4.0, 4.0]);
-        let unpaired = subject(&[1.0, 2.0, 4.0, 5.0]);
-        let params = &model.default_params;
-        let eta = vec![0.0; model.n_eta];
-        for (m, name, in_dense_scope) in [(&model, "in scope", true), (&outside, "outside", false)]
-        {
-            assert_eq!(
-                is_structural_decline(m, &paired, params, &eta),
-                !in_dense_scope,
-                "paired, {name}"
-            );
-            assert!(
-                !is_structural_decline(m, &unpaired, params, &eta),
-                "unpaired, {name}"
-            );
-        }
-        // The provider-decline cell: the same subjects with their bolus swapped for a
-        // rate-defined infusion, which the provider declines under `F ≠ 1` on the in-scope
-        // model. The straddle is asserted, so the cell cannot quietly stop declining.
-        let infused = |mut s: Subject| {
-            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
-            s
-        };
-        let (paired_inf, unpaired_inf) = (infused(paired.clone()), infused(unpaired.clone()));
-        let theta = &params.theta;
-        for m in [&model, &outside] {
-            assert!(
-                crate::sens::provider::subject_sensitivities(m, &paired, theta, &eta).is_some()
-            );
-        }
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &paired_inf, theta, &eta)
-                .is_none()
-        );
-        assert!(
-            is_structural_decline(&model, &paired_inf, params, &eta),
-            "paired, provider declines"
-        );
-        assert!(
-            !is_structural_decline(&model, &unpaired_inf, params, &eta),
-            "unpaired, provider declines"
-        );
     }
 
     /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject
@@ -7107,157 +7015,6 @@ mod outer_fd_fallback {
     }
 
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
-
-    /// T7, the routing straddle. A subject whose `ARM` holds two or more rows has an `R`
-    /// that depends on ρ directly, so it takes the dense assembly, whose θ block carries
-    /// `∂R/∂ρ` (#1960; before, it declined to the reconverged FD gradient, #1536); a
-    /// subject whose arms are all singletons has an `R` free of ρ and stays on the scalar
-    /// assembly, with `∂/∂ρ = 0` correctly. Both are analytic and nothing declines; then
-    /// the population gradient's ρ component is checked against a central difference of
-    /// the population objective. Dies if `has_cross_observation_residual` ignores the
-    /// serial source (the paired subject then takes the scalar assembly and reports
-    /// `∂/∂ρ = 0`) or if the dense θ block drops the direct ρ channel. Run for `cs` (ρ
-    /// packed on the linear scale, its lower bound negative) and `car1` (lower bound 0,
-    /// so ρ is log-packed and the FD step is on `log ρ`), whose `R` reads ρ through
-    /// `ρ^|Δt|` at the fixture's non-integer gaps.
-    #[test]
-    fn serial_rho_routes_paired_subjects_to_the_dense_assembly() {
-        for (kind, lower) in [("cs", "-0.4"), ("car1", "0.0")] {
-            serial_rho_routes_paired_subjects_case(kind, lower);
-        }
-    }
-
-    fn serial_rho_routes_paired_subjects_case(kind: &str, lower: &str) {
-        let model = crate::parser::model_parser::parse_model_string(&format!(
-            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta RHO(0.4, {lower}, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n",
-        ))
-        .expect("model parses");
-        let subject = |id: &str, arms: [f64; 6], scale: f64| {
-            let mut s = Subject {
-                id: id.into(),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
-                obs_cmts: vec![1; 6],
-                cens: vec![0; 6],
-                obs_covariates: arms
-                    .iter()
-                    .map(|a| HashMap::from([("ARM".to_string(), *a)]))
-                    .collect(),
-                ..Default::default()
-            };
-            let f = crate::pk::compute_predictions_with_tv(
-                &model,
-                &s,
-                &model.default_params.theta,
-                &[0.0],
-            );
-            s.observations = f
-                .iter()
-                .enumerate()
-                .map(|(j, v)| v * scale + if j % 2 == 0 { 0.4 } else { -0.3 })
-                .collect();
-            s.obs_rgroup = crate::stats::residual_error::residual_groups(&model, &s);
-            s
-        };
-        let paired = subject("PAIRED", [1.0, 1.0, 1.0, 2.0, 2.0, 2.0], 1.2);
-        let singles = subject("SINGLES", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0.85);
-        let pop = mk_pop(vec![paired, singles]);
-        let template = &model.default_params;
-        let PackedStart {
-            packed: x, bounds, ..
-        } = pack_with_bounds(template);
-        let opts = FitOptions {
-            method: EstimationMethod::FoceI,
-            interaction: true,
-            ..FitOptions::default()
-        };
-        let (ehs, hms, _) = solve_at(&model, &pop, template, &x, &opts);
-        // The straddle: cross-row on one side of the predicate, not on the other — and
-        // both analytic.
-        for (i, cross) in [(0, true), (1, false)] {
-            assert_eq!(
-                crate::stats::residual_error::has_cross_observation_residual(
-                    &model.error_spec,
-                    &pop.subjects[i],
-                    &template.sigma.values,
-                    model.residual_cov_at(template),
-                ),
-                cross,
-                "{kind}: subject {i}"
-            );
-        }
-        assert!(
-            subject_analytic_outer_gradient(
-                &model,
-                &pop.subjects[0],
-                template,
-                &x,
-                ehs[0].as_slice(),
-                true
-            )
-            .is_some(),
-            "{kind}: a subject with a multi-row block takes the dense assembly"
-        );
-        assert!(
-            subject_analytic_outer_gradient(
-                &model,
-                &pop.subjects[1],
-                template,
-                &x,
-                ehs[1].as_slice(),
-                true
-            )
-            .is_some(),
-            "{kind}: a subject of singleton blocks must stay analytic"
-        );
-        let log = OuterFdDeclineLog::new(pop.subjects.len());
-        let g = population_gradient_sens_mixed(
-            &x,
-            template,
-            &model,
-            &pop,
-            &ehs,
-            &hms,
-            &bounds,
-            &opts,
-            OuterTrial::unknown(),
-            &log,
-        );
-        assert!(
-            log.declined_indices().is_empty(),
-            "{kind}: nothing declines"
-        );
-        // ρ is θ index 2: linear-packed under `cs`, log-packed under `car1`.
-        assert_eq!(
-            crate::estimation::parameterization::theta_packs_log(template.theta_lower[2]),
-            kind == "car1"
-        );
-        let k = 2;
-        let h = 1e-5;
-        let ofv_at = |dx: f64| {
-            let mut xx = x.clone();
-            xx[k] += dx;
-            solve_at(&model, &pop, template, &xx, &opts)
-                .2
-                .iter()
-                .sum::<f64>()
-        };
-        let fd = (ofv_at(h) - ofv_at(-h)) / (2.0 * h);
-        assert!(
-            g[k].is_finite() && fd.is_finite(),
-            "{kind}: g {} fd {fd}",
-            g[k]
-        );
-        assert!(
-            fd.abs() > 1e-2,
-            "{kind}: fixture: ρ moves the objective ({fd})"
-        );
-        assert!(
-            (g[k] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
-            "{kind}: ∂OFV/∂ρ: assembled {} vs FD {fd}",
-            g[k]
-        );
-    }
 }
 
 // ── #1934: the BHHH Newton decrement and the latch-time veto ───────────────────────
@@ -7752,11 +7509,16 @@ fn predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one() {
         gain_is_negligible(Some(exact_optimum)),
         "optimum: {exact_optimum}"
     );
-    // The fixture's integrator noise is real: at the fit's tolerance the optimum reads as a
-    // creep, so a decrement that skipped the tight re-solve fails the agreement below.
+    // At the fit's own tolerance this read 1.85 at the optimum before #2093 — a creep, which
+    // is why #2001 re-solves tightly. Since #2093 it reads 0.0083989 (exact 0.0083205): the
+    // noise was in the fit-tolerance EBEs' stationarity, which the ODE noise-floor exit now
+    // carries past the objective's resolution when the gradient can still see the mode
+    // (`gradient_verified_step`). So on this fixture the tight re-solve is no longer what
+    // makes the decrement right, and skipping it no longer fails this test; the agreement
+    // rows below still pin that the tight re-solve itself returns the exact value.
     assert!(
-        !gain_is_negligible(Some(loose_optimum)),
-        "fit-tolerance optimum: {loose_optimum}"
+        gain_is_negligible(Some(loose_optimum)) && (loose_optimum - exact_optimum).abs() < 1e-3,
+        "fit-tolerance optimum: {loose_optimum} vs exact {exact_optimum}"
     );
     for (label, got, want) in [
         ("latch", rk45_latch, exact_latch),
@@ -8751,7 +8513,7 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
     let (alg_model, alg_pop) = fx::prepared(&fx::algebraic(), 1);
     for m in [&cf_model, &ode_model, &alg_model] {
         assert!(
-            crate::sens::provider::iov_sens_supported(m)
+            crate::sens::ode_provider::adjoint::model_in_scope(m)
                 && crate::sens::provider::analytic_outer_gradient_available(m),
             "the outer gradient must be analytic"
         );
@@ -8835,18 +8597,13 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
     }
 }
 
-/// #1082 PR5, V6: on an IOV model with a residual `correlation` line, the outer gradient
-/// handed to the optimizer is central differences of the (reconverged) OFV, on FOCE and on
-/// FOCEI. The IOV outer assemblies score a diagonal `R`: FOCEI's declines per subject, but
-/// FOCE's (`subject_packed_gradient_foce_iov`) would differentiate the diagonal `R⁰`, with
-/// no `∂/∂ρ` at all. So the one gate is the structural decline in
-/// `analytic_outer_gradient_in_scope`; the model without the line keeps the analytic
-/// gradient (the straddle, asserted).
-///
-/// Mutation: delete that decline → the FOCE gradient is the diagonal-`R⁰` analytic one, and
-/// its ρ component is 0 against a finite difference of 20.73 (measured). FOCE and FOCEI
-/// give the same number here: with additive error the Gauss–Newton Laplace marginal is the
-/// Sheiner–Beal one (Woodbury), so the two paths differ only in which assembly would run.
+/// #1082 PR5 / #2101: on a nested-level model with a residual `correlation ar1(RHO) by
+/// ARM` line, the outer gradient handed to the optimizer is the adjoint's — every subject
+/// served by it, no FD salvage — and matches central differences of the reconverged OFV on
+/// FOCE and FOCEI, ρ included (∂OFV/∂ρ ≈ 20.7, so a gradient that ignored the dense `R`'s
+/// off-diagonal, as the diagonal IOV assemblies would, is far off). FOCE and FOCEI give the
+/// same number here: with additive error the Gauss–Newton Laplace marginal is the
+/// Sheiner–Beal one (Woodbury).
 #[test]
 fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     use crate::stats::nested_levels::test_helpers as fx;
@@ -8863,9 +8620,7 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let (m, mut pop) = fx::prepared(&src, 1);
     crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
     let (m_plain, _) = fx::prepared(&plain, 1);
-    assert!(!crate::sens::provider::analytic_outer_gradient_available(
-        &m
-    ));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert!(crate::sens::provider::analytic_outer_gradient_available(
         &m_plain
     ));
@@ -8877,10 +8632,17 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let rho = params.theta.len() - 1;
     assert_eq!(m.residual_serial.as_ref().unwrap().rho_theta, rho);
     let n = pop.subjects.len();
+    // At the default `inner_tol` the gap measured 4.5e-6 (FOCE = FOCEI here). It does not
+    // shrink at 1e-8 or 1e-10 (1.2e-5, 5.3e-6): it is the stencil's truncation, as the
+    // Richardson oracle on the same subject without the line shows (#2101,
+    // `cov_hessian_matches_profile_fd_nested_residual_correlation`). Bound: ~2× the worst.
+    let inner_tol = FitOptions::default().inner_tol;
     for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
         let opts = FitOptions {
             method,
             interaction: method == EstimationMethod::FoceI,
+            inner_tol,
+            inner_maxiter: 2000,
             ..FitOptions::default()
         };
         let (ehs, hms, _, kappas) = run_inner_loop_warm(
@@ -8909,6 +8671,26 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             OuterTrial::unknown(),
             &OuterFdDeclineLog::new(n),
         );
+        // Every subject on the adjoint, so the comparison below is of its gradient.
+        for (i, s) in pop.subjects.iter().enumerate() {
+            let mut b = ehs[i].as_slice().to_vec();
+            for k in &kappas[i] {
+                b.extend(k.iter());
+            }
+            assert!(
+                crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+                    &m,
+                    s,
+                    params,
+                    &x,
+                    &b,
+                    opts.interaction,
+                )
+                .is_some(),
+                "{method:?}: subject {} declined the adjoint",
+                s.id
+            );
+        }
         let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
         assert_eq!(g.len(), fd.len());
         eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
@@ -8916,12 +8698,152 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             fd[rho].is_finite() && fd[rho].abs() > 0.1,
             "{method:?}: ρ is live"
         );
+        let mut worst = 0.0f64;
         for (k, (a, b)) in g.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && b.is_finite(), "{method:?}[{k}]");
-            assert!(
-                (a - b).abs() <= 1e-6 * (1.0 + b.abs()),
-                "{method:?}[{k}]: handed {a} vs FD of the OFV {b}"
-            );
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
         }
+        eprintln!("{method:?}: worst {worst:.2e} at inner_tol {inner_tol:e}");
+        assert!(
+            worst <= 1e-5,
+            "{method:?}: handed vs FD of the OFV {worst:.2e}"
+        );
     }
+}
+
+/// The mid-leg basin probe's schedule (#2093): 32, 64, 128, … feasible evaluations, so a
+/// leg pays a logarithmic number of cold passes and none before its 32nd evaluation.
+#[test]
+fn the_basin_probe_runs_on_a_geometric_schedule() {
+    let due: Vec<usize> = (1..=600).filter(|&n| basin_probe_due(n)).collect();
+    assert_eq!(due, vec![32, 64, 128, 256, 512]);
+}
+
+/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
+/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
+/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
+/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
+/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
+/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
+/// it does again. `main` and the previous head reached −1173.559691.
+#[cfg(feature = "nn")]
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+    let r = crate::fit_from_files(
+        "examples/warfarin_dcm.ferx",
+        Some("data/warfarin_dcm.csv"),
+        None,
+        None,
+    )
+    .expect("warfarin_dcm fits");
+    assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
+    assert!(
+        r.ofv < -1180.0,
+        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv
+    );
+}
+
+/// The restart chain (#2093): a basin-shift restart repeats while each one is adopted and
+/// its own leg ends in a basin shift, at most `MAX_BASIN_RESTARTS` more; a rejected restart
+/// ends the chain on the result it already had; a mid-descent stall's restart may be followed
+/// by a basin-shift one, but a second stall is not restarted again.
+#[test]
+fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() {
+    use crate::estimation::outer_optimizer::{
+        resolve_restart_chain, RestartCause, MAX_BASIN_RESTARTS,
+    };
+    use std::cell::Cell;
+    let ofv = |x: &f64| *x;
+
+    // Three basin shifts, then a clean leg: four legs, the last one reported.
+    let calls = Cell::new(0);
+    let legs = [
+        (-20.0, Some(RestartCause::BasinShift)),
+        (-30.0, Some(RestartCause::BasinShift)),
+        (-40.0, None),
+    ];
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::BasinShift)),
+        |_: &f64, c| {
+            assert_eq!(c, RestartCause::BasinShift);
+            let k = calls.get();
+            calls.set(k + 1);
+            legs[k]
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-40.0, 3));
+
+    // Every leg traps again: the chain stops after the first restart plus the cap.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (0.0, Some(RestartCause::BasinShift)),
+        |prev: &f64, _| {
+            calls.set(calls.get() + 1);
+            (prev - 1.0, Some(RestartCause::BasinShift))
+        },
+        ofv,
+    );
+    assert_eq!(calls.get(), 1 + MAX_BASIN_RESTARTS);
+    assert_eq!(got, -((1 + MAX_BASIN_RESTARTS) as f64));
+
+    // A restart that ends higher is rejected, and nothing is retried from it.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::BasinShift)),
+        |_: &f64, _| {
+            calls.set(calls.get() + 1);
+            (-5.0, Some(RestartCause::BasinShift))
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-10.0, 1));
+
+    // A mid-descent restart whose leg ends in a basin shift gets one basin restart…
+    let causes = std::cell::RefCell::new(Vec::new());
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::MidDescent)),
+        |prev: &f64, c| {
+            causes.borrow_mut().push(c);
+            let next = if c == RestartCause::MidDescent {
+                Some(RestartCause::BasinShift)
+            } else {
+                None
+            };
+            (prev - 1.0, next)
+        },
+        ofv,
+    );
+    assert_eq!(got, -12.0);
+    assert_eq!(
+        *causes.borrow(),
+        vec![RestartCause::MidDescent, RestartCause::BasinShift]
+    );
+
+    // …but a second mid-descent stall is reported as a stall, not restarted again.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::MidDescent)),
+        |prev: &f64, _| {
+            calls.set(calls.get() + 1);
+            (prev - 1.0, Some(RestartCause::MidDescent))
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-11.0, 1));
 }

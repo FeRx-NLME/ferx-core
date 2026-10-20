@@ -1934,7 +1934,7 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// than -1, 0 or 1 (#1496).
 ///
 /// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
-/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `foce_tail_jet`,
+/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `focei_kernel::m3_terms`,
 /// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
 /// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
 /// see `bloq_method`, so the message states both methods. `cell` is quoted as

@@ -29,7 +29,7 @@
 //! Tier 2: one `predict()`, one dual walk per subject, one no-op adaptive run per subject,
 //! and two `fit()` evaluations at `maxiter = 0`.
 
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     fit, parse_full_model_file, predict, read_nonmem_csv, simulate_adaptive,
@@ -140,10 +140,11 @@ fn via_dual(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let labels = via_predict(m, pop);
     let mut values = Vec::new();
     for s in &pop.subjects {
-        let sens = ode_subject_sensitivities(m, s, &m.default_params.theta, &eta)
+        // The adjoint's recorder (#2093): the dual walk the gradients differentiate.
+        let obs = subject_eta_grad(m, s, &m.default_params.theta, &eta)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        assert_eq!(sens.obs.len(), s.obs_times.len(), "ID {}: dual rows", s.id);
-        values.extend(sens.obs.iter().map(|o| (s.id.clone(), o.f)));
+        assert_eq!(obs.len(), s.obs_times.len(), "ID {}: dual rows", s.id);
+        values.extend(obs.iter().map(|o| (s.id.clone(), o.f)));
     }
     assert_eq!(values.len(), labels.len(), "dual vs predict row count");
     values

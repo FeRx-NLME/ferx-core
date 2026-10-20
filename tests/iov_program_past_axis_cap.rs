@@ -12,7 +12,8 @@
 //! evaluated in two θ-column chunks whose blocks are bit-identical to the one-chunk
 //! evaluation (pinned in Tier 1, `sens::provider::tests::iov_program_*`). What this pins is
 //! the wiring: a real fit of the 25-axis model reports no subject on finite differences.
-//! Mutation: `iov_combined_derivs_dyn` returning `None` past 24 axes again — the pad18 fit
+//! Mutation (pre-#2093; `iov_combined_derivs_dyn` was retired in #2093): it returning
+//! `None` past 24 axes again — the pad18 fit
 //! then warns that 10 of 10 subjects use finite-difference inner gradients and that 10 of
 //! 10 could not be given the exact analytic outer gradient (63 s instead of 11 s, debug).
 //!

@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// differences. The choice is [`analytic_inner_grad_supported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InnerGradientMethod {
-    /// Exact analytic η-gradient from the `Dual2` sensitivity provider — one
-    /// provider evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
+    /// Exact analytic η-gradient from the adjoint's unified recorder
+    /// (`exact_obs_grads_into` / `exact_inner_gradient`) — one
+    /// recorder evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
     /// Central finite differences. Used when the provider can't serve the model
     /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
@@ -66,7 +67,8 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     // Eta-dependent `[scaling] obs_scale`. VESTIGIAL: the retired Enzyme-AD path froze the
     // scale subject-static and dropped `d obs_scale / d eta`, so it routed here to FD. The
     // LIVE inner path now serves a differentiable `ExpressionScale` analytically via the
-    // η-quotient rule (#486, `provider::apply_expression_scale_inner`), and
+    // η-quotient rule (#486; since #2093 the adjoint recorder's on-tape quotient,
+    // `apply_expression_scale` / `closed_form_finish` in `sens/ode_adjoint.rs`), and
     // `analytic_inner_grad_supported_model` does NOT bail on it. This branch is retained
     // only as the historical named reason (this whole fn is dead — see the header); it no
     // longer reflects routing. The divergence is pinned by `analytical_ad_unsupported_flags_each_class`.
@@ -186,33 +188,27 @@ fn iov_inner_subject_route(
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
-    // The **η-only** predicate (#1015): this route asks for `deta` and nothing else, so a
-    // program whose θ-axis count does not match `model.n_theta` (every `[covariate_nn]`
-    // model) is still exactly served. Must stay the same predicate `analytic_iov_inner` and
-    // `inner_reports_analytic_model` use, or the reported route drifts from the taken one.
-    if !crate::sens::provider::iov_sens_eta_supported(model)
-        || model.default_params.omega_iov.is_none()
+    if model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
         || subject_has_survival_records(subject)
-        || iov_inner_residual_correlation(model, subject)
     {
         return None;
     }
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
-    let n_flat = stacked_width(model.n_eta, model.n_kappa, k_occasions);
-    let stacked = vec![0.0; n_flat];
-    crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
+    let stacked = vec![0.0; stacked_width(model.n_eta, model.n_kappa, k_occasions)];
+    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, &stacked)
 }
 
 /// Whether an IOV subject's residuals are correlated across rows by a `correlation … by`
-/// line (#1082 PR5). The analytic IOV inner gradient
-/// (`analytic_eta_nll_gradient_iov_frozen`) differentiates the per-row diagonal data term
-/// and has no dense-`R` form, so such a subject's EBE search runs on central differences
-/// of its (dense) objective. A subject whose blocks are all singletons has a diagonal `R`
-/// and keeps the analytic gradient. Value-free, like `has_cross_observation_residual`: a
+/// line (#1082 PR5). The per-row IOV inner gradient (`analytic_eta_nll_gradient_iov_frozen`)
+/// differentiates the diagonal data term and has no dense-`R` form, so such a subject's EBE
+/// search takes the adjoint kernel's exact inner gradient instead (`exact_inner_gradient`,
+/// whose `l` carries the dense `R`; #2101). A subject whose blocks are all singletons
+/// has a diagonal `R` and keeps the per-row gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
-    crate::sens::provider::kappa_residual_correlation_fd_route(model)
+    model.n_kappa > 0
+        && model.residual_serial.is_some()
         && crate::stats::residual_error::has_cross_observation_residual(
             &model.error_spec,
             subject,
@@ -225,7 +221,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
-    if crate::sens::provider::nested_levels_outside_analytic_scope(model) {
+    if crate::sens::ode_provider::adjoint::nested_levels_outside_scope(model) {
         return "nested variability levels on a closed-form transit/IG model";
     }
     if analytic_inner_common_bail(model) {
@@ -237,101 +233,26 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
     }
-    if iov_inner_residual_correlation(model, subject) {
-        return "residual correlation";
-    }
-    if !crate::sens::provider::iov_sens_eta_supported(model) {
+    if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
     }
-    // A nested-level subject never given its cells has no compact axes (#1082): every walk
-    // declines it (`StackedLayout::sens_of` is `None`), on every model class.
+    // A nested-level subject never given its cells has no compact axes (#1082): every
+    // recording declines it (`StackedLayout::sens_of` is `None`), on every model class.
     if crate::stats::nested_levels::unprepared(model, subject) {
         return "nested-level subject without level cells";
     }
-    // #814: attribute against the *effective* model for this subject. A closed-form
-    // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
-    // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
-    // analytic primary's own `ode_spec` is `None` — the same reroute `is_ode_iov` and
-    // `inner_stall_enabled` already track. `effective_for` returns `self` for a genuine ODE
-    // model and for every non-rerouted subject, so this is unchanged for them. A subject the
-    // absorption walk serves (#1560) is never here: the walk takes only subjects whose
-    // gradient it can serve analytically (`walk_eligible`), so an FD subject of such a model
-    // is one the twin served — which is what `effective_for` names.
-    let eff = model.effective_for(subject);
-    if eff.ode_spec.is_some() {
-        // Single scan for the periodic steady-state predicate, mirroring
-        // `ode_iov_subject_supported`'s hoisted `has_ss` so the attribution order and
-        // the gate can't drift.
-        let has_ss = subject.has_periodic_ss_dose();
-        // Modeled-`RATE`/duration doses are analytic under IOV since #486 (the per-occasion
-        // modeled-window jet rides the rate-off saltation) — including combined with
-        // steady-state (#486: `equilibrate_ss_state_g` now threads the same jet into its
-        // per-cycle active/quiet split), EXCEPT when a `D{cmt}`/`R{cmt}` slot is absent —
-        // mirror `ode_iov_subject_supported`'s screen so this attribution can't drift.
-        if !subject.all_doses_fixed() {
-            let attr_map = eff.active_dose_attr_map();
-            let all_slots_present = subject.doses.iter().all(|d| {
-                matches!(d.rate_mode, crate::types::RateMode::Fixed)
-                    || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some()
-            });
-            if !all_slots_present {
-                return "modeled RATE/DURATION dose with missing D/R slot";
-            }
-        }
-        // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
-        // (they are checked *before* the occasion/axis gates below, so omitting
-        // them would misattribute an SS bail to a later reason). #590 review. A
-        // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
-        // with an estimated lagtime, are both analytic now (#486).
-        // `reads_model_time`, mirroring `ode_iov_subject_supported` exactly: asking the
-        // bare `uses_time_vars` here would misattribute a bare-`TIME` SS bail to a later
-        // reason once that gate declines it (#1124).
-        if has_ss
-            && eff
-                .ode_spec
-                .as_ref()
-                .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| p.reads_model_time())
-        {
-            return "steady-state dose + time-dependent ODE RHS";
-        }
-        // Infusion into a built-in absorption compartment (#719 gap 2) declines to FD under IOV
-        // (the dual walk's `+rate` would double-count the mass the convolved `R_in_inf` already
-        // delivers). `ode_iov_subject_supported` checks this *before* its SS-absorption bail, so
-        // naming it here keeps the attribution from drifting to the generic catch-all below.
-        if crate::sens::ode_provider::has_infusion_into_input_rate(eff, subject) {
-            return "infusion into built-in absorption compartment";
-        }
-        // #835: a steady-state dose into a built-in absorption compartment is analytic for the
-        // smooth density kernels (transit/igd/weibull/first_order) — the dual fixed point carries
-        // its κ-coupled sensitivity. Only SS into a `zero_order` window and SS + an absorption
-        // lagtime stay on FD; mirror `ode_iov_subject_supported`'s flipped bail via the shared
-        // `CompiledModel::ss_absorption_out_of_scope` so this attribution can't drift.
-        if eff.ss_absorption_out_of_scope(subject) {
-            return "steady-state dose + built-in absorption forcing";
-        }
-        // The walk's layout: its width is the compact axis count under nested levels. A
-        // subject `sens_of` declines is the unprepared one, already named above.
-        let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(eff, subject)
-        else {
-            return "nested-level subject without level cells";
-        };
-        if layout.n_groups() == 0 {
-            return "no observation occasions";
-        }
-        let m_dim = eff.n_theta + layout.n_axes();
-        if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
-            return "ODE IOV stacked axis cap";
-        }
+    if crate::sens::ode_provider::adjoint::subject_width(model, subject)
+        .is_some_and(|w| w > crate::sens::ode_provider::adjoint::MAX_WIDTH)
+    {
+        return "stacked [η, κ] past the widest dispatch bucket";
     }
     // Reached only for an FD subject (the caller invokes this after
-    // `iov_inner_subject_route(..).is_none()`), so this is the catch-all for any
-    // provider bail not enumerated above — never the analytic case.
+    // `iov_inner_subject_route(..).is_none()`): a shape no recorder serves.
     "subject outside IOV analytic scope"
 }
 
 /// Warning when *some but not all* subjects fall back to the FD inner gradient
-/// (outside the analytic provider's scope — SS+reset, time-varying covariates,
+/// (a shape no analytic recorder serves — formerly SS+reset, time-varying covariates,
 /// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
 /// population: all-analytic needs no warning, and all-FD is a model-level property
 /// already obvious from the banner and the model itself. Surfaced into
@@ -361,7 +282,9 @@ pub(crate) fn fd_fallback_warning(
     let n_fd = population
         .subjects
         .iter()
-        .filter(|s| crate::sens::provider::subject_eta_grad(model, s, theta, &zeros).is_none())
+        .filter(|s| {
+            crate::sens::ode_provider::adjoint::exact_obs_grads(model, s, theta, &zeros).is_none()
+        })
         .count();
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
@@ -385,9 +308,9 @@ pub(crate) fn fd_fallback_warning(
                 .unwrap_or_default();
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
-             (outside the analytic provider's scope, e.g. steady-state + reset, \
-             time-varying covariates + LTBS, or modeled-duration doses); their \
-             results are correct but slower.{tolerance_note}"
+             (a shape no analytic recorder serves, e.g. an SDE, a per-CMT \
+             `obs_scale`, or more than 48 random effects); their results are correct \
+             but slower.{tolerance_note}"
         ))
     } else {
         None
@@ -511,9 +434,9 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
-    /// Exact conditional eta Hessian at the returned mode when the second-order
-    /// sensitivity provider can produce it.  Laplace/AGQ may reuse this instead
-    /// of immediately repeating the same `Dual2` evaluation.
+    /// Exact conditional eta Hessian at the returned mode when the adjoint
+    /// (`exact_inner_hessian`) can produce it.  Laplace/AGQ may reuse this instead
+    /// of immediately repeating the same evaluation.
     pub(crate) terminal_hessian: Option<DMatrix<f64>>,
     /// True when the returned η̂ is certified stationary: BFGS met `gnorm < tol` (or its
     /// objective-stall stop on a noise-floored objective), or a Nelder–Mead fallback result
@@ -570,7 +493,7 @@ fn analytic_inner_seed_hessian(
     }
     // The seed is a provider product like the fused gradient, so it honours the same escape
     // hatches (`gradient = fd`, `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop
-    // to FD because the analytic provider misbehaves on their model must get the historical
+    // to FD because the analytic gradient misbehaves on their model must get the historical
     // unseeded solve back, not FD gradients against a provider-built metric.
     if analytic_inner_common_bail(model) {
         return None;
@@ -605,14 +528,10 @@ fn analytic_inner_seed_hessian(
     }
     if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
-        if let Some(sens) = crate::sens::provider::subject_eta_grad_with_schedule(
-            model,
-            subject,
-            &params.theta,
-            eta,
-            schedule,
-            hint,
-        ) {
+        let _ = (schedule, hint);
+        if let Some(sens) =
+            crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, &params.theta, eta)
+        {
             let mut htilde = params.omega.inv.clone();
             let mut gradient = vec![0.0; model.n_eta];
             let m3 = matches!(model.bloq_in_force(), crate::types::BloqMethod::M3);
@@ -667,13 +586,8 @@ fn analytic_inner_seed_hessian(
                     )
                     .1
                 } else {
-                    crate::estimation::sens_outer_gradient::err_terms(
-                        r,
-                        d,
-                        d2,
-                        subject.observations[j] - obs.f,
-                    )
-                    .p
+                    // The Gauss–Newton weight `p = 1/R + ½(d/R)²` (FOCEI's `H̃` row scalar).
+                    1.0 / r + 0.5 * (d / r) * (d / r)
                 };
                 if !p.is_finite() {
                     valid = false;
@@ -698,31 +612,15 @@ fn analytic_inner_seed_hessian(
             }
         }
     }
-    // The full-provider seed is a metric only (no fused gradient), valid under a frozen
-    // variance for the reason given at `frozen_var_preds` above.
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
-    crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        model.n_eta,
-        &params.omega.inv,
-        eta,
-        model.residual_error_eta,
-    )
-    .map(|core| {
-        if exact {
-            // Laplace's integration correction is defined by the exact
-            // conditional Hessian. Use that same curvature for its BFGS seed;
-            // `init_h_inv` accepts it only when Cholesky proves it SPD.
-            (core.h_inner, None)
-        } else {
-            // nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
-            // Gauss-Newton/Almquist curvature is the FO-family metric.
-            (core.htilde, None)
-        }
-    })
+    // The full seed is a metric only (no fused gradient), valid under a frozen variance for
+    // the reason given at `frozen_var_preds` above: the unified recording's exact Hessian
+    // (Laplace) or `H̃`.
+    let unified = if exact {
+        crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, eta)
+    } else {
+        crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, eta)
+    };
+    unified.map(|h| (h, None))
 }
 
 /// Terminal `(∂f/∂η Jacobian, exact conditional η-Hessian)` at the converged EBE, from one
@@ -747,28 +645,17 @@ pub(crate) fn analytic_terminal_work(
     if !crate::estimation::agq::analytic_score_supported(model) {
         return None;
     }
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
-    let core = crate::estimation::sens_outer_gradient::score_core(
-        model,
-        subject,
-        params,
-        &sens,
-        model.n_eta,
-        &params.omega.inv,
-        eta,
-        model.residual_error_eta,
-    )?;
-    let mut jac = DMatrix::zeros(subject.obs_times.len(), model.n_eta);
-    if sens.obs.len() != jac.nrows() {
+    // `∂f/∂η` and the exact Hessian from one tape-free recording each.
+    use crate::sens::ode_provider::adjoint::{exact_eta_jacobian, exact_inner_hessian};
+    let (mut jac, h) = (
+        exact_eta_jacobian(model, subject, &params.theta, eta)?,
+        exact_inner_hessian(model, subject, params, eta)?,
+    );
+    if jac.nrows() != subject.obs_times.len() {
         return None;
     }
-    for (row, obs) in sens.obs.iter().enumerate() {
-        for col in 0..model.n_eta {
-            jac[(row, col)] = obs.df_deta[col];
-        }
-    }
     overwrite_frem_pseudo_obs_rows(&mut jac, model, subject, model.n_eta);
-    Some((jac, core.h_inner))
+    Some((jac, h))
 }
 
 /// `FERX_NO_TERMINAL_HESSIAN_REUSE=1` — internal A/B switch that keeps Laplace/AGQ
@@ -1093,7 +980,7 @@ impl FallbackCertifier<'_> {
         if gnorm.is_finite() && gnorm < self.tol {
             return true;
         }
-        if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g) {
+        if !(self.stall_at)(x) && self.newton_certifies(obj, x, &g, admissible) {
             return true;
         }
         // A gradient driver, whatever `inner_optimizer` selects: under `nelder_mead` the
@@ -1142,14 +1029,98 @@ impl FallbackCertifier<'_> {
     }
 
     /// Test 2 of [`Self::certify`]: the Hessian of `grad` at `x` (symmetrised central
-    /// differences, `2n` gradient evaluations) is positive definite, and either the Newton
-    /// step `‖H⁻¹g‖₂` is below `tol` or the decrease it predicts, `½gᵀH⁻¹g`, is at or below
-    /// the objective's resolution `INNER_FTOL_REL·(1 + |f|)`. Any non-finite entry, or a
+    /// differences, `2n` gradient evaluations) is positive definite, and the point is within
+    /// `tol` of its mode by the Newton step `‖H⁻¹g‖₂`, by the gradient norm after the step, or
+    /// by the resolution arm (`½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`). Any non-finite entry, or a
     /// failed Cholesky, is "not certified".
-    fn newton_certifies(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64], g: &[f64]) -> bool {
+    ///
+    /// **Takes the Newton step it computes** (up to [`NEWTON_CERT_STEPS`]), keeping each only
+    /// when it is admissible and either lowers the objective or, within the objective's
+    /// rounding, lowers the gradient norm — so `x` is never made worse beyond rounding. The
+    /// resolution arm alone used to certify a point without moving it: at curvature ~100 it
+    /// admits `‖∇l‖ ~ 1e-4`, so a fallback EBE asked for `tol = 1e-12` came back ~1e-6 from its
+    /// mode (measured `‖∇l‖` up to 3e-7 on a one-compartment oral fixture). The FOCEI objective
+    /// is not stationary in η, so that miss enters the marginal to first order. The step
+    /// converges quadratically from there, so the requested `tol` is met wherever the
+    /// objective can resolve it, and the resolution arm still certifies the rest.
+    fn newton_certifies(
+        &self,
+        obj: &dyn Fn(&[f64]) -> f64,
+        x: &mut Vec<f64>,
+        g: &[f64],
+        admissible: &dyn Fn(&[f64]) -> bool,
+    ) -> bool {
+        let n = x.len();
+        let mut g = g.to_vec();
+        for _ in 0..NEWTON_CERT_STEPS.min(self.max_iter) {
+            let Some(newton) = self.pd_newton_step(x, &g) else {
+                return false;
+            };
+            let step_norm = newton.norm();
+            if !step_norm.is_finite() {
+                return false;
+            }
+            if step_norm < self.tol {
+                return true;
+            }
+            let f = obj(x);
+            let cand: Vec<f64> = (0..n).map(|i| x[i] - newton[i]).collect();
+            // Kept when the objective falls, or — once the step's predicted gain is below what
+            // the objective can resolve — when it stays within its rounding and the gradient
+            // norm falls: there the exact gradient is the only instrument that can still see
+            // the mode, and a PD Newton step that shrinks it is moving toward it.
+            let accepted = if cand.iter().all(|v| v.is_finite()) && admissible(&cand) {
+                let fc = obj(&cand);
+                let rounding = 8.0 * f64::EPSILON * (1.0 + f.abs());
+                if fc <= f {
+                    Some((self.grad)(&cand))
+                } else if fc <= f + rounding {
+                    let gc = (self.grad)(&cand);
+                    (grad_norm_metric(&gc, self.stop_precond)
+                        < grad_norm_metric(&g, self.stop_precond))
+                    .then_some(gc)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(gc) = accepted else {
+                // The resolution arm. `½gᵀH⁻¹g` is what a full Newton step would still gain;
+                // when it is no larger than the relative change the objective-stall stop
+                // already treats as *flat* (`INNER_FTOL_REL`, #555), no step from here is
+                // distinguishable from rounding in the objective, and the point is a mode to
+                // the precision the objective defines. This is what makes the certificate
+                // independent of `tol`: at `inner_tol = 1e-8` a well-curved η sits ~1e-7 from
+                // its mode before the line search can no longer resolve a decrease, so a step
+                // test alone reported the converged subjects of the Schnider NONMEM anchor fit
+                // unconverged and the EBE guard rejected its start (#1527).
+                let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+                return f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs());
+            };
+            *x = cand;
+            g = gc;
+            let gnorm = grad_norm_metric(&g, self.stop_precond);
+            if gnorm.is_finite() && gnorm < self.tol {
+                return true;
+            }
+        }
+        // Still short of `tol` after the steps: certified by the resolution arm at the point
+        // they reached, as before.
+        let Some(newton) = self.pd_newton_step(x, &g) else {
+            return false;
+        };
+        let f = obj(x);
+        let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+        newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
+    }
+
+    /// `H⁻¹g` for the central-difference Hessian of `grad` at `x`, or `None` when `g` or `H`
+    /// is non-finite or `H` is not positive definite.
+    fn pd_newton_step(&self, x: &[f64], g: &[f64]) -> Option<DVector<f64>> {
         let n = x.len();
         if n == 0 || !g.iter().all(|v| v.is_finite()) {
-            return false;
+            return None;
         }
         let mut h = DMatrix::<f64>::zeros(n, n);
         let mut probe = x.to_vec();
@@ -1166,33 +1137,19 @@ impl FallbackCertifier<'_> {
         }
         let h = (&h + h.transpose()) * 0.5;
         if !h.iter().all(|v| v.is_finite()) {
-            return false;
+            return None;
         }
-        let Some(chol) = h.cholesky() else {
-            return false;
-        };
-        let gv = DVector::from_column_slice(g);
-        let newton = chol.solve(&gv);
-        let step_norm = newton.norm();
-        if !step_norm.is_finite() {
-            return false;
-        }
-        if step_norm < self.tol {
-            return true;
-        }
-        // The resolution arm. `½gᵀH⁻¹g` is what a full Newton step would still gain; when it
-        // is no larger than the relative change the objective-stall stop already treats as
-        // *flat* (`INNER_FTOL_REL`, #555), no step from here is distinguishable from rounding
-        // in the objective, and the point is a mode to the precision the objective defines.
-        // This is what makes the certificate independent of `tol`: at `inner_tol = 1e-8` a
-        // well-curved η sits ~1e-7 from its mode before the line search can no longer resolve
-        // a decrease, so a step test alone reported the converged subjects of the Schnider
-        // NONMEM anchor fit unconverged and the EBE guard rejected its start (#1527).
-        let f = obj(x);
-        let decrement = 0.5 * gv.dot(&newton);
-        f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs())
+        let chol = h.cholesky()?;
+        Some(chol.solve(&DVector::from_column_slice(g)))
     }
 }
+
+/// Newton steps the fallback certificate may take ([`FallbackCertifier::newton_certifies`]),
+/// and never more than the caller's iteration budget (`max_iter`). From a point the resolution
+/// arm would have certified the step converges quadratically, so two or three reach the
+/// requested `tol`; the bound keeps a step that cannot (a noisy or barely-convex objective)
+/// from costing more than a few Hessians.
+const NEWTON_CERT_STEPS: usize = 3;
 
 /// Relative central-difference step for the Hessian in the fallback's Newton-step certificate
 /// ([`FallbackCertifier`] test 2): `h_j = NEWTON_CERT_FD_STEP·(1 + |η_j|)`. The certificate needs
@@ -1917,7 +1874,7 @@ fn find_ebe_solve(
     // Per-subject `ObsGrad` buffer, reused across every inner BFGS step the same
     // way `pk_scratch_cell` is: `analytic_eta_nll_gradient_with_schedule` takes its
     // previous contents as a reuse hint and stores the fresh result back, so the
-    // light sensitivity provider's closed-form path overwrites its `ObsGrad`s'
+    // unified recorder (`exact_obs_grads_into`) overwrites its `ObsGrad`s'
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
@@ -1974,8 +1931,8 @@ fn find_ebe_solve(
         )
     };
 
-    // BFGS with the exact analytic η-gradient from the sensitivity provider when
-    // in scope (Almquist et al. 2015): one provider evaluation per inner step
+    // BFGS with the exact analytic η-gradient from the adjoint's recorder when
+    // in scope (Almquist et al. 2015): one recorder evaluation per inner step
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
     // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
     //
@@ -1996,14 +1953,34 @@ fn find_ebe_solve(
     // throughout. Checking the fallback with a *different* (FD) gradient than the analytic
     // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
     let use_analytic = analytic_inner_grad_supported(model, subject);
+    let opted_out = inner_analytic_opted_out(model);
     let profile = inner_profile_enabled();
     let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
     let agrad = |e: &[f64]| -> Vec<f64> {
         if let Some(g) = fused_first_gradient.borrow_mut().take() {
             return g;
         }
+        let exact = || {
+            if opted_out {
+                return None;
+            }
+            crate::sens::ode_provider::adjoint::exact_inner_gradient(
+                model, subject, params, e, frozen,
+            )
+        };
         if !use_analytic {
-            return gradient_fd(&obj, e, n_eta);
+            return match exact() {
+                Some(g) => {
+                    #[cfg(test)]
+                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
+                None => {
+                    #[cfg(test)]
+                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, e, n_eta)
+                }
+            };
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -2032,6 +2009,10 @@ fn find_ebe_solve(
                 g
             }
             None => {
+                if let Some(g) = exact() {
+                    GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
+                    return g;
+                }
                 let g = gradient_fd(&obj, e, n_eta);
                 GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                 if profile {
@@ -2442,8 +2423,14 @@ fn ebe_h_matrix(
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
         match captured_jac {
             Some(jac) => Some(jac),
-            None => crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, eta)
-                .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j)),
+            None => crate::sens::ode_provider::adjoint::exact_obs_grads(
+                model,
+                subject,
+                &params.theta,
+                eta,
+            )
+            .filter(|rows| rows.len() == subject.obs_times.len())
+            .map(|rows| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k])),
         }
         .filter(|j| j.iter().all(|v| v.is_finite()))
     } else {
@@ -2459,13 +2446,31 @@ fn ebe_h_matrix(
     // directly undercut the speed premise (PR #381 review finding #10).
     match analytic_jac {
         Some(j) => j,
-        None => {
-            // FD Jacobian fallback for models the analytic provider doesn't cover.
-            let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
-            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-            j
-        }
+        // The exact Jacobian from the adjoint's recording (every engine it serves).
+        None => match (!inner_analytic_opted_out(model))
+            .then(|| {
+                crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta,
+                )
+            })
+            .flatten()
+        {
+            Some(mut j) => {
+                overwrite_frem_pseudo_obs_rows(&mut j, model, subject, n_eta);
+                j
+            }
+            None => {
+                // FD Jacobian fallback for models no exact provider covers.
+                let t0 = std::time::Instant::now();
+                let j =
+                    compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
+                GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+                j
+            }
+        },
     }
 }
 
@@ -2494,15 +2499,7 @@ pub(crate) fn ebe_h_matrices_at(
         .map(|(i, subject)| {
             // The same branch `find_ebe_impl` takes.
             if model.n_kappa > 0 && !subject.occasions.is_empty() {
-                let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject);
-                iov_ebe_h_matrix(
-                    model,
-                    subject,
-                    params,
-                    layout.as_ref(),
-                    etas[i].as_slice(),
-                    &kappas[i],
-                )
+                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
             } else {
                 let schedule = cacheable_schedule(model, subject);
                 ebe_h_matrix(
@@ -2526,6 +2523,11 @@ thread_local! {
     /// per-iterate fallback — the fit still reports the analytic route — so a test that
     /// means "the search ran on the analytic gradient" reads this (#2053 review 1).
     pub(crate) static IOV_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    /// `(exact, fd)` inner-gradient evaluations of `find_ebe` on this thread when the legacy
+    /// analytic route is out of scope (`gradient = fd`, the escape hatch, or a shape it
+    /// declines): the adjoint kernel's exact gradient, or central differences.
+    pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
 }
 
@@ -2647,26 +2649,28 @@ fn find_ebe_iov(
     // analytic stacked-η gradient when the ODE IOV provider serves this model (one
     // provider eval per inner step vs ~2·n_flat+1 predictions for FD, and exact → fewer
     // steps); per-step FD fallback if a given (θ, stacked-η) is out of provider scope.
-    // Covers both the ODE IOV provider (RHS-program models) and the closed-form
-    // analytical IOV provider — both now expose an analytic stacked-η inner gradient
-    // via `subject_eta_grad_iov`.
+    // Covers both the ODE (RHS-program models) and the closed-form engines — both
+    // expose the exact stacked-η inner gradient through the adjoint recorder
+    // (`adjoint::exact_obs_grads_in`, called by `analytic_eta_nll_gradient_iov_frozen`).
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
     // hits a common bail (escape hatch, `gradient = fd`, SDE, or magnitude × correlated
     // residual) or the subject carries survival/TTE records (whose hazard term the analytic
     // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
     // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
-    // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
-    // `ExpressionScale` divisor, so `iov_sens_supported` is `true` and the
-    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient
-    // (`apply_expression_scale_iov`). A constant `ScalarScale` divisor is now analytic under
-    // IOV on both engines (#486 parity — closed-form `run_obs_iov{,_eta}` divide the jet by
-    // `k`; the ODE readout `apply_output_transform` already divides `p/k` in-walk over the
-    // stacked dual). **LTBS × IOV is analytic here too as of #486** — `run_obs_iov_eta`
-    // applies the shared `ln` jet last over the stacked axes, so `log_transform` is no
-    // longer a common bail at any κ count. ODE-IOV × LTBS still routes to FD, but via
-    // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
-    // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
+    // now served analytically too (#575): the IOV scope (pre-#2093 `ode_iov_supported` /
+    // `iov_sens_supported`, now the adjoint's `recorder_in_scope`) admits a non-LTBS
+    // `ExpressionScale` divisor, so the
+    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient (the
+    // recorders' per-group scale in `record_ode_iov` / `record_analytic_events`). A constant
+    // `ScalarScale` divisor is now analytic under IOV on both engines (#486 parity — the
+    // closed-form `closed_form_finish` divides the taped prediction by `k`; the ODE readout
+    // `apply_output_transform` already divides `p/k` in-walk over the stacked dual).
+    // **LTBS × IOV is analytic here too as of #486** — the closed-form event recorder applies
+    // `ltbs_log_g` last over the stacked axes, so `log_transform` is no
+    // longer a common bail at any κ count. (Before #2093, ODE-IOV × LTBS still routed to
+    // FD, via the retired `iov_sens_supported` / `ode_iov_supported` scope, not via the
+    // bail.) Without these guards a joint IOV + TTE / `gradient = fd` fit would
     // converge EBEs against an incomplete gradient.
     // The `H` Jacobian (`iov_ebe_h_matrix`) stays analytic under a residual correlation:
     // it is `∂f/∂η`, which `R` does not enter. Only the gradient of the (dense) objective
@@ -2696,11 +2700,47 @@ fn find_ebe_iov(
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
+    // The recording's exact stacked gradient, at η_true (identical in psi-space).
+    let opted_out = inner_analytic_opted_out(model);
+    let exact = |p: &[f64]| {
+        if opted_out {
+            return None;
+        }
+        let mut stacked_true = p.to_vec();
+        for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+            *st = p[k] - mu[k];
+        }
+        if nested.is_some() {
+            // The recording reads the per-cell stack, and returns the gradient over the
+            // compact vector `p` lives in (#1082).
+            stacked_true.truncate(n_eta);
+            stacked_true.extend(to_kappas(p).into_iter().flatten());
+        }
+        crate::sens::ode_provider::adjoint::exact_inner_gradient_in(
+            model,
+            subject,
+            layout.as_ref(),
+            params,
+            &stacked_true,
+            frozen,
+        )
+    };
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
-            #[cfg(test)]
-            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-            return gradient_fd(&obj, p, n_flat);
+            // The kernel's exact gradient where it serves the subject; it declines a
+            // dense IOV residual (#1082 PR5), whose search runs on central differences.
+            return match exact(p) {
+                Some(g) => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
+                None => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, p, n_flat)
+                }
+            };
         }
         let Some(layout) = &layout else {
             // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
@@ -2738,11 +2778,18 @@ fn find_ebe_iov(
                 IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 g
             }
-            None => {
-                #[cfg(test)]
-                IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                gradient_fd(&obj, p, n_flat)
-            }
+            None => match exact(p) {
+                Some(g) => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
+                    g
+                }
+                None => {
+                    #[cfg(test)]
+                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+                    gradient_fd(&obj, p, n_flat)
+                }
+            },
         }
     };
 
@@ -2869,15 +2916,7 @@ fn find_ebe_iov(
         .map(|k| DVector::from_column_slice(k))
         .collect();
 
-    // The search's own layout (#2037 review 1).
-    let h_matrix = iov_ebe_h_matrix(
-        model,
-        subject,
-        params,
-        layout.as_ref(),
-        &bsv_eta,
-        &kappas_vec,
-    );
+    let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -2900,67 +2939,48 @@ fn analytic_iov_inner_supported(
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
-    crate::sens::provider::iov_sens_eta_supported(model)
+    crate::sens::ode_provider::adjoint::model_in_scope(model)
         && params.omega_iov.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject)
 }
 
 /// The `H` matrix an IOV EBE solve reports at `(bsv_eta, kappas)`: BSV columns only
-/// (`∂f/∂η_bsv` with κ fixed at the EBE). The BSV block of the analytic stacked-η Jacobian
-/// is exactly this, so reuse the provider when it serves this subject; else the FD
-/// Jacobian. Like [`ebe_h_matrix`], a function of the EBE alone (#2026).
-///
-/// `layout` is the subject's `StackedLayout::sens_of`: the EBE search passes its own
-/// (#2037), and a caller with none builds it.
+/// (`∂f/∂η_bsv` with κ fixed at the EBE) — the BSV block of the exact stacked
+/// η-Jacobian from the adjoint's recording, else the FD Jacobian. Like
+/// [`ebe_h_matrix`], a function of the EBE alone (#2026).
 fn iov_ebe_h_matrix(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
     bsv_eta: &[f64],
     kappas: &[DVector<f64>],
 ) -> DMatrix<f64> {
     let n_eta = model.n_eta;
-    let analytic = if analytic_iov_inner_supported(model, subject, params) {
-        let mut stacked_hat = bsv_eta.to_vec();
-        for k in kappas {
-            stacked_hat.extend(k.iter().copied());
-        }
-        // `None` is the unprepared subject, which no walk serves.
-        layout.and_then(|l| {
-            crate::sens::provider::subject_eta_grad_iov_in(
+    let mut stacked_hat = bsv_eta.to_vec();
+    for k in kappas {
+        stacked_hat.extend(k.iter().copied());
+    }
+    let n_obs = subject.obs_times.len();
+    match (!inner_analytic_opted_out(model))
+        .then(|| {
+            crate::sens::ode_provider::adjoint::exact_eta_jacobian(
                 model,
                 subject,
-                l,
                 &params.theta,
                 &stacked_hat,
             )
         })
-    } else {
-        None
-    };
-    match analytic {
-        // Require one sensitivity row per observation — the indexed writes below would
-        // otherwise panic and abort the fit. The provider's scope gates hold this
-        // invariant today; guard it so a future mismatch degrades to FD instead of
-        // crashing, mirroring the outer `subject_packed_gradient_foce_iov` check (#466
-        // review round 4 #7).
-        Some(sens) if sens.len() == subject.obs_times.len() => {
-            let n_obs = subject.obs_times.len();
-            let mut h = DMatrix::zeros(n_obs, n_eta);
-            for (j, obs) in sens.iter().enumerate() {
-                for k in 0..n_eta {
-                    h[(j, k)] = obs.df_deta[k];
-                }
-            }
-            // Match the FD path: FREM covariate pseudo-obs rows carry the exact {0,1}
-            // Jacobian, which the provider's PK-prediction sensitivity does not emit
-            // (#466 review #9).
+        .flatten()
+        .filter(|j| j.nrows() == n_obs && j.ncols() >= n_eta)
+    {
+        Some(j) => {
+            let mut h = j.columns(0, n_eta).into_owned();
+            // FREM covariate pseudo-obs rows carry the exact {0,1} Jacobian (#466 review #9).
             overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
             h
         }
-        _ => {
+        None => {
             let kappas_slices: Vec<Vec<f64>> =
                 kappas.iter().map(|k| k.as_slice().to_vec()).collect();
             compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
@@ -3033,7 +3053,7 @@ fn compute_jacobian_fd_iov(
 /// both the FD and the analytic IOV H-matrix so the analytic branch does not silently drop
 /// the correction the FD path performs (#466 review #9). No-op when the model isn't FREM
 /// or the subject carries no pseudo-obs rows.
-fn overwrite_frem_pseudo_obs_rows(
+pub(crate) fn overwrite_frem_pseudo_obs_rows(
     h: &mut DMatrix<f64>,
     model: &CompiledModel,
     subject: &Subject,
@@ -3061,8 +3081,9 @@ fn overwrite_frem_pseudo_obs_rows(
 /// L-BFGS two-loop recursion: the search direction `d = −H·g` from the bounded
 /// `(s, y, ρ)` history, with implicit initial Hessian `H₀ = γI`,
 /// `γ = sᵀy / yᵀy` of the most recent pair (Nocedal & Wright, Alg. 7.4). With an
-/// empty history this returns `−g` (steepest descent), so the first step matches
-/// the old dense-BFGS start. A diagonal `precond` (FREM, issue #406) replaces the
+/// empty history this returns `−H₀·g` (steepest descent) unscaled; `lbfgs_core` bounds it as
+/// dense BFGS bounds its first step ([`h0_step_scale`] on the identity,
+/// [`cap_curvature_free_step`] under a preconditioner), so the two starts match. A diagonal `precond` (FREM, issue #406) replaces the
 /// scalar `γ` initial Hessian with `H₀ = diag(precond)`, so the central scaling
 /// step is per-dimension instead of a single ill-scaled `γ`.
 fn lbfgs_direction(
@@ -3257,41 +3278,51 @@ pub fn profile_report() {
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
 ///
-/// LTBS is **no longer** a blanket common bail. The plain closed-form inner provider applies
-/// the `g = ln(f)` jet transform (`subject_eta_grad` → `run_obs_eta`), so it serves plain LTBS
+/// LTBS is **no longer** a blanket common bail. The adjoint recorder applies the `g = ln(f)`
+/// transform on the tape (`subject_eta_grad` → `adjoint::exact_obs_grads`; closed form in
+/// `closed_form_finish`, ODE in `apply_output_transform`), so it serves plain LTBS
 /// analytically; the covariance step reconverges those EBEs at the tighter `cov_inner_tol`
 /// ([`FitOptions::effective_cov_inner_tol`]) so the `ln`-amplified EBE noise no longer corrupts
 /// the SEs. LTBS + η-dependent `ExpressionScale` is served analytically on the inner too now
-/// (the η-quotient then the `ln f` jet, `subject_eta_grad`; validated by
-/// `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov (the event-driven
-/// inner walk applies the same jet last). **LTBS × IOV** is analytic on the inner too as of
-/// #486: `run_obs_iov_eta` applies the same shared `apply_ltbs_transform_inner` jet last, after
-/// the per-occasion scale quotient — the transform is a per-observation scalar quotient
-/// (`∂g/∂x = (∂f/∂x)/f`) identical on every stacked axis, so the κ columns need nothing the
-/// η_bsv columns do not. So `log_transform` is no longer a common bail at any κ count, and the
+/// on the closed form (the η-quotient then the `ln f`, `closed_form_finish`; validated before
+/// #2093 by the retired `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov
+/// (the event-driven walk applies the same transform last). **LTBS × IOV** is analytic on the inner
+/// too as of #486: the closed-form event recorder (`record_analytic_events`) applies `ltbs_log_g`
+/// last, after the per-occasion scale quotient — the transform is a per-observation scalar quotient
+/// (`∂g/∂x = (∂f/∂x)/f`) identical on every stacked axis, so the κ columns need nothing the η_bsv
+/// columns do not. So `log_transform` is no longer a common bail at any κ count, and the
 /// closed-form inner and outer IOV loops now differentiate the same `ln(f/s)`.
 ///
-/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
-/// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
-/// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
-/// walk *and* the TV-cov event-driven walk (#534/#486 — the scale is subject-static even
-/// under time-varying covariates, so one post-walk quotient covers both), so both run
-/// analytically. The **IOV** inner path serves it too (#486): both the closed-form
-/// (`subject_eta_grad_iov_analytical` → `run_obs_iov_eta`) and the ODE
-/// (`ode_subject_eta_grad_iov`) IOV inner walks apply a per-occasion-group post-walk
-/// quotient, so `iov_analytical_supported` / `ode_iov_supported` now admit `ExpressionScale`
-/// and the inner and outer loops stay matched. The **ODE** inner path does not consult this
-/// common bail at all — it has its own inline bail list in [`analytic_inner_grad_supported`]
-/// and its own per-subject scope (`ode_inner_grad_supported`, which admits exactly the
-/// static-walk and TV-cov-walk `ExpressionScale` that the ODE provider actually applies).
+/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the adjoint recorder
+/// (`subject_eta_grad` → `adjoint::exact_obs_grads`) applies the quotient on the tape —
+/// `closed_form_finish` on the closed form, `apply_expression_scale` on the ODE static walk *and*
+/// the TV-cov event-driven walk (#534/#486 — the scale is subject-static even under time-varying
+/// covariates, so one post-walk quotient covers both), so both run analytically. The **IOV** inner
+/// path serves it too (#486): both the closed-form (`record_analytic_events`) and the ODE
+/// (`record_ode_iov`) IOV recorders, reached through `adjoint::exact_obs_grads_in`, apply a
+/// per-occasion-group post-walk quotient, so the IOV scope (pre-#2093 `iov_analytical_supported` /
+/// `ode_iov_supported`, now the adjoint's `recorder_in_scope`) admits `ExpressionScale` and the
+/// inner and outer loops stay matched. Since #2093 the **ODE** inner path consults this common
+/// bail too (via [`analytic_inner_grad_supported_model`]); its per-subject scope is the
+/// recorder's own (`static_walk_subject_supported` / `event_walk_subject_supported`, which
+/// admit exactly the static-walk and event-walk `ExpressionScale` that `record_ode` applies).
+/// Whether the user switched the inner loop off analytic derivatives: `gradient = fd` or
+/// `FERX_NO_ANALYTIC_INNER=1`. Every exact route of the inner loop (the adjoint kernel's
+/// inner gradient, its η-Jacobian for `H`) honours it, so the search runs on the finite
+/// differences the gradient report says it does (#2093 review).
+pub(crate) fn inner_analytic_opted_out(model: &CompiledModel) -> bool {
+    no_analytic_inner_forced() || GradientMethod::forced_fd(model)
+}
+
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || GradientMethod::forced_fd(model)
         || model.is_sde()
         // LTBS is served analytically on the inner loop for every combination now — plain,
-        // × `ExpressionScale` (the η-quotient then the `ln f` jet, `subject_eta_grad`),
-        // × TV-cov (the event-driven inner walk applies the same jet LAST), and × IOV
-        // (`run_obs_iov_eta` applies it last over the stacked axes, #486). So there is no
+        // × `ExpressionScale` on the closed form (the η-quotient then the `ln f`,
+        // `closed_form_finish`), × TV-cov (the event-driven walk applies the same transform
+        // LAST), and × IOV (`record_analytic_events` applies `ltbs_log_g` last over the
+        // stacked axes, #486). So there is no
         // `log_transform` clause here: the closed-form inner and outer IOV gradients now
         // differentiate the same `ln(f/s)`, closing the last inner/outer scope split.
         // Correlated residual error (`block_sigma`) is now served analytically by the
@@ -3403,7 +3434,8 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
     // would be a pure misreport.
     //
-    // `analytical_supported` below does **not** catch this, which is the trap: an
+    // `recorder_in_scope` below does **not** catch this (nor did the retired
+    // `analytical_supported` it replaced), which is the trap: an
     // endpoint-only model (a `[markov_model]` with no `[structural_model]`) is *still* given
     // a default `pk_model` and a vacuous `tv_fn` (`model_parser.rs`, `tv_fn = Some(..)` for
     // any non-ODE model), and its `pk_indices` are empty so the per-slot check passes
@@ -3413,38 +3445,23 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
         return false;
     }
-    crate::sens::provider::analytical_supported(model)
+    // The unified recorder's scope, or an endpoint-only model (no structural model, no
+    // compartments), whose inner gradient is the prior plus the exactly-served endpoint term.
+    crate::sens::ode_provider::adjoint::recorder_in_scope(model)
+        || (model.ode_spec.is_none()
+            && !model.is_algebraic()
+            && model.pk_indices.is_empty()
+            && model.has_non_gaussian())
 }
 
 /// Whether the inner (per-subject EBE) loop reports an **analytic** gradient at the model
-/// level — the union of the three in-scope routes, each gated by the shared escape hatches:
-///   - **closed-form / CTMM** — [`analytic_inner_grad_supported_model`];
-///   - **ODE non-IOV** — the light `Dual1` walk
-///     ([`ode_inner_grad_supported_model`](crate::sens::provider::ode_inner_grad_supported_model)),
-///     which the closed-form predicate misses (ODE models have no `tv_fn`). The live ODE
-///     branch of [`analytic_inner_grad_supported`] now *delegates* to
-///     `analytic_inner_common_bail` rather than re-listing it, so the two cannot drift;
-///   - **IOV** — the stacked-η walk
-///     ([`iov_sens_eta_supported`](crate::sens::provider::iov_sens_eta_supported) + `omega_iov`)
-///     — the η-only predicate, matching what the inner route actually gates on.
-///
-/// **Single source of truth** for both `build_info::gradient_method_inner` (the reported
-/// method) and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted
-/// `gradient_method_inner` label and the reconciling FD-fallback warning cannot drift as the
-/// analytic scope grows — the coupling PR #381 review #9 relies on, extended to the ODE route
-/// (#378 task B / #926). This is **best-case, model-level**: a per-subject FD fallback is
-/// caught separately by `fd_fallback_warning` (mixed populations) and, for an all-FD in-scope
-/// population, by that same warning *because* this predicate reports analytic.
+/// level: [`analytic_inner_grad_supported_model`], the unified recorder's scope behind the
+/// shared escape hatches. **Single source of truth** for `build_info::gradient_method_inner`
+/// and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted label and the
+/// reconciling warning cannot drift. Best-case and model-level: a per-subject FD fallback is
+/// reported by `fd_fallback_warning`.
 pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
     analytic_inner_grad_supported_model(model)
-        // Compartment-free (#811): served by neither the closed-form predicate (which
-        // declines the placeholder `pk_model` outright) nor the ODE one (no `ode_spec`).
-        || (crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model))
-        || (crate::sens::provider::ode_inner_grad_supported_model(model)
-            && !analytic_inner_common_bail(model))
-        || (crate::sens::provider::iov_sens_eta_supported(model)
-            && model.default_params.omega_iov.is_some()
-            && !analytic_inner_common_bail(model))
 }
 
 /// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its
@@ -3465,12 +3482,12 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
 /// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the model must
 /// be in scope ([`analytic_inner_grad_supported_model`]) and the *subject* must
 /// not carry features the light inner provider can't serve. Survival obs records
-/// decline; time-varying covariates / oral infusion are served by the event-driven
-/// inner walk (`subject_eta_grad_tvcov`, #447) when `tvcov_analytical_supported`.
+/// decline; time-varying covariates / oral infusion are served by the adjoint recorder's
+/// event-driven walks (#447; `record_analytic_events` / `record_ode`).
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // Survival/TTE observation records carry a likelihood term that neither inner
-    // provider models — the analytical path declines below, and the light ODE walk
-    // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
+    // provider models — the analytical path declines below, and the recorder's walks
+    // (`adjoint::exact_obs_grads`) iterate only `subject.obs_times`, so they would silently
     // omit the survival term. Guard both routes up front.
     //
     // CTMM is the exception since #759: its transition likelihood *does* have an exact
@@ -3485,7 +3502,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     }
     // No Gaussian observations ⇒ no Gaussian data term, hence nothing for the PK provider
     // to serve: an **endpoint-only** fit (a `[markov_model]` with no `[structural_model]`,
-    // which the parser admits) has no PK model at all, and `analytical_supported` below
+    // which the parser admits) has no PK model at all, and `recorder_in_scope` below
     // would reject it on that basis alone. Its inner gradient is the prior plus the
     // non-Gaussian term, both of which we have exactly, so only the global escape hatches
     // apply. (`analytic_eta_nll_gradient_with_schedule` mirrors this by skipping the
@@ -3501,80 +3518,17 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if subject.obs_times.is_empty() {
         return !analytic_inner_common_bail(model);
     }
-    // Compartment-free (#811): its own provider, with a model-level scope and no
-    // per-subject exclusions — there are no doses, no resets and no absorption for a
-    // subject to carry that could put it out of scope, and time-varying covariates
-    // are served (the readout is re-seeded per observation, exactly as production
-    // re-evaluates it). Placed before the ODE and closed-form branches, which would
-    // both misread the placeholder `pk_model`.
-    if model.is_algebraic() {
-        return crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model);
-    }
-    // ODE models use the light `Dual1` inner provider (#410) with their own
-    // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
-    // plus the model-level exclusions the analytical path applies in
-    // `analytic_inner_grad_supported_model` still hold here:
-    //   - IIV on residual error (#409/#474): the residual-variance scaling
-    //     `exp(2·η_ruv)` and the `η_ruv` variance column live in the shared
-    //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
-    //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
-    //     keeps FD (the censored residual-eta second derivatives are not assembled).
-    //   - LTBS: the ODE `Dual1` walk shares `solve_ode_g` with the objective, so the
-    //     analytic-EBE *is* the objective's own minimum — the gradient matches FD of
-    //     `individual_nll` and the analytic/FD EBEs agree to integrator tolerance,
-    //     leaving the covariance Hessian clean. Validated by
-    //     `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd` (#474). The
-    //     closed-form inner now serves LTBS too: its provider closed forms agree with
-    //     `compute_predictions` only to ~1e-9, which the `g = ln(f)` wrap amplifies into
-    //     the covariance Hessian, so it relies on the covariance step reconverging at the
-    //     tighter `cov_inner_tol` rather than on shared code (see
-    //     `FitOptions::effective_cov_inner_tol`).
-    if model.ode_spec.is_some() {
-        // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
-        // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
-        // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
-        // magnitude-×-`block_sigma` cases revert here — which is now exactly
-        // `analytic_inner_common_bail`, so delegate instead of re-listing it.
-        //
-        // The hand-inlined copy that used to live here was justified by the shared bail
-        // being a strict superset: it also carried `log_transform && n_kappa > 0`, which
-        // the ODE branch had to skip. #486 deleted that clause, so the two lists coincide;
-        // keeping both would mean the next escape hatch added to the documented single
-        // source of truth silently would not apply to ODE inner subjects, which would then
-        // keep claiming an analytic inner the provider declines — the inner/outer route
-        // split this whole change set exists to close (PR #950 review #8).
-        if analytic_inner_common_bail(model) {
-            return false;
-        }
-        return crate::sens::provider::ode_inner_grad_supported(model, subject);
-    }
-    if !analytic_inner_grad_supported_model(model) {
-        return false;
-    }
-    // TV-cov / oral-infusion subjects now get the light event-driven inner gradient
-    // (`subject_eta_grad_tvcov`, #447); trust the provider's `None` for the residual
-    // out-of-scope cases (it matches the outer TV-cov scope). Other subjects keep the
-    // static superposition inner. (The survival guard is hoisted to the top of this
-    // function, so it covers this path too.)
-    //
-    // A `TIME`-built-in structural parameter routes through the same per-event walk
-    // (#486), so it must consult `tvcov_analytical_supported` too — otherwise a TIME
-    // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
-    // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
-    // inner route from the outer. LTBS now takes the analytic inner gradient on the
-    // event-driven walk too (`subject_eta_grad_tvcov` applies the `ln f` jet LAST), so
-    // no `!log_transform` carve-out is needed here.
-    if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
-        return crate::sens::provider::tvcov_analytical_supported(model);
-    }
-    true
+    // The unified recorder (`adjoint::exact_obs_grads`) serves every engine in its scope; a
+    // subject it declines falls back per point.
+    crate::sens::ode_provider::adjoint::recorder_in_scope(model)
+        && !analytic_inner_common_bail(model)
 }
 
 /// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`
-/// from the analytic sensitivity provider — the closed-form analog of the
-/// sensitivity-equation gradient (Almquist, Leander & Jirstrand 2015). Replaces
-/// the FD gradient's `~2·n_eta+1` predictions per inner step with one provider
-/// evaluation. `None` when the provider can't serve this `(θ, η)` (degenerate
+/// from the adjoint's unified recorder (`exact_obs_grads_into`) — the closed-form analog
+/// of the sensitivity-equation gradient (Almquist, Leander & Jirstrand 2015). Replaces
+/// the FD gradient's `~2·n_eta+1` predictions per inner step with one recorder
+/// evaluation. `None` when the recorder can't serve this `(θ, η)` (degenerate
 /// params / out of scope), so the caller falls back to FD for that point.
 ///
 /// Per observation `j`, with `f = f_j(η)`, `ε = y_j − f`, `v = R(f)` the residual
@@ -3628,7 +3582,8 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
 /// `None` reproducing the legacy unscaled variance. The magnitude is
 /// η-independent, so this is the *entire* inner-loop change it needs: no new η
 /// term, just the scale on `v`/`dv_df` (the direct-θ dependence is a separate,
-/// outer-only gradient channel — see `sens_outer_gradient::prepare_stacked`).
+/// outer-only gradient channel, recorded on the adjoint tape via
+/// `RuvMagDerivProgram::eval_g`).
 ///
 /// `f_frozen = Some(f₀)` is the non-interaction FOCE objective (#1722): the variance is
 /// taken at `f₀` and is a constant of the search, so `dv_df = 0` and the coefficient
@@ -3691,13 +3646,12 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
     h * m
 }
 
-/// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
-/// `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the model is in the
-/// provider's scope (returns `None` for ODE / TV-cov / oral-infusion / SS+reset /
-/// LTBS subjects). A η-dependent `ExpressionScale` `obs_scale` is in scope as of
-/// #486 (the quotient rule is applied to the η-block), except when combined with
-/// LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
-/// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
+/// Exact analytic `∂NLL_i/∂η` from the adjoint's unified recorder
+/// (`exact_obs_grads_into`): `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the
+/// recorder serves the subject (`None` otherwise, so the caller falls back to FD). A
+/// η-dependent `ExpressionScale` `obs_scale` is in scope as of #486 (the quotient rule is
+/// applied to the η-block), except when combined with LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
+/// both estimators use the same analytic gradient (replacing the retired Enzyme path).
 /// `residual_correlations` carries the live `block_sigma` off-diagonals,
 /// parallel to `sigma` (#847). The inner EBE search has to see the ρ the outer
 /// loop is proposing, or it converges to the mode of a different objective than
@@ -3754,7 +3708,7 @@ pub(crate) fn analytic_eta_nll_gradient(
 ///
 /// `obs_grad_recycle` is a per-subject scratch slot, owned by the caller and
 /// reused across every inner BFGS step: this function hands its previous
-/// contents in as [`subject_eta_grad_with_schedule`]'s reuse hint, then stores
+/// contents in as `exact_obs_grads_into`'s reuse buffer, then stores
 /// the freshly computed `Vec<ObsGrad>` back before returning, so the next call
 /// for the same subject can overwrite its `ObsGrad`s in place instead of
 /// allocating a fresh one per observation (mirrors the `pk_scratch_cell`
@@ -3814,17 +3768,18 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         return Some(grad);
     }
 
-    // Light first-order provider (value + ∂f/∂η only); the inner gradient never
-    // needs the second-order / θ blocks the full `subject_sensitivities` carries.
-    let hint = std::mem::take(obs_grad_recycle);
-    let sens = crate::sens::provider::subject_eta_grad_with_schedule(
-        model,
-        subject,
-        theta,
-        eta,
-        cached_schedule,
-        hint,
-    )?;
+    // First-order recorder (value + ∂f/∂η only); the inner gradient never
+    // needs second-order or θ blocks.
+    // The recorder fills the caller's buffer in place (one per subject, reused across
+    // iterations), handed back below on every exit.
+    let _ = cached_schedule;
+    let mut sens = std::mem::take(obs_grad_recycle);
+    if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model, subject, None, theta, eta, &mut sens,
+    ) {
+        *obs_grad_recycle = sens;
+        return None;
+    }
     // Fold the non-Gaussian block into whichever Gaussian branch runs below.
     #[cfg(feature = "markov")]
     let add_nongaussian = |mut g: Vec<f64>| -> Vec<f64> {
@@ -3884,7 +3839,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let mut ruv_grad = 0.0_f64;
     // FREM covariate pseudo-observations: the objective scores these rows against the
     // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
-    // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
+    // already corrected their `f` and `∂f/∂η` (`adjoint::exact_obs_grads_into`); this is the
     // variance half. `R` is η-independent on such a row, so `∂R/∂f = 0` and the whole
     // residual chain collapses to `∂L/∂η_k = (−ε/R)·δ_{k,ei}`. `None` on a non-FREM model.
     let frem_ov = crate::stats::likelihood::build_frem_r_override(
@@ -4134,15 +4089,15 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
-    // The walk reads the per-group `stacked_true` and returns the jet over the layout's
-    // axes — the compact vector under nested levels (#1082 PR3), the stack itself otherwise
-    // — so the gradient below is over the vector the EBE search moves.
+    // The recording reads the per-cell `stacked_true` and returns the jet over the
+    // layout's axes — the compact vector under nested levels (#1082), the stack itself
+    // otherwise — so the gradient below is over the vector the EBE search moves.
     let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens = crate::sens::provider::subject_eta_grad_iov_in(
+    let sens = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
         model,
         subject,
-        layout,
+        Some(layout),
         theta,
         stacked_true,
     )?;
@@ -4358,6 +4313,51 @@ fn seed_h_inv(n: usize, hessian_seed: Option<&DMatrix<f64>>) -> Option<DMatrix<f
     solved.iter().all(|v| v.is_finite()).then_some(solved)
 }
 
+/// The factor that brings a step from the **identity** `H₀` to O(1) length: `1/‖g‖` when
+/// `gnorm > 1`, else 1 (below that, `1/‖g‖` would *lengthen* the step). Dense BFGS's first
+/// iterate has applied it since #406; since #2093 L-BFGS's empty-history direction and its
+/// steepest-descent fallback do too (#2099). A preconditioned start is bounded by
+/// [`cap_curvature_free_step`] instead: a scalar rescaling of `diag(Ω)` keeps its length
+/// right only along the axis that dominates ‖g‖ and shrinks every other one.
+fn h0_step_scale(gnorm: f64) -> f64 {
+    if gnorm > 1.0 {
+        1.0 / gnorm
+    } else {
+        1.0
+    }
+}
+
+/// Bounds a step taken from the **preconditioned** curvature-free metric (`d = −diag(p)·g`,
+/// or its L-BFGS / steepest-descent-reset equivalents) to the runaway region's radius in
+/// that metric: `√(Σ dᵢ²/pᵢ) ≤ √(RUNAWAY_EBE_MAHA_PER_ETA · n)`, which with `p = diag(Ω)`
+/// is 10√n prior SDs — the ball outside which the #958 guard already treats an EBE as a
+/// runaway. The step's per-axis shape, which the preconditioner gets right, is kept; only
+/// its length is shortened, and only when it would leave that ball, so an ordinary start is
+/// untouched.
+///
+/// Why: since #464 every FOCE/FOCEI inner solve is Ω-preconditioned, and the first step
+/// `−Ω·g` has the gradient's magnitude (#2080). On a steep start — an observation on the
+/// proportional-variance floor, ‖g‖ ~ 1e12 — it lands thousands of prior SDs out:
+/// `examples/warfarin_ode_lagtime.ferx` put η_LAG at −800, and #2093's exact gradient then
+/// followed a real descent to `KA = e^42`, where every ODE solve is stiff (1.0–1.7 s per
+/// subject). Rescaling the whole metric by `1/‖g‖` fixed that but shrank a stiff second
+/// axis 20× too small on a flip-flop subject, which then stalled at ‖∇‖ = 1.1.
+fn cap_curvature_free_step(d: &mut [f64], precond: Option<&[f64]>) {
+    let Some(p) = precond else {
+        return;
+    };
+    let m: f64 = d
+        .iter()
+        .zip(p)
+        .map(|(di, pi)| if *pi > 0.0 { di * di / pi } else { 0.0 })
+        .sum();
+    let r2 = RUNAWAY_EBE_MAHA_PER_ETA * d.len() as f64;
+    if m.is_finite() && m > r2 {
+        let k = (r2 / m).sqrt();
+        d.iter_mut().for_each(|di| *di *= k);
+    }
+}
+
 /// Initial inverse-Hessian for the inner BFGS: the accepted analytic seed inverse when
 /// [`seed_h_inv`] produced one, else `diag(precond)` when a preconditioner is supplied,
 /// else identity.
@@ -4526,16 +4526,30 @@ fn lbfgs_core(
         }
 
         let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n, precond);
+        // With no curvature pair yet the direction is `−H₀·g` alone: bound it like any
+        // curvature-free start (#2099).
+        let bound_curvature_free = |d: &mut Vec<f64>| match precond {
+            Some(_) => cap_curvature_free_step(d, precond),
+            None => {
+                let k = h0_step_scale(gnorm);
+                d.iter_mut().for_each(|di| *di *= k);
+            }
+        };
+        if s_hist.is_empty() {
+            bound_curvature_free(&mut d);
+        }
         // Guard against a non-descent direction (e.g. after a bad curvature
-        // pair) by falling back to (preconditioned) steepest descent.
+        // pair) by falling back to (preconditioned) steepest descent, bounded the same way.
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
             d = match precond {
                 Some(p) => g.iter().zip(p).map(|(gi, pi)| -gi * pi).collect(),
                 None => g.iter().map(|gi| -gi).collect(),
             };
+            bound_curvature_free(&mut d);
         }
 
+        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
         let (alpha, f_new) = backtracking_line_search(
             obj,
             x,
@@ -4544,7 +4558,18 @@ fn lbfgs_core(
             f_cur,
             &mut line_search_point,
             short_line_search,
+            floor,
         );
+        // At the noise floor an unverifiable step is convergence, not a failure — unless the
+        // gradient verifies it ([`gradient_verified_step`]).
+        let (alpha, f_new) = if alpha == 0.0 && floor {
+            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                Some(fc) => (1.0, fc),
+                None => return true,
+            }
+        } else {
+            (alpha, f_new)
+        };
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -4659,16 +4684,21 @@ fn dense_bfgs_core(
             best_gnorm = gnorm;
         }
 
-        // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
-        // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
-        // `None`, so `gnorm` here is the raw L2 norm; a diagonal preconditioner
-        // already sets the per-dim scale.
-        // An accepted analytic seed already carries the scale, so it skips this; a
-        // *rejected* one (`seed_inv.is_none()`) takes the historical path unchanged.
-        if precond.is_none() && seed_inv.is_none() && first_step && gnorm > 1.0 {
-            h_inv *= 1.0 / gnorm;
-            first_step = false;
+        // Scale the initial metric so the first step is O(1) not O(gnorm). Only for the
+        // identity-H0 path (`precond.is_none()`); a preconditioned first step is bounded
+        // below instead ([`cap_curvature_free_step`]), which keeps `diag(Ω)`'s per-axis
+        // shape. An accepted analytic seed already carries the scale, so it skips both; a
+        // *rejected* one (`seed_inv.is_none()`) takes the curvature-free path.
+        //
+        // Decided once, at the first iterate (#2093): a later `gnorm > 1` must not rescale an
+        // `h_inv` that BFGS updates have already shaped. The flag used to clear only when
+        // the scaling fired, so a search starting at `gnorm ≤ 1` could have its learned
+        // curvature divided by ‖g‖ mid-search.
+        let curvature_free_step = seed_inv.is_none() && first_step;
+        if curvature_free_step && precond.is_none() {
+            h_inv *= h0_step_scale(gnorm);
         }
+        first_step = false;
         if gnorm < tol {
             return true;
         }
@@ -4676,6 +4706,9 @@ fn dense_bfgs_core(
         g_vec.as_mut_slice().copy_from_slice(&g);
         d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
         d.copy_from_slice(d_vec.as_slice());
+        if curvature_free_step {
+            cap_curvature_free_step(&mut d, precond);
+        }
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
@@ -4685,6 +4718,11 @@ fn dense_bfgs_core(
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
+            // A curvature-free step like the first one: bounded the same way (#2099).
+            if seed_inv.is_none() {
+                cap_curvature_free_step(&mut d, precond);
+            }
+            let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
             let (alpha, f_new) = backtracking_line_search(
                 obj,
                 x,
@@ -4693,7 +4731,18 @@ fn dense_bfgs_core(
                 f_cur,
                 &mut line_search_point,
                 short_line_search,
+                floor,
             );
+            // At the noise floor an unverifiable step is convergence, not a failure — unless
+            // the gradient verifies it ([`gradient_verified_step`]).
+            let (alpha, f_new) = if alpha == 0.0 && floor {
+                match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                    Some(fc) => (1.0, fc),
+                    None => return true,
+                }
+            } else {
+                (alpha, f_new)
+            };
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -4712,6 +4761,7 @@ fn dense_bfgs_core(
             continue;
         }
 
+        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
         let (alpha, f_new) = backtracking_line_search(
             obj,
             x,
@@ -4720,7 +4770,18 @@ fn dense_bfgs_core(
             f_cur,
             &mut line_search_point,
             short_line_search,
+            floor,
         );
+        // At the noise floor an unverifiable step is convergence, not a failure — unless the
+        // gradient verifies it ([`gradient_verified_step`]).
+        let (alpha, f_new) = if alpha == 0.0 && floor {
+            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
+                Some(fc) => (1.0, fc),
+                None => return true,
+            }
+        } else {
+            (alpha, f_new)
+        };
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -5081,6 +5142,56 @@ fn iov_prior_maha(
     q
 }
 
+/// Whether the step along `d` cannot improve the objective by more than the flat-step
+/// threshold of [`objective_stalled`] (`INNER_FTOL_REL·(1+|f|)`): `|∇f·d|` bounds the decrease
+/// the quasi-Newton model predicts at `α = 1` (it is twice that, `½|∇f·d|`), so any step the
+/// line search could find is flat by definition. On an ODE objective (`enable_stall`) its
+/// solver-noise floor sits above that threshold, and the search spent 11–14 solves backtracking
+/// to accept such a step — three times per solve before the stall stop fired (#2093). There the
+/// line search tries the full step alone, and a rejected one ends the solve as converged
+/// at the noise floor; an accepted one is kept (it often is: the noise can favour it). An
+/// exact objective never takes this exit. Callers pass `enable_stall && !gnorm_improving`:
+/// the stall stop's own plateau guard, so a solve whose gradient is still falling keeps
+/// descending even when each step is flat.
+fn step_below_noise_floor(enable_stall: bool, d: &[f64], g: &[f64], f: f64) -> bool {
+    if !enable_stall {
+        return false;
+    }
+    let dg: f64 = d.iter().zip(g).map(|(di, gi)| di * gi).sum();
+    dg < 0.0 && -dg <= INNER_FTOL_REL * (1.0 + f.abs())
+}
+
+/// At the noise floor, whether the full step `x + d` that the objective could not verify is
+/// verified by the **gradient** instead: the objective stays within its resolution
+/// (`INNER_FTOL_REL·(1 + |f|)`, the flat-step threshold) and the gradient norm at least
+/// halves. Returns the objective there when it is.
+///
+/// The objective-based stop treats "no resolvable decrease" as convergence, which is right
+/// when the gradient carries the same noise. When the ODE is integrated tightly enough for
+/// the gradient to stay accurate, it is not: measured on a route-lag fixture at
+/// `reltol = 1e-12`, solves stopped this way at `‖∇l‖` up to 1.8e-6 against `tol = 1e-12`,
+/// though the gradient there is good to ~1e-10 (#2093). The FOCEI marginal is not stationary
+/// in η, so the miss enters the objective to first order. A gradient that halves is moving
+/// toward the mode; noise does not halve it repeatedly, so on a noise-floored gradient this
+/// returns `None` and the stop is unchanged. Costs one objective and one gradient.
+fn gradient_verified_step(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    f: f64,
+    g: &[f64],
+    stop_precond: Option<&[f64]>,
+) -> Option<f64> {
+    let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
+    let fc = obj(&cand);
+    if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
+        return None;
+    }
+    let gc = grad_norm_metric(&grad(&cand), stop_precond);
+    (gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond)).then_some(fc)
+}
+
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
 /// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
 /// L-BFGS inner drivers so the two paths cannot drift apart on convergence (#555).
@@ -5115,6 +5226,9 @@ fn backtracking_line_search(
     f0: f64,
     x_new: &mut [f64],
     short_line_search: bool,
+    // `step_below_noise_floor`: try the full step only; there is nothing a backtrack
+    // could verify.
+    single_trial: bool,
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
@@ -5128,7 +5242,12 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    for _ in 0..inner_line_search_trials(short_line_search) {
+    let trials = if single_trial {
+        1
+    } else {
+        inner_line_search_trials(short_line_search)
+    };
+    for _ in 0..trials {
         for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
         }

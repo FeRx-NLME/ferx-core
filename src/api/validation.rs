@@ -5370,8 +5370,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
-    // The GN anchor's `H̃` comes from the sensitivity provider (`score_core`), so the
-    // refinement is available only where that provider reaches — the same analytic scope
+    // The GN anchor's `H̃` comes from the adjoint (`exact_htilde`), so the
+    // refinement is available only where the adjoint reaches — the same analytic scope
     // FOCEI's own outer gradient needs. Outside it (e.g. an ODE model without sensitivities,
     // or a pure-TTE endpoint), reject up front rather than fail deep in the objective.
     if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI))

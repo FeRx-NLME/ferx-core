@@ -36,6 +36,35 @@ pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
     (alpha, beta, k21)
 }
 
+/// A two-compartment disposition: the micro parameters and their macro rates
+/// ([`macro_rates_g`]), computed once for a parameter set and shared by every dose and
+/// observation evaluated at it.
+#[derive(Clone, Copy)]
+pub(crate) struct TwoCpt<T> {
+    pub cl: T,
+    pub v1: T,
+    pub q: T,
+    pub v2: T,
+    pub alpha: T,
+    pub beta: T,
+    pub k21: T,
+}
+
+impl<T: PkNum> TwoCpt<T> {
+    pub(crate) fn new(cl: T, v1: T, q: T, v2: T) -> Self {
+        let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+        Self {
+            cl,
+            v1,
+            q,
+            v2,
+            alpha,
+            beta,
+            k21,
+        }
+    }
+}
+
 /// Shared domain guard for the analytic 2-cpt transit closed forms (#386 PR D):
 /// the central concentration ([`two_cpt_transit_amt_g`]) and the peripheral / depot
 /// `[derived]` amounts (`crate::pk::two_compartment`) must reject the *same*
@@ -79,17 +108,38 @@ pub(crate) fn transit_2cpt_domain_ok<T: PkNum>(
 /// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`. `t` is generic so the caller can
 /// seed it as a dual carrying the lagtime sensitivity (`∂t/∂lagtime = −1`).
 pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -> T {
-    two_cpt_iv_bolus_amt_g(T::from_f64(amt), t, cl, v1, q, v2)
+    two_cpt_iv_bolus_d(amt, t, &TwoCpt::new(cl, v1, q, v2))
+}
+
+/// [`two_cpt_iv_bolus_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_iv_bolus_d<T: PkNum>(amt: f64, t: T, d: &TwoCpt<T>) -> T {
+    two_cpt_iv_bolus_amt_d(T::from_f64(amt), t, d)
 }
 
 /// As [`two_cpt_iv_bolus_g`] but with a generic amount `amt` (issue #524), so an
 /// analytical initial condition `A₀(θ,η)` threads its sensitivity through the
 /// central impulse. The single-dose path delegates here with a constant `amt`.
 pub fn two_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T) -> T {
+    two_cpt_iv_bolus_amt_d(amt, t, &TwoCpt::new(cl, v1, q, v2))
+}
+
+/// [`two_cpt_iv_bolus_amt_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        alpha,
+        beta,
+        k21,
+        ..
+    } = *d;
+
     if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
     // poles, undefined at exact root coalescence. Measure-zero for physical PK
@@ -115,13 +165,34 @@ pub fn two_cpt_infusion_g<T: PkNum>(
     q: T,
     v2: T,
 ) -> T {
+    two_cpt_infusion_d(rate, dur, amt, t, &TwoCpt::new(cl, v1, q, v2))
+}
+
+/// [`two_cpt_infusion_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_infusion_d<T: PkNum>(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: T,
+    d: &TwoCpt<T>,
+) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        alpha,
+        beta,
+        k21,
+        ..
+    } = *d;
+
     if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
-        return two_cpt_iv_bolus_g(amt, t, cl, v1, q, v2);
+        return two_cpt_iv_bolus_d(amt, t, d);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
         return T::from_f64(0.0);
@@ -182,17 +253,39 @@ pub fn two_cpt_zero_order_g<T: PkNum>(
 
 /// 2-cpt oral (first-order absorption), with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
 pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
-    two_cpt_oral_amt_g(T::from_f64(amt), t, cl, v1, q, v2, ka, f_bio)
+    two_cpt_oral_d(amt, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
+}
+
+/// [`two_cpt_oral_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_oral_d<T: PkNum>(amt: f64, t: T, d: &TwoCpt<T>, ka: T, f_bio: T) -> T {
+    two_cpt_oral_amt_d(T::from_f64(amt), t, d, ka, f_bio)
 }
 
 /// As [`two_cpt_oral_g`] but with a generic amount `amt` (issue #524); the
 /// initial-condition path passes a pre-loaded depot `A₀` as a dual with `F = 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
+    two_cpt_oral_amt_d(amt, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
+}
+
+/// [`two_cpt_oral_amt_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn two_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>, ka: T, f_bio: T) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        alpha,
+        beta,
+        k21,
+        ..
+    } = *d;
+
     if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
     // poles, undefined at exact root coalescence. Measure-zero for physical PK
@@ -284,7 +377,7 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
 }
 
 /// Transit-absorption counterpart to [`two_cpt_oral_g`] for the analytic
-/// `two_cpt_transit` model (#386 PR D), used by the sensitivity provider. Transit
+/// `two_cpt_transit` model (#386 PR D), used by the analytic gradient path. Transit
 /// rejects infusion/SS doses at parse, so only the absorbed-bolus route exists — a
 /// thin wrapper over [`two_cpt_transit_amt_g`] with `F` baked into the kernel.
 /// Generic over [`PkNum`] so prediction (`T = f64`) and the `Dual1`/`Dual2`
@@ -393,7 +486,7 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
 }
 
 /// Inverse-Gaussian counterpart to [`two_cpt_transit_conc_g`] for the analytic
-/// `two_cpt_ig` model (#790), used by the sensitivity provider. IG rejects
+/// `two_cpt_ig` model (#790), used by the analytic gradient path. IG rejects
 /// infusion/SS doses at parse, so only the absorbed-bolus route exists — a thin
 /// wrapper over [`two_cpt_ig_amt_g`] with `F` baked into the kernel.
 #[allow(clippy::too_many_arguments)]
@@ -423,6 +516,22 @@ fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
 
 /// 2-cpt IV bolus at steady state.
 pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T) -> T {
+    two_cpt_iv_bolus_ss_d(amt, t, ii, &TwoCpt::new(cl, v1, q, v2))
+}
+
+/// [`two_cpt_iv_bolus_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &TwoCpt<T>) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        q,
+        v2,
+        alpha,
+        beta,
+        k21,
+    } = *d;
+
     // `q < 0` (e.g. a step or additive IIV driving Q negative) makes a disposition
     // eigenvalue negative, so the SS geometric `1/(1−e^{−λΙΙ})` flips sign and the
     // closed form returns a non-physical (or NaN, via a negative discriminant)
@@ -436,7 +545,7 @@ pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q:
     {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
     // poles, undefined at exact root coalescence. Measure-zero for physical PK
@@ -465,6 +574,29 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
+    two_cpt_oral_ss_d(amt, t, ii, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
+}
+
+/// [`two_cpt_oral_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+pub(crate) fn two_cpt_oral_ss_d<T: PkNum>(
+    amt: f64,
+    t: T,
+    ii: f64,
+    d: &TwoCpt<T>,
+    ka: T,
+    f_bio: T,
+) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        q,
+        v2,
+        alpha,
+        beta,
+        k21,
+    } = *d;
+
     if t.val() < 0.0
         || v1.val() <= 0.0
         || cl.val() <= 0.0
@@ -475,7 +607,7 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
     {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
     // poles, undefined at exact root coalescence. Measure-zero for physical PK
@@ -538,6 +670,30 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     q: T,
     v2: T,
 ) -> T {
+    two_cpt_infusion_ss_d(rate, dur, amt, t, ii, &TwoCpt::new(cl, v1, q, v2))
+}
+
+/// [`two_cpt_infusion_ss_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn two_cpt_infusion_ss_d<T: PkNum>(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: T,
+    ii: f64,
+    d: &TwoCpt<T>,
+) -> T {
+    let TwoCpt {
+        cl,
+        v1,
+        q,
+        v2,
+        alpha,
+        beta,
+        k21,
+    } = *d;
+
     // See `two_cpt_iv_bolus_ss_g` for why SS guards `q < 0` (PR #381 #3).
     if t.val() < 0.0
         || v1.val() <= 0.0
@@ -549,9 +705,9 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
-        return two_cpt_iv_bolus_ss_g(amt, t, ii, cl, v1, q, v2);
+        return two_cpt_iv_bolus_ss_d(amt, t, ii, d);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+
     let diff = alpha - beta;
     if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
         return T::from_f64(0.0);
@@ -614,33 +770,37 @@ pub fn two_cpt_conc_g<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
+    two_cpt_conc_d(dose, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio, oral)
+}
+
+/// [`two_cpt_conc_g`] over a precomputed disposition (its macro rates computed once per
+/// parameter set, not once per dose and observation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn two_cpt_conc_d<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    d: &TwoCpt<T>,
+    ka: T,
+    f_bio: T,
+    oral: bool,
+) -> T {
     // `F` rule mirrors production `route_f_scale` (#327): oral-depot bolus bakes
     // `F` in; IV bolus and every infusion are linear in dose → post-multiply.
     let oral_bolus = oral && !dose.is_infusion();
     let raw = if dose.ss && dose.ii > 0.0 {
         if dose.is_infusion() {
-            two_cpt_infusion_ss_g(
-                dose.rate,
-                dose.duration,
-                dose.amt,
-                t,
-                dose.ii,
-                cl,
-                v1,
-                q,
-                v2,
-            )
+            two_cpt_infusion_ss_d(dose.rate, dose.duration, dose.amt, t, dose.ii, d)
         } else if oral {
-            two_cpt_oral_ss_g(dose.amt, t, dose.ii, cl, v1, q, v2, ka, f_bio)
+            two_cpt_oral_ss_d(dose.amt, t, dose.ii, d, ka, f_bio)
         } else {
-            two_cpt_iv_bolus_ss_g(dose.amt, t, dose.ii, cl, v1, q, v2)
+            two_cpt_iv_bolus_ss_d(dose.amt, t, dose.ii, d)
         }
     } else if dose.is_infusion() {
-        two_cpt_infusion_g(dose.rate, dose.duration, dose.amt, t, cl, v1, q, v2)
+        two_cpt_infusion_d(dose.rate, dose.duration, dose.amt, t, d)
     } else if oral {
-        two_cpt_oral_g(dose.amt, t, cl, v1, q, v2, ka, f_bio)
+        two_cpt_oral_d(dose.amt, t, d, ka, f_bio)
     } else {
-        two_cpt_iv_bolus_g(dose.amt, t, cl, v1, q, v2)
+        two_cpt_iv_bolus_d(dose.amt, t, d)
     };
     if oral_bolus {
         raw

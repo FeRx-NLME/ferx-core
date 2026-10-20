@@ -7075,7 +7075,8 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
     // full-budget truncation was ~30% low). The fast case is deliberately not *extreme*
     // (ke·II ≫ 6): a near-total between-dose decay drives the trough toward the RK45 `abstol`
     // floor, where relative precision is lost — an integration-noise artifact, not the fixed
-    // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
+    // point being wrong (`ode_steady_state_dose_matches_reconverged_fd` in
+    // `sens/ode_adjoint_tests.rs` checks the gradient too).
     for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
         let pk = pk_one(cl, v);
         let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
@@ -11174,9 +11175,9 @@ mod break_collision_1186 {
         }
 
         // The analytic-sensitivity static walk carries the same timeline and was one of
-        // the `unwrap_or(Equal)` sites; its twin lives in `sens/provider_tests.rs`
-        // (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`), where the provider can be
-        // driven directly.
+        // the `unwrap_or(Equal)` sites; its twin lived in the since-deleted (#2093)
+        // `sens/provider_tests.rs` (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`),
+        // where the forward provider could be driven directly.
     }
 
     /// **The CHZ event-time search must report a non-finite timeline as `SolveFailed`.**
@@ -11985,8 +11986,8 @@ mod lag_arrival_read_1226 {
     /// doses at 17511.8 and 17520, sample at 17520) and tables
     /// `PRED = 1.4404316545059672E+02`. That run does double duty — it is also a *dose
     /// landing on the same time as an observation*, so it pins the ordering convention that
-    /// `provider_reads_a_dose_landing_on_the_last_observation` checks the sensitivity walk
-    /// against.
+    /// the pre-#2093 `provider_reads_a_dose_landing_on_the_last_observation` (retired in #2093)
+    /// checked the sensitivity walk against.
     ///
     /// Mutation: write either predicate in the sum form and `ode_predictions` reads the
     /// pre-dose 44.04 here while the event-driven control still reads 144.04.
@@ -15431,4 +15432,80 @@ fn adaptive_nan_amount_from_a_finite_state_is_still_a_controller_action() {
     assert!(msg.contains("decision 0 at t=1"), "{msg}");
     assert!(msg.contains("dose amount must be finite"), "{msg}");
     assert!(!msg.contains("diverged"), "{msg}");
+}
+
+/// A stiff, non-linear model integrated by Rosenbrock: `J` is filled from the batched lane
+/// evaluator (`OdeRhsProgram::rhs_columns` through `rosenbrock::FdColumnsGuard`), and the
+/// whole solve must be bit-identical to the scalar column loop. `cond` adds a branch on the
+/// state, whose lanes can disagree near the switch and then fall back to scalar columns.
+fn batched_jacobian_model(cond: bool) -> crate::types::CompiledModel {
+    let elim = if cond {
+        "(if (central > 20.0) VMAX else 0.5 * VMAX) * central / (KM + central)"
+    } else {
+        "VMAX * central / (KM + central)"
+    };
+    let src = format!(
+        "[parameters]
+  theta TVKA(1.2, 0.01, 10.0)
+  theta TVVMAX(40.0, 0.1, 1000.0)
+  theta TVKM(2.0, 0.01, 100.0)
+  omega ETA_KA ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  KA = TVKA * exp(ETA_KA)
+  VMAX = TVVMAX
+  KM = TVKM
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, periph])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - {elim} - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rodas4
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
+}
+
+#[test]
+fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
+    use crate::ode::rosenbrock::{FD_COLUMNS_HITS, FD_COLUMNS_OFF};
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            // An infusion: a forcing the batched columns must add per column too.
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
+        ],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
+    );
+    for cond in [false, true] {
+        let model = batched_jacobian_model(cond);
+        let run = |off: bool| {
+            FD_COLUMNS_OFF.with(|c| c.set(off));
+            FD_COLUMNS_HITS.with(|c| c.set(0));
+            let p = crate::pk::compute_predictions_with_tv(
+                &model,
+                &s,
+                &model.default_params.theta,
+                &[0.1],
+            );
+            FD_COLUMNS_OFF.with(|c| c.set(false));
+            (p, FD_COLUMNS_HITS.with(|c| c.get()))
+        };
+        let (batched, hits) = run(false);
+        let (scalar, scalar_hits) = run(true);
+        assert!(
+            hits > 0,
+            "cond={cond}: the batched columns must actually fill J (non-vacuity)"
+        );
+        assert_eq!(scalar_hits, 0);
+        assert!(batched.iter().all(|v| v.is_finite()), "{batched:?}");
+        for (j, (a, b)) in batched.iter().zip(&scalar).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "cond={cond} obs {j}: {a} vs {b}");
+        }
+    }
 }

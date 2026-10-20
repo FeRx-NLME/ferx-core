@@ -207,14 +207,13 @@ This also covers the dosing forms below (all closed by #486):
 
 One SS sub-case routes to the finite-difference fallback:
 
-- **SS + a non-autonomous RHS** (one that reads the `TIME`/`TAFD`/`TAD` builtins) — the
-  *dual* equilibration anchors both model-time slots at zero and does not re-anchor them
-  per window, so its cycle recurrence is not the one the value path computes. Such models
-  stay on FD. Note this is a statement about the **gradient route only**: the value path
-  does anchor `TAD` correctly since [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) (see
-  [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs)), so these
-  models fit — with a finite-difference inner gradient, reported in
-  `FitResult.warnings`.
+- **SS + an RHS reading an absolute clock** (`TIME`/`T`/`TAFD`), or **`TAD` under a
+  lagged SS dose**. An absolute clock has no periodic steady state, and the lagged
+  pre-arrival window's `TAD` convention is still open (#1126), so these subjects fit with a
+  finite-difference inner gradient, reported in `FitResult.warnings`. A `TAD`-only RHS
+  under unlagged SS dosing is analytic: the dual run-in replays the value path's per-window
+  clocks (see
+  [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs)).
 
 ### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
 

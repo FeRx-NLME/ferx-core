@@ -13,7 +13,19 @@
 
 use super::*;
 use crate::diagnostics::Severity;
-use crate::types::test_helpers::{analytical_model, ode_model};
+use crate::types::test_helpers::ode_model;
+
+/// A parsed one-compartment oral model — in the analytic gradient's scope, which needs the
+/// compiled individual-parameter program a parsed model carries (the hand-built
+/// `test_helpers::analytical_model` has none). `ode_model` stays the out-of-scope sibling.
+fn analytical_model(gradient_method: GradientMethod) -> crate::types::CompiledModel {
+    let mut model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("one-compartment oral model parses");
+    model.gradient_method = gradient_method;
+    model
+}
 use crate::types::{EstimationMethod, GradientMethod, Optimizer};
 
 const CODE: &str = "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT";

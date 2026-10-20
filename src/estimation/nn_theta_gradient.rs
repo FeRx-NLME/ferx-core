@@ -283,7 +283,7 @@ impl NnGradPlan {
 /// `subject_needs_per_event_pk`, is what keeps this predicate honest: it stays
 /// correct regardless of which prediction path the subject ends up on.
 #[cfg(feature = "nn")]
-fn static_nn_input_map<'a>(
+pub(crate) fn static_nn_input_map<'a>(
     subject: &'a Subject,
     input_names: &[String],
 ) -> Option<&'a HashMap<String, f64>> {

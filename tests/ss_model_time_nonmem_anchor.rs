@@ -528,8 +528,8 @@ fn both_spellings_of_absolute_time_give_the_same_steady_state() {
 /// t = 482, and by the same factor in NONMEM as in ferx.
 ///
 /// This exists because that number lived only in a doc comment on a *routing* test
-/// (`sens/ode_provider_tests.rs`), where it was documenting a defect the routing gate does
-/// not fix and could not notice if it changed. The `TAD` half of the same table is now
+/// (in the since-deleted `sens/ode_provider_tests.rs`), where it was documenting a defect
+/// the routing gate does not fix and could not notice if it changed. The `TAD` half of the same table is now
 /// wrong — that is what this PR changed — so the whole table had to become assertions or
 /// be deleted. Here it is measured from the committed streams.
 #[test]
