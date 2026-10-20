@@ -102,9 +102,13 @@ jobs:
         # two runners with the same nightly get different keys: on `fcad163d` the core leg
         # (image 20261018.339, stable 1.99.1) missed under `897d571a` while the nn leg
         # (20261012.334, stable 1.99.0) hit `f7f40fb1`. Nothing here uses stable —
-        # `RUSTUP_TOOLCHAIN: nightly` is set workflow-wide — so the key now follows the
-        # nightly alone, which is the one change it is meant to track.
-        run: rustup toolchain uninstall stable
+        # `RUSTUP_TOOLCHAIN: nightly` is set workflow-wide — so the toolchain part of the
+        # key now follows the nightly alone (Cargo.lock, the manifests and the job still
+        # count). `rustup default nightly` first, so the default never names a removed
+        # toolchain; the uninstall exits 0 when an image ships no stable at all.
+        run: |
+          rustup default nightly
+          rustup toolchain uninstall stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -112,8 +116,15 @@ jobs:
           # Save even when the job is red (#2184). A timed-out run otherwise leaves the
           # next same-key run cold. What is saved is dependencies only: rust-cache removes
           # the workspace crates from `target/` before saving (`cache-workspace-crates`
-          # defaults to false), and a dependency that was half-built when the job died has
-          # no cargo fingerprint, so the next run rebuilds it rather than trusting it.
+          # defaults to false). Cargo writes a dependency's fingerprint only after it built,
+          # so a cache saved mid-build is never trusted wrongly — it is INCOMPLETE.
+          #
+          # Accepted cost: the save also runs on a CANCELLED job (rust-cache's post step is
+          # `success() || CACHE_ON_FAILURE`). A run cancelled during the ~30 s dependency
+          # compile of a miss saves part of `deps/`; later runs are exact hits, which
+          # rust-cache never re-saves, so each rebuilds the missing crates (≤ ~26 s) until
+          # the next nightly rolls the key — within a day. `save-if` cannot tell a cancel
+          # apart (it is read at job start), and a cold miss on every red run costs more.
           #
           # Measured over 70 jobs (35 runs on main, 2026-10-17..20), this is a small win,
           # not the 6 min #2184 first suspected. 19 jobs missed: 10 races (an earlier
