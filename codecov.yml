@@ -21,6 +21,16 @@
 # patch status can require each family independently and so a future split of the
 # jobs needs no config change.
 
+# Every ci.yml event uploads exactly two reports: `endpoints` (survival/markov/nn)
+# plus `coverage-pr-upload` (fast, on PR/push) or `coverage` (slow, on schedule/
+# dispatch). Without this Codecov grades the first one alone — and the endpoints
+# report also covers shared core code, so `codecov/patch` could go green before (or
+# without) the `fast` report, e.g. when a core shard fails. A missing report now
+# leaves the status pending. Pinned by tests/ci_test_shards.rs (#2167).
+codecov:
+  notify:
+    after_n_builds: 2
+
 coverage:
   range: 85..95
   precision: 2

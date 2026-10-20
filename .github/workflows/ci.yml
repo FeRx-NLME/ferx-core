@@ -494,7 +494,12 @@ jobs:
         # with the guards off, and arming it there fails them for doing the right thing.
         env:
           FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
-        run: cargo llvm-cov --workspace --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov $(python3 tools/ci-test-shard.py args ${{ matrix.shard }} ${{ strategy.job-total }}) --lcov --output-path lcov.info
+        # The planner runs as its own assignment so `bash -e` sees its exit status.
+        # Inlined as `cargo … $(planner)` a planner error was swallowed and cargo ran
+        # with no target arguments, i.e. its default targets — green, wrong suite.
+        run: |
+          targets=$(python3 tools/ci-test-shard.py args ${{ matrix.shard }} ${{ strategy.job-total }})
+          cargo llvm-cov --workspace --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov $targets --lcov --output-path lcov.info
 
       - uses: actions/upload-artifact@v7
         with:
@@ -507,14 +512,15 @@ jobs:
   # the `Tests + coverage (core)` name the `main-protection` ruleset REQUIRES. So it
   # must go red when a shard does, not be skipped: GitHub counts a skipped job as a
   # passing required check, and plain `needs:` skips this job on a red shard — a PR
-  # with failing tests would show every required check green. Hence `!cancelled()`
-  # plus the explicit result check as the first step, which also stops the upload
-  # (as before, when a red test run skipped the upload step).
+  # with failing tests would show every required check green. Hence `always()` —
+  # not `!cancelled()`, which skips this job when a shard is cancelled and so lets a
+  # cancel mid-run read green — plus the explicit result check as the first step,
+  # which also stops the upload (as before, when a red test run skipped the upload).
   coverage-pr-upload:
     name: Tests + coverage (core)
     needs: coverage-pr
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
     permissions:
       contents: read
       pull-requests: write # for the below-floor nudge comment
