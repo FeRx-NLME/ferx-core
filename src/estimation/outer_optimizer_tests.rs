@@ -203,6 +203,7 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
     )
+    .frozen
     .expect("the unmapped TVFLAT must be detected and frozen");
     let idx = |name: &str| {
         model
@@ -1702,6 +1703,7 @@ fn test_polish_is_wired_and_an_unfinished_polish_is_not_converged() {
             false,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
+            None,
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         (
@@ -1811,6 +1813,7 @@ fn test_short_window_latch_is_wired_and_plateau_checked() {
             &opts,
             false,
             &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
             None,
         )
     };
@@ -2107,6 +2110,7 @@ fn preflight_freezes_flat_theta() {
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
     )
+    .frozen
     .expect("flat TVV must be detected");
     assert!(!frozen.theta_fixed[0], "active TVCL stays free");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
@@ -2134,6 +2138,7 @@ fn preflight_no_freeze_when_all_thetas_active() {
             &options,
             &OuterFdDeclineLog::new(pop.subjects.len()),
         )
+        .frozen
         .is_none(),
         "no theta is flat — nothing to freeze"
     );
@@ -2167,6 +2172,7 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
     )
+    .frozen
     .expect("flat TVV must be detected");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen");
     assert!(
@@ -3422,6 +3428,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         false,
         &declines,
         None,
+        None,
     )
     .0
     .params;
@@ -3433,6 +3440,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &options,
         false,
         &declines,
+        None,
         None,
     );
     let (from_reference, reference_outcome) = optimize_nlopt_once(
@@ -3446,6 +3454,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
             escape_from: &reference,
             spent_evals: 0,
         }),
+        None,
     );
 
     // The straddle itself, asserted so it cannot silently become a tautology: the
@@ -8414,6 +8423,7 @@ fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64
         false,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
+        None,
     );
     eprintln!("{label}: OFV {}", result.ofv);
     assert!(
@@ -8846,4 +8856,180 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
         ofv,
     );
     assert_eq!((got, calls.get()), (-11.0, 1));
+}
+
+/// Runs `f` on a one-thread pool and returns its result with the number of inner
+/// multi-starts it entered (#2076). The counter is thread-local, so the pool must be
+/// single-threaded for every solve to land on the thread that reads it.
+fn count_multistarts<R: Send>(f: impl FnOnce() -> R + Send) -> (R, usize) {
+    use crate::estimation::inner_optimizer::EBE_MULTISTARTS_STARTED;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let m0 = EBE_MULTISTARTS_STARTED.with(|n| n.get());
+        let r = f();
+        (r, EBE_MULTISTARTS_STARTED.with(|n| n.get()) - m0)
+    })
+}
+
+/// The `make_model` twin whose `TVV` never reaches the objective, so the flat-theta
+/// pre-flight freezes it (as in `preflight_freezes_flat_theta`).
+fn make_flat_tvv_model() -> CompiledModel {
+    let mut model = make_model();
+    model.pk_param_fn = Box::new(
+        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = 50.0;
+            p
+        },
+    );
+    model
+}
+
+/// #2076: the flat-theta pre-flight's cold solve and the optimizer's first evaluation are
+/// the same EBE problem, so the first evaluation is seeded from the pre-flight's EBEs and
+/// runs no multi-start of its own. Measured on the leg itself: the cold first evaluation
+/// costs exactly the pre-flight's multi-starts, the seeded one none, and both reach the
+/// same objective. The final cold re-solve multi-starts on both legs and cancels in the
+/// difference.
+#[test]
+fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
+    use crate::types::{EstimationMethod, FitOptions, Optimizer};
+    let model = make_model();
+    let pop = make_population(4);
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        optimizer: Optimizer::Bobyqa,
+        outer_maxiter: 1,
+        inner_restarts: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = &model.default_params;
+    let (preflight, pre) = count_multistarts(|| {
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            init,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+        )
+    });
+    assert!(
+        preflight.frozen.is_none(),
+        "every theta of make_model is live"
+    );
+    let etas = preflight.etas.expect("the pre-flight solved");
+    // The fixture must reach the gate: at least one multi-start per subject.
+    assert!(
+        pre >= pop.subjects.len(),
+        "pre-flight ran {pre} multi-starts on {} subjects",
+        pop.subjects.len()
+    );
+    let leg = |seed: Option<&[DVector<f64>]>| {
+        count_multistarts(|| {
+            optimize_nlopt_once(
+                &model,
+                &pop,
+                init,
+                &opts,
+                false,
+                &OuterFdDeclineLog::new(pop.subjects.len()),
+                None,
+                seed,
+            )
+            .0
+        })
+    };
+    let (cold, cold_n) = leg(None);
+    let (seeded, seeded_n) = leg(Some(&etas));
+    assert_eq!(
+        cold_n - seeded_n,
+        pre,
+        "the seeded first evaluation must skip exactly the pre-flight's multi-starts \
+         (cold leg {cold_n}, seeded leg {seeded_n}, pre-flight {pre})"
+    );
+    assert!(cold.ofv.is_finite() && seeded.ofv.is_finite());
+    assert!(
+        (cold.ofv - seeded.ofv).abs() < 1e-6 * (1.0 + cold.ofv.abs()),
+        "seeding moved the objective: cold {} vs seeded {}",
+        cold.ofv,
+        seeded.ofv
+    );
+}
+
+/// #2076, both sides of the "same point" gate end to end, per optimizer family. Each fit
+/// is compared with the same optimizer run directly from a cold cache on the parameters
+/// `optimize_population` hands it. With nothing frozen the pre-flight's multi-starts
+/// stand in for the first evaluation's, so the fit costs exactly the cold run; with a
+/// theta frozen the pre-flight's EBEs are dropped, and the fit costs the pre-flight on
+/// top of the cold run.
+#[test]
+fn optimize_population_reuses_preflight_etas_only_when_nothing_is_frozen() {
+    use crate::types::{EstimationMethod, FitOptions, Optimizer};
+    let pop = make_population(4);
+    for optimizer in [Optimizer::Bobyqa, Optimizer::Bfgs, Optimizer::TrustRegion] {
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer,
+            outer_maxiter: 1,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = || OuterFdDeclineLog::new(pop.subjects.len());
+        let cold_run = |model: &CompiledModel, init: &ModelParameters| {
+            count_multistarts(|| match optimizer {
+                Optimizer::Bobyqa => optimize_nlopt(model, &pop, init, &opts, &declines(), None),
+                Optimizer::Bfgs => optimize_bfgs(model, &pop, init, &opts, &declines(), None),
+                _ => {
+                    crate::estimation::trust_region::optimize_trust_region(model, &pop, init, &opts)
+                }
+            })
+            .1
+        };
+        let preflight_and_fit = |model: &CompiledModel| {
+            let (pre, pre_n) = count_multistarts(|| {
+                freeze_flat_thetas(model, &pop, &model.default_params, &opts, &declines())
+            });
+            let (fit, fit_n) = count_multistarts(|| {
+                optimize_population(model, &pop, &model.default_params, &opts)
+            });
+            assert!(fit.ofv.is_finite(), "{optimizer:?}: non-finite OFV");
+            let init = pre.frozen.map(|(p, _)| p);
+            let cold_n = cold_run(model, init.as_ref().unwrap_or(&model.default_params));
+            (init.is_some(), pre_n, fit_n, cold_n)
+        };
+
+        let (frozen, pre_n, fit_n, cold_n) = preflight_and_fit(&make_model());
+        assert!(!frozen, "every theta of make_model is live");
+        assert!(
+            pre_n >= pop.subjects.len(),
+            "{optimizer:?}: gate not reached"
+        );
+        assert_eq!(
+            fit_n, cold_n,
+            "{optimizer:?}: the first evaluation re-ran the multi-start \
+             (pre-flight {pre_n}, fit {fit_n}, cold run {cold_n})"
+        );
+
+        let (frozen, pre_n, fit_n, cold_n) = preflight_and_fit(&make_flat_tvv_model());
+        assert!(frozen, "the flat TVV must be frozen");
+        assert!(
+            pre_n >= pop.subjects.len(),
+            "{optimizer:?}: gate not reached"
+        );
+        assert_eq!(
+            fit_n,
+            pre_n + cold_n,
+            "{optimizer:?}: a frozen fit must solve its first evaluation cold \
+             (pre-flight {pre_n}, fit {fit_n}, cold run {cold_n})"
+        );
+    }
 }

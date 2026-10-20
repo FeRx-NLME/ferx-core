@@ -259,18 +259,30 @@ pub fn optimize_population(
     // Skip the flat-theta pre-flight for mixture models: it probes the single-
     // population outer gradient, which is not the mixture objective's gradient and
     // would mis-freeze the mixing-logit thetas.
+    //
+    // The pre-flight's cold solve is the same EBE problem the optimizer's first
+    // evaluation solves: both start from η = 0 at the packed, clamped initial
+    // estimate, so both would run the guarded inner multi-start (#1941), under both
+    // Hessian metrics when the policy is seeded. When nothing is frozen the first
+    // evaluation is warm-started from the pre-flight's EBEs instead (#2076): it
+    // starts at the mode the pre-flight's multi-start chose, and pays for no second
+    // scan. When a theta is frozen the start point is rebuilt from a different
+    // template, so the EBEs are dropped and the first evaluation solves cold as before.
     let frozen_params;
-    let (init_params, preflight_warnings) = if init_params.mixture.is_some() {
-        (init_params, Vec::new())
+    let (init_params, preflight_warnings, first_eval_etas) = if init_params.mixture.is_some() {
+        (init_params, Vec::new(), None)
     } else {
-        match freeze_flat_thetas(model, population, init_params, options, &preflight_declines) {
+        let preflight =
+            freeze_flat_thetas(model, population, init_params, options, &preflight_declines);
+        match preflight.frozen {
             Some((fp, w)) => {
                 frozen_params = fp;
-                (&frozen_params, w)
+                (&frozen_params, w, None)
             }
-            None => (init_params, Vec::new()),
+            None => (init_params, Vec::new(), preflight.etas),
         }
     };
+    let first_eval_etas = first_eval_etas.as_deref();
 
     let mut result = match resolved {
         // `Auto` is resolved away above; group it with the NLopt path defensively.
@@ -278,15 +290,28 @@ pub fn optimize_population(
         | Optimizer::NloptLbfgs
         | Optimizer::Mma
         | Optimizer::Bobyqa
-        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options, &declines),
-        Optimizer::Bfgs | Optimizer::Lbfgs => {
-            optimize_bfgs(model, population, init_params, options, &declines)
-        }
-        Optimizer::TrustRegion => crate::estimation::trust_region::optimize_trust_region(
+        | Optimizer::Auto => optimize_nlopt(
             model,
             population,
             init_params,
             options,
+            &declines,
+            first_eval_etas,
+        ),
+        Optimizer::Bfgs | Optimizer::Lbfgs => optimize_bfgs(
+            model,
+            population,
+            init_params,
+            options,
+            &declines,
+            first_eval_etas,
+        ),
+        Optimizer::TrustRegion => crate::estimation::trust_region::optimize_trust_region_seeded(
+            model,
+            population,
+            init_params,
+            options,
+            first_eval_etas,
         ),
     };
     // Surface the optimizer-downgrade and freeze warnings ahead of the optimizer's
@@ -308,6 +333,19 @@ pub fn optimize_population(
     result
 }
 
+/// What the flat-theta pre-flight ([`freeze_flat_thetas`]) hands back to
+/// [`optimize_population`].
+struct FlatThetaPreflight {
+    /// The initial estimates with the flat thetas fixed, and one warning per
+    /// frozen theta; `None` when nothing is flat.
+    frozen: Option<(ModelParameters, Vec<String>)>,
+    /// The EBEs of the pre-flight's cold inner solve, at the packed and clamped
+    /// initial estimate — the point an optimizer's first evaluation solves at
+    /// again when nothing is frozen (#2076). `None` when the pre-flight solved
+    /// nothing (every theta already fixed).
+    etas: Option<Vec<DVector<f64>>>,
+}
+
 /// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
 /// initial estimate and flags any non-fixed theta whose gradient is negligible
 /// relative to the largest theta gradient, then **confirms** each candidate with a
@@ -317,22 +355,26 @@ pub fn optimize_population(
 /// coincidentally-tiny gradient at the start point, and freezing it there biases
 /// the whole fit — see the probe comment below.)
 ///
-/// Returns `None` when nothing is flat (the common case; the caller keeps the
+/// `frozen` is `None` when nothing is flat (the common case; the caller keeps the
 /// borrowed `init_params` untouched), or `Some((frozen, warnings))` with a
 /// modified clone whose `theta_fixed` marks the flat thetas so the rest of the
 /// pipeline treats them as FIX — the graceful-degradation the issue asks for
-/// instead of the whole fit dying on an eval-1 `Failure`.
+/// instead of the whole fit dying on an eval-1 `Failure`. `etas` are the EBEs of
+/// the cold solve at the packed, clamped initial point (see [`FlatThetaPreflight`]).
 fn freeze_flat_thetas(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
-) -> Option<(ModelParameters, Vec<String>)> {
+) -> FlatThetaPreflight {
     let n_theta = init_params.theta.len();
     // Nothing to freeze if every theta is already fixed.
     if (0..n_theta).all(|i| init_params.theta_fixed.get(i).copied().unwrap_or(false)) {
-        return None;
+        return FlatThetaPreflight {
+            frozen: None,
+            etas: None,
+        };
     }
 
     let PackedStart {
@@ -362,132 +404,138 @@ fn freeze_flat_thetas(
         InnerHessianSeed::for_options(options),
         options,
     );
-    let mut grad_eval_idx = 0usize;
-    let grad = population_gradient(
-        &x,
-        n_subj,
-        init_params,
-        model,
-        population,
-        &ehs,
-        &hms,
-        &kappas,
-        &bounds,
-        options,
-        &mut grad_eval_idx,
-        OuterTrial::unknown(),
-        declines,
-    );
-
-    // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
-    // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
-    // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
-    // precision — freeze only that near-zero case, never a merely weakly-identified
-    // param (small-but-nonzero; covariance flags those as high RSE).
-    const FLAT_ABS: f64 = 1e-8;
-    const FLAT_REL: f64 = 1e-6;
-    let is_free = |i: usize| !init_params.theta_fixed.get(i).copied().unwrap_or(false);
-    let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
-    // Reference scale for "negligible". If the whole theta gradient is ~0 the
-    // objective is globally flat (no data reaches it) — a different pathology, so
-    // bail rather than freeze every parameter.
-    let g_max = (0..n_theta)
-        .filter(|&i| is_free(i))
-        .map(g_at)
-        .fold(0.0_f64, f64::max);
-    if g_max <= FLAT_ABS {
-        return None;
-    }
-
-    let candidates: Vec<usize> = (0..n_theta)
-        .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Confirm structural flatness with a perturbation probe before freezing. A
-    // near-zero gradient at the *initial* estimate is necessary but not sufficient
-    // for "unmapped": a genuinely-identifiable theta can have a coincidentally-tiny
-    // gradient there — e.g. an event-model hazard baseline `H0` evaluated at
-    // `BETA = 0`, where `hazard = H0·exp(0)` is momentarily flat in the coupling
-    // term, and whose ODE-path outer gradient is finite-differenced (#826 froze
-    // such an `H0` at its wrong initial value and biased the whole joint PK-TTE
-    // fit). A truly unmapped theta leaves the reconverged objective *exactly*
-    // unchanged when moved; an identifiable one moves it. Only freeze the former —
-    // freezing an identifiable theta pins it at its initial value and biases every
-    // other estimate. The probe costs one inner solve per candidate (candidates
-    // are rare), on top of the pre-flight gradient eval.
-    let base_ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-    let reconverged_ofv = |theta_i: usize, value: f64| -> f64 {
-        let mut p = params.clone();
-        p.theta[theta_i] = value;
-        let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
-        let (e, h, _s, k) = run_inner_loop_warm_seeded(
+    let frozen = 'freeze: {
+        let mut grad_eval_idx = 0usize;
+        let grad = population_gradient(
+            &x,
+            n_subj,
+            init_params,
             model,
             population,
-            &p,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(&cold_etas),
-            Some(&mu),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-            InnerHessianSeed::for_options(options),
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
             options,
+            &mut grad_eval_idx,
+            OuterTrial::unknown(),
+            declines,
         );
-        2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
-    };
-    // True ⇒ moving this theta changes the objective ⇒ it is identifiable, not flat.
-    let moves_objective = |i: usize| -> bool {
-        let ti = params.theta[i];
-        let (lo, hi) = (init_params.theta_lower[i], init_params.theta_upper[i]);
-        let delta = (ti.abs() * 0.5).max((hi - lo).abs() * 0.1).max(1e-2);
-        let mut probe = ti + delta;
-        if !(probe < hi) {
-            probe = ti - delta;
-        }
-        if !(probe > lo) {
-            probe = 0.5 * (lo + hi);
-        }
-        // Could not build a distinct in-bounds probe — do not freeze (safe side).
-        if (probe - ti).abs() <= 1e-12 {
-            return true;
-        }
-        (reconverged_ofv(i, probe) - base_ofv).abs() > 1e-6 * (1.0 + base_ofv.abs())
-    };
-    let flat: Vec<usize> = candidates
-        .into_iter()
-        .filter(|&i| !moves_objective(i))
-        .collect();
-    if flat.is_empty() {
-        return None;
-    }
 
-    let mut frozen = init_params.clone();
-    let mut warnings = Vec::new();
-    for &i in &flat {
-        // Pin the FIX at the *clamped* value the gradient was actually evaluated at
-        // (`params.theta`, not the raw `init_params.theta`): an out-of-bounds initial
-        // theta must not be frozen — nor reported — outside its declared bounds, and
-        // the printed value must match the point the flatness was decided at.
-        frozen.theta[i] = params.theta[i];
-        frozen.theta_fixed[i] = true;
-        let name = init_params
-            .theta_names
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("<theta>");
-        warnings.push(format!(
-            "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
-             initial estimate) — it is likely computed but never used (unmapped, or dropped \
-             from the structural / scaling model). Freezing it at its initial value ({val}) \
-             so the remaining parameters can be estimated; map or remove `{name}` to silence \
-             this.",
-            val = params.theta[i],
-        ));
+        // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
+        // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
+        // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
+        // precision — freeze only that near-zero case, never a merely weakly-identified
+        // param (small-but-nonzero; covariance flags those as high RSE).
+        const FLAT_ABS: f64 = 1e-8;
+        const FLAT_REL: f64 = 1e-6;
+        let is_free = |i: usize| !init_params.theta_fixed.get(i).copied().unwrap_or(false);
+        let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
+        // Reference scale for "negligible". If the whole theta gradient is ~0 the
+        // objective is globally flat (no data reaches it) — a different pathology, so
+        // bail rather than freeze every parameter.
+        let g_max = (0..n_theta)
+            .filter(|&i| is_free(i))
+            .map(g_at)
+            .fold(0.0_f64, f64::max);
+        if g_max <= FLAT_ABS {
+            break 'freeze None;
+        }
+
+        let candidates: Vec<usize> = (0..n_theta)
+            .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
+            .collect();
+        if candidates.is_empty() {
+            break 'freeze None;
+        }
+
+        // Confirm structural flatness with a perturbation probe before freezing. A
+        // near-zero gradient at the *initial* estimate is necessary but not sufficient
+        // for "unmapped": a genuinely-identifiable theta can have a coincidentally-tiny
+        // gradient there — e.g. an event-model hazard baseline `H0` evaluated at
+        // `BETA = 0`, where `hazard = H0·exp(0)` is momentarily flat in the coupling
+        // term, and whose ODE-path outer gradient is finite-differenced (#826 froze
+        // such an `H0` at its wrong initial value and biased the whole joint PK-TTE
+        // fit). A truly unmapped theta leaves the reconverged objective *exactly*
+        // unchanged when moved; an identifiable one moves it. Only freeze the former —
+        // freezing an identifiable theta pins it at its initial value and biases every
+        // other estimate. The probe costs one inner solve per candidate (candidates
+        // are rare), on top of the pre-flight gradient eval.
+        let base_ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+        let reconverged_ofv = |theta_i: usize, value: f64| -> f64 {
+            let mut p = params.clone();
+            p.theta[theta_i] = value;
+            let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
+            let (e, h, _s, k) = run_inner_loop_warm_seeded(
+                model,
+                population,
+                &p,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(&cold_etas),
+                Some(&mu),
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+                InnerHessianSeed::for_options(options),
+                options,
+            );
+            2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
+        };
+        // True ⇒ moving this theta changes the objective ⇒ it is identifiable, not flat.
+        let moves_objective = |i: usize| -> bool {
+            let ti = params.theta[i];
+            let (lo, hi) = (init_params.theta_lower[i], init_params.theta_upper[i]);
+            let delta = (ti.abs() * 0.5).max((hi - lo).abs() * 0.1).max(1e-2);
+            let mut probe = ti + delta;
+            if !(probe < hi) {
+                probe = ti - delta;
+            }
+            if !(probe > lo) {
+                probe = 0.5 * (lo + hi);
+            }
+            // Could not build a distinct in-bounds probe — do not freeze (safe side).
+            if (probe - ti).abs() <= 1e-12 {
+                return true;
+            }
+            (reconverged_ofv(i, probe) - base_ofv).abs() > 1e-6 * (1.0 + base_ofv.abs())
+        };
+        let flat: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&i| !moves_objective(i))
+            .collect();
+        if flat.is_empty() {
+            break 'freeze None;
+        }
+
+        let mut frozen = init_params.clone();
+        let mut warnings = Vec::new();
+        for &i in &flat {
+            // Pin the FIX at the *clamped* value the gradient was actually evaluated at
+            // (`params.theta`, not the raw `init_params.theta`): an out-of-bounds initial
+            // theta must not be frozen — nor reported — outside its declared bounds, and
+            // the printed value must match the point the flatness was decided at.
+            frozen.theta[i] = params.theta[i];
+            frozen.theta_fixed[i] = true;
+            let name = init_params
+                .theta_names
+                .get(i)
+                .map(|s| s.as_str())
+                .unwrap_or("<theta>");
+            warnings.push(format!(
+                "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
+                 initial estimate) — it is likely computed but never used (unmapped, or dropped \
+                 from the structural / scaling model). Freezing it at its initial value ({val}) \
+                 so the remaining parameters can be estimated; map or remove `{name}` to silence \
+                 this.",
+                val = params.theta[i],
+            ));
+        }
+        Some((frozen, warnings))
+    };
+    FlatThetaPreflight {
+        frozen,
+        etas: Some(ehs),
     }
-    Some((frozen, warnings))
 }
 
 /// Evaluate the population objective at the initial parameters without running
@@ -3210,6 +3258,7 @@ fn optimize_nlopt(
     init_params: &ModelParameters,
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
+    first_eval_etas: Option<&[DVector<f64>]>,
 ) -> OuterResult {
     // The attempts minimised the *penalized* objective (covariate-NN
     // regularization, parameter priors), so they are ranked on it too:
@@ -3236,6 +3285,7 @@ fn optimize_nlopt(
             hold_cap_at_init,
             declines,
             None,
+            first_eval_etas,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -3278,6 +3328,7 @@ fn optimize_nlopt(
                     escape_from: init_params,
                     spent_evals: stalled.n_iterations,
                 }),
+                None,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -3743,6 +3794,7 @@ fn optimize_nlopt_once(
     hold_cap_at_init: bool,
     declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>,
+    first_eval_etas: Option<&[DVector<f64>]>,
 ) -> (OuterResult, AttemptOutcome) {
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
@@ -3898,12 +3950,21 @@ fn optimize_nlopt_once(
     // which is the default.
     let optimizer_start_s: Vec<f64> = x0.clone();
 
-    let state = new_nlopt_state(
+    let mut state = new_nlopt_state(
         n_subj,
         n_eta,
         &x0,
         SalvageGuardPolicy::for_optimizer(options.optimizer),
     );
+    // #2076: the flat-theta pre-flight's EBEs, solved at this attempt's start, seed the
+    // first evaluation — but only on a leg that starts there: not a restart leg (it
+    // starts at the stalled estimates), and not after a global pre-search that moved
+    // the start.
+    if let Some(etas) = first_eval_etas
+        .filter(|e| restart.is_none() && optimizer_start_s == x0_start_s && e.len() == n_subj)
+    {
+        state.cached_etas = etas.to_vec();
+    }
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
     // back after `opt.optimize()`, so we need an Arc to read the final
@@ -5507,6 +5568,7 @@ fn optimize_bfgs(
     init_params: &ModelParameters,
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
+    first_eval_etas: Option<&[DVector<f64>]>,
 ) -> OuterResult {
     let PackedStart {
         packed: mut x,
@@ -5519,7 +5581,12 @@ fn optimize_bfgs(
     let n_eta = model.n_eta;
 
     let mut warnings = Vec::new();
-    let mut cached_etas: Vec<DVector<f64>> = vec![DVector::zeros(n_eta); n_subj];
+    // #2076: the first evaluation solves at `x`, where the flat-theta pre-flight
+    // already solved; start it from the pre-flight's EBEs when it handed them over.
+    let mut cached_etas: Vec<DVector<f64>> = match first_eval_etas {
+        Some(etas) if etas.len() == n_subj => etas.to_vec(),
+        _ => vec![DVector::zeros(n_eta); n_subj],
+    };
 
     // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
     // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but

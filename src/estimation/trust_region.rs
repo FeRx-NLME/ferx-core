@@ -677,6 +677,20 @@ pub fn optimize_trust_region(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
+    optimize_trust_region_seeded(model, population, init_params, options, None)
+}
+
+/// [`optimize_trust_region`] with the first evaluation's EBEs supplied: `first_eval_etas`
+/// are the EBEs already solved at the packed, clamped `init_params` (the flat-theta
+/// pre-flight's, #2076), so the first inner solve starts at that mode instead of solving
+/// it cold a second time. `None` is the cold start.
+pub(crate) fn optimize_trust_region_seeded(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    first_eval_etas: Option<&[DVector<f64>]>,
+) -> OuterResult {
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -704,7 +718,10 @@ pub fn optimize_trust_region(
         options,
         init_params,
         bounds,
-        cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
+        cached_etas: std::sync::Mutex::new(match first_eval_etas {
+            Some(etas) if etas.len() == n_subj => etas.to_vec(),
+            _ => vec![DVector::zeros(n_eta); n_subj],
+        }),
         grad_cache: std::sync::Mutex::new(None),
         priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
         nn_reg,
