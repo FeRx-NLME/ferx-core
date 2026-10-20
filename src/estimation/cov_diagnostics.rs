@@ -658,18 +658,29 @@ pub(crate) const REGULARIZED_PREFIX: &str = "Covariance step regularized:";
 /// Assemble the `covariance_regularized` message.
 ///
 /// The leading [`REGULARIZED_PREFIX`] is load-bearing (see there) and is pinned by a test.
+///
+/// The `|min eig|/max eig` clause prints only when the spectrum is indefinite (#2132).
+/// [`CovRegularizationFacts::neg_ratio`] is one-sided — `0` on a non-negative spectrum, since
+/// that is the magnitude `grade()` reads — so printing it under that label beside a positive
+/// `min eig` claimed `1.161e-8 / 2.078e3 = 0`. A positive `min eig` already says
+/// "near-singular, not indefinite", so the clause is omitted rather than relabelled.
 pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> String {
     let grade = facts.grade();
+    let neg_ratio = facts.neg_ratio();
+    let ratio_clause = if neg_ratio > 0.0 {
+        format!(", |min eig|/max eig = {neg_ratio:.2e}")
+    } else {
+        String::new()
+    };
     let mut msg = format!(
         "{REGULARIZED_PREFIX} eigenvalue floor applied to {} ({} of {} free-block \
-         eigenvalues clipped; min eig = {:.3e}, max eig = {:.3e}, |min eig|/max eig = {:.2e}, \
+         eigenvalues clipped; min eig = {:.3e}, max eig = {:.3e}{ratio_clause}, \
          floor = {:.3e}; worst inflation of a reported variance = {}; severity: {}). {}",
         facts.source.label(),
         facts.n_clipped,
         facts.n_free,
         facts.min_eigenvalue,
         facts.max_eigenvalue,
-        facts.neg_ratio(),
         facts.floor,
         fmt_inflation(facts.variance_inflation),
         grade.severity.label(),

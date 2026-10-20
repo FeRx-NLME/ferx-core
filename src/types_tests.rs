@@ -1464,7 +1464,7 @@ fn classify_warning_roundtrips_every_engine_message() {
         (
             "Covariance step regularized: eigenvalue floor applied to the FD Hessian \
                  (1 of 3 free-block eigenvalues clipped; min eig = 1.200e-6, max eig = 8.4e3, \
-                 |min eig|/max eig = 0.00e0, floor = 8.4e-14; worst variance inflation from \
+                 floor = 8.4e-14; worst variance inflation from \
                  the floor = 1.050e0\u{d7}; severity: minor). Standard errors are likely reliable.",
             Warning,
             "covariance_regularized",
