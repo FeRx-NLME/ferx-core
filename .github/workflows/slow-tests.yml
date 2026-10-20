@@ -290,12 +290,14 @@ jobs:
   # under `nn`, for `nn-summary`'s check that the list is complete.
   #
   # Budget: a worst-case nn compile of 19 min (`fcad163d`) plus 1.81 x its ~15 fast
-  # test-min (lib 674 s, the DCM VI fits 202 s) is 46 min; / 0.7 = 65.
+  # test-min (lib 674 s, the DCM VI fits 202 s) is 46 min. Measured on the #2182
+  # dispatches: 35.9, 46.8 and 29.2 min, so the predicted worst case does occur;
+  # 46.8 / 0.7 = 67, rounded up to 70.
   nn:
     name: Slow regression tests (nn)
     if: github.event.schedule != '0 7 * * 0' && inputs.leg != 'full-nn'
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 85
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
@@ -313,14 +315,14 @@ jobs:
       - name: cargo test (ci-test profile + slow-tests + nn)
         # The build arguments of `shards`, plus `ferx-core/nn`.
         run: |
-          timeout --signal=INT --kill-after=2m 65m \
+          timeout --signal=INT --kill-after=2m 70m \
             python3 tools/ci-test-shard.py run slow-nn 1 1 --lib-parts 1 --list-all --manifest manifest -- \
               --workspace --exclude docs-lint --no-default-features \
               --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \
-                   echo "::error::slow-tests (nn) exceeded its 65m budget - a test is hanging or the nn list outgrew it"; \
+                   echo "::error::slow-tests (nn) exceeded its 70m budget - a test is hanging or the nn list outgrew it"; \
                  fi; \
                  exit "$code"; }
       - name: Upload the nn manifest
@@ -355,7 +357,7 @@ jobs:
           name: slow-manifest-nn
           path: nn-manifest
       - name: The nn job ran every listed test
-        run: python3 tools/ci-test-shard.py check slow-nn 1 nn-manifest --result ${{ needs.nn.result }} --budget-min 65
+        run: python3 tools/ci-test-shard.py check slow-nn 1 nn-manifest --result ${{ needs.nn.result }} --budget-min 70
       - name: tools/slow-nn-tests.txt is every binary nn adds a test to
         # Not skipped by a red step above: the two verdicts are independent.
         if: success() || failure()
