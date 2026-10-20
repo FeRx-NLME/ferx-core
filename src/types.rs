@@ -7200,6 +7200,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on `data_quality`. That arm serves several unrelated inputs, so a test
         // asserting only the category asserts almost nothing — assert the token.
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("covariance step failed") {
+        // #2158: every covariance-step failure reason starts with this prefix (after the
+        // chain tag stripped above), and the prefix — not a phrase inside the reason —
+        // decides the class. First of the prose arms, because a reason goes on to say why
+        // the step failed, in words the arms below claim: the profiled step's "the profile
+        // solve did not converge at the estimates" was filed `Convergence` by the arm below,
+        // reporting a covariance failure on a converged fit as optimizer non-convergence.
+        // After the token arms, which classify their own (`W_COV_NON_STATIONARY_ESTIMATE`'s
+        // failure form starts with its token, not with this prefix).
+        (WarningSeverity::Critical, WarningCode::CovarianceFailed)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
