@@ -1410,54 +1410,10 @@ pub fn foce_subject_nll(
     )
 }
 
-/// A subject's objective that is not finite — a `NaN`/`inf` prediction, typically a
-/// parameter outside the model's domain — scores as the finite `1e20` sentinel, as the
-/// individual objective does (#97): the point sorts as worst and is repelled, rather than
-/// handing a `NaN` to the outer optimizer, the profile solve or a sampler. The value is
-/// otherwise unchanged.
-///
-/// Until #2093 the FOCE objectives met this only by accident: an FD-built κ column of
-/// `H_full` went `NaN` with the prediction, and the failed Cholesky of `H̃` returned the
-/// sentinel. An exact Jacobian is finite there (∂f/∂κ of a model linear in κ is 1 at any
-/// θ), so the guard has to be explicit.
-fn repel_non_finite(nll: f64) -> f64 {
-    if nll.is_finite() {
-        nll
-    } else {
-        1e20
-    }
-}
-
 /// [`foce_subject_nll`] over a resolved [`ResidualCov`] — the form every in-crate
-/// caller uses (#1081). A non-finite objective returns the `1e20` sentinel
-/// ([`repel_non_finite`]).
+/// caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_nll_cov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
-) -> f64 {
-    repel_non_finite(foce_subject_nll_cov_unguarded(
-        model,
-        subject,
-        theta,
-        eta_hat,
-        h_matrix,
-        omega,
-        sigma_values,
-        residual_cov,
-        interaction,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn foce_subject_nll_cov_unguarded(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -2663,14 +2619,9 @@ pub fn foce_subject_nll_iov(
     match iov_linearization(
         model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
     ) {
-        Some(lin) => repel_non_finite(foce_subject_nll_iov_linearized(
-            model,
-            subject,
-            theta,
-            sigma_values,
-            interaction,
-            &lin,
-        )),
+        Some(lin) => {
+            foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
+        }
         None => 1e20,
     }
 }

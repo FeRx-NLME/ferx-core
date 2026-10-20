@@ -628,11 +628,21 @@ fn every_contrast_profiles_to_the_minimum() {
 // ── Replay: the covariance step's solve failure ────────────────────────────────────
 
 /// `replay_covariance` on a start the profile solve cannot use (a `NaN` level; measured,
-/// the solve fails as `ProfileFailure::Singular`) returns no matrix and the one warning
+/// the solve fails as `ProfileFailure::NonFinite`) returns no matrix and the one warning
 /// `profile_solve_failed_msg` builds — and that warning, as emitted, classifies
 /// `covariance_failed` (#2158). The `classify_warning` table in `types_tests.rs` builds its
 /// profile rows from the same function; this test is what ties the function to the call
 /// site, so an inline message put back there (with the prefix reworded, say) fails here.
+///
+/// The failure arm is `NonFinite` since #2093 (it was `Singular` when #2176 added this
+/// test): the `NaN` level makes subject 0's FOCE objective `NaN`, and the solve rejects
+/// its non-finite start. The FOCE objective propagates `NaN` by design — the fit's
+/// non-finite arm (#1303, `nonfinite_objective_tests`) keys on it — and the IOV path
+/// returned `1e20` only by accident: its κ columns of `H_full` were central differences
+/// of the `NaN` predictions, so `H_full` went `NaN` and the linearized objective fell into
+/// its `1e20` sentinel (measured: subject 0 scores `1e20` on `main`, `NaN` here). #2093
+/// builds them exactly (∂f/∂κ = 1 on F1 at any θ), so the IOV path now behaves like the
+/// non-IOV one. Which arm fires is incidental here; the classification is the claim.
 #[test]
 fn a_failed_replay_solve_is_a_covariance_failure() {
     let p = prep(F1, F1_DATA, None, |t| t);
@@ -648,7 +658,7 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
     assert!(out.matrix.is_none());
     assert_eq!(
         out.warnings,
-        vec![profile_solve_failed_msg(&ProfileFailure::Singular)]
+        vec![profile_solve_failed_msg(&ProfileFailure::NonFinite)]
     );
     let w = crate::types::classify_warning(&out.warnings[0]);
     assert_eq!(
@@ -657,53 +667,4 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
         "{}",
         out.warnings[0]
     );
-}
-
-/// A `NaN` level makes the subject it reaches score `NaN` before any guard. The FOCE
-/// objective returns the finite `1e20` sentinel for it instead (#97's convention, made
-/// explicit for the population objectives on #2093), and leaves the other subjects' terms
-/// alone. Before the guard this held only by accident: the FD κ columns of `H_full` went
-/// `NaN` with the prediction and the failed Cholesky returned the sentinel; F1 is linear in
-/// κ, so the exact Jacobian is finite and the `NaN` reached the return value (measured:
-/// subject 0 scored `NaN`, which `a_failed_replay_solve_is_a_covariance_failure` then saw
-/// as `ProfileFailure::NonFinite`). Mutation: drop `repel_non_finite` → subject 0 is `NaN`.
-#[test]
-fn a_nan_level_scores_as_the_sentinel_not_nan() {
-    let p = prep(F1, F1_DATA, None, |t| t);
-    let layout = layout_of(&p);
-    let mut params = p.init_params.clone();
-    params.theta[layout.coords[0]] = f64::NAN;
-    let o = options(&p);
-    let mu_k = compute_mu_k(&p.parsed.model, &params.theta, o.mu_referencing);
-    let (etas, hms, _, kaps) = crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
-        &p.parsed.model,
-        &p.population,
-        &params,
-        o.inner_maxiter,
-        o.inner_tol,
-        None,
-        Some(&mu_k),
-        o.min_obs_for_convergence_check as usize,
-        o.inner_restarts,
-        crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&o),
-        &o,
-    );
-    let nll: Vec<f64> = (0..p.population.subjects.len())
-        .map(|i| {
-            subject_nll(
-                &p.parsed.model,
-                &p.population.subjects[i],
-                &params,
-                &etas[i],
-                &hms[i],
-                &kaps.get(i).cloned().unwrap_or_default(),
-                o.interaction,
-            )
-        })
-        .collect();
-    assert!(nll.iter().all(|v| v.is_finite()), "{nll:?}");
-    // Subject 0 is in the `NaN` level's group (measured); the others are not, and keep
-    // their real objectives — far below the sentinel (25–80 on F1, measured).
-    assert_eq!(nll[0], 1e20, "{nll:?}");
-    assert!(nll[1..].iter().all(|&v| v < 1e3), "{nll:?}");
 }
