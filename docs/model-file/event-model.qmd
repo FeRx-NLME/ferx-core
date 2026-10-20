@@ -43,7 +43,11 @@ including data format, hazard families, and comparison with nlmixr2 / NONMEM.
 > ([#1919](https://github.com/FeRx-NLME/ferx-core/issues/1919)). The family's own time
 > dependence lives in its closed form; for a hazard that varies in `TIME` some other way,
 > write it as an [ODE-accumulated `hazard =`](#joint-pk-tte-ode-accumulated-hazard-hazard)
-> with the `TIME` term in that expression.
+> with the `TIME` term in that expression. The check follows the block in order, across
+> both arms of each `if`, but does not recognise two separate `if` statements testing the same
+> condition as one: a value made `TIME`-dependent under one `if` and read under the opposite
+> arm of another is refused even if no execution combines them. The message says so; merge
+> the two `if` statements into one to resolve it.
 > Writing the full theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`) also
 > works.
 

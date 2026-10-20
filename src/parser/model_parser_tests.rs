@@ -34183,6 +34183,10 @@ mod analytic_hazard_time_1919 {
 
     const BASE_IP: &str = "  CL  = TVCL * exp(ETA_CL)\n  V1  = TVV\n";
 
+    /// The caveat a refusal carries when its dependency holds on only some paths.
+    const SOME_PATH: &str = "This dependency holds on at least one path through the block's `if` \
+                             statements";
+
     /// Every sentence of the message, per cell: the shared why/fix and the cell's lead.
     fn assert_message(err: &str, lead: &str) {
         for part in [
@@ -34207,6 +34211,10 @@ mod analytic_hazard_time_1919 {
             &err,
             "the hazard reads the [individual_parameters] value `LAM`, whose value \
              depends on the `TIME` built-in",
+        );
+        assert!(
+            !err.contains(SOME_PATH),
+            "a dependency on every path carries no some-path caveat: {err}"
         );
     }
 
@@ -34294,15 +34302,20 @@ mod analytic_hazard_time_1919 {
     /// governed by every earlier condition too.
     #[test]
     fn a_time_reading_condition_governing_the_reached_assignment_is_refused() {
-        for (label, branch) in [
+        // Third field: whether the dependency is on only some paths. Both arms of the first
+        // case assign `LAM` under the `TIME` test, so it holds on every path; in the second
+        // only the `else if` arm does.
+        for (label, branch, some_path) in [
             (
                 "own condition",
                 "  if (TIME > 5) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = 2 * TVLAMBDA\n  }",
+                false,
             ),
             (
                 "earlier arm's condition",
                 "  LAM = TVLAMBDA\n  if (TIME > 5) {\n    AUX = 1\n  } \
                  else if (TVKT > 0) {\n    LAM = 2 * TVLAMBDA\n  }",
+                true,
             ),
         ] {
             let ip = format!("{BASE_IP}{branch}");
@@ -34311,6 +34324,7 @@ mod analytic_hazard_time_1919 {
                 err.contains("value `LAM`, whose value depends on the `TIME` built-in"),
                 "{label}: got: {err}"
             );
+            assert_eq!(err.contains(SOME_PATH), some_path, "{label}: got: {err}");
         }
     }
 
@@ -34339,6 +34353,34 @@ mod analytic_hazard_time_1919 {
                 err.contains("value `LAM`, whose value depends on the `TIME` built-in."),
                 "{label}: got: {err}"
             );
+            assert!(err.contains(SOME_PATH), "{label}: got: {err}");
+        }
+    }
+
+    /// **Conservative across separate `if` statements, pinned** (round-3 review). Every
+    /// execution leaves `LAM` time-free — `LAM = K` runs only when `TVKT > 0` is false,
+    /// which is exactly when `K = TIME` did not run — but proving that needs the two
+    /// conditions to be recognised as one, which the walk does not attempt (condition
+    /// equivalence is undecidable in general). So it is refused, and the refusal says the
+    /// dependency is on only some paths and how to rewrite. The one-`if` form of the same
+    /// model parses (`a_time_dependency_on_no_single_path_is_not_refused`), which is the
+    /// rewrite the message suggests. If a later change makes this parse, it must still
+    /// refuse `a_time_dependency_on_any_single_path_is_refused`.
+    #[test]
+    fn a_dependency_split_across_separate_ifs_is_refused_with_the_some_path_caveat() {
+        let ip = format!(
+            "{BASE_IP}  K = TVLAMBDA\n  LAM = TVLAMBDA\n  if (TVKT > 0) {{\n    K = TIME\n  }}\n  \
+             if (TVKT > 0) {{\n    LAM = TVLAMBDA\n  }} else {{\n    LAM = K\n  }}"
+        );
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        for part in [
+            "value `LAM`, whose value depends on the `TIME` built-in (through `K`).",
+            SOME_PATH,
+            "the check does not correlate conditions across separate `if` statements",
+            "so if that path cannot occur, assign `LAM` without reading a value another `if` \
+             makes TIME-dependent (e.g. merge the two `if` statements into one).",
+        ] {
+            assert!(err.contains(part), "missing `{part}` in: {err}");
         }
     }
 

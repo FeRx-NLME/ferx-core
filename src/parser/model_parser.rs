@@ -7913,22 +7913,48 @@ fn reject_time_in_analytic_hazard(
             }
         });
     }
-    if let Some((name, root)) = read.iter().find_map(|n| tainted.get(n).map(|r| (n, r))) {
-        let through = if root == name {
+    if let Some((name, taint)) = read.iter().find_map(|n| tainted.get(n).map(|t| (n, t))) {
+        let through = if &taint.root == name {
             String::new()
         } else {
-            format!(" (through `{root}`)")
+            format!(" (through `{}`)", taint.root)
+        };
+        // A dependency carried by only some arms of an `if` may be infeasible when a later
+        // `if` re-tests the same condition: the walk does not correlate separate `if`s,
+        // because that needs condition equivalence, which it cannot decide in general
+        // (`TVKT > 0` vs `0 < TVKT`, or a covariate test). Say so on exactly those refusals,
+        // so a user whose model is in fact time-free has the rewrite in hand.
+        let some_path = if taint.some_path {
+            format!(
+                " This dependency holds on at least one path through the block's `if` \
+                 statements; the check does not correlate conditions across separate `if` \
+                 statements, so if that path cannot occur, assign `{name}` without reading a \
+                 value another `if` makes TIME-dependent (e.g. merge the two `if` statements \
+                 into one)."
+            )
+        } else {
+            String::new()
         };
         return Err(format!(
             "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
-             `{name}`, whose value depends on the `TIME` built-in{through}. {WHY} {FIX}"
+             `{name}`, whose value depends on the `TIME` built-in{through}.{some_path} {WHY} {FIX}"
         ));
     }
     Ok(())
 }
 
-/// Which names hold a `TIME`-dependent value once `stmts` has run, each mapped to a
-/// witness: the name whose own assignment (or governing condition) reads `TIME` directly.
+/// A name holding a `TIME`-dependent value, per `indiv_time_taint_at_exit`.
+#[cfg(feature = "survival")]
+#[derive(Clone)]
+struct TimeTaint {
+    /// The name whose own assignment, or governing condition, reads `TIME` directly.
+    root: String,
+    /// The dependency is carried by only some paths through an `if` (a join of arms that
+    /// disagree), so it may be infeasible if a later `if` re-tests the same condition.
+    some_path: bool,
+}
+
+/// Which names hold a `TIME`-dependent value once `stmts` has run.
 ///
 /// One forward pass in program order, the way the block executes. An `Assign` is a strong
 /// update — a name re-assigned from a time-free RHS is clean again — and its value depends
@@ -7936,35 +7962,47 @@ fn reject_time_in_analytic_hazard(
 /// `if` condition does (every condition up to and including the arm's own: an arm runs only
 /// when the earlier conditions were false, as in `compute_time_dependent_mask`). Each arm
 /// runs from the state before the `if`; the state after it is the union over the arms, plus
-/// the state before when there is no `else`. Path-correlated, so a definition on one arm
-/// never pairs with a read on another.
+/// the state before when there is no `else`. So a definition on one arm never pairs with a
+/// read on another arm of the **same** `if` (round-2 review).
+///
+/// **Conservative across separate `if` statements, by design.** The join forgets which
+/// arm ran, so two `if`s re-testing one condition are treated as independent, and a
+/// dependency on a path no execution takes can be refused (round-3 review:
+/// `if (C) { K = TIME }; if (C) { LAM = 1 } else { LAM = K }`). Correlating them needs
+/// condition equivalence, which is undecidable in general; the over-approximation never
+/// accepts a `TIME`-dependent hazard, it is the direction #1853's
+/// `compute_time_dependent_mask` takes too, and such a refusal says so (`some_path`).
 #[cfg(feature = "survival")]
-fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, String> {
-    // `Some(None)`: reads `TIME` itself; `Some(Some(root))`: reads a dependent name.
-    type Src = Option<Option<String>>;
+fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, TimeTaint> {
+    // `Some((None, _))`: reads `TIME` itself; `Some((Some(root), some_path))`: reads a
+    // dependent name.
+    type Src = Option<(Option<String>, bool)>;
     fn src_of(
         visit: &mut dyn FnMut(&mut dyn FnMut(&Expression)),
-        st: &HashMap<String, String>,
+        st: &HashMap<String, TimeTaint>,
     ) -> Src {
         let (mut direct, mut via) = (false, None);
         visit(&mut |e: &Expression| match e {
             Expression::Time => direct = true,
-            Expression::Variable(n) if via.is_none() => via = st.get(n).cloned(),
+            Expression::Variable(n) if via.is_none() => {
+                via = st.get(n).map(|t| (Some(t.root.clone()), t.some_path))
+            }
             _ => {}
         });
         if direct {
-            Some(None)
+            Some((None, false))
         } else {
-            via.map(Some)
+            via
         }
     }
-    fn walk(stmts: &[Statement], governed: &Src, st: &mut HashMap<String, String>) {
+    fn walk(stmts: &[Statement], governed: &Src, st: &mut HashMap<String, TimeTaint>) {
         for s in stmts {
             match s {
                 Statement::Assign(name, e) => {
                     match src_of(&mut |f| visit_expr_nodes(e, f), st).or_else(|| governed.clone()) {
-                        Some(root) => {
-                            st.insert(name.clone(), root.unwrap_or_else(|| name.clone()));
+                        Some((root, some_path)) => {
+                            let root = root.unwrap_or_else(|| name.clone());
+                            st.insert(name.clone(), TimeTaint { root, some_path });
                         }
                         None => {
                             st.remove(name);
@@ -7976,7 +8014,7 @@ fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, String> {
                     else_body,
                 } => {
                     let before = st.clone();
-                    let mut arms: Vec<HashMap<String, String>> = Vec::new();
+                    let mut arms: Vec<HashMap<String, TimeTaint>> = Vec::new();
                     let mut g = governed.clone();
                     for (cond, body) in branches {
                         g = g.or_else(|| src_of(&mut |f| visit_condition_nodes(cond, f), &before));
@@ -7990,9 +8028,17 @@ fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, String> {
                     }
                     arms.push(arm);
                     st.clear();
-                    for arm in arms {
+                    for arm in &arms {
                         for (k, v) in arm {
-                            st.entry(k).or_insert(v);
+                            st.entry(k.clone()).or_insert_with(|| {
+                                let on_every_arm = arms.iter().all(|a| a.contains_key(k));
+                                let some_path = !on_every_arm
+                                    || arms.iter().any(|a| a.get(k).is_some_and(|t| t.some_path));
+                                TimeTaint {
+                                    root: v.root.clone(),
+                                    some_path,
+                                }
+                            });
                         }
                     }
                 }
