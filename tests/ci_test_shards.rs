@@ -215,33 +215,94 @@ fn a_planner_failure_fails_the_shard() {
     );
 }
 
-/// `codecov.yml` holds Codecov's status until `after_n_builds` reports arrive. That is
-/// right only while every event uploads exactly that many: the three upload steps in
-/// `ci.yml` pair up as `endpoints` (every event) plus `coverage-pr-upload` (PR/push) or
-/// `coverage` (schedule/dispatch). A third upload on some event would grade early
-/// again; one fewer would leave every status pending forever.
+/// The keys of the two-space-indented mapping under the top-level `section:` line
+/// (`on:` → the triggers, `jobs:` → the job keys).
+fn top_level_keys(yml: &str, section: &str) -> Vec<String> {
+    yml.lines()
+        .skip_while(|l| l.trim_end() != format!("{section}:"))
+        .skip(1)
+        .take_while(|l| l.is_empty() || l.starts_with(' ') || l.starts_with('#'))
+        .filter_map(|l| {
+            let key = l.strip_prefix("  ")?.strip_suffix(':')?;
+            (!key.starts_with([' ', '#', '-'])
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .then(|| key.to_owned())
+        })
+        .collect()
+}
+
+/// Whether a job-level `if:` admits `event`. Deliberately small: it reads only the
+/// `github.event_name == / != '<event>'` comparisons ci.yml uses, and treats a
+/// condition naming no `== '…'` event as event-independent (`always()` etc.).
+fn runs_on(cond: Option<&str>, event: &str) -> bool {
+    let Some(c) = cond else { return true };
+    if c.contains(&format!("github.event_name != '{event}'")) {
+        return false;
+    }
+    if c.contains("github.event_name == '") {
+        return c.contains(&format!("github.event_name == '{event}'"));
+    }
+    true
+}
+
+/// `codecov.yml` holds Codecov's status until `after_n_builds` reports arrive, which is
+/// right only while every ci.yml trigger that uploads at all uploads exactly that many.
+/// Built as a truth table — every trigger in `on:` × every job holding an upload step,
+/// through the job's `if:` — so a trigger dropped from one job's condition (dispatch
+/// uploading only `endpoints`, pending forever) or a new upload job fails here. Zero is
+/// allowed: an event that uploads nothing (a merge queue, #2043) expects no status.
 #[test]
 fn codecov_waits_for_every_report_of_an_event() {
     let root = repo_root();
     let codecov = std::fs::read_to_string(root.join("codecov.yml")).unwrap();
-    assert!(
-        codecov.lines().any(|l| l.trim() == "after_n_builds: 2"),
-        "codecov.yml no longer waits for both reports of an event"
-    );
-    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    let uploads = ci
+    let want: usize = codecov
         .lines()
-        .filter(|l| !l.trim_start().starts_with('#') && l.contains("codecov/codecov-action@"))
-        .count();
-    assert_eq!(
-        uploads, 3,
-        "ci.yml has {uploads} Codecov upload steps; re-derive the per-event count and \
-         update `after_n_builds` in codecov.yml"
+        .find_map(|l| l.trim().strip_prefix("after_n_builds:"))
+        .expect("codecov.yml no longer sets `after_n_builds`")
+        .trim()
+        .parse()
+        .unwrap();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let events = top_level_keys(&ci, "on");
+    assert!(
+        events.iter().any(|e| e == "pull_request"),
+        "trigger parse found {events:?}"
     );
-    for job in ["endpoints", "coverage", "coverage-pr-upload"] {
+    let uploaders: Vec<(String, Option<String>)> = top_level_keys(&ci, "jobs")
+        .into_iter()
+        .filter_map(|job| {
+            let body = job_body(&job);
+            let at = body.find("codecov/codecov-action@")?;
+            // The evaluator reads job-level conditions only, so an upload step must
+            // carry none of its own.
+            let step_start = body[..at].rfind("\n      - ").unwrap_or(0);
+            let step_end = body[at..].find("\n      - ").map_or(body.len(), |i| at + i);
+            assert!(
+                !body[step_start..step_end].contains("\n        if:"),
+                "job `{job}`'s Codecov step has its own `if:`, which this table ignores"
+            );
+            let cond = body
+                .lines()
+                .find(|l| l.starts_with("    if:"))
+                .map(|l| l.trim().to_owned());
+            Some((job, cond))
+        })
+        .collect();
+    assert!(
+        uploaders.len() >= 2,
+        "found only {uploaders:?} uploading to Codecov"
+    );
+    for event in &events {
+        let n = uploaders
+            .iter()
+            .filter(|(_, c)| runs_on(c.as_deref(), event))
+            .count();
         assert!(
-            job_body(job).contains("codecov/codecov-action@"),
-            "job `{job}` no longer uploads to Codecov"
+            n == 0 || n == want,
+            "on `{event}` ci.yml uploads {n} Codecov report(s) but codecov.yml waits for \
+             {want} (`after_n_builds`); uploaders: {uploaders:?}"
         );
     }
 }

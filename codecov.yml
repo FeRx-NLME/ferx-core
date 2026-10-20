@@ -25,8 +25,11 @@
 # plus `coverage-pr-upload` (fast, on PR/push) or `coverage` (slow, on schedule/
 # dispatch). Without this Codecov grades the first one alone — and the endpoints
 # report also covers shared core code, so `codecov/patch` could go green before (or
-# without) the `fast` report, e.g. when a core shard fails. A missing report now
-# leaves the status pending. Pinned by tests/ci_test_shards.rs (#2167).
+# without) the `fast` report, e.g. when a core shard fails. On a commit's first
+# run a missing report now leaves the status pending. Codecov counts reports per
+# COMMIT, though, not per run: a scheduled or re-dispatched run on a commit that
+# already has two reports is graded as each new one lands, as it was before this
+# setting. Pinned by tests/ci_test_shards.rs (#2167).
 codecov:
   notify:
     after_n_builds: 2
