@@ -2703,9 +2703,8 @@ fn find_ebe_iov(
     // (`adjoint::exact_obs_grads_in`, called by `analytic_eta_nll_gradient_iov_frozen`).
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
-    // hits a common bail (escape hatch, `gradient = fd`, SDE, or magnitude × correlated
-    // residual) or the subject carries survival/TTE records (whose hazard term the analytic
-    // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
+    // hits a common bail (escape hatch, `gradient = fd`, SDE) or the subject carries
+    // survival/TTE records (whose hazard term the analytic IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
     // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
     // now served analytically too (#575): the IOV scope (pre-#2093 `ode_iov_supported` /
     // `iov_sens_supported`, now the adjoint's `recorder_in_scope`) admits a non-LTBS
