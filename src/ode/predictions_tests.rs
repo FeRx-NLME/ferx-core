@@ -15509,3 +15509,36 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
         }
     }
 }
+
+/// #2139: a `saveat` point one ULP **before** a dose that the integration start sits on is
+/// read pre-dose. The reader moves an observation listed before a co-timed dose one ULP
+/// earlier (#614/#1810), which makes that observation the subject's integration start, so
+/// the dose lands inside the first break's `EVENT_MATCH_TOL` band and used to be applied
+/// before the band was read — the observation came back as seed + dose. The straddle is
+/// asserted in one call: the ULP-earlier point reads the pre-dose state and the bit-equal
+/// point the post-dose one, so a walk that ignores the record/event order on either side
+/// fails here. Both magnitudes: `0.0` (one ULP is the smallest subnormal, and the two times
+/// merge into one break under the timeline's `1e-15` dedup) and `8.2` (one ULP is
+/// `1.8e-15`, two separate breaks).
+#[test]
+fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    for t_dose in [0.0_f64, 8.2] {
+        let t_pre = t_dose.next_down();
+        let subject = make_subject(
+            vec![DoseEvent::new(t_dose, 100.0, 1, 0.0, false, 0.0)],
+            vec![t_pre, t_dose],
+        );
+        let states =
+            ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &subject.obs_times);
+        assert_eq!(
+            states[0][0], 0.0,
+            "t = {t_dose}: one ULP before the dose reads pre-dose"
+        );
+        assert_eq!(
+            states[1][0], 100.0,
+            "t = {t_dose}: at the dose reads post-dose"
+        );
+    }
+}

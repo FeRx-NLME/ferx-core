@@ -8294,6 +8294,14 @@ struct SegmentForcings {
     reset_floor: f64,
     gated: Vec<(usize, f64, f64, f64)>,
     zero_order: Vec<(usize, f64)>,
+    /// The earliest record time among the events applied on this break — a reset row, an
+    /// SS record-time seed, a dose arrival — or `+∞` when none fired. A break's band
+    /// `[t_start, t_start + EVENT_MATCH_TOL)` can hold a record strictly *earlier* than an
+    /// event matched to it (the break is the earlier of the two times, e.g. the integration
+    /// start at an observation the reader moved one ULP below a co-timed dose, #614/#1810);
+    /// the caller reads such a record from the pre-boundary state, as the event-driven
+    /// engine's exact-time ordering does (#2139).
+    first_event: f64,
 }
 
 /// Apply a dose segment's boundary events and resolve its forcings — the shared
@@ -8342,10 +8350,18 @@ fn apply_segment_boundary(
     // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
     // precedes it, as an observation between the two rows does in the event-driven walk.
     // On the final break (`t_end == t_start`) nothing later exists.
+    let on_this_break =
+        |rt: f64| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start);
+    let mut first_event = subject
+        .reset_times
+        .iter()
+        .copied()
+        .filter(|&rt| on_this_break(rt))
+        .fold(f64::INFINITY, f64::min);
     if let Some(r) = subject
         .reset_times
         .iter()
-        .rposition(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start))
+        .rposition(|&rt| on_this_break(rt))
     {
         *u = ode.initial_state(init_reads.reset(disposition, r));
     }
@@ -8359,6 +8375,7 @@ fn apply_segment_boundary(
         }
         if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
             seed_applied[i] = true;
+            first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
             *u = ss_state_at_phase(
                 ode,
@@ -8402,6 +8419,7 @@ fn apply_segment_boundary(
         if (t_eff - t_start).abs() < EVENT_MATCH_TOL {
             // One arrival event: equilibrate + bolus + infusion push (#1186).
             applied[dose_idx] = true;
+            first_event = first_event.min(t_eff);
             let f = dose_f_bio[dose_idx];
             let live = gate.live(&subject.doses, dose_idx);
             if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
@@ -8464,6 +8482,7 @@ fn apply_segment_boundary(
         reset_floor,
         gated,
         zero_order,
+        first_event,
     }
 }
 
@@ -8642,6 +8661,12 @@ fn ode_dense_solve_states_seeded(
         }
         let t_end = next.unwrap_or(t_start);
 
+        // The band is collected *before* the boundary events, so a grid point strictly
+        // earlier than every event on this break can be read from the state they find
+        // (#2139); `u_before` is cloned only when the band holds a point at all.
+        saveat_index.records_at_break(t_start, &mut boundary_saveat);
+        let u_before = (!boundary_saveat.is_empty()).then(|| u.clone());
+
         let forcings = apply_segment_boundary(
             ode,
             subject,
@@ -8666,9 +8691,18 @@ fn ode_dense_solve_states_seeded(
         // convention) — the whole `EVENT_MATCH_TOL` band, through the same helper (#1226).
         // `u` here is the post-dose state; `apply_segment_boundary` set ext_params and
         // resolved forcings but did not touch `u` after the dose pulses.
-        saveat_index.records_at_break(t_start, &mut boundary_saveat);
+        //
+        // Except a point strictly earlier than the first event applied here (#2139): the
+        // break can be the earlier of two times within `EVENT_MATCH_TOL` — the integration
+        // start at an observation listed before a co-timed dose, which the reader moved one
+        // ULP below it (#614/#1810) — and the dose then matches this break too. The
+        // event-driven engine orders the two by exact time and reads the observation
+        // pre-dose, as NONMEM does; read off the post-dose `u` it was the seed plus the dose.
         for &i in &boundary_saveat {
-            result[i] = u.clone();
+            result[i] = match &u_before {
+                Some(pre) if saveat[i] < forcings.first_event => pre.clone(),
+                _ => u.clone(),
+            };
         }
 
         let Some(t_end) = next else {
