@@ -8731,12 +8731,27 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
 }
 
 /// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
-/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
-/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
-/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
-/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
-/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
-/// it does again. `main` and the previous head reached −1173.559691.
+/// is ended by the mid-leg basin probe and restarted (#2093). The claim is the mechanism —
+/// the probe fires, and the fit converges — not which basin it reaches: the population
+/// objective is multimodal here, and the basin a fit ends in depends on its path.
+///
+/// Measured on `main` after #2202 (Linux x86_64), probe on vs disabled (`basin_probe_due`
+/// returning `false`), default `inner_screen = 100` and with the screen off:
+///
+/// | | screen on | screen off |
+/// |---|---|---|
+/// | probe on | −1173.559690, 235 evals | −1185.462085, 145 evals |
+/// | probe off | −1175.187637, 499 evals | −1185.462085, 592 evals |
+///
+/// Every run converges. This bound used to read `OFV < −1180`: the −1185.46 basin, which
+/// the fit reached before #2094's Sobol screen changed the cold re-solves the probe and
+/// the restarts read. On this tree the probe's payoff on this fixture is the evaluation
+/// count (2–4× fewer), not the basin. Before the later `main` changes a probe-less fit
+/// stopped at −1154.590742 unconverged, which is the regression the probe was written
+/// for; the end-of-leg checks now escape it too, given the budget.
+///
+/// Mutation: `basin_probe_due` returning `false` → `BASIN_PROBE_STOPS` stays 0 and the
+/// first assertion fails.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(
@@ -8744,6 +8759,9 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+    use crate::estimation::outer_optimizer::BASIN_PROBE_STOPS;
+    use std::sync::atomic::Ordering;
+    let before = BASIN_PROBE_STOPS.load(Ordering::Relaxed);
     let r = crate::fit_from_files(
         "examples/warfarin_dcm.ferx",
         Some("data/warfarin_dcm.csv"),
@@ -8751,10 +8769,20 @@ fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
         None,
     )
     .expect("warfarin_dcm fits");
-    assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
+    // Other tests may add stops concurrently; with the probe disabled none can.
+    let stops = BASIN_PROBE_STOPS.load(Ordering::Relaxed) - before;
     assert!(
-        r.ofv < -1180.0,
-        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        stops >= 1,
+        "the basin probe never ended a trapped leg (OFV {}, {} evals)",
+        r.ofv,
+        r.n_iterations
+    );
+    assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
+    // Not "converged" at the trap: −1160 is 5.4 below the trapped −1154.59 and 13.6 above the
+    // shallowest converged basin measured (−1173.56); it does not pick a basin.
+    assert!(
+        r.ofv.is_finite() && r.ofv < -1160.0,
+        "OFV {} — the fit converged at the trapped objective",
         r.ofv
     );
 }
