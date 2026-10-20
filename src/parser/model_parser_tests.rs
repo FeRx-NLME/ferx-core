@@ -34205,8 +34205,8 @@ mod analytic_hazard_time_1919 {
         let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
         assert_message(
             &err,
-            "the hazard reads the [individual_parameters] value `LAM`, whose definition \
-             reads the `TIME` built-in",
+            "the hazard reads the [individual_parameters] value `LAM`, whose value \
+             depends on the `TIME` built-in",
         );
     }
 
@@ -34216,7 +34216,7 @@ mod analytic_hazard_time_1919 {
     fn a_time_read_reached_transitively_names_the_reader() {
         let ip = format!("{BASE_IP}  K   = 1.0 + TVKT * TIME\n  LAM = TVLAMBDA * K");
         let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
-        assert!(err.contains("value `K`, whose definition"), "got: {err}");
+        assert!(err.contains("value `K`, whose value depends"), "got: {err}");
     }
 
     /// Every hazard-parameter key is a read site, not only `scale`.
@@ -34230,8 +34230,51 @@ mod analytic_hazard_time_1919 {
         ] {
             let err = expect_parse_err(&model(&ip, em, ""));
             assert!(
-                err.contains("value `PT`, whose definition"),
+                err.contains("value `PT`, whose value depends"),
                 "{em}: got: {err}"
+            );
+        }
+    }
+
+    /// Taint is per assignment, not per statement: one `if` block assigns both a
+    /// `TIME`-reading `UNUSED` and the time-free `LAM` the hazard reads, so nothing the
+    /// hazard depends on reads `TIME` (round-1 review). Straddle asserted: the block does
+    /// read `TIME`, inside the very statement that defines `LAM`.
+    #[test]
+    fn a_time_read_in_a_sibling_assignment_of_the_same_if_is_not_refused() {
+        let ip = format!(
+            "{BASE_IP}  if (TVKT > 0) {{\n    UNUSED = TIME\n    LAM = TVLAMBDA\n  }} \
+             else {{\n    UNUSED = 0\n    LAM = TVLAMBDA\n  }}"
+        );
+        let model = parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read in a sibling assignment the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// Control dependence: `LAM` reads no `TIME` itself, but which value it takes does —
+    /// including through an `else if` whose own condition is time-free, because the arm is
+    /// governed by every earlier condition too.
+    #[test]
+    fn a_time_reading_condition_governing_the_reached_assignment_is_refused() {
+        for (label, branch) in [
+            (
+                "own condition",
+                "  if (TIME > 5) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = 2 * TVLAMBDA\n  }",
+            ),
+            (
+                "earlier arm's condition",
+                "  LAM = TVLAMBDA\n  if (TIME > 5) {\n    AUX = 1\n  } \
+                 else if (TVKT > 0) {\n    LAM = 2 * TVLAMBDA\n  }",
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in"),
+                "{label}: got: {err}"
             );
         }
     }

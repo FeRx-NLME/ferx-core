@@ -7898,19 +7898,151 @@ fn reject_time_in_analytic_hazard(
              built-in. {WHY} {FIX}"
         ));
     }
-    for s in needed_indiv_stmts {
-        if stmts_use_time_builtin(std::slice::from_ref(s)) {
-            let name = assigned_vars_in_order(std::slice::from_ref(s))
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            return Err(format!(
-                "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
-                 `{name}`, whose definition reads the `TIME` built-in. {WHY} {FIX}"
-            ));
-        }
+    // Per assignment, not per statement: one `if` block can assign several names, and a
+    // `TIME` read in a sibling assignment the hazard does not reach must not refuse it
+    // (round-1 review). `TIME`-dependent names ∩ names the hazard reaches.
+    let tainted = indiv_names_depending_on_time(needed_indiv_stmts);
+    let reached = indiv_names_reached_by(hazard_exprs, needed_indiv_stmts);
+    if let Some(name) = assigned_vars_in_order(needed_indiv_stmts)
+        .into_iter()
+        .find(|n| tainted.contains(n) && reached.contains(n))
+    {
+        return Err(format!(
+            "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
+             `{name}`, whose value depends on the `TIME` built-in. {WHY} {FIX}"
+        ));
     }
     Ok(())
+}
+
+/// Names whose value depends on the `TIME` built-in, per assignment: an `Assign` whose RHS
+/// reads `TIME` or an already-dependent name, or whose governing `if` conditions do (every
+/// condition up to and including its own arm, as in `compute_time_dependent_mask`, which
+/// answers the same question on the compiled program's slots). Monotone, iterated to a
+/// fixpoint so a read of a name assigned later in the block is not missed.
+#[cfg(feature = "survival")]
+fn indiv_names_depending_on_time(stmts: &[Statement]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    fn reads(
+        visit: &mut dyn FnMut(&mut dyn FnMut(&Expression)),
+        tainted: &HashSet<String>,
+    ) -> bool {
+        let mut hit = false;
+        visit(&mut |e: &Expression| match e {
+            Expression::Time => hit = true,
+            Expression::Variable(n) if tainted.contains(n) => hit = true,
+            _ => {}
+        });
+        hit
+    }
+    fn walk(
+        stmts: &[Statement],
+        governed: bool,
+        tainted: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, e) => {
+                    if !tainted.contains(name)
+                        && (governed || reads(&mut |f| visit_expr_nodes(e, f), tainted))
+                    {
+                        tainted.insert(name.clone());
+                        *changed = true;
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut g = governed;
+                    for (cond, body) in branches {
+                        g = g || reads(&mut |f| visit_condition_nodes(cond, f), tainted);
+                        walk(body, g, tainted, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, g, tainted, changed);
+                    }
+                }
+                // `[individual_parameters]` at parse time holds only named assignments and
+                // `if` blocks; the indexed/bytecode/ODE forms appear later or elsewhere.
+                Statement::AssignIdx(..)
+                | Statement::AssignBc(..)
+                | Statement::DiffEq(..)
+                | Statement::DiffEqIdx(..)
+                | Statement::DiffEqBc(..) => {}
+            }
+        }
+    }
+    let mut tainted = HashSet::new();
+    loop {
+        let mut changed = false;
+        walk(stmts, false, &mut tainted, &mut changed);
+        if !changed {
+            return tainted;
+        }
+    }
+}
+
+/// Names the `exprs` reach through `stmts`, per assignment: a reached name pulls in the
+/// names its RHS reads and those its governing `if` conditions read — but not a sibling
+/// assignment's in the same block. Iterated to a fixpoint.
+#[cfg(feature = "survival")]
+fn indiv_names_reached_by(
+    exprs: &[&Expression],
+    stmts: &[Statement],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    fn walk<'a>(
+        stmts: &'a [Statement],
+        conds: &mut Vec<&'a Condition>,
+        reached: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, e) if reached.contains(name) => {
+                    let mut add = |x: &Expression| {
+                        if let Expression::Variable(n) = x {
+                            if reached.insert(n.clone()) {
+                                *changed = true;
+                            }
+                        }
+                    };
+                    visit_expr_nodes(e, &mut add);
+                    for c in conds.iter() {
+                        visit_condition_nodes(c, &mut add);
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let depth = conds.len();
+                    for (cond, body) in branches {
+                        conds.push(cond);
+                        walk(body, conds, reached, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, conds, reached, changed);
+                    }
+                    conds.truncate(depth);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut reached = HashSet::new();
+    for e in exprs {
+        collect_variable_names(e, &mut reached);
+    }
+    loop {
+        let mut changed = false;
+        walk(stmts, &mut Vec::new(), &mut reached, &mut changed);
+        if !changed {
+            return reached;
+        }
+    }
 }
 
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
