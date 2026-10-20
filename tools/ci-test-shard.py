@@ -534,6 +534,7 @@ class Shard:
         self.lists = {}  # prefix -> {binary: (listed set, ignored set)}
         self.summary = {}  # binary -> list of (passed, failed, ignored, filtered, secs)
         self.failed = {}  # binary -> [test]
+        self.outcomes = {}  # binary -> number of `test ... ok|FAILED|ignored` lines
         for r in rows:
             self.add(r)
 
@@ -551,8 +552,10 @@ class Shard:
         elif t == "S":
             self.summary.setdefault(r[1], []).append(
                 tuple(int(x) for x in r[2:6]) + (float(r[6]),))
-        elif t == "R" and r[3] == "FAILED":
-            self.failed.setdefault(r[1], []).append(r[2])
+        elif t == "R":
+            self.outcomes[r[1]] = self.outcomes.get(r[1], 0) + 1
+            if r[3] == "FAILED":
+                self.failed.setdefault(r[1], []).append(r[2])
 
 
 def load_shards(directory):
@@ -569,8 +572,9 @@ def shard_errors(suite, n, all_shards, result):
     manifests, missing shards, and shards that did not finish or did not pass."""
     errors = []
     if result is not None and result != "success":
-        errors.append(f"the {suite} shard jobs ended '{result}' (a job killed by "
-                      f"timeout-minutes reports as cancelled) — see the shard logs")
+        why = (" (a job killed by timeout-minutes reports as cancelled)"
+               if result == "cancelled" else "")
+        errors.append(f"the {suite} shard jobs ended '{result}'{why} — see the shard logs")
     shards = {}
     for s in all_shards:
         if s.meta.get("suite") != suite or s.meta.get("n") != str(n):
@@ -615,15 +619,24 @@ def placement_errors(suite, shards):
 
 def binary_errors(k, b, listed, s):
     """One binary on shard k: it ran every test its `--list` names, none
-    filtered, and none failed."""
+    filtered, and none failed. `ran != listed` alone covers a filter: libtest's
+    passed + failed + ignored + filtered is its unfiltered `--list` count, so a
+    filtered-out test always shows as a shortfall (`filtered` is reported, not
+    gated on)."""
     errors = []
     runs = s.summary.get(b, [])
     ran = sum(x[0] + x[1] + x[2] for x in runs)
     filtered = sum(x[3] for x in runs)
-    if listed and ran == 0:
+    if listed and not runs:
+        # No `test result:` line: the binary aborted (stack overflow, `abort`,
+        # SIGKILL) after some of its tests reported, or never started.
+        errors.append(f"{b}: no `test result:` line after {s.outcomes.get(b, 0)} of its "
+                      f"{len(listed)} listed tests reported — it crashed or was killed "
+                      f"(shard {k})")
+    elif listed and ran == 0:
         errors.append(f"{b}: its --list names {len(listed)} tests but none "
                       f"ran (shard {k})")
-    elif ran != len(listed) or filtered:
+    elif ran != len(listed):
         errors.append(f"{b}: ran {ran} of the {len(listed)} tests its --list "
                       f"names, {filtered} filtered out (shard {k})")
     fails = sum(x[1] for x in runs)
@@ -723,7 +736,14 @@ def check_nn(core_dir, nn_dir, list_path=SLOW_NN_TESTS):
             gains[b] = len(runnable_nn - runnable_core)
     listed = set(binary_key(t) for t in read_list(Path(list_path)))
     for b, g in sorted(gains.items()):
-        if b not in ran:
+        if b in ran:
+            continue
+        if b in listed:
+            # Listed but no `test result:`: the nn job timed out or the binary
+            # crashed. The list is right; the nn job's own `check` names the cause.
+            errors.append(f"{b}: gains {g} test(s) under nn and is listed, but the nn "
+                          f"job reported no result for it — see the nn job's own check")
+        else:
             errors.append(f"{b}: gains {g} test(s) under nn but the nn leg does not run "
                           f"it — add it to tools/slow-nn-tests.txt")
     for b in sorted(listed - set(gains)):

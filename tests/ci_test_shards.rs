@@ -936,6 +936,11 @@ struct Bin {
     passed: usize,
     failed: usize,
     filtered: usize,
+    /// `false`: the binary aborted before its `test result:` line — its passed
+    /// tests leave `R` rows, but there is no `S` row.
+    reported: bool,
+    /// The `finished in` seconds of its `S` row.
+    secs: f64,
 }
 
 impl Bin {
@@ -948,6 +953,8 @@ impl Bin {
             passed: listed - ignored,
             failed: 0,
             filtered: 0,
+            reported: true,
+            secs: 1.0,
         }
     }
 }
@@ -955,9 +962,25 @@ impl Bin {
 const EXPECTED: &[&str] = &["a", "b", "u[unit]", "z"];
 
 fn write_manifest(dir: &Path, k: usize, n: usize, bins: &[Bin], done: bool) {
-    let d = dir.join(format!("slow-manifest-core-{k}"));
+    let name = format!("slow-manifest-core-{k}");
+    write_manifest_as(dir, &name, "slow", k, n, bins, done, 60.0);
+}
+
+/// [`write_manifest`] into `dir/name`, for suite `suite`, with `elapsed` seconds.
+#[allow(clippy::too_many_arguments)]
+fn write_manifest_as(
+    dir: &Path,
+    name: &str,
+    suite: &str,
+    k: usize,
+    n: usize,
+    bins: &[Bin],
+    done: bool,
+    elapsed: f64,
+) {
+    let d = dir.join(name);
     std::fs::create_dir_all(&d).unwrap();
-    let mut s = format!("M\tsuite\tslow\nM\tk\t{k}\nM\tn\t{n}\n");
+    let mut s = format!("M\tsuite\t{suite}\nM\tk\t{k}\nM\tn\t{n}\n");
     for e in EXPECTED {
         s += &format!("E\t{e}\n");
     }
@@ -972,12 +995,18 @@ fn write_manifest(dir: &Path, k: usize, n: usize, bins: &[Bin], done: bool) {
         for t in 0..b.failed {
             s += &format!("R\t{}\tt{t}\tFAILED\n", b.name);
         }
+        if !b.reported {
+            for t in 0..b.passed {
+                s += &format!("R\t{}\tp{t}\tok\n", b.name);
+            }
+            continue;
+        }
         s += &format!(
-            "S\t{}\t{}\t{}\t{}\t{}\t1.0\n",
-            b.name, b.passed, b.failed, b.ignored, b.filtered
+            "S\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            b.name, b.passed, b.failed, b.ignored, b.filtered, b.secs
         );
     }
-    s += "M\telapsed\t60\n";
+    s += &format!("M\telapsed\t{elapsed}\n");
     if done {
         let status = if bins.iter().any(|b| b.failed > 0) {
             "failed"
@@ -1113,7 +1142,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
         all.to_vec(),
         both,
         "cancelled",
-        "::error::the slow shard jobs ended 'cancelled'",
+        "::error::the slow shard jobs ended 'cancelled' (a job killed by timeout-minutes reports as cancelled)",
     ));
     // a shard killed while writing
     cases.push((
@@ -1140,6 +1169,44 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
         "::error::b: 1 test(s) FAILED (shard 2): t0",
     ));
 
+    // a non-cancelled shard result: no timeout clause (it would send the reader
+    // looking for a kill that did not happen)
+    cases.push((
+        "failure-result",
+        valid_shards(),
+        all.to_vec(),
+        both,
+        "failure",
+        "::error::the slow shard jobs ended 'failure' — see the shard logs",
+    ));
+    // a binary outside the suite
+    let mut s = valid_shards();
+    s[0].push(Bin::ok("q", 1, 0));
+    cases.push((
+        "outside",
+        s,
+        all.to_vec(),
+        both,
+        "success",
+        "::error::q: a shard ran a binary outside the slow suite",
+    ));
+    // a binary that aborted after 2 of its 3 tests reported: no `test result:` line
+    let mut s = valid_shards();
+    s[0][0] = Bin {
+        passed: 2,
+        ignored: 0,
+        reported: false,
+        ..Bin::ok("a", 3, 1)
+    };
+    cases.push((
+        "crashed",
+        s,
+        all.to_vec(),
+        both,
+        "success",
+        "::error::a: no `test result:` line after 2 of its 3 listed tests reported — it crashed or was killed (shard 1)",
+    ));
+
     let markers: Vec<&str> = cases.iter().map(|c| c.5).collect();
     for (case, shards, present, done, result, marker) in &cases {
         let (ok, text) = run_check(case, shards, present, done, result);
@@ -1160,6 +1227,123 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
             }
         }
     }
+
+    // Two cases a `Vec<Bin>` per shard cannot spell: a second manifest for one
+    // shard, and a manifest of another suite in the download directory.
+    for (case, name, suite, marker) in [
+        (
+            "duplicate",
+            "copy-of-1",
+            "slow",
+            "::error::two manifests for shard 1/2",
+        ),
+        (
+            "foreign",
+            "stray",
+            "slow-nn",
+            "a manifest of suite slow-nn N=2, not slow N=2",
+        ),
+    ] {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("ci_test_shards_check")
+            .join(case);
+        let _ = std::fs::remove_dir_all(&dir);
+        for (i, bins) in valid_shards().iter().enumerate() {
+            write_manifest(&dir, i + 1, 2, bins, true);
+        }
+        write_manifest_as(&dir, name, suite, 1, 2, &valid_shards()[0], true, 60.0);
+        let out = shard_tool(
+            &[
+                "check",
+                "slow",
+                "2",
+                &dir.display().to_string(),
+                "--result",
+                "success",
+            ]
+            .map(|s| s.to_string()),
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success() && text.contains(marker),
+            "{case}: no `{marker}` in:\n{text}"
+        );
+    }
+}
+
+/// `check --budget-min`: a shard over 70% of its budget, and a binary (or the unit
+/// bundle) over twice its weight, each print their `::warning::`; the same fixture
+/// under the thresholds prints none. Warnings, not errors: the run stays green.
+#[test]
+fn check_warns_when_a_shard_nears_its_budget_or_a_binary_outgrows_its_weight() {
+    let weights =
+        std::fs::read_to_string(repo_root().join("tools/ci-test-weights-slow.txt")).unwrap();
+    let weight = |name: &str| -> f64 {
+        weights
+            .lines()
+            .find_map(|l| {
+                let (secs, n) = l.split_once(' ')?;
+                (n == name).then(|| secs.parse().unwrap())
+            })
+            .unwrap_or_else(|| panic!("no `{name}` in tools/ci-test-weights-slow.txt"))
+    };
+    let (bin, unit) = (weight("run_covariance_per_engine"), weight("<unit>"));
+    let run = |case: &str, factor: f64, elapsed: f64| -> (bool, String) {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("ci_test_shards_budget")
+            .join(case);
+        let _ = std::fs::remove_dir_all(&dir);
+        let shards = [
+            vec![Bin {
+                secs: factor * unit,
+                ..Bin::ok("u[unit]", 2, 0)
+            }],
+            vec![Bin {
+                secs: factor * bin,
+                ..Bin::ok("run_covariance_per_engine", 1, 0)
+            }],
+        ];
+        for (i, bins) in shards.iter().enumerate() {
+            let name = format!("slow-manifest-core-{}", i + 1);
+            write_manifest_as(&dir, &name, "slow", i + 1, 2, bins, true, elapsed);
+        }
+        let out = shard_tool(
+            &[
+                "check",
+                "slow",
+                "2",
+                &dir.display().to_string(),
+                "--budget-min",
+                "60",
+            ]
+            .map(|s| s.to_string()),
+        );
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    // 70% of 60 min is 2520 s.
+    let (_, quiet) = run("under", 1.5, 2500.0);
+    assert!(
+        !quiet.contains("::warning::"),
+        "warned under every threshold:\n{quiet}"
+    );
+    let (_, loud) = run("over", 2.5, 2600.0);
+    for marker in [
+        "::warning::shard 1/2 took 43.3 min, over 70% of its 60.0 min budget".to_owned(),
+        "::warning::shard 2/2 took 43.3 min, over 70% of its 60.0 min budget".to_owned(),
+        format!(
+            "::warning::run_covariance_per_engine took {:.0} s, over twice its {bin:.0} s weight",
+            2.5 * bin
+        ),
+        format!(
+            "::warning::the unit tests took {:.0} s, over twice their {unit:.0} s weight",
+            2.5 * unit
+        ),
+    ] {
+        assert!(loud.contains(&marker), "no `{marker}` in:\n{loud}");
+    }
 }
 
 /// T14's offline half: `check-nn` on fixture manifests. The binaries the nn leg must
@@ -1176,7 +1360,7 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
         ("loses", &["k"], &[], &["k"], &["k"]),
         ("same", &["s"], &["s"], &["s"], &["s"]),
     ];
-    let run = |case: &str, list: &[&str], nn_runs: &[&str]| -> (bool, String) {
+    let run = |case: &str, list: &[&str], nn_runs: &[&str], nn_only: bool| -> (bool, String) {
         let dir = base.join(case);
         let _ = std::fs::remove_dir_all(&dir);
         for d in ["core/m1", "nn/m"] {
@@ -1203,6 +1387,9 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
                 .map(|t| format!("XI\t{b}\t{t}\n"))
                 .collect::<String>();
         }
+        if nn_only {
+            nn += "XB\tnew_bin\n";
+        }
         for b in nn_runs {
             nn += &format!("S\t{b}\t1\t0\t0\t0\t1.0\n");
         }
@@ -1224,14 +1411,14 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
-    let (ok, text) = run("valid", &["gains"], &["ferx_core[unit]", "gains"]);
+    let (ok, text) = run("valid", &["gains"], &["ferx_core[unit]", "gains"], false);
     assert!(ok, "the valid fixture is red:\n{text}");
     assert!(
         !text.contains("loses"),
         "a binary that only loses tests was required:\n{text}"
     );
 
-    let (ok, text) = run("missing", &[], &["ferx_core[unit]"]);
+    let (ok, text) = run("missing", &[], &["ferx_core[unit]"], false);
     assert!(
         !ok && text
             .contains("::error::gains: gains 1 test(s) under nn but the nn leg does not run it"),
@@ -1241,11 +1428,67 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
         "extra",
         &["gains", "same"],
         &["ferx_core[unit]", "gains", "same"],
+        false,
     );
     assert!(
         !ok && text.contains("::error::same: listed in tools/slow-nn-tests.txt but gains no test"),
         "a listed binary that gains nothing under nn passed:\n{text}"
     );
+    // Listed, gains, but no `test result:` (the nn job timed out or the binary
+    // crashed): the list is right, so the advice must not say to add it.
+    let (ok, text) = run("listed-no-result", &["gains"], &["ferx_core[unit]"], false);
+    assert!(
+        !ok && text.contains(
+            "::error::gains: gains 1 test(s) under nn and is listed, but the nn job reported no result for it"
+        ) && !text.contains("add it to"),
+        "a listed binary with no nn result got the wrong advice:\n{text}"
+    );
+    let (ok, text) = run("nn-only", &["gains"], &["ferx_core[unit]", "gains"], true);
+    assert!(
+        !ok && text.contains("::error::new_bin: only the nn build has this binary"),
+        "a binary only one build has passed:\n{text}"
+    );
+}
+
+/// The weekly `full-nn` leg is selected by comparing `github.event.schedule` with
+/// the cron string, spelled out in every job's condition. Every such literal must
+/// be one of the `schedule:` crons — otherwise an edit to the cron line silently
+/// turns the Sunday run into a second core run and full-nn never runs again.
+#[test]
+fn every_schedule_comparison_names_a_declared_cron() {
+    let yml = std::fs::read_to_string(repo_root().join(SLOW_YML)).unwrap();
+    let code: Vec<&str> = yml
+        .lines()
+        .map(|l| l.split(" #").next().unwrap())
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    let crons: BTreeSet<String> = code
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("- cron: '"))
+        .map(|l| l.split('\'').next().unwrap().to_owned())
+        .collect();
+    assert!(crons.len() >= 2, "found only crons {crons:?}");
+    let mut seen = Vec::new();
+    for l in &code {
+        for op in ["github.event.schedule == '", "github.event.schedule != '"] {
+            for (at, _) in l.match_indices(op) {
+                let lit = l[at + op.len()..].split('\'').next().unwrap();
+                seen.push(lit.to_owned());
+            }
+        }
+    }
+    assert!(
+        seen.len() >= 5,
+        "found only {} schedule comparisons — is the scan still matching?",
+        seen.len()
+    );
+    for lit in &seen {
+        assert!(
+            crons.contains(lit),
+            "`github.event.schedule` is compared with '{lit}', which is not a declared \
+             cron ({crons:?}) — that branch can never run"
+        );
+    }
 }
 
 /// T11. Each summary job reports even when a shard fails or is cancelled (a job
