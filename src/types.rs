@@ -4102,6 +4102,15 @@ pub enum EndpointLikelihood {
         link: LinkFn,
         /// Linear predictor `lp` (log-odds) as a function of (theta, eta, covariates).
         lp_fn: LinearPredictorFn,
+        /// Resolved, dual-evaluable form of the same predictor, for the **analytic**
+        /// inner gradient: it yields `∂lp/∂(θ,η)` exactly, which the endpoint chains
+        /// through the closed-form Bernoulli score `(p − y)` instead of
+        /// finite-differencing the whole data term (#2024).
+        ///
+        /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
+        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
+        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
         /// snapshot (the [`LinearPredictorFn`] takes no time argument), so a covariate

@@ -43,6 +43,9 @@ than the finite differences it replaces, not merely more accurate.
 Two things are still finite-differenced: the FOCEI Laplace `½log|H̃|` term needs the
 **second** derivative of the data term w.r.t. η (Van Loan gives first derivatives), and
 the **outer** (θ) gradient is still FD for any model with a non-Gaussian endpoint. A
+subject that also carries `[binary_model]` records stays analytic — that term has an
+exact gradient too ([categorical endpoints](categorical.qmd#analytic-inner-gradient)) —
+but one with a time-to-event record runs FD for its whole objective. A
 drug-driven `Q(t)` keeps FD throughout — its likelihood is an occupancy ODE, not an
 `expm`, so the Fréchet identity does not apply.
 
