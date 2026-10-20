@@ -282,9 +282,7 @@ pub(crate) fn fd_fallback_warning(
     let n_fd = population
         .subjects
         .iter()
-        .filter(|s| {
-            crate::sens::ode_provider::adjoint::exact_obs_grads(model, s, theta, &zeros).is_none()
-        })
+        .filter(|s| subject_inner_runs_fd(model, s, theta, &zeros))
         .count();
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
@@ -315,6 +313,33 @@ pub(crate) fn fd_fallback_warning(
     } else {
         None
     }
+}
+
+/// Whether `subject`'s non-IOV inner EBE gradient runs on finite differences at `eta`, as
+/// [`fd_fallback_warning`] counts it: the probe has to follow the route `find_ebe` takes.
+///
+/// A subject carrying non-Gaussian records is FD whenever [`analytic_inner_grad_supported`]
+/// declines it — a TTE / count term, or an endpoint without a dual program — however well
+/// the Gaussian recorder serves its other rows (before #2024 the probe asked only the
+/// recorder, so a joint PK-TTE subject read as analytic, #1861). One with no Gaussian rows
+/// that the predicate admits is analytic without any recorder (prior plus the served
+/// endpoint term; an endpoint-only model has no structural model to record), where the
+/// recorder probe alone had counted every such subject as FD.
+fn subject_inner_runs_fd(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    if subject_has_survival_records(subject) {
+        if !analytic_inner_grad_supported(model, subject) {
+            return true;
+        }
+        if subject.obs_times.is_empty() {
+            return false;
+        }
+    }
+    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta).is_none()
 }
 
 fn iov_fd_fallback_warning(
@@ -514,7 +539,6 @@ fn analytic_inner_seed_hessian(
     // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
     // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
     // subject) declines here to the full provider, whose seed carries no gradient.
-    #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
     let mut light_supported = model.residual_error_eta.is_none()
         && !model.residual_cov_at(params).is_dense()
         && model.frem_config.is_none()
@@ -526,6 +550,8 @@ fn analytic_inner_seed_hessian(
     {
         light_supported = light_supported && !model.has_ctmm();
     }
+    // Likewise the binary block (#2024), now that binary subjects run the analytic gradient.
+    light_supported = light_supported && !model.has_discrete();
     if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
         let _ = (schedule, hint);
@@ -3372,55 +3398,54 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
 }
 
 /// Whether [`analytic_eta_nll_gradient_with_schedule`] serves **every** non-Gaussian term
-/// `subject` carries: none at all, or only CTMM state records its exact program covers.
+/// `subject` carries: none at all, or only CTMM state records and `[binary_model]` records
+/// whose exact programs cover them.
 ///
-/// That function assumes the answer is yes — for a subject with no Gaussian rows it returns
-/// the Ω prior plus the CTMM block and nothing else — so a caller that can reach it with a
-/// TTE, `[binary_model]` or count record must ask first. The inner loop does, through
-/// [`analytic_inner_grad_supported`]; AGQ's per-node `∂nll/∂b` asks directly (#1781), since
-/// it had been contracting the grid response against a gradient missing the whole event term.
+/// That function asks this itself and declines (`None` → FD) when the answer is no, since
+/// for a subject with no Gaussian rows it returns the Ω prior plus the served non-Gaussian
+/// blocks and nothing else. The inner loop also asks up front, through
+/// [`analytic_inner_grad_supported`], so its route report matches what runs.
 pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subject) -> bool {
-    !subject_has_survival_records(subject) || ctmm_records_fully_analytic(model, subject)
+    !subject_has_survival_records(subject) || non_gaussian_records_fully_analytic(model, subject)
 }
 
-/// Whether **every** non-Gaussian record on this subject is a CTMM state observation that
-/// the analytic path can serve exactly (#759) — i.e. the subject's whole non-Gaussian data
-/// term is `−Σ log P(Δt)[s,s']` on a time-homogeneous generator with a dual-evaluable
-/// program ([`ctmm_subject_eta_grad`](crate::markov::endpoint::ctmm_subject_eta_grad)).
+/// Whether **every** non-Gaussian record on this subject is one the analytic path can
+/// serve exactly — a CTMM state observation on an endpoint with a dual-evaluable generator
+/// program (#759, [`ctmm_subject_eta_grad`](crate::markov::endpoint::ctmm_subject_eta_grad)),
+/// or a binary observation on an endpoint with a dual-evaluable linear predictor (#2024,
+/// [`discrete_subject_eta_grad`](crate::categorical::discrete_subject_eta_grad)).
 ///
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
-/// subject that also carries a TTE / binary / count record would silently drop that term's
-/// contribution — a wrong gradient, not a slow one. TTE and binary have no analytic η-channel
-/// at all (their `LinearPredictorFn` / `HazardParamFn` are `f64` closures outside `sens/`),
-/// so such a subject keeps FD for the whole objective.
+/// subject that also carries a TTE or count record would silently drop that term's
+/// contribution — a wrong gradient, not a slow one. TTE has no analytic η-channel yet (its
+/// `HazardParamFn` is an `f64` closure outside `sens/`), so such a subject keeps FD for the
+/// whole objective.
 ///
-/// Always `false` without the `markov` feature (there are no CTMM records to serve).
-fn ctmm_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
-    #[cfg(feature = "markov")]
+/// Always `false` without the `survival` feature (there are no such records to serve).
+fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
+    #[cfg(feature = "survival")]
     {
         use crate::types::{EndpointLikelihood, ObsRecord};
-        if !model.has_ctmm() {
-            return false;
-        }
-        // The CMTs whose endpoint is a CTMM we can differentiate exactly. An endpoint with
-        // no `generator_program` — a time-inhomogeneous (drug-driven) generator, whose
-        // likelihood is an occupancy ODE rather than an `expm` — is not one of them.
-        let analytic_cmts: Vec<usize> = model
-            .endpoints
-            .iter()
-            .filter_map(|(cmt, ep)| match ep {
-                EndpointLikelihood::Ctmm {
+        // The CMTs whose endpoint term we can differentiate exactly. A binary endpoint with
+        // no `lp_program`, or a CTMM endpoint with no `generator_program` — a
+        // time-inhomogeneous (drug-driven) generator, whose likelihood is an occupancy ODE
+        // rather than an `expm` — is not one of them.
+        let served = |cmt: usize| -> bool {
+            match model.endpoints.get(&cmt) {
+                Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
+                #[cfg(feature = "markov")]
+                Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                } if generator_program.is_some() => Some(*cmt),
-                _ => None,
-            })
-            .collect();
+                }) => generator_program.is_some(),
+                _ => false,
+            }
+        };
         subject.obs_records.iter().all(|r| match r {
-            ObsRecord::DiscreteState { cmt, .. } => analytic_cmts.contains(cmt),
+            ObsRecord::DiscreteState { cmt, .. } => served(*cmt),
             _ => false,
         })
     }
-    #[cfg(not(feature = "markov"))]
+    #[cfg(not(feature = "survival"))]
     {
         let _ = (model, subject);
         false
@@ -3460,6 +3485,12 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
         return false;
     }
+    // Binary (#2024): the same reasoning — a `[binary_model]` whose linear predictor has no
+    // dual-evaluable program declines every subject carrying its records.
+    #[cfg(feature = "survival")]
+    if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+        return false;
+    }
     // The unified recorder's scope, or an endpoint-only model (no structural model, no
     // compartments), whose inner gradient is the prior plus the exactly-served endpoint term.
     crate::sens::ode_provider::adjoint::recorder_in_scope(model)
@@ -3481,7 +3512,7 @@ pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
 
 /// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its
 /// transition term can be differentiated exactly rather than finite-differenced. The
-/// model-level counterpart of [`ctmm_records_fully_analytic`]'s per-subject check.
+/// model-level counterpart of [`non_gaussian_records_fully_analytic`]'s per-subject check.
 #[cfg(feature = "markov")]
 fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     use crate::types::EndpointLikelihood;
@@ -3508,9 +3539,10 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // CTMM is the exception since #759: its transition likelihood *does* have an exact
     // η-gradient now (`Q` rebuilt over `Dual1` for `∂Q/∂η`, chained through the Van Loan
     // Fréchet derivative of `expm`), and `analytic_eta_nll_gradient_with_schedule` adds it
-    // to the Gaussian block. `ctmm_records_fully_analytic` is deliberately strict — it
-    // demands that *every* record on the subject be a CTMM state observation the program
-    // can serve, so a subject that also carries a TTE / binary / count record (whose terms
+    // to the Gaussian block; binary records likewise since #2024 (the closed-form Bernoulli
+    // score over a dual-evaluable linear predictor). `non_gaussian_records_fully_analytic`
+    // is deliberately strict — it demands that *every* record on the subject be one a
+    // program can serve, so a subject that also carries a TTE / count record (whose terms
     // remain FD-only) still declines the whole gradient rather than silently omitting them.
     if !non_gaussian_eta_grad_served(model, subject) {
         return false;
@@ -3752,17 +3784,42 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // first, because it is the one that decides whether this subject can be served at all
     // (the Gaussian provider's own `None` is handled below, as before).
     //
+    // TTE / count records have no analytic η-channel. Refuse a subject carrying one here,
+    // not only upstream in `analytic_inner_grad_supported`: HMC and VI call this directly,
+    // and a gradient missing a whole data term is wrong, not slow.
+    if !non_gaussian_eta_grad_served(model, subject) {
+        return None;
+    }
     // CTMM (#759): exact, via `∂Q/∂(θ,η)` over `Dual1` chained through the Van Loan Fréchet
     // derivative of `expm`. The objective's `2×` on the data term and the outer `½` cancel,
     // so this enters at 1× — the same scale `ctmm_subject_eta_grad` returns.
-    // TTE / binary / count records have no analytic η-channel and are refused upstream by
-    // `analytic_inner_grad_supported` → `ctmm_records_fully_analytic`, so a subject reaching
-    // here carries no other non-Gaussian term to omit.
     #[cfg(feature = "markov")]
     let ctmm_grad: Option<Vec<f64>> = if model.has_ctmm() {
         Some(crate::markov::endpoint::ctmm_subject_eta_grad(model, subject, theta, eta)?.1)
     } else {
         None
+    };
+    // Binary (#2024): exact, via `∂lp/∂(θ,η)` over `Dual1` times the closed-form Bernoulli
+    // score `(p − y)`; the same 1× scale as the CTMM block.
+    #[cfg(feature = "survival")]
+    let discrete_grad: Option<Vec<f64>> = if model.has_discrete() {
+        Some(crate::categorical::discrete_subject_eta_grad(model, subject, theta, eta)?.1)
+    } else {
+        None
+    };
+    #[cfg(feature = "survival")]
+    let fold_nongaussian = |grad: &mut [f64]| {
+        #[cfg(feature = "markov")]
+        if let Some(g) = &ctmm_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
+        if let Some(g) = &discrete_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
     };
 
     // No Gaussian observations ⇒ no Gaussian data term and (for an endpoint-only fit) no PK
@@ -3771,15 +3828,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     if subject.obs_times.is_empty() {
         eta_work.as_mut_slice().copy_from_slice(eta);
         prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
-        // `mut` is only exercised by the markov CTMM fold below.
-        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+        // `mut` is only exercised by the non-Gaussian fold below.
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
         let mut grad: Vec<f64> = prior_work.as_slice().to_vec();
-        #[cfg(feature = "markov")]
-        if let Some(g) = &ctmm_grad {
-            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
-                *acc += gi;
-            }
-        }
+        #[cfg(feature = "survival")]
+        fold_nongaussian(&mut grad);
         return Some(grad);
     }
 
@@ -3796,16 +3849,12 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         return None;
     }
     // Fold the non-Gaussian block into whichever Gaussian branch runs below.
-    #[cfg(feature = "markov")]
+    #[cfg(feature = "survival")]
     let add_nongaussian = |mut g: Vec<f64>| -> Vec<f64> {
-        if let Some(c) = &ctmm_grad {
-            for (acc, gi) in g.iter_mut().zip(c.iter()) {
-                *acc += gi;
-            }
-        }
+        fold_nongaussian(&mut g);
         g
     };
-    #[cfg(not(feature = "markov"))]
+    #[cfg(not(feature = "survival"))]
     let add_nongaussian = |g: Vec<f64>| -> Vec<f64> { g };
     // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
