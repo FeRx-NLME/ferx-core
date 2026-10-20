@@ -2003,23 +2003,21 @@ fn find_ebe_solve(
             if opted_out {
                 return None;
             }
-            crate::sens::ode_provider::adjoint::exact_inner_gradient(
+            let g = crate::sens::ode_provider::adjoint::exact_inner_gradient(
                 model, subject, params, e, frozen,
-            )
+            );
+            // Counted here, branch-free, so both callers below share one count (#2209).
+            #[cfg(test)]
+            INNER_AGRAD_ROUTE
+                .with(|c| c.set((c.get().0, c.get().1 + usize::from(g.is_some()), c.get().2)));
+            g
         };
         if !use_analytic {
-            return match exact() {
-                Some(g) => {
-                    #[cfg(test)]
-                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1, c.get().2)));
-                    g
-                }
-                None => {
-                    #[cfg(test)]
-                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
-                    gradient_fd(&obj, e, n_eta)
-                }
-            };
+            return exact().unwrap_or_else(|| {
+                #[cfg(test)]
+                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
+                gradient_fd(&obj, e, n_eta)
+            });
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -2051,8 +2049,6 @@ fn find_ebe_solve(
             }
             None => {
                 if let Some(g) = exact() {
-                    #[cfg(test)]
-                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1, c.get().2)));
                     GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
                     return g;
                 }
