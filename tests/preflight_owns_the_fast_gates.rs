@@ -793,8 +793,17 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // clippy line has to lint a feature set WITHOUT `survival`, transitively. Deleting the
     // `--features ci` line leaves the count tripwire at 2 if the line is replaced rather
     // than removed; this is what fires.
+    //
+    // And it has to lint the LIB ALONE, the target ferx-r compiles. Under `--all-targets`
+    // (or `--tests`) a `#[cfg(test)]` reader counts as a use, so a production helper only
+    // a test calls still warns in ferx-r's build while the line passes.
     let survival_free = clippy.iter().any(|cmd| {
         if !selects_ferx_core(cmd) {
+            return false;
+        }
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        if !args.contains(&"--lib") || args.contains(&"--all-targets") || args.contains(&"--tests")
+        {
             return false;
         }
         let mut set = Vec::new();
@@ -810,9 +819,10 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     });
     assert!(
         survival_free,
-        "no ferx-core clippy command lints a feature set without `survival`, so an item \
-         whose only reader is survival-gated is dead in the default build and no gate \
-         denies it (#2075).\n  {}",
+        "no ferx-core clippy command lints the lib alone (`--lib`, no `--all-targets` / \
+         `--tests`) on a feature set without `survival`, so an item whose only reader is \
+         survival-gated or test-only is dead in the default build and no gate denies it \
+         (#2075).\n  {}",
         clippy.join("\n  ")
     );
 
@@ -1122,7 +1132,7 @@ fn preflight_is_executable_and_lists_every_group() {
         ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
-        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci (#2075) · members
+        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
         ("rustdoc", 2),    // ferx-core rustdoc · members
         ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check

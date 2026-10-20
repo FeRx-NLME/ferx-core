@@ -397,7 +397,13 @@ group_clippy() {
   # the survival-gated refusal in `api/validation.rs`) warned in every default build for
   # weeks with every gate green (#2075). `ci` alone rather than a bare default build so
   # it shares the `check` group's feature hash; `ci` adds no source of its own.
-  run cargo clippy --no-default-features --features ci --all-targets -- -Dunused
+  #
+  # `--lib`, NOT `--all-targets`, and that is the point of the line rather than a speed
+  # trade. Under `--all-targets` a `#[cfg(test)]` reader counts as a use, so a
+  # production helper that only a test calls still warns in ferx-r's build while this
+  # line passes. ferx-r compiles the lib alone; so does this. Test code is linted by
+  # the feature-rich `--all-targets` line above.
+  run cargo clippy --no-default-features --features ci --lib -- -Dunused
 
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
