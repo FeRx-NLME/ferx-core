@@ -42,10 +42,12 @@ const MODEL: &str = r"
 const NONMEM_OFV: f64 = -432.166_830_842_677_9;
 
 /// Before the fix the stop was 2.3e-3 (Linux x86_64, per the issue) and 0.135 (macOS
-/// arm64, re-measured: −432.031734 with the polish disabled) above NONMEM. At the fix it
-/// is −432.166831 on Linux arm64 (657 evals) and on macOS arm64 (1236 evals) — under
-/// 1e-6 off. The 1e-3 bound sits below the smaller of the two false stops, so neither
-/// platform's old answer passes it.
+/// arm64, re-measured: −432.031734 with the polish disabled) above NONMEM. At the fix,
+/// measured: |OFV − NONMEM| = 5.361e-7 on Linux arm64 (657 evals) and 5.874e-7 on
+/// macOS arm64 (1236 evals) — the same distance L-BFGS sits from NONMEM here
+/// (`tests/latched_creep_convergence.rs`: ≤ 1e-6), so it is ferx-vs-NONMEM, not a
+/// short stop. The 1e-5 bound is 17× the worse of the two, and 230× below the smaller
+/// false stop, so a polish that stops partway does not pass it.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -64,13 +66,17 @@ fn a_bobyqa_tolerance_stop_is_polished_to_the_optimum() {
     };
     let r = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
     eprintln!(
-        "bobyqa: converged {} OFV {:.6} evals {} theta {:?}",
-        r.converged, r.ofv, r.n_iterations, r.theta
+        "bobyqa: converged {} OFV {:.10} |OFV - NONMEM| {:.3e} evals {} theta {:?}",
+        r.converged,
+        r.ofv,
+        (r.ofv - NONMEM_OFV).abs(),
+        r.n_iterations,
+        r.theta
     );
     assert!(r.converged, "BOBYQA must converge");
     assert!(r.ofv.is_finite(), "OFV {}", r.ofv);
     assert!(
-        (r.ofv - NONMEM_OFV).abs() < 1e-3,
+        (r.ofv - NONMEM_OFV).abs() < 1e-5,
         "OFV {} vs NONMEM {NONMEM_OFV}: a tolerance stop short of the optimum",
         r.ofv
     );

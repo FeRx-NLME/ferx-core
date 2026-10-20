@@ -239,27 +239,40 @@ objective has stopped falling. At |OFV| ≈ 430, a single step of 4e-4 OFV satis
 run can stop mid-descent and still report success. Before #1782, any such stop was reported as
 `converged = true`.
 
-Now a BOBYQA stop on either tolerance is treated as a checkpoint, not the end of the run. ferx
-restarts BOBYQA from the best point seen, at a fresh trust radius and with tight tolerances
-(`ftol_rel = 1e-10`, `xtol_rel = 1e-7`, or your own values if they are tighter). The restart is
-called a *polish leg*. Only the last leg's stop decides `converged`.
+Now a BOBYQA stop on either tolerance — including the plain `Success` it returns when its trust
+radius reaches the `outer_xtol` floor — is treated as a checkpoint, not the end of the run. ferx
+restarts BOBYQA from the best point seen, at a fresh trust radius. The restart is called a *polish
+leg*. Its tolerances are ceilings: `ftol_rel = 1e-10` and `xtol_rel = 1e-7`, or your own
+`outer_ftol` / `outer_xtol` where those are tighter. Only the last leg's stop decides `converged`.
 
 - If a leg still lowers the objective by more than 1e-3, it is followed by another, up to four
   polish legs.
 - All the legs share the fit's `maxiter` evaluation budget.
-- The [stagnation guard](../model-file/fit-options.qmd#stagnation-guard) and the plateau check still apply inside each leg. On a
-  noisy objective a leg therefore ends on a 1e-3 plateau instead of grinding toward `1e-10`.
+- The [stagnation guard](../model-file/fit-options.qmd#stagnation-guard) and the plateau check still
+  apply inside each leg. On a noisy objective a leg therefore ends on a 1e-3 plateau instead of
+  grinding toward `1e-10`.
+
+Two endings report `converged = false`, because the tolerance stop they were meant to check is
+still unchecked:
+
+- **The budget runs out.** Either no evaluations are left for a polish leg, or a leg spends the rest.
+  The fit carries the usual "hit the evaluation budget … increase maxiter" warning.
+- **The fourth leg still gained more than 1e-3.** The objective was still falling when polishing
+  stopped, and a warning says so ("still improving after 4 polish legs").
 
 Measured on the fixtures from #1782, all with `optimizer = bobyqa`:
 
 | model | platform | before: OFV (evals) | polished: OFV (evals) | reference optimum |
 |---|---|---|---|---|
-| issue's 2-cpt IV on `data/two_cpt_iv.csv`, FOCEI | macOS arm64 | −432.0317 (1006) | −432.1668 (1148) | −432.1668 (NONMEM, L-BFGS) |
-| same | Linux arm64 | −432.1645 (636, issue) | −432.1668 (657) | −432.1668 |
+| issue's 2-cpt IV on `data/two_cpt_iv.csv`, FOCEI, `--threads 4` | macOS arm64 | −432.0317 (1006) | −432.1668 (1148) | −432.1668 (NONMEM, L-BFGS) |
+| same | Linux arm64 | −432.1645 (636, issue, x86_64) | −432.1668 (657) | −432.1668 |
 | `examples/warfarin_iov.ferx`, FOCE, `--threads 1` | macOS arm64 | 205.1043 | 205.0927 (502) | 205.0903 (L-BFGS) |
 | same | Linux arm64 | 205.2279 | 205.0914 (561) | 205.0903 |
 
-The polish adds a few percent to a few tens of percent more evaluations. It does not make BOBYQA
+On the 2-cpt IV fixture the polish costs 14% more evaluations on macOS. The thread count changes
+the trajectory: the same fit at the library's default thread count takes 1236 evaluations to the
+same −432.1668.
+It does not make BOBYQA
 a gradient method. On `examples/ctmm_pd_2state.ferx` (`auto` picks BOBYQA there), the default
 fit moves from 711.68 to 711.46. `trust_region` reports a lower 710.76 on the same objective, but
 with ‖∇‖∞ ≈ 4e2 and a singular covariance step, so neither optimizer's endpoint on that model is
