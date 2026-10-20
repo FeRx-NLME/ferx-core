@@ -204,6 +204,9 @@ When `loghr` is omitted it defaults to 0 (no effect).
 > The same freeze on the `TIME` axis — an individual parameter that reads `TIME` and is
 > integrated by a drug-driven hazard — is refused too; see
 > [A `TIME`-dependent disposition is refused](#time-dependent-disposition) (#1853).
+> On an **analytic** hazard the `TIME` axis is refused at parse: a `scale` / `shape` /
+> `alpha` / `gamma` / `loghr` that reads `TIME`, directly or through an individual parameter,
+> would be evaluated with no time argument and silently read 0 (#1919).
 
 ## Estimation
 

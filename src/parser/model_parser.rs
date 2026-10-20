@@ -7867,6 +7867,284 @@ fn restrict_and_validate_indiv_stmts(
     Ok((needed_indiv_stmts, covariates))
 }
 
+/// Reject an **analytic** hazard whose parameters read the `TIME` built-in, directly in
+/// `scale`/`shape`/`alpha`/`gamma`/`loghr` or through an `[individual_parameters]` value
+/// those expressions reach (#1919). `HazardParamFn` takes `(θ, η, covariates)` and no time,
+/// so `TIME` there resolves to whatever the model-time thread-local holds when it runs:
+/// measured, `0.0` outside any `ModelTimeGuard` and the guard's time inside one — frozen at
+/// `TIME = 0` on the likelihood path, caller-dependent elsewhere. The `TIME` axis of the
+/// freeze #741 refuses on the covariate axis. The family's own time dependence lives in its
+/// closed form, not in its parameters.
+///
+/// `needed_indiv_stmts` is the reachability-filtered subset from
+/// `restrict_and_validate_indiv_stmts`, so a `TIME`-reading parameter the hazard does not
+/// reach is not refused. The `[binary_model]` logit is not checked here: it is evaluated
+/// under each record's guard, so `TIME` is honoured there.
+#[cfg(feature = "survival")]
+fn reject_time_in_analytic_hazard(
+    cmt: usize,
+    hazard_exprs: &[&Expression],
+    needed_indiv_stmts: &[Statement],
+) -> Result<(), String> {
+    const WHY: &str = "An analytic hazard (`family = ...`) is evaluated once per subject with \
+                       no time argument, so TIME would not follow the hazard's clock — it would \
+                       silently read the ambient model time (0 outside any record) instead (#1919).";
+    const FIX: &str = "To let the hazard vary in TIME, write it as an ODE-accumulated \
+                       `hazard = ...` expression (which integrates TIME along the hazard's \
+                       clock) with the TIME term in that expression itself.";
+    if hazard_exprs.iter().any(|e| expr_references_time_node(e)) {
+        return Err(format!(
+            "[event_model] on CMT={cmt}: a hazard parameter expression references the `TIME` \
+             built-in. {WHY} {FIX}"
+        ));
+    }
+    // Flow-sensitive, per assignment: what matters is the value each name holds when the
+    // block finishes, along every path. A per-statement scan refused an `if` whose sibling
+    // assignment read `TIME` (round-1 review); two path-insensitive name sets intersected
+    // could pair a definition on one arm with a read on another (round-2 review).
+    let tainted = indiv_time_taint_at_exit(needed_indiv_stmts);
+    let mut read: Vec<String> = Vec::new();
+    for e in hazard_exprs {
+        visit_expr_nodes(e, &mut |x: &Expression| {
+            if let Expression::Variable(n) = x {
+                if !read.contains(n) {
+                    read.push(n.clone());
+                }
+            }
+        });
+    }
+    if let Some((name, taint)) = read.iter().find_map(|n| tainted.get(n).map(|t| (n, t))) {
+        let through = if &taint.root == name {
+            String::new()
+        } else {
+            format!(" (through `{}`)", taint.root)
+        };
+        // A dependency carried by only some paths may still be infeasible when two `if`s
+        // test equivalent conditions written differently (`TVKT > 0` vs `0 < TVKT`): the walk
+        // correlates only identically-written ones, since equivalence in general cannot be
+        // decided. Say so on exactly those refusals, so a user whose model is in fact
+        // time-free has the rewrite in hand.
+        let some_path = if taint.some_path {
+            format!(
+                " This dependency holds on at least one path through the block's `if` \
+                 statements; the check correlates separate `if` statements only when their \
+                 conditions are written identically and read no value re-assigned in between, \
+                 so if that path cannot occur, write those conditions identically or merge the \
+                 `if` statements into one."
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
+             `{name}`, whose value depends on the `TIME` built-in{through}.{some_path} {WHY} {FIX}"
+        ));
+    }
+    Ok(())
+}
+
+/// A name holding a `TIME`-dependent value, per `indiv_time_taint_at_exit`.
+#[cfg(feature = "survival")]
+#[derive(Clone)]
+struct TimeTaint {
+    /// The name whose own assignment, or governing condition, reads `TIME` directly.
+    root: String,
+    /// The dependency is carried by only some paths through the block's `if`s, so it may
+    /// be infeasible if two `if`s test equivalent conditions written differently.
+    some_path: bool,
+}
+
+/// Where a value's `TIME` dependence comes from: `Some(None)` reads `TIME` itself,
+/// `Some(Some(root))` reads a dependent name, `None` is time-free.
+#[cfg(feature = "survival")]
+type TimeSrc = Option<(Option<String>, bool)>;
+
+/// One set of paths through the block that agree on every condition outcome recorded so far.
+#[cfg(feature = "survival")]
+#[derive(Clone)]
+struct TimeWorld {
+    taint: HashMap<String, TimeTaint>,
+    /// Outcomes of the conditions taken on these paths, keyed by the condition's structure
+    /// (`Debug` of the AST), with the names it reads so a re-assignment can drop it.
+    facts: Vec<(String, std::collections::HashSet<String>, bool)>,
+    /// The `TIME` dependence of the enclosing arms' conditions.
+    governed: TimeSrc,
+}
+
+/// Above this many live worlds the walk merges them into one and forgets their facts —
+/// the round-3 union join, which is conservative — so a block of many sequential `if`s
+/// cannot blow up exponentially. Real `[individual_parameters]` blocks stay far below it.
+#[cfg(feature = "survival")]
+const MAX_TIME_WORLDS: usize = 64;
+
+/// Which names hold a `TIME`-dependent value once `stmts` has run.
+///
+/// One forward pass in program order, the way the block executes, over a set of
+/// **worlds**: each is a group of paths that took the same arm of every `if` so far, with
+/// its own taint map. An `Assign` is a strong update — a name re-assigned from a time-free
+/// RHS is clean again — and its value depends on `TIME` when its RHS reads `TIME` or a
+/// currently dependent name, or when a governing `if` condition does (every condition up to
+/// and including the arm's own: an arm runs only when the earlier conditions were false, as
+/// in `compute_time_dependent_mask`). An `if` splits each world into one per arm (plus the
+/// fall-through when there is no `else`), recording the condition outcomes that select it.
+///
+/// **Path correlation (round-2/3/4 reviews).** A definition on one arm never pairs with a
+/// read on another arm of the same `if`, and an `if` whose condition is written
+/// identically to one a world already decided — with no name it reads re-assigned since —
+/// takes only the arm that outcome selects, so
+/// `if (C) { K = TIME }; if (C) { LAM = 1 } else { LAM = K }` leaves `LAM` time-free.
+/// Equivalent conditions written differently (`TVKT > 0` vs `0 < TVKT`) are not
+/// correlated — equivalence is undecidable in general — so the result stays a sound
+/// over-approximation: it never misses a `TIME`-dependent value, the direction #1853's
+/// `compute_time_dependent_mask` takes too, and a refusal that may be such a false
+/// positive says so (`some_path`).
+#[cfg(feature = "survival")]
+fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, TimeTaint> {
+    use std::collections::HashSet;
+    fn src_of(
+        visit: &mut dyn FnMut(&mut dyn FnMut(&Expression)),
+        st: &HashMap<String, TimeTaint>,
+    ) -> TimeSrc {
+        let (mut direct, mut via) = (false, None);
+        visit(&mut |e: &Expression| match e {
+            Expression::Time => direct = true,
+            Expression::Variable(n) if via.is_none() => {
+                via = st.get(n).map(|t| (Some(t.root.clone()), t.some_path))
+            }
+            _ => {}
+        });
+        if direct {
+            Some((None, false))
+        } else {
+            via
+        }
+    }
+    /// Union of the worlds' taint: a name dependent in every world, on a must-path in each,
+    /// stays a must-dependency; otherwise it is `some_path`.
+    fn join(worlds: &[TimeWorld]) -> HashMap<String, TimeTaint> {
+        let mut out: HashMap<String, TimeTaint> = HashMap::new();
+        for w in worlds {
+            for (k, v) in &w.taint {
+                out.entry(k.clone()).or_insert_with(|| {
+                    let on_every = worlds.iter().all(|w| w.taint.contains_key(k));
+                    let some_path = !on_every
+                        || worlds
+                            .iter()
+                            .any(|w| w.taint.get(k).is_some_and(|t| t.some_path));
+                    TimeTaint {
+                        root: v.root.clone(),
+                        some_path,
+                    }
+                });
+            }
+        }
+        out
+    }
+    fn assign(w: &mut TimeWorld, name: &str, e: &Expression) {
+        match src_of(&mut |f| visit_expr_nodes(e, f), &w.taint).or_else(|| w.governed.clone()) {
+            Some((root, some_path)) => {
+                let root = root.unwrap_or_else(|| name.to_string());
+                w.taint
+                    .insert(name.to_string(), TimeTaint { root, some_path });
+            }
+            None => {
+                w.taint.remove(name);
+            }
+        }
+        // A recorded outcome no longer describes a condition whose input just changed.
+        w.facts.retain(|(_, reads, _)| !reads.contains(name));
+    }
+    fn walk(stmts: &[Statement], mut worlds: Vec<TimeWorld>) -> Vec<TimeWorld> {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, e) => {
+                    for w in &mut worlds {
+                        assign(w, name, e);
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut out = Vec::new();
+                    for w in worlds {
+                        let saved = w.governed.clone();
+                        // `rest`: the paths of `w` on which every condition so far was false.
+                        let mut rest = Some(w);
+                        let mut g = saved.clone();
+                        for (cond, body) in branches {
+                            let Some(r) = rest.take() else { break };
+                            g = g.or_else(|| {
+                                src_of(&mut |f| visit_condition_nodes(cond, f), &r.taint)
+                            });
+                            let key = format!("{cond:?}");
+                            let known = r.facts.iter().find(|(k, _, _)| *k == key).map(|f| f.2);
+                            let mut reads = HashSet::new();
+                            visit_condition_nodes(cond, &mut |e: &Expression| {
+                                if let Expression::Variable(n) = e {
+                                    reads.insert(n.clone());
+                                }
+                            });
+                            if known != Some(false) {
+                                let mut taken = r.clone();
+                                if known.is_none() {
+                                    taken.facts.push((key.clone(), reads.clone(), true));
+                                }
+                                taken.governed = g.clone();
+                                out.extend(walk(body, vec![taken]).into_iter().map(|mut t| {
+                                    t.governed = saved.clone();
+                                    t
+                                }));
+                            }
+                            if known != Some(true) {
+                                let mut skip = r;
+                                if known.is_none() {
+                                    skip.facts.push((key, reads, false));
+                                }
+                                rest = Some(skip);
+                            }
+                        }
+                        if let Some(mut r) = rest {
+                            if let Some(eb) = else_body {
+                                r.governed = g;
+                                out.extend(walk(eb, vec![r]).into_iter().map(|mut t| {
+                                    t.governed = saved.clone();
+                                    t
+                                }));
+                            } else {
+                                out.push(r);
+                            }
+                        }
+                    }
+                    worlds = out;
+                    if worlds.len() > MAX_TIME_WORLDS {
+                        let governed = worlds.iter().find_map(|w| w.governed.clone());
+                        worlds = vec![TimeWorld {
+                            taint: join(&worlds),
+                            facts: Vec::new(),
+                            governed,
+                        }];
+                    }
+                }
+                // `[individual_parameters]` at parse time holds only named assignments and
+                // `if` blocks; the indexed/bytecode/ODE forms appear later or elsewhere.
+                Statement::AssignIdx(..)
+                | Statement::AssignBc(..)
+                | Statement::DiffEq(..)
+                | Statement::DiffEqIdx(..)
+                | Statement::DiffEqBc(..) => {}
+            }
+        }
+        worlds
+    }
+    let start = TimeWorld {
+        taint: HashMap::new(),
+        facts: Vec::new(),
+        governed: None,
+    };
+    join(&walk(stmts, vec![start]))
+}
+
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
 ///
 /// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
@@ -8224,6 +8502,7 @@ fn parse_event_model_block(
         kappa_names,
         "event_model",
     )?;
+    reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.

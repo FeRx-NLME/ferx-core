@@ -34147,3 +34147,342 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     let bc = compile_bytecode(&split);
     assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
 }
+
+/// #1919 — an analytic hazard's `HazardParamFn` takes no time, so a `TIME` read in its
+/// parameters (directly, or through a reached `[individual_parameters]` value) is refused
+/// at parse rather than silently read at the ambient model time (0 on the likelihood path).
+#[cfg(feature = "survival")]
+mod analytic_hazard_time_1919 {
+    use super::*;
+
+    /// `ip` is the `[individual_parameters]` body, `em` the `[event_model]` body after
+    /// `cmt`, `extra` any further block.
+    fn model(ip: &str, em: &str, extra: &str) -> String {
+        format!(
+            "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  theta TVKT(0.5, 0.0, 10.0)
+  theta TVSHAPE(1.2, 0.1, 10.0)
+  theta BETA(0.1, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+{ip}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+[event_model]
+  cmt    = 2
+{em}
+{extra}"
+        )
+    }
+
+    const BASE_IP: &str = "  CL  = TVCL * exp(ETA_CL)\n  V1  = TVV\n";
+
+    /// The caveat a refusal carries when its dependency holds on only some paths.
+    const SOME_PATH: &str = "This dependency holds on at least one path through the block's `if` \
+                             statements";
+
+    /// Every sentence of the message, per cell: the shared why/fix and the cell's lead.
+    fn assert_message(err: &str, lead: &str) {
+        for part in [
+            "[event_model] on CMT=2: ",
+            lead,
+            "An analytic hazard (`family = ...`) is evaluated once per subject with no time \
+             argument, so TIME would not follow the hazard's clock",
+            "silently read the ambient model time (0 outside any record) instead (#1919)",
+            "write it as an ODE-accumulated `hazard = ...` expression",
+            "with the TIME term in that expression itself",
+        ] {
+            assert!(err.contains(part), "missing `{part}` in: {err}");
+        }
+    }
+
+    /// The issue's model: `scale = LAM`, `LAM` reads `TIME`.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_reaches_is_refused() {
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert_message(
+            &err,
+            "the hazard reads the [individual_parameters] value `LAM`, whose value \
+             depends on the `TIME` built-in",
+        );
+        assert!(
+            !err.contains(SOME_PATH),
+            "a dependency on every path carries no some-path caveat: {err}"
+        );
+    }
+
+    /// Transitive: the hazard reads `LAM`, `LAM` reads `K`, and only `K` reads `TIME`.
+    /// The message names the value the hazard reads and the one that reads `TIME`; the
+    /// issue's direct case (`LAM` reads `TIME` itself) carries no `through` clause.
+    #[test]
+    fn a_time_read_reached_transitively_names_the_reader() {
+        let ip = format!("{BASE_IP}  K   = 1.0 + TVKT * TIME\n  LAM = TVLAMBDA * K");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(
+            err.contains("value `LAM`, whose value depends on the `TIME` built-in (through `K`)."),
+            "got: {err}"
+        );
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(
+            !err.contains("through"),
+            "direct read has no witness clause: {err}"
+        );
+    }
+
+    /// Path correlation (round-2 review): `K` is time-free on the arm where `LAM` reads it,
+    /// and `TIME`-dependent only on the arm where `LAM` does not, so `LAM` is time-free on
+    /// both paths. A time-free re-assignment likewise clears an earlier `TIME` read.
+    /// Straddle asserted per case: the block reads `TIME`.
+    #[test]
+    fn a_time_dependency_on_no_single_path_is_not_refused() {
+        for (label, branch) in [
+            (
+                "mutually exclusive arms",
+                "  K = TVLAMBDA\n  if (TVKT > 0) {\n    LAM = K\n  } else {\n    \
+                 K = TIME\n    LAM = TVLAMBDA\n  }",
+            ),
+            ("overwritten", "  LAM = TIME\n  LAM = TVLAMBDA"),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let model =
+                parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+                    .unwrap_or_else(|e| panic!("{label}: must parse, got: {e}"));
+            assert!(
+                compiled_model_uses_time_builtin(&model),
+                "{label}: straddle — the block must read TIME"
+            );
+        }
+    }
+
+    /// Every hazard-parameter key is a read site, not only `scale`.
+    #[test]
+    fn every_hazard_parameter_key_is_a_read_site() {
+        let ip = format!("{BASE_IP}  PT  = TVSHAPE * (1.0 + TVKT * TIME)");
+        for em in [
+            "  family = weibull\n  scale = TVLAMBDA\n  shape = PT",
+            "  family = gompertz\n  alpha = TVLAMBDA\n  gamma = PT",
+            "  family = exponential\n  scale = TVLAMBDA\n  loghr = BETA * PT",
+        ] {
+            let err = expect_parse_err(&model(&ip, em, ""));
+            assert!(
+                err.contains("value `PT`, whose value depends"),
+                "{em}: got: {err}"
+            );
+        }
+    }
+
+    /// Taint is per assignment, not per statement: one `if` block assigns both a
+    /// `TIME`-reading `UNUSED` and the time-free `LAM` the hazard reads, so nothing the
+    /// hazard depends on reads `TIME` (round-1 review). Straddle asserted: the block does
+    /// read `TIME`, inside the very statement that defines `LAM`.
+    #[test]
+    fn a_time_read_in_a_sibling_assignment_of_the_same_if_is_not_refused() {
+        let ip = format!(
+            "{BASE_IP}  if (TVKT > 0) {{\n    UNUSED = TIME\n    LAM = TVLAMBDA\n  }} \
+             else {{\n    UNUSED = 0\n    LAM = TVLAMBDA\n  }}"
+        );
+        let model = parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read in a sibling assignment the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// Control dependence: `LAM` reads no `TIME` itself, but which value it takes does —
+    /// including through an `else if` whose own condition is time-free, because the arm is
+    /// governed by every earlier condition too.
+    #[test]
+    fn a_time_reading_condition_governing_the_reached_assignment_is_refused() {
+        // Third field: whether the dependency is on only some paths. Both arms of the first
+        // case assign `LAM` under the `TIME` test, so it holds on every path; in the second
+        // only the `else if` arm does.
+        for (label, branch, some_path) in [
+            (
+                "own condition",
+                "  if (TIME > 5) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = 2 * TVLAMBDA\n  }",
+                false,
+            ),
+            (
+                "earlier arm's condition",
+                "  LAM = TVLAMBDA\n  if (TIME > 5) {\n    AUX = 1\n  } \
+                 else if (TVKT > 0) {\n    LAM = 2 * TVLAMBDA\n  }",
+                true,
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in"),
+                "{label}: got: {err}"
+            );
+            assert_eq!(err.contains(SOME_PATH), some_path, "{label}: got: {err}");
+        }
+    }
+
+    /// The join after an `if` keeps a dependency any path carries: one arm assigning a
+    /// `TIME`-dependent `LAM`, and an `if` with no `else` that leaves an earlier
+    /// `TIME`-dependent `LAM` in place on its fall-through path.
+    #[test]
+    fn a_time_dependency_on_any_single_path_is_refused() {
+        for (label, branch) in [
+            (
+                "one arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA * TIME\n  } else {\n    LAM = TVLAMBDA\n  }",
+            ),
+            (
+                "else arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = TVLAMBDA * TIME\n  }",
+            ),
+            (
+                "fall-through",
+                "  LAM = TVLAMBDA * TIME\n  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  }",
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in."),
+                "{label}: got: {err}"
+            );
+            assert!(err.contains(SOME_PATH), "{label}: got: {err}");
+        }
+    }
+
+    /// The two-`if` model of the round-3/4 reviews, as text with the second condition
+    /// spelled by the caller and an optional statement between the two `if`s.
+    fn split_ifs(second_cond: &str, between: &str) -> String {
+        format!(
+            "{BASE_IP}  SW = TVKT\n  K = TVLAMBDA\n  LAM = TVLAMBDA\n  \
+             if (SW > 0) {{\n    K = TIME\n  }}\n{between}  \
+             if ({second_cond}) {{\n    LAM = TVLAMBDA\n  }} else {{\n    LAM = K\n  }}"
+        )
+    }
+
+    /// **Identical conditions correlate across separate `if`s** (round-4 review). `LAM = K`
+    /// runs only when `SW > 0` is false, which is exactly when `K = TIME` did not run, so
+    /// `LAM` is time-free on every execution and the model parses. Straddle asserted: the
+    /// block does read `TIME`, on a path the hazard's value never takes.
+    #[test]
+    fn a_dependency_split_across_identically_conditioned_ifs_is_not_refused() {
+        let src = model(
+            &split_ifs("SW > 0", ""),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let model = parse_model_string(&src).expect("identical conditions must correlate");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME"
+        );
+    }
+
+    /// The correlation is what decides it, not the shape: on either side of the gate the
+    /// same model is refused. (a) An **equivalent condition written differently** is not
+    /// correlated — equivalence is undecidable in general — so the refusal stands and carries
+    /// the some-path caveat with its rewrite; every sentence asserted. (b) Re-assigning the
+    /// condition's input between the two `if`s makes the second test a different question
+    /// (`SW = -1` here: the `else` always runs, so `LAM = K` really is `TIME` whenever the
+    /// first `if` fired) — a recorded outcome that survived the re-assignment would accept
+    /// a genuinely `TIME`-dependent hazard.
+    #[test]
+    fn a_dependency_split_across_uncorrelated_ifs_is_refused_with_the_some_path_caveat() {
+        for (label, ip) in [
+            ("written differently", split_ifs("0 < SW", "")),
+            ("input re-assigned", split_ifs("SW > 0", "  SW = -1\n")),
+        ] {
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            for part in [
+                "value `LAM`, whose value depends on the `TIME` built-in (through `K`).",
+                SOME_PATH,
+                "the check correlates separate `if` statements only when their conditions are \
+                 written identically and read no value re-assigned in between",
+                "so if that path cannot occur, write those conditions identically or merge the \
+                 `if` statements into one.",
+            ] {
+                assert!(err.contains(part), "{label}: missing `{part}` in: {err}");
+            }
+        }
+    }
+
+    /// Past `MAX_TIME_WORLDS` live paths the walk merges them (union join, facts dropped),
+    /// which must stay sound: seven independent `if`s (2^7 = 128 paths) before a `TIME`
+    /// read on one arm still refuse, with the caveat; and the merge forgets the first `if`'s
+    /// outcome, so the round-4 correlation it would otherwise find is conservatively lost.
+    #[test]
+    fn many_sequential_ifs_merge_paths_soundly() {
+        let mut pad = String::new();
+        for i in 0..7 {
+            pad.push_str(&format!(
+                "  if (TVKT > {i}) {{\n    A{i} = 1\n  }} else {{\n    A{i} = 2\n  }}\n"
+            ));
+        }
+        // The hazard must reach the `A{i}`, or the reachability filter drops the pad.
+        let tail = "  LAM = LAM + 0 * (A0 + A1 + A2 + A3 + A4 + A5 + A6)";
+        let ip = format!(
+            "{BASE_IP}  if (TVKT > 0.5) {{\n    LAM = TVLAMBDA * TIME\n  }} else {{\n    \
+             LAM = TVLAMBDA\n  }}\n{pad}{tail}"
+        );
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(err.contains(SOME_PATH), "merged: got: {err}");
+        let src = model(
+            &format!("{}\n{tail}", split_ifs("SW > 0", &pad)),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("(through `K`)"),
+            "merge drops facts: got: {err}"
+        );
+    }
+
+    /// `TIME` written directly in a hazard parameter expression.
+    #[test]
+    fn a_direct_time_read_is_refused() {
+        let err = expect_parse_err(&model(
+            BASE_IP,
+            "  family = exponential\n  scale = TVLAMBDA * (1.0 + TVKT * TIME)",
+            "",
+        ));
+        assert_message(
+            &err,
+            "a hazard parameter expression references the `TIME` built-in",
+        );
+    }
+
+    /// Control, with the straddle asserted: the block reads `TIME` (`CL`), but the hazard
+    /// does not reach `CL`, so nothing is refused — the reachability filter is the gate.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_does_not_reach_is_not_refused() {
+        let ip = "  CL  = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  V1  = TVV\n  \
+                  LAM = TVLAMBDA * exp(BETA)";
+        let model = parse_model_string(&model(ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// The `[binary_model]` logit is evaluated under each record's model-time guard, so a
+    /// `TIME`-reading parameter there is honoured and must keep parsing.
+    #[test]
+    fn a_binary_model_reading_time_is_not_refused() {
+        let ip = format!("{BASE_IP}  B0 = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let src = model(
+            &ip,
+            "  family = exponential\n  scale = TVLAMBDA",
+            "[binary_model]\n  cmt   = 3\n  logit = B0\n",
+        );
+        parse_model_string(&src).expect("a TIME-reading logit predictor must parse");
+    }
+}
