@@ -632,7 +632,7 @@ fn the_slow_shards_run_every_test_exactly_once() {
     check_plan("slow-nn", &["--lib"], &slow_nn_list(), 1, 1);
 }
 
-/// `run OWN... -- BUILD...` for a call that must be refused before cargo runs: a
+/// `run OWN... -- BUILD...` for a call that must be refused before any cargo call: a
 /// fake cargo that fails, and a scratch manifest directory, so a refusal that
 /// regresses into a real run neither builds the workspace nor writes into the tree.
 fn refused_run(own: &[&str], build: &[&str]) -> std::process::Output {
