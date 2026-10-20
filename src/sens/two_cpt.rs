@@ -367,6 +367,10 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
     if t.val() < 0.0 {
         return T::from_f64(0.0);
     }
+    // A `NaN` parameter is served as `NaN` (#2134), before the domain guard clamps it.
+    if [cl, v1, q, v2, n, mtt].iter().any(|x| x.val().is_nan()) {
+        return crate::sens::one_cpt::nan_jet(cl + v1);
+    }
     // Shared disposition-domain guard (params valid, non-confluent, α<KTR, NaN-safe);
     // central and peripheral read the same helper so they can't drift (#634 finding 7).
     let Some((alpha, beta, k21)) = transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt) else {
@@ -474,6 +478,10 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
 ) -> T {
     if t.val() < 0.0 {
         return T::from_f64(0.0);
+    }
+    // A `NaN` parameter is served as `NaN` (#2134), before the domain guard clamps it.
+    if [cl, v1, q, v2, mat, cv2].iter().any(|x| x.val().is_nan()) {
+        return crate::sens::one_cpt::nan_jet(cl + v1);
     }
     let Some((alpha, beta, k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
         return T::from_f64(0.0);
@@ -903,10 +911,27 @@ mod tests {
             let r = two_cpt_transit_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, p.4, p.5, 1.0);
             assert_eq!(r, 0.0, "invalid params must return 0: {p:?}");
         }
-        // Transient NaN (NaN cl ⇒ NaN ke/α) must hit the NaN-safe `!(α < KTR)` guard,
-        // not `mgf`'s debug_assert — finite 0.0 even in a debug build.
-        let nan = two_cpt_transit_amt_g::<f64>(100.0, 2.0, f64::NAN, v1, q, v2, 3.0, 0.3, 1.0);
-        assert_eq!(nan, 0.0, "NaN cl must return 0 (NaN-safe guard), got {nan}");
+        // A NaN parameter is served as NaN (#2134), and returns before `mgf`'s
+        // debug_assert, so a debug build does not panic. It used to clamp to 0.
+        for p in [
+            (f64::NAN, v1, q, v2, 3.0, 0.3),
+            (cl, f64::NAN, q, v2, 3.0, 0.3),
+            (cl, v1, f64::NAN, v2, 3.0, 0.3),
+            (cl, v1, q, f64::NAN, 3.0, 0.3),
+            (cl, v1, q, v2, f64::NAN, 0.3),
+            (cl, v1, q, v2, 3.0, f64::NAN),
+        ] {
+            let r = two_cpt_transit_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, p.4, p.5, 1.0);
+            assert!(
+                r.is_nan(),
+                "a NaN parameter must be served as NaN: {p:?} → {r}"
+            );
+            let r = two_cpt_ig_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, 0.3, 0.5, 1.0);
+            let ig_nan = p.4.is_nan() || p.5.is_nan();
+            assert_eq!(r.is_nan(), !ig_nan, "IG, disposition {p:?} → {r}");
+            let r = two_cpt_ig_amt_g::<f64>(100.0, 2.0, cl, v1, q, v2, p.4, p.5 * 1.5, 1.0);
+            assert_eq!(r.is_nan(), ig_nan, "IG, kernel {p:?} → {r}");
+        }
         // Dual2 sensitivity path stays finite (exercises two_cpt_transit_conc_g).
         let d = two_cpt_transit_conc_g::<Dual2<6>>(
             &DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),

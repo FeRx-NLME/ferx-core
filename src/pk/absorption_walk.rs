@@ -98,7 +98,22 @@ pub(crate) enum WalkDomain {
     Twin,
     /// A non-physical parameter (`CL ≤ 0`, `V ≤ 0`, `n < 0`, `MTT ≤ 0`, …). The static
     /// closed form returns `0` there as a deliberate optimiser penalty, and so does the walk.
+    /// A `NaN` is not in this arm: the walk serves it as `NaN` from the record it starts on
+    /// and keeps the records before it (#2134), as every other engine does.
     Invalid,
+}
+
+/// A `NaN` in an interval's disposition (`CL`, `V`, and `V2` on a 2-cpt model). The walk
+/// serves `NaN` from that interval on (#2134). A `NaN` `Q` is left to [`fastest_rate`],
+/// whose `NaN` macro-rates send the subject to the twin, which serves the same `NaN`.
+fn disposition_is_nan<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> bool {
+    p.cl.val().is_nan() || p.v.val().is_nan() || (two_cpt && p.v2.val().is_nan())
+}
+
+/// A `NaN` in a dose's kernel parameters (`n`/`MTT`, `MAT`/`CV²`): the walk serves `NaN`
+/// from the first interval that evaluates the dose (#2134).
+fn kernel_is_nan<T: PkNum>(d: &AbsDose<T>) -> bool {
+    d.a.val().is_nan() || d.b.val().is_nan()
 }
 
 /// The MGF abscissa of one dose's kernel: `KTR = (n+1)/MTT` (transit) or
@@ -177,7 +192,7 @@ pub(crate) fn walk_domain<T: PkNum>(
     };
     let mut verdict = WalkDomain::Walk;
     for d in doses {
-        if abscissa(kernel, d.a.val(), d.b.val()).is_none() {
+        if !kernel_is_nan(d) && abscissa(kernel, d.a.val(), d.b.val()).is_none() {
             verdict = WalkDomain::Invalid;
         }
     }
@@ -196,6 +211,11 @@ pub(crate) fn walk_domain<T: PkNum>(
             let Some(p) = gov[i] else {
                 return WalkDomain::Twin;
             };
+            // From a `NaN` on the walk serves `NaN`, so no later pair needs the twin.
+            let open = doses.iter().filter(|d| d.arrival.val() <= cur_t);
+            if disposition_is_nan(two_cpt, p) || open.clone().any(kernel_is_nan) {
+                return verdict;
+            }
             let vals = PkDual {
                 cl: p.cl.val(),
                 v: p.v.val(),
@@ -215,7 +235,7 @@ pub(crate) fn walk_domain<T: PkNum>(
                 }
             };
             if let Some(r) = rate {
-                for d in doses.iter().filter(|d| d.arrival.val() <= cur_t) {
+                for d in open {
                     if let Some(abs) = abscissa(kernel, d.a.val(), d.b.val()) {
                         if !(r < abs) {
                             return WalkDomain::Twin;
@@ -280,7 +300,8 @@ fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
 
 /// The walk. Returns `None` when [`walk_domain`] sends the subject to the twin; otherwise
 /// the central concentration at every observation (clamped at `0` like the other walks, a
-/// `NaN` kept), and — when `states` is `Some` — the per-observation states in the model's
+/// `NaN` kept — and served from the first interval whose disposition or open dose kernel
+/// is `NaN`, with the records before it walked as usual, #2134), and — when `states` is `Some` — the per-observation states in the model's
 /// analytical layout and convention (`[depot, central]` / `[depot, central, peripheral]`:
 /// the kernel's undelivered amount, then concentrations), the one `[derived]` reads by the
 /// model's `analytical_compartment_names`.
@@ -322,12 +343,28 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
         WalkDomain::Walk => {}
     }
     let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    let nan = T::from_f64(f64::NAN);
     let mut state = [zero, zero];
     let mut arrived = vec![false; doses.len()];
+    // Set at the first `NaN` disposition or open dose kernel. From there the state is
+    // `NaN`, as an integrator's would be, and the tilting terms are not evaluated: their
+    // `mgf` `debug_assert` rejects a `NaN` rate (#386).
+    let mut poisoned = false;
     let mut cur_t = schedule.events[0].time;
     for (i, ev) in schedule.events.iter().enumerate() {
         let pk_now = gov[i];
-        if ev.time > cur_t {
+        if !poisoned && pk_now.is_some_and(|p| disposition_is_nan(two_cpt, p)) {
+            poisoned = true;
+        }
+        if ev.time > cur_t && !poisoned {
+            poisoned = doses
+                .iter()
+                .zip(&arrived)
+                .any(|(d, &a)| a && kernel_is_nan(d));
+        }
+        if poisoned {
+            state = [nan, nan];
+        } else if ev.time > cur_t {
             let p = pk_now.expect("walk_domain declines a timeline with no record");
             let dt = T::from_f64(ev.time - cur_t);
             let disp = if two_cpt {
@@ -366,25 +403,35 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                     }
                 }
             }
-            cur_t = ev.time;
         }
+        cur_t = cur_t.max(ev.time);
         match ev.kind {
             EventKind::Dose => arrived[ev.orig_idx] = true,
             EventKind::Obs => {
                 let p = pk_now.expect("an observation is a record");
-                let per_volume =
-                    |amount: T, vol: T| if vol.val() > 0.0 { amount / vol } else { zero };
+                // A `NaN` volume is kept, as in `central_concentration_g` (#2039, #2134).
+                let per_volume = |amount: T, vol: T| {
+                    if vol.val() > 0.0 || vol.val().is_nan() {
+                        amount / vol
+                    } else {
+                        zero
+                    }
+                };
                 let conc = per_volume(state[0], p.v);
                 // `conc < 0` is false for `NaN`, which is kept rather than floored to 0.
                 preds[ev.orig_idx] = if conc.val() < 0.0 { zero } else { conc };
                 if let Some(s) = states.as_deref_mut() {
                     // The analytical state convention (`single_dose_states`): the kernel
                     // `depot` as an amount, central and peripheral as concentrations.
-                    let depot = doses
-                        .iter()
-                        .zip(&arrived)
-                        .filter(|(_, &a)| a)
-                        .fold(zero, |acc, (d, _)| acc + undelivered(kernel, d, ev.time));
+                    let depot = if poisoned {
+                        nan
+                    } else {
+                        doses
+                            .iter()
+                            .zip(&arrived)
+                            .filter(|(_, &a)| a)
+                            .fold(zero, |acc, (d, _)| acc + undelivered(kernel, d, ev.time))
+                    };
                     let row = if two_cpt {
                         vec![depot, conc, per_volume(state[1], p.v2)]
                     } else {
