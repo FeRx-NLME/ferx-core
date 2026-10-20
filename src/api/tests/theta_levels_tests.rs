@@ -690,6 +690,42 @@ fn a_constrained_block_without_written_bounds_takes_a_sign_free_box() {
     );
 }
 
+/// #2178 review r1 #3: a constrained block's bounds must hold 0 strictly inside them.
+/// Measured before at `9ede6904`: `(0.0, 0.0)` and `(0.0, 0.0, 5.0)` bound, log-packed,
+/// with every free coefficient starting at `1e-10` (packed `ln(1e-10)`) and held ≥ 0;
+/// `(0.0, -5.0, 0.0)` bound with every coefficient held ≤ 0 from a start on its bound.
+/// Each side is refused with its own text, in full; the straddle, in the same test:
+/// bounds a hair either side of 0 bind, linearly packed at exactly 0.
+///
+/// Mutations — delete the new arm: all three refusal cells bind; swap `lower`/`upper` in
+/// it: the `side` texts die; delete any sentence of the message: the equality dies;
+/// `== 0.0` → `<= 0.0`: the straddle is refused.
+#[test]
+fn a_constrained_block_bound_at_zero_is_refused_on_either_side() {
+    use crate::estimation::parameterization::{pack_with_bounds, theta_packs_log};
+    let refusal = |side: &str, inside: &str, got: &str| {
+        format!(
+            "theta PLACEBO[...]: a constrained level block's {side} bound cannot be 0 (got \
+             {got}). Its free θ are contrast coefficients, which start at 0 and have no sign, \
+             so a bound at 0 holds every one of them to one sign and starts the fit on that \
+             bound. Write no bounds for the sign-free default (-1e9..1e9), or a {side} bound \
+             {inside} 0."
+        )
+    };
+    for (decl, side, inside, got) in [
+        ("(0.0, 0.0)", "lower", "below", "0..1000000000"),
+        ("(0.0, 0.0, 5.0)", "lower", "below", "0..5"),
+        ("(0.0, -5.0, 0.0)", "upper", "above", "-5..0"),
+    ] {
+        let err = bind_placebo(&format!("PLACEBO[STUDY, TIME]{decl}")).unwrap_err();
+        assert!(err.ends_with(&refusal(side, inside, got)), "{decl}: {err}");
+    }
+    let m = bind_placebo("PLACEBO[STUDY, TIME](0.0, -1e-12, 1e-12)").expect("the straddle binds");
+    let p = &m.default_params;
+    assert!(p.theta_lower[1..4].iter().all(|l| !theta_packs_log(*l)));
+    assert_eq!(&pack_with_bounds(p).packed[1..4], &[0.0; 3]);
+}
+
 #[test]
 fn unconstrained_blocks_keep_broadcast_init_and_fix_semantics() {
     let text = no_eta_model()
@@ -6679,9 +6715,10 @@ mod absorption {
                 "{bounds}"
             );
         }
-        // Bounds that leave no room at all: the θ cannot step, which measures
-        // nothing, so the levels count as live and the block binds. Read as "no
-        // change", every level would be dead.
+        // Bounds that leave no room at all are refused since #2178 review r1 #3: a
+        // constrained block's bounds must hold 0 strictly inside them, and a block
+        // pinned at 0 is spelled `FIX`. Before, `(0.0, 0.0, 0.0)` bound through
+        // `toward_interior`'s no-room arm (asserted on the helper below).
         let pinned = cf_model(
             "",
             "STUDY, TIME",
@@ -6689,11 +6726,8 @@ mod absorption {
             &format!("E0 + {EMAXY}"),
         )
         .replace("(0.0, -10.0, 10.0)", "(0.0, 0.0, 0.0)");
-        assert_eq!(
-            try_bind(&pinned, &pop),
-            Ok((LevelContrast::SumToZero, 17)),
-            "no room"
-        );
+        let err = try_bind(&pinned, &pop).expect_err("no room");
+        assert!(err.contains("lower bound cannot be 0 (got 0..0)"), "{err}");
         // The helper itself: never onto a bound, and back to `x` only with no room.
         assert!((toward_interior(0.0, -0.1, 0.1, 0.13) - 0.05).abs() < 1e-15);
         assert!((toward_interior(0.09, -0.1, 0.1, 0.25) + 0.005).abs() < 1e-15);
@@ -11234,10 +11268,26 @@ mod level_uncertainty {
     /// Rows past θ in every covariance below: the model's one Ω and one σ.
     const EXTRA: usize = 2;
 
+    /// `lower = "0.0"` is the log-packed case. The parser refuses a constrained block
+    /// bound at 0 (#2178 review r1 #3), so it is bound at `-10.0` and the block's
+    /// lower bound is then set to 0 in the parameters: binding never reads the bounds,
+    /// so the model is the one `(0.0, 0.0, 10.0)` used to parse to, and
+    /// `theta_level_values` still meets a log-packed level through caller-supplied
+    /// `ModelParameters`.
     fn within(lower: &str) -> CompiledModel {
         let mut pop = population(2, 3);
-        let text = mbma_model("").replace("(0.0, -10.0, 10.0)", &format!("(0.0, {lower}, 10.0)"));
-        bind(&text, &mut pop).unwrap()
+        let written = if lower == "0.0" { "-10.0" } else { lower };
+        let text = mbma_model("").replace("(0.0, -10.0, 10.0)", &format!("(0.0, {written}, 10.0)"));
+        let mut model = bind(&text, &mut pop).unwrap();
+        if lower == "0.0" {
+            let p = &mut model.default_params;
+            for (l, name) in p.theta_lower.iter_mut().zip(&p.theta_names) {
+                if name.starts_with("PLACEBO[") {
+                    *l = 0.0;
+                }
+            }
+        }
+        model
     }
 
     fn global() -> CompiledModel {

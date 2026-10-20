@@ -17454,6 +17454,12 @@ fn build_level_rules(
 /// shared initializer can therefore represent every level only at zero; the
 /// declared bounds apply to the remaining free contrast coefficients, not to
 /// the derived negative sum.
+///
+/// The free coefficients start at 0 and have no sign, so 0 must lie strictly inside
+/// their bounds (#2178 review r1 #3). A bound *at* 0 holds every coefficient to one
+/// sign and starts the fit on that bound; at a lower bound of 0 the coefficients are
+/// also log-packed (`theta_packs_log`), so they start at the packing floor, not at 0.
+/// With this rule no constrained free θ is ever log-packed.
 fn validate_constrained_level_init(
     name: &str,
     binding: &LevelBinding,
@@ -17475,7 +17481,20 @@ fn validate_constrained_level_init(
             "theta {name}[...]: constrained level bounds must include 0 (got {lower}..{upper})"
         ));
     }
-    Ok(())
+    let (side, inside) = if lower == 0.0 {
+        ("lower", "below")
+    } else if upper == 0.0 {
+        ("upper", "above")
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "theta {name}[...]: a constrained level block's {side} bound cannot be 0 (got \
+         {lower}..{upper}). Its free θ are contrast coefficients, which start at 0 and have \
+         no sign, so a bound at 0 holds every one of them to one sign and starts the fit on \
+         that bound. Write no bounds for the sign-free default (-1e9..1e9), or a {side} \
+         bound {inside} 0."
+    ))
 }
 
 // --- Build omega matrix from diagonal + block specs ---
