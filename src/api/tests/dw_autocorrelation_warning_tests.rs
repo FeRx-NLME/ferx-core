@@ -93,7 +93,8 @@ fn non_finite_dw_never_warns() {
 /// the drift through the EBE search; it cannot, because a scalar on `CL` cannot
 /// bend a mono-exponential into a bi-exponential. Durbin-Watson on this fixture
 /// (the two subjects of `assert_fit_pushes_only_the_helpers_message`), one
-/// variable changed at a time, macOS arm64:
+/// variable changed at a time — the same to four digits on native macOS arm64 and
+/// on Linux aarch64 (`tools/linux-test.sh`):
 ///
 /// | variant | `outer_maxiter: 1` | converged | converged ω |
 /// |---|---|---|---|
