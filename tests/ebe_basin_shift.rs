@@ -39,6 +39,16 @@
 //! 10-subject draws from `mm_n200.csv` (`random.Random(1565)`) — do: a genuine secondary mode,
 //! caught by the mid-leg basin probe at the trapped leg's 33rd evaluation.
 //!
+//! **This subset traps on macOS arm64 too (#2070).** The #1527 subset did not: native macOS
+//! went straight to −79.1679 on its first leg (the #1688 libm split, not a defect in the
+//! gate), so both tests were red there and the restart path ran only on Linux. The #2093
+//! subset was re-measured natively on macOS arm64 at `3909a294`, debug and release: both
+//! tests pass, and every quoted digit matches the Linux numbers — cold 17.064785 at the 33rd
+//! evaluation, restarted OFV 11.5047986; at `maxiter = 3` best-seen 26.9989, cold 17.0007,
+//! gap 9.9982. Both tests pass on Linux aarch64 (`tools/linux-test.sh`, glibc 2.41) at the
+//! same commit. Linux stays the reference for the bands; if a future re-pick is needed,
+//! intersect the trapping draws on both platforms rather than taking a Linux-only one.
+//!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
 //! file pins what a fit publishes.
