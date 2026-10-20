@@ -595,6 +595,8 @@ the structural parameters, re-solving the levels at every point. This gives the
 structural block of the full `R⁻¹`. The level blocks come from the objective's
 Hessian in the levels and its mixed θ-level Hessian. `s` and `rsr` are refused for
 now (#2108).
+`run_covariance` on a profiled fit, in memory or reloaded from a `.fitrx` bundle,
+repeats this step bit for bit (#2173).
 
 **When it applies.** The solve is a least-squares step, so the block must enter
 every prediction as `c × block` plus terms that do not read it, with `c` taken from

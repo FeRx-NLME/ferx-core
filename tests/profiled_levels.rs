@@ -14,6 +14,7 @@
 //! the profile solve, the objective, the profiled `R` and the level SEs at once, against
 //! a reference that profiles nothing.
 
+use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::types::{FitOptions, FitResult, OmegaMatrix};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
@@ -370,8 +371,15 @@ const C1_BOUND: f64 = 1e-2;
 const C1_CORR_BOUND: f64 = 2.5e-2;
 
 /// `run_covariance` on a profiled fit replays the profiled step the fit ran: the same
-/// standard errors, levels included. The unprofiled step it would otherwise take is the
-/// 41-coordinate stencil the profile avoids (at 800 levels, routed to `s`).
+/// covariance matrix, levels included, **bit for bit** (#2173) — in memory and after a
+/// `.fitrx` round trip. The unprofiled step it would otherwise take is the 41-coordinate
+/// stencil the profile avoids (at 800 levels, routed to `s`).
+///
+/// Bit-equality holds because the inline step and the replay share one implementation
+/// (`ProfileCtx::covariance_at_estimate`): each re-profiles from the reported levels and
+/// EBEs before the stencil. Before #2173 the inline step used the optimizer's own solve and
+/// the replay a fresh one, and this fixture measured a worst SE gap of 7.6e-7 (3.9e-3 on
+/// the worst covariance entry), macOS arm64.
 #[test]
 fn run_covariance_replays_the_profiled_step() {
     let (p, f) = profiled_at_nonmem_optimum();
@@ -379,25 +387,38 @@ fn run_covariance_replays_the_profiled_step() {
         verbose: false,
         ..p.parsed.fit_options.clone()
     };
-    let r = ferx_core::run_covariance(&f, Some(&p.parsed.model), Some(&p.population), &opts)
-        .unwrap_or_else(|e| panic!("{e}"));
-    let (a, b) = (
-        f.se_theta.as_ref().unwrap(),
-        r.se_theta.as_ref().expect("replayed SE"),
-    );
-    let worst = (0..a.len())
-        .map(|k| ((a[k] - b[k]) / a[k]).abs())
-        .fold(0.0_f64, |m, v| {
-            assert!(v.is_finite());
-            m.max(v)
-        });
-    eprintln!("replay: worst SE gap {worst:.3e}");
-    assert!(worst < REPLAY_BOUND, "{worst}");
-}
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    assert!(want.iter().all(|v| v.is_finite()));
+    let replay = |fit: &FitResult, how: &str| {
+        let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
+            .unwrap_or_else(|e| panic!("{how}: {e}"));
+        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
+        assert_eq!(got.shape(), want.shape(), "{how}");
+        let differing = got
+            .iter()
+            .zip(want.iter())
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
+        assert_eq!(r.se_theta, f.se_theta, "{how}");
+    };
+    replay(f, "in memory");
 
-/// Worst realised 5.5e-6: the replay re-profiles from the fit's levels, already at the
-/// optimum, so only the re-solved EBEs differ; 18× headroom.
-const REPLAY_BOUND: f64 = 1e-4;
+    let model_text = std::fs::read_to_string(root().join(F2)).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("ferx_profiled_replay_{}.fitrx", std::process::id()));
+    save_fit(
+        f,
+        &p.population,
+        &model_text,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .expect("saves");
+    let loaded = load_fit(&path).expect("loads");
+    let _ = std::fs::remove_file(&path);
+    replay(&loaded.fit, "after .fitrx reload");
+}
 
 // ── A1: the existing level-SE anchor, profiled (#2130 review #8) ───────────────────
 
