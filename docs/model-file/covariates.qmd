@@ -68,7 +68,9 @@ off the data).
 - **Undeclared-but-used is a warning, not an error.** A covariate used in
   `[individual_parameters]` but missing from `[covariates]` is still usable —
   ferx reads it (leniently) and emits a warning recommending you declare it so
-  its type is recorded and it appears in the table. Declaring a covariate the
+  its type is recorded and it appears in the table. A column named only on a
+  `level … by COL in …` line is a grouping column, not a covariate, and is not
+  in this warning; one an expression also reads is. Declaring a covariate the
   model does *not* use is also fine — that is the point.
 - **Validation against the data.** A *declared* column that is absent from the
   dataset is an error (`E_MISSING_COVARIATE`).

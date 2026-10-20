@@ -5351,6 +5351,7 @@ pub fn parse_full_model_with(
     }
     // #1082: explicit `level` declarations. They replace `iov_column` / `iov_occasion`
     // rather than combine with them, so a model states its occasion grouping once.
+    let mut nested_level_columns: Vec<String> = Vec::new();
     if !declared_levels.is_empty() {
         if fit_options.iov_column.is_some() || fit_options.iov_occasion != IovOccasionRule::Column {
             return Err(format!(
@@ -5371,9 +5372,9 @@ pub fn parse_full_model_with(
             fit_options.iov_column = Some(declared_levels[0].column.clone());
         } else {
             // The level labels are read like covariates and turned into groups when
-            // the population is prepared for the fit.
-            let columns: Vec<String> = declared_levels.iter().map(|l| l.column.clone()).collect();
-            register_referenced_covariates(&mut model.referenced_covariates, columns);
+            // the population is prepared for the fit. Registered after the
+            // undeclared-covariate warning (#2166), like a `correlation … by` column.
+            nested_level_columns = declared_levels.iter().map(|l| l.column.clone()).collect();
         }
     }
     // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
@@ -6202,7 +6203,10 @@ pub fn parse_full_model_with(
 
     // ── [derived] block ──
     if let Some(derived_lines) = blocks.get("derived") {
-        let cov_names = model.referenced_covariates.clone();
+        // The nested-level columns are data columns a [derived] expression may read,
+        // though they are registered only after the undeclared-covariate warning.
+        let mut cov_names = model.referenced_covariates.clone();
+        register_referenced_covariates(&mut cov_names, nested_level_columns.iter().cloned());
         let mut derived_warnings = Vec::new();
         // For ODE models, ode_state_names drives uses_compartments detection.
         // For analytical models, use analytical_compartment_names() so that
@@ -6729,6 +6733,13 @@ pub fn parse_full_model_with(
             ));
         }
     }
+
+    // A nested `level … by COL in …` line's columns are required data columns too
+    // (#1082), registered here for the same reason as the `by` columns below: the
+    // warning above is about columns model expressions read, and a `[covariates]`
+    // type means nothing to a grouping column (#2166). A level column an expression
+    // also reads was registered by that expression and is still reported.
+    register_referenced_covariates(&mut model.referenced_covariates, nested_level_columns);
 
     // A `correlation … by COL` line's columns are required data columns (#1081),
     // read per row: the reader has to take them and the pruning has to keep them.
