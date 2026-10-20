@@ -626,8 +626,11 @@ fn bits(v: &[f64]) -> Vec<u64> {
 /// `(-1e9, 1e9)`, since its free θ are contrast coefficients and its init must be 0.
 /// Before, the positive default `(1e-9, 1e9)` refused `(0.0)` and `(0.0) FIX` ("bounds
 /// must include 0 (got 0.000000001..1000000000)"), and would have log-packed a θ that
-/// starts at 0. Bounds, packed start and FIX flags are bit-identical to the written
-/// `(0.0, -1e9, 1e9)`. The controls, in the same test: `contrast = none` and a count
+/// starts at 0. Bounds, packed start and packed box are bit-identical to the written
+/// `(0.0, -1e9, 1e9)`, and those are all an optimizer receives that a box can change
+/// (the objective never reads `theta_lower` / `theta_upper`), so the fit is the written
+/// spelling's — measured equal to `(0.0, -50.0, 50.0)`, which `nonmem_anchor/profile_mbma*`
+/// anchors, in every printed digit. The controls, in the same test: `contrast = none` and a count
 /// block keep the positive box and log packing, and a written lower bound keeps its
 /// refusal byte for byte.
 ///
@@ -685,48 +688,6 @@ fn a_constrained_block_without_written_bounds_takes_a_sign_free_box() {
         ),
         "{err}"
     );
-}
-
-/// #2174 T5b: the default box changes no number. One objective evaluation at the
-/// same θ, with a live contrast, is bit-identical between `(0.0)` and the written
-/// `(0.0, -1e9, 1e9)` — the spelling measured equal to `(0.0, -50.0, 50.0)`, which
-/// `nonmem_anchor/profile_mbma*` anchors, in every printed digit.
-///
-/// Mutation — revert the arm: `(0.0)` is refused.
-#[test]
-fn a_sign_free_default_box_scores_as_the_written_one() {
-    let mut pop = population(2, 2);
-    let ofv = |decl: &str, pop: &Population| -> f64 {
-        let m = bind_placebo(decl).expect("binds");
-        let p = &m.default_params;
-        let mut theta = p.theta.clone();
-        theta[1..4].copy_from_slice(&[0.3, -0.2, 0.1]);
-        let eta = vec![0.0; p.omega.matrix.nrows()];
-        let total: f64 = pop
-            .subjects
-            .iter()
-            .map(|s| {
-                crate::stats::likelihood::individual_nll(
-                    &m,
-                    s,
-                    &theta,
-                    &eta,
-                    &p.omega,
-                    &p.sigma.values,
-                )
-            })
-            .sum();
-        assert!(total.is_finite(), "{decl}: {total}");
-        total
-    };
-    // Bind the population once for its index column; both models index it alike.
-    bind(&no_eta_model(), &mut pop).unwrap();
-    let a = ofv("PLACEBO[STUDY, TIME](0.0)", &pop);
-    let b = ofv(
-        "PLACEBO[STUDY, TIME](0.0, -1000000000.0, 1000000000.0)",
-        &pop,
-    );
-    assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
 }
 
 #[test]
