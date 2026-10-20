@@ -128,8 +128,9 @@ fn rescaling_an_identity_packed_theta_leaves_every_standard_error_where_it_was()
         let reference = natural_ses(&fit_scaled(1.0, method), 1.0);
         // Large units: before #2145, `s` failed and `r` / `rsr` understated SE(TVV) by 4.5×
         // (r, k = 1e5) up to 2000× (rsr, k = 1e6). Measured worst relative difference over
-        // all seven SEs, macOS arm64: 4.3e-7 (`s`, k = 1e6), 6.5e-8 (`rsr`, k = 1e6), 3.0e-10
-        // (`r`, k = 1e6), and 1e-10 or less at k = 1e5. The bound is 23× the worst.
+        // all seven SEs, Linux x86_64 (glibc 2.28): 1.2e-9 (`rsr`), 6.0e-10 (`r`), 3.4e-10
+        // (`s`), all at k = 1e6. macOS arm64 is looser, 4.3e-7 (`s`, k = 1e6), and the bound
+        // is 23× that.
         for k in [1e5, 1e6] {
             let label = format!("{method:?}, k = {k:e}");
             let got = natural_ses(&fit_scaled(k, method), k);
@@ -150,9 +151,10 @@ fn rescaling_an_identity_packed_theta_leaves_every_standard_error_where_it_was()
     // - `s` is left out, and `rsr` gets a wider bound: the per-subject score takes an
     //   absolute FD step on an identity-packed θ, which this small a θ does not tolerate
     //   (#2147).
-    // Measured worst relative difference over the six SEs, macOS arm64: 2.4e-4 under `r`
-    // (TVCL) and 5.1e-3 under `rsr` (TVCL, through `S`). Each bound is about 4× its worst and
-    // two orders of magnitude below the error before the fix.
+    // Measured worst relative difference over the six SEs, Linux x86_64 (glibc 2.28): 2.38e-4
+    // under `r` (TVCL) and 5.06e-3 under `rsr` (TVCL, through `S`); macOS arm64 agrees to two
+    // figures. Each bound is about 4× its worst and two orders of magnitude below the error
+    // before the fix.
     let others = [0usize, 2, 3, 4, 5, 6];
     for (method, tol) in [
         (CovarianceMethod::Hessian, 1e-3),
@@ -210,8 +212,8 @@ fn an_identity_packed_v_in_large_units_reproduces_nonmem_matrix_r_ses() {
     let th = r.se_theta.as_ref().expect("theta SEs");
     let omega_se = |i: usize| omega_se_at(&r.se_omega, 3, i, i).expect("omega diag SE");
     // NONMEM 7.5.1 FOCEI `$COV MATRIX=R`, `.ext` row ITERATION = -1000000001, as in #432.
-    // Measured worst relative difference 1.8e-5 (TVKA; the others 9e-7 to 6.3e-6), macOS
-    // arm64; the bound is 5.5× that. Before #2145 the floor clipped this R: SE(TVV) came out
+    // Measured worst relative difference 1.8e-5 (TVKA; the others 3.5e-7 to 6.3e-6), Linux
+    // x86_64 (glibc 2.28), and the same worst on macOS arm64; the bound is 5.5× that. Before #2145 the floor clipped this R: SE(TVV) came out
     // 0.0308, 7.8× too small, and SE(TVCL) 0.65 % low. NONMEM's own values are printed to six
     // significant figures, so the bound cannot usefully go much below 1e-5.
     let checks: [(&str, f64, f64); 7] = [
