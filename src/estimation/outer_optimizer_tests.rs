@@ -270,7 +270,7 @@ fn test_invert_psd_with_floor_pd_matrix_unchanged() {
     // 3×3 SPD: build as Lᵀ·L with L lower-triangular so eigenvalues are O(1).
     let l = DMatrix::from_row_slice(3, 3, &[2.0, 0.0, 0.0, 0.5, 1.5, 0.0, 0.3, 0.2, 1.2]);
     let h = l.transpose() * &l;
-    let r = invert_psd_with_floor(&h).expect("PD input inverts");
+    let r = invert_psd_with_floor(&h, &[]).expect("PD input inverts");
     assert_eq!(r.n_clipped, 0, "PD input should not trigger clipping");
     assert!(r.min_eigenvalue > 0.0);
 
@@ -310,13 +310,13 @@ fn assert_mat_close(a: &DMatrix<f64>, b: &DMatrix<f64>, tol: f64, ctx: &str) {
 fn test_combine_covariance_collapses_when_s_equals_r() {
     let l = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.5, 1.3]);
     let r = l.transpose() * &l; // SPD
-    let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+    let r_inv = invert_psd_with_floor(&r, &[]).expect("R PD").inverse;
     for m in [
         CovarianceMethod::Hessian,
         CovarianceMethod::CrossProduct,
         CovarianceMethod::Sandwich,
     ] {
-        let cov = combine_covariance(m, r_inv.clone(), &r)
+        let cov = combine_covariance(m, r_inv.clone(), &r, &[])
             .unwrap_or_else(|| panic!("{m:?} should produce a covariance"));
         assert_mat_close(&cov, &r_inv, 1e-9, &format!("{m:?} with S=R"));
     }
@@ -327,10 +327,10 @@ fn test_combine_covariance_collapses_when_s_equals_r() {
 fn test_combine_covariance_sandwich_matches_explicit_product() {
     let l = DMatrix::from_row_slice(2, 2, &[1.7, 0.0, 0.3, 1.1]);
     let r = l.transpose() * &l;
-    let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+    let r_inv = invert_psd_with_floor(&r, &[]).expect("R PD").inverse;
     let s = DMatrix::from_row_slice(2, 2, &[3.0, 0.4, 0.4, 2.0]);
     let sandwich =
-        combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s).expect("sandwich");
+        combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &[]).expect("sandwich");
     let expected = &r_inv * &s * &r_inv;
     assert_mat_close(&sandwich, &expected, 1e-12, "sandwich = R⁻¹SR⁻¹");
     // Sandwich must stay symmetric (S and R⁻¹ are symmetric).
@@ -349,15 +349,15 @@ fn test_combine_covariance_sandwich_matches_explicit_product() {
 fn test_combine_covariance_singular_s() {
     let l = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.2, 1.0]);
     let r = l.transpose() * &l;
-    let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+    let r_inv = invert_psd_with_floor(&r, &[]).expect("R PD").inverse;
     let g = DVector::from_column_slice(&[1.0, 2.0]);
     let s_rank1 = &g * g.transpose(); // rank-1, singular 2×2
     assert!(
-        combine_covariance(CovarianceMethod::CrossProduct, r_inv.clone(), &s_rank1).is_none(),
+        combine_covariance(CovarianceMethod::CrossProduct, r_inv.clone(), &s_rank1, &[]).is_none(),
         "S⁻¹ must report singular S"
     );
     assert!(
-        combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1).is_some(),
+        combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1, &[]).is_some(),
         "sandwich must tolerate rank-deficient S"
     );
 }
@@ -381,7 +381,7 @@ fn test_invert_psd_with_floor_clips_negative_eigenvalue() {
     let lambdas = DMatrix::from_diagonal(&DVector::from_column_slice(&[1.0, 0.5, -1e-9]));
     let h = &q * lambdas * q.transpose();
 
-    let r = invert_psd_with_floor(&h).expect("near-PD input must regularise");
+    let r = invert_psd_with_floor(&h, &[]).expect("near-PD input must regularise");
     assert_eq!(r.n_clipped, 1, "exactly one eigenvalue should clip");
     assert!(
         r.min_eigenvalue < 0.0 && r.min_eigenvalue.abs() < 1e-6,
@@ -416,7 +416,7 @@ fn test_invert_psd_with_floor_clips_negative_eigenvalue() {
 #[test]
 fn test_invert_psd_with_floor_rejects_negative_definite() {
     let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
-    assert!(invert_psd_with_floor(&h).is_none());
+    assert!(invert_psd_with_floor(&h, &[]).is_none());
     // The eigenvalues are finite, so the fallback path is taken (not Unusable):
     // extract_eigenvalues succeeds and the proposal is all-finite and PD.
     let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
@@ -639,7 +639,7 @@ fn test_regularization_severity_minor() {
     let h = DMatrix::from_diagonal(&nalgebra::DVector::from_row_slice(&[
         1.0, 1.0, 1e-20, // this one will be clipped
     ]));
-    let r = invert_psd_with_floor(&h).expect("should succeed");
+    let r = invert_psd_with_floor(&h, &[]).expect("should succeed");
     assert_eq!(r.n_clipped, 1, "exactly one eigenvalue should be clipped");
     // pct = 1*100/3 = 33 → "minor" threshold
     let pct = r.n_clipped * 100 / 3;
@@ -817,7 +817,8 @@ fn test_assemble_score_cross_product_cancelled() {
 /// case). Returns a 0×0 inverse without clipping.
 #[test]
 fn test_invert_psd_with_floor_empty() {
-    let r = invert_psd_with_floor(&DMatrix::<f64>::zeros(0, 0)).expect("0×0 input must succeed");
+    let r =
+        invert_psd_with_floor(&DMatrix::<f64>::zeros(0, 0), &[]).expect("0×0 input must succeed");
     assert_eq!(r.inverse.nrows(), 0);
     assert_eq!(r.n_clipped, 0);
 }
@@ -2664,7 +2665,7 @@ fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
         }
     }
     let h_sym = (&h + h.transpose()) * 0.5;
-    let ref_cov = invert_psd_with_floor(&h_sym)
+    let ref_cov = invert_psd_with_floor(&h_sym, &[])
         .expect("reference Hessian inverts")
         .inverse
         * 2.0;

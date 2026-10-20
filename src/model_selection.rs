@@ -428,7 +428,8 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
     // condition number behind for the thresholds to find: measured on warfarin's one-
     // peripheral candidate, correlation-matrix condition number 2.98 and max |r| 0.35 next to
     // a TVQ RSE of 293519%. The floor fires only on an indefinite Hessian or one with
-    // `λ_min < max(1e-10·λ_max, 1e-12)` (`invert_psd_with_floor`) — the analogue of NONMEM's "R matrix algorithmically singular" —
+    // `λ_min < max(1e-10·λ_max, 1e-12)` (`invert_psd_with_floor`, once an identity-packed θ's
+    // units are equilibrated out, #2145) — the analogue of NONMEM's "R matrix algorithmically singular" —
     // so it fails here whenever either matrix-reading gate is enabled, rather than passing on
     // numbers the floor manufactured.
     //

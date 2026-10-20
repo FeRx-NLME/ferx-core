@@ -450,23 +450,27 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
 /// unidentified directions, so the cross-product estimator requires a full-rank
 /// `S`. `Sandwich` never inverts `S`, so it stays defined even when `S` is
 /// rank-deficient.
+///
+/// `equilibrate` is [`invert_psd_with_floor`]'s mask for the `S` inverse, read only by
+/// `CrossProduct`.
 pub(crate) fn combine_covariance(
     method: CovarianceMethod,
     r_inv: DMatrix<f64>,
     s: &DMatrix<f64>,
+    equilibrate: &[bool],
 ) -> Option<DMatrix<f64>> {
     match method {
         CovarianceMethod::Hessian => Some(r_inv),
         CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
-        CovarianceMethod::CrossProduct => invert_cross_product(s),
+        CovarianceMethod::CrossProduct => invert_cross_product(s, equilibrate),
     }
 }
 
 /// `S⁻¹`, accepted only when `S` is full-rank (no eigenvalue clipped); a rank-deficient or
 /// indefinite `S` yields `None`. The whole of the `CrossProduct` estimator — it reads no `R` —
 /// which is why `covariance_method = s` can call it without building one (#1803).
-fn invert_cross_product(s: &DMatrix<f64>) -> Option<DMatrix<f64>> {
-    match invert_psd_with_floor(s) {
+fn invert_cross_product(s: &DMatrix<f64>, equilibrate: &[bool]) -> Option<DMatrix<f64>> {
+    match invert_psd_with_floor(s, equilibrate) {
         Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
         _ => None,
     }
@@ -533,9 +537,13 @@ pub(crate) fn combine_covariance_and_reference(
     r_inv: DMatrix<f64>,
     r_inv_ref: Option<DMatrix<f64>>,
     s: &DMatrix<f64>,
+    equilibrate: &[bool],
 ) -> Option<(DMatrix<f64>, Option<DMatrix<f64>>)> {
-    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s));
-    Some((combine_covariance(method, r_inv, s)?, reference))
+    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s, equilibrate));
+    Some((
+        combine_covariance(method, r_inv, s, equilibrate)?,
+        reference,
+    ))
 }
 
 /// Assemble the per-subject score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free
@@ -1694,6 +1702,9 @@ pub(crate) fn compute_covariance_for(
     // covariance step (#243). Since #1018 the optimizer holds them through the
     // same mask, so there is one gate, not a second structural filter here.
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
+    // The coordinates whose units the eigenvalue floor must not see (#2145), for both the `S`
+    // and the `R` inverse.
+    let equilibrate = identity_theta_mask(template, &free_idx);
     let n_free = free_idx.len();
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
@@ -1733,7 +1744,7 @@ pub(crate) fn compute_covariance_for(
             Ok(s) => s,
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        let Some(cov_free) = invert_cross_product(&s_free) else {
+        let Some(cov_free) = invert_cross_product(&s_free, &equilibrate) else {
             return CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string());
         };
         if options.verbose {
@@ -1997,7 +2008,7 @@ pub(crate) fn compute_covariance_for(
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
 
-    let inv = match invert_psd_with_floor(&hess_free_sym) {
+    let inv = match invert_psd_with_floor(&hess_free_sym, &equilibrate) {
         Some(inv) => inv,
         None => {
             // `invert_psd_with_floor` returns None in two distinct cases, and we
@@ -2112,7 +2123,7 @@ pub(crate) fn compute_covariance_for(
             }
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free) {
+        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free, &equilibrate) {
             Some(pair) => pair,
             None => {
                 debug_assert!(
@@ -2282,12 +2293,15 @@ fn offdiag_nan_warning(
 }
 
 /// Result of [`invert_psd_with_floor`].
+///
+/// The three spectrum fields describe the matrix the floor ran on: the input,
+/// or its equilibrated `D⁻¹ M D⁻¹` when a coordinate was marked (#2145).
 pub(crate) struct RegularizedInverse {
     pub inverse: DMatrix<f64>,
-    /// Smallest eigenvalue of the input matrix (before clipping). `f64::INFINITY`
+    /// Smallest eigenvalue of the floored matrix (before clipping). `f64::INFINITY`
     /// for 0×0 matrices.
     pub min_eigenvalue: f64,
-    /// Largest eigenvalue of the input matrix. `f64::NEG_INFINITY` for 0×0 matrices.
+    /// Largest eigenvalue of the floored matrix. `f64::NEG_INFINITY` for 0×0 matrices.
     /// Paired with `min_eigenvalue` this gives the scale-free `|min λ| / λ_max` the
     /// regularization severity is graded on (#520).
     pub max_eigenvalue: f64,
@@ -2424,19 +2438,47 @@ pub(crate) fn worst_variance_inflation(var: &[f64], var_ref: &[f64]) -> f64 {
 /// floor leaves PD inputs untouched (`n_clipped == 0`, exact inverse) and
 /// recovers a PD inverse on near-singular or marginally-indefinite inputs.
 ///
-/// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` keeps the
-/// regularisation scale-equivariant; the absolute floor handles the edge case
-/// where the whole spectrum is tiny.
+/// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` makes the
+/// floor invariant to a common rescaling of the whole matrix; the absolute floor
+/// handles the edge case where the whole spectrum is tiny.
+///
+/// It is **not** invariant to rescaling one coordinate, and one kind of
+/// coordinate carries units: an identity-packed θ (`theta_packs_log` false — a
+/// θ whose lower bound is negative), whose row of `R` or `S` scales as `1/k²`
+/// when the θ is written `k` times larger. Every other packed coordinate (log-θ,
+/// Cholesky-Ω, log-σ) is already dimensionless. So `equilibrate[i] == true`
+/// marks the coordinates to rescale before the floor is applied (#2145): each
+/// such row and column is divided by `dᵢ = sqrt(|Mᵢᵢ| / g)`, where `g` is the
+/// geometric mean of `|Mⱼⱼ|` over the unmarked coordinates (`1` when there are
+/// none), the eigendecomposition and the floor run on `C = D⁻¹ M D⁻¹`, and the
+/// result is returned as `D⁻¹ C⁻¹ D⁻¹`. A marked coordinate is moved to the
+/// typical magnitude of the others, so its units can no longer decide what the
+/// floor clips, while every dimensionless coordinate keeps the floor it had —
+/// a tiny diagonal there is a flat direction, and equilibrating it away would
+/// silence the alarm. A marked coordinate whose diagonal is zero or non-finite
+/// keeps `dᵢ = 1`, so a θ with no information is still clipped. An empty
+/// `equilibrate` marks nothing.
+///
+/// With a marked coordinate, `min_eigenvalue`, `max_eigenvalue` and `floor`
+/// describe `C`, not `M`. By Sylvester's law of inertia `C` has as many
+/// positive eigenvalues as `M`, so the `None` decision below does not move.
 ///
 /// Returns `None` only when the eigendecomposition fails or every eigenvalue
 /// is non-finite or non-positive — i.e. the Hessian carries no usable
 /// curvature information at all, in which case regularisation cannot help.
-pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInverse> {
+pub(crate) fn invert_psd_with_floor(
+    sym: &DMatrix<f64>,
+    equilibrate: &[bool],
+) -> Option<RegularizedInverse> {
     let n = sym.nrows();
     debug_assert_eq!(
         n,
         sym.ncols(),
         "invert_psd_with_floor requires square input"
+    );
+    debug_assert!(
+        equilibrate.is_empty() || equilibrate.len() == n,
+        "invert_psd_with_floor: one equilibrate flag per coordinate, or none"
     );
     if n == 0 {
         return Some(RegularizedInverse {
@@ -2451,8 +2493,19 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 
     // Symmetric eigendecomposition: H = Q Λ Qᵀ ⇒ H⁻¹ = Q Λ⁻¹ Qᵀ. Inverting via
     // the eigendecomposition lets us clip non-positive Λ entries before
-    // forming Λ⁻¹, which is what `try_inverse` cannot do.
-    let eig = SymmetricEigen::new(sym.clone());
+    // forming Λ⁻¹, which is what `try_inverse` cannot do. It runs on the
+    // equilibrated `C = D⁻¹ M D⁻¹` (#2145), which is `M` itself when nothing is
+    // marked.
+    let d = equilibration_scales(sym, equilibrate);
+    let rescale = |mut m: DMatrix<f64>| {
+        for i in 0..n {
+            for j in 0..n {
+                m[(i, j)] /= d[i] * d[j];
+            }
+        }
+        m
+    };
+    let eig = SymmetricEigen::new(rescale(sym.clone()));
     let q = &eig.eigenvectors;
     let lambdas = &eig.eigenvalues;
 
@@ -2534,14 +2587,63 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
         (&m + &m_t) * 0.5
     };
 
+    // M⁻¹ = D⁻¹ C⁻¹ D⁻¹: the same element-wise division by `dᵢ dⱼ` that formed `C`.
     Some(RegularizedInverse {
-        inverse,
+        inverse: rescale(inverse),
         min_eigenvalue: min_eig,
         max_eigenvalue: max_eig,
         floor,
         n_clipped,
-        unclipped_inverse,
+        unclipped_inverse: rescale(unclipped_inverse),
     })
+}
+
+/// The diagonal scale `D` of [`invert_psd_with_floor`]'s equilibration (#2145):
+/// `sqrt(|Mᵢᵢ| / g)` on each marked coordinate, `1` everywhere else, with `g`
+/// the geometric mean of `|Mⱼⱼ|` over the unmarked coordinates whose diagonal is
+/// finite and non-zero (`1` when there are none). A marked coordinate whose
+/// scale would be zero or non-finite keeps `1`.
+fn equilibration_scales(sym: &DMatrix<f64>, equilibrate: &[bool]) -> Vec<f64> {
+    let n = sym.nrows();
+    let marked = |i: usize| equilibrate.get(i).copied().unwrap_or(false);
+    let usable = |a: f64| a > 0.0 && a.is_finite();
+    let (mut log_sum, mut count) = (0.0, 0usize);
+    for i in (0..n).filter(|&i| !marked(i)) {
+        let a = sym[(i, i)].abs();
+        if usable(a) {
+            log_sum += a.ln();
+            count += 1;
+        }
+    }
+    let g = if count > 0 {
+        (log_sum / count as f64).exp()
+    } else {
+        1.0
+    };
+    (0..n)
+        .map(|i| {
+            let s = (sym[(i, i)].abs() / g).sqrt();
+            if marked(i) && usable(s) {
+                s
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// Which free coordinates [`invert_psd_with_floor`] equilibrates (#2145): the
+/// identity-packed θ's, the only packed coordinates that carry the θ's units.
+/// `free_idx` indexes the packed vector, whose leading `template.theta.len()`
+/// entries are the θ's.
+fn identity_theta_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
+    free_idx
+        .iter()
+        .map(|&i| {
+            i < template.theta.len()
+                && !crate::estimation::parameterization::theta_packs_log(template.theta_lower[i])
+        })
+        .collect()
 }
 
 /// Owned result of the gated covariance step, consumed by every estimator
@@ -2976,7 +3078,7 @@ mod tests {
         // manufactured no variance and the reference equals the inverse — an inflation of
         // exactly 1.0, the value that grades `Minor` however many free parameters there are.
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 1.0]));
-        let inv = super::invert_psd_with_floor(&m).expect("PD input inverts");
+        let inv = super::invert_psd_with_floor(&m, &[]).expect("PD input inverts");
         assert_eq!(inv.n_clipped, 0);
         assert!(
             (inv.max_eigenvalue - 4.0).abs() < 1e-12,
@@ -3011,7 +3113,7 @@ mod tests {
         let a = 0.5 * (100.0 + -1e-3);
         let b = 0.5 * (100.0 - -1e-3);
         let m = DMatrix::from_row_slice(2, 2, &[a, b, b, a]);
-        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&m, &[]).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         assert!(
             (inv.max_eigenvalue - 100.0).abs() < 1e-9,
@@ -3053,11 +3155,195 @@ mod tests {
         // for it at all. The ratio is `+∞`, which `format_regularized_warning` words rather
         // than printing as `inf`.
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
-        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&m, &[]).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         let got =
             super::worst_variance_inflation(&diag(&inv.inverse), &diag(&inv.unclipped_inverse));
         assert!(got.is_infinite(), "{got}");
+    }
+
+    // ── #2145: the floor does not see an identity-packed θ's units ───────────
+
+    /// A well-conditioned, fully coupled 3×3 information matrix: eigenvalues of order 1, every
+    /// off-diagonal non-zero, so a rescaled coordinate cannot be inverted on its own.
+    fn coupled_information() -> DMatrix<f64> {
+        DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.0])
+    }
+
+    /// `M` with coordinate 0 written `k` times larger: its row and column scale as `1/k`.
+    fn rescale_coordinate_0(m: &DMatrix<f64>, k: f64) -> DMatrix<f64> {
+        let mut out = m.clone();
+        for j in 0..m.ncols() {
+            out[(0, j)] /= k;
+            out[(j, 0)] /= k;
+        }
+        out
+    }
+
+    #[test]
+    fn an_identity_theta_in_large_or_small_units_is_not_clipped_and_inverts_exactly() {
+        // The issue's defect at the smallest scale that shows it. Writing coordinate 0 as
+        // `k·θ` moves its information by `1/k²`; at `k = 1e6` its eigenvalue falls below
+        // `1e-10·λ_max`, and at `k = 1e-6` it pushes `λ_max` up until the other two fall below.
+        // Either way today's floor clips a positive-definite matrix. Equilibrating the marked
+        // coordinate gives back the exact inverse, `K M⁻¹ K` with `K = diag(k, 1, 1)`.
+        let m = coupled_information();
+        let m_inv = m.clone().try_inverse().expect("PD");
+        for k in [1e6, 1e-6] {
+            let mk = rescale_coordinate_0(&m, k);
+            // The straddle: unmarked, the same matrix IS clipped, so the fixture reaches the
+            // floor. This half also fails an implementation that equilibrates every
+            // coordinate regardless of the mask.
+            let unmarked = super::invert_psd_with_floor(&mk, &[]).expect("has curvature");
+            assert!(
+                unmarked.n_clipped > 0,
+                "k = {k}: the fixture must reach the floor"
+            );
+            // Marking a coordinate other than the rescaled one does not help: the mask is
+            // per coordinate, not a switch.
+            let wrong = super::invert_psd_with_floor(&mk, &[false, true, false]).expect("curv");
+            assert!(
+                wrong.n_clipped > 0,
+                "k = {k}: marking coordinate 1 must not help"
+            );
+
+            let inv = super::invert_psd_with_floor(&mk, &[true, false, false]).expect("PD");
+            assert_eq!(
+                inv.n_clipped, 0,
+                "k = {k}: the marked coordinate is clipped"
+            );
+            let kv = [k, 1.0, 1.0];
+            let mut worst: f64 = 0.0;
+            for i in 0..3 {
+                for j in 0..3 {
+                    let want = kv[i] * kv[j] * m_inv[(i, j)];
+                    let got = inv.inverse[(i, j)];
+                    assert!(got.is_finite(), "k = {k}: inverse[{i},{j}] = {got}");
+                    let rel = ((got - want) / want).abs();
+                    if rel > worst {
+                        worst = rel;
+                    }
+                }
+            }
+            // Measured worst relative error 1.06e-15 (k = 1e6) and 1.45e-15 (k = 1e-6) on
+            // macOS arm64; the bound gives about 70× headroom and is still far below the
+            // order-one error of a clipped direction.
+            assert!(worst < 1e-13, "k = {k}: worst relative error {worst:e}");
+            assert_eq!(inv.unclipped_inverse, inv.inverse, "k = {k}");
+        }
+    }
+
+    #[test]
+    fn the_cross_product_estimator_forwards_the_mask_to_the_s_inverse() {
+        // `S⁻¹` rejects any clipped `S`, so in large units it failed outright (#2145). Both
+        // `combine_covariance` and `combine_covariance_and_reference` — the route the
+        // SAEM/IMP `r` → `s` fallback takes — must hand the mask on.
+        let s = rescale_coordinate_0(&coupled_information(), 1e6);
+        let r_inv = DMatrix::<f64>::identity(3, 3);
+        let mask = [true, false, false];
+        let est = CovarianceMethod::CrossProduct;
+        assert!(super::combine_covariance(est, r_inv.clone(), &s, &[]).is_none());
+        assert!(super::combine_covariance(est, r_inv.clone(), &s, &mask).is_some());
+        let (cov, reference) =
+            super::combine_covariance_and_reference(est, r_inv.clone(), None, &s, &mask)
+                .expect("S⁻¹ exists once the units are equilibrated");
+        assert!(reference.is_none());
+        let want = super::invert_psd_with_floor(&s, &mask).expect("PD").inverse;
+        assert_eq!(cov, want);
+        assert!(super::combine_covariance_and_reference(est, r_inv, None, &s, &[]).is_none());
+    }
+
+    #[test]
+    fn a_marked_coordinate_collinear_with_another_is_still_clipped() {
+        // Equilibration fixes the units, not the information: a marked coordinate whose
+        // correlation with another is 1 − 1e-14 is a flat direction in any units, and the
+        // floor must still clip it. Fails an equilibration that bypasses the floor.
+        let (rho, k) = (1.0 - 1e-14, 1e3);
+        let m = rescale_coordinate_0(&DMatrix::from_row_slice(2, 2, &[1.0, rho, rho, 1.0]), k);
+        let inv = super::invert_psd_with_floor(&m, &[true, false]).expect("has curvature");
+        assert_eq!(inv.n_clipped, 1);
+        // The diagnostic's reference is unscaled too. Here `D = diag(1/k, 1)` (g = 1, the
+        // unmarked diagonal), so `C` is the unit-diagonal matrix and its pseudo-inverse over
+        // the kept direction (1, 1)/√2 is `[[1, 1], [1, 1]] / (2(1 + ρ))`; `D⁻¹ C⁺ D⁻¹` puts
+        // `k²` and `k` on the marked row. Measured exact (relative error 0) on macOS arm64;
+        // the bound leaves room for a different eigensolver rounding, and is still far below
+        // the factor of `k` or `k²` an unscaled reference would be off by.
+        let c_plus = 1.0 / (2.0 * (1.0 + rho));
+        for (i, j, want) in [(0, 0, k * k * c_plus), (0, 1, k * c_plus), (1, 1, c_plus)] {
+            let got = inv.unclipped_inverse[(i, j)];
+            assert!(
+                ((got - want) / want).abs() < 1e-9,
+                "unclipped_inverse[{i},{j}] = {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_coordinate_with_no_information_keeps_unit_scale_and_is_clipped() {
+        // A zero diagonal would give `d = 0` and turn `C` into NaN, which the eigenvalue
+        // check reports as "no usable curvature" — the wrong failure for a matrix with a
+        // perfectly good second coordinate. The scale stays 1 and the floor clips it.
+        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![2.0, 0.0]));
+        let inv = super::invert_psd_with_floor(&m, &[false, true]).expect("has curvature");
+        assert_eq!(inv.n_clipped, 1);
+        assert_eq!(inv.floor, 1e-10 * 2.0);
+        assert_eq!(inv.inverse[(1, 1)], 1.0 / inv.floor);
+    }
+
+    #[test]
+    fn equilibration_scales_move_a_marked_diagonal_to_the_geometric_mean_of_the_others() {
+        // Hand-computed: the unmarked diagonals are 4 and 9, so g = 6, and the marked 1.5e9
+        // gets d = sqrt(1.5e9 / 6) = 15811.38…, putting its equilibrated diagonal at g.
+        // `|Mᵢᵢ|`, not `Mᵢᵢ`: the negative unmarked entry counts by magnitude. The zero
+        // unmarked entry (a coordinate with no information) is left out of the mean rather
+        // than dragging it to 0.
+        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, -9.0, 0.0, 1.5e9]));
+        let d = super::equilibration_scales(&m, &[false, false, false, true]);
+        assert_eq!(&d[..3], &[1.0; 3]);
+        let want = (1.5e9f64 / 6.0).sqrt();
+        assert!((d[3] - want).abs() / want < 1e-15, "{} vs {want}", d[3]);
+        // No unmarked coordinate: g = 1, so the marked diagonal is moved to 1.
+        let one = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![25.0]));
+        assert_eq!(super::equilibration_scales(&one, &[true]), vec![5.0]);
+        // An empty mask marks nothing.
+        assert_eq!(super::equilibration_scales(&m, &[]), vec![1.0; 4]);
+    }
+
+    #[test]
+    fn identity_theta_mask_marks_exactly_the_free_identity_packed_thetas() {
+        // θ lower bounds -1 (identity), 0.1 (log), -5 (identity, FIXED, so not in free_idx),
+        // then Ω and σ coordinates, which are never marked. A θ on a lower bound of exactly 0
+        // log-packs (`theta_packs_log` is `lo >= 0`).
+        let omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(1, 1, &[0.09]),
+            vec!["E1".into()],
+            false,
+        );
+        let template = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![1.0, 5.0, 2.0, 3.0],
+            theta_names: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            theta_lower: vec![-1.0, 0.1, -5.0, 0.0],
+            theta_upper: vec![10.0, 50.0, 10.0, 10.0],
+            theta_fixed: vec![false, false, true, false],
+            omega,
+            omega_fixed: vec![false],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        };
+        // Packed: θ(4) | Ω(1) | σ(1); θ index 2 is FIX.
+        let free_idx = [0usize, 1, 3, 4, 5];
+        assert_eq!(
+            super::identity_theta_mask(&template, &free_idx),
+            vec![true, false, false, false, false]
+        );
     }
 
     #[test]
@@ -3109,7 +3395,7 @@ mod tests {
         // `R` is axis-aligned with a floored second direction, so `R⁻¹ = diag(1/100, 1/floor)`
         // and the floored direction is coordinate 1.
         let r = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
-        let inv = super::invert_psd_with_floor(&r).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&r, &[]).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         let r_inv = inv.inverse.clone() * 2.0;
         let r_inv_ref = inv.unclipped_inverse.clone() * 2.0;
@@ -3124,6 +3410,7 @@ mod tests {
                 r_inv.clone(),
                 Some(r_inv_ref.clone()),
                 s,
+                &[],
             )
             .expect("sandwich never inverts S");
             let cov_ref = cov_ref.expect("a reference was supplied");
@@ -3174,6 +3461,7 @@ mod tests {
             r_inv.clone(),
             Some(r_inv_ref.clone()),
             &s_asym,
+            &[],
         )
         .expect("sandwich never inverts S");
         let reference = reference.expect("a reference was supplied");
@@ -3196,6 +3484,7 @@ mod tests {
             r_inv.clone(),
             None,
             &s_loaded,
+            &[],
         )
         .expect("sandwich never inverts S");
         assert!(none_ref.is_none());
@@ -4561,7 +4850,7 @@ mod tests {
         )
         .expect("S");
         let want = super::embed_free(
-            &super::invert_cross_product(&s).expect("S⁻¹ exists"),
+            &super::invert_cross_product(&s, &[]).expect("S⁻¹ exists"),
             &free_idx,
             x.len(),
         );
