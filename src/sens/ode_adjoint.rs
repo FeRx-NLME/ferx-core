@@ -1081,7 +1081,7 @@ fn record_analytic_events<T: VmNum>(
     let doses: Vec<_> = (0..subject.doses.len())
         .map(|k| {
             at_record(
-                subject.dose_occasions.get(k).copied().unwrap_or(0),
+                crate::pk::dose_row_occasion(subject, k),
                 subject.dose_cov(k),
                 subject.param_time_at(subject.doses[k].time),
             )

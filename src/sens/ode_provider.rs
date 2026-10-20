@@ -1558,7 +1558,8 @@ fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
 /// the individual parameter switches both by κ (occasion) and by covariate; when
 /// covariates are subject-static, one source per occasion group is built and shared,
 /// preserving the non-TV cost (mirrors the analytical IOV provider). `seed_group_cov`
-/// is fallible (`None` aborts the subject → FD fallback).
+/// is fallible (`None` aborts the subject → FD fallback). `seed_pk_only_cov` is the κ = 0
+/// seeder, for every dose or pk-only row whose occasion has no group (#1876, #2065).
 #[allow(clippy::too_many_arguments)]
 fn seed_iov_events<T: Clone>(
     subject: &Subject,
@@ -1581,14 +1582,16 @@ fn seed_iov_events<T: Clone>(
     // threaded to `seed_group_cov`/`seed_pk_only_cov` so `TIME` resolves per event.
     let pk_only_group = |m: usize| crate::pk::pk_only_row_group(subject, m, occ_to_k);
     if per_event {
+        // A dose under its occasion's group; one whose occasion has no group (an
+        // unlabelled dose, #2065) falls to the κ = 0 seeder, which is production's
+        // `combined_for` miss there too.
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
-                let g = *occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?;
-                seed_group_cov(
-                    g,
-                    subject.dose_cov(d),
-                    subject.param_time_at(subject.doses[d].time),
-                )
+                let t = subject.param_time_at(subject.doses[d].time);
+                match crate::pk::dose_row_group(subject, d, occ_to_k) {
+                    Some(g) => seed_group_cov(g, subject.dose_cov(d), t),
+                    None => seed_pk_only_cov(subject.dose_cov(d), t),
+                }
             })
             .collect::<Option<_>>()?;
         let pk_at_obs = (0..subject.obs_times.len())
@@ -1642,17 +1645,22 @@ fn seed_iov_events<T: Clone>(
                 &owned
             }
         };
-        let pk_at_dose = (0..subject.doses.len())
-            .map(|d| {
-                Some(group_dual[*occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?].clone())
-            })
-            .collect::<Option<_>>()?;
+        // A dose or pk-only row reads its group's seeding (#1876, #2065); one κ = 0
+        // seeding, built on first use, serves every one whose occasion has no group.
+        let mut ungrouped: Option<Vec<T>> = None;
+        let mut pk_at_dose = Vec::with_capacity(subject.doses.len());
+        for d in 0..subject.doses.len() {
+            pk_at_dose.push(match crate::pk::dose_row_group(subject, d, occ_to_k) {
+                Some(g) => group_dual[g].clone(),
+                None => match &ungrouped {
+                    Some(seeded) => seeded.clone(),
+                    None => ungrouped.insert(seed_pk_only_cov(static_cov, 0.0)?).clone(),
+                },
+            });
+        }
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
             .collect::<Option<_>>()?;
-        // A pk-only row reads its group's seeding (#1876); one κ = 0 seeding, built on
-        // first use, serves every row whose occasion has no group.
-        let mut ungrouped: Option<Vec<T>> = None;
         let mut pk_at_pk_only = Vec::with_capacity(subject.pk_only_times.len());
         for m in 0..subject.pk_only_times.len() {
             pk_at_pk_only.push(match pk_only_group(m) {
