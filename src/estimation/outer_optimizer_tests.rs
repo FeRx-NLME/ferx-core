@@ -1495,6 +1495,83 @@ fn test_latched_stop_needs_plateau_check() {
     assert!(!latched_stop_needs_plateau_check(false, false, false));
 }
 
+/// #1782: only a BOBYQA *tolerance* stop is polished — `FtolReached`, `XtolReached`,
+/// or the bare `Success` its trust radius reaching `rhoend` returns. Each `false` row names a stop
+/// the polish must leave alone: a gradient method (whose default stops are the
+/// unreachable 1e-12 ones), a spent budget, a bare `Failure` (the plateau check's),
+/// a stagnation latch (forced, also the plateau check's), and a cancelled run.
+#[test]
+fn test_bobyqa_stop_needs_polish() {
+    use nlopt::{Algorithm, FailState, SuccessState};
+    let ok = |s| Ok((s, 0.0));
+    let bob = Algorithm::Bobyqa;
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        false,
+        false
+    ));
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::XtolReached),
+        false,
+        false
+    ));
+    // `rho` reaching `rhoend` — BOBYQA's ordinary trust-radius stop.
+    assert!(bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::Success),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::StopValReached),
+        false,
+        false
+    ));
+    for algo in [Algorithm::Lbfgs, Algorithm::Slsqp, Algorithm::Mma] {
+        assert!(!bobyqa_stop_needs_polish(
+            algo,
+            &ok(SuccessState::FtolReached),
+            false,
+            false
+        ));
+    }
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::MaxEvalReached),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &Err((FailState::Failure, 0.0)),
+        false,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        true,
+        false
+    ));
+    assert!(!bobyqa_stop_needs_polish(
+        bob,
+        &ok(SuccessState::FtolReached),
+        false,
+        true
+    ));
+}
+
+/// The BOBYQA trust radius: 0.5 in scaled space, capped at half a narrow box and
+/// floored at 1e-6 for a degenerate (fixed) one.
+#[test]
+fn test_bobyqa_initial_step() {
+    let step = bobyqa_initial_step(&[-10.0, 0.0, 1.0], &[10.0, 0.4, 1.0]);
+    assert_eq!(step, vec![0.5, 0.2, 1e-6]);
+}
+
 /// End to end through `optimize_nlopt_once`, the production wiring of #1530: on
 /// `examples/one_cpt_iv.ferx` FOCEI / L-BFGS the short window latches, and the
 /// latched stop's `converged` comes from the plateau check, not NLopt's forced

@@ -3476,6 +3476,69 @@ fn outer_eval_budget(algo: nlopt::Algorithm, n: usize, outer_maxiter: usize) -> 
     }
 }
 
+/// `ftol_rel` / `xtol_rel` of the #1782 BOBYQA polish leg — the tolerances that,
+/// set from the start, closed every gap the issue measured (`two_cpt_iv` to the
+/// L-BFGS optimum, `warfarin_iov` to within 1.4e-5). Each is a ceiling: a user who
+/// asked for tighter keeps their own.
+const POLISH_FTOL_REL: f64 = 1e-10;
+const POLISH_XTOL_REL: f64 = 1e-7;
+/// A polish leg that lowered the objective by more than this is followed by
+/// another: it was still descending. The 1e-3 the stagnation guard and the
+/// plateau check already treat as the FOCE objective's noise floor.
+const POLISH_MIN_GAIN: f64 = 1e-3;
+/// Polish legs after the first BOBYQA stop, at most. Each costs at least the
+/// `2n + 1` evaluations BOBYQA spends rebuilding its interpolation model.
+const MAX_POLISH_LEGS: usize = 4;
+
+/// Does this NLopt return need the #1782 polish leg before it may be called
+/// converged? Only a BOBYQA *tolerance* stop, which it reports three ways:
+/// `FtolReached`, `XtolReached` (its final Newton step), and a bare `Success` —
+/// NLopt's `bobyqb_` falls through to its exit with `rc = NLOPT_SUCCESS` when the
+/// trust radius reaches `rhoend = xtol_rel · rhobeg`, which is how the default
+/// `examples/ctmm_pd_2state.ferx` fit stopped. All three are relative criteria the run
+/// can meet mid-descent. Not a latched stagnation guard
+/// (its stop is forced and goes to the plateau check instead), not a spent budget,
+/// not a cancelled run, and not the gradient methods, whose default stops are the
+/// unreachable 1e-12 ones.
+fn bobyqa_stop_needs_polish(
+    algo: nlopt::Algorithm,
+    result: &Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>,
+    latched: bool,
+    cancelled: bool,
+) -> bool {
+    matches!(algo, nlopt::Algorithm::Bobyqa)
+        && matches!(
+            result,
+            Ok((
+                nlopt::SuccessState::Success
+                    | nlopt::SuccessState::FtolReached
+                    | nlopt::SuccessState::XtolReached,
+                _
+            ))
+        )
+        && !latched
+        && !cancelled
+}
+
+/// BOBYQA's initial trust radius per coordinate, in scaled space.
+///
+/// NLopt's default rhobeg is 25% of the bound-width — huge in our log-space
+/// packing (theta bounds can span 40+ log units), so the initial 2n+1
+/// interpolation probes land in regions where the EBE inner loop fails and the
+/// OFV gets clamped to 1e20, poisoning the quadratic model. 0.5 in scaled space
+/// is a ~1.6× move on the natural parameter scale — small enough to stay
+/// feasible at start, large enough to see real OFV signal.
+fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
+    lower_s
+        .iter()
+        .zip(upper_s)
+        .map(|(lo, hi)| {
+            let half_width = (hi - lo).abs() * 0.5;
+            0.5_f64.min(half_width.max(1e-6))
+        })
+        .collect()
+}
+
 /// One NLopt outer-optimizer run. Returns the result and the
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
@@ -4293,7 +4356,9 @@ fn optimize_nlopt_once(
     };
 
     // Create NLopt optimizer with state (operates in scaled xs space)
-    let mut opt = nlopt::Nlopt::new(algo, n, objective, nlopt::Target::Minimize, state);
+    // `&objective`, not `objective`: the #1782 polish leg below runs a second NLopt
+    // instance on the same closure, and so on the same best-seen tracker and counters.
+    let mut opt = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     // The budget this leg may spend: the fit's, less what a stalled leg it
@@ -4318,20 +4383,9 @@ fn optimize_nlopt_once(
             options.outer_ftol,
         );
         opt.set_ftol_rel(ftol).unwrap();
-        // NLopt's default rhobeg is 25% of the bound-width — huge in our
-        // log-space packing (theta bounds can span 40+ log units), so the
-        // initial 2n+1 interpolation probes land in regions where the EBE
-        // inner loop fails and the OFV gets clamped to 1e20, poisoning the
-        // quadratic model. 0.5 in scaled space is a ~1.6× move on the
-        // natural parameter scale — small enough to stay feasible at
-        // start, large enough to see real OFV signal.
-        let init_step: Vec<f64> = (0..n)
-            .map(|i| {
-                let half_width = (upper_s[i] - lower_s[i]).abs() * 0.5;
-                0.5_f64.min(half_width.max(1e-6))
-            })
-            .collect();
-        opt.set_initial_step(&init_step).unwrap();
+        // Not NLopt's default rhobeg — see `bobyqa_initial_step`.
+        opt.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
+            .unwrap();
     } else {
         opt.set_maxeval(max_eval).unwrap();
         if gradient_run_has_reachable_stops(options) {
@@ -4372,7 +4426,85 @@ fn optimize_nlopt_once(
     }
 
     // Run optimization
-    let result = opt.optimize(&mut x0);
+    let mut result = opt.optimize(&mut x0);
+
+    // #1782: BOBYQA's default stop is *relative* (`ftol_rel = 1e-6`, `xtol_rel = 1e-4`),
+    // and on its own it is not evidence of a minimum — at |OFV| ≈ 430 a 4e-4 step
+    // satisfies it while the trace is still falling. Measured on `two_cpt_iv` (−432.0317
+    // against the −432.1668 L-BFGS reaches, macOS) and `warfarin_iov` (+1.53 OFV on
+    // Linux), each reporting `converged: YES`. So a tolerance stop is not the end of the
+    // run: restart BOBYQA from the best point seen under tight tolerances, which rebuilds
+    // its interpolation model at a fresh trust radius, and let the *last* leg's stop
+    // decide `converged`. One leg is not always enough — on `warfarin_iov` (macOS) the
+    // first polish ended 2.4e-3 above the optimum on `XtolReached` — so a leg that still
+    // bought more than `POLISH_MIN_GAIN` is followed by another, up to `MAX_POLISH_LEGS`.
+    // Every leg feeds the same best-seen tracker, so the restore below picks the lowest
+    // point whichever leg found it, and the legs share the run's budget.
+    let best_point = || {
+        best_seen
+            .lock()
+            .unwrap()
+            .get()
+            .map(|b| (b.x.clone(), b.ofv))
+    };
+    let mut opt = opt;
+    let mut polish_legs = 0usize;
+    let mut last_gain = f64::INFINITY;
+    while polish_legs < MAX_POLISH_LEGS
+        && last_gain > POLISH_MIN_GAIN
+        && bobyqa_stop_needs_polish(
+            algo,
+            &result,
+            stagnation_latched.load(Ordering::Relaxed),
+            crate::cancel::is_cancelled(&options.cancel),
+        )
+    {
+        let used = spent_evals + n_evals_outer.load(Ordering::Relaxed);
+        let left = full_budget.saturating_sub(used as u32);
+        // Nothing feasible seen means the best point is the guard penalty's minimum
+        // (#1617) — not a place to polish from; the verdict below reports that run.
+        let any_feasible = plateau_tracker.lock().unwrap().2 > 0;
+        let Some((best_x, before)) = best_point() else {
+            break;
+        };
+        if left == 0 || !any_feasible || best_x.len() != n {
+            break;
+        }
+        let mut state = opt.recover_user_data();
+        x0.copy_from_slice(&best_x);
+        state.prev_x = best_x;
+        // A full stagnation window for the leg: the previous leg's flat tail is what
+        // ended it, and must not latch this one on its first eval.
+        state.last_improvement_eval = state.n_evals;
+        state.best_at_last_improvement = state.best_ofv;
+        opt = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+        opt.set_lower_bounds(&lower_s).unwrap();
+        opt.set_upper_bounds(&upper_s).unwrap();
+        opt.set_maxeval(left).unwrap();
+        opt.set_xtol_rel(options.outer_xtol.min(POLISH_XTOL_REL))
+            .unwrap();
+        opt.set_ftol_rel(
+            resolve_outer_ftol(
+                model.has_non_gaussian(),
+                model.is_ode_based(),
+                options.outer_ftol,
+            )
+            .min(POLISH_FTOL_REL),
+        )
+        .unwrap();
+        opt.set_initial_step(&bobyqa_initial_step(&lower_s, &upper_s))
+            .unwrap();
+        if options.verbose {
+            eprintln!(
+                "BOBYQA stopped on its tolerance (best objective = {before:.6}); polishing \
+                 from the best point with ftol_rel = {POLISH_FTOL_REL:e}, \
+                 xtol_rel = {POLISH_XTOL_REL:e} ({left} evaluations left).",
+            );
+        }
+        result = opt.optimize(&mut x0);
+        polish_legs += 1;
+        last_gain = best_point().map_or(0.0, |(_, after)| before - after);
+    }
 
     // `max_eval_reached` distinguishes a spent evaluation budget from other
     // non-convergence: it gets its own warning ("increase maxiter") rather than
