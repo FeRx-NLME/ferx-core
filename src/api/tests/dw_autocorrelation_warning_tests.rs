@@ -140,8 +140,8 @@ fn one_cpt_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
-/// The same model with a `[diffusion]` block, so the pair differs in exactly
-/// one thing: whether `model.is_sde()` holds.
+/// The same model with a `[diffusion]` block, so the pair differs in whether
+/// `model.is_sde()` holds — and in the `fd` gradient that block forces (below).
 ///
 /// Without this arm the test cannot see a recommendation gated on `is_sde()` —
 /// which is the population that must least of all be told to add process noise.
