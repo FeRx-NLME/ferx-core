@@ -119,9 +119,9 @@ pub(crate) use run::{
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    read_population_with, resolve_data_path, run_model_simulate, run_model_simulate_with_overrides,
-    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
-    ReaderSettings, RunOverrides,
+    read_population_with, read_population_with_source, resolve_data_path, run_model_simulate,
+    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
+    run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
 pub(crate) use simulate::obs_row_time;
@@ -269,6 +269,10 @@ mod dose_compartment_tests;
 #[cfg(test)]
 #[path = "tests/reader_warning_suppression_tests.rs"]
 mod reader_warning_suppression_tests;
+
+#[cfg(test)]
+#[path = "tests/data_source_read_tests.rs"]
+mod data_source_read_tests;
 
 #[cfg(test)]
 #[path = "tests/compartment_free_doses_tests.rs"]

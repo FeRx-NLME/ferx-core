@@ -149,8 +149,10 @@ pub fn fit_from_files(
     let (data_path, data_path_warning) =
         resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
     let data_path = data_path.as_str();
-    let (mut population, covariate_table) =
-        read_population_with_diag(&parsed.model, &reader_settings, data_path)
+    // One read of the dataset (#2140): the population and `data_hash` are the same
+    // bytes, so a CSV edited while the fit runs is not recorded as the fitted data.
+    let (mut population, covariate_table, data_hash) =
+        crate::api::run::read_population_hashed_diag(&parsed.model, &reader_settings, data_path)
             .map_err(EngineError::from_diagnostic)?;
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
@@ -176,13 +178,12 @@ pub fn fit_from_files(
         result.warnings.push(w);
         rebuild_warnings_structured(&mut result);
     }
-    // The model's hash and text are the read that was parsed and fitted (#1752).
-    // The CSV is hashed post-fit; a failure there is non-fatal and just disables
-    // the data integrity check in `run_sir`.
+    // The model's hash and text, and the data's hash, are the reads that were
+    // parsed and fitted (#1752, #2140).
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
     result.model_hash = Some(model_hash);
-    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.data_hash = Some(data_hash);
     result.model_text = Some(model_text);
     result.reader_settings = Some(reader_settings);
     Ok(result)
