@@ -699,7 +699,8 @@ fn a_constrained_block_without_written_bounds_takes_a_sign_free_box() {
 ///
 /// Mutations — delete the new arm: all three refusal cells bind; swap `lower`/`upper` in
 /// it: the `side` texts die; delete any sentence of the message: the equality dies;
-/// `== 0.0` → `<= 0.0`: the straddle is refused.
+/// `== 0.0` → `<= 0.0`: the straddle is refused; drop the FIX exemption: the FIX cells
+/// are refused; invert it: the three refusal cells bind.
 #[test]
 fn a_constrained_block_bound_at_zero_is_refused_on_either_side() {
     use crate::estimation::parameterization::{pack_with_bounds, theta_packs_log};
@@ -724,6 +725,14 @@ fn a_constrained_block_bound_at_zero_is_refused_on_either_side() {
     let p = &m.default_params;
     assert!(p.theta_lower[1..4].iter().all(|l| !theta_packs_log(*l)));
     assert_eq!(&pack_with_bounds(p).packed[1..4], &[0.0; 3]);
+    // Review r2 #5: a FIX block is not estimated, so its bounds do nothing and a bound
+    // at 0 still binds, fixed at 0, as it did at `9ede6904`.
+    for decl in ["(0.0, 0.0, 5.0) FIX", "(0.0, -5.0, 0.0) FIX"] {
+        let m = bind_placebo(&format!("PLACEBO[STUDY, TIME]{decl}")).expect(decl);
+        let p = &m.default_params;
+        assert_eq!(&p.theta[1..4], &[0.0; 3], "{decl}");
+        assert!(p.theta_fixed[1..4].iter().all(|x| *x), "{decl}");
+    }
 }
 
 #[test]

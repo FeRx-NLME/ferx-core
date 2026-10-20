@@ -16824,7 +16824,7 @@ fn parse_parameters(
                             let binding = level_bindings.get(&name);
                             if let Some(binding) = binding {
                                 validate_constrained_level_init(
-                                    &name, binding, init, lower, upper,
+                                    &name, binding, init, lower, upper, fixed,
                                 )?;
                             }
                             let (levels, theta_names) = match binding {
@@ -17459,13 +17459,16 @@ fn build_level_rules(
 /// their bounds (#2178 review r1 #3). A bound *at* 0 holds every coefficient to one
 /// sign and starts the fit on that bound; at a lower bound of 0 the coefficients are
 /// also log-packed (`theta_packs_log`), so they start at the packing floor, not at 0.
-/// With this rule no constrained free θ is ever log-packed.
+/// With this rule no constrained free θ is ever log-packed. A `FIX` block is not
+/// estimated, so its bounds neither constrain nor pack anything, and it is exempt
+/// from that rule (#2178 review r2 #5).
 fn validate_constrained_level_init(
     name: &str,
     binding: &LevelBinding,
     init: f64,
     lower: f64,
     upper: f64,
+    fixed: bool,
 ) -> Result<(), String> {
     if binding.contrast == LevelContrast::Unconstrained {
         return Ok(());
@@ -17481,7 +17484,9 @@ fn validate_constrained_level_init(
             "theta {name}[...]: constrained level bounds must include 0 (got {lower}..{upper})"
         ));
     }
-    let (side, inside) = if lower == 0.0 {
+    let (side, inside) = if fixed {
+        return Ok(());
+    } else if lower == 0.0 {
         ("lower", "below")
     } else if upper == 0.0 {
         ("upper", "above")
