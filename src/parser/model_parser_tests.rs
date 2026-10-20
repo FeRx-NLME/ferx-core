@@ -34211,12 +34211,47 @@ mod analytic_hazard_time_1919 {
     }
 
     /// Transitive: the hazard reads `LAM`, `LAM` reads `K`, and only `K` reads `TIME`.
-    /// The message names the parameter that reads `TIME`.
+    /// The message names the value the hazard reads and the one that reads `TIME`; the
+    /// issue's direct case (`LAM` reads `TIME` itself) carries no `through` clause.
     #[test]
     fn a_time_read_reached_transitively_names_the_reader() {
         let ip = format!("{BASE_IP}  K   = 1.0 + TVKT * TIME\n  LAM = TVLAMBDA * K");
         let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
-        assert!(err.contains("value `K`, whose value depends"), "got: {err}");
+        assert!(
+            err.contains("value `LAM`, whose value depends on the `TIME` built-in (through `K`)."),
+            "got: {err}"
+        );
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(
+            !err.contains("through"),
+            "direct read has no witness clause: {err}"
+        );
+    }
+
+    /// Path correlation (round-2 review): `K` is time-free on the arm where `LAM` reads it,
+    /// and `TIME`-dependent only on the arm where `LAM` does not, so `LAM` is time-free on
+    /// both paths. A time-free re-assignment likewise clears an earlier `TIME` read.
+    /// Straddle asserted per case: the block reads `TIME`.
+    #[test]
+    fn a_time_dependency_on_no_single_path_is_not_refused() {
+        for (label, branch) in [
+            (
+                "mutually exclusive arms",
+                "  K = TVLAMBDA\n  if (TVKT > 0) {\n    LAM = K\n  } else {\n    \
+                 K = TIME\n    LAM = TVLAMBDA\n  }",
+            ),
+            ("overwritten", "  LAM = TIME\n  LAM = TVLAMBDA"),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let model =
+                parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+                    .unwrap_or_else(|e| panic!("{label}: must parse, got: {e}"));
+            assert!(
+                compiled_model_uses_time_builtin(&model),
+                "{label}: straddle — the block must read TIME"
+            );
+        }
     }
 
     /// Every hazard-parameter key is a read site, not only `scale`.
@@ -34274,6 +34309,34 @@ mod analytic_hazard_time_1919 {
             let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
             assert!(
                 err.contains("value `LAM`, whose value depends on the `TIME` built-in"),
+                "{label}: got: {err}"
+            );
+        }
+    }
+
+    /// The join after an `if` keeps a dependency any path carries: one arm assigning a
+    /// `TIME`-dependent `LAM`, and an `if` with no `else` that leaves an earlier
+    /// `TIME`-dependent `LAM` in place on its fall-through path.
+    #[test]
+    fn a_time_dependency_on_any_single_path_is_refused() {
+        for (label, branch) in [
+            (
+                "one arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA * TIME\n  } else {\n    LAM = TVLAMBDA\n  }",
+            ),
+            (
+                "else arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = TVLAMBDA * TIME\n  }",
+            ),
+            (
+                "fall-through",
+                "  LAM = TVLAMBDA * TIME\n  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  }",
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in."),
                 "{label}: got: {err}"
             );
         }

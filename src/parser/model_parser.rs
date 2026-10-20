@@ -7898,70 +7898,102 @@ fn reject_time_in_analytic_hazard(
              built-in. {WHY} {FIX}"
         ));
     }
-    // Per assignment, not per statement: one `if` block can assign several names, and a
-    // `TIME` read in a sibling assignment the hazard does not reach must not refuse it
-    // (round-1 review). `TIME`-dependent names ∩ names the hazard reaches.
-    let tainted = indiv_names_depending_on_time(needed_indiv_stmts);
-    let reached = indiv_names_reached_by(hazard_exprs, needed_indiv_stmts);
-    if let Some(name) = assigned_vars_in_order(needed_indiv_stmts)
-        .into_iter()
-        .find(|n| tainted.contains(n) && reached.contains(n))
-    {
+    // Flow-sensitive, per assignment: what matters is the value each name holds when the
+    // block finishes, along every path. A per-statement scan refused an `if` whose sibling
+    // assignment read `TIME` (round-1 review); two path-insensitive name sets intersected
+    // could pair a definition on one arm with a read on another (round-2 review).
+    let tainted = indiv_time_taint_at_exit(needed_indiv_stmts);
+    let mut read: Vec<String> = Vec::new();
+    for e in hazard_exprs {
+        visit_expr_nodes(e, &mut |x: &Expression| {
+            if let Expression::Variable(n) = x {
+                if !read.contains(n) {
+                    read.push(n.clone());
+                }
+            }
+        });
+    }
+    if let Some((name, root)) = read.iter().find_map(|n| tainted.get(n).map(|r| (n, r))) {
+        let through = if root == name {
+            String::new()
+        } else {
+            format!(" (through `{root}`)")
+        };
         return Err(format!(
             "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
-             `{name}`, whose value depends on the `TIME` built-in. {WHY} {FIX}"
+             `{name}`, whose value depends on the `TIME` built-in{through}. {WHY} {FIX}"
         ));
     }
     Ok(())
 }
 
-/// Names whose value depends on the `TIME` built-in, per assignment: an `Assign` whose RHS
-/// reads `TIME` or an already-dependent name, or whose governing `if` conditions do (every
-/// condition up to and including its own arm, as in `compute_time_dependent_mask`, which
-/// answers the same question on the compiled program's slots). Monotone, iterated to a
-/// fixpoint so a read of a name assigned later in the block is not missed.
+/// Which names hold a `TIME`-dependent value once `stmts` has run, each mapped to a
+/// witness: the name whose own assignment (or governing condition) reads `TIME` directly.
+///
+/// One forward pass in program order, the way the block executes. An `Assign` is a strong
+/// update — a name re-assigned from a time-free RHS is clean again — and its value depends
+/// on `TIME` when its RHS reads `TIME` or a currently dependent name, or when a governing
+/// `if` condition does (every condition up to and including the arm's own: an arm runs only
+/// when the earlier conditions were false, as in `compute_time_dependent_mask`). Each arm
+/// runs from the state before the `if`; the state after it is the union over the arms, plus
+/// the state before when there is no `else`. Path-correlated, so a definition on one arm
+/// never pairs with a read on another.
 #[cfg(feature = "survival")]
-fn indiv_names_depending_on_time(stmts: &[Statement]) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    fn reads(
+fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, String> {
+    // `Some(None)`: reads `TIME` itself; `Some(Some(root))`: reads a dependent name.
+    type Src = Option<Option<String>>;
+    fn src_of(
         visit: &mut dyn FnMut(&mut dyn FnMut(&Expression)),
-        tainted: &HashSet<String>,
-    ) -> bool {
-        let mut hit = false;
+        st: &HashMap<String, String>,
+    ) -> Src {
+        let (mut direct, mut via) = (false, None);
         visit(&mut |e: &Expression| match e {
-            Expression::Time => hit = true,
-            Expression::Variable(n) if tainted.contains(n) => hit = true,
+            Expression::Time => direct = true,
+            Expression::Variable(n) if via.is_none() => via = st.get(n).cloned(),
             _ => {}
         });
-        hit
+        if direct {
+            Some(None)
+        } else {
+            via.map(Some)
+        }
     }
-    fn walk(
-        stmts: &[Statement],
-        governed: bool,
-        tainted: &mut HashSet<String>,
-        changed: &mut bool,
-    ) {
+    fn walk(stmts: &[Statement], governed: &Src, st: &mut HashMap<String, String>) {
         for s in stmts {
             match s {
                 Statement::Assign(name, e) => {
-                    if !tainted.contains(name)
-                        && (governed || reads(&mut |f| visit_expr_nodes(e, f), tainted))
-                    {
-                        tainted.insert(name.clone());
-                        *changed = true;
+                    match src_of(&mut |f| visit_expr_nodes(e, f), st).or_else(|| governed.clone()) {
+                        Some(root) => {
+                            st.insert(name.clone(), root.unwrap_or_else(|| name.clone()));
+                        }
+                        None => {
+                            st.remove(name);
+                        }
                     }
                 }
                 Statement::If {
                     branches,
                     else_body,
                 } => {
-                    let mut g = governed;
+                    let before = st.clone();
+                    let mut arms: Vec<HashMap<String, String>> = Vec::new();
+                    let mut g = governed.clone();
                     for (cond, body) in branches {
-                        g = g || reads(&mut |f| visit_condition_nodes(cond, f), tainted);
-                        walk(body, g, tainted, changed);
+                        g = g.or_else(|| src_of(&mut |f| visit_condition_nodes(cond, f), &before));
+                        let mut arm = before.clone();
+                        walk(body, &g, &mut arm);
+                        arms.push(arm);
                     }
+                    let mut arm = before.clone();
                     if let Some(eb) = else_body {
-                        walk(eb, g, tainted, changed);
+                        walk(eb, &g, &mut arm);
+                    }
+                    arms.push(arm);
+                    st.clear();
+                    for arm in arms {
+                        for (k, v) in arm {
+                            st.entry(k).or_insert(v);
+                        }
                     }
                 }
                 // `[individual_parameters]` at parse time holds only named assignments and
@@ -7974,75 +8006,9 @@ fn indiv_names_depending_on_time(stmts: &[Statement]) -> std::collections::HashS
             }
         }
     }
-    let mut tainted = HashSet::new();
-    loop {
-        let mut changed = false;
-        walk(stmts, false, &mut tainted, &mut changed);
-        if !changed {
-            return tainted;
-        }
-    }
-}
-
-/// Names the `exprs` reach through `stmts`, per assignment: a reached name pulls in the
-/// names its RHS reads and those its governing `if` conditions read — but not a sibling
-/// assignment's in the same block. Iterated to a fixpoint.
-#[cfg(feature = "survival")]
-fn indiv_names_reached_by(
-    exprs: &[&Expression],
-    stmts: &[Statement],
-) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    fn walk<'a>(
-        stmts: &'a [Statement],
-        conds: &mut Vec<&'a Condition>,
-        reached: &mut HashSet<String>,
-        changed: &mut bool,
-    ) {
-        for s in stmts {
-            match s {
-                Statement::Assign(name, e) if reached.contains(name) => {
-                    let mut add = |x: &Expression| {
-                        if let Expression::Variable(n) = x {
-                            if reached.insert(n.clone()) {
-                                *changed = true;
-                            }
-                        }
-                    };
-                    visit_expr_nodes(e, &mut add);
-                    for c in conds.iter() {
-                        visit_condition_nodes(c, &mut add);
-                    }
-                }
-                Statement::If {
-                    branches,
-                    else_body,
-                } => {
-                    let depth = conds.len();
-                    for (cond, body) in branches {
-                        conds.push(cond);
-                        walk(body, conds, reached, changed);
-                    }
-                    if let Some(eb) = else_body {
-                        walk(eb, conds, reached, changed);
-                    }
-                    conds.truncate(depth);
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut reached = HashSet::new();
-    for e in exprs {
-        collect_variable_names(e, &mut reached);
-    }
-    loop {
-        let mut changed = false;
-        walk(stmts, &mut Vec::new(), &mut reached, &mut changed);
-        if !changed {
-            return reached;
-        }
-    }
+    let mut st = HashMap::new();
+    walk(stmts, &None, &mut st);
+    st
 }
 
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
