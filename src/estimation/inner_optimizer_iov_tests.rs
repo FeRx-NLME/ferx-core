@@ -4706,7 +4706,8 @@ fn an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_on_both_engines() {
 fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engines() {
     // Measured worst |walk − FD| / (1 + |FD|): 3.0e-10 closed form, 1.5e-10 ODE (h = 1e-6
     // central differences, macOS arm64); the bound keeps ~300× headroom. Seeding the
-    // dose under occasion 2's κ puts ∂f/∂κ₂ ≈ 0.1–0.4 where FD reads 0, nine orders above.
+    // dose under occasion 2's κ instead — mutated on each walk's new arm, both branches —
+    // is caught first by the value check: obs 6 reads 2.3626 against `predict_iov`'s 2.3354.
     const TOL: f64 = 1e-7;
     for (label, m) in unlabelled_dose_models() {
         let s = unlabelled_dose_subject(&m);
