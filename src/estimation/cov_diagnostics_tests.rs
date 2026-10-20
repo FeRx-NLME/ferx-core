@@ -539,10 +539,39 @@ fn the_head_sentence_carries_the_classification_token_and_the_numbers() {
     );
     assert!(msg.contains("min eig = -3.197e1"), "{msg}");
     assert!(msg.contains("max eig = 8.416e3"), "{msg}");
-    assert!(msg.contains("|min eig|/max eig ="), "{msg}");
+    assert!(msg.contains("|min eig|/max eig = 3.80e-3"), "{msg}");
     assert!(
         msg.contains("worst inflation of a reported variance ="),
         "{msg}"
+    );
+}
+
+#[test]
+fn the_eigenvalue_ratio_clause_prints_only_on_an_indefinite_spectrum() {
+    // #2132: `neg_ratio()` is 0 on a non-negative spectrum, and printing it under the
+    // `|min eig|/max eig` label beside a positive `min eig` claimed 1.161e-8 / 2.078e3 = 0.
+    // Both sides of the gate in one test, so forcing either branch reddens it.
+    let mut positive = measured_severe_facts();
+    positive.min_eigenvalue = 1.161e-8;
+    positive.max_eigenvalue = 2.078e3;
+    positive.floor = 2.078e-7;
+    let pos = format_regularized_warning(&positive);
+    assert!(
+        pos.contains("min eig = 1.161e-8, max eig = 2.078e3, floor = 2.078e-7;"),
+        "{pos}"
+    );
+    assert!(!pos.contains("|min eig|/max eig"), "{pos}");
+
+    let neg = format_regularized_warning(&measured_severe_facts());
+    // 3.197e1 / 8.416e3 = 3.799e-3.
+    assert!(
+        neg.contains("max eig = 8.416e3, |min eig|/max eig = 3.80e-3, floor = 8.416e-7;"),
+        "{neg}"
+    );
+    // Same classification either way: the clause is not part of the taxonomy key.
+    assert_eq!(
+        classify_warning(&pos).category,
+        WarningCode::CovarianceRegularized
     );
 }
 
