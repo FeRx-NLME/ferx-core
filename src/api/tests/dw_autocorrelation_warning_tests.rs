@@ -241,9 +241,13 @@ fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
 /// empty search.
 /// Every warning either fixture is *entitled* to emit, as (opening, closing)
 /// pairs. Both ends are pinned on purpose: with prefixes alone, appending the
-/// recommendation to an already-accounted warning — the shrinkage notice, say —
+/// recommendation to an already-accounted warning — the budget notice, say —
 /// stays accounted and the test passes (measured; that is how this list came to
 /// be anchored at both ends).
+///
+/// There is deliberately no `High ETA shrinkage` entry. With an identifiable ω
+/// (see `one_cpt_model`) neither arm emits one, and allowing it would let a
+/// regression back to the collapsing-ω fixture pass unaccounted.
 ///
 /// The thread notice opens with a machine-dependent count, so its "prefix" is
 /// `classify_warning`'s own key, matched anywhere in the string.
@@ -257,7 +261,6 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "increase maxiter for a tighter fit.",
     ),
     ("Outer optimization did not converge", "did not converge"),
-    ("High ETA shrinkage", "or collecting more informative data."),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
