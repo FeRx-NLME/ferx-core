@@ -412,7 +412,7 @@ fn se_misses(ferx: &[f64; 8], nm: &[f64; 8], tol: f64) -> Vec<&'static str> {
 /// in every printed digit). `3%` is 2.9× above it, and well below the 11–27% by which the
 /// committed run's default-precision `$COV` is off its own `SIGL=12` result on four of the
 /// eight. NONMEM is not exact either: re-estimated at `NSIG=4 SIGL=12` (a slightly different
-/// optimum), its SEs move by up to 2.2% (ED50) from this run, so the band is 1.36× above the
+/// optimum), its SEs move by up to 2.3% (ED50) from this run, so the band is 1.32× above the
 /// oracle's own spread. ferx is within 1.23% of that run too. It is the second reference below,
 /// not this band, that pins the route.
 const SE_TOL: f64 = 0.03;
@@ -435,8 +435,9 @@ const EXT_FD_SE: [f64; 8] = [
     2.621309e-2,
 ];
 /// Worst realised |analytic/external − 1|: 1.84e-4 (K_ST). The whole-population FD stencil
-/// misses by 5.0e-3 (TVE0) and 2.2e-3 (ED50). `1e-3` sits 5.4× above the analytic gap,
-/// 3.1× above the oracle's step-to-step spread, and 2.2× below the stencil's ED50 miss.
+/// misses by 5.0e-3 (TVE0), 3.1e-3 (ET50) and 2.2e-3 (ED50). `1e-3` sits 5.4× above the
+/// analytic gap, 3.1× above the oracle's step-to-step spread, and 2.2× below the stencil's
+/// smallest miss (ED50).
 const ROUTE_TOL: f64 = 1e-3;
 
 /// The covariance step on the nested anchor against NONMEM's `MATRIX=R` (#2177).
