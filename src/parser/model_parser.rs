@@ -7867,6 +7867,52 @@ fn restrict_and_validate_indiv_stmts(
     Ok((needed_indiv_stmts, covariates))
 }
 
+/// Reject an **analytic** hazard whose parameters read the `TIME` built-in, directly in
+/// `scale`/`shape`/`alpha`/`gamma`/`loghr` or through an `[individual_parameters]` value
+/// those expressions reach (#1919). `HazardParamFn` takes `(θ, η, covariates)` and no time,
+/// so `TIME` there resolves to whatever the model-time thread-local holds when it runs:
+/// measured, `0.0` outside any `ModelTimeGuard` and the guard's time inside one — frozen at
+/// `TIME = 0` on the likelihood path, caller-dependent elsewhere. The `TIME` axis of the
+/// freeze #741 refuses on the covariate axis. The family's own time dependence lives in its
+/// closed form, not in its parameters.
+///
+/// `needed_indiv_stmts` is the reachability-filtered subset from
+/// `restrict_and_validate_indiv_stmts`, so a `TIME`-reading parameter the hazard does not
+/// reach is not refused. The `[binary_model]` logit is not checked here: it is evaluated
+/// under each record's guard, so `TIME` is honoured there.
+#[cfg(feature = "survival")]
+fn reject_time_in_analytic_hazard(
+    cmt: usize,
+    hazard_exprs: &[&Expression],
+    needed_indiv_stmts: &[Statement],
+) -> Result<(), String> {
+    const WHY: &str = "An analytic hazard (`family = ...`) is evaluated once per subject with \
+                       no time argument, so TIME would not follow the hazard's clock — it would \
+                       silently read the ambient model time (0 outside any record) instead (#1919).";
+    const FIX: &str = "To let the hazard vary in TIME, write it as an ODE-accumulated \
+                       `hazard = ...` expression (which integrates TIME along the hazard's \
+                       clock) with the TIME term in that expression itself.";
+    if hazard_exprs.iter().any(|e| expr_references_time_node(e)) {
+        return Err(format!(
+            "[event_model] on CMT={cmt}: a hazard parameter expression references the `TIME` \
+             built-in. {WHY} {FIX}"
+        ));
+    }
+    for s in needed_indiv_stmts {
+        if stmts_use_time_builtin(std::slice::from_ref(s)) {
+            let name = assigned_vars_in_order(std::slice::from_ref(s))
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            return Err(format!(
+                "[event_model] on CMT={cmt}: the hazard reads the [individual_parameters] value \
+                 `{name}`, whose definition reads the `TIME` built-in. {WHY} {FIX}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
 ///
 /// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
@@ -8224,6 +8270,7 @@ fn parse_event_model_block(
         kappa_names,
         "event_model",
     )?;
+    reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.

@@ -34147,3 +34147,133 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     let bc = compile_bytecode(&split);
     assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
 }
+
+/// #1919 — an analytic hazard's `HazardParamFn` takes no time, so a `TIME` read in its
+/// parameters (directly, or through a reached `[individual_parameters]` value) is refused
+/// at parse rather than silently read at the ambient model time (0 on the likelihood path).
+#[cfg(feature = "survival")]
+mod analytic_hazard_time_1919 {
+    use super::*;
+
+    /// `ip` is the `[individual_parameters]` body, `em` the `[event_model]` body after
+    /// `cmt`, `extra` any further block.
+    fn model(ip: &str, em: &str, extra: &str) -> String {
+        format!(
+            "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  theta TVKT(0.5, 0.0, 10.0)
+  theta TVSHAPE(1.2, 0.1, 10.0)
+  theta BETA(0.1, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+{ip}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+[event_model]
+  cmt    = 2
+{em}
+{extra}"
+        )
+    }
+
+    const BASE_IP: &str = "  CL  = TVCL * exp(ETA_CL)\n  V1  = TVV\n";
+
+    /// Every sentence of the message, per cell: the shared why/fix and the cell's lead.
+    fn assert_message(err: &str, lead: &str) {
+        for part in [
+            "[event_model] on CMT=2: ",
+            lead,
+            "An analytic hazard (`family = ...`) is evaluated once per subject with no time \
+             argument, so TIME would not follow the hazard's clock",
+            "silently read the ambient model time (0 outside any record) instead (#1919)",
+            "write it as an ODE-accumulated `hazard = ...` expression",
+            "with the TIME term in that expression itself",
+        ] {
+            assert!(err.contains(part), "missing `{part}` in: {err}");
+        }
+    }
+
+    /// The issue's model: `scale = LAM`, `LAM` reads `TIME`.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_reaches_is_refused() {
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert_message(
+            &err,
+            "the hazard reads the [individual_parameters] value `LAM`, whose definition \
+             reads the `TIME` built-in",
+        );
+    }
+
+    /// Transitive: the hazard reads `LAM`, `LAM` reads `K`, and only `K` reads `TIME`.
+    /// The message names the parameter that reads `TIME`.
+    #[test]
+    fn a_time_read_reached_transitively_names_the_reader() {
+        let ip = format!("{BASE_IP}  K   = 1.0 + TVKT * TIME\n  LAM = TVLAMBDA * K");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(err.contains("value `K`, whose definition"), "got: {err}");
+    }
+
+    /// Every hazard-parameter key is a read site, not only `scale`.
+    #[test]
+    fn every_hazard_parameter_key_is_a_read_site() {
+        let ip = format!("{BASE_IP}  PT  = TVSHAPE * (1.0 + TVKT * TIME)");
+        for em in [
+            "  family = weibull\n  scale = TVLAMBDA\n  shape = PT",
+            "  family = gompertz\n  alpha = TVLAMBDA\n  gamma = PT",
+            "  family = exponential\n  scale = TVLAMBDA\n  loghr = BETA * PT",
+        ] {
+            let err = expect_parse_err(&model(&ip, em, ""));
+            assert!(
+                err.contains("value `PT`, whose definition"),
+                "{em}: got: {err}"
+            );
+        }
+    }
+
+    /// `TIME` written directly in a hazard parameter expression.
+    #[test]
+    fn a_direct_time_read_is_refused() {
+        let err = expect_parse_err(&model(
+            BASE_IP,
+            "  family = exponential\n  scale = TVLAMBDA * (1.0 + TVKT * TIME)",
+            "",
+        ));
+        assert_message(
+            &err,
+            "a hazard parameter expression references the `TIME` built-in",
+        );
+    }
+
+    /// Control, with the straddle asserted: the block reads `TIME` (`CL`), but the hazard
+    /// does not reach `CL`, so nothing is refused — the reachability filter is the gate.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_does_not_reach_is_not_refused() {
+        let ip = "  CL  = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  V1  = TVV\n  \
+                  LAM = TVLAMBDA * exp(BETA)";
+        let model = parse_model_string(&model(ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// The `[binary_model]` logit is evaluated under each record's model-time guard, so a
+    /// `TIME`-reading parameter there is honoured and must keep parsing.
+    #[test]
+    fn a_binary_model_reading_time_is_not_refused() {
+        let ip = format!("{BASE_IP}  B0 = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let src = model(
+            &ip,
+            "  family = exponential\n  scale = TVLAMBDA",
+            "[binary_model]\n  cmt   = 3\n  logit = B0\n",
+        );
+        parse_model_string(&src).expect("a TIME-reading logit predictor must parse");
+    }
+}
