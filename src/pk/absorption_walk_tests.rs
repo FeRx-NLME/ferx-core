@@ -1155,3 +1155,106 @@ fn a_nan_disposition_on_a_record_governing_no_interval_poisons_nothing() {
         }
     }
 }
+
+/// #2134 review: a `NaN` still reaches the objective when a finite non-physical parameter
+/// elsewhere makes the subject `WalkDomain::Invalid`. The `0` penalty stands before the
+/// `NaN` onset and the `NaN` is served from it on, so the subject's objective is
+/// non-finite rather than a confident zero. Three ways to be `Invalid`: a finite `CL ≤ 0`
+/// on an interval before the onset, a finite non-physical kernel on dose 1 (the pre-scan),
+/// and — which must **not** count — one on a dose arriving only after the onset, which is
+/// never evaluated, so the records before the onset keep their walked values.
+///
+/// Mutation (run): answer `Invalid` with the bare all-zero `Some(preds)` → the first two
+/// rows die on their `NaN` half; scan every dose regardless of the onset → the third row
+/// dies on its finite half.
+#[test]
+fn a_nan_wins_over_a_finite_non_physical_parameter_in_the_walk() {
+    use crate::types::{PK_IDX_CL, PK_IDX_CV2, PK_IDX_MTT};
+    for (model, subject, bad_from) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let kernel_b = match model.pk_model {
+            PkModel::OneCptIg | PkModel::TwoCptIg => PK_IDX_CV2,
+            _ => PK_IDX_MTT,
+        };
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &vec![pk; subject.obs_times.len()],
+            &[],
+            None,
+        )
+        .expect("inside the domain");
+        let mut nan_cl = pk;
+        nan_cl.values[PK_IDX_CL] = f64::NAN;
+        let mut neg_cl = pk;
+        neg_cl.values[PK_IDX_CL] = -1.0;
+        // CL < 0 on record 1, NaN from `bad_from` on.
+        let at_obs_neg: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| match j {
+                1 => neg_cl,
+                j if j >= bad_from => nan_cl,
+                _ => pk,
+            })
+            .collect();
+        let at_obs_nan: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| if j >= bad_from { nan_cl } else { pk })
+            .collect();
+        let mut bad_kernel_1 = dose.clone();
+        bad_kernel_1[0].values[kernel_b] = -1.0;
+        let mut bad_kernel_last = dose.clone();
+        *bad_kernel_last.last_mut().unwrap() = {
+            let mut p = pk;
+            p.values[kernel_b] = -1.0;
+            p
+        };
+        assert!(
+            subject.doses.last().unwrap().time > subject.obs_times[bad_from],
+            "{name}: premise — the last dose arrives after the NaN onset"
+        );
+        for (label, at_dose, at_obs, zero_before) in [
+            ("CL < 0 before the onset", dose.clone(), at_obs_neg, true),
+            (
+                "dose 1 kernel non-physical",
+                bad_kernel_1,
+                at_obs_nan.clone(),
+                true,
+            ),
+            (
+                "a post-onset dose's kernel non-physical",
+                bad_kernel_last,
+                at_obs_nan,
+                false,
+            ),
+        ] {
+            let preds =
+                absorption_walk_predictions(model.pk_model, &subject, &at_dose, &at_obs, &[], None)
+                    .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, p) in preds.iter().enumerate() {
+                if j >= bad_from {
+                    assert!(
+                        p.is_nan(),
+                        "{name} {label}: record {j} must be NaN, not {p}"
+                    );
+                } else if zero_before {
+                    assert_eq!(*p, 0.0, "{name} {label}: record {j} keeps the 0 penalty");
+                } else {
+                    assert_eq!(
+                        p.to_bits(),
+                        clean[j].to_bits(),
+                        "{name} {label}: record {j} precedes everything wrong: {p} vs {}",
+                        clean[j]
+                    );
+                }
+            }
+        }
+    }
+}

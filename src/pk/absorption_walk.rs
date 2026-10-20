@@ -173,6 +173,34 @@ fn governing<'a, T: PkNum>(
         .collect()
 }
 
+/// Where a `NaN` starts acting (#2134): the first event closing an interval of positive
+/// length whose governing disposition, or a dose open at its start, is `NaN`, with that
+/// interval's start time. A record that governs no elapsed time (the first record, or one
+/// co-timed with the previous event) never acts, so it is not an onset, as on the
+/// event-driven and ODE engines. The one owner of the rule: [`walk_domain`] stops there,
+/// and [`absorption_walk_g`] serves `NaN` from there on, whatever the verdict before it.
+fn nan_onset<T: PkNum>(
+    schedule: &EventSchedule,
+    doses: &[AbsDose<T>],
+    gov: &[Option<&PkDual<T>>],
+    two_cpt: bool,
+) -> Option<(usize, f64)> {
+    let mut cur_t = schedule.events.first()?.time;
+    for (i, ev) in schedule.events.iter().enumerate() {
+        if ev.time > cur_t {
+            let disp_nan = gov[i].is_some_and(|p| disposition_is_nan(two_cpt, p));
+            let open_nan = doses
+                .iter()
+                .any(|d| d.arrival.val() <= cur_t && kernel_is_nan(d));
+            if disp_nan || open_nan {
+                return Some((i, cur_t));
+            }
+            cur_t = ev.time;
+        }
+    }
+    None
+}
+
 /// **The** decision between the walk and the ODE twin (see the module docs). Reads only
 /// values, so the `f64` router and a dual walk over the same parameters agree.
 ///
@@ -190,13 +218,20 @@ pub(crate) fn walk_domain<T: PkNum>(
     let Some((kernel, two_cpt)) = kernel_of(pk_model) else {
         return WalkDomain::Twin;
     };
+    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    // Nothing from the `NaN` onset on is evaluated, so nothing there can make the subject
+    // `Invalid` or send it to the twin (#2134): a dose arriving at or after it is not
+    // scanned, and the interval loop stops at it.
+    let onset = nan_onset(schedule, doses, &gov, two_cpt);
     let mut verdict = WalkDomain::Walk;
     for d in doses {
+        if onset.is_some_and(|(_, t)| !(d.arrival.val() < t)) {
+            continue;
+        }
         if !kernel_is_nan(d) && abscissa(kernel, d.a.val(), d.b.val()).is_none() {
             verdict = WalkDomain::Invalid;
         }
     }
-    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
     let mut cur_t = match schedule.events.first() {
         Some(e) => e.time,
         None => return verdict,
@@ -207,15 +242,15 @@ pub(crate) fn walk_domain<T: PkNum>(
             // reset semantics of its own; the twin does.
             return WalkDomain::Twin;
         }
+        if onset.is_some_and(|(k, _)| i >= k) {
+            // From the `NaN` onset on the walk serves `NaN`, so no later pair matters.
+            return verdict;
+        }
         if ev.time > cur_t {
             let Some(p) = gov[i] else {
                 return WalkDomain::Twin;
             };
-            // From a `NaN` on the walk serves `NaN`, so no later pair needs the twin.
             let open = doses.iter().filter(|d| d.arrival.val() <= cur_t);
-            if disposition_is_nan(two_cpt, p) || open.clone().any(kernel_is_nan) {
-                return verdict;
-            }
             let vals = PkDual {
                 cl: p.cl.val(),
                 v: p.v.val(),
@@ -330,6 +365,13 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     if schedule.non_finite_event_time {
         return Some(vec![T::from_f64(f64::NAN); n_obs]);
     }
+    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    let nan = T::from_f64(f64::NAN);
+    let n_states = if two_cpt { 3 } else { 2 };
+    // From the `NaN` onset on the state is `NaN`, as an integrator's would be, and the
+    // tilting terms are not evaluated: their `mgf` `debug_assert` rejects a `NaN` rate
+    // (#386). A `NaN` `V` on an observation is still read as `NaN` by the readout.
+    let onset = nan_onset(schedule, doses, &gov, two_cpt).map(|(k, _)| k);
     match walk_domain(
         pk_model,
         schedule,
@@ -339,31 +381,29 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
         pk_at_pk_only,
     ) {
         WalkDomain::Twin => return None,
-        WalkDomain::Invalid => return Some(preds),
+        WalkDomain::Invalid => {
+            // The `0` penalty for a non-physical parameter before the onset; a `NaN`
+            // still reaches the objective from it on (#2134).
+            if let Some(k) = onset {
+                for ev in &schedule.events[k..] {
+                    if ev.kind == EventKind::Obs {
+                        preds[ev.orig_idx] = nan;
+                        if let Some(s) = states.as_deref_mut() {
+                            s[ev.orig_idx] = vec![nan; n_states];
+                        }
+                    }
+                }
+            }
+            return Some(preds);
+        }
         WalkDomain::Walk => {}
     }
-    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
-    let nan = T::from_f64(f64::NAN);
     let mut state = [zero, zero];
     let mut arrived = vec![false; doses.len()];
-    // Set at the first interval of positive length whose disposition or open dose kernel
-    // is `NaN`. From there the state is `NaN`, as an integrator's would be, and the
-    // tilting terms are not evaluated: their `mgf` `debug_assert` rejects a `NaN` rate
-    // (#386). A record that governs no elapsed time (the first record, or one co-timed
-    // with the previous event) poisons nothing, as on the event-driven and ODE engines:
-    // its disposition never acts. A `NaN` `V` on an observation is still read as `NaN`
-    // by the readout's division.
-    let mut poisoned = false;
     let mut cur_t = schedule.events[0].time;
     for (i, ev) in schedule.events.iter().enumerate() {
         let pk_now = gov[i];
-        if ev.time > cur_t && !poisoned {
-            poisoned = pk_now.is_some_and(|p| disposition_is_nan(two_cpt, p))
-                || doses
-                    .iter()
-                    .zip(&arrived)
-                    .any(|(d, &a)| a && kernel_is_nan(d));
-        }
+        let poisoned = onset.is_some_and(|k| i >= k);
         if poisoned {
             state = [nan, nan];
         } else if ev.time > cur_t {

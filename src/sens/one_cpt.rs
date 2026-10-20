@@ -87,12 +87,21 @@ pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_
 /// flip-flop (#386), and the subject was scored against a confident zero. It returns
 /// before `convolve_1cpt`, so `mgf`'s `debug_assert` still never sees it.
 pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
-    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // A `NaN` parameter is served as `NaN` (#2134), before — and in preference to — the
+    // non-physical-parameter penalty below, so a `NaN` alongside e.g. a finite `CL ≤ 0`
+    // still reaches the objective.
+    if [cl, v, n, mtt].iter().any(|x| x.val().is_nan()) {
+        return nan_jet(cl + v + n + mtt);
+    }
+    if v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     let ktr = (n + T::from_f64(1.0)) / mtt;
-    // A `NaN` is served as `NaN` (#2134), before the guard below would clamp it.
+    // `ke = ∞/∞` is `NaN` too, served the same way.
     if ke.val().is_nan() || ktr.val().is_nan() {
         return nan_jet(ke + ktr);
     }
@@ -126,7 +135,15 @@ pub fn one_cpt_ig_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, mat: T, cv2: T, f_bio
 /// A `NaN` `ke` or abscissa is served as `NaN` before the guard (#2134), matching
 /// [`one_cpt_transit_amt_g`].
 pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
-    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // A `NaN` parameter wins over the non-physical-parameter penalty (#2134), as in
+    // `one_cpt_transit_amt_g`.
+    if [cl, v, mat, cv2].iter().any(|x| x.val().is_nan()) {
+        return nan_jet(cl + v + mat + cv2);
+    }
+    if v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
@@ -597,6 +614,10 @@ mod tests {
                 ("kernel a", (cl, v, nan, b)),
                 ("kernel b", (cl, v, a, nan)),
                 ("CL = V = inf", (f64::INFINITY, f64::INFINITY, a, b)),
+                // A NaN wins over a finite non-physical parameter (#2134 review).
+                ("CL = NaN, V < 0", (nan, -v, a, b)),
+                ("CL < 0, kernel a = NaN", (-cl, v, nan, b)),
+                ("V = 0, kernel b = NaN", (cl, 0.0, a, nan)),
             ] {
                 let r = f(p.0, p.1, p.2, p.3);
                 assert!(r.is_nan(), "{kernel}, {label}: must be NaN, not {r}");

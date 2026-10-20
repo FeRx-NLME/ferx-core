@@ -932,6 +932,11 @@ mod tests {
             let r = two_cpt_ig_amt_g::<f64>(100.0, 2.0, cl, v1, q, v2, p.4, p.5 * 1.5, 1.0);
             assert_eq!(r.is_nan(), ig_nan, "IG, kernel {p:?} → {r}");
         }
+        // A NaN wins over a finite non-physical parameter (#2134 review).
+        let mixed = two_cpt_transit_amt_g::<f64>(100.0, 2.0, -cl, v1, q, v2, f64::NAN, 0.3, 1.0);
+        assert!(mixed.is_nan(), "transit, CL < 0 with n = NaN: {mixed}");
+        let mixed = two_cpt_ig_amt_g::<f64>(100.0, 2.0, f64::NAN, v1, q, -v2, 0.3, 0.5, 1.0);
+        assert!(mixed.is_nan(), "IG, CL = NaN with V2 < 0: {mixed}");
         // Dual2 sensitivity path stays finite (exercises two_cpt_transit_conc_g).
         let d = two_cpt_transit_conc_g::<Dual2<6>>(
             &DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
