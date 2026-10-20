@@ -5353,7 +5353,7 @@ mod tests {
         };
         let x = [0.0, 0.0];
         let opts = FitOptions::default();
-        let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, None, &ofv, &opts)
+        let stencil = fd_ofv_stencil(2, &x, &[0, 1], &[], 1e-2, 0.0, None, &ofv, &opts)
             .expect("nothing cancels in a test");
 
         // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
@@ -5517,6 +5517,7 @@ mod tests {
                     n,
                     &x_hat,
                     &free_idx,
+                    &[],
                     opts.fd_hessian_step,
                     f0,
                     None,

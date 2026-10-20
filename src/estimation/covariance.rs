@@ -314,14 +314,23 @@ enum FdPert {
     },
 }
 
-/// The diagonal stencil's specs at step `eps`, in the order both [`select_fd_step`] and
-/// [`fd_ofv_stencil`] lay them out: `+hₐ, −hₐ` for each free coordinate `a`, with
-/// `hₐ = eps·(1 + |x̂ᵢ|)`. One builder for both, so the probe's accepted pass is the stencil's
-/// diagonal by construction rather than by two loops happening to agree (#1935).
-fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64) -> Vec<FdPert> {
+/// The step `hₐ = eps·(sᵢ + |x̂ᵢ|)` ([`fd_step`]) of each free coordinate `a`, with `sᵢ` its
+/// floor from [`fd_step_floors`]. The one place [`select_fd_step`] and [`fd_ofv_stencil`] take
+/// their steps from, for the points and the divisor alike (#2147).
+pub(crate) fn fd_hsteps(x_hat: &[f64], free_idx: &[usize], floors: &[f64], eps: f64) -> Vec<f64> {
+    free_idx
+        .iter()
+        .map(|&i| fd_step(eps, x_hat[i], floors, i))
+        .collect()
+}
+
+/// The diagonal stencil's specs for the steps `hsteps` ([`fd_hsteps`]), in the order both
+/// [`select_fd_step`] and [`fd_ofv_stencil`] lay them out: `+hₐ, −hₐ` for each free coordinate
+/// `a`. One builder for both, so the probe's accepted pass is the stencil's diagonal by
+/// construction rather than by two loops happening to agree (#1935).
+fn fd_diag_specs(free_idx: &[usize], hsteps: &[f64]) -> Vec<FdPert> {
     let mut specs = Vec::with_capacity(2 * free_idx.len());
-    for &i in free_idx {
-        let hi = eps * (1.0 + x_hat[i].abs());
+    for (&i, &hi) in free_idx.iter().zip(hsteps) {
         specs.push(FdPert::Single { i, di: hi });
         specs.push(FdPert::Single { i, di: -hi });
     }
@@ -381,6 +390,7 @@ pub(crate) struct FdStep {
 pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     x_hat: &[f64],
     free_idx: &[usize],
+    floors: &[f64],
     initial_eps: f64,
     f0: f64,
     ofv: &F,
@@ -389,7 +399,8 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     const MAX_HALVINGS: usize = 8;
     let mut eps = initial_eps;
     for halvings in 0..MAX_HALVINGS {
-        let specs = fd_diag_specs(x_hat, free_idx, eps);
+        let hsteps = fd_hsteps(x_hat, free_idx, floors, eps);
+        let specs = fd_diag_specs(free_idx, &hsteps);
         let report = cov_progress("step probe", specs.len(), options.verbose);
         let vals: Vec<f64> = specs
             .par_iter()
@@ -414,8 +425,7 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
         // including the division. A finite numerator can still overflow once divided by a tiny
         // hi², and the FD loop rejects on the quotient, so accepting the step here on the
         // numerator alone would hand back an eps the loop then rejects.
-        let all_ok = free_idx.iter().enumerate().all(|(a, &i)| {
-            let hi = eps * (1.0 + x_hat[i].abs());
+        let all_ok = hsteps.iter().enumerate().all(|(a, &hi)| {
             let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
             h_ii.is_finite()
         });
@@ -1151,6 +1161,7 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,
     x_hat: &[f64],
     free_idx: &[usize],
+    floors: &[f64],
     eps: f64,
     f0: f64,
     diag: Option<&[f64]>,
@@ -1158,16 +1169,13 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     options: &FitOptions,
 ) -> Option<FdStencil> {
     let nf = free_idx.len();
-    let hsteps: Vec<f64> = free_idx
-        .iter()
-        .map(|&i| eps * (1.0 + x_hat[i].abs()))
-        .collect();
+    let hsteps = fd_hsteps(x_hat, free_idx, floors, eps);
     // Flat list of perturbation SPECS (not materialised x-vectors): 2 per diagonal (±hᵢ), then
     // 4 per (a<b) off-diagonal pair. Each par_iter task clones `x_hat` once and applies its
     // spec, so only ~n_threads vectors are live at a time instead of all ~2·nf² perturbed
     // points held resident for the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
     let mut specs: Vec<FdPert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
-    specs.extend(fd_diag_specs(x_hat, free_idx, eps));
+    specs.extend(fd_diag_specs(free_idx, &hsteps));
     let n_diag = specs.len();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for a in 0..nf {
@@ -1271,6 +1279,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,
     x_hat: &[f64],
     free_idx: &[usize],
+    floors: &[f64],
     initial_eps: f64,
     f0: f64,
     ofv: &F,
@@ -1281,7 +1290,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
     // are finite. Most models use the initial step; halving only kicks in when the OFV
     // overflows at the default perturbation size.
-    let step = select_fd_step(x_hat, free_idx, initial_eps, f0, ofv, options);
+    let step = select_fd_step(x_hat, free_idx, floors, initial_eps, f0, ofv, options);
     if crate::cancel::is_cancelled(&options.cancel) {
         return None;
     }
@@ -1298,6 +1307,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
         n,
         x_hat,
         free_idx,
+        floors,
         step.eps,
         f0,
         step.diag.as_deref(),
@@ -1899,7 +1909,18 @@ pub(crate) fn compute_covariance_for(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
-        let stencil = fd_ofv_hessian(n, x_hat, &free_idx, initial_eps, f0_fd, &fd_ofv, options);
+        // An identity-packed θ is stepped relative to its declared initial value (#2147).
+        let floors = fd_step_floors(template, &model.default_params.theta);
+        let stencil = fd_ofv_hessian(
+            n,
+            x_hat,
+            &free_idx,
+            &floors,
+            initial_eps,
+            f0_fd,
+            &fd_ofv,
+            options,
+        );
         #[cfg(test)]
         FD_OBJECTIVE_EVALS
             .with(|c| c.set(c.get() + fd_evals.load(std::sync::atomic::Ordering::Relaxed)));
@@ -4739,7 +4760,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::Relaxed);
                 ofv(x)
             };
-            let got = fd_ofv_hessian(n, &x_hat, &free_idx, eps0, f0, &counted, &opts)
+            let got = fd_ofv_hessian(n, &x_hat, &free_idx, &[], eps0, f0, &counted, &opts)
                 .expect("nothing cancels in a test");
             assert_eq!(
                 calls.load(Ordering::Relaxed),
@@ -4747,14 +4768,14 @@ mod tests {
                 "{label}: objective evaluations on the FD Hessian route"
             );
 
-            let step = select_fd_step(&x_hat, &free_idx, eps0, f0, &ofv, &opts);
+            let step = select_fd_step(&x_hat, &free_idx, &[], eps0, f0, &ofv, &opts);
             assert_eq!(step.n_halvings, halvings, "{label}: halvings");
             assert_eq!(
                 step.diag.is_some(),
                 halvings < 8,
                 "{label}: a reusable pass exists exactly when one was accepted"
             );
-            let alone = fd_ofv_stencil(n, &x_hat, &free_idx, step.eps, f0, None, &ofv, &opts)
+            let alone = fd_ofv_stencil(n, &x_hat, &free_idx, &[], step.eps, f0, None, &ofv, &opts)
                 .expect("nothing cancels in a test");
             assert_eq!(got.hess, alone.hess, "{label}: reuse changed the matrix");
             assert_eq!(got.diag_nan, alone.diag_nan, "{label}: diag_nan");
@@ -4852,7 +4873,7 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| select_fd_step(&x_hat, &[0, 1, 2], 1e-2, quad(&x_hat), &ofv, &opts));
+            .install(|| select_fd_step(&x_hat, &[0, 1, 2], &[], 1e-2, quad(&x_hat), &ofv, &opts));
         assert_eq!(step.n_halvings, 0);
         assert!(
             witness.overlapped(),
@@ -4953,12 +4974,89 @@ mod tests {
             .num_threads(THREADS)
             .build()
             .unwrap()
-            .install(|| fd_ofv_hessian(4, &x_hat, &[0, 1, 2, 3], 1e-2, 1.0, &ofv, &opts));
+            .install(|| fd_ofv_hessian(4, &x_hat, &[0, 1, 2, 3], &[], 1e-2, 1.0, &ofv, &opts));
         assert!(got.is_none(), "a cancelled step must not return a Hessian");
         let n = calls.load(Ordering::SeqCst);
         assert!(
             (1..=THREADS).contains(&n),
             "{n} objective evaluations after the first call cancelled (at most {THREADS})"
         );
+    }
+
+    /// #2147: the FD Hessian steps each coordinate by `eps·(sᵢ + |x̂ᵢ|)`. Coordinate 0 is a
+    /// θ̂ = 0.0077 behind a penalty that is huge but finite below zero, the shape a bounded
+    /// identity-packed θ has. Under the unit floor its step is 0.0101, the minus point lands
+    /// in the penalty, and the probe accepts the resulting finite but absurd curvature. With
+    /// the floor at `|θ₀| = 0.0077` the step is 1.54e-4 and the diagonal is the quadratic's
+    /// own. Coordinate 1 at 7.7, floor 1, keeps today's step bit for bit: both sides of
+    /// the floor in one fixture.
+    #[test]
+    fn the_fd_hessian_steps_a_small_identity_theta_relative_to_its_floor() {
+        use super::fd_ofv_hessian;
+
+        let opts = crate::types::FitOptions {
+            verbose: false,
+            ..Default::default()
+        };
+        let x_hat = [0.0077f64, 7.7];
+        let (a0, a1) = (3.0, 0.5);
+        let points = std::sync::Mutex::new(Vec::<[f64; 2]>::new());
+        let ofv = |x: &[f64]| -> f64 {
+            points.lock().unwrap().push([x[0], x[1]]);
+            if x[0] < 0.0 {
+                1e16
+            } else {
+                a0 * (x[0] - x_hat[0]).powi(2) + a1 * (x[1] - x_hat[1]).powi(2)
+            }
+        };
+        let f0 = ofv(&x_hat);
+        let eps = 1e-2;
+        let run = |floors: &[f64]| {
+            points.lock().unwrap().clear();
+            let st = fd_ofv_hessian(2, &x_hat, &[0, 1], floors, eps, f0, &ofv, &opts)
+                .expect("nothing cancels in a test");
+            let pts = std::mem::take(&mut *points.lock().unwrap());
+            (st, pts)
+        };
+
+        let (old, old_pts) = run(&[]);
+        assert!(
+            old_pts.iter().any(|p| p[0] < 0.0),
+            "the unit floor must step coordinate 0 through zero, or the fixture is degenerate"
+        );
+        assert!(
+            old.hess[(0, 0)] > 1e3 * 2.0 * a0,
+            "the unit floor's diagonal must be the penalty's, not the quadratic's: {}",
+            old.hess
+        );
+
+        let (new, new_pts) = run(&[0.0077, 1.0]);
+        let step = |pts: &[[f64; 2]], c: usize| {
+            pts.iter()
+                .map(|p| (p[c] - x_hat[c]).abs())
+                .fold(0.0f64, f64::max)
+        };
+        assert!(
+            new_pts.iter().all(|p| p[0] > 0.0),
+            "a point stepped coordinate 0 through zero under its floor"
+        );
+        // `(x̂ + h) − x̂` rounds, so the step is read back to a relative 1e-12.
+        let close = |got: f64, want: f64| ((got - want) / want).abs() < 1e-12;
+        let (h0, h1) = (step(&new_pts, 0), step(&new_pts, 1));
+        assert!(
+            close(h0, eps * (0.0077 + 0.0077)),
+            "coordinate 0's step {h0}"
+        );
+        assert!(close(h1, eps * (1.0 + 7.7)), "coordinate 1's step {h1}");
+        assert_eq!(h1, step(&old_pts, 1), "a unit floor's step must not move");
+        assert!(new.diag_nan.is_empty() && new.offdiag_nan.is_empty());
+        for (c, a) in [(0, a0), (1, a1)] {
+            let h = new.hess[(c, c)];
+            assert!(
+                h.is_finite() && ((h - 2.0 * a) / (2.0 * a)).abs() < 1e-6,
+                "diagonal {c}: {h} vs {}",
+                2.0 * a
+            );
+        }
     }
 }

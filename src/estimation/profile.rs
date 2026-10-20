@@ -41,7 +41,7 @@ use std::time::Instant;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
-use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
+use crate::estimation::covariance::{fd_hsteps, fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
@@ -50,8 +50,8 @@ use crate::estimation::outer_optimizer::{
     OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, pack_with_bounds, theta_packs_log, unpack_params, PackedBounds,
-    PackedStart,
+    clamp_to_bounds, compute_mu_k, fd_step_floors, pack_with_bounds, theta_packs_log,
+    unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
 use crate::types::{
@@ -1181,9 +1181,18 @@ impl ProfileCtx<'_> {
                     .to_string(),
             );
         }
-        let Some(stencil) =
-            fd_ofv_hessian(n, x_hat, free, options.fd_hessian_step, f0, &f, options)
-        else {
+        // An identity-packed θ is stepped relative to its declared initial value (#2147).
+        let floors = fd_step_floors(hold, &self.model.default_params.theta);
+        let Some(stencil) = fd_ofv_hessian(
+            n,
+            x_hat,
+            free,
+            &floors,
+            options.fd_hessian_step,
+            f0,
+            &f,
+            options,
+        ) else {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
         };
         if !stencil.diag_nan.is_empty() || !stencil.offdiag_nan.is_empty() {
@@ -1284,10 +1293,8 @@ impl ProfileCtx<'_> {
         let layout = self.layout;
         let nf = free.len();
         let l = layout.coords.len();
-        let theta_steps: Vec<f64> = free
-            .iter()
-            .map(|&i| self.options.fd_hessian_step * (1.0 + x_hat[i].abs()))
-            .collect();
+        let floors = fd_step_floors(hold, &self.model.default_params.theta);
+        let theta_steps = fd_hsteps(x_hat, free, &floors, self.options.fd_hessian_step);
         let level_steps: Vec<f64> = solve.se_scale.iter().map(|s| COV_STEP_SE * s).collect();
         if !level_steps.iter().all(|s| s.is_finite() && *s > 0.0) {
             return Err(

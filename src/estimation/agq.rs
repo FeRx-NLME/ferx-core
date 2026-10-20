@@ -3027,6 +3027,8 @@ pub(crate) struct SubjectScoreContext<'a> {
     nodes: Vec<f64>,
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
+    /// Per-coordinate FD step floors (#2147): `|θ₀|` for a small identity-packed θ.
+    fd_floors: Vec<f64>,
     force_fd: bool,
     parallel_grid: bool,
 }
@@ -3052,6 +3054,10 @@ impl<'a> SubjectScoreContext<'a> {
             nodes: nodes.to_vec(),
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
+            fd_floors: crate::estimation::parameterization::fd_step_floors(
+                template,
+                &model.default_params.theta,
+            ),
             force_fd: force_fd || !analytic_gradient_available(model),
             parallel_grid: false,
         }
@@ -3203,7 +3209,8 @@ impl<'a> SubjectScoreContext<'a> {
             if self.fixed[k] {
                 continue;
             }
-            let h = 1e-4 * (1.0 + self.x[k].abs());
+            let h =
+                crate::estimation::parameterization::fd_step(1e-4, self.x[k], &self.fd_floors, k);
             let mut xp = self.x.to_vec();
             let mut xm = self.x.to_vec();
             xp[k] = (self.x[k] + h).min(self.bounds.upper[k]);

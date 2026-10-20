@@ -938,6 +938,7 @@ fn subject_nll_pop_grad_analytical(
 
     // ── Theta parameters (indices 0..n_theta) ──────────────────────────────
     let eps = 1e-5;
+    let floors = fd_step_floors(template, &model.default_params.theta);
     'theta: for k in 0..n_theta {
         if fixed_mask[k] {
             continue;
@@ -945,7 +946,7 @@ fn subject_nll_pop_grad_analytical(
 
         // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
         let d_ipreds: Vec<f64> = {
-            let h = eps * (1.0 + x[k].abs());
+            let h = fd_step(eps, x[k], &floors, k);
             let xk_plus = (x[k] + h).min(bounds.upper[k]);
             let actual_h = xk_plus - x[k];
             if actual_h.abs() < 1e-16 {
@@ -967,7 +968,7 @@ fn subject_nll_pop_grad_analytical(
         // is always FD. Cheap (one extra prediction eval per free θ) and only on
         // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
         let d_pop_preds: Vec<f64> = if use_pop_var {
-            let h = eps * (1.0 + x[k].abs());
+            let h = fd_step(eps, x[k], &floors, k);
             let xk_plus = (x[k] + h).min(bounds.upper[k]);
             let actual_h = xk_plus - x[k];
             if actual_h.abs() < 1e-16 {
@@ -1429,6 +1430,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
 
     let mut grad = vec![0.0f64; n];
     let eps = 1e-5;
+    let floors = fd_step_floors(template, &model.default_params.theta);
     for k in 0..n_theta {
         if fixed_mask[k] {
             continue;
@@ -1438,7 +1440,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         // of a second prediction call. Both perturbations are clamped to bounds
         // and the actual span is used as the denominator (degrades gracefully to
         // one-sided at a boundary).
-        let h = eps * (1.0 + x[k].abs());
+        let h = fd_step(eps, x[k], &floors, k);
         let xk_plus = (x[k] + h).min(bounds.upper[k]);
         let xk_minus = (x[k] - h).max(bounds.lower[k]);
         let actual_h = xk_plus - xk_minus;
@@ -1906,6 +1908,7 @@ pub(crate) fn subject_nll_pop_grad(
     let n = x.len();
     let fixed_mask = packed_fixed_mask(template);
     let eps = 1e-4;
+    let floors = fd_step_floors(template, &model.default_params.theta);
     fn mask_sentinel(nll: f64) -> f64 {
         if is_usable_subject_nll(nll) {
             nll
@@ -1934,7 +1937,7 @@ pub(crate) fn subject_nll_pop_grad(
         if fixed_mask[j] {
             continue;
         }
-        let h = eps * (1.0 + x[j].abs());
+        let h = fd_step(eps, x[j], &floors, j);
         let xj_plus = (x[j] + h).min(bounds.upper[j]);
         let xj_minus = (x[j] - h).max(bounds.lower[j]);
         let actual_2h = xj_plus - xj_minus;

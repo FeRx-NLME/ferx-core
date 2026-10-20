@@ -488,6 +488,102 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
 const A1_OFV: f64 = 1e-5;
 const A1_SE: f64 = 1e-2;
 
+// ── #2147: the profiled R steps a small identity-packed θ relative to its size ─────
+
+/// A1's profiled model at NONMEM (a)'s structural optimum, with `ED50` written as the
+/// identity-packed `ED50_S = k·ED50` (bounds `±100·ED50_S`): every structural SE (`ED50_S`'s
+/// divided by `k`) followed by every level SE.
+fn a1_scaled_ed50_ses(k: f64) -> Vec<f64> {
+    let (est_a, _) = ext("level_se_a.ext");
+    let ed50 = est_a["THETA3"] * k;
+    let text =
+        std::fs::read_to_string(root().join("nonmem_anchor/level_se_mbma_fit.ferx")).unwrap();
+    for needle in [UNPROFILED, "theta ED50(20.0, 0.1, 1000.0)", "(ED50 + DOSE)"] {
+        assert!(text.contains(needle), "fixture moved: {needle}");
+    }
+    let text = text
+        .replace(UNPROFILED, PROFILED)
+        .replace(
+            "theta ED50(20.0, 0.1, 1000.0)",
+            &format!(
+                "theta ED50_S({ed50:e}, {:e}, {:e})",
+                -100.0 * ed50,
+                100.0 * ed50
+            ),
+        )
+        .replace("(ED50 + DOSE)", &format!("(ED50_S / {k:e} + DOSE)"));
+    let path = unique_temp("ferx_profiled_levels_2147");
+    std::fs::write(&path, text).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(F1_DATA).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let model = &p.parsed.model;
+    let mut params = p.init_params.clone();
+    for i in 0..4 {
+        params.theta[i] = est_a[&format!("THETA{}", i + 1)];
+    }
+    params.theta[2] = ed50;
+    params.omega = OmegaMatrix::from_diagonal(&[est_a["OMEGA(1,1)"]], vec!["ETA_E0".into()]);
+    let opts = FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    };
+    let f = ferx_core::fit(model, &p.population, &params, &opts).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(f.profiled_blocks, ["PLACEBO"]);
+    let cov = f
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("k = {k:e}: covariance step: {:?}", f.warnings));
+    assert!(
+        !f.warnings.iter().any(|w| w.contains("regularized")),
+        "k = {k:e}: {:?}",
+        f.warnings
+    );
+    let se = f.se_theta.as_ref().expect("theta SEs");
+    let mut out = vec![se[0], se[1], se[2] / k, se[3]];
+    let levels =
+        &ferx_core::theta_level_values(model, &f.theta, Some(cov), None).unwrap()["PLACEBO"];
+    out.extend(
+        levels
+            .iter()
+            .map(|l| l.se.unwrap_or_else(|| panic!("{}: no SE", l.label))),
+    );
+    out
+}
+
+/// Both FD sites of the profiled step take the floor: the profile objective's stencil
+/// (the structural SEs) and the per-subject `B` block (the level SEs, through `D⁻¹Bᵀ`).
+///
+/// Worst over both `k`: structural 9.648e-5, levels 6.407e-6, so the bounds are 10× and
+/// 16× above them. With the stencil's floor dropped, structural 3.508e-2; with the `B`
+/// block's dropped, levels 3.526e-3 and structural unchanged: each site has its own bound
+/// that dies, 35× past it.
+#[test]
+fn the_profiled_covariance_steps_a_small_identity_theta_relative_to_its_size() {
+    let reference = a1_scaled_ed50_ses(1.0);
+    for k in [1e-3, 1e-4] {
+        let got = a1_scaled_ed50_ses(k);
+        assert_eq!(got.len(), reference.len());
+        let (mut worst_s, mut worst_l) = (0.0_f64, 0.0_f64);
+        for (i, (g, w)) in got.iter().zip(&reference).enumerate() {
+            let rel = ((g - w) / w).abs();
+            assert!(rel.is_finite(), "k = {k:e}, SE {i}: {g} vs {w}");
+            if i < 4 {
+                worst_s = worst_s.max(rel);
+            } else {
+                worst_l = worst_l.max(rel);
+            }
+        }
+        eprintln!("#2147 profiled, k = {k:e}: structural {worst_s:.3e}, levels {worst_l:.3e}");
+        assert!(worst_s < 1e-3, "k = {k:e}: structural SE {worst_s:e}");
+        assert!(worst_l < 1e-4, "k = {k:e}: level SE {worst_l:e}");
+    }
+}
+
 // ── EBE convergence: counted and guarded, as unprofiled (#2130 review #2) ──────────
 
 /// A starved inner solve (`inner_maxiter = 12` on F1: 4 subjects unconverged, 11 Nelder–Mead

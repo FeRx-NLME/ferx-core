@@ -57,6 +57,40 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
     }
 }
 
+/// The floor `sᵢ` of each packed coordinate's finite-difference step
+/// [`fd_step`]` = eps·(sᵢ + |xᵢ|)`, over the whole packed vector (#2147).
+///
+/// `sᵢ = 1` everywhere except on an identity-packed θ whose declared initial value
+/// `theta0[i]` (the model file's, `model.default_params`) is non-zero and below 1 in
+/// magnitude, where it is `|theta0[i]|`. A log-packed θ, an Ω Cholesky entry or a σ
+/// is dimensionless, so a unit floor already makes its step relative. An identity-packed
+/// θ carries its own units, and a unit floor stepped a `θ̂ = 0.0077` by about 0.01: the
+/// minus point sat at a negative volume, and every SE collapsed 1000×. NONMEM's
+/// unconstrained parameters scale each θ by its initial estimate in the same way.
+///
+/// A θ declared at 0 has no scale to offer and keeps the unit floor. So does one at or
+/// above 1, where `eps·(1 + |x|)` is already relative, which also keeps every such
+/// model's step bit-identical.
+pub(crate) fn fd_step_floors(template: &ModelParameters, theta0: &[f64]) -> Vec<f64> {
+    let mut floors = vec![1.0; packed_len(template)];
+    for (i, (floor, &lower)) in floors.iter_mut().zip(&template.theta_lower).enumerate() {
+        let t0 = theta0.get(i).map_or(0.0, |t| t.abs());
+        if !theta_packs_log(lower) && t0 > 0.0 && t0 < 1.0 {
+            *floor = t0;
+        }
+    }
+    floors
+}
+
+/// The finite-difference step on packed coordinate `i`: `eps·(floors[i] + |x|)`, with a
+/// missing floor read as 1 (see [`fd_step_floors`]). The one spelling of that step,
+/// shared by the covariance step's `R` stencil and the per-subject score that `S` is
+/// built from, so the two cannot drift apart.
+#[inline]
+pub(crate) fn fd_step(eps: f64, x: f64, floors: &[f64], i: usize) -> f64 {
+    eps * (floors.get(i).copied().unwrap_or(1.0) + x.abs())
+}
+
 /// Smallest value the **log packing** represents: [`pack_params`] floors at it
 /// and `compute_bounds` floors a declared θ *lower* bound at it, so a
 /// declaration reaching below it arrives at the optimizer as this number.
@@ -2221,6 +2255,51 @@ mod tests {
             }],
             residual_correlation_fixed: vec![false],
         }
+    }
+
+    /// #2147: the FD step's floor is `|θ₀|` on an identity-packed θ declared below 1 in
+    /// magnitude, and 1 everywhere else. `make_all_segments_template` packs θ₀ (`tvcl`) and
+    /// θ₂ (`tvf`) by log and θ₁ (`gamma`) as itself; θ₀ and θ₂ are given small initial
+    /// values here so the log gate, not the magnitude gate, is what keeps their floor at 1.
+    #[test]
+    fn fd_step_floors_scale_only_a_small_identity_theta() {
+        let t = make_all_segments_template();
+        let n = packed_len(&t);
+        let floors_at = |gamma0: Option<f64>| {
+            let mut theta0 = vec![0.5, 0.0, 0.03];
+            match gamma0 {
+                Some(g) => theta0[1] = g,
+                None => theta0.truncate(1),
+            }
+            fd_step_floors(&t, &theta0)
+        };
+        let mut want = vec![1.0; n];
+        want[1] = 0.0077;
+        assert_eq!(
+            floors_at(Some(-0.0077)),
+            want,
+            "|θ₀| for a small identity θ"
+        );
+        want[1] = 1.0;
+        for (label, g) in [
+            ("at 1 or above", Some(7.7)),
+            ("exactly 1", Some(-1.0)),
+            ("declared at 0", Some(0.0)),
+            ("no initial value", None),
+        ] {
+            assert_eq!(floors_at(g), want, "{label}: unit floor");
+        }
+        // The Ω, Σ, Ω_IOV, mixture and ρ coordinates are never scaled, whatever θ₀ holds.
+        assert_eq!(fd_step_floors(&t, &[]).len(), n);
+    }
+
+    /// #2147: `fd_step` reads a missing floor as 1, so a caller passing `&[]` keeps the
+    /// pre-#2147 step `eps·(1 + |x|)` exactly.
+    #[test]
+    fn fd_step_reads_a_missing_floor_as_one() {
+        assert_eq!(fd_step(1e-2, -0.5, &[], 0), 1e-2 * 1.5);
+        assert_eq!(fd_step(1e-2, -0.5, &[0.25], 0), 1e-2 * 0.75);
+        assert_eq!(fd_step(1e-2, -0.5, &[0.25], 1), 1e-2 * 1.5);
     }
 
     /// T1 (#1252). One walk produces the packed vector, the box and the FIX
