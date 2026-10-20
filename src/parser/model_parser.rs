@@ -14603,7 +14603,8 @@ fn build_ode_spec(
     // `init_fn` builds below (states + individual parameters, all three cases) and is
     // then sealed inside that closure, where nothing can inspect it. The state's slot
     // rides along so `chz_dependency_slice` can ask whether that seed can reach the
-    // hazard accumulator at all.
+    // hazard accumulator at all. Its only reader is the survival refusal, hence the gate.
+    #[cfg(feature = "survival")]
     let init_indiv_reads: Vec<(usize, Vec<usize>)> = init_specs
         .iter()
         .map(|(state_idx, expr)| {
@@ -14729,6 +14730,7 @@ fn build_ode_spec(
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
+        #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
         hoist: rhs_hoist,
@@ -28176,6 +28178,12 @@ pub struct OdeRhsProgram {
     /// construction sites, while this struct's are private and built in exactly one
     /// place. `init_fn` is an opaque `Box<dyn Fn>`, so an init read has to be recorded at
     /// parse time or not at all.
+    ///
+    /// `survival`-gated, as are the four accessors that read it
+    /// ([`Self::chz_dependency_slice`] and its siblings): their only production caller is
+    /// the joint PK-TTE refusal in `api/validation.rs`, so without the feature they are
+    /// dead code (#2075).
+    #[cfg(feature = "survival")]
     init_indiv_reads: Vec<(usize, Vec<usize>)>,
     /// Each `init(state) = …` as `(state, program)`, evaluable over any dual type — the
     /// exact initial state a dual walk seeds (`None`: no init, or one the compiled form
@@ -28288,6 +28296,7 @@ impl OdeRhsProgram {
     /// its own dose record (#1575), so they are not frozen and have no business in a
     /// slice of what *is*. `extract_input_rate_terms` has already lifted them out of
     /// `stmts`, so this falls out rather than needing a rule.
+    #[cfg(feature = "survival")]
     pub(crate) fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
         /// Every slot any statement in `stmts` writes, recursively.
         fn writes_into(stmts: &[Statement], out: &mut Vec<usize>) {
@@ -28429,6 +28438,7 @@ impl OdeRhsProgram {
     /// written, so a `true` here *is* "a statement the accumulator depends on reads it".
     ///
     /// Requires [`Self::has_indiv_param`] first.
+    #[cfg(feature = "survival")]
     pub(crate) fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
         debug_assert!(
             self.has_indiv_param(i),
@@ -28450,6 +28460,7 @@ impl OdeRhsProgram {
     ///
     /// Requires [`Self::has_indiv_param`] first. A seed whose state slot is outside the
     /// mask counts as reaching, for the same reason the sibling does.
+    #[cfg(feature = "survival")]
     pub(crate) fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
         debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
         self.has_indiv_param(i)
@@ -28473,6 +28484,7 @@ impl OdeRhsProgram {
     /// So a caller walking `CompiledModel::indiv_param_names` must skip the indices this
     /// returns `false` for. "The `[odes]` block does not read it" is the truth for them,
     /// not a default.
+    #[cfg(feature = "survival")]
     pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
     }
@@ -28844,6 +28856,7 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
 /// `compute_cov_static_mask` skips them: the snapshot this runs on is the *resolved*
 /// program (`build_pk_param_fn` clones `stmts_owned` after `resolve_variable_indices`),
 /// where every assignment carries its slot.
+#[cfg(feature = "survival")]
 fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
     fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
         // The slot list the two slot-walks take, rebuilt per statement group from the
@@ -29253,6 +29266,7 @@ impl IndivParamProgram {
     /// length is `indiv_param_names[i]` (#1356, pinned by
     /// `indiv_param_values_are_var_slot_ordered`). A slot the mask does not cover reads
     /// `true` — a missing answer must not look like "time-free" to a gate.
+    #[cfg(feature = "survival")]
     pub(crate) fn params_reading_time(&self) -> Vec<bool> {
         let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
         (0..self.n_top_level_vars)

@@ -388,6 +388,17 @@ group_clippy() {
   # `rustup update nightly` before trusting a green result here.
   run cargo clippy --no-default-features --features ci,markov,nn --all-targets -- -Dunused
 
+  # The same gate on the feature set ferx-core SHIPS with (`default = []`, which is what
+  # ferx-r builds). The line above cannot see it: `markov` implies `survival`, so an item
+  # whose only reader is `#[cfg(feature = "survival")]` counts as used there and is dead
+  # here. `-Dunused` is not additive across feature sets — a superset build proves
+  # nothing about a subset — and the one `check` line without `survival` is a `cargo
+  # check`, which denies nothing. That is how four parser items from #1924 (read only by
+  # the survival-gated refusal in `api/validation.rs`) warned in every default build for
+  # weeks with every gate green (#2075). `ci` alone rather than a bare default build so
+  # it shares the `check` group's feature hash; `ci` adds no source of its own.
+  run cargo clippy --no-default-features --features ci --all-targets -- -Dunused
+
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
   # ferx-core line) because the members' test code is a meaningful share of their
