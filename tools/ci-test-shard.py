@@ -702,29 +702,35 @@ def check(suite, n, directory, result=None, budget_min=None):
     print(f"{suite}: {len(where)} binaries over {n} shard(s), every listed test ran once")
 
 
-def check_nn(core_dir, nn_dir, list_path=SLOW_NN_TESTS):
-    """The binaries the nn leg must run are exactly those that gain a runnable
-    test under `nn`: a test `--list` names that `--list --ignored` does not. The
-    nn leg's `--list-all` is held against the core shards' lists, binary by
-    binary; the lib unit tests always run there. Read from the compiler, not
-    from the source text, so a `cfg` spelled in a way a grep misses still counts."""
-    errors = []
+def report_errors(errors):
+    for e in errors:
+        gh("error", e)
+    if errors:
+        sys.exit(1)
+
+
+def nn_inputs(core_dir, nn_dir):
+    """`(core lists, nn shard)`: every core shard's `--list`s by binary, and the
+    one nn manifest with its `--list-all`; exits with an error if either is missing."""
     core = {}
     for s in load_shards(core_dir):
         for b, v in s.lists.get("", {}).items():
             core[b] = v
-    nn = [s for s in load_shards(nn_dir)]
+    nn = load_shards(nn_dir)
+    errors = []
     if not core:
         errors.append(f"no core-shard lists under {core_dir}")
     if len(nn) != 1 or "X" not in nn[0].lists:
         errors.append(f"no nn --list-all manifest under {nn_dir}")
-    if errors:
-        for e in errors:
-            gh("error", e)
-        sys.exit(1)
-    nn = nn[0]
-    every = nn.lists["X"]
-    ran = set(nn.summary)
+    report_errors(errors)
+    return core, nn[0]
+
+
+def nn_gains(core, every):
+    """`(gains, errors)`: per binary both builds have, how many runnable tests nn
+    adds (a test `--list` names that `--list --ignored` does not); a binary only
+    one build has is an error."""
+    errors = []
     for b in sorted(set(core) ^ set(every)):
         side = "core" if b in core else "nn"
         errors.append(f"{b}: only the {side} build has this binary")
@@ -734,7 +740,13 @@ def check_nn(core_dir, nn_dir, list_path=SLOW_NN_TESTS):
         runnable_nn = every[b][0] - every[b][1]
         if runnable_nn - runnable_core:
             gains[b] = len(runnable_nn - runnable_core)
-    listed = set(binary_key(t) for t in read_list(Path(list_path)))
+    return gains, errors
+
+
+def nn_list_errors(gains, ran, listed):
+    """Every binary that gains a test ran in the nn job, and the list names no
+    binary that gains nothing."""
+    errors = []
     for b, g in sorted(gains.items()):
         if b in ran:
             continue
@@ -749,10 +761,20 @@ def check_nn(core_dir, nn_dir, list_path=SLOW_NN_TESTS):
     for b in sorted(listed - set(gains)):
         errors.append(f"{b}: listed in tools/slow-nn-tests.txt but gains no test under "
                       f"nn — drop it")
-    for e in errors:
-        gh("error", e)
-    if errors:
-        sys.exit(1)
+    return errors
+
+
+def check_nn(core_dir, nn_dir, list_path=SLOW_NN_TESTS):
+    """The binaries the nn leg must run are exactly those that gain a runnable
+    test under `nn`: a test `--list` names that `--list --ignored` does not. The
+    nn leg's `--list-all` is held against the core shards' lists, binary by
+    binary; the lib unit tests always run there. Read from the compiler, not
+    from the source text, so a `cfg` spelled in a way a grep misses still counts."""
+    core, nn = nn_inputs(core_dir, nn_dir)
+    gains, errors = nn_gains(core, nn.lists["X"])
+    listed = set(binary_key(t) for t in read_list(Path(list_path)))
+    errors += nn_list_errors(gains, set(nn.summary), listed)
+    report_errors(errors)
     print(f"nn: {len(gains)} binaries gain tests under nn, all run: "
           + " ".join(f"{b}(+{g})" for b, g in sorted(gains.items())))
 
