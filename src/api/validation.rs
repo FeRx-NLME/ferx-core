@@ -9140,7 +9140,39 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 /// per-CMT / steady-state / lag-time checks run as well. An explicit
 /// `data_path` overrides the model's `[data]` block, with a warning
 /// diagnostic when the two differ (see [`resolve_data_path`]).
+///
+/// The checks run against the model file's own `[fit_options]` and
+/// `[data_selection]`. To check against the settings a fit with call-time
+/// overrides actually uses, call [`validate_model_file_with`].
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
+    validate_model_file_with(model_path, data_path, &[])
+}
+
+/// [`validate_model_file`], against the options a fit with call-time overrides
+/// runs with (#2165).
+///
+/// `overrides` are `(key, value)` fit-option pairs — the keys of `[fit_options]`
+/// and `[data_selection]` (`ignore`, `accept`, `ignore_subjects`) — applied in
+/// order on top of the model file's own options with
+/// [`apply_fit_option`](crate::parser::model_parser::apply_fit_option) (and
+/// `method`, one method or a `[a, b]` chain, as a `[fit_options]` line reads it),
+/// the way ferx-r's `ferx_fit(settings = …)` builds the options it fits with: a later
+/// value of a scalar key wins, a selection clause is added to the file's. Every
+/// check reads the merged options — `check_model_options`, the variance-rail,
+/// box and prior checks, the data read's selection filter and `iov_column`,
+/// and the `iov_occasion` the model–data checks group occasions by — so a
+/// finding the fit would not produce is not reported, and one it would is.
+///
+/// A pair that cannot be applied — an unknown key, or a value the key does not
+/// accept — is an `E_FIT_OPTION` error, one per pair, and like a model file that
+/// does not parse it is terminal: the report carries only those diagnostics,
+/// since the options every other check would read are not ones any fit runs
+/// with. An empty `overrides` is exactly [`validate_model_file`].
+pub fn validate_model_file_with(
+    model_path: &str,
+    data_path: Option<&str>,
+    overrides: &[(String, String)],
+) -> CheckReport {
     use crate::io::model_source::ModelSource;
 
     // 1. Read and parse, once (#1752): the binding step below takes its text from
@@ -9167,6 +9199,18 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     // it (#1395: the check report used the stem unconditionally).
     super::run::set_model_name(&mut parsed.model, model_path);
     let model_name = parsed.model.name.clone();
+
+    // Call-time overrides (#2165), merged before anything reads the options. A
+    // pair that does not apply is terminal, like a parse failure: the checks
+    // below would describe options no fit runs with.
+    let override_errors = apply_fit_option_overrides(&mut parsed, overrides);
+    if !override_errors.is_empty() {
+        return CheckReport::new(
+            model_name,
+            data_path.map(|s| s.to_string()),
+            override_errors,
+        );
+    }
 
     // Resolve which dataset (if any) to check against: an explicit
     // `data_path` wins over the model's `[data]` block; absence of both just
@@ -9310,9 +9354,9 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    records. A covariate-validation failure surfaces as the matching
     //    diagnostic rather than a generic read error.
     //
-    //    The filter is the model file's own clauses and only those: this function
-    //    takes no `FitOptions`, so clauses a *caller* merges in (`fit_from_files`,
-    //    ferx-r's `ferx_fit(ignore =, accept =, ignore_ids =)`) are invisible here
+    //    The filter is the model file's own clauses plus any the caller passed as
+    //    `overrides` (#2165) — the same merged list a fit with those overrides
+    //    reads with. Clauses a caller merges in some other way are invisible here
     //    and a check cannot speak for them (#1465).
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
@@ -9409,6 +9453,54 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
     report
+}
+
+/// Apply `overrides` onto `parsed.fit_options` in order, with the parser's own
+/// [`apply_fit_option`](crate::parser::model_parser::apply_fit_option) (`method`
+/// through `apply_method_option`, as a `[fit_options]` line). Returns one
+/// `E_FIT_OPTION` error per pair that could not be applied; on any error
+/// `parsed.fit_options` is left partially updated, which the caller does not read
+/// further.
+///
+/// Only the options are updated, not the copies the parser stamped on the model
+/// (`bloq_method`, the ODE solver settings): no check reads those — every M3 gate
+/// a check reaches sits behind `check_model_options`, which arms
+/// `options.bloq_method` itself — and `fit()` resolves both from its options too.
+fn apply_fit_option_overrides(
+    parsed: &mut crate::types::ParsedModel,
+    overrides: &[(String, String)],
+) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for (key, value) in overrides {
+        let key = key.trim();
+        // `method` is parsed beside `apply_fit_option` rather than by it, so it is
+        // routed to the same helper `[fit_options]` uses.
+        let applied = if key == "method" {
+            crate::parser::model_parser::apply_method_option(&mut parsed.fit_options, value)
+                .map(|()| true)
+        } else {
+            crate::parser::model_parser::apply_fit_option(&mut parsed.fit_options, key, value)
+        };
+        match applied {
+            Ok(true) => {}
+            Ok(false) => errors.push(
+                Diagnostic::error(
+                    "E_FIT_OPTION",
+                    format!("fit option override `{key}` is not a known fit option"),
+                )
+                .with_suggestion(
+                    "use a `[fit_options]` or `[data_selection]` key; see the fit options \
+                     reference"
+                        .to_string(),
+                ),
+            ),
+            Err(e) => errors.push(Diagnostic::error(
+                "E_FIT_OPTION",
+                format!("fit option override `{key} = {value}`: {e}"),
+            )),
+        }
+    }
+    errors
 }
 
 /// The binding step of [`validate_model_file`]: bind `parsed` to `population`

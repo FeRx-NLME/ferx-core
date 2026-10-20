@@ -41,9 +41,9 @@ pub use api::{
     simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs, simulate_with_options,
     simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty,
     simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
-    AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult, PoolPlan, PredictionOutput,
-    PredictionResult, PreparedRun, ReaderSettings, RunOverrides, SimulateOptions,
-    SimulateUncertaintyOptions, SimulationOutput, SimulationResult, SuppliedEtas,
+    validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
+    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
+    SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult, SuppliedEtas,
     UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;

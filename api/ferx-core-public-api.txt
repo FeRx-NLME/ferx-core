@@ -157,6 +157,7 @@ pub fn ferx_core::api::tafd_tad_for_subject(subject: &ferx_core::Subject, obs_id
 pub fn ferx_core::api::theta_level_map(model: &ferx_core::CompiledModel) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub mod ferx_core::build_info
 pub enum ferx_core::build_info::GradientMethodKind
@@ -5332,6 +5333,7 @@ pub fn ferx_core::stalled_at_init(result: &ferx_core::FitResult) -> core::option
 pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>

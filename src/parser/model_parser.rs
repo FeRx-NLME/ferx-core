@@ -10018,6 +10018,52 @@ fn reject_fit_option_line(line: &str) -> String {
     )
 }
 
+/// Apply a `method = …` value — one method, or a `[a, b, c]` chain — to `opts`,
+/// the way a `[fit_options]` line does. `method` is the one `[fit_options]` key
+/// [`apply_fit_option`] does not take (a front end with a dedicated method
+/// argument parses it itself), so the parser and `validate_model_file_with`'s
+/// overrides (#2165) share this instead of two spellings of the rule.
+pub(crate) fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
+    let raw = value.trim();
+    // List form: `method = [a, b, c]` — chain of stages.
+    if raw.starts_with('[') {
+        let inner = raw.trim_start_matches('[').trim_end_matches(']');
+        let chain: Vec<EstimationMethod> = inner
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(parse_method_token)
+            .collect::<Result<_, _>>()?;
+        if chain.is_empty() {
+            return Err("method = [] is empty; provide at least one method".into());
+        }
+        // A final `focei` switches interaction on and a final `foce`
+        // switches it off; any other final stage leaves the default
+        // (on) alone, as the single-method form below does. The chain
+        // form used to *clear* the flag for every chain not ending in
+        // `focei`, so `method = [saem, imp]` reported SAEM's final
+        // FOCE-approximation objective *without* interaction — 175
+        // units above the FOCEI objective at the same estimates on the
+        // thiotepa model of #1415 — and every SAEM-vs-FOCEI comparison
+        // built on that number compared two different objectives. A
+        // `foce` / `focei` *stage* still sets its own flag per stage in
+        // `api::fit` (FOCEI on, FOCE off).
+        opts.interaction = crate::types::interaction_for(*chain.last().unwrap(), opts.interaction);
+        opts.method = *chain.last().unwrap();
+        opts.methods = chain;
+    } else {
+        let m = parse_method_token(raw)?;
+        opts.method = m;
+        opts.methods.clear();
+        // `foce` clears the flag as `focei` sets it (#1710): left at the `true`
+        // default, a file `method = foce` scored its SIR weights and CWRES under
+        // the FOCEI marginal while estimating under the FOCE one.
+        opts.interaction = crate::types::interaction_for(m, opts.interaction);
+    }
+    opts.user_set_keys.push("method".to_string());
+    Ok(())
+}
+
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
     let mut opts = FitOptions::default();
     for line in lines {
@@ -10041,44 +10087,7 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
             return Err(reject_fit_option_line(line));
         }
         if parts[0] == "method" {
-            let raw = parts[1].trim();
-            // List form: `method = [a, b, c]` — chain of stages.
-            if raw.starts_with('[') {
-                let inner = raw.trim_start_matches('[').trim_end_matches(']');
-                let chain: Vec<EstimationMethod> = inner
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(parse_method_token)
-                    .collect::<Result<_, _>>()?;
-                if chain.is_empty() {
-                    return Err("method = [] is empty; provide at least one method".into());
-                }
-                // A final `focei` switches interaction on and a final `foce`
-                // switches it off; any other final stage leaves the default
-                // (on) alone, as the single-method form below does. The chain
-                // form used to *clear* the flag for every chain not ending in
-                // `focei`, so `method = [saem, imp]` reported SAEM's final
-                // FOCE-approximation objective *without* interaction — 175
-                // units above the FOCEI objective at the same estimates on the
-                // thiotepa model of #1415 — and every SAEM-vs-FOCEI comparison
-                // built on that number compared two different objectives. A
-                // `foce` / `focei` *stage* still sets its own flag per stage in
-                // `api::fit` (FOCEI on, FOCE off).
-                opts.interaction =
-                    crate::types::interaction_for(*chain.last().unwrap(), opts.interaction);
-                opts.method = *chain.last().unwrap();
-                opts.methods = chain;
-            } else {
-                let m = parse_method_token(raw)?;
-                opts.method = m;
-                opts.methods.clear();
-                // `foce` clears the flag as `focei` sets it (#1710): left at the `true`
-                // default, a file `method = foce` scored its SIR weights and CWRES under
-                // the FOCEI marginal while estimating under the FOCE one.
-                opts.interaction = crate::types::interaction_for(m, opts.interaction);
-            }
-            opts.user_set_keys.push("method".to_string());
+            apply_method_option(&mut opts, parts[1])?;
             continue;
         }
         // All other keys flow through the shared dispatch. Both `.ferx`
