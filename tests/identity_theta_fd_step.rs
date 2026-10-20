@@ -175,7 +175,8 @@ fn check(route: Route, ks: &[f64], tol: f64) {
     }
 }
 
-/// Worst SE at every `k` 1.206e-4 (SE(TVV)), so `1e-3` is 8× headroom. Before the fix:
+/// Worst SE at every `k` 1.206e-4 (SE(TVV)), Linux x86_64 and macOS arm64 alike, so `1e-3`
+/// is 8× headroom. Before the fix:
 /// 1.01e-2 at `k = 1e-2`, and at `k ≤ 1e-3` the matrix was regularized and every SE ~1000×
 /// small.
 #[test]
@@ -197,9 +198,11 @@ fn the_fd_r_matrix_does_not_step_a_small_identity_theta_through_zero() {
 /// the central FD of the whole subject objective (IIV on the residual error), and the
 /// quadrature score's reconverged central FD (`method = laplace`).
 ///
-/// Worst SE, then before the fix: Laplace 4.258e-7 (5.35e-4), Sheiner–Beal 3.515e-6
-/// (4.97e-3), FD 1.489e-4 (0.27, SE(TVV)), quadrature FD 5.805e-6 (1.876e-2, SE(TVV)),
-/// each bound 5–70× above the first and 18–625× below the second. The FD route runs at
+/// Worst SE on Linux x86_64, macOS arm64 in brackets where it differs, then before the fix
+/// (macOS arm64): Laplace 9.344e-10 [4.258e-7] (5.35e-4), Sheiner–Beal 3.515e-6 (4.97e-3),
+/// FD 1.489e-4 (0.27, SE(TVV)), quadrature FD 1.393e-5 [5.805e-6] (1.876e-2, SE(TVV)). Each
+/// bound sits 7–70× above the worst on either platform and 18–270× below the value before
+/// the fix. The FD route runs at
 /// `k = 1e-3`: at `1e-4` its `S` is rejected as singular with or without this fix, by the
 /// scale-dependent floor of #2145.
 #[test]
@@ -208,7 +211,7 @@ fn the_score_steps_a_small_identity_theta_relative_to_its_size() {
         (true, false, false, 1e-4, 3e-5),
         (false, false, false, 1e-4, 3e-5),
         (true, true, false, 1e-3, 1e-3),
-        (true, false, true, 1e-4, 3e-5),
+        (true, false, true, 1e-4, 1e-4),
     ] {
         check(
             Route {
@@ -292,7 +295,8 @@ fn an_identity_packed_v_in_small_units_reproduces_nonmem_matrix_r_ses_by_fd() {
             worst = rel;
         }
     }
-    // Worst 5.175e-4 (SE(PROP_ERR); SE(TVV) 1.80e-4), so `2e-3` is 3.9× headroom. Before
+    // Worst 5.175e-4 (SE(PROP_ERR); SE(TVV) 1.80e-4), Linux x86_64 and macOS arm64 alike,
+    // so `2e-3` is 3.9× headroom. Before
     // the fix every SE was ~1000× small (worst 1.0).
     eprintln!("#432 twin: WORST {worst:.3e}");
     assert!(

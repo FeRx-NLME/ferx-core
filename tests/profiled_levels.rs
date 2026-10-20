@@ -558,7 +558,8 @@ fn a1_scaled_ed50_ses(k: f64) -> Vec<f64> {
 /// Both FD sites of the profiled step take the floor: the profile objective's stencil
 /// (the structural SEs) and the per-subject `B` block (the level SEs, through `D⁻¹Bᵀ`).
 ///
-/// Worst over both `k`: structural 9.648e-5, levels 6.407e-6, so the bounds are 10× and
+/// Worst over both `k`: structural 9.648e-5, levels 6.407e-6, Linux x86_64 and macOS arm64
+/// alike, so the bounds are 10× and
 /// 16× above them. With the stencil's floor dropped, structural 3.508e-2; with the `B`
 /// block's dropped, levels 3.526e-3 and structural unchanged: each site has its own bound
 /// that dies, 35× past it.
