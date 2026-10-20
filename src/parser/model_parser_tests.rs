@@ -34357,31 +34357,92 @@ mod analytic_hazard_time_1919 {
         }
     }
 
-    /// **Conservative across separate `if` statements, pinned** (round-3 review). Every
-    /// execution leaves `LAM` time-free — `LAM = K` runs only when `TVKT > 0` is false,
-    /// which is exactly when `K = TIME` did not run — but proving that needs the two
-    /// conditions to be recognised as one, which the walk does not attempt (condition
-    /// equivalence is undecidable in general). So it is refused, and the refusal says the
-    /// dependency is on only some paths and how to rewrite. The one-`if` form of the same
-    /// model parses (`a_time_dependency_on_no_single_path_is_not_refused`), which is the
-    /// rewrite the message suggests. If a later change makes this parse, it must still
-    /// refuse `a_time_dependency_on_any_single_path_is_refused`.
+    /// The two-`if` model of the round-3/4 reviews, as text with the second condition
+    /// spelled by the caller and an optional statement between the two `if`s.
+    fn split_ifs(second_cond: &str, between: &str) -> String {
+        format!(
+            "{BASE_IP}  SW = TVKT\n  K = TVLAMBDA\n  LAM = TVLAMBDA\n  \
+             if (SW > 0) {{\n    K = TIME\n  }}\n{between}  \
+             if ({second_cond}) {{\n    LAM = TVLAMBDA\n  }} else {{\n    LAM = K\n  }}"
+        )
+    }
+
+    /// **Identical conditions correlate across separate `if`s** (round-4 review). `LAM = K`
+    /// runs only when `SW > 0` is false, which is exactly when `K = TIME` did not run, so
+    /// `LAM` is time-free on every execution and the model parses. Straddle asserted: the
+    /// block does read `TIME`, on a path the hazard's value never takes.
     #[test]
-    fn a_dependency_split_across_separate_ifs_is_refused_with_the_some_path_caveat() {
+    fn a_dependency_split_across_identically_conditioned_ifs_is_not_refused() {
+        let src = model(
+            &split_ifs("SW > 0", ""),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let model = parse_model_string(&src).expect("identical conditions must correlate");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME"
+        );
+    }
+
+    /// The correlation is what decides it, not the shape: on either side of the gate the
+    /// same model is refused. (a) An **equivalent condition written differently** is not
+    /// correlated — equivalence is undecidable in general — so the refusal stands and carries
+    /// the some-path caveat with its rewrite; every sentence asserted. (b) Re-assigning the
+    /// condition's input between the two `if`s makes the second test a different question
+    /// (`SW = -1` here: the `else` always runs, so `LAM = K` really is `TIME` whenever the
+    /// first `if` fired) — a recorded outcome that survived the re-assignment would accept
+    /// a genuinely `TIME`-dependent hazard.
+    #[test]
+    fn a_dependency_split_across_uncorrelated_ifs_is_refused_with_the_some_path_caveat() {
+        for (label, ip) in [
+            ("written differently", split_ifs("0 < SW", "")),
+            ("input re-assigned", split_ifs("SW > 0", "  SW = -1\n")),
+        ] {
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            for part in [
+                "value `LAM`, whose value depends on the `TIME` built-in (through `K`).",
+                SOME_PATH,
+                "the check correlates separate `if` statements only when their conditions are \
+                 written identically and read no value re-assigned in between",
+                "so if that path cannot occur, write those conditions identically or merge the \
+                 `if` statements into one.",
+            ] {
+                assert!(err.contains(part), "{label}: missing `{part}` in: {err}");
+            }
+        }
+    }
+
+    /// Past `MAX_TIME_WORLDS` live paths the walk merges them (union join, facts dropped),
+    /// which must stay sound: seven independent `if`s (2^7 = 128 paths) before a `TIME`
+    /// read on one arm still refuse, with the caveat; and the merge forgets the first `if`'s
+    /// outcome, so the round-4 correlation it would otherwise find is conservatively lost.
+    #[test]
+    fn many_sequential_ifs_merge_paths_soundly() {
+        let mut pad = String::new();
+        for i in 0..7 {
+            pad.push_str(&format!(
+                "  if (TVKT > {i}) {{\n    A{i} = 1\n  }} else {{\n    A{i} = 2\n  }}\n"
+            ));
+        }
+        // The hazard must reach the `A{i}`, or the reachability filter drops the pad.
+        let tail = "  LAM = LAM + 0 * (A0 + A1 + A2 + A3 + A4 + A5 + A6)";
         let ip = format!(
-            "{BASE_IP}  K = TVLAMBDA\n  LAM = TVLAMBDA\n  if (TVKT > 0) {{\n    K = TIME\n  }}\n  \
-             if (TVKT > 0) {{\n    LAM = TVLAMBDA\n  }} else {{\n    LAM = K\n  }}"
+            "{BASE_IP}  if (TVKT > 0.5) {{\n    LAM = TVLAMBDA * TIME\n  }} else {{\n    \
+             LAM = TVLAMBDA\n  }}\n{pad}{tail}"
         );
         let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
-        for part in [
-            "value `LAM`, whose value depends on the `TIME` built-in (through `K`).",
-            SOME_PATH,
-            "the check does not correlate conditions across separate `if` statements",
-            "so if that path cannot occur, assign `LAM` without reading a value another `if` \
-             makes TIME-dependent (e.g. merge the two `if` statements into one).",
-        ] {
-            assert!(err.contains(part), "missing `{part}` in: {err}");
-        }
+        assert!(err.contains(SOME_PATH), "merged: got: {err}");
+        let src = model(
+            &format!("{}\n{tail}", split_ifs("SW > 0", &pad)),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("(through `K`)"),
+            "merge drops facts: got: {err}"
+        );
     }
 
     /// `TIME` written directly in a hazard parameter expression.

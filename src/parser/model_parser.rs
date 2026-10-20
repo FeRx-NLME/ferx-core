@@ -7919,18 +7919,18 @@ fn reject_time_in_analytic_hazard(
         } else {
             format!(" (through `{}`)", taint.root)
         };
-        // A dependency carried by only some arms of an `if` may be infeasible when a later
-        // `if` re-tests the same condition: the walk does not correlate separate `if`s,
-        // because that needs condition equivalence, which it cannot decide in general
-        // (`TVKT > 0` vs `0 < TVKT`, or a covariate test). Say so on exactly those refusals,
-        // so a user whose model is in fact time-free has the rewrite in hand.
+        // A dependency carried by only some paths may still be infeasible when two `if`s
+        // test equivalent conditions written differently (`TVKT > 0` vs `0 < TVKT`): the walk
+        // correlates only identically-written ones, since equivalence in general cannot be
+        // decided. Say so on exactly those refusals, so a user whose model is in fact
+        // time-free has the rewrite in hand.
         let some_path = if taint.some_path {
             format!(
                 " This dependency holds on at least one path through the block's `if` \
-                 statements; the check does not correlate conditions across separate `if` \
-                 statements, so if that path cannot occur, assign `{name}` without reading a \
-                 value another `if` makes TIME-dependent (e.g. merge the two `if` statements \
-                 into one)."
+                 statements; the check correlates separate `if` statements only when their \
+                 conditions are written identically and read no value re-assigned in between, \
+                 so if that path cannot occur, write those conditions identically or merge the \
+                 `if` statements into one."
             )
         } else {
             String::new()
@@ -7949,38 +7949,62 @@ fn reject_time_in_analytic_hazard(
 struct TimeTaint {
     /// The name whose own assignment, or governing condition, reads `TIME` directly.
     root: String,
-    /// The dependency is carried by only some paths through an `if` (a join of arms that
-    /// disagree), so it may be infeasible if a later `if` re-tests the same condition.
+    /// The dependency is carried by only some paths through the block's `if`s, so it may
+    /// be infeasible if two `if`s test equivalent conditions written differently.
     some_path: bool,
 }
 
+/// Where a value's `TIME` dependence comes from: `Some(None)` reads `TIME` itself,
+/// `Some(Some(root))` reads a dependent name, `None` is time-free.
+#[cfg(feature = "survival")]
+type TimeSrc = Option<(Option<String>, bool)>;
+
+/// One set of paths through the block that agree on every condition outcome recorded so far.
+#[cfg(feature = "survival")]
+#[derive(Clone)]
+struct TimeWorld {
+    taint: HashMap<String, TimeTaint>,
+    /// Outcomes of the conditions taken on these paths, keyed by the condition's structure
+    /// (`Debug` of the AST), with the names it reads so a re-assignment can drop it.
+    facts: Vec<(String, std::collections::HashSet<String>, bool)>,
+    /// The `TIME` dependence of the enclosing arms' conditions.
+    governed: TimeSrc,
+}
+
+/// Above this many live worlds the walk merges them into one and forgets their facts —
+/// the round-3 union join, which is conservative — so a block of many sequential `if`s
+/// cannot blow up exponentially. Real `[individual_parameters]` blocks stay far below it.
+#[cfg(feature = "survival")]
+const MAX_TIME_WORLDS: usize = 64;
+
 /// Which names hold a `TIME`-dependent value once `stmts` has run.
 ///
-/// One forward pass in program order, the way the block executes. An `Assign` is a strong
-/// update — a name re-assigned from a time-free RHS is clean again — and its value depends
-/// on `TIME` when its RHS reads `TIME` or a currently dependent name, or when a governing
-/// `if` condition does (every condition up to and including the arm's own: an arm runs only
-/// when the earlier conditions were false, as in `compute_time_dependent_mask`). Each arm
-/// runs from the state before the `if`; the state after it is the union over the arms, plus
-/// the state before when there is no `else`. So a definition on one arm never pairs with a
-/// read on another arm of the **same** `if` (round-2 review).
+/// One forward pass in program order, the way the block executes, over a set of
+/// **worlds**: each is a group of paths that took the same arm of every `if` so far, with
+/// its own taint map. An `Assign` is a strong update — a name re-assigned from a time-free
+/// RHS is clean again — and its value depends on `TIME` when its RHS reads `TIME` or a
+/// currently dependent name, or when a governing `if` condition does (every condition up to
+/// and including the arm's own: an arm runs only when the earlier conditions were false, as
+/// in `compute_time_dependent_mask`). An `if` splits each world into one per arm (plus the
+/// fall-through when there is no `else`), recording the condition outcomes that select it.
 ///
-/// **Conservative across separate `if` statements, by design.** The join forgets which
-/// arm ran, so two `if`s re-testing one condition are treated as independent, and a
-/// dependency on a path no execution takes can be refused (round-3 review:
-/// `if (C) { K = TIME }; if (C) { LAM = 1 } else { LAM = K }`). Correlating them needs
-/// condition equivalence, which is undecidable in general; the over-approximation never
-/// accepts a `TIME`-dependent hazard, it is the direction #1853's
-/// `compute_time_dependent_mask` takes too, and such a refusal says so (`some_path`).
+/// **Path correlation (round-2/3/4 reviews).** A definition on one arm never pairs with a
+/// read on another arm of the same `if`, and an `if` whose condition is written
+/// identically to one a world already decided — with no name it reads re-assigned since —
+/// takes only the arm that outcome selects, so
+/// `if (C) { K = TIME }; if (C) { LAM = 1 } else { LAM = K }` leaves `LAM` time-free.
+/// Equivalent conditions written differently (`TVKT > 0` vs `0 < TVKT`) are not
+/// correlated — equivalence is undecidable in general — so the result stays a sound
+/// over-approximation: it never misses a `TIME`-dependent value, the direction #1853's
+/// `compute_time_dependent_mask` takes too, and a refusal that may be such a false
+/// positive says so (`some_path`).
 #[cfg(feature = "survival")]
 fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, TimeTaint> {
-    // `Some((None, _))`: reads `TIME` itself; `Some((Some(root), some_path))`: reads a
-    // dependent name.
-    type Src = Option<(Option<String>, bool)>;
+    use std::collections::HashSet;
     fn src_of(
         visit: &mut dyn FnMut(&mut dyn FnMut(&Expression)),
         st: &HashMap<String, TimeTaint>,
-    ) -> Src {
+    ) -> TimeSrc {
         let (mut direct, mut via) = (false, None);
         visit(&mut |e: &Expression| match e {
             Expression::Time => direct = true,
@@ -7995,51 +8019,111 @@ fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, TimeTaint> {
             via
         }
     }
-    fn walk(stmts: &[Statement], governed: &Src, st: &mut HashMap<String, TimeTaint>) {
+    /// Union of the worlds' taint: a name dependent in every world, on a must-path in each,
+    /// stays a must-dependency; otherwise it is `some_path`.
+    fn join(worlds: &[TimeWorld]) -> HashMap<String, TimeTaint> {
+        let mut out: HashMap<String, TimeTaint> = HashMap::new();
+        for w in worlds {
+            for (k, v) in &w.taint {
+                out.entry(k.clone()).or_insert_with(|| {
+                    let on_every = worlds.iter().all(|w| w.taint.contains_key(k));
+                    let some_path = !on_every
+                        || worlds
+                            .iter()
+                            .any(|w| w.taint.get(k).is_some_and(|t| t.some_path));
+                    TimeTaint {
+                        root: v.root.clone(),
+                        some_path,
+                    }
+                });
+            }
+        }
+        out
+    }
+    fn assign(w: &mut TimeWorld, name: &str, e: &Expression) {
+        match src_of(&mut |f| visit_expr_nodes(e, f), &w.taint).or_else(|| w.governed.clone()) {
+            Some((root, some_path)) => {
+                let root = root.unwrap_or_else(|| name.to_string());
+                w.taint
+                    .insert(name.to_string(), TimeTaint { root, some_path });
+            }
+            None => {
+                w.taint.remove(name);
+            }
+        }
+        // A recorded outcome no longer describes a condition whose input just changed.
+        w.facts.retain(|(_, reads, _)| !reads.contains(name));
+    }
+    fn walk(stmts: &[Statement], mut worlds: Vec<TimeWorld>) -> Vec<TimeWorld> {
         for s in stmts {
             match s {
                 Statement::Assign(name, e) => {
-                    match src_of(&mut |f| visit_expr_nodes(e, f), st).or_else(|| governed.clone()) {
-                        Some((root, some_path)) => {
-                            let root = root.unwrap_or_else(|| name.clone());
-                            st.insert(name.clone(), TimeTaint { root, some_path });
-                        }
-                        None => {
-                            st.remove(name);
-                        }
+                    for w in &mut worlds {
+                        assign(w, name, e);
                     }
                 }
                 Statement::If {
                     branches,
                     else_body,
                 } => {
-                    let before = st.clone();
-                    let mut arms: Vec<HashMap<String, TimeTaint>> = Vec::new();
-                    let mut g = governed.clone();
-                    for (cond, body) in branches {
-                        g = g.or_else(|| src_of(&mut |f| visit_condition_nodes(cond, f), &before));
-                        let mut arm = before.clone();
-                        walk(body, &g, &mut arm);
-                        arms.push(arm);
-                    }
-                    let mut arm = before.clone();
-                    if let Some(eb) = else_body {
-                        walk(eb, &g, &mut arm);
-                    }
-                    arms.push(arm);
-                    st.clear();
-                    for arm in &arms {
-                        for (k, v) in arm {
-                            st.entry(k.clone()).or_insert_with(|| {
-                                let on_every_arm = arms.iter().all(|a| a.contains_key(k));
-                                let some_path = !on_every_arm
-                                    || arms.iter().any(|a| a.get(k).is_some_and(|t| t.some_path));
-                                TimeTaint {
-                                    root: v.root.clone(),
-                                    some_path,
+                    let mut out = Vec::new();
+                    for w in worlds {
+                        let saved = w.governed.clone();
+                        // `rest`: the paths of `w` on which every condition so far was false.
+                        let mut rest = Some(w);
+                        let mut g = saved.clone();
+                        for (cond, body) in branches {
+                            let Some(r) = rest.take() else { break };
+                            g = g.or_else(|| {
+                                src_of(&mut |f| visit_condition_nodes(cond, f), &r.taint)
+                            });
+                            let key = format!("{cond:?}");
+                            let known = r.facts.iter().find(|(k, _, _)| *k == key).map(|f| f.2);
+                            let mut reads = HashSet::new();
+                            visit_condition_nodes(cond, &mut |e: &Expression| {
+                                if let Expression::Variable(n) = e {
+                                    reads.insert(n.clone());
                                 }
                             });
+                            if known != Some(false) {
+                                let mut taken = r.clone();
+                                if known.is_none() {
+                                    taken.facts.push((key.clone(), reads.clone(), true));
+                                }
+                                taken.governed = g.clone();
+                                out.extend(walk(body, vec![taken]).into_iter().map(|mut t| {
+                                    t.governed = saved.clone();
+                                    t
+                                }));
+                            }
+                            if known != Some(true) {
+                                let mut skip = r;
+                                if known.is_none() {
+                                    skip.facts.push((key, reads, false));
+                                }
+                                rest = Some(skip);
+                            }
                         }
+                        if let Some(mut r) = rest {
+                            if let Some(eb) = else_body {
+                                r.governed = g;
+                                out.extend(walk(eb, vec![r]).into_iter().map(|mut t| {
+                                    t.governed = saved.clone();
+                                    t
+                                }));
+                            } else {
+                                out.push(r);
+                            }
+                        }
+                    }
+                    worlds = out;
+                    if worlds.len() > MAX_TIME_WORLDS {
+                        let governed = worlds.iter().find_map(|w| w.governed.clone());
+                        worlds = vec![TimeWorld {
+                            taint: join(&worlds),
+                            facts: Vec::new(),
+                            governed,
+                        }];
                     }
                 }
                 // `[individual_parameters]` at parse time holds only named assignments and
@@ -8051,10 +8135,14 @@ fn indiv_time_taint_at_exit(stmts: &[Statement]) -> HashMap<String, TimeTaint> {
                 | Statement::DiffEqBc(..) => {}
             }
         }
+        worlds
     }
-    let mut st = HashMap::new();
-    walk(stmts, &None, &mut st);
-    st
+    let start = TimeWorld {
+        taint: HashMap::new(),
+        facts: Vec::new(),
+        governed: None,
+    };
+    join(&walk(stmts, vec![start]))
 }
 
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
