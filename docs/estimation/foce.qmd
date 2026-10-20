@@ -538,6 +538,19 @@ and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV equals NONMEM's (�
 
 (macOS arm64. Before #1722 the FOCE column was off by up to 6% — ω²(KA) 0.1510 — because the covariance step linearised around EBEs NONMEM does not use. A FOCE fit with proportional or combined error now takes the FD covariance stencil; see [Where the residual variance is taken](#inner-loop-residual-variance).) Both are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
+#### Compare against `$COV SIGL=12`, not the default {#nonmem-cov-precision}
+
+NONMEM builds its R-matrix by finite differences, at a precision `$COVARIANCE` inherits from `$ESTIMATION` unless `SIGL` is set. At the default that matrix can be up to 27% off its own `SIGL=12` result **at the same optimum** (ETA_SP below; the table compares ferx against each column), so a gap between ferx's and NONMEM's SEs is not evidence against either until NONMEM's side has been re-run at a higher `SIGL`. On the nested-levels anchor (`nonmem_anchor/nested_levels_3*`, three variability levels, FOCEI; [#2177](https://github.com/FeRx-NLME/ferx-core/issues/2177)), both NONMEM runs converge to the same OBJ, 107.04357104523862, and differ only in `$COV` (and a dropped `$TABLE`):
+
+| Parameter | ferx SE (analytic R) | NONMEM `MATRIX=R` | rel. diff | NONMEM `MATRIX=R SIGL=12` | rel. diff |
+|-----------|---------|---------|--------|---------|--------|
+| TVEMAX    | 2.977   | 2.362   | +26.1% | 2.957   | +0.67% |
+| ED50      | 5.863   | 5.138   | +14.1% | 5.803   | +1.02% |
+| ω²(sponsor) | 0.05712 | 0.07262 | −21.3% | 0.05713 | −0.02% |
+| σ² (ADD)  | 0.02621 | 0.03253 | −19.4% | 0.02629 | −0.30% |
+
+The other four parameters agree within 1% at `SIGL=12` too. A central-difference Hessian of ferx's own OFV, re-finding the EBEs at every point, agrees with the analytic R to 2.3e-4, so the default-precision column was NONMEM's error, not ferx's. For an SE comparison, set `$COVARIANCE MATRIX=R SIGL=12` (with `$ESTIMATION SIGDIG` unchanged, the optimum does not move). Guarded by `nested_levels_r_ses_match_nonmem_matrix_r_at_sigl12` in `tests/nested_levels_nonmem_anchor.rs` (3% band; it also asserts the default-precision column fails that band).
+
 ### Covariance estimator: R, S, or sandwich
 
 By default ferx reports the **R-matrix** covariance `R⁻¹` (the inverse observed information), which assumes the model is correctly specified. `covariance_method` selects an alternative, mirroring NONMEM's `$COVARIANCE MATRIX=`:
