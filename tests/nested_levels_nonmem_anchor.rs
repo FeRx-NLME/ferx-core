@@ -410,8 +410,34 @@ fn se_misses(ferx: &[f64; 8], nm: &[f64; 8], tol: f64) -> Vec<&'static str> {
 /// Worst realised |ferx/NONMEM − 1| over the eight SEs against `$COV MATRIX=R SIGL=12`
 /// (`results/nested_levels_3_cov.ext`): 1.02% (ED50; macOS arm64 and Linux aarch64 agree
 /// in every printed digit). `3%` is 2.9× above it, and well below the 11–27% by which the
-/// committed run's default-precision `$COV` is off on four of the eight.
+/// committed run's default-precision `$COV` is off its own `SIGL=12` result on four of the
+/// eight. NONMEM is not exact either: re-estimated at `NSIG=4 SIGL=12` (a slightly different
+/// optimum), its SEs move by up to 2.2% (ED50) from this run, so the band is 1.36× above the
+/// oracle's own spread. ferx is within 1.23% of that run too. It is the second reference below,
+/// not this band, that pins the route.
 const SE_TOL: f64 = 0.03;
+
+/// The same eight SEs from a central-difference Hessian of ferx's own OFV, built outside
+/// `compute_covariance`. Each point is a fresh `outer_maxiter = 0` evaluation with EBEs
+/// re-found. The parameters are on NONMEM's natural scale (θ, ω², κ², σ² as values in the
+/// model file), with relative step 3e-3 and `cov = 2·H⁻¹`. Release build, macOS arm64.
+///
+/// Steps 1e-2 and 3e-3 agree within 3.2e-4 (ED50). At 1e-3 the EBE noise over h² takes over
+/// (6.8e-4 on ETA_SP).
+const EXT_FD_SE: [f64; 8] = [
+    1.274414e-1,
+    2.976518,
+    5.862647,
+    1.341867e-1,
+    5.711978e-2,
+    4.809719e-2,
+    1.426637,
+    2.621309e-2,
+];
+/// Worst realised |analytic/external − 1|: 1.84e-4 (K_ST). The whole-population FD stencil
+/// misses by 5.0e-3 (TVE0) and 2.2e-3 (ED50). `1e-3` sits 5.4× above the analytic gap,
+/// 3.1× above the oracle's step-to-step spread, and 2.2× below the stencil's ED50 miss.
+const ROUTE_TOL: f64 = 1e-3;
 
 /// The covariance step on the nested anchor against NONMEM's `MATRIX=R` (#2177).
 ///
@@ -426,6 +452,10 @@ const SE_TOL: f64 = 0.03;
 ///
 /// The straddle asserts the reference matters: the same check against the committed
 /// default-precision row must fail, on at least TVEMAX, ETA_SP and ADD.
+///
+/// The 3% band cannot tell the analytic R from ferx's own FD stencil. With the analytic
+/// assembly switched off, the stencil lands within 0.80% of NONMEM and emits no warning. So a
+/// second check, against [`EXT_FD_SE`] at [`ROUTE_TOL`], pins the analytic route.
 #[test]
 fn nested_levels_r_ses_match_nonmem_matrix_r_at_sigl12() {
     let r = eval_with(MODEL, true);
@@ -476,6 +506,16 @@ fn nested_levels_r_ses_match_nonmem_matrix_r_at_sigl12() {
         se_misses(&ferx, &nm, SE_TOL),
         Vec::<&str>::new(),
         "ferx {ferx:?} vs NONMEM {nm:?}"
+    );
+
+    let route_worst = (0..8)
+        .map(|i| (ferx[i] / EXT_FD_SE[i] - 1.0).abs())
+        .fold(0.0f64, f64::max);
+    eprintln!("MEASURE worst SE rel vs external FD Hessian: {route_worst:.4e}");
+    assert_eq!(
+        se_misses(&ferx, &EXT_FD_SE, ROUTE_TOL),
+        Vec::<&str>::new(),
+        "not the analytic R: ferx {ferx:?} vs external FD {EXT_FD_SE:?}"
     );
 
     let default_precision = se_misses(&ferx, &nonmem_ses("nested_levels_3.ext"), SE_TOL);
