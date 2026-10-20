@@ -171,7 +171,12 @@ that neither production nor test code uses — among non-`pub` items, since `dea
 never fires on a `pub` one, and under `--all-targets` a test-only reader counts as a
 use, which is what #1470's two `#[cfg(test)]`s rely on. Not a warning-free tree. What it
 still cannot see is an unused item inside a `slow-tests`-gated body, which this
-group does not compile.
+group does not compile. "Used" is per feature set and does not carry down to a subset:
+an item read only from a `#[cfg(feature = "survival")]` body is used under
+`ci,markov,nn` and dead in the default build ferx-r ships, so the group also lints
+`--lib` alone under `ci` (#2075) — `--lib` because ferx-r compiles no test target, so a
+test-only reader must not count there. Gate such an item on the same feature as its
+reader.
 
 `tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
 invariant worth knowing when editing the script is that **`run` exits rather
