@@ -79,7 +79,10 @@ pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
 
 #[cfg(feature = "survival")]
-pub use api::{predict_categorical, predict_survival, SurvivalPredictionResult};
+pub use api::{
+    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
+    SurvivalPredictionResult,
+};
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE
 /// (#344, #1248).

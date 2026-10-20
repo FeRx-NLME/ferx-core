@@ -2275,6 +2275,9 @@ pub(crate) enum SolverStatsPhase {
     PostfitPredictions,
     /// One [`crate::api::predict_diag`] pass.
     Predict,
+    /// One [`crate::api::predict_survival_diag`] pass (#2164).
+    #[cfg(feature = "survival")]
+    PredictSurvival,
     /// One [`crate::api::simulate_with_options_diag`] pass.
     Simulate,
     /// One [`crate::api::simulate_adaptive`] pass.
@@ -2289,6 +2292,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "postfit_predictions",
             Self::Predict => "predict",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "predict_survival",
             Self::Simulate => "simulate",
             Self::SimulateAdaptive => "simulate_adaptive",
             Self::SimulateUncertainty => "simulate_with_uncertainty",
@@ -2305,6 +2310,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "at the final estimates",
             Self::Predict | Self::Simulate | Self::SimulateAdaptive => "at the supplied parameters",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "at the supplied parameters",
             // Many parameter sets, none of them the caller's argument as such.
             Self::SimulateUncertainty => "at the drawn parameter sets",
         }
@@ -2322,6 +2329,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "the fit",
             Self::Predict => "this predict() pass",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "this predict_survival() pass",
             Self::Simulate => "this simulate() pass",
             Self::SimulateAdaptive => "this simulate_adaptive() run",
             Self::SimulateUncertainty => "this simulate_with_uncertainty() run",
@@ -2340,6 +2349,10 @@ impl SolverStatsPhase {
                 "Counters are from the post-fit prediction pass over all subjects."
             }
             Self::Predict => "Counters are from this predict() pass over all subjects.",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => {
+                "Counters are from this predict_survival() pass over all subjects."
+            }
             Self::Simulate => {
                 "Counters are from this simulate() pass over all subjects and replicates."
             }
@@ -2410,10 +2423,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 
 /// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
 ///
-/// **One implementation, four callers.** `predict_diag`, `simulate_with_options_diag`,
-/// `simulate_adaptive` and `simulate_with_uncertainty_diag` (#1645) all report exactly this
-/// list, so a diagnostic added to any source below reaches all four at once and none of them
-/// can carry a different subset than the others —
+/// **One implementation, five callers.** `predict_diag`, `predict_survival_diag` (#2164),
+/// `simulate_with_options_diag`, `simulate_adaptive` and `simulate_with_uncertainty_diag`
+/// (#1645) all report exactly this list, so a diagnostic added to any source below reaches all
+/// five at once and none of them can carry a different subset than the others —
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
 /// them on a fixture that trips both halves.
 ///
