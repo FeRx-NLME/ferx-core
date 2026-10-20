@@ -1,5 +1,16 @@
 pub mod ferx_core
 pub mod ferx_core::api
+#[non_exhaustive] pub enum ferx_core::api::UnmatchedSubjects
+pub ferx_core::api::UnmatchedSubjects::Draw
+pub ferx_core::api::UnmatchedSubjects::Refuse
+#[non_exhaustive] pub struct ferx_core::api::AdaptiveInputs<'a>
+pub ferx_core::api::AdaptiveInputs::etas: core::option::Option<&'a ferx_core::SuppliedEtas>
+pub ferx_core::api::AdaptiveInputs::params: &'a ferx_core::ModelParameters
+pub ferx_core::api::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
+impl<'a> ferx_core::AdaptiveInputs<'a>
+pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSimulateOptions
 pub ferx_core::api::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::max_decisions: usize
@@ -76,6 +87,13 @@ pub ferx_core::api::SimulationResult::ipred: f64
 pub ferx_core::api::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::api::SimulationResult::sim: usize
 pub ferx_core::api::SimulationResult::time: f64
+pub struct ferx_core::api::SuppliedEtas
+impl ferx_core::SuppliedEtas
+pub fn ferx_core::SuppliedEtas::from_fit(fit: &ferx_core::FitResult, model: &ferx_core::CompiledModel) -> core::result::Result<Self, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::SuppliedEtas::from_table(ids: alloc::vec::Vec<alloc::string::String>, names: alloc::vec::Vec<alloc::string::String>, rows: alloc::vec::Vec<alloc::vec::Vec<f64>>) -> core::result::Result<Self, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::SuppliedEtas::get(&self, id: &str) -> core::option::Option<&[f64]>
+pub fn ferx_core::SuppliedEtas::ids(&self) -> &[alloc::string::String]
+pub fn ferx_core::SuppliedEtas::names(&self) -> &[alloc::string::String]
 pub struct ferx_core::api::SurvivalPredictionResult
 pub ferx_core::api::SurvivalPredictionResult::cif: f64
 pub ferx_core::api::SurvivalPredictionResult::cmt: usize
@@ -127,6 +145,8 @@ pub fn ferx_core::api::run_model_with_overrides(model_path: &str, data_path: cor
 pub fn ferx_core::api::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::api::simulate_adaptive_from_spec(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::simulate_adaptive_from_spec_with_inputs(model: &ferx_core::CompiledModel, population: &ferx_core::Population, inputs: &ferx_core::AdaptiveInputs<'_>, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::simulate_adaptive_with_inputs<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, inputs: &ferx_core::AdaptiveInputs<'_>, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::api::simulate_with_options(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, opts: &ferx_core::SimulateOptions) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_with_options_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, opts: &ferx_core::SimulateOptions) -> core::result::Result<ferx_core::SimulationOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::simulate_with_seed(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, seed: u64) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
@@ -2084,6 +2104,7 @@ pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::auc_target_attainment: cor
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::cumulative_dose: f64
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::discontinued: bool
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::draw: usize
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::eta_supplied: bool
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_decreases: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
@@ -3977,6 +3998,9 @@ pub ferx_core::TteRecurrence::Single
 pub enum ferx_core::UncertaintyMethod
 pub ferx_core::UncertaintyMethod::Asymptotic
 pub ferx_core::UncertaintyMethod::Sir
+#[non_exhaustive] pub enum ferx_core::UnmatchedSubjects
+pub ferx_core::UnmatchedSubjects::Draw
+pub ferx_core::UnmatchedSubjects::Refuse
 pub enum ferx_core::ViEtaGrad
 pub ferx_core::ViEtaGrad::Analytic
 pub ferx_core::ViEtaGrad::Auto
@@ -4060,6 +4084,14 @@ pub ferx_core::AdaptiveDosingSpec::target_window: core::option::Option<(f64, f64
 pub ferx_core::AdaptiveDosingSpec::with_assay_error: bool
 impl ferx_core::sim::adaptive::AdaptiveDosingSpec
 pub fn ferx_core::sim::adaptive::AdaptiveDosingSpec::validate(&self) -> core::result::Result<(), alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::AdaptiveInputs<'a>
+pub ferx_core::AdaptiveInputs::etas: core::option::Option<&'a ferx_core::SuppliedEtas>
+pub ferx_core::AdaptiveInputs::params: &'a ferx_core::ModelParameters
+pub ferx_core::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
+impl<'a> ferx_core::AdaptiveInputs<'a>
+pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
 pub ferx_core::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
@@ -4083,6 +4115,7 @@ pub ferx_core::AdaptiveSubjectMetrics::auc_target_attainment: core::option::Opti
 pub ferx_core::AdaptiveSubjectMetrics::cumulative_dose: f64
 pub ferx_core::AdaptiveSubjectMetrics::discontinued: bool
 pub ferx_core::AdaptiveSubjectMetrics::draw: usize
+pub ferx_core::AdaptiveSubjectMetrics::eta_supplied: bool
 pub ferx_core::AdaptiveSubjectMetrics::n_decreases: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_holds: usize
@@ -5153,6 +5186,13 @@ pub ferx_core::SubjectResult::pred: alloc::vec::Vec<f64>
 pub struct ferx_core::SuggestedStart
 pub ferx_core::SuggestedStart::params: ferx_core::ModelParameters
 pub ferx_core::SuggestedStart::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::SuppliedEtas
+impl ferx_core::SuppliedEtas
+pub fn ferx_core::SuppliedEtas::from_fit(fit: &ferx_core::FitResult, model: &ferx_core::CompiledModel) -> core::result::Result<Self, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::SuppliedEtas::from_table(ids: alloc::vec::Vec<alloc::string::String>, names: alloc::vec::Vec<alloc::string::String>, rows: alloc::vec::Vec<alloc::vec::Vec<f64>>) -> core::result::Result<Self, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::SuppliedEtas::get(&self, id: &str) -> core::option::Option<&[f64]>
+pub fn ferx_core::SuppliedEtas::ids(&self) -> &[alloc::string::String]
+pub fn ferx_core::SuppliedEtas::names(&self) -> &[alloc::string::String]
 pub struct ferx_core::SurvivalPredictionResult
 pub ferx_core::SurvivalPredictionResult::cif: f64
 pub ferx_core::SurvivalPredictionResult::cmt: usize
@@ -5261,6 +5301,8 @@ pub fn ferx_core::run_sir(fit: &ferx_core::FitResult, model: core::option::Optio
 pub fn ferx_core::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::simulate_adaptive_from_spec(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::simulate_adaptive_from_spec_with_inputs(model: &ferx_core::CompiledModel, population: &ferx_core::Population, inputs: &ferx_core::AdaptiveInputs<'_>, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::simulate_adaptive_with_inputs<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, inputs: &ferx_core::AdaptiveInputs<'_>, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, ferx_core::diagnostics::EngineError> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::simulate_with_options(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, opts: &ferx_core::SimulateOptions) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate_with_options_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, opts: &ferx_core::SimulateOptions) -> core::result::Result<ferx_core::SimulationOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::simulate_with_seed(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, seed: u64) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, ferx_core::diagnostics::EngineError>

@@ -175,7 +175,7 @@ found:
 | Ω~IOV~ present (`simulate*`) | `E_PARAM_SHAPE` |
 | `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
-| adaptive dosing: the model, the options, the spec, the controller's actions | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
+| adaptive dosing: the model, the options, the spec, the controller's actions, supplied per-subject η | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`, `E_SUPPLIED_ETAS`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
 | the covariance matrix or SIR resamples to draw from (`simulate_with_uncertainty()`): not on the fit, or an empty pool; not the size of the model's packed parameters | `E_FIT_INPUT_MISSING`; `E_FIT_INPUT_MODEL` |
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
