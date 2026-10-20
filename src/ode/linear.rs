@@ -61,11 +61,21 @@ const THETA13: f64 = 5.371_920_351_148_152;
 const MAX_SQUARINGS: u32 = 64;
 
 /// Row-major `n×n` product `x·y`.
+///
+/// A factor that is a **structural** zero — value 0 and no derivative at all, no jet and no
+/// tape node (`structural_zero`) — is skipped: its products add exactly 0 to every
+/// component, so the result is bit-identical (up to the sign of a zero). A PK generator is
+/// mostly such zeros (a transit chain is bidiagonal, its powers stay near-triangular), and in
+/// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
+/// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
     let mut out = vec![T::from_f64(0.0); n * n];
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
+            if crate::sens::linsolve::structural_zero(xik) {
+                continue;
+            }
             for j in 0..n {
                 out[i * n + j] = out[i * n + j] + xik * y[k * n + j];
             }
@@ -351,6 +361,9 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             for i in 0..n {
                 let mut acc = e[i * m + n] * c;
                 for j in 0..n {
+                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                        continue;
+                    }
                     acc = acc + e[i * m + j] * x[j];
                 }
                 next[i] = acc;

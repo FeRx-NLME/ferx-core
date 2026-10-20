@@ -701,3 +701,76 @@ fn every_dual_overrides_jet_max_abs() {
         "DualH: the base's jet of a Hessian entry counts"
     );
 }
+
+/// The pre-skip `matmul`: every product taken, structural zeros included.
+fn matmul_reference<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+    let mut out = vec![T::from_f64(0.0); n * n];
+    for i in 0..n {
+        for k in 0..n {
+            for j in 0..n {
+                out[i * n + j] = out[i * n + j] + x[i * n + k] * y[k * n + j];
+            }
+        }
+    }
+    out
+}
+
+/// Bits of every component, with `±0` identified (skipping a zero product may flip a zero's
+/// sign and nothing else).
+fn component_bits(v: &[crate::sens::vfree::DualF<2, 0>]) -> Vec<u64> {
+    let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
+    v.iter()
+        .flat_map(|d| std::iter::once(norm(d.v)).chain(d.g.iter().map(|&g| norm(g))))
+        .collect()
+}
+
+/// A transit-like generator with structural zeros, a parameter-carrying chain, and one entry
+/// that is numerically zero but carries a derivative (`θ − θ₀` at `θ = θ₀`).
+fn sparse_generator() -> Vec<crate::sens::vfree::DualF<2, 0>> {
+    use crate::sens::vfree::DualF;
+    let n = 4;
+    let z = DualF::<2, 0>::from_f64(0.0);
+    let mut a = vec![z; n * n];
+    for i in 0..n {
+        a[i * n + i] = DualF {
+            v: -0.7 - 0.1 * i as f64,
+            g: [-1.0, 0.0],
+            h: [],
+        };
+        if i + 1 < n {
+            a[(i + 1) * n + i] = DualF {
+                v: 0.7 + 0.1 * i as f64,
+                g: [1.0, 0.3],
+                h: [],
+            };
+        }
+    }
+    // Numerically zero, derivative live: must not be skipped.
+    a[3] = DualF {
+        v: 0.0,
+        g: [0.0, 2.5],
+        h: [],
+    };
+    a
+}
+
+/// The structural-zero skip in `matmul` is exact — bit-identical to taking every product —
+/// while a zero that carries a derivative is still multiplied. Mutation: test the value
+/// alone (`val() == 0`) → the `a[3]` jet is dropped and the `DualF` comparison fails.
+#[test]
+fn matmul_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
+    let n = 4;
+    let a = sparse_generator();
+    let a2 = matmul(&a, &a, n);
+    assert_eq!(
+        component_bits(&a2),
+        component_bits(&matmul_reference(&a, &a, n))
+    );
+    // The jet on the numerically-zero a[0][3] reaches the product: row 0 × column 3 of A·A
+    // picks it up through a[3][3].
+    assert_ne!(a2[3].g[1], 0.0, "the jet-carrying zero was dropped");
+    let af: Vec<f64> = a.iter().map(|d| d.v).collect();
+    let got = matmul(&af, &af, n);
+    let want = matmul_reference(&af, &af, n);
+    assert!(got.iter().zip(&want).all(|(g, w)| g == w));
+}

@@ -37,6 +37,17 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
     Some(x)
 }
 
+/// A value that is exactly 0 and carries no derivative at all — no jet, no tape node
+/// ([`PkNum::is_constant`]). Its products contribute exactly 0 to every component, so the
+/// dense kernels here and in `ode::linear` skip them without changing a bit (up to the sign
+/// of a zero). A value that is merely *numerically* 0 (`θ − θ₀` at `θ = θ₀`) has a
+/// derivative and is not skipped; a type that cannot tell cheaply reports non-constant, so
+/// nothing is skipped for it.
+#[inline]
+pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
+    x.val() == 0.0 && x.is_constant()
+}
+
 /// Partial-pivoted LU factorization of the row-major `n×n` matrix `m`, **in place**: the
 /// unit-lower multipliers land in the strict lower triangle and `U` in the upper, with
 /// `piv[col]` recording the row swapped into `col`. Returns `false` (leaving `m` partially
@@ -89,6 +100,12 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
         }
         let pivot = m[col * n + col];
         for r in (col + 1)..n {
+            // A structural zero below the pivot (value 0, no jet, no tape) has multiplier
+            // exactly 0 in every component, so its row update is a no-op; skipping it is
+            // bit-identical and saves the row of jet multiplies (see `structural_zero`).
+            if structural_zero(m[r * n + col]) {
+                continue;
+            }
             let factor = m[r * n + col] / pivot;
             m[r * n + col] = factor;
             for c in (col + 1)..n {
@@ -126,7 +143,13 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
         }
     }
     for col in 0..n {
+        if structural_zero(b[col]) {
+            continue;
+        }
         for r in (col + 1)..n {
+            if structural_zero(m[r * n + col]) {
+                continue;
+            }
             let sub = m[r * n + col] * b[col];
             b[r] = b[r] - sub;
         }
@@ -134,6 +157,9 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
     for i in (0..n).rev() {
         let mut s = b[i];
         for c in (i + 1)..n {
+            if structural_zero(m[i * n + c]) {
+                continue;
+            }
             s = s - m[i * n + c] * b[c];
         }
         b[i] = s / m[i * n + i];
@@ -144,6 +170,97 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
 mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
+
+    /// The pre-skip factor and solve: every update taken, structural zeros included.
+    fn lu_reference<T: PkNum>(m: &[T], n: usize, b: &[T]) -> Option<Vec<T>> {
+        let mut m = m.to_vec();
+        let mut piv = vec![0usize; n];
+        let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
+        for col in 0..n {
+            let mut p = col;
+            let mut best = m[col * n + col].val().abs();
+            for r in (col + 1)..n {
+                if m[r * n + col].val().abs() > best {
+                    best = m[r * n + col].val().abs();
+                    p = r;
+                }
+            }
+            if !(best > 1e-12 * scale) {
+                return None;
+            }
+            piv[col] = p;
+            if p != col {
+                for c in 0..n {
+                    m.swap(col * n + c, p * n + c);
+                }
+            }
+            let pivot = m[col * n + col];
+            for r in (col + 1)..n {
+                let factor = m[r * n + col] / pivot;
+                m[r * n + col] = factor;
+                for c in (col + 1)..n {
+                    let sub = factor * m[col * n + c];
+                    m[r * n + c] = m[r * n + c] - sub;
+                }
+            }
+        }
+        let mut x = b.to_vec();
+        for col in 0..n {
+            x.swap(col, piv[col]);
+        }
+        for col in 0..n {
+            for r in (col + 1)..n {
+                let sub = m[r * n + col] * x[col];
+                x[r] = x[r] - sub;
+            }
+        }
+        for i in (0..n).rev() {
+            let mut s = x[i];
+            for c in (i + 1)..n {
+                s = s - m[i * n + c] * x[c];
+            }
+            x[i] = s / m[i * n + i];
+        }
+        Some(x)
+    }
+
+    /// The structural-zero skips in the factor and both substitutions are exact on a sparse
+    /// system — bit-identical to taking every update (`±0` identified) — and a zero that
+    /// carries a derivative is still used. Mutation: drop `is_constant` from
+    /// `structural_zero` → the jet on `m[1][0]` is lost and the `DualF` solve differs.
+    #[test]
+    fn lu_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
+        use crate::sens::vfree::DualF;
+        let n = 4;
+        let c = |v: f64| DualF::<2, 0>::from_f64(v);
+        let d = |v: f64, g0: f64, g1: f64| DualF::<2, 0> {
+            v,
+            g: [g0, g1],
+            h: [],
+        };
+        let mut m = vec![c(0.0); n * n];
+        for i in 0..n {
+            m[i * n + i] = d(2.0 + i as f64, 1.0, 0.2);
+        }
+        m[2 * n + 1] = d(0.5, 0.0, 1.0);
+        m[3 * n + 2] = c(0.25);
+        m[n] = d(0.0, 3.0, 0.0); // numerically zero, derivative live
+        let b = vec![d(1.0, 0.0, 0.0), c(0.0), d(0.0, 0.5, 0.0), c(2.0)];
+        let mut got = b.clone();
+        let mut mm = m.clone();
+        let mut piv = vec![0usize; n];
+        assert!(lu_factor_in_place_g(&mut mm, &mut piv, n));
+        lu_solve_in_place_g(&mm, &piv, n, &mut got);
+        let want = lu_reference(&m, n, &b).unwrap();
+        let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(norm(g.v), norm(w.v));
+            for k in 0..2 {
+                assert_eq!(norm(g.g[k]), norm(w.g[k]));
+            }
+        }
+        assert_ne!(got[1].g[0], 0.0, "the jet-carrying zero was dropped");
+    }
 
     /// A 2×2 system whose entries mix both parameters (so `x(p)` is genuinely nonlinear in
     /// `p` and the Hessian is nonzero), built generically so the same source runs at `f64`
