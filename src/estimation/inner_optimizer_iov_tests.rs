@@ -1033,14 +1033,15 @@ fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
         obs_records: vec![],
     };
     let params = model.default_params.clone();
-    // Stacked layout [η_CL, η_V, κ_occ1, κ_occ2]; nonzero, so it is an informative warm start.
-    let warm = [0.05, 0.0, 0.0, 0.0];
+    // η-only, `[η_CL, η_V]`: the shape the pre-flight hands the first evaluation (it drops
+    // κ̂, so `iov_initial_vector` starts every κ at 0). Nonzero, so an informative warm start.
+    let warm = [0.05, 0.0];
     let start_nll = individual_nll_iov(
         &model,
         &subject,
         &params.theta,
-        &warm[..2],
-        &[vec![warm[2]], vec![warm[3]]],
+        &warm,
+        &[vec![0.0], vec![0.0]],
         &params.omega,
         params.omega_iov.as_ref(),
         &params.sigma.values,
