@@ -37,7 +37,10 @@
 use ferx_core::api::read_population_for;
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{CompiledModel, Population};
-use ferx_core::{fit, predict, simulate, validate_model_file, EstimationMethod, FitOptions};
+use ferx_core::{
+    fit, predict, run_covariance, run_sir, simulate, validate_model_file, EstimationMethod,
+    FitOptions,
+};
 use std::io::Write;
 
 /// `CL_EXPR` is spliced into `CL`; everything else is fixed.
@@ -192,4 +195,44 @@ fn predict_and_simulate_are_not_pre_empted() {
     );
     let err = simulate(&m, &pop, &m.default_params, 1).expect_err("simulate refuses a CTMM");
     assert_eq!(err.code(), Some("E_CTMM_UNSUPPORTED"), "{err}");
+}
+
+/// **The post-fit re-scorers refuse too** (round-2 review). `run_covariance()` and
+/// `run_sir()` re-run the CTMM likelihood from a `FitResult`, which may predate the refusal
+/// or be caller-supplied. The fit here is the time-free control's (so it exists); handed
+/// the `TIME`-dependent model, both must return the coded refusal — and handed the control
+/// model, neither may, so the `Err` is the `TIME` read and not the inputs.
+#[test]
+fn run_covariance_and_run_sir_refuse_it() {
+    let control = model(FREE_CL);
+    let pop = population(&control);
+    let res = fit(&control, &pop, &control.default_params, &fit_opts()).expect("control fits");
+    let refusing = model(TIME_CL);
+    let opts = fit_opts();
+
+    let err = run_covariance(&res, Some(&refusing), Some(&pop), &opts)
+        .expect_err("run_covariance must refuse");
+    assert_eq!(err.code(), Some("E_ENDPOINT_TIME_DEPENDENT_PK"), "{err}");
+    assert_is_the_1918_refusal("run_covariance", &err.to_string());
+
+    let err = run_sir(&res, Some(&refusing), Some(&pop), &opts).expect_err("run_sir must refuse");
+    assert_eq!(err.code(), Some("E_ENDPOINT_TIME_DEPENDENT_PK"), "{err}");
+    assert_is_the_1918_refusal("run_sir", &err.to_string());
+
+    // The straddle: on the control model whatever these return is not this refusal.
+    for (entry, out) in [
+        (
+            "run_covariance",
+            run_covariance(&res, Some(&control), Some(&pop), &opts),
+        ),
+        ("run_sir", run_sir(&res, Some(&control), Some(&pop), &opts)),
+    ] {
+        if let Err(e) = out {
+            assert_ne!(
+                e.code(),
+                Some("E_ENDPOINT_TIME_DEPENDENT_PK"),
+                "{entry}: {e}"
+            );
+        }
+    }
 }

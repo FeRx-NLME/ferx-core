@@ -153,8 +153,8 @@ The `[odes]` solve behind a drug-driven intensity runs under the individual para
 evaluated once, at `TIME = 0` (dose quantities — `F`, `ALAG`, `D{n}`, absorption — are read
 at each dose record). So an `[individual_parameters]` value that reads `TIME` and reaches a
 state the intensities read — through the `[odes]` right-hand side or an `init(...)` seed —
-would be frozen there while the Gaussian predictions read it at every record. `fit()` and
-`ferx check` refuse such a model with `E_ENDPOINT_TIME_DEPENDENT_PK`, naming the parameter
+would be frozen there while the Gaussian predictions read it at every record. `fit()`,
+`ferx check`, `run_covariance()` and `run_sir()` refuse such a model with `E_ENDPOINT_TIME_DEPENDENT_PK`, naming the parameter
 ([#1918](https://github.com/FeRx-NLME/ferx-core/issues/1918)); a `TIME`-dependent parameter
 the intensities' states do not depend on, and a time-homogeneous CTMM, are unaffected.
 

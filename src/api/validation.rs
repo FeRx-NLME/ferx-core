@@ -4446,8 +4446,9 @@ pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> V
 
 /// [`check_ctmm_time_dependent_pk`] as a diagnostic: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
 /// `markov_model` (#1918). Kept apart from [`check_survival_time_dependent_pk_diags`] because
-/// the two freezes are read by different entry points: only `fit()` scores the CTMM
-/// likelihood, so only `fit()` and `ferx check` call this. `predict()` drops CTMM rows when
+/// the two freezes are read by different entry points: the CTMM likelihood is scored by
+/// `fit()` and re-scored by the post-fit `run_covariance()` / `run_sir()`, so those three and
+/// `ferx check` call this. `predict()` drops CTMM rows when
 /// continuous observations exist and its per-record walk never runs the frozen solve, and
 /// `simulate()` refuses every CTMM with `E_CTMM_UNSUPPORTED` — a refusal this must not
 /// pre-empt.
