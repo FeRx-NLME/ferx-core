@@ -4435,23 +4435,29 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
 /// text, the two fail-closed arms included: each says the hazard pass would read a
 /// TIME-dependent disposition at its TIME=0 snapshot, or cannot rule that out. A function of
 /// the model alone, so `ferx check` reports it without `--data`.
-///
-/// Also carries [`check_ctmm_time_dependent_pk`] under the same code, on block
-/// `markov_model` (#1918) — the same freeze on the CTMM endpoint — so `fit()` and
-/// `ferx check` refuse it through the one call they already make.
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
-    let mut diags: Vec<Diagnostic> = check_survival_time_dependent_pk(model)
-        .map(|m| Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model"))
-        .into_iter()
-        .collect();
-    #[cfg(feature = "markov")]
-    diags.extend(
-        check_ctmm_time_dependent_pk(model).map(|m| {
-            Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("markov_model")
-        }),
-    );
-    diags
+    check_survival_time_dependent_pk(model)
+        .map(|m| {
+            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model")]
+        })
+        .unwrap_or_default()
+}
+
+/// [`check_ctmm_time_dependent_pk`] as a diagnostic: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
+/// `markov_model` (#1918). Kept apart from [`check_survival_time_dependent_pk_diags`] because
+/// the two freezes are read by different entry points: only `fit()` scores the CTMM
+/// likelihood, so only `fit()` and `ferx check` call this. `predict()` drops CTMM rows when
+/// continuous observations exist and its per-record walk never runs the frozen solve, and
+/// `simulate()` refuses every CTMM with `E_CTMM_UNSUPPORTED` — a refusal this must not
+/// pre-empt.
+#[cfg(feature = "markov")]
+pub(crate) fn check_ctmm_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
+    check_ctmm_time_dependent_pk(model)
+        .map(|m| {
+            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("markov_model")]
+        })
+        .unwrap_or_default()
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
@@ -9361,6 +9367,9 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    predict / simulate entry point refuse it; `ferx check` reports it (#1774).
     #[cfg(feature = "survival")]
     diags.extend(check_survival_time_dependent_pk_diags(&parsed.model));
+    // The same freeze on a drug-driven CTMM generator (#1918); `fit()` refuses it too.
+    #[cfg(feature = "markov")]
+    diags.extend(check_ctmm_time_dependent_pk_diags(&parsed.model));
 
     // 2d. Undeclared random effects, *without* a dataset. With data present this
     //    is an `E_ETA_NOT_DECLARED` error from `check_covariates` below (we know

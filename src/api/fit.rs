@@ -759,6 +759,9 @@ fn fit_unstamped(
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
     first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // The same freeze on a drug-driven CTMM generator's `[odes]` solve (#1918).
+    #[cfg(feature = "markov")]
+    first_error(&check_ctmm_time_dependent_pk_diags(model))?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —

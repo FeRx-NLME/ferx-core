@@ -37,7 +37,7 @@
 use ferx_core::api::read_population_for;
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{CompiledModel, Population};
-use ferx_core::{fit, validate_model_file, EstimationMethod, FitOptions};
+use ferx_core::{fit, predict, simulate, validate_model_file, EstimationMethod, FitOptions};
 use std::io::Write;
 
 /// `CL_EXPR` is spliced into `CL`; everything else is fixed.
@@ -174,4 +174,22 @@ fn ferx_check_reports_it_without_data() {
             assert!(hits.is_empty(), "{cl}: {hits:?}");
         }
     }
+}
+
+/// **Only the entry points that score the CTMM refuse** (round-1 review). `predict()` drops
+/// CTMM rows when continuous observations exist and its per-record walk never runs the
+/// frozen solve, so the Gaussian prediction of this mixed model stays available; and
+/// `simulate()` keeps its own `E_CTMM_UNSUPPORTED` refusal rather than this one.
+#[test]
+fn predict_and_simulate_are_not_pre_empted() {
+    let m = model(TIME_CL);
+    let pop = population(&m);
+    let preds = predict(&m, &pop, &m.default_params)
+        .expect("predict() of the Gaussian half must not be refused by the CTMM check");
+    assert!(
+        !preds.is_empty() && preds.iter().all(|p| p.pred.is_finite()),
+        "{preds:?}"
+    );
+    let err = simulate(&m, &pop, &m.default_params, 1).expect_err("simulate refuses a CTMM");
+    assert_eq!(err.code(), Some("E_CTMM_UNSUPPORTED"), "{err}");
 }

@@ -180,7 +180,7 @@ fn a_homogeneous_ctmm_is_not_refused() {
     let model = ctmm_model(TIME_CL_IP, PLAIN_ODES, NO_STATE_DRIVER);
     assert_eq!(check_ctmm_time_dependent_pk(&model), None);
     // The diag wrapper — what `fit()` calls — agrees.
-    assert!(check_survival_time_dependent_pk_diags(&model).is_empty());
+    assert!(check_ctmm_time_dependent_pk_diags(&model).is_empty());
 }
 
 /// The time-free baseline is accepted.
@@ -190,12 +190,15 @@ fn a_time_free_drug_driven_ctmm_is_not_refused() {
     assert_eq!(check_ctmm_time_dependent_pk(&model), None);
 }
 
-/// The diagnostic `fit()` and `ferx check` report: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
+/// The diagnostic only `fit()` and `ferx check` report: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
 /// `markov_model`, exactly once, carrying the check's text.
 #[test]
 fn the_diagnostic_is_coded_on_the_markov_model_block() {
     let model = ctmm_model(TIME_CL_IP, PLAIN_ODES, CENTRAL_DRIVER);
-    let diags = check_survival_time_dependent_pk_diags(&model);
+    // The hazard check's wrapper — which `predict()` / `simulate()` also call — stays
+    // silent: those entry points never run the frozen CTMM solve (round-1 review).
+    assert!(check_survival_time_dependent_pk_diags(&model).is_empty());
+    let diags = check_ctmm_time_dependent_pk_diags(&model);
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, "E_ENDPOINT_TIME_DEPENDENT_PK");
     assert!(diags[0].is_error());
