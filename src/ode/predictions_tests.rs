@@ -7166,10 +7166,9 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
     let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
     assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
     // Read this equilibration's OWN answer, not the process-global sink (#1289). The sink is
-    // shared by every thread in the test binary and its reader guard serializes only readers,
-    // so `take_ss_nonconvergence_warnings().is_empty()` — what this line used to be — failed
-    // whenever any concurrently-running test capped an SS equilibration between the clear and
-    // the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
+    // shared by every thread in the test binary, so `take_ss_nonconvergence_warnings().is_empty()`
+    // — what this line used to be — failed whenever any concurrently-running test capped an SS
+    // equilibration between the clear and the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
     //
     // The `true` half of this differential pair is `ss_nonlinear_over_capacity_bolus_caps_and_warns`
     // below, on the same helper: without it a flag that was never written would satisfy this
@@ -7187,11 +7186,6 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
 /// input-rate branch). Predictions stay finite.
 #[test]
 fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     let ode = mm_disposition_spec();
     let mut pk = PkParams::default();
     pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
@@ -7205,9 +7199,9 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
     );
     // The `true` half of the #1289 differential pair — this equilibration's own answer, read
-    // per-thread. The sink assertion further down cannot serve that role: every writer emits
-    // the same deduplicated message, so `.any(|w| w.contains(…))` passes just as happily on a
-    // foreign test's warning as on this one's.
+    // per-thread. The text check further down is per-thread too, for the prediction pass: the
+    // process-global sink would pass on a foreign test's warning (#1289) and fail when a
+    // concurrent `api` call drains it between the write and the read (#2071).
     assert!(
         crate::dosing::last_ss_equilibration_warned(),
         "an over-capacity bolus must record a non-convergence warning for its own equilibration"
@@ -7220,12 +7214,12 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         preds.iter().all(|p| p.is_finite()),
         "predictions must stay finite: {preds:?}"
     );
-    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    let warning = crate::dosing::last_ss_equilibration_warning();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-        "an over-capacity bolus must surface a non-convergence warning; got: {warnings:?}"
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an over-capacity bolus must surface a non-convergence warning; got: {warning:?}"
     );
 }
 
@@ -7247,11 +7241,6 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
 /// the private function it has to call.
 #[test]
 fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     // 1. Produce a warning: the over-capacity MM disposition (mean input 6.25 > Vmax 5) has no
     //    periodic steady state, so the capped train runs the full budget and notes it.
     let mm = mm_disposition_spec();
@@ -7304,10 +7293,6 @@ fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
          reports the PREVIOUS capped run's warning as its own — the shape `sens::ode_provider` \
          hits, since it calls that helper directly"
     );
-
-    // Housekeeping: this test deliberately fills the sink, so drain it rather than leaving the
-    // entries for whichever reader runs next.
-    let _ = crate::dosing::take_ss_nonconvergence_warnings();
 }
 
 #[test]
@@ -8379,10 +8364,6 @@ fn ss_input_rate_over_capacity_deep_saturation_declines() {
 /// the caller falls to the capped pulse train, and the non-convergence warning fires.
 #[test]
 fn ss_input_rate_no_steady_state_warns() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
     let ode = mm_ss_absorption_spec();
     let mut pk = PkParams::default();
     pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
@@ -8408,19 +8389,19 @@ fn ss_input_rate_no_steady_state_warns() {
     // true periodic steady state" text are valid here — the capped drift can estimate ρ either
     // side of 1 — so assert on the shared prefix rather than one branch).
     //
-    // The per-thread flag first (#1289): it pins that *this* prediction pass warned, which the
-    // sink `.any(…)` below cannot, since every writer emits the same deduplicated message and a
-    // concurrently-running test's warning satisfies it identically.
+    // Both reads are per-thread (#1289, #2071): they pin that *this* prediction pass warned and
+    // with what text. The process-global sink can do neither in a lib test — a concurrent
+    // test's write satisfies a "present" check, and a concurrent `api` drain empties it.
     assert!(
         crate::dosing::last_ss_equilibration_warned(),
         "the input-rate train must record a non-convergence warning for its own equilibration"
     );
-    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    let warning = crate::dosing::last_ss_equilibration_warning();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-        "an input-above-capacity model must surface a non-convergence warning; got: {warnings:?}"
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an input-above-capacity model must surface a non-convergence warning; got: {warning:?}"
     );
 }
 

@@ -525,9 +525,9 @@ fn equilibrate_ss_state_event_driven(
     // Clear the warning observation up front (#1289, PR #1392 review): the exact affine fixed
     // point below and the two bail-outs return without reaching
     // `note_ss_nonconvergence_if_capped`, so without this `last_ss_equilibration_warned()` would
-    // report an earlier capped run's `true` as this call's answer. Deterministic on a reused
+    // report an earlier capped run's warning as this call's answer. Deterministic on a reused
     // harness thread, not a race.
-    crate::dosing::record_ss_nonconvergence_warned(false);
+    crate::dosing::record_ss_nonconvergence_warning(None);
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
@@ -3678,11 +3678,6 @@ mod tests {
     /// model validation would reject either parameter set.
     #[test]
     fn ss_equilibration_falls_back_when_no_steady_state_exists() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
         let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let n = crate::dosing::SS_EQUILIBRATION_CYCLES;
         for (label, model, pk) in [
@@ -3703,22 +3698,22 @@ mod tests {
             approx::assert_relative_eq!(state[0], n as f64 * 100.0, max_relative = 1e-12);
         }
 
-        // Per-thread, so it is this walk's own answer (#1289). The sink assertion below cannot
-        // serve that role on its own: every writer emits the same deduplicated message, so
-        // `.any(…)` is satisfied by a concurrently-running test's warning just as well as by
-        // this one's. Keep both — the flag pins *who* warned, the sink pins the message text
-        // that reaches `FitResult.warnings`.
+        // Per-thread, so it is this walk's own answer and its own text (#1289, #2071). Never
+        // read the process-global sink here: a concurrent test's write satisfies a "present"
+        // check just as well as this one's, and a concurrent `api` drain empties it under us.
+        // That the noted text reaches `FitResult.warnings` is pinned end to end by
+        // `tests/ss_absorption_nonmem_anchor.rs`.
         assert!(
             crate::dosing::last_ss_equilibration_warned(),
             "the analytical walk must record a non-convergence warning for its own equilibration"
         );
-        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface a non-convergence warning \
-             from the analytical walk; got: {warnings:?}"
+             from the analytical walk; got: {warning:?}"
         );
     }
 
@@ -3734,11 +3729,6 @@ mod tests {
     /// reach it from another file would be a wider change than the test is worth.
     #[test]
     fn an_exact_event_driven_ss_clears_a_previous_runs_warning_flag() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
         // `CL = 0` ⇒ `ke = 0` ⇒ `M = I`: nothing is ever eliminated, so no periodic steady state
         // exists, the exact solve declines and the capped train warns. (The same fixture
         // `ss_equilibration_falls_back_when_no_steady_state_exists` uses.)
@@ -3759,9 +3749,6 @@ mod tests {
             "the reset at the top of `equilibrate_ss_state_event_driven` is missing: an exact \
              analytical equilibration reports the PREVIOUS capped run's warning as its own"
         );
-
-        // This test fills the sink on purpose; drain it rather than leaving entries behind.
-        let _ = crate::dosing::take_ss_nonconvergence_warnings();
     }
 
     #[test]
