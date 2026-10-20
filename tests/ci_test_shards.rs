@@ -1,21 +1,30 @@
-//! Guard: the sharded `Tests + coverage (core)` job runs every test binary exactly
-//! once (#2167).
+//! Guard: the sharded coverage jobs run every test exactly as the unsharded ones
+//! did (#2167).
 //!
-//! The job used to be one `cargo llvm-cov --workspace --tests`. It is now a matrix
-//! whose shard `k` runs `tools/ci-test-shard.py args k N`, so `--tests` holds only
-//! if the union of those argument lists is every test target. A planner bug that
-//! dropped a binary would leave every shard green — the dropped tests simply never
-//! run, and their lines read as uncovered against the patch gate with nothing
-//! pointing at the cause. A binary scheduled twice wastes a shard's time.
+//! `Tests + coverage (core)` used to be one `cargo llvm-cov --workspace --tests`,
+//! and `Tests + coverage (TTE/CTMM endpoints)` one `--lib --test …` invocation.
+//! Both are now matrices whose shard `k` runs `tools/ci-test-shard.py run SUITE k
+//! N --lib-parts P`, so the old selection holds only if the union of the shards'
+//! invocations is that selection. A planner bug that dropped a binary, or a
+//! module of unit tests, would leave every shard green — the dropped tests simply
+//! never run, and their lines read as uncovered against the patch gate with
+//! nothing pointing at the cause. A binary scheduled twice wastes a shard's time.
 //!
-//! The oracle is the filesystem, not `cargo metadata`, because `cargo metadata` is
+//! The oracle for the integration binaries is the filesystem (core) and the
+//! endpoint list (endpoints), not `cargo metadata`, because `cargo metadata` is
 //! what the script itself reads: agreeing with it would be agreeing with itself.
 //! Cargo auto-discovers `<member>/tests/*.rs` and `<member>/tests/<dir>/main.rs`
 //! (no member declares `[[test]]` or `autotests = false`), so that is the set.
 //!
+//! The unit tests cannot be listed from here (that needs the lib test harness
+//! built), so their completeness is pinned structurally: the lib parts are libtest
+//! substring filters, and the last part `--skip`s exactly the union of the others'
+//! filters. Every test either contains one of those filters or does not, so that
+//! shape runs every unit test, whatever the filters are.
+//!
 //! Not feature-gated: it must run in the base `--features ci` job it guards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,29 +59,164 @@ fn every_test_target() -> Vec<String> {
     names
 }
 
-fn shard_args(k: usize, n: usize) -> Vec<String> {
-    let out = Command::new("python3")
-        .arg(repo_root().join("tools/ci-test-shard.py"))
-        .args(["args", &k.to_string(), &n.to_string()])
-        .current_dir(repo_root())
-        .output()
-        .expect("python3 runs tools/ci-test-shard.py");
-    assert!(
-        out.status.success(),
-        "ci-test-shard.py args {k} {n} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
+fn endpoint_list() -> Vec<String> {
+    std::fs::read_to_string(repo_root().join("tools/ci-endpoint-tests.txt"))
         .unwrap()
-        .split_whitespace()
+        .lines()
+        .map(|l| l.split('#').next().unwrap().trim())
+        .filter(|l| !l.is_empty())
         .map(str::to_owned)
         .collect()
 }
 
-/// Every shard count, not just the 4 `ci.yml` uses today: the matrix size is a
-/// one-line edit, and the planner must be complete for whatever it becomes.
+fn shard_tool(args: &[String]) -> std::process::Output {
+    Command::new("python3")
+        .arg(repo_root().join("tools/ci-test-shard.py"))
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .expect("python3 runs tools/ci-test-shard.py")
+}
+
+/// The argument list of each cargo invocation shard `k` of `n` runs.
+fn invocations(suite: &str, k: usize, n: usize, p: usize) -> Vec<Vec<String>> {
+    let args: Vec<String> = ["invocations", suite, &k.to_string(), &n.to_string()]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(["--lib-parts".to_owned(), p.to_string()])
+        .collect();
+    let out = shard_tool(&args);
+    assert!(
+        out.status.success(),
+        "ci-test-shard.py {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split_whitespace().map(str::to_owned).collect())
+        .collect()
+}
+
+/// One lib part: the shard that runs it, and its filters (positive or `--skip`).
+struct LibPart {
+    shard: usize,
+    unit: Vec<String>,
+    filters: Vec<String>,
+    skips: Vec<String>,
+}
+
+/// Checks one suite at one (N, P): every expected binary on exactly one shard, and
+/// P lib parts on shards 1..=P whose filters cover every unit test.
+fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usize) {
+    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut parts = Vec::new();
+    for k in 1..=n {
+        for inv in invocations(suite, k, n, p) {
+            if inv.first().is_some_and(|a| a == "--test") {
+                let mut it = inv.iter();
+                while let Some(flag) = it.next() {
+                    assert_eq!(
+                        flag, "--test",
+                        "{suite} {k}/{n}: unexpected `{flag}` in {inv:?}"
+                    );
+                    seen.entry(it.next().unwrap().clone()).or_default().push(k);
+                }
+                continue;
+            }
+            let (targets, harness) = match inv.iter().position(|a| a == "--") {
+                Some(i) => (inv[..i].to_vec(), inv[i + 1..].to_vec()),
+                None => (inv.clone(), Vec::new()),
+            };
+            let mut part = LibPart {
+                shard: k,
+                unit: targets,
+                filters: vec![],
+                skips: vec![],
+            };
+            let mut it = harness.into_iter();
+            while let Some(a) = it.next() {
+                if a == "--skip" {
+                    part.skips.push(it.next().expect("`--skip` with no filter"));
+                } else {
+                    assert!(
+                        !a.starts_with('-'),
+                        "{suite} {k}/{n}: unexpected harness flag `{a}`"
+                    );
+                    part.filters.push(a);
+                }
+            }
+            parts.push(part);
+        }
+    }
+    let tag = format!("{suite} N={n} P={p}");
+
+    let missing: Vec<_> = expected.iter().filter(|t| !seen.contains_key(*t)).collect();
+    assert!(
+        missing.is_empty(),
+        "{tag}: test binaries no shard runs: {missing:?}"
+    );
+    let twice: Vec<_> = seen.iter().filter(|(_, ks)| ks.len() > 1).collect();
+    assert!(
+        twice.is_empty(),
+        "{tag}: test binaries run on several shards: {twice:?}"
+    );
+    let unknown: Vec<_> = seen.keys().filter(|t| !expected.contains(t)).collect();
+    assert!(
+        unknown.is_empty(),
+        "{tag}: shards name tests outside the suite: {unknown:?}"
+    );
+
+    assert_eq!(
+        parts.iter().map(|x| x.shard).collect::<Vec<_>>(),
+        (1..=p).collect::<Vec<_>>(),
+        "{tag}: lib part i must run once, on shard i"
+    );
+    for x in &parts {
+        assert_eq!(
+            x.unit, unit,
+            "{tag}: lib part on shard {} runs other targets",
+            x.shard
+        );
+    }
+    if p == 1 {
+        let x = &parts[0];
+        assert!(
+            x.filters.is_empty() && x.skips.is_empty(),
+            "{tag}: a single lib part must run every unit test unfiltered"
+        );
+        return;
+    }
+    let (rest, named) = parts.split_last().unwrap();
+    assert!(
+        rest.filters.is_empty(),
+        "{tag}: the last lib part must be `--skip`-only"
+    );
+    for x in named {
+        assert!(
+            !x.filters.is_empty(),
+            "{tag}: lib part on shard {} has no filter, so it runs EVERY unit test",
+            x.shard
+        );
+        assert!(x.skips.is_empty(), "{tag}: a filtered lib part also skips");
+    }
+    let union: BTreeSet<_> = named
+        .iter()
+        .flat_map(|x| x.filters.iter().cloned())
+        .collect();
+    let skipped: BTreeSet<_> = rest.skips.iter().cloned().collect();
+    assert_eq!(
+        skipped, union,
+        "{tag}: the rest part must skip exactly the other parts' filters — a skip with \
+         no matching filter drops those unit tests, a filter with no skip runs them twice"
+    );
+}
+
+/// Every shard count and lib-part count, not just the ones `ci.yml` uses today: the
+/// matrix size is a one-line edit, and the planner must be complete for whatever it
+/// becomes.
 #[test]
-fn the_shards_run_every_test_binary_exactly_once() {
+fn the_core_shards_run_every_test_exactly_once() {
     let all = every_test_target();
     assert!(
         all.len() > 100,
@@ -80,48 +224,107 @@ fn the_shards_run_every_test_binary_exactly_once() {
         all.len()
     );
     for n in 1..=6 {
-        let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        let (mut lib_shards, mut bins_shards) = (Vec::new(), Vec::new());
-        for k in 1..=n {
-            let args = shard_args(k, n);
-            let mut it = args.iter();
-            while let Some(flag) = it.next() {
-                match flag.as_str() {
-                    "--test" => seen.entry(it.next().unwrap().clone()).or_default().push(k),
-                    "--lib" => lib_shards.push(k),
-                    // Tracked separately: `ferx-cli`'s unit tests live in its bin target,
-                    // so dropping `--bins` alone silently drops them.
-                    "--bins" => bins_shards.push(k),
-                    other => panic!("shard {k}/{n} emitted an unexpected argument `{other}`"),
-                }
-            }
+        for p in 1..=n.min(3) {
+            check_plan("core", &["--lib", "--bins"], &all, n, p);
         }
-        assert_eq!(
-            lib_shards,
-            vec![1],
-            "N={n}: the `--lib` unit tests must run once, on shard 1"
-        );
-        assert_eq!(
-            bins_shards,
-            vec![1],
-            "N={n}: the `--bins` unit tests must run once, on shard 1"
-        );
-        let missing: Vec<_> = all.iter().filter(|t| !seen.contains_key(*t)).collect();
+    }
+}
+
+#[test]
+fn the_endpoint_shards_run_every_listed_test_exactly_once() {
+    let listed = endpoint_list();
+    assert!(
+        listed.len() > 10,
+        "tools/ci-endpoint-tests.txt lists only {listed:?}"
+    );
+    for n in 1..=4 {
+        for p in 1..=n {
+            check_plan("endpoints", &["--lib"], &listed, n, p);
+        }
+    }
+}
+
+/// `run` is what makes N invocations one coverage report, and both halves of its
+/// recipe were measured, not assumed (cargo-llvm-cov 0.8): an invocation without
+/// `--no-report` DELETES the profiles of the ones before it, and the `report`
+/// subcommand has no `--workspace`, so it silently drops `crates/*` from the lcov.
+/// A fake cargo records the calls. Its first `llvm-cov` call fails, so this also
+/// pins that a red invocation neither stops the later ones (`--no-fail-fast`
+/// across invocations) nor lets the shard exit green.
+#[test]
+fn run_reports_once_over_every_invocation_and_fails_if_any_did() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ci_test_shards_fake_cargo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("calls.txt");
+    let fake = dir.join("cargo");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\n[ \"$(wc -l < '{log}')\" -eq 1 ] && exit 3\nexit 0\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (k, n, p) = (2, 3, 2);
+    let out = Command::new("python3")
+        .arg(repo_root().join("tools/ci-test-shard.py"))
+        .args([
+            "run",
+            "core",
+            &k.to_string(),
+            &n.to_string(),
+            "--lib-parts",
+            &p.to_string(),
+        ])
+        .args([
+            "--output",
+            "out.info",
+            "--",
+            "--workspace",
+            "--profile",
+            "ci-cov",
+        ])
+        .env("CI_TEST_SHARD_CARGO", &fake)
+        .current_dir(repo_root())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a failing invocation left the shard green: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let planned = invocations("core", k, n, p);
+    assert_eq!(
+        calls.len(),
+        planned.len() + 1,
+        "expected every planned invocation plus one report, despite the first failing: {calls:#?}"
+    );
+    let (report, runs) = calls.split_last().unwrap();
+    for (call, inv) in runs.iter().zip(&planned) {
         assert!(
-            missing.is_empty(),
-            "N={n}: test binaries no shard runs: {missing:?}"
+            call.starts_with("llvm-cov --no-report --no-fail-fast --workspace --profile ci-cov "),
+            "an invocation without `--no-report` deletes the earlier profiles: `{call}`"
         );
-        let twice: Vec<_> = seen.iter().filter(|(_, ks)| ks.len() > 1).collect();
         assert!(
-            twice.is_empty(),
-            "N={n}: test binaries run on several shards: {twice:?}"
-        );
-        let unknown: Vec<_> = seen.keys().filter(|t| !all.contains(t)).collect();
-        assert!(
-            unknown.is_empty(),
-            "N={n}: shards name non-existent tests: {unknown:?}"
+            call.ends_with(&inv.join(" ")),
+            "`{call}` is not the planned {inv:?}"
         );
     }
+    assert_eq!(
+        report, "llvm-cov --no-run --workspace --profile ci-cov --lcov --output-path out.info",
+        "the report must be one `--no-run` over the same build args"
+    );
 }
 
 /// The body of job `name` in `ci.yml`, comment lines dropped (prose about a key must
@@ -141,78 +344,97 @@ fn job_body(name: &str) -> String {
         .join("\n")
 }
 
-/// `Tests + coverage (core)` is a REQUIRED check in the `main-protection` ruleset,
-/// and since the split it is the upload job, not the shards. GitHub counts a skipped
-/// job as passing a required check, and a bare `needs:` skips the job when a shard
-/// fails — so without both pieces below a PR with red tests shows every required
-/// check green. Each assertion dies on its own deletion.
+/// Both `Tests + coverage (core)` and `Tests + coverage (TTE/CTMM endpoints)` are
+/// REQUIRED checks in the `main-protection` ruleset, and since the split each is an
+/// upload job, not the shards. GitHub counts a skipped job as passing a required
+/// check, and a bare `needs:` skips the job when a shard fails — so without both
+/// pieces below a PR with red tests shows every required check green. Each
+/// assertion dies on its own deletion, for each pair.
 #[test]
-fn the_required_core_check_goes_red_with_any_shard() {
-    let body = job_body("coverage-pr-upload");
-    assert!(
-        body.contains("name: Tests + coverage (core)\n"),
-        "the upload job no longer carries the required `Tests + coverage (core)` name"
-    );
-    assert!(
-        body.contains("needs: coverage-pr"),
-        "the upload job does not wait for the shards"
-    );
-    let cond = body
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("if:"))
-        .expect("the upload job has no job-level `if:`");
-    // `always()`, not `!cancelled()`: the latter skips this job when a shard is
-    // cancelled, and a cancel mid-run would then read green.
-    assert!(
-        cond.contains("always()"),
-        "`{cond}`: without `always()` a failed or cancelled shard SKIPS this job, and a \
-         skipped required check counts as passing"
-    );
-    let guard = "if: needs.coverage-pr.result != 'success'";
-    let at = body.find(guard).unwrap_or_else(|| {
-        panic!(
-            "the upload job no longer fails on a non-successful shard — with `always()` it \
-             would then upload partial coverage and report green"
-        )
-    });
-    // The guard step must actually fail: its body runs up to the next step.
-    let step = &body[at..];
-    let step = &step[..step[guard.len()..]
-        .find("\n      - ")
-        .map_or(step.len(), |i| i + guard.len())];
-    assert!(
-        step.lines().any(|l| l.trim() == "exit 1"),
-        "the shard-result step no longer exits non-zero, so it reports and passes:\n{step}"
-    );
+fn each_required_coverage_check_goes_red_with_any_shard() {
+    for (upload, shards, check) in [
+        (
+            "coverage-pr-upload",
+            "coverage-pr",
+            "Tests + coverage (core)",
+        ),
+        (
+            "endpoints-upload",
+            "endpoints",
+            "Tests + coverage (TTE/CTMM endpoints)",
+        ),
+    ] {
+        let body = job_body(upload);
+        assert!(
+            body.contains(&format!("name: {check}\n")),
+            "`{upload}` no longer carries the required `{check}` name"
+        );
+        assert!(
+            body.contains(&format!("needs: {shards}\n")),
+            "`{upload}` does not wait for the `{shards}` shards"
+        );
+        let cond = body
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("if:"))
+            .unwrap_or_else(|| panic!("`{upload}` has no job-level `if:`"));
+        // `always()`, not `!cancelled()`: the latter skips this job when a shard is
+        // cancelled, and a cancel mid-run would then read green.
+        assert!(
+            cond.contains("always()"),
+            "`{upload}`: `{cond}`: without `always()` a failed or cancelled shard SKIPS \
+             this job, and a skipped required check counts as passing"
+        );
+        let guard = format!("if: needs.{shards}.result != 'success'");
+        let at = body.find(&guard).unwrap_or_else(|| {
+            panic!(
+                "`{upload}` no longer fails on a non-successful shard — with `always()` \
+                 it would then upload partial coverage and report green"
+            )
+        });
+        // The guard step must actually fail: its body runs up to the next step.
+        let step = &body[at..];
+        let step = &step[..step[guard.len()..]
+            .find("\n      - ")
+            .map_or(step.len(), |i| i + guard.len())];
+        assert!(
+            step.lines().any(|l| l.trim() == "exit 1"),
+            "`{upload}`'s shard-result step no longer exits non-zero, so it reports and \
+             passes:\n{step}"
+        );
+        assert!(
+            !job_body(shards).contains(&format!("name: {check}\n")),
+            "the `{shards}` shards carry the bare required name `{check}` — the matrix \
+             name must keep its `k/N` suffix so only `{upload}` reports it"
+        );
+    }
 }
 
-/// The shard's planner must run where `bash -e` sees its exit status. Inlined as
-/// `cargo llvm-cov … $(python3 tools/ci-test-shard.py …)`, a planner error is swallowed
-/// (a simple command's status is the command's, not its substitutions') and cargo runs
-/// with no target arguments — its default targets, green, the wrong suite.
+/// Each shard's planner must run where `bash -e` sees its exit status (#2168). Inlined
+/// as `cargo llvm-cov … $(python3 tools/ci-test-shard.py …)`, a planner error is
+/// swallowed (a simple command's status is the command's, not its substitutions') and
+/// cargo runs with no target arguments — its default targets, green, the wrong suite.
+/// Since #2167's `run`, the planner IS the step's command: pinned for both jobs.
 #[test]
 fn a_planner_failure_fails_the_shard() {
-    let body = job_body("coverage-pr");
-    let lines: Vec<&str> = body.lines().map(str::trim).collect();
-    let cargo = lines
-        .iter()
-        .find(|l| l.contains("cargo llvm-cov"))
-        .expect("coverage-pr runs no `cargo llvm-cov`");
-    assert!(
-        !cargo.contains("$("),
-        "`{cargo}` substitutes a command inline; its failure would be swallowed"
-    );
-    assert!(
-        cargo.contains("$targets"),
-        "`{cargo}` no longer takes the planner's targets"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("targets=$(python3 tools/ci-test-shard.py args ")),
-        "coverage-pr no longer assigns `targets` from the planner on a line of its own"
-    );
+    for (job, suite) in [("coverage-pr", "core"), ("endpoints", "endpoints")] {
+        let body = job_body(job);
+        let run = body
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("ci-test-shard.py"))
+            .unwrap_or_else(|| panic!("`{job}` no longer runs tools/ci-test-shard.py"));
+        assert!(
+            run.starts_with(&format!("run: python3 tools/ci-test-shard.py run {suite} ")),
+            "`{job}`: `{run}` — the planner must be the step's own command, so its \
+             failure is the step's failure"
+        );
+        assert!(
+            !body.contains("$(") && !body.contains("cargo llvm-cov"),
+            "`{job}` substitutes a command inline or calls cargo-llvm-cov around the \
+             planner; a planner error there would be swallowed"
+        );
+    }
 }
 
 /// The keys of the two-space-indented mapping under the top-level `section:` line
@@ -316,15 +538,25 @@ fn codecov_waits_for_every_report_of_an_event() {
 
 /// A shard number outside `1..=N` is a workflow typo, not an empty shard: running
 /// `cargo llvm-cov` with no target arguments would fall back to the package's
-/// default targets and silently test something else.
+/// default targets and silently test something else. Likewise more lib parts than
+/// shards, or an unknown suite.
 #[test]
 fn an_out_of_range_shard_is_refused() {
-    for (k, n) in [(0, 4), (5, 4)] {
-        let out = Command::new("python3")
-            .arg(repo_root().join("tools/ci-test-shard.py"))
-            .args(["args", &k.to_string(), &n.to_string()])
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "shard {k}/{n} was accepted");
+    for args in [
+        ["invocations", "core", "0", "4", "--lib-parts", "1"],
+        ["invocations", "core", "5", "4", "--lib-parts", "1"],
+        ["invocations", "endpoints", "4", "3", "--lib-parts", "1"],
+        ["invocations", "core", "1", "2", "--lib-parts", "3"],
+        ["invocations", "nope", "1", "2", "--lib-parts", "1"],
+    ] {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = shard_tool(&args);
+        assert!(!out.status.success(), "{args:?} was accepted");
+        // Refused by a check that names the problem, not by a crash further in.
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.starts_with("ci-test-shard: ") && !err.contains("Traceback"),
+            "{args:?} was refused without saying why:\n{err}"
+        );
     }
 }
