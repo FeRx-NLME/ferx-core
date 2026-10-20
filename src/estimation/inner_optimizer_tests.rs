@@ -5295,3 +5295,85 @@ fn newton_polish_is_opt_in_and_reaches_the_stage_policy() {
     o.inner_newton_polish = true;
     assert!(InnerSolvePolicy::for_stage(&o, &model).newton_polish);
 }
+
+/// An accepted polish returns the inner loop's own η-Jacobian at the polished mode —
+/// `exact_obs_grads`, bit for bit — FREM rows included: a covariate pseudo-observation
+/// predicts `θ_i + η_e`, so its row is the unit vector `e_e`, a fix-up the bare recording
+/// does not carry. The first form of the polish read `exact_eta_jacobian`, which skips it.
+/// Fixture: warfarin subject 0 under `warfarin_frem.ferx`, with its two covariate
+/// pseudo-observations (`FREMTYPE` 100 → `ETA_WT_FREM`, 200 → `ETA_AGE_FREM`) appended.
+#[test]
+fn an_accepted_polish_returns_the_inner_loops_own_jacobian_frem_rows_included() {
+    use std::path::Path;
+    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(
+        "examples/warfarin_frem.ferx",
+    ))
+    .expect("warfarin_frem parses");
+    let model = parsed.model;
+    let fc = model
+        .frem_config
+        .clone()
+        .expect("premise: the model carries FREM rows");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let mut s = pop.subjects[0].clone();
+    let n = s.obs_times.len();
+    let t = s.obs_times[n - 1];
+    s.fremtype = vec![0; n];
+    for (ft, y) in [(100u16, 80.0), (200u16, 45.0)] {
+        s.fremtype.push(ft);
+        s.obs_times.push(t);
+        s.observations.push(y);
+        s.obs_cmts.push(s.obs_cmts[n - 1]);
+        if !s.cens.is_empty() {
+            s.cens.push(0);
+        }
+        if !s.obs_covariates.is_empty() {
+            s.obs_covariates.push(s.obs_covariates[n - 1].clone());
+        }
+        for v in [&mut s.occasions, &mut s.obs_rgroup] {
+            if !v.is_empty() {
+                v.push(v[n - 1]);
+            }
+        }
+        if !s.obs_raw_times.is_empty() {
+            s.obs_raw_times.push(t);
+        }
+        if !s.obs_l2.is_empty() {
+            s.obs_l2.push(s.obs_l2[n - 1]);
+        }
+    }
+    assert!(s.obs_records.is_empty(), "premise: Gaussian rows only");
+    let raw = polish_solve(&model, &s, 1e-2, false, EbeVariance::Conditional);
+    let r = polish_solve(&model, &s, 1e-2, true, EbeVariance::Conditional);
+    assert_ne!(
+        r.eta, raw.eta,
+        "premise: the polish was accepted on this subject"
+    );
+    let rows = crate::sens::ode_provider::adjoint::exact_obs_grads(
+        &model,
+        &s,
+        &model.default_params.theta,
+        r.eta.as_slice(),
+    )
+    .expect("the recorders serve the subject");
+    assert_eq!(r.h_matrix.nrows(), rows.len());
+    for (j, row) in rows.iter().enumerate() {
+        for k in 0..model.n_eta {
+            assert_eq!(
+                r.h_matrix[(j, k)].to_bits(),
+                row.df_deta[k].to_bits(),
+                "h_matrix[({j}, {k})]"
+            );
+        }
+    }
+    for (j, ft) in [(n, 100u16), (n + 1, 200u16)] {
+        let (_, e) = fc.fremtype_to_indices[&ft];
+        for k in 0..model.n_eta {
+            assert_eq!(
+                r.h_matrix[(j, k)],
+                if k == e { 1.0 } else { 0.0 },
+                "FREM row {j}"
+            );
+        }
+    }
+}

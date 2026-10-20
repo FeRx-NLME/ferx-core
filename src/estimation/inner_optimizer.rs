@@ -1751,35 +1751,26 @@ fn find_ebe_impl(
         return r;
     }
     let e = r.eta.as_slice().to_vec();
+    // Two recordings: one second-order at the mode (value, gradient and Hessian of `l`
+    // from the same dual), one first-order at the step (value, gradient, Jacobian).
     let polished = (|| {
-        use crate::sens::ode_provider::adjoint::{
-            exact_eta_jacobian, exact_inner_gradient, exact_inner_hessian,
-        };
-        let g = exact_inner_gradient(model, subject, params, &e, None)?;
-        let h = exact_inner_hessian(model, subject, params, &e)?;
-        let step = h.cholesky()?.solve(&DVector::from_column_slice(&g));
+        use crate::sens::ode_provider::adjoint::{exact_inner_newton_point, exact_inner_point};
+        let at = exact_inner_newton_point(model, subject, params, &e)?;
+        let step = at
+            .hess?
+            .cholesky()?
+            .solve(&DVector::from_column_slice(&at.grad));
         let e_new: Vec<f64> = e.iter().zip(step.iter()).map(|(a, d)| a - d).collect();
-        let nll = |x: &[f64]| {
-            crate::stats::likelihood::individual_nll(
-                model,
-                subject,
-                &params.theta,
-                x,
-                &params.omega,
-                &params.sigma.values,
-            )
-        };
-        let (f0, f1) = (nll(&e), nll(&e_new));
-        if !(f1.is_finite() && f1 <= f0) {
+        let to = exact_inner_point(model, subject, params, &e_new)?;
+        // `l` and `individual_nll` differ by an η-free constant, so the change is the same.
+        if to.l > at.l {
             return None;
         }
-        let jac = exact_eta_jacobian(model, subject, &params.theta, &e_new)?;
-        let g1 = exact_inner_gradient(model, subject, params, &e_new, None)?;
         Some((
             e_new,
-            jac,
-            f1 - f0,
-            g1.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            to.jac,
+            to.l - at.l,
+            to.grad.iter().map(|v| v * v).sum::<f64>().sqrt(),
         ))
     })();
     if let Some((e_new, jac, decrease, gn)) = polished {
