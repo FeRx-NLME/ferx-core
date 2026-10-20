@@ -423,6 +423,7 @@ covariance step that followed produced usable standard errors.
 |-------------------|----------|-------|------------------------|
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
+| `degenerate_clearance_or_volume` | Warning | `W_DEGENERATE_CL_V`: the final estimates put a non-positive or infinite `CL` or `V` on at least one dose, observation or EVID=2 record of a 1-/2-/3-cpt IV / oral closed-form model, each record read under its own covariates and occasion κ (#2104). Both closed-form engines serve such a record a concentration of 0 and drop any drug in the body over an interval it governs, so the fit scored those subjects against a prediction NONMEM would not make — PREDPP rejects a non-positive PK parameter as an error. Names the subjects, the record count and the first offending `TIME`; `details` lists each subject's record times. | Usually a linear covariate term such as `CL = TVCL * (1 + THETA * (AGE - 40))` going negative on an extreme record. Use a form that keeps `CL` and `V` positive (exponential or power), or bound the covariate effect. |
 
 ### Run configuration and informational notes {#codes-run}
 

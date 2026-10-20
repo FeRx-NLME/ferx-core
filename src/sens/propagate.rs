@@ -22,13 +22,53 @@ use crate::pk::event_driven::{Event, EventKind, EventSchedule};
 use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, Subject};
 
+/// Whether a clearance or central volume leaves the closed forms with no answer
+/// (#2104): non-positive, or `+inf`.
+///
+/// This is the one degenerate-parameter rule both closed-form engines apply, so a
+/// subject is served the same prediction whether or not one of its covariates
+/// varies over time:
+///
+/// - the **superposition** closed forms drop such a dose — its contribution is 0
+///   (`pk::single_dose_concentration` / `single_dose_states` return early);
+/// - the **event-driven walk** empties every compartment over an interval whose
+///   parameters fail it ([`zero_state_if_cl_v_degenerate`]), and reads 0 at an
+///   observation whose own parameters fail it ([`observe_central_g`]).
+///
+/// Before #2104 the walk instead *skipped* the propagation step, so the dose stayed
+/// in the body with no elimination: a `CL ≤ 0` on an IV model served `AMT / V` from
+/// the dose on where superposition served 0. And neither guard caught `+inf`, where
+/// `ke = CL / V` is `0` or `inf` and the closed forms form `0 / 0` or `inf · 0`.
+///
+/// A `NaN` is **not** degenerate here. It is kept, so the subject is repelled
+/// through the likelihood's sentinel rather than served a confident value (#2039).
+#[inline]
+pub(crate) fn cl_or_v_degenerate(cl: f64, v: f64) -> bool {
+    let bad = |x: f64| x <= 0.0 || x == f64::INFINITY;
+    bad(cl) || bad(v)
+}
+
+/// The walk's half of [`cl_or_v_degenerate`]: when the interval's `CL` or `V` is
+/// degenerate, empty every compartment and return `true`, so the caller skips the
+/// closed-form step. Matches superposition, which drops a dose with such parameters
+/// outright. Every propagator — the inline `*_g` wrappers and the production walk's
+/// cached-eigendata arms — goes through this one function.
+#[inline]
+pub(crate) fn zero_state_if_cl_v_degenerate<T: PkNum>(state: &mut [T], cl: T, v: T) -> bool {
+    if !cl_or_v_degenerate(cl.val(), v.val()) {
+        return false;
+    }
+    for a in state.iter_mut() {
+        *a = T::from_f64(0.0);
+    }
+    true
+}
+
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
 /// a constant input `rate` into the central compartment. Mirror of
 /// `crate::pk::event_driven::propagate_one_cpt`.
 pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: T) {
-    if v.val() <= 0.0 || cl.val() <= 0.0 {
-        // Degenerate params: skip (the outer optimizer sees a poor OFV and steps
-        // away), matching the production propagator.
+    if zero_state_if_cl_v_degenerate(state, cl, v) {
         return;
     }
     let ke = cl / v;
@@ -52,7 +92,7 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
     rate_central: T,
     rate_depot: T,
 ) {
-    if v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
+    if zero_state_if_cl_v_degenerate(state, cl, v) || ka.val() <= 0.0 {
         return;
     }
     let ke = cl / v;
@@ -129,7 +169,7 @@ pub struct TwoCptEigen<T: PkNum> {
 /// + eigenvalue solve). `None` ⇒ callers skip propagation, matching the old f64
 /// propagators' early return.
 pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
-    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 {
+    if cl_or_v_degenerate(cl.val(), v1.val()) || v2.val() <= 0.0 || q.val() <= 0.0 {
         return None;
     }
     let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
@@ -204,6 +244,9 @@ pub fn propagate_two_cpt_g<T: PkNum>(
     rate_central: T,
     rate_periph: T,
 ) {
+    if zero_state_if_cl_v_degenerate(state, cl, v1) {
+        return;
+    }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
         propagate_two_cpt_core_g(state, dt, &e, rate_central, rate_periph);
     }
@@ -338,7 +381,7 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     rate_periph1: T,
     rate_depot: T,
 ) {
-    if ka.val() <= 0.0 {
+    if zero_state_if_cl_v_degenerate(state, cl, v1) || ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
@@ -390,8 +433,7 @@ pub fn three_cpt_eigen_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> Option<ThreeCptEigen<T>> {
-    if v1.val() <= 0.0
-        || cl.val() <= 0.0
+    if cl_or_v_degenerate(cl.val(), v1.val())
         || v2.val() <= 0.0
         || q2.val() <= 0.0
         || v3.val() <= 0.0
@@ -501,6 +543,9 @@ pub fn propagate_three_cpt_g<T: PkNum>(
     rate_periph1: T,
     rate_periph2: T,
 ) {
+    if zero_state_if_cl_v_degenerate(state, cl, v1) {
+        return;
+    }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
         propagate_three_cpt_core_g(state, dt, &e, rate_central, rate_periph1, rate_periph2);
     }
@@ -623,7 +668,7 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     rate_periph2: T,
     rate_depot: T,
 ) {
-    if ka.val() <= 0.0 {
+    if zero_state_if_cl_v_degenerate(state, cl, v1) || ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
@@ -1387,28 +1432,38 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     state
 }
 
-/// The concentration an observation reads from the central amount, `amount / v`,
-/// floored at zero. The production walk
+/// The concentration an observation reads from the walk's state, `amount / v` on the
+/// central slot, floored at zero. The production walk
 /// (`event_driven::event_driven_predictions_with_schedule_impl`) and its dual twin
 /// [`event_driven_sens_with_doses_g`] both read through this one function, so they
-/// cannot disagree on a degenerate record (#2039).
+/// cannot disagree on a degenerate record (#2039, #2104). `cl` and `v` are the
+/// observation's own parameters.
 ///
-/// - A finite `v ≤ 0` reads 0, as the superposition closed forms' own guard does
-///   (`one_cpt_iv_bolus_amt_g`).
-/// - A `NaN`, in `v` or in the amount, is kept. The walk used to test `v > 0.0`,
-///   which is false for a `NaN`, and floor with `f64::max`, which discards one, so a
-///   subject whose `CL` or `V` was `NaN` from some record on was served a prediction
-///   of 0 there and scored against it with a finite objective. Superposition keeps
-///   the `NaN` since #1399, and so does the ODE engine.
+/// - A degenerate `CL` or `V` ([`cl_or_v_degenerate`]: non-positive or `+inf`) reads
+///   0, as the superposition closed forms drop a dose with such parameters (#2104).
+/// - A `NaN` `V` or amount is kept. The walk used to test `v > 0.0`, which is false
+///   for a `NaN`, and floor with `f64::max`, which discards one, so a subject whose
+///   `CL` or `V` was `NaN` from some record on was served a prediction of 0 there and
+///   scored against it with a finite objective. Superposition keeps the `NaN` since
+///   #1399, and so does the ODE engine.
+/// - A `NaN` `CL` reads `NaN` once any compartment holds drug (#2104). Usually the
+///   propagation step has already turned the state `NaN`, but an observation that
+///   sits on a dose's arrival has no elapsed time behind it, so the state is the dose
+///   itself, finite. Superposition serves `NaN` there, since its closed form reads
+///   `exp(−ke·0)` with a `NaN` `ke`. Before any dose the state is all zeros and
+///   superposition has no dose to sum, so both serve 0.
 /// - A negative concentration clamps to 0 and its derivatives vanish there, so the
 ///   dual path is consistent with the objective.
 #[inline]
-pub(crate) fn central_concentration_g<T: PkNum>(amount: T, v: T) -> T {
-    let conc = if v.val() > 0.0 || v.val().is_nan() {
-        amount / v
-    } else {
-        T::from_f64(0.0)
-    };
+pub(crate) fn observe_central_g<T: PkNum>(read: &[T], central_slot: usize, cl: T, v: T) -> T {
+    if cl_or_v_degenerate(cl.val(), v.val()) {
+        return T::from_f64(0.0);
+    }
+    // `!= 0.0` is true for a `NaN` amount, which is then kept either way.
+    if cl.val().is_nan() && read.iter().any(|a| a.val() != 0.0) {
+        return T::from_f64(f64::NAN);
+    }
+    let conc = read[central_slot] / v;
     // `<` is false for a `NaN`, which therefore passes through.
     if conc.val() < 0.0 {
         T::from_f64(0.0)
@@ -1654,7 +1709,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     }
                     None => &state[..],
                 };
-                preds[ev.orig_idx] = central_concentration_g(read[central_slot], pk_now.v);
+                preds[ev.orig_idx] = observe_central_g(read, central_slot, pk_now.cl, pk_now.v);
             }
             EventKind::PkOnly => {}
             EventKind::Reset => unreachable!("Reset handled before pk_for_g above"),
@@ -1850,21 +1905,50 @@ mod tests {
         );
     }
 
-    /// #2039: the observation readout keeps a `NaN`, in the volume or in the amount,
-    /// and floors everything else at 0, on `f64` and on `Dual2`. A finite `v ≤ 0`
-    /// reads 0, as the superposition closed forms do. A clamped negative carries no
-    /// derivative.
+    /// #2039 / #2104: the observation readout keeps a `NaN`, in the volume or in the
+    /// amount, and floors everything else at 0, on `f64` and on `Dual2`. A degenerate
+    /// `CL` or `V` (non-positive or `+inf`) reads 0, as the superposition closed forms
+    /// do. A `NaN` `CL` reads `NaN` once any compartment holds drug, and 0 before. A
+    /// clamped negative carries no derivative.
     #[test]
-    fn central_concentration_keeps_a_nan_and_floors_the_rest() {
-        let f = central_concentration_g::<f64>;
+    fn observe_central_keeps_a_nan_and_floors_the_rest() {
+        let f = |amount: f64, v: f64| observe_central_g::<f64>(&[amount], 0, 5.0, v);
         assert_eq!(f(50.0, 10.0), 5.0);
         assert!(f(50.0, f64::NAN).is_nan(), "a NaN volume is kept");
         assert!(f(f64::NAN, 10.0).is_nan(), "a NaN amount is kept");
         assert_eq!(f(50.0, 0.0), 0.0, "a zero volume reads 0");
         assert_eq!(f(50.0, -5.0), 0.0, "a negative volume reads 0");
+        assert_eq!(f(50.0, f64::INFINITY), 0.0, "an infinite volume reads 0");
         assert_eq!(f(-1.0, 10.0), 0.0, "a negative concentration clamps");
 
-        let d = central_concentration_g::<Dual2<1>>;
+        // The clearance half (#2104). Slot 1 is central, slot 0 a depot.
+        let g = |read: &[f64], cl: f64| observe_central_g::<f64>(read, 1, cl, 10.0);
+        assert_eq!(g(&[0.0, 50.0], 0.0), 0.0, "a zero clearance reads 0");
+        assert_eq!(g(&[0.0, 50.0], -1.0), 0.0, "a negative clearance reads 0");
+        assert_eq!(
+            g(&[0.0, 50.0], f64::INFINITY),
+            0.0,
+            "an infinite clearance reads 0"
+        );
+        assert!(g(&[0.0, 50.0], f64::NAN).is_nan(), "NaN CL on central drug");
+        assert!(
+            g(&[50.0, 0.0], f64::NAN).is_nan(),
+            "NaN CL on depot drug only"
+        );
+        assert_eq!(
+            g(&[0.0, 0.0], f64::NAN),
+            0.0,
+            "NaN CL before any dose reads 0"
+        );
+        assert_eq!(
+            observe_central_g::<f64>(&[0.0, 50.0], 1, f64::NAN, -10.0),
+            0.0,
+            "a degenerate V wins over a NaN CL, as superposition's early return does"
+        );
+
+        let d = |amount: Dual2<1>, v: Dual2<1>| {
+            observe_central_g::<Dual2<1>>(&[amount], 0, Dual2::constant(5.0), v)
+        };
         assert!(d(Dual2::constant(50.0), Dual2::constant(f64::NAN))
             .value
             .is_nan());
@@ -2297,8 +2381,9 @@ mod tests {
 
     /// **#908 dual fallback.** The gradient twin of
     /// `pk::event_driven::tests::ss_equilibration_falls_back_when_no_steady_state_exists`. A
-    /// singular `I − M` — here `CL = 0`, so every disposition eigenvalue is zero and
-    /// `two_cpt_eigen_g` declines, leaving `M = I` — has no periodic steady state, so
+    /// singular `I − M` — here `Q = 0`, so `two_cpt_eigen_g` declines, leaving `M = I` (a
+    /// `CL = 0` empties the system since #2104, so it no longer reaches this) — has no
+    /// periodic steady state, so
     /// `equilibrate_ss_g`'s exact solve must decline and its capped pulse-train fallback must
     /// run. This proves the *dual* fallback still functions on genuinely-singular input; the
     /// mutation check (forcing the fallback on non-singular input) only proves the two paths
@@ -2306,8 +2391,8 @@ mod tests {
     #[test]
     fn ss_equilibration_dual_falls_back_when_no_steady_state_exists() {
         let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
-        // CL = 0 ⇒ ke = 0 ⇒ `two_cpt_eigen_g` returns None ⇒ propagation is the identity.
-        let pkd = pk_dual_2cpt_f64(&pk_2cpt(0.0, 50.0, 3.0, 80.0, 0.0));
+        // Q = 0 ⇒ `two_cpt_eigen_g` returns None ⇒ propagation is the identity.
+        let pkd = pk_dual_2cpt_f64(&pk_2cpt(5.0, 50.0, 0.0, 80.0, 0.0));
         let trough = equilibrate_ss_g::<f64>(PkModel::TwoCptIv, &pkd, &dose, None);
         assert_eq!(
             crate::dosing::last_ss_equilibration_cycles(),

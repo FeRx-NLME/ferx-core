@@ -6892,6 +6892,12 @@ pub enum WarningCode {
     /// [`WarningCode::FlipFlop`]: the rows returned are a sample of a truncated parameter
     /// distribution, so intervals built from them are biased, not merely fewer.
     UncertaintyDrawsSkipped,
+    /// The final estimates put a non-positive or infinite `CL` or `V` on at least one record
+    /// of a closed-form (1-/2-/3-cpt IV / oral) model (`W_DEGENERATE_CL_V`, #2104). Both
+    /// closed-form engines serve such a record a concentration of 0 — the dose is dropped —
+    /// a prediction NONMEM would not make: PREDPP treats a non-positive PK parameter as an
+    /// error.
+    DegenerateClearanceOrVolume,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -6938,6 +6944,7 @@ impl WarningCode {
             WarningCode::FlatParameter => "flat_parameter",
             WarningCode::OdeSolver => "ode_solver",
             WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
+            WarningCode::DegenerateClearanceOrVolume => "degenerate_clearance_or_volume",
             WarningCode::General => "general",
         }
     }
@@ -7033,6 +7040,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
+        )
+    } else if lower.contains("w_degenerate_cl_v") {
+        // #2104: a non-positive or infinite CL / V at the final estimates. A token arm ahead
+        // of the generic "degenerate" → optimizer-health prose arm, which its wording would
+        // otherwise match.
+        (
+            WarningSeverity::Warning,
+            WarningCode::DegenerateClearanceOrVolume,
         )
     } else if lower.contains("w_uncertainty_draws_skipped") {
         // #1485: skipped uncertainty draws, one warning per run. A token arm ahead of the

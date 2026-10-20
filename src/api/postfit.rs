@@ -2250,6 +2250,82 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     Some((msg, entry))
 }
 
+/// Build the human message + native structured entry for a closed-form fit whose final
+/// estimates put a non-positive or infinite `CL` or `V` on any record, or `None` (#2104).
+///
+/// Both closed-form engines serve such a record a concentration of 0 — superposition drops
+/// the dose, the event-driven walk empties every compartment over the interval the record
+/// governs — so the fit completes and scores those subjects against a confident, finite
+/// prediction. NONMEM would not have made it: PREDPP reports a non-positive PK parameter as
+/// a PRED error. Nothing else surfaces this, which is why it is a warning at fit end rather
+/// than silence. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
+/// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
+/// own fitted class.
+pub(crate) fn degenerate_cl_v_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    mixest: Option<&[usize]>,
+) -> Option<(String, WarningEntry)> {
+    let no_kappas: Vec<DVector<f64>> = Vec::new();
+    let hits: Vec<(String, Vec<f64>)> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .enumerate()
+        .filter_map(|(si, (subject, eta))| {
+            // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
+            let class = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
+            let _mix = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let ks = kappas.get(si).unwrap_or(&no_kappas);
+            let times = crate::pk::degenerate_cl_v_record_times(
+                model,
+                subject,
+                theta,
+                eta.as_slice(),
+                ks.iter()
+                    .map(|k| k.as_slice())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            );
+            (!times.is_empty()).then(|| (subject.id.clone(), times))
+        })
+        .collect();
+    let (first_id, first_times) = hits.first()?;
+    let n_records: usize = hits.iter().map(|(_, t)| t.len()).sum();
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    let msg = format!(
+        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or infinite CL or V on {} \
+         record(s) at the final estimates (first at TIME {} in subject {}). The closed-form PK \
+         engines serve a concentration of 0 there and drop any drug in the body over an \
+         interval such a record governs, so these subjects were scored against predictions \
+         NONMEM would not make: PREDPP rejects a non-positive PK parameter as an error. Check \
+         the individual-parameter model — a linear covariate term such as \
+         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record — and prefer a \
+         form that keeps CL and V positive, such as an exponential or power model.",
+        hits.len(),
+        ids.join(", "),
+        n_records,
+        first_times[0],
+        first_id,
+    );
+    let entry = warning_entry(
+        WarningCode::DegenerateClearanceOrVolume,
+        msg.clone(),
+        Some(serde_json::json!({
+            "model": model.pk_model.canonical_name(),
+            "n_records": n_records,
+            "subjects": hits
+                .iter()
+                .map(|(id, times)| serde_json::json!({ "id": id, "times": times }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Some((msg, entry))
+}
+
 /// The `W_` token that opens the post-fit ODE-solver diagnostics message, and the string
 /// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
 const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";

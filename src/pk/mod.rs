@@ -238,6 +238,67 @@ pub(crate) fn absorption_flip_flop_at(
     }
 }
 
+/// The times of `subject`'s dose, observation and EVID=2 records whose `CL` or `V`, at
+/// `(theta, eta_bsv, kappas)`, is degenerate in the sense of
+/// [`crate::sens::propagate::cl_or_v_degenerate`] — non-positive or `+inf` — in record
+/// order (#2104). Empty for a model that is not one of the six 1-/2-/3-cpt IV / oral
+/// closed forms, the only models whose engines that rule governs.
+///
+/// Each record is evaluated the way the prediction evaluates it: its own covariate
+/// snapshot and `TIME`, and on an IOV model its own occasion's κ (the same occasion map
+/// `predict_iov` uses). `kappas` is ignored when `model.n_kappa == 0`.
+pub(crate) fn degenerate_cl_v_record_times<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[K],
+) -> Vec<f64> {
+    let closed_form = matches!(
+        model.pk_model,
+        PkModel::OneCptIv
+            | PkModel::OneCptOral
+            | PkModel::TwoCptIv
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIv
+            | PkModel::ThreeCptOral
+    );
+    if !closed_form || model.ode_spec.is_some() || model.is_algebraic() {
+        return Vec::new();
+    }
+    let params = if model.n_kappa > 0 {
+        let layout =
+            crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), model.n_kappa, subject);
+        let combined_for = iov_occasion_eta(&layout, eta_bsv, kappas);
+        let mut out = EventPkParams::default();
+        fill_iov_record_params(
+            model,
+            subject,
+            theta,
+            &combined_for,
+            &mut out.dose,
+            &mut out.obs,
+            &mut out.pk_only,
+        );
+        out
+    } else {
+        compute_event_pk_params(model, subject, theta, eta_bsv)
+    };
+    let bad = |p: &PkParams| crate::sens::propagate::cl_or_v_degenerate(p.cl(), p.v());
+    let mut times: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .zip(&params.dose)
+        .chain(subject.obs_times.iter().copied().zip(&params.obs))
+        .chain(subject.pk_only_times.iter().copied().zip(&params.pk_only))
+        .filter(|(_, p)| bad(p))
+        .map(|(t, _)| t)
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times
+}
+
 /// The model to evaluate this subject with at `(theta, eta)`: the structural
 /// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` / IOV transit or IG
 /// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
@@ -2004,6 +2065,11 @@ fn route_f_scale(pk_model: PkModel, infusion: bool, p: &PkParams) -> f64 {
 fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> f64 {
     let cl = p.cl();
     let v = p.v();
+    // A degenerate `CL` or `V` drops the dose — the rule the event-driven walk applies
+    // too, so the two engines serve the same subject the same prediction (#2104).
+    if crate::sens::propagate::cl_or_v_degenerate(cl, v) {
+        return 0.0;
+    }
     let infusion = dose.is_infusion();
     let f_scale = route_f_scale(pk_model, infusion, p);
 
@@ -2198,6 +2264,10 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> Vec<f64> {
     let cl = p.cl();
     let v = p.v();
+    // The state twin of `single_dose_concentration`'s degenerate-parameter rule (#2104).
+    if crate::sens::propagate::cl_or_v_degenerate(cl, v) {
+        return vec![0.0; pk_model.topology().n_states];
+    }
     let infusion = dose.is_infusion();
 
     // Bioavailability handling mirrors `single_dose_concentration` (#419):
@@ -5988,6 +6058,15 @@ mod tests {
         assert!((states[1] - c).abs() <= 1e-9 * c.abs().max(1.0));
     }
 
+    /// A `PkParams` whose `CL` and `V` pass the degenerate-parameter early return (#2104),
+    /// so a direct call reaches the dispatch below it.
+    fn pk_valid_cl_v() -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 5.0;
+        p.values[crate::types::PK_IDX_V] = 50.0;
+        p
+    }
+
     /// SS doses reroute to the ODE twin before reaching the closed forms (`effective_for`,
     /// #719), so the SS arms of `single_dose_concentration` / `single_dose_states` are
     /// `unreachable!` — calling them directly with an SS dose must hit those guards (covers the
@@ -5995,7 +6074,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "one_cpt_ig SS doses reroute")]
     fn single_dose_concentration_one_cpt_ig_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_concentration(PkModel::OneCptIg, &ss, 2.0, &p);
     }
@@ -6003,7 +6082,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_ig SS doses reroute")]
     fn single_dose_states_two_cpt_ig_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_states(PkModel::TwoCptIg, &ss, 2.0, &p);
     }
@@ -6014,7 +6093,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_concentration_two_cpt_transit_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_concentration(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }
@@ -6023,7 +6102,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_states_two_cpt_transit_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_states(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }

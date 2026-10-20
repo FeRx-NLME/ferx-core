@@ -2960,6 +2960,20 @@ fn fit_inner(
         native_warnings.push(entry);
     }
 
+    // A non-positive or infinite CL / V on any record at the final estimates: the
+    // closed-form engines served those records 0, which NONMEM would refuse (#2104).
+    if let Some((msg, entry)) = degenerate_cl_v_warning(
+        model,
+        population,
+        &result.params.theta,
+        &result.eta_hats,
+        &result.kappas,
+        mixest_classes.as_deref(),
+    ) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
