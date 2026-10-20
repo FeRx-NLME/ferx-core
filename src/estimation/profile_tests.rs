@@ -624,3 +624,37 @@ fn every_contrast_profiles_to_the_minimum() {
         );
     }
 }
+
+// ── Replay: the covariance step's solve failure ────────────────────────────────────
+
+/// `replay_covariance` on a start the profile solve cannot use (a `NaN` level; measured,
+/// the solve fails as `ProfileFailure::Singular`) returns no matrix and the one warning
+/// `profile_solve_failed_msg` builds — and that warning, as emitted, classifies
+/// `covariance_failed` (#2158). The `classify_warning` table in `types_tests.rs` builds its
+/// profile rows from the same function; this test is what ties the function to the call
+/// site, so an inline message put back there (with the prefix reworded, say) fails here.
+#[test]
+fn a_failed_replay_solve_is_a_covariance_failure() {
+    let p = prep(F1, F1_DATA, None, |t| t);
+    let layout = layout_of(&p);
+    let mut params = p.init_params.clone();
+    params.theta[layout.coords[0]] = f64::NAN;
+    let o = FitOptions {
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let out = replay_covariance(&p.parsed.model, &p.population, &params, &[], &o)
+        .expect("F1 profiles a level block");
+    assert!(out.matrix.is_none());
+    assert_eq!(
+        out.warnings,
+        vec![profile_solve_failed_msg(&ProfileFailure::Singular)]
+    );
+    let w = crate::types::classify_warning(&out.warnings[0]);
+    assert_eq!(
+        (w.severity, w.category.as_str()),
+        (crate::types::WarningSeverity::Critical, "covariance_failed"),
+        "{}",
+        out.warnings[0]
+    );
+}
