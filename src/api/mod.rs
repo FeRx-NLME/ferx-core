@@ -34,7 +34,8 @@ pub(crate) use validation::{
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
-    check_model_data_warnings, check_model_options, validate_model_file, validate_output_columns,
+    check_model_data_warnings, check_model_options, validate_model_file, validate_model_file_with,
+    validate_output_columns,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
