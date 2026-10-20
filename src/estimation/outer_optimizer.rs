@@ -1879,18 +1879,20 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
 /// about `1/|θ|` of a unit-magnitude one, so the stop test passes with the θ at its
 /// initial value. Warfarin's volume written as `TVV_S` in units of 1e-5 L
 /// (θ₀ = 1e6, minimum OFV −286.0042) stops at −265.4195 under L-BFGS and at
-/// −265.4166 under BOBYQA, both reporting convergence. BOBYQA already stalls at
-/// θ₀ = 100 (−265.3128), L-BFGS from θ₀ = 1e5.
+/// −265.4196 under BOBYQA, both reporting convergence. L-BFGS stalls from
+/// θ₀ = 1e5; BOBYQA stops short from θ₀ = 1e4 (−285.3322, unconverged) and stalls
+/// from 1e5.
 ///
 /// The threshold is 10, not 1. At 1 the rule reaches `ctmm_pd_2state`'s
 /// `LQ01 = -1.2` and moves all three optimizers to a worse objective (L-BFGS
-/// 712.6479 → 712.9186, SLSQP 711.6420 → 712.5712, BOBYQA 711.6792 → 712.9318).
-/// At 10 no committed fixture has such a θ, and BOBYQA is still covered from the
-/// θ₀ = 100 where it first fails.
+/// 712.6479 → 712.9186, SLSQP 711.6420 → 712.5712, BOBYQA 711.4581 → 712.2777).
+/// At 10 no committed fixture has such a θ, and the rule still reaches every θ₀
+/// at which an optimizer fails.
 ///
 /// There is no mirror rule for a small identity θ: dividing one with
-/// `0 < |θ₀| < 0.1` by `|θ₀|` cost BOBYQA 14 OFV units on `two_cpt_oral_cov` with
-/// both covariate exponents started at 0.001 (−1185.4095 against −1199.3202).
+/// `0 < |θ₀| < 0.1` by `|θ₀|` cost BOBYQA 3.9 OFV units on `two_cpt_oral_cov` with
+/// both covariate exponents started at 0.001 (−1195.4114, unconverged after 7560
+/// iterations, against −1199.3264).
 const IDENTITY_THETA_SCALE_ABOVE: f64 = 10.0;
 
 /// The per-coordinate scale vector of the NLopt outer loop: the optimizer sees
