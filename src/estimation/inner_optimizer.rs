@@ -2004,23 +2004,21 @@ fn find_ebe_solve(
             if opted_out {
                 return None;
             }
-            crate::sens::ode_provider::adjoint::exact_inner_gradient(
+            let g = crate::sens::ode_provider::adjoint::exact_inner_gradient(
                 model, subject, params, e, frozen,
-            )
+            );
+            // Counted here, branch-free, so both callers below share one count (#2209).
+            #[cfg(test)]
+            INNER_AGRAD_ROUTE
+                .with(|c| c.set((c.get().0, c.get().1 + usize::from(g.is_some()), c.get().2)));
+            g
         };
         if !use_analytic {
-            return match exact() {
-                Some(g) => {
-                    #[cfg(test)]
-                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
-                    g
-                }
-                None => {
-                    #[cfg(test)]
-                    INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                    gradient_fd(&obj, e, n_eta)
-                }
-            };
+            return exact().unwrap_or_else(|| {
+                #[cfg(test)]
+                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
+                gradient_fd(&obj, e, n_eta)
+            });
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -2042,6 +2040,8 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
+                #[cfg(test)]
+                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
                 if profile {
                     PROFILE_INNER_ANALYTIC_GRAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2053,6 +2053,8 @@ fn find_ebe_solve(
                     GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
                     return g;
                 }
+                #[cfg(test)]
+                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
                 let g = gradient_fd(&obj, e, n_eta);
                 GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                 if profile {
@@ -2566,11 +2568,13 @@ thread_local! {
     /// means "the search ran on the analytic gradient" reads this (#2053 review 1).
     pub(crate) static IOV_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
-    /// `(exact, fd)` inner-gradient evaluations of `find_ebe` on this thread when the legacy
-    /// analytic route is out of scope (`gradient = fd`, the escape hatch, or a shape it
-    /// declines): the adjoint kernel's exact gradient, or central differences.
-    pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize)> =
-        const { std::cell::Cell::new((0, 0)) };
+    /// `(analytic, exact, fd)` inner-gradient evaluations of `find_ebe` on this thread: the
+    /// legacy analytic η-gradient (`analytic_eta_nll_gradient_with_schedule`, in scope only),
+    /// the adjoint kernel's exact gradient (the out-of-scope arm, or the in-scope arm's
+    /// per-point fallback), or central differences. Counting all three keeps "the search ran
+    /// on the analytic route" distinguishable from "no step ran" (#2209).
+    pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
@@ -2697,9 +2701,8 @@ fn find_ebe_iov(
     // (`adjoint::exact_obs_grads_in`, called by `analytic_eta_nll_gradient_iov_frozen`).
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
-    // hits a common bail (escape hatch, `gradient = fd`, SDE, or magnitude × correlated
-    // residual) or the subject carries survival/TTE records (whose hazard term the analytic
-    // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
+    // hits a common bail (escape hatch, `gradient = fd`, SDE) or the subject carries
+    // survival/TTE records (whose hazard term the analytic IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
     // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
     // now served analytically too (#575): the IOV scope (pre-#2093 `ode_iov_supported` /
     // `iov_sens_supported`, now the adjoint's `recorder_in_scope`) admits a non-LTBS
@@ -2770,8 +2773,8 @@ fn find_ebe_iov(
     };
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
-            // The kernel's exact gradient where it serves the subject; it declines a
-            // dense IOV residual (#1082 PR5), whose search runs on central differences.
+            // The kernel's exact gradient where it serves the subject, a cross-row
+            // (dense) IOV residual included (#1082 PR5, #2101); central differences else.
             return match exact(p) {
                 Some(g) => {
                     #[cfg(test)]
@@ -3365,24 +3368,20 @@ pub(crate) fn inner_analytic_opted_out(model: &CompiledModel) -> bool {
 }
 
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
-    no_analytic_inner_forced()
-        || GradientMethod::forced_fd(model)
-        || model.is_sde()
-        // LTBS is served analytically on the inner loop for every combination now — plain,
-        // × `ExpressionScale` on the closed form (the η-quotient then the `ln f`,
-        // `closed_form_finish`), × TV-cov (the event-driven walk applies the same transform
-        // LAST), and × IOV (`record_analytic_events` applies `ltbs_log_g` last over the
-        // stacked axes, #486). So there is no
-        // `log_transform` clause here: the closed-form inner and outer IOV gradients now
-        // differentiate the same `ln(f/s)`, closing the last inner/outer scope split.
-        // Correlated residual error (`block_sigma`) is now served analytically by the
-        // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
-        // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
-        // Custom residual-error magnitude (#484) alone stays analytic (#576/#486 —
-        // `residual_inner_obs` threads the η-independent per-obs multiplier). Only the
-        // *combination* with a correlated residual bails: the dense-R inner kernel does
-        // not carry the magnitude's θ-dependence, so route it to FD (magnitude-aware).
-        || (model.has_custom_ruv_magnitude() && model.residual_is_dense())
+    no_analytic_inner_forced() || GradientMethod::forced_fd(model) || model.is_sde()
+    // LTBS is served analytically on the inner loop for every combination now — plain,
+    // × `ExpressionScale` on the closed form (the η-quotient then the `ln f`,
+    // `closed_form_finish`), × TV-cov (the event-driven walk applies the same transform
+    // LAST), and × IOV (`record_analytic_events` applies `ltbs_log_g` last over the
+    // stacked axes, #486). So there is no
+    // `log_transform` clause here: the closed-form inner and outer IOV gradients now
+    // differentiate the same `ln(f/s)`, closing the last inner/outer scope split.
+    // Correlated residual error (`block_sigma`) is now served analytically by the
+    // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
+    // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
+    // Custom residual-error magnitude (#484, `weight =`) is not a bail either, alone
+    // or with a dense R: `residual_inner_obs` and the dense-R kernel both thread the
+    // per-obs multiplier (#576/#627), which the η-gradient sees as a constant (#2209).
     // `iiv_on_ruv` needs no bail here: residual-η is served analytically on both loops for
     // every combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
     // (#474/#4b/#4c/#591/#623/#677); the scaling and the censored/quantified `η_ruv` terms

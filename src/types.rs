@@ -5903,7 +5903,7 @@ impl CompiledModel {
     /// loops are analytic on FOCE and FOCEI (#644/#659) — including combined with `iiv_on_ruv` on
     /// the closed-form (#673/#677) and ODE (#486) paths, since the outer assembly is
     /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude combined with an
-    /// M3-censored row, a correlated `block_sigma`, or more θ than the magnitude program's `Dual1`
+    /// M3-censored row or more θ than the magnitude program's `Dual1`
     /// dispatch serves (see #486's remaining-FD register). The FD forward NLL is itself
     /// magnitude-aware, so those fallbacks stay exact.
     #[inline]
