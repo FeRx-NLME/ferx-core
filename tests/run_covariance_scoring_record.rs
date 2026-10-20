@@ -273,6 +273,11 @@ fn inner_tol() {
 /// from the record site in `fit_inner` → the record is 1e-8 and the row dies.
 /// `imp_eval_only` needs no row: an IMP readout does not tighten `inner_tol`, so its record
 /// equals the estimating stage's and the defect cannot show there.
+///
+/// On `warfarin_iov` for the reason `inner_tol` gives: on warfarin this premise's gap was
+/// 2.8e-10–3.6e-9 on macOS arm64 and 2.5e-10–3.7e-9 on Linux aarch64 across
+/// `outer_maxiter` 2–6, the band in which `inner_tol`'s went to exactly 0. On `warfarin_iov`
+/// it is 6.4e-8–3.1e-7 on both platforms.
 #[test]
 fn inner_tol_ignores_a_trailing_evaluator() {
     let with = FitOptions {
@@ -281,7 +286,7 @@ fn inner_tol_ignores_a_trailing_evaluator() {
         ..quiet(EstimationMethod::FoceI)
     };
     let what = "inner_tol (trailing evaluator)";
-    let f = Fitted::new(&WARFARIN, &with, what);
+    let f = Fitted::new(&WARFARIN_IOV, &with, what);
     assert_eq!(
         f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
         Some(FitOptions::default().inner_tol),
