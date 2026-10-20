@@ -8094,10 +8094,18 @@ fn predicted_remaining_gain_straddles_the_issue_1934_false_stop() {
 /// SLSQP on the #1934 model's ODE twin (`ode_method = auto`) from TVQ = 0.01 latched at
 /// −204.41 and reported converged, 227.8 short of NONMEM's −432.17 — the #1934 false stop
 /// again, one model block over. At both of #1934's points the decrement is the closed
-/// form's: measured on Linux x86_64, 14.832907993 vs 14.832907995 at the false stop and
-/// 5.7691e-7 vs 5.7670e-7 at NONMEM's optimum — 1.7e-9 and 2.1e-10 apart. The bound is
-/// 1e-7 absolute (60× the worse), a millionth of the 0.1 threshold, so the straddle
-/// carries over unchanged.
+/// form's, to the decrement's own floating-point floor, which is why the bound is relative.
+/// At the false stop (TVQ 0.011638) Q is nearly unidentified and the BHHH system
+/// ill-conditioned: re-evaluating the *closed form* with every EBE scaled by `1 ± k·ε`,
+/// k ≤ 8, spreads its gain over 2.37e-7 on Linux aarch64 (2.41e-7 on macOS arm64) — 1.6e-8
+/// relative — so any reordering of the arithmetic moves it by ~1e-7 (#2160: the former
+/// 1e-7 absolute bound, set in #2143 from a 1.7e-9 Linux x86_64 reading, went red on
+/// macOS at `c5e78b48` and sat at 3.2e-8 on Linux aarch64 at `badfdd5e`). Measured on Linux
+/// aarch64 at `badfdd5e`: 14.832907827586 vs 14.832907859785 at the false stop (3.2e-8,
+/// 2.2e-9 relative) and 5.77066912164e-7 vs 5.77066912252e-7 at NONMEM's optimum (8.7e-17,
+/// 1.5e-10 relative; floor 9.6e-18). The bound is 1e-6 relative — 60× the false stop's
+/// floor, 450× its reading — which is 1.5e-5 at the false stop, still four orders below the
+/// 0.1 threshold, so the straddle carries over unchanged.
 #[test]
 fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
     use crate::parser::model_parser::parse_model_string;
@@ -8145,7 +8153,7 @@ fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
         let got = gain_at(&ode, &pop, &opts).expect("exact ODE");
         eprintln!("closed {want:e}, exact ODE {got:e}");
         assert!(
-            got.is_finite() && (got - want).abs() <= 1e-7,
+            got.is_finite() && (got - want).abs() <= 1e-6 * want.abs(),
             "exact ODE {got} vs closed form {want}"
         );
         gains.push(got);
