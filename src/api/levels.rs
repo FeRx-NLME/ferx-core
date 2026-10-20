@@ -869,10 +869,14 @@ fn level_key(values: &[f64]) -> Vec<u64> {
 
 /// Why a population's index column for one bound level block is not the index the
 /// model's level table gives its records (#1762). The first that applies, in this
-/// order; a population no subject of which carries the column is the caller's
-/// (`check_level_index_columns`) to report, before this is asked.
+/// order.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LevelIndexFinding {
+    /// No subject carries the index column, so the population was never bound for the
+    /// block (#1795). Decided from the subjects alone: a name listed in
+    /// `covariate_names` is not an index, so a population listing it and carrying it on
+    /// no subject is never bound too. An empty population is never bound.
+    NeverBound,
     /// `unbound` of the population's `of` subjects carry no index column; `first_id`
     /// is the first of them.
     SomeSubjectsUnbound {
@@ -925,6 +929,9 @@ pub(crate) fn level_index_finding(
         .iter()
         .filter(|s| !s.covariates.contains_key(&column))
         .collect();
+    if unbound.len() == population.subjects.len() {
+        return Some(LevelIndexFinding::NeverBound);
+    }
     if let Some(first) = unbound.first() {
         return Some(LevelIndexFinding::SomeSubjectsUnbound {
             unbound: unbound.len(),

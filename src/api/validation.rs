@@ -247,6 +247,10 @@ pub(crate) enum LevelDataEntry {
     /// `fit()` (and `ferx check`, which binds before it gets here): it estimates θ, so
     /// the model is laid out afresh on the population's own levels.
     Fit,
+    /// `run_covariance` / `run_sir` on a fit with no current fingerprint to compare the
+    /// population against (#1793): they run the fit's θ, so the binder is `Run`'s, but
+    /// a population with levels the fit lacks is not the one it was given.
+    PostHoc,
 }
 
 /// A **bound** `theta NAME[...]` block handed a population that was never bound for
@@ -260,7 +264,7 @@ pub(crate) enum LevelDataEntry {
 ///
 /// | Entry | Binder named |
 /// |---|---|
-/// | `Run` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
+/// | `Run`, `PostHoc` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
 /// | `Fit` | `bind_theta_levels` on a fresh parse |
 ///
 /// A population that carries the column is checked record by record against the
@@ -274,7 +278,7 @@ pub(crate) enum LevelDataEntry {
 /// | no subject carries the index | `E_THETA_LEVELS_DATA_UNBOUND`, "never bound" | the binder above |
 /// | some subjects carry none | `E_THETA_LEVELS_DATA_UNBOUND`, "`k` of `n` subjects" | the binder above |
 /// | an index without its level column | `E_THETA_LEVELS_DATA_MISMATCH` | none: the level is unknown |
-/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder |
+/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder; `PostHoc`: the population the fit was given |
 /// | indexed for another table | `E_THETA_LEVELS_DATA_MISMATCH`, the first record | the binder above |
 ///
 /// A population is refused, never re-indexed: the check reads `&Population`, and
@@ -286,7 +290,7 @@ pub(crate) fn check_level_index_columns(
     entry: LevelDataEntry,
 ) -> Vec<Diagnostic> {
     let binder = match entry {
-        LevelDataEntry::Run => {
+        LevelDataEntry::Run | LevelDataEntry::PostHoc => {
             "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
              population, &fit.data_bindings)`, passing the bindings the θ you run was \
              laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
@@ -302,25 +306,19 @@ pub(crate) fn check_level_index_columns(
     let blocks = model.theta_blocks();
     bound_level_columns(model)
         .into_iter()
-        .filter_map(|(name, column)| {
-            // "Never bound" only when no subject carries the index: a population some of
-            // whose subjects do is partly bound, and is told so below (#1762).
-            let carried = population.covariate_names.contains(&column)
-                || population
-                    .subjects
-                    .iter()
-                    .any(|s| s.covariates.contains_key(&column));
-            if !carried {
-                return Some(Diagnostic::error(
+        .filter_map(|(name, _)| {
+            let decl = blocks.level_blocks().iter().find(|d| d.name() == name)?;
+            let (code, message) = match level_index_finding(decl, population)? {
+                // "Never bound" only when no subject carries the index, whatever
+                // `covariate_names` lists (#1795): a population some of whose subjects
+                // do is partly bound, and is told so below (#1762).
+                LevelIndexFinding::NeverBound => (
                     "E_THETA_LEVELS_DATA_UNBOUND",
                     format!(
                         "`theta {name}[...]` is bound, but this population was never bound for \
                          it, so its records carry no index into the block's levels. {binder}"
                     ),
-                ));
-            }
-            let decl = blocks.level_blocks().iter().find(|d| d.name() == name)?;
-            let (code, message) = match level_index_finding(decl, population)? {
+                ),
                 LevelIndexFinding::SomeSubjectsUnbound {
                     unbound,
                     of,
@@ -347,6 +345,10 @@ pub(crate) fn check_level_index_columns(
                             "A θ for them comes from a fit of a model bound on this population."
                         }
                         LevelDataEntry::Fit => binder,
+                        // #1793: the fit's own population has only the fit's levels.
+                        LevelDataEntry::PostHoc => {
+                            "So this is not the population the fit was given: pass that one."
+                        }
                     };
                     (
                         "E_THETA_LEVELS_DATA_MISMATCH",
