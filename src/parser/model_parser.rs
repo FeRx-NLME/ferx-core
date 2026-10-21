@@ -28492,7 +28492,42 @@ pub struct OdeRhsProgram {
     binding: RhsBindingPlan,
 }
 
+/// Streams `Debug` output straight into a hasher, so a compiled program can be
+/// fingerprinted without allocating its rendering (#1150).
+#[cfg(debug_assertions)]
+struct HashWriter<'a, H: std::hash::Hasher>(&'a mut H);
+
+#[cfg(debug_assertions)]
+impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl OdeRhsProgram {
+    /// Feed the compiled program's **structure** into `h`: every statement (with its
+    /// constants and variable slots) and the slot plan, so two programs hash equal
+    /// only when they compute the same thing the same way. Debug-only: the MR
+    /// verify-gate memo keys on it (#1150), where a behavioural probe at a finite set
+    /// of points could not tell `y = f` from `y = f + g` with `g` vanishing there.
+    #[cfg(debug_assertions)]
+    pub(crate) fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::fmt::Write;
+        let _ = write!(
+            HashWriter(h),
+            "{:?}|{}|{}|{:?}|{}|{}|{}|{}",
+            self.stmts,
+            self.n_vars_total,
+            self.state_count,
+            self.indiv_to_params_slot,
+            self.time_slot,
+            self.tafd_slot,
+            self.tad_slot,
+            self.macheps_slot,
+        );
+    }
+
     /// The batched FD-column evaluator of the f64 RHS, when the program runs on lanes.
     pub(crate) fn rhs_columns(&self) -> Option<&RhsColumnsFn> {
         self.columns.as_ref()
@@ -29933,6 +29968,22 @@ pub struct OdeOutputProgram {
 }
 
 impl OdeOutputProgram {
+    /// The readout counterpart of [`OdeRhsProgram::hash_structure`]: the bytecode,
+    /// the state/parameter layout and the covariate names it reads (#1150).
+    #[cfg(debug_assertions)]
+    pub(crate) fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::fmt::Write;
+        let _ = write!(
+            HashWriter(h),
+            "{:?}|{}|{}|{:?}|{:?}",
+            self.bc,
+            self.n_states,
+            self.n_indiv,
+            self.indiv_to_pk,
+            self.cov_names,
+        );
+    }
+
     /// See [`OdeOutputProgram::dual_evaluable`].
     pub(crate) fn is_dual_evaluable(&self) -> bool {
         self.dual_evaluable
