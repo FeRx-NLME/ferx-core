@@ -138,9 +138,9 @@ fn rescaling_an_identity_packed_theta_leaves_every_sir_interval_where_it_was() {
         // and at k = 1e8 every one of the 1000 draws had an invalid weight. Since, the draws
         // are `ŷ + L·z` with `L` exactly `K·L₁`, so what is left is rounding: worst CI
         // difference 2.3e-15 (k = 1e6) and ESS 1.5e-10 (k = 1e6) on macOS arm64, and
-        // LINUX_NUMBERS. The ESS moves more than the CIs because the weights
-        // carry the objective's own rounding at each draw. The bounds are 430× and 66× the
-        // worst.
+        // 3.9e-15 (k = 1e6) and 2.8e-10 (k = 1e5) on Linux x86_64 (glibc 2.28). The ESS
+        // moves more than the CIs because the weights carry the objective's own rounding at
+        // each draw. The bounds are 256× and 36× the Linux worst.
         if !(worst < 1e-12) {
             failures.push(format!("{label}: worst relative CI difference {worst:e}"));
         }
