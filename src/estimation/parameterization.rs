@@ -56,6 +56,67 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
     }
 }
 
+/// The floor `sₖ` of packed coordinate `k`'s finite-difference step `eps·(sₖ + |xₖ|)`
+/// ([`fd_step`], #2147).
+///
+/// `sₖ = 1` everywhere — which is the step every FD site took before #2147, bit for bit —
+/// except on an **identity-packed θ** (a negative lower bound) whose declared initial value
+/// `θ₀` is non-zero and below 1 in magnitude, where `sₖ = |θ₀|`. On such a θ the packed
+/// coordinate is the θ itself, so `eps·(1 + |x|)` is about `eps` *in the θ's own units*: a θ
+/// of 0.0077 under `fd_hessian_step = 1e-2` is stepped by 0.0101, straight through zero, and
+/// the minus point evaluates a negative volume. Scaling the floor by `|θ₀|` makes the step
+/// relative to the coordinate's declared magnitude, as NONMEM's UCP scaling does.
+///
+/// The floor is `θ₀` (the model's declared value, `declared`) rather than the estimate, so a θ
+/// estimated at or near zero — a covariate effect — still gets a usable step. A log-packed θ,
+/// whose coordinate is `log θ`, is already stepped relatively; Ω, σ and every other
+/// coordinate keep `1`. `template` supplies the packing (θ lower bounds) and `declared` the
+/// initial values; a `k` past either θ vector is not a θ and gets `1`.
+pub(crate) fn fd_step_floor(
+    template: &ModelParameters,
+    declared: &ModelParameters,
+    k: usize,
+) -> f64 {
+    match (template.theta_lower.get(k), declared.theta.get(k)) {
+        (Some(&lo), Some(&t0)) if !theta_packs_log(lo) && t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
+        _ => 1.0,
+    }
+}
+
+/// [`fd_step_floor`] for every packed coordinate of `template`, in packed order.
+pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParameters) -> Vec<f64> {
+    (0..packed_len(template))
+        .map(|k| fd_step_floor(template, declared, k))
+        .collect()
+}
+
+/// The per-θ floor of a finite difference taken in **θ's own units** rather than the packed
+/// coordinate — the mixing-probability derivatives (`mixing_logp_grad{,_fd}`), which step
+/// `1e-6·max(|θⱼ|, floorⱼ)` (#2147). `floorⱼ = |θ₀ⱼ|` when `0 < |θ₀ⱼ| < 1`, else 1 (the
+/// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
+/// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
+pub(crate) fn fd_theta_step_floors(declared: &ModelParameters) -> Vec<f64> {
+    declared
+        .theta
+        .iter()
+        .map(|&t0| {
+            if t0 != 0.0 && t0.abs() < 1.0 {
+                t0.abs()
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// The finite-difference step of a packed coordinate at `x` with floor `floor`
+/// ([`fd_step_floor`]): `eps·(floor + |x|)`. The one formula every covariance and score FD
+/// site steps by (#2147); with `floor = 1` it is the pre-#2147 `eps·(1 + |x|)`.
+#[inline]
+pub(crate) fn fd_step(eps: f64, x: f64, floor: f64) -> f64 {
+    eps * (floor + x.abs())
+}
+
 /// Smallest value the **log packing** represents: [`pack_params`] floors at it
 /// and `compute_bounds` floors a declared θ *lower* bound at it, so a
 /// declaration reaching below it arrives at the optimizer as this number.
@@ -2108,6 +2169,47 @@ mod tests {
         let template = make_template();
         // 2 theta + 2 diagonal omega + 1 sigma = 5
         assert_eq!(packed_len(&template), 5);
+    }
+
+    // ── #2147: the FD step floor ────────────────────────────────────────────
+
+    /// Each gate of `fd_step_floor`, one θ per cell, plus Ω/σ: only an identity-packed θ
+    /// with `0 < |θ₀| < 1` takes `|θ₀|`; a log-packed θ, a `|θ₀| ≥ 1` θ, a `θ₀ = 0` θ and
+    /// every non-θ coordinate keep the pre-#2147 floor of 1. The floor reads the *declared*
+    /// θ₀, not the template's current value: θ 0 sits at 0.001 in the template and still
+    /// gets 0.0077, so a θ estimated near zero keeps a usable step.
+    #[test]
+    fn the_fd_step_floor_is_theta0_only_on_a_small_identity_packed_theta() {
+        let mut declared = make_template();
+        declared.theta = vec![0.0077, 7.7, 0.0, 0.5, -0.3];
+        declared.theta_lower = vec![-0.77, -770.0, -1.0, 0.0, -1.0];
+        declared.theta_upper = vec![0.77, 770.0, 1.0, 1.0, 1.0];
+        declared.theta_names = (0..5).map(|i| format!("t{i}")).collect();
+        declared.theta_fixed = vec![false; 5];
+        let mut template = declared.clone();
+        template.theta[0] = 0.001;
+
+        let floors = fd_step_floors(&template, &declared);
+        assert_eq!(floors.len(), packed_len(&template));
+        assert_eq!(&floors[..5], &[0.0077, 1.0, 1.0, 1.0, 0.3]);
+        assert!(floors[5..].iter().all(|&s| s == 1.0), "Ω/σ: {floors:?}");
+        // A declared θ vector shorter than the template's is not read past its end.
+        let mut short = declared.clone();
+        short.theta.truncate(1);
+        assert_eq!(fd_step_floor(&template, &short, 4), 1.0);
+    }
+
+    /// With floor 1, `fd_step` is the pre-#2147 `eps·(1 + |x|)` bit for bit — the property
+    /// that keeps every log-packed θ, Ω and σ step unchanged.
+    #[test]
+    fn fd_step_at_floor_one_is_the_legacy_step() {
+        for &(eps, x) in &[(1e-2, 0.3), (1e-4, -7.25), (1e-5, 1e-12), (1e-2, 0.0)] {
+            assert_eq!(
+                fd_step(eps, x, 1.0).to_bits(),
+                (eps * (1.0 + x.abs())).to_bits()
+            );
+        }
+        assert_eq!(fd_step(1e-2, 0.0077, 0.0077), 1e-2 * (0.0077 + 0.0077));
     }
 
     // ── #1252: `pack_with_bounds` / `packed_segments` ───────────────────────

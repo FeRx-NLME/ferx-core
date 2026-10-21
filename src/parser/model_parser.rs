@@ -16816,10 +16816,16 @@ pub(crate) fn eval_mixing_log_probs(
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
 /// `g ≡ 0 ⇒ ∂ = 0`) and `∂g/∂θ_j` comes from the symbolic differentiator.
+///
+/// `floor` is the per-θ step floor of [`crate::estimation::parameterization::fd_theta_step_floors`]
+/// (#2147): θⱼ is stepped by `1e-6·max(|θⱼ|, floorⱼ)`, so a θ declared below 1 in magnitude is
+/// stepped relative to its θ₀ rather than by `1e-6` in its own units, which crosses zero on a
+/// θ near `1e-6`.
 pub(crate) fn mixing_logp_grad(
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
+    floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
@@ -16845,7 +16851,7 @@ pub(crate) fn mixing_logp_grad(
         let c = m.class - 1;
         logit[c] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
         for j in 0..nt {
-            let h = 1e-6 * theta[j].abs().max(1.0);
+            let h = 1e-6 * theta[j].abs().max(floor[j]);
             tperturb[j] = theta[j] + h;
             let fp = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
             tperturb[j] = theta[j] - h;
@@ -16877,17 +16883,18 @@ pub(crate) fn mixing_logp_grad(
 /// of the whole mixture objective there; a per-subject score has no such fallback.
 /// Differences `eval_mixing_log_probs` itself, so the clamp and renormalisation the
 /// objective applies are exactly what is differentiated; same step as the logit form's
-/// expression FD.
+/// expression FD, `floor` included.
 pub(crate) fn mixing_logp_grad_fd(
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
+    floor: &[f64],
 ) -> Vec<Vec<f64>> {
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
     for j in 0..nt {
-        let h = 1e-6 * theta[j].abs().max(1.0);
+        let h = 1e-6 * theta[j].abs().max(floor[j]);
         tperturb[j] = theta[j] + h;
         let fp = eval_mixing_log_probs(spec, &tperturb, covariates);
         tperturb[j] = theta[j] - h;

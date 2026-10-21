@@ -459,6 +459,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
                 n,
                 &x_hat,
                 &free_idx,
+                &crate::estimation::parameterization::fd_step_floors(params, &model.default_params),
                 opts.fd_hessian_step,
                 f0,
                 None,
@@ -1055,7 +1056,7 @@ fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
     };
     let x = [0.0, 0.0];
     let opts = FitOptions::default();
-    let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, None, &ofv, &opts)
+    let stencil = fd_ofv_stencil(2, &x, &[0, 1], &[1.0, 1.0], 1e-2, 0.0, None, &ofv, &opts)
         .expect("nothing cancels in a test");
 
     // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
