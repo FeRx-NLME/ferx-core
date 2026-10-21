@@ -942,22 +942,9 @@ fn fit_unstamped(
     //     where each expanded dose opens an occasion), the inner per-subject
     //     problem balloons; warn so the multiplication isn't silent.
     if derive_occ {
-        // Distinct occasion labels seen across observations and doses, per subject.
-        // Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
-        // (#1876): a derived rule is monotone in time, so on a subject whose observations
-        // and doses share one occasion such a row lies before or after all of them. Its κ is
-        // then at most weakly informed: only when a second such row lies between it and the
-        // first dose or observation, and the model has an `init(...)` baseline, does it
-        // govern a non-empty interval on nonzero state. Counting it would let the
-        // unidentifiable case below through, so the check errs on the conservative side.
-        let distinct_occ = |s: &Subject| -> usize {
-            let mut occs: Vec<u32> = s.occasions.clone();
-            occs.extend_from_slice(&s.dose_occasions);
-            occs.sort_unstable();
-            occs.dedup();
-            occs.len()
-        };
-        let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
+        // Distinct occasion labels seen across observations and doses, per subject; the
+        // `--simulate` pre-check reads the same count on its template (#2052).
+        let max_occ = crate::api::max_obs_dose_occasions(pop_ref);
         if max_occ <= 1 {
             return Err(EngineError::uncoded(
                 "The `iov_occasion` rule produced only a single occasion for every subject, \

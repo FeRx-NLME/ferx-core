@@ -2228,6 +2228,79 @@ pub(crate) fn check_simulation_iov_occasions(
     Some(Diagnostic::error("E_IOV_MISSING_OCC", message).with_block("fit_options"))
 }
 
+/// The most distinct occasion labels any one subject carries over its observations and
+/// doses: the count `fit()`'s single-occasion refusal reads after a derived
+/// `iov_occasion` rule has labelled the population, and the `--simulate` pre-check
+/// ([`check_simulation_iov_single_occasion`]) reads on the template (#2052).
+///
+/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
+/// (#1876): a derived rule is monotone in time, so on a subject whose observations
+/// and doses share one occasion such a row lies before or after all of them. Its κ is
+/// then at most weakly informed: only when a second such row lies between it and the
+/// first dose or observation, and the model has an `init(...)` baseline, does it
+/// govern a non-empty interval on nonzero state. Counting it would let the
+/// unidentifiable case through, so the count errs on the conservative side.
+pub(crate) fn max_obs_dose_occasions(population: &Population) -> usize {
+    let distinct_occ = |s: &Subject| -> usize {
+        let mut occs: Vec<u32> = s.occasions.clone();
+        occs.extend_from_slice(&s.dose_occasions);
+        occs.sort_unstable();
+        occs.dedup();
+        occs.len()
+    };
+    population
+        .subjects
+        .iter()
+        .map(distinct_occ)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `fit()`'s single-occasion refusal, checked on the template population
+/// `run_model_simulate` builds from the `[simulation]` block before anything is
+/// simulated (#2052). `fit()` refuses a derived `iov_occasion` rule that leaves every
+/// subject with at most one occasion, but only after the simulation, and with advice
+/// written for a dataset: an `iov_column` (no dataset column exists here) or
+/// `iov_occasion = dose` on a multiple-dose design (every template subject gets the
+/// block's one dose). The template carries the `times` grid and that dose, so the
+/// occasions derived on it are the ones `fit()` would count; the message names only
+/// `iov_occasion = time(...)` with a breakpoint inside `times`.
+///
+/// The gate is `fit()`'s: kappa declared and a derived rule active. A model with
+/// nested levels is left to `fit()`, which labels its records from the level columns
+/// rather than from the rule.
+pub(crate) fn check_simulation_iov_single_occasion(
+    model: &CompiledModel,
+    template: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Option<String> {
+    if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
+        return None;
+    }
+    let mut derived = template.clone();
+    apply_iov_occasion_rule(&mut derived, iov_rule, false, &mut Vec::new());
+    if max_obs_dose_occasions(&derived) > 1 {
+        return None;
+    }
+    let why = match iov_rule {
+        IovOccasionRule::PerDose => {
+            "`iov_occasion = dose` derives one occasion here: each simulated subject receives \
+             the [simulation] block's single dose."
+        }
+        _ => {
+            "No `time(...)` breakpoint lies after the simulated dose at time 0 and at or \
+             before the last of the [simulation] `times`, so every record falls in one window."
+        }
+    };
+    Some(format!(
+        "The `iov_occasion` rule derives only a single occasion for every subject simulated \
+         from the [simulation] block, so the per-occasion kappa (IOV) cannot be separated \
+         from between-subject variability (it is unidentifiable). {why} Set \
+         `iov_occasion = time(...)` in [fit_options], with a breakpoint between the first \
+         and last of the [simulation] `times`, to derive more than one occasion."
+    ))
+}
+
 /// Derive each subject's IOV occasion labels from a model-side rule
 /// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
 /// `Subject::occasions` (parallel to `obs_times`), `Subject::dose_occasions`
