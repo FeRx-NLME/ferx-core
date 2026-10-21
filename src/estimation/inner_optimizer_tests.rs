@@ -819,7 +819,7 @@ fn legacy_dense_bfgs(
         if d.iter().zip(&g).map(|(di, gi)| di * gi).sum::<f64>() >= 0.0 {
             h_inv = DMatrix::identity(n, n);
             let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
-            let (alpha, f_new) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
+            let (alpha, f_new, verified_g) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
             if alpha == 0.0 {
                 return false;
             }
@@ -827,11 +827,11 @@ fn legacy_dense_bfgs(
                 x[i] += alpha * d[i];
             }
             f_cur = f_new;
-            g = grad(x);
+            g = verified_g.unwrap_or_else(|| grad(x));
             continue;
         }
 
-        let (alpha, f_new) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
+        let (alpha, f_new, verified_g) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
         if alpha == 0.0 {
             return false;
         }
@@ -841,7 +841,7 @@ fn legacy_dense_bfgs(
         }
         f_cur = f_new;
 
-        let g_new = grad(x);
+        let g_new = verified_g.unwrap_or_else(|| grad(x));
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
         let s_vec = DVector::from_column_slice(&s);
         let y_vec = DVector::from_column_slice(&y);
@@ -860,7 +860,8 @@ fn legacy_dense_bfgs(
 }
 
 /// The step rule both drivers apply since #2270: a gradient-verified step below the objective's
-/// resolution first, else the line search.
+/// resolution first, else the line search. A verified step hands back the gradient it took at
+/// its end point, which the driver uses instead of evaluating it again.
 fn legacy_step(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -869,10 +870,13 @@ fn legacy_step(
     g: &[f64],
     n: usize,
     f0: f64,
-) -> (f64, f64) {
+) -> (f64, f64, Option<Vec<f64>>) {
     match exact_step_verified_by_gradient(obj, grad, x, d, f0, g, None, false) {
-        Some(fc) => (1.0, fc),
-        None => legacy_line_search(obj, x, d, g, n, f0),
+        Some((fc, gc)) => (1.0, fc, Some(gc)),
+        None => {
+            let (alpha, f) = legacy_line_search(obj, x, d, g, n, f0);
+            (alpha, f, None)
+        }
     }
 }
 
@@ -4874,9 +4878,14 @@ fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
             "fixture premise: gain {gain:.3e}"
         );
         let mut x = start.clone();
+        let points = std::cell::RefCell::new(Vec::new());
+        let logged = |x: &[f64]| {
+            points.borrow_mut().push([x[0].to_bits(), x[1].to_bits()]);
+            grad(x)
+        };
         let ok = dense_bfgs_core(
             &obj,
-            &grad,
+            &logged,
             &mut x,
             2,
             200,
@@ -4890,6 +4899,16 @@ fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
         if !(ok && gn(&x) < tol) {
             stuck.push((k, gn(&x)));
         }
+        // The verified step's gradient at its end point is the driver's next gradient: no point
+        // has its gradient evaluated twice.
+        let mut seen = points.borrow().clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            points.borrow().len(),
+            "start {k}: a gradient was evaluated twice at one point"
+        );
     }
     assert!(
         stuck.is_empty(),

@@ -4647,6 +4647,8 @@ fn lbfgs_core(
         }
 
         let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
+        // The gradient a verified step already took at its end point, reused below.
+        let mut verified_g: Option<Vec<f64>> = None;
         let (alpha, f_new) = match exact_step_verified_by_gradient(
             obj,
             grad,
@@ -4657,7 +4659,10 @@ fn lbfgs_core(
             stop_precond,
             enable_stall,
         ) {
-            Some(fc) => (1.0, fc),
+            Some((fc, gc)) => {
+                verified_g = Some(gc);
+                (1.0, fc)
+            }
             None => backtracking_line_search(
                 obj,
                 x,
@@ -4673,7 +4678,10 @@ fn lbfgs_core(
         // gradient verifies it ([`gradient_verified_step`]).
         let (alpha, f_new) = if alpha == 0.0 && floor {
             match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                Some(fc) => (1.0, fc),
+                Some((fc, gc)) => {
+                    verified_g = Some(gc);
+                    (1.0, fc)
+                }
                 None => return true,
             }
         } else {
@@ -4700,7 +4708,7 @@ fn lbfgs_core(
             return true;
         }
 
-        let g_new = grad(x);
+        let g_new = verified_g.take().unwrap_or_else(|| grad(x));
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
@@ -4846,6 +4854,8 @@ fn dense_bfgs_core(
                 cap_curvature_free_step(&mut d, precond);
             }
             let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
+            // The gradient a verified step already took at its end point, reused below.
+            let mut verified_g: Option<Vec<f64>> = None;
             let (alpha, f_new) = match exact_step_verified_by_gradient(
                 obj,
                 grad,
@@ -4856,7 +4866,10 @@ fn dense_bfgs_core(
                 stop_precond,
                 enable_stall,
             ) {
-                Some(fc) => (1.0, fc),
+                Some((fc, gc)) => {
+                    verified_g = Some(gc);
+                    (1.0, fc)
+                }
                 None => backtracking_line_search(
                     obj,
                     x,
@@ -4872,7 +4885,10 @@ fn dense_bfgs_core(
             // the gradient verifies it ([`gradient_verified_step`]).
             let (alpha, f_new) = if alpha == 0.0 && floor {
                 match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                    Some(fc) => (1.0, fc),
+                    Some((fc, gc)) => {
+                        verified_g = Some(gc);
+                        (1.0, fc)
+                    }
                     None => return true,
                 }
             } else {
@@ -4892,11 +4908,13 @@ fn dense_bfgs_core(
             if stalled {
                 return true;
             }
-            g = grad(x);
+            g = verified_g.take().unwrap_or_else(|| grad(x));
             continue;
         }
 
         let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
+        // The gradient a verified step already took at its end point, reused below.
+        let mut verified_g: Option<Vec<f64>> = None;
         let (alpha, f_new) = match exact_step_verified_by_gradient(
             obj,
             grad,
@@ -4907,7 +4925,10 @@ fn dense_bfgs_core(
             stop_precond,
             enable_stall,
         ) {
-            Some(fc) => (1.0, fc),
+            Some((fc, gc)) => {
+                verified_g = Some(gc);
+                (1.0, fc)
+            }
             None => backtracking_line_search(
                 obj,
                 x,
@@ -4923,7 +4944,10 @@ fn dense_bfgs_core(
         // gradient verifies it ([`gradient_verified_step`]).
         let (alpha, f_new) = if alpha == 0.0 && floor {
             match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                Some(fc) => (1.0, fc),
+                Some((fc, gc)) => {
+                    verified_g = Some(gc);
+                    (1.0, fc)
+                }
                 None => return true,
             }
         } else {
@@ -4946,7 +4970,7 @@ fn dense_bfgs_core(
             return true;
         }
 
-        let g_new = grad(x);
+        let g_new = verified_g.take().unwrap_or_else(|| grad(x));
         for i in 0..n {
             y[i] = g_new[i] - g[i];
         }
@@ -5317,8 +5341,8 @@ fn step_below_resolution(d: &[f64], g: &[f64], f: f64) -> bool {
 /// On an **exact** objective (`!enable_stall`), a step whose predicted gain is below the
 /// objective's resolution ([`step_below_resolution`]) is taken when the gradient verifies it
 /// ([`gradient_verified_step`]: the objective stays within its resolution and the gradient norm
-/// at least halves), without a line search. Returns the objective at `x + d` when it is; `None`
-/// sends the step to the line search as before.
+/// at least halves), without a line search. Returns the objective and the gradient at `x + d`
+/// when it is; `None` sends the step to the line search as before.
 ///
 /// Why (#2270): next to the mode the gain a good step can make is below the objective's rounding,
 /// so the Armijo test reads noise. Measured on `examples/warfarin_iov` started from the previous
@@ -5337,7 +5361,7 @@ fn exact_step_verified_by_gradient(
     g: &[f64],
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
-) -> Option<f64> {
+) -> Option<(f64, Vec<f64>)> {
     if enable_stall || !step_below_resolution(d, g, f) {
         return None;
     }
@@ -5375,7 +5399,8 @@ fn l2_norm(v: &[f64]) -> f64 {
 /// At the noise floor, whether the full step `x + d` that the objective could not verify is
 /// verified by the **gradient** instead: the objective stays within its resolution
 /// (`INNER_FTOL_REL·(1 + |f|)`, the flat-step threshold) and the gradient norm at least
-/// halves. Returns the objective there when it is.
+/// halves. Returns the objective and the gradient there when it is, so the driver that takes the
+/// step does not evaluate that gradient a second time.
 ///
 /// The objective-based stop treats "no resolvable decrease" as convergence, which is right
 /// when the gradient carries the same noise. When the ODE is integrated tightly enough for
@@ -5393,14 +5418,15 @@ fn gradient_verified_step(
     f: f64,
     g: &[f64],
     stop_precond: Option<&[f64]>,
-) -> Option<f64> {
+) -> Option<(f64, Vec<f64>)> {
     let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
     let fc = obj(&cand);
     if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
         return None;
     }
-    let gc = grad_norm_metric(&grad(&cand), stop_precond);
-    (gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond)).then_some(fc)
+    let g_cand = grad(&cand);
+    let gc = grad_norm_metric(&g_cand, stop_precond);
+    (gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond)).then_some((fc, g_cand))
 }
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
