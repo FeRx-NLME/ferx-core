@@ -17077,6 +17077,92 @@ fn bytecode_g_f64_bit_identical() {
     );
 }
 
+/// The `Dual2` VM's `Op::Mod` carries the jet `a' − q·b'` (`q = div_euclid(a, b)`)
+/// and keeps the value `rem_euclid` bit for bit. It used to lift the result as a
+/// constant, a zero gradient on both operands (#2150). The points straddle the
+/// cases `q = 0` (the short arm), `q ≠ 0` and a negative divisor, each inside a
+/// period so FD measures the slope and not the jump.
+#[test]
+fn bytecode_g_mod_carries_the_jet_of_both_operands() {
+    use crate::sens::dual2::Dual2;
+    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let bc = compile_bytecode(&expr);
+    for (x, y) in [
+        (1.3, 2.5),
+        (7.1, 2.5),
+        (-3.4, 2.5),
+        (7.1, -2.5),
+        (-3.4, -2.5),
+    ] {
+        bc_g_dual2_fd(&expr, x, y, 1e-6, 1e-3);
+        bc_g_f64_matches(&expr, &[x, y]);
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(
+            d.value.to_bits(),
+            x.rem_euclid(y).to_bits(),
+            "value of {x} mod {y}"
+        );
+        assert_eq!(d.grad, [1.0, -x.div_euclid(y)], "grad of {x} mod {y}");
+        assert_eq!(d.hess, [[0.0; 2]; 2], "hess of {x} mod {y}");
+    }
+    // The zero-divisor guard still returns a constant.
+    let vd = [Dual2::<2>::var(1.3, 0), Dual2::<2>::var(0.0, 1)];
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+    assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
+}
+
+/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
+/// anchor: the reverse sweep reaches the third derivative of each record, so the
+/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
+/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
+/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
+/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
+#[test]
+fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
+    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
+    type V = DualV<2, 2, true>;
+    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let bc = compile_bytecode(&expr);
+    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
+    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
+        let q = x.div_euclid(y);
+        vtape_reset(1 + 2 + 2);
+        let vd = [
+            V::leaf(x, [1.0, 0.0], [0.0; 2]),
+            V::leaf(y, [0.0, 1.0], [0.0; 2]),
+        ];
+        let mut sd: Vec<V> = Vec::new();
+        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(
+            f.v.to_bits(),
+            x.rem_euclid(y).to_bits(),
+            "value of {x} mod {y}"
+        );
+        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
+        let adj = vadj_init::<1>();
+        for (comp, wc) in w.iter().enumerate() {
+            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
+        }
+        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
+        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
+        assert!(
+            got.iter().all(|g| g.is_finite()),
+            "{x} mod {y}: sweep {got:?}"
+        );
+        assert!(
+            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
+            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
+            w[0],
+            -q * w[0]
+        );
+    }
+}
+
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
 // For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
@@ -18117,6 +18203,96 @@ fn differentiate_floor_ceil_round_is_zero_away_from_a_step() {
             "d/dθ₀ {name}(3·θ₀) must be 0, not the argument's derivative (3)"
         );
         assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    }
+}
+
+/// `a mod b = a − b·q` with `q = div_euclid(a, b)` piecewise constant, so away
+/// from a jump `∂/∂a = 1` and `∂/∂b = −q`. The arm used to return `0`, which
+/// froze any η or θ read through a `mod`: `CL = TVCL·exp((ETA_CL + 5) mod 10 − 5)`
+/// fit with 100 % shrinkage and ω at its initial value (#2150).
+///
+/// Mutations it catches: the old `0` arm (every `∂/∂a` is `1`, not `0`); dropping
+/// the `−q·b'` term (the `b` axis at `q ≠ 0`); spelling `q` as `floor(a / b)` (the
+/// negative-`b` rows, where the Euclidean quotient is `ceil(a / b)`). Each point
+/// sits strictly inside a period, at least `0.2` from a jump against FD's `h`.
+#[test]
+fn differentiate_mod_matches_fd_in_both_operands() {
+    let eta = &[];
+    let vars = &[];
+    let covs = &[];
+    let expr = binop(BinOp::Mod, Expression::Theta(0), Expression::Theta(1));
+    // (a, b, q = div_euclid(a, b)): q = 0, positive and negative q, negative b.
+    for (a, b, q) in [
+        (1.3, 2.5, 0.0),
+        (7.1, 2.5, 2.0),
+        (-3.4, 2.5, -2.0),
+        (7.1, -2.5, -2.0),
+        (-3.4, -2.5, 2.0),
+    ] {
+        let theta = &[a, b];
+        assert_eq!(f64::div_euclid(a, b), q, "fixture q for ({a}, {b})");
+        let d_a = eval_at(
+            &differentiate(&expr, DiffAxis::Theta(0)),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        let d_b = eval_at(
+            &differentiate(&expr, DiffAxis::Theta(1)),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert!(
+            (d_a - 1.0).abs() < 1e-12,
+            "∂/∂a ({a} mod {b}) = {d_a}, want 1"
+        );
+        assert!(
+            (d_b + q).abs() < 1e-12,
+            "∂/∂b ({a} mod {b}) = {d_b}, want {}",
+            -q
+        );
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(0), theta, eta, vars, covs);
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(1), theta, eta, vars, covs);
+    }
+    // The issue's reproduction shape: an η through a `mod` with a literal divisor
+    // (the `b' = 0` short arm), equal to `η` on `[-5, 5)`.
+    let wrapped = binop(
+        BinOp::Sub,
+        binop(
+            BinOp::Mod,
+            binop(BinOp::Add, Expression::Eta(0), lit(5.0)),
+            lit(10.0),
+        ),
+        lit(5.0),
+    );
+    for eta0 in [-0.7, 0.3, 12.4] {
+        let d = eval_at(
+            &differentiate(&wrapped, DiffAxis::Eta(0)),
+            &[],
+            &[eta0],
+            vars,
+            covs,
+        );
+        assert_eq!(d, 1.0, "d/dη ((η + 5) mod 10 − 5) at η = {eta0}");
+        assert_diff_matches_fd(wrapped.clone(), DiffAxis::Eta(0), &[], &[eta0], vars, covs);
+    }
+    // A zero divisor: the VM returns the constant `0`, so the derivative is `0`,
+    // through a literal divisor and through a θ one.
+    let zero_lit = binop(BinOp::Mod, Expression::Theta(0), lit(0.0));
+    let d = eval_at(
+        &differentiate(&zero_lit, DiffAxis::Theta(0)),
+        &[1.3],
+        eta,
+        vars,
+        covs,
+    );
+    assert_eq!(d, 0.0, "∂/∂a (a mod 0)");
+    for axis in [DiffAxis::Theta(0), DiffAxis::Theta(1)] {
+        let d = eval_at(&differentiate(&expr, axis), &[1.3, 0.0], eta, vars, covs);
+        assert_eq!(d, 0.0, "{axis:?} of (a mod θ₁) at θ₁ = 0");
     }
 }
 

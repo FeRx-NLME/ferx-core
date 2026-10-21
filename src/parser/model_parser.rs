@@ -27196,11 +27196,26 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::Mod => {
                 let b = pop!();
                 let a = pop!();
-                // Non-differentiable: compute on values, lift as a constant.
-                push!(if b.val().abs() < 1e-30 {
+                // `a mod b = a − b·q`, `q = div_euclid(a, b)` piecewise constant:
+                // the jet is `a' − q·b'` (#2150 — it used to be lifted as a
+                // constant, so an η read through `mod` had a zero gradient). The
+                // value stays `rem_euclid` bit for bit: `a`'s jet is lifted onto
+                // it, and the `q·b` term enters with its value cancelled exactly.
+                // The lift is `lift4`, not `lift2`: the map is affine, so every
+                // higher derivative is a known `0`, and the taped-Hessian `DualV`
+                // of the Laplace/AGQ exact anchor poisons a `lift2` with a `NaN` `φ‴`.
+                let (av, bv) = (a.val(), b.val());
+                push!(if bv.abs() < 1e-30 {
                     k(0.0)
                 } else {
-                    k(a.val().rem_euclid(b.val()))
+                    let out = a.lift4(av.rem_euclid(bv), 1.0, 0.0, 0.0, 0.0);
+                    let q = av.div_euclid(bv);
+                    if q == 0.0 {
+                        out
+                    } else {
+                        let qb = b * k(q);
+                        out - (qb - k(qb.val()))
+                    }
                 });
             }
             Op::Exp => {
@@ -30510,7 +30525,43 @@ fn differentiate_with_chain(
                 let denom = mul((**r).clone(), (**r).clone());
                 div(num, denom)
             }
-            BinOp::Mod => Expression::Literal(0.0), // mod is discontinuous; derivative is 0 a.e.
+            BinOp::Mod => {
+                // `a mod b = a − b·q` with `q = div_euclid(a, b)` (the value is
+                // `rem_euclid`), and `q` is piecewise constant, so away from the
+                // jumps the slope is `a' − q·b'` — `1` in `a`, `−q` in `b`. It used
+                // to be `0`, which froze any η or θ read through a `mod` (#2150).
+                // `q` is spelled `(a − a mod b) / b`, the quotient the value path
+                // implies, rather than `floor(a / b)`, which is the wrong integer
+                // for a negative `b`. The VM's `|b| < 1e-30` arm returns the
+                // constant `0`, so its derivative is `0` there too.
+                let dl = differentiate_with_chain(l, axis, chain);
+                let dr = differentiate_with_chain(r, axis, chain);
+                let slope = if matches!(dr, Expression::Literal(x) if x == 0.0) {
+                    dl
+                } else {
+                    let q = div(
+                        sub(
+                            (**l).clone(),
+                            Expression::BinOp(l.clone(), BinOp::Mod, r.clone()),
+                        ),
+                        (**r).clone(),
+                    );
+                    sub(dl, mul(q, dr))
+                };
+                match **r {
+                    Expression::Literal(b) if b.abs() < 1e-30 => Expression::Literal(0.0),
+                    Expression::Literal(_) => slope,
+                    _ => Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            Expression::UnaryFn("abs".into(), r.clone()),
+                            CmpOp::Lt,
+                            Expression::Literal(1e-30),
+                        )),
+                        Box::new(Expression::Literal(0.0)),
+                        Box::new(slope),
+                    ),
+                }
+            }
         },
         Expression::UnaryFn(name, arg) => {
             let da = differentiate_with_chain(arg, axis, chain);
@@ -30558,8 +30609,8 @@ fn differentiate_with_chain(
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the
-                    // integer boundaries (the same convention `BinOp::Mod` takes
-                    // just above). These three had arms in `eval_expr` and in the
+                    // integer boundaries. (`BinOp::Mod` is not one of them: it
+                    // has slope `1` in its left operand between jumps, #2150.) These three had arms in `eval_expr` and in the
                     // bytecode compiler but none here, so they landed on the
                     // identity fallthrough and differentiated as `a'` — a value
                     // path that rounds against an analytic gradient that does not
