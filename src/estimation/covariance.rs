@@ -2702,6 +2702,11 @@ pub(crate) fn published_covariance_method(
 /// `covariance_method = r` is the user's call and is honoured, but is told what
 /// it is about to cost.
 ///
+/// `rsr` builds the same `R` and is told the same (#2055). It is never the
+/// default, so it is never routed — the routing is gated on `Hessian`, the cost
+/// warning on [`needs_r`]. Its warning does not read `explicitly_set`: a
+/// `Sandwich` request is the user's whether or not the flag was raised.
+///
 /// Split out from [`run_covariance_step_inner`] so the three branches are
 /// reachable from a unit test: exercising them through the real covariance step
 /// would mean converging a fit with several hundred free parameters.
@@ -2711,7 +2716,7 @@ pub(crate) fn scale_routed_covariance_method(
     explicitly_set: bool,
     has_priors: bool,
 ) -> (CovarianceMethod, Option<String>) {
-    if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
+    if n <= crate::types::COV_HESSIAN_MAX_DIM || !needs_r(requested) {
         return (requested, None);
     }
     // #254: `S` is a sum of per-*subject* score cross-products, and a parameter
@@ -2724,6 +2729,29 @@ pub(crate) fn scale_routed_covariance_method(
     // A packed dimension near `usize::MAX.sqrt()` is not a model anyone can write; the
     // saturated count is still a lower bound on the cost.
     let stencil = fd_r_objective_evals(n).unwrap_or(usize::MAX);
+    if requested == CovarianceMethod::Sandwich {
+        // `S` cannot carry a prior (above), so with one declared the cheap way out
+        // is not `s` — it would drop the prior from the sandwich's `S` and its `R`
+        // alike — and only switching the step off is left to name.
+        let warning = if has_priors {
+            format!(
+                "covariance_method = rsr with {n} free parameters and parameter priors \
+                 declared: the sandwich R⁻¹SR⁻¹ needs the R matrix, a finite-difference \
+                 Hessian needing {stencil} re-converged objective evaluations. \
+                 `covariance_method = s` builds no R but cannot represent a prior, so it is \
+                 not a way out here. Set `covariance = false` if this does not finish."
+            )
+        } else {
+            format!(
+                "covariance_method = rsr with {n} free parameters: the sandwich R⁻¹SR⁻¹ \
+                 needs the R matrix, a finite-difference Hessian that re-converges every \
+                 subject's EBEs at each of {stencil} objective evaluations. Set \
+                 `covariance_method = s` (the score cross-product, one pass) if this does \
+                 not finish."
+            )
+        };
+        return (requested, Some(warning));
+    }
     if has_priors {
         return (
             requested,
@@ -3731,12 +3759,80 @@ mod tests {
     #[test]
     fn a_non_hessian_request_is_never_rerouted() {
         // Only a defaulted `r` is rerouted: `s` builds no `R`, and `rsr` is an explicit
-        // request for the sandwich, which no cheaper estimator computes.
+        // request for the sandwich, which no cheaper estimator computes. `s` is not warned
+        // about either; `rsr` is (#2055), in the test below.
         for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+            for explicit in [false, true] {
+                for priors in [false, true] {
+                    let (routed, _) = scale_routed_covariance_method(
+                        COV_HESSIAN_MAX_DIM * 8,
+                        method,
+                        explicit,
+                        priors,
+                    );
+                    assert_eq!(routed, method, "explicit {explicit}, priors {priors}");
+                }
+            }
+        }
+        let (_, warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM * 8,
+            CovarianceMethod::CrossProduct,
+            false,
+            false,
+        );
+        assert!(warning.is_none(), "`s` builds no R: {warning:?}");
+    }
+
+    /// #2055: `rsr` builds the same `R` as `r`, so above the threshold it gets the
+    /// explicit-`r` cost warning, naming `rsr` — before the fix it returned before any cost
+    /// branch, because the gate read `requested == Hessian`. The straddle is `n`: 100 is
+    /// silent, 101 warns. The warning does not depend on `explicitly_set`, since `rsr` is
+    /// never the default. With priors the `s` advice is replaced, as for `r`: `S` cannot
+    /// carry a prior.
+    ///
+    /// Mutations: gate on `Hessian` again → the 101 cell has no warning; route `rsr` to `s`
+    /// → the `routed` assertion fires; give the priored arm the unpriored text → the
+    /// `covariance = false` assertion fires.
+    #[test]
+    fn an_rsr_request_is_honoured_at_scale_but_warned_about() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        for explicit in [false, true] {
             let (routed, warning) =
-                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false, false);
-            assert_eq!(routed, method);
-            assert!(warning.is_none());
+                scale_routed_covariance_method(n, CovarianceMethod::Sandwich, explicit, false);
+            assert_eq!(routed, CovarianceMethod::Sandwich, "rsr is never rerouted");
+            let warning = warning.expect("rsr builds R, so its cost must be reported");
+            assert!(warning.contains("covariance_method = rsr"), "{warning}");
+            assert!(warning.contains("20402"), "2·101²: {warning}");
+            assert!(
+                warning.contains("Set `covariance_method = s`"),
+                "the way out must be named: {warning}"
+            );
+        }
+
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Sandwich, true, true);
+        assert_eq!(routed, CovarianceMethod::Sandwich);
+        let warning = warning.expect("priored rsr at scale must be reported");
+        assert!(warning.contains("covariance_method = rsr"), "{warning}");
+        assert!(warning.contains("parameter priors"), "{warning}");
+        assert!(warning.contains("cannot represent a prior"), "{warning}");
+        assert!(warning.contains("covariance = false"), "{warning}");
+        assert!(
+            !warning.contains("Set `covariance_method = s`"),
+            "`s` drops the prior, so it must not be advised: {warning}"
+        );
+        assert!(warning.contains("20402"), "{warning}");
+
+        // The straddle: at the threshold nothing is said.
+        for priors in [false, true] {
+            let (small, small_warning) = scale_routed_covariance_method(
+                COV_HESSIAN_MAX_DIM,
+                CovarianceMethod::Sandwich,
+                true,
+                priors,
+            );
+            assert_eq!(small, CovarianceMethod::Sandwich);
+            assert!(small_warning.is_none(), "{small_warning:?}");
         }
     }
 
