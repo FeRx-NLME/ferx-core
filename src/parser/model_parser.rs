@@ -10017,7 +10017,15 @@ fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
 
 // ── [fit_options] block parser ──────────────────────────────────────────────
 
-fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
+/// Parse one estimation-method token — `focei`, `saem`, `vi`, an alias such as
+/// `importance_sampling` — the way a `[fit_options]` `method = …` line reads it:
+/// case-insensitive, surrounding quotes stripped. Removed spellings (`agq`) and
+/// unknown tokens are an `Err` carrying the user-facing message.
+///
+/// Public so a front end with its own `method` argument (ferx-r's
+/// `ferx_fit(method = …)`) accepts exactly the engine's tokens instead of keeping
+/// a copy that drifts each time a method is added (ferx-r #506).
+pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     let val = token
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -10310,10 +10318,13 @@ fn reject_fit_option_line(line: &str) -> String {
 
 /// Apply a `method = …` value — one method, or a `[a, b, c]` chain — to `opts`,
 /// the way a `[fit_options]` line does. `method` is the one `[fit_options]` key
-/// [`apply_fit_option`] does not take (a front end with a dedicated method
-/// argument parses it itself), so the parser and `validate_model_file_with`'s
-/// overrides (#2165) share this instead of two spellings of the rule.
-pub(crate) fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
+/// [`apply_fit_option`] does not take, so the parser, `validate_model_file_with`'s
+/// overrides (#2165) and a front end with a dedicated method argument (ferx-r
+/// #506) share this instead of separate spellings of the rule: the tokens go
+/// through [`parse_method_token`], and the final stage sets `interaction` the
+/// same way for all of them. Chain-shape rules that depend on other options (an
+/// evaluate-only stage must come last) are checked when the fit is validated.
+pub fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
     let raw = value.trim();
     // List form: `method = [a, b, c]` — chain of stages.
     if raw.starts_with('[') {
