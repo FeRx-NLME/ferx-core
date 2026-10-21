@@ -320,9 +320,9 @@ a valid NCA estimate.
 
 Each pooled estimate is routed to a θ in two steps: find the individual parameter
 the `[structural_model]` line binds to that PK role, then find that parameter's θ
-— through its mu-reference when the parameter carries an η **named after it**,
-otherwise by searching `[parameters]` for a θ whose name contains the parameter's
-name.
+— through the mu-reference of the η the parameter **itself** reads, when it reads
+one, otherwise by searching `[parameters]` for a θ whose name contains the
+parameter's name.
 
 The first step is exact **when a declared individual parameter binds the role**. An
 intermediate the block declares on the way —
@@ -334,28 +334,26 @@ declared *before* the bound parameter: the clearance estimate landed on
 is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
 model default (#1899).
 
-A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter, so
-there is no first step to be exact about: the lookup falls back to searching every θ
-for the canonical slot name, and a θ whose name merely contains it wins — a readout
-coefficient called `THCL_A` receives the pooled clearance, where the right answer is
-to write nothing at all (#1930).
+A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter and
+nothing for NCA to estimate, so nothing is written for it and the fit reports that
+the estimate could not be mapped. Earlier versions searched every θ for the
+canonical slot name instead, so a readout coefficient called `THCL_A` received the
+pooled clearance (#1930).
 
-The second step is exact only through the mu-reference, and the mu-reference is
-matched **by η name**: the η must be called exactly the parameter's name or end in
-`_<PARAM>`, so `ETA_V` and `IIV_V` resolve `V` but `ETA_VOL` does not. Anything
-else falls through to the name search, which takes the first θ whose name
-*contains* the parameter's name — so a parameter whose name is a substring of an
-earlier θ's name resolves to that θ. `V = TVV` or `V = TVV * exp(ETA_VOL)`
-declared alongside a `theta TVCL` both resolve to `TVCL`, which then receives the
-volume estimate instead of the clearance one, and `TVV` is never written at all
-(#1922). Name the η after its parameter (`ETA_V`, not `ETA_VOL`), or give the θ a
-name that does not collide.
+The second step follows the parameter's own η, whatever it is called: `ETA_V`,
+`IIV_V` and `ETA_VOL` all resolve `V = TVV * exp(…)` to `TVV`. Earlier versions
+matched the mu-reference by η **name** (`<PARAM>` or `…_<PARAM>`), which missed
+`ETA_VOL` and, when two η names qualified — `ETA_CL` on the clearance and an
+`IIV_CL` on another parameter — picked one in hash order, so start values could
+differ between runs of the same model on the same data (#1930). An η read by two
+parameters is not followed, since its one mu-reference cannot belong to both.
 
-The η-name match is also not checked for **uniqueness**: if two η names qualify for
-one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — one of
-them is used and which one is unspecified. In the current implementation it depends on
-hash iteration order, so the resulting start values can differ between runs of the
-same model on the same data (#1930). Keep one qualifying η name per parameter.
+A parameter without such an η falls through to the name search, which takes the
+first θ whose name *contains* the parameter's name — so a parameter whose name is a
+substring of an earlier θ's name resolves to that θ. `V = TVV` declared alongside a
+`theta TVCL` resolves to `TVCL`, which then receives the volume estimate instead of
+the clearance one, and `TVV` is never written at all (#1922). Give the parameter an
+η, or give the θ a name that does not collide.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
