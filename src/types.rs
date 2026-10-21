@@ -7669,10 +7669,14 @@ pub struct FitResult {
     pub nlopt_missing_algorithms: Vec<String>,
     /// Estimated OFV evaluations for the covariance step's `R` matrix on the
     /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
-    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
-    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
-    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
-    /// applies, which evaluates none of them.
+    /// true`, `n_parameters > 30`, the step's estimator reads `R` — never under
+    /// `covariance_method = s`, which builds no `R` (#1803) — and `R` is not
+    /// expected on the analytic assembly (`analytic_cov_hessian`) for every
+    /// subject, which evaluates none of them (#2054). When only a minority of
+    /// subjects falls outside the analytic scope, the count is the same
+    /// `2·n_params²` but each evaluation covers just those subjects (#1514). A
+    /// prediction made before the fit: a subject can still bail out of the
+    /// analytic assembly at run time.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.

@@ -374,8 +374,10 @@ struct FlatThetaPreflight {
     /// initial estimate — the point an optimizer's first evaluation solves at
     /// again when nothing is frozen (#2076). Each is a converged mode, so the
     /// first evaluation takes them as warm starts whatever their values
-    /// ([`InnerSolvePolicy::init_is_mode`]). `None` when the pre-flight solved
-    /// nothing (every theta already fixed) or any subject did not converge.
+    /// ([`InnerSolvePolicy::init_is_mode`]). An IOV subject's entry is its whole
+    /// mode, `η̂` then each occasion cell's `κ̂` ([`joint_warm_starts`]), so the
+    /// first evaluation does not restart κ at 0 (#2217). `None` when the pre-flight
+    /// solved nothing (every theta already fixed) or any subject did not converge.
     etas: Option<Vec<DVector<f64>>>,
     /// `(θ index, scale)` for each near-zero identity-packed θ the NLopt outer loop
     /// divides by its initial magnitude — see [`identity_theta_scales`] (#2159).
@@ -638,7 +640,10 @@ fn freeze_flat_thetas(
     };
     FlatThetaPreflight {
         frozen,
-        etas: converged.iter().all(|&c| c).then_some(ehs),
+        etas: converged
+            .iter()
+            .all(|&c| c)
+            .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
     }
 }

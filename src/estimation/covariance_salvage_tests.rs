@@ -1269,6 +1269,127 @@ fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject
     }
 }
 
+/// #2054: the pre-fit cost prediction (`predicted_r_route`) follows the covariance step's own
+/// route, salvage included, and the assembly agrees with it on the same population. Laplace on
+/// the exact anchor serves at most 8 stacked `[η, κ]` axes, so on the 3-η / 1-κ IOV fixture a
+/// subject with 6 occasions (9 axes) declines and one with 1 occasion (4 axes) does not —
+/// the population's mix of the two is the only input that changes between cells:
+///
+/// - none wide → `Analytic`, no cost note, no count;
+/// - 1 of 3 wide → `Salvage { 1, 3 }`, the `2·n²` count over that one subject — and
+///   `analytic_cov_assembly` returns `Partial` declining exactly that subject;
+/// - 1 of 2 wide → `Stencil`, the salvage cut is `>=` one half;
+/// - the 1-of-3 population with `analytic_cov_hessian = false` → `Stencil`, the model-level
+///   gate overrides the per-subject walk.
+#[test]
+fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
+    use super::{
+        analytic_cov_assembly, pre_fit_covariance_cost, pre_fit_covariance_cost_note,
+        predicted_r_route, AnalyticCovAssembly, PredictedRRoute,
+    };
+    use crate::types::{EstimationMethod, FitOptions, Population};
+    let (model, narrow) = iov_cov_fixture(1, false);
+    let (_, wide) = iov_cov_fixture(6, false);
+    let subject = |s: &Subject, id: &str| Subject {
+        id: id.into(),
+        ..s.clone()
+    };
+    let pop = |subjects: Vec<Subject>| Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options = FitOptions {
+        method: EstimationMethod::Laplace,
+        run_covariance_step: true,
+        ..FitOptions::default()
+    };
+    let none_wide = pop(vec![subject(&narrow, "n1"), subject(&narrow, "n2")]);
+    let one_of_three = pop(vec![
+        subject(&narrow, "n1"),
+        subject(&narrow, "n2"),
+        subject(&wide, "w1"),
+    ]);
+    let one_of_two = pop(vec![subject(&narrow, "n1"), subject(&wide, "w1")]);
+
+    let route = |p: &Population, o: &FitOptions| predicted_r_route(&model, p, o, false);
+    assert_eq!(route(&none_wide, &options), PredictedRRoute::Analytic);
+    let salvage = PredictedRRoute::Salvage {
+        declined: 1,
+        n_subjects: 3,
+    };
+    assert_eq!(route(&one_of_three, &options), salvage);
+    assert_eq!(route(&one_of_two, &options), PredictedRRoute::Stencil);
+    let disabled = FitOptions {
+        analytic_cov_hessian: false,
+        ..options.clone()
+    };
+    assert_eq!(route(&one_of_three, &disabled), PredictedRRoute::Stencil);
+    assert!(
+        route(
+            &one_of_three,
+            &FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                ..options.clone()
+            }
+        ) == PredictedRRoute::Analytic,
+        "control: under FOCEI's wider ladder the 9-axis subject is in scope"
+    );
+
+    // The cost and the note, at n = 31, on each route.
+    assert_eq!(
+        pre_fit_covariance_cost(31, &options, false, PredictedRRoute::Analytic),
+        None
+    );
+    assert_eq!(
+        pre_fit_covariance_cost(31, &options, false, salvage),
+        Some(Some(1922))
+    );
+    assert_eq!(
+        pre_fit_covariance_cost(31, &options, false, PredictedRRoute::Stencil),
+        Some(Some(1922))
+    );
+    let note = pre_fit_covariance_cost_note(31, Some(Some(1922)), salvage).expect("a note");
+    assert!(note.contains("over 1 of 3 subjects"), "{note}");
+
+    // The assembly declines exactly the subject the prediction named.
+    let params = model.default_params.clone();
+    let x_hat = pack_params(&params);
+    let eta_hats: Vec<DVector<f64>> = one_of_three
+        .subjects
+        .iter()
+        .map(|_| DVector::from_element(model.n_eta, 0.1))
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = one_of_three
+        .subjects
+        .iter()
+        .map(|s| {
+            (0..crate::stats::stacked_layout::group_count(s))
+                .map(|k| {
+                    DVector::from_element(model.n_kappa, if k % 2 == 0 { 0.12 } else { -0.08 })
+                })
+                .collect()
+        })
+        .collect();
+    match analytic_cov_assembly(
+        &model,
+        &one_of_three,
+        &params,
+        &x_hat,
+        &eta_hats,
+        &kappas,
+        &options,
+    ) {
+        AnalyticCovAssembly::Partial { declined, .. } => assert_eq!(declined, vec![2]),
+        AnalyticCovAssembly::Full(_) => panic!("expected Partial, got Full"),
+        AnalyticCovAssembly::Unavailable => panic!("expected Partial, got Unavailable"),
+    }
+}
+
 /// #1933: the warning once told a closed-form `obs_scale` user that rewriting it as
 /// `[scaling] y = central / V` "moves the fit onto the analytic route", and on a `pk`
 /// model the rewrite only traded the scaling clause for an analytic-readout one. Since
