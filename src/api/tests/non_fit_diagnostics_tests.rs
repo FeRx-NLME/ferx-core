@@ -1086,7 +1086,7 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
 /// |---|---|
 /// | `postfit::compute_subject_results` (per subject task) | `PostfitPredictions` |
 /// | `postfit::sweep_sensitivity_solver_stats` (per subject task) | `PostfitPredictions` |
-/// | `postfit::solver_stats_scope` (the shared gate) | `Simulate` / `SimulateAdaptive` |
+/// | `postfit::solver_stats_scope` (the shared gate) | `Simulate` / `SimulateAdaptive` / `PredictSurvival` |
 /// | `predict::predict_diag` (per subject task) | `Predict` |
 ///
 /// `simulate.rs` and `adaptive.rs` must read **zero**: both go through `solver_stats_scope`, so

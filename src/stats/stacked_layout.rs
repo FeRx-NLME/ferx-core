@@ -185,17 +185,6 @@ impl StackedLayout {
         }
     }
 
-    /// `a ⊕ (κ blocks of b)` over the axes: [`block_diag_stack`] without nested levels,
-    /// the compact `a ⊕_L (I_{G_L} ⊗ b_L)` with them. Serves the prior covariance
-    /// (`Ω`, `Ω_iov`), its Cholesky factor and its precision, which share the structure
-    /// (no `block_kappa` spans two levels, so each is block-diagonal by level).
-    pub(crate) fn axes_block_diag(&self, a: &DMatrix<f64>, b: &DMatrix<f64>) -> DMatrix<f64> {
-        match &self.nested {
-            Some(n) => n.prior(a, b),
-            None => block_diag_stack(a, b, self.n_groups()),
-        }
-    }
-
     /// Every axis pair `(row, col)` at which `Ω_iov[(i, j)]` appears in the axes prior,
     /// in group order: once per group, or — under nested levels — once per group of the
     /// level both κs live at, and nowhere when they live at two levels (a structural

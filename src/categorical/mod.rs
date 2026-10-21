@@ -271,6 +271,116 @@ pub(crate) fn discrete_subject_nll(
     nll
 }
 
+/// Exact `∂/∂η` of [`discrete_subject_nll`] — the analytic counterpart of
+/// finite-differencing the whole Bernoulli data term (#2024 phase 1).
+///
+/// Each binary endpoint's linear predictor is replayed over `Dual1` with θ and η seeded
+/// (`EndpointExprProgram::eval_duals`), giving an exact `∂lp/∂(θ,η)` per record, and the
+/// logit data term has a closed-form score:
+///
+/// ```text
+///   ∂/∂η [softplus(lp) − y·lp] = (p − y)·∂lp/∂η,    p = inv_logit(lp)
+/// ```
+///
+/// Returns `(value, ∂/∂η)` with the gradient at the **same 1× scale as the value** — the
+/// caller applies the objective's factor, as for
+/// [`ctmm_subject_eta_grad`](crate::markov::endpoint::ctmm_subject_eta_grad). The value is
+/// the same sum [`discrete_subject_nll`] returns.
+///
+/// `None` — caller falls back to FD for this point — when *any* binary endpoint on the
+/// subject cannot be served exactly: no dual program (an unbindable identifier, or a
+/// `(θ, η)` width past the dispatch cap), or a non-finite predictor on some record, where
+/// the value is the flat `1e20` repellent with no meaningful derivative.
+///
+/// Only the **η** block is returned (the inner EBE loop is the consumer). The program
+/// seeds the θ axes too, so the outer θ-gradient is a projection away (#2024 phase 4).
+pub(crate) fn discrete_subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    let n_eta = model.n_eta;
+    let mut nll = 0.0;
+    let mut grad = vec![0.0_f64; n_eta];
+    if subject.obs_records.is_empty() {
+        return Some((nll, grad));
+    }
+    // Sorted CMT order, as `discrete_subject_nll`'s multi-endpoint walk, so the summed value
+    // is reproducible across processes.
+    for (cmt, endpoint) in binary_endpoints(model) {
+        let EndpointLikelihood::Binary {
+            link,
+            lp_fn,
+            lp_program,
+            ..
+        } = endpoint
+        else {
+            continue;
+        };
+        // No program ⇒ not exactly representable. Decline the whole subject rather than
+        // serve a partial gradient.
+        let prog = lp_program.as_ref()?;
+        let n_theta = prog.n_theta_axis();
+        // A length mismatch would mean the program's axis layout disagrees with the model's
+        // η count. Decline (→ FD) rather than zero-fill: a zero jet is a *wrong* gradient
+        // reported as analytic.
+        if prog.n_axes() != n_theta + n_eta {
+            return None;
+        }
+        for r in &subject.obs_records {
+            let ObsRecord::DiscreteState {
+                time,
+                state,
+                cmt: c,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if *c != cmt {
+                continue;
+            }
+            // Same per-record model-time scoping as `for_each_binary_lp`, so a `TIME` term
+            // resolves to this record's time on both paths.
+            let outs = with_model_time(*time, || prog.eval_duals(theta, eta, &subject.covariates))?;
+            let (lp, dlp) = outs.into_iter().next()?;
+            if !lp.is_finite() || dlp.iter().any(|g| !g.is_finite()) {
+                return None;
+            }
+            debug_assert!(
+                {
+                    let lp_ref = with_model_time(*time, || lp_fn(theta, eta, &subject.covariates));
+                    (lp - lp_ref).abs() <= 1e-9 * lp_ref.abs().max(1.0)
+                },
+                "binary lp program disagrees with lp_fn on CMT {cmt}"
+            );
+            debug_assert!(*state <= 1, "binary state must be 0/1 (validated pre-fit)");
+            let y = (*state as f64).min(1.0);
+            let score = match link {
+                LinkFn::Logit => {
+                    nll += softplus(lp) - y * lp;
+                    inv_logit(lp) - y
+                }
+            };
+            for (acc, d) in grad.iter_mut().zip(&dlp[n_theta..]) {
+                *acc += score * d;
+            }
+        }
+    }
+    Some((nll, grad))
+}
+
+/// Whether [`discrete_subject_eta_grad`] can serve every binary endpoint of `model`: each
+/// carries a dual-evaluable linear-predictor program. The model-level counterpart of the
+/// per-subject routing check. Vacuously `true` with no binary endpoint.
+pub(crate) fn all_binary_endpoints_analytic(model: &CompiledModel) -> bool {
+    model.endpoints.values().all(|ep| match ep {
+        EndpointLikelihood::Binary { lp_program, .. } => lp_program.is_some(),
+        _ => true,
+    })
+}
+
 /// Draw a simulated outcome for every binary record of every `Binary` endpoint, pushing
 /// one [`SimOutcome::Category`](crate::types::SimOutcome::Category) row per record (Slice 1b, §8.8.2).
 ///

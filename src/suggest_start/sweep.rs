@@ -411,30 +411,37 @@ mod tests {
 
     /// #1652 review r1 #1: the sweep runs inside `fit()`'s SS-sink window, once per start of a
     /// multi-start fit and concurrently with the other starts' objective passes, so it must not
-    /// drain the process-global sink. A note already in the sink when `rrmse` runs must still be
-    /// there afterwards for `fit()`'s own take.
+    /// clear or drain the process-global sink — a note already there when `rrmse` runs must
+    /// still be there for `fit()`'s own take.
+    ///
+    /// Asserted on this thread's drain counter, not on the sink (#2071): a note written into the
+    /// sink and read back after `rrmse` races every concurrently-running lib test that calls a
+    /// draining `api` entry point, since each clears the sink on entry. Every draining entry
+    /// point clears on the thread that called it, so the counter sees exactly the drains `rrmse`
+    /// itself caused.
     ///
     /// Mutation: `rrmse` predicting through `crate::api::predict` (which clears and drains) kills
-    /// this. The write uses the not-contracting branch of the #867 tail check (`ρ = 2`,
-    /// last step 20% of the trough), so it is a real note, not a test-only string.
-    ///
-    /// Exposure: like every reader under `SS_WARN_SINK_READER_GUARD`, a concurrent lib test that
-    /// calls a draining `api` entry point can clear the sink inside this window (tracked with the
-    /// rest of that class, not here).
+    /// this.
     #[test]
     fn rrmse_does_not_drain_the_ss_nonconvergence_sink() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (model, population) = warfarin();
-        crate::dosing::note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
+        let before = crate::dosing::ss_sink_drains_on_this_thread();
         rrmse(&model, &population, &model.default_params).expect("rrmse runs");
-        let left = crate::dosing::take_ss_nonconvergence_warnings();
+        let drains = crate::dosing::ss_sink_drains_on_this_thread() - before;
+        assert_eq!(
+            drains, 0,
+            "the sweep's predictor cleared or drained the SS sink {drains} time(s), deleting any \
+             note the enclosing fit had written"
+        );
+
+        // The other side of the gate: the draining entry point the mutation would route
+        // through does move the counter on this thread, so a zero above is not vacuous.
+        let before = crate::dosing::ss_sink_drains_on_this_thread();
+        crate::api::predict(&model, &population, &model.default_params).expect("predict runs");
         assert!(
-            left.iter()
-                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-            "the sweep's predictor drained the SS sink, deleting a note the enclosing fit had \
-             written; got {left:?}"
+            crate::dosing::ss_sink_drains_on_this_thread() > before,
+            "`api::predict` must register its clear on the calling thread, or this test cannot \
+             see a draining predictor"
         );
     }
 

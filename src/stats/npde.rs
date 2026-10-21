@@ -144,10 +144,16 @@ pub fn compute_npde_npd(
         .map(|(scores, _warnings)| scores)
 }
 
-/// [`compute_npde_npd`], plus its non-fatal warnings. The one warning is
-/// `W_IOV_NO_OCCASIONS`: a `kappa` model handed subjects that carry no occasion
-/// label once `iov_occasion` is applied, whose reference distribution was then
-/// simulated at κ = 0, without its inter-occasion component (#1980).
+/// [`compute_npde_npd`], plus its non-fatal warnings:
+///
+/// - `W_IOV_NO_OCCASIONS`: a `kappa` model handed subjects that carry no occasion
+///   label once `iov_occasion` is applied, whose reference distribution was then
+///   simulated at κ = 0, without its inter-occasion component (#1980).
+/// - `W_SIMULATED_FLIP_FLOP`: on a transit / inverse-Gaussian closed form with no ODE
+///   twin, some reference replicates were drawn at an η inside the flip-flop regime,
+///   where the closed form clamps the dose-driven concentration to zero, so the reference
+///   those subjects are scored against carries undosed profiles (#1928). One count per
+///   call, of the replicates dosed before one of their observations.
 ///
 /// # Errors
 ///
@@ -165,7 +171,7 @@ pub fn compute_npde_npd_diag(
     // post-hoc caller re-reading the data has none.
     let derived = crate::api::with_derived_occasions(model, population, iov_occasion);
     let population: &Population = &derived;
-    let warnings: Vec<String> = crate::api::no_occasion_warning(
+    let mut warnings: Vec<String> = crate::api::no_occasion_warning(
         params.omega_iov.is_some(),
         population,
         "their NPDE/NPD reference distribution was simulated",
@@ -289,12 +295,19 @@ pub fn compute_npde_npd_diag(
                 );
                 let kappa_factor =
                     iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
+                // #1928: this loop draws its own η rather than going through
+                // `simulate_inner_with_draw`, so it counts its own flip-flop crossers — on a
+                // twin-less transit / IG closed form a replicate whose η leaves the domain
+                // enters the reference as an undosed profile, silently. One tally per
+                // subject (the walk is parallel), folded below.
+                let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
                     let eta = &*eta_factor * DVector::from_column_slice(&z);
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    flip_flop.observe(model, subject, &params.theta, &eta_slice);
 
                     // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
                     // occasion through the occasion-aware `predict_iov`, mirroring
@@ -383,10 +396,19 @@ pub fn compute_npde_npd_diag(
                     &sims,
                     model.bloq_in_force(),
                 );
-                SubjectNpde { npd, npde }
+                (SubjectNpde { npd, npde }, flip_flop)
             })
-            .collect()
+            .collect::<Vec<_>>()
     });
+    let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
+    let scores: Vec<SubjectNpde> = scores
+        .into_iter()
+        .map(|(score, tally)| {
+            flip_flop.absorb(tally);
+            score
+        })
+        .collect();
+    warnings.extend(flip_flop.npde_reference_warning(model));
     Ok((scores, warnings))
 }
 

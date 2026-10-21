@@ -171,7 +171,12 @@ that neither production nor test code uses — among non-`pub` items, since `dea
 never fires on a `pub` one, and under `--all-targets` a test-only reader counts as a
 use, which is what #1470's two `#[cfg(test)]`s rely on. Not a warning-free tree. What it
 still cannot see is an unused item inside a `slow-tests`-gated body, which this
-group does not compile.
+group does not compile. "Used" is per feature set and does not carry down to a subset:
+an item read only from a `#[cfg(feature = "survival")]` body is used under
+`ci,markov,nn` and dead in the default build ferx-r ships, so the group also lints
+`--lib` alone under `ci` (#2075) — `--lib` because ferx-r compiles no test target, so a
+test-only reader must not count there. Gate such an item on the same feature as its
+reader.
 
 `tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
 invariant worth knowing when editing the script is that **`run` exits rather
@@ -236,7 +241,7 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 
 **Every new feature requires a test** at the appropriate tier. When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding test before considering the change done. Bug fixes should add a regression test that fails without the fix.
 
-**Every new feature requires a comparison with NONMEM output.** When adding an estimator, error model, structural model, or any behaviour that produces numerical results (estimates, OFV, residuals, diagnostics), validate it against equivalent NONMEM output and include the comparison — either in the feature's docs page (e.g. `docs/faq.qmd` or the relevant `docs/estimation/*.qmd`) or in the PR description.
+**Every new feature requires a comparison with NONMEM output.** When adding an estimator, error model, structural model, or any behaviour that produces numerical results (estimates, OFV, residuals, diagnostics), validate it against equivalent NONMEM output and include the comparison — either in the feature's docs page (e.g. `docs/faq.qmd` or the relevant `docs/estimation/*.qmd`) or in the PR description. A control stream committed under `nonmem_anchor/` gets a row in the catalogue table at the top of `nonmem_anchor/README.md` in the same PR — anchor, ferx feature + issue, control stream(s), test file — so the next person can find what is already anchored instead of re-running NONMEM; `tests/nonmem_anchor_index.rs` fails on a `.ctl` no row names (#1024).
 
 > **Exception — adaptive / feedback dosing simulations (epic #391) do not use NONMEM.** NONMEM has no native feedback dosing (a controller reading simulated state to choose the next dose), so there is no equivalent NONMEM run to anchor against. Validate these features instead with: (c) a **degenerate oracle** — a controller that re-emits a fixed regimen must equal `simulate()` on that regimen bit-for-bit; the **frozen-schedule replay verifier** — rebuild a static subject from the realized dose ledger and assert bit-equality with the static engine (the exact internal analogue of a NONMEM dose-bookkeeping anchor); and, for genuinely reactive behaviour, (b) reproduction of a published **mrgsolve** dynamic-dosing example (e.g. vancomycin AUC-target TDM, the platelet ladder). mrgsolve — not NONMEM — is the external comparator for this family, since it actually does feedback dosing. See issue #391's Validation section.
 
@@ -428,7 +433,7 @@ failure it exists to catch. Three things that "I mutation-tested it" does **not*
   This is the whole of `check-report.qmd`'s value and none of it is numeric, which is why the
   rules above do not reach it.
 
-**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
+**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a dual-vs-FD parity test.** The closed-form PK solutions, event-driven propagators and ODE solvers are written once as generic `*_g<T: PkNum>` functions; the adjoint (`sens::ode_provider::adjoint`, `sens/ode_adjoint.rs`) records them over its own dual types and gives FOCE, FOCEI, Laplace and AGQ their exact outer gradient, inner gradient, `H` and covariance R-matrix. A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the recorder or likelihood kernel that consumes them, assert it against central finite differences of the `T = f64` production objective (with the EBE re-found at every point), to a measured tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: the reconverged-FD oracles `fd_oracle` / `fd_oracle_agq` (outer gradient) and `hessian_gaps_for` (R-matrix), and the kernel-vs-production `objective_gaps` check, all in `sens/ode_adjoint_tests.rs`, plus the per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`). If a model or subject is outside the recorders' scope it must route to FD via the scope predicates (`adjoint::model_in_scope` / `recorder_in_scope`, `analytic_inner_grad_supported_model`, `cov_width_declines`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 
@@ -531,7 +536,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `estimation/covariance.rs` | Covariance/SE step: FD-of-OFV Hessian, eigen-floor inverse, score cross-product, non-PD SIR fallback (`compute_covariance`, `run_covariance_step`) |
 | `stats/likelihood.rs` | Individual, FOCE, and FOCEI negative log-likelihood computations |
 | `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES. **Sole owner of the residual-variance-and-derivatives math**: the `residual_variance` primitive, the `ErrorSpec` dispatch layer (`variance_at{,_scaled,_with_correlations}`, `dvar_df{,_scaled}`, `d2var_df2{,_scaled}`, `sigma_loadings`/`_slopes`, …), the `residual_rd`/`residual_rd2` scalar accessors, and the dense-`R`/IWRES consumers. `types.rs` keeps only the `ErrorSpec` data definition + `obs_key`/`obs_keys`. Two association traps: `variance_at` (legacy `(f·σ)·(f·σ)`) is deliberately **not** collapsed into `variance_at_scaled` (`((f·f)·σ)·σ`) — they differ by ~1 ULP and every bare-σ R/OFV/CWRES is pinned to the legacy form; and `ruv_scale` is applied by each **caller**, never folded into `residual_rd` |
-| `sens/` | Hand-rolled `Dual2` analytic sensitivities (`∂f/∂η`, `∂f/∂θ`) over the `PkNum` trait — the exact gradients FOCE/FOCEI/HMC use |
+| `sens/` | Dual number types over the `PkNum` trait and the adjoint that records the generic kernels on them (`ode_provider::adjoint`): the exact outer and inner gradients, `H` and covariance R-matrix of FOCE/FOCEI/Laplace/AGQ |
 | `io/datareader.rs` | NONMEM-format CSV reader (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS) |
 
 ### Model File Format (.ferx)
@@ -540,7 +545,7 @@ Models are defined in a custom DSL with blocks: `[parameters]`, `[individual_par
 
 ### PK Parameter Convention
 
-PK parameters use a fixed-size array `[f64; 8]` with indices: CL=0, V/V1=1, Q=2, V2=3, KA=4, F=5. The fixed layout keeps the closed forms allocation-free, including under the `Dual2` sensitivity type.
+PK parameters use a fixed-size array `[f64; 8]` with indices: CL=0, V/V1=1, Q=2, V2=3, KA=4, F=5. The fixed layout keeps the closed forms allocation-free, including under the dual sensitivity types.
 
 ### Parameterization
 
@@ -552,13 +557,14 @@ Warnings and non-fatal issues should be collected into `FitResult.warnings` (a `
 
 ### Analytic Sensitivities (`sens/` over `PkNum`)
 
-The exact `∂f/∂η` and `∂f/∂θ` gradients used by FOCE/FOCEI (outer + inner) and the
-SAEM/Bayes HMC sampler come from hand-rolled forward sensitivities. The
-closed-form PK solutions and event-driven propagators are written **once** as
-generic `*_g<T: PkNum>` functions (`sens/`, `pk/event_driven.rs`); instantiating
-`T = f64` gives gradient-less predictions and `T = Dual2<M>` gives the
-sensitivities. There is no second copy of any formula to keep in sync — edit the
-generic version.
+The closed-form PK solutions, event-driven propagators and ODE solvers are written
+**once** as generic `*_g<T: PkNum>` functions (`sens/`, `pk/event_driven.rs`, `ode/`);
+`T = f64` gives the predictions. The adjoint (`sens/ode_adjoint.rs`, re-exported as
+`sens::ode_provider::adjoint`) records the same functions over its own dual types — `vtape::DualV`
+(θ on a reverse tape, η-jets forward), `vfree::DualF` (tape-free η-jets for the inner loop) and
+`rtape::{DualT, DualH}` (the covariance step's nested duals) — and assembles the exact outer
+gradient (`Ψ = F − wᵀ∇_η l`), inner gradient, `H` and R-matrix for FOCE, FOCEI, Laplace and AGQ
+from them. There is no second copy of any formula to keep in sync — edit the generic version.
 
 ## Changelog
 

@@ -746,7 +746,7 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
 }
 
 /// True when the generic walk implements this model — all six analytical 1-/2-/3-
-/// cpt models. Callers (`subject_sensitivities_iov`) screen earlier; this is the
+/// cpt models. Callers screen earlier; this is the
 /// defensive backstop.
 #[inline]
 fn walk_supports(pk_model: PkModel) -> bool {
@@ -805,10 +805,12 @@ fn record_pk_at_g<T: PkNum>(
 /// quiet sub-intervals with the exact **dual** window lengths, so the
 /// moving-boundary sensitivity flows through the closed-form flow to all orders —
 /// no explicit saltation is needed (the closed-form analogue of the ODE path's
-/// `inject_rate_saltation`). `rate_bare` is the F-agnostic rate (`amt/D` or `R`);
-/// the walk applies `F` as the existing `pk.f * rate` post-multiply, matching
-/// [`crate::types::DoseEvent::bioavailable_infusion`] for the duration-defined case.
-/// Empty (or `None` entries) recover the pre-#486 fixed-window behaviour.
+/// `cross_rate_switch`, which gets the same all-orders exactness from an `rk4_dual` flow over
+/// the dual boundary shift). Under bioavailability every infusion carries such a pair,
+/// with its dose-time `F` already applied as production applies it
+/// ([`crate::types::DoseEvent::bioavailable_infusion`], #419): a rate-defined window
+/// stretched to `F·dur` (so its end moves with `F`), a duration-defined rate scaled. The
+/// walk injects that rate as-is. Empty (or `None` entries) recover the fixed-window walk.
 #[allow(clippy::too_many_arguments)]
 fn propagate_bounds_g<T: PkNum>(
     state: &mut [T],
@@ -964,8 +966,11 @@ fn active_rates_g<T: PkNum>(
             t_start <= mid
         };
         if d.rate > 0.0 && d.duration > 0.0 && started && t_end >= mid {
+            // A dual window already carries its dose-time `F` (`modeled_dose_inf_duals`,
+            // #419) and is injected as-is, as production injects its `F`-applied rate. A
+            // fixed window has one only without bioavailability, where `pk.f` is 1.
             let r = match dose_inf_dual.get(k).copied().flatten() {
-                Some((rate_bare, _)) => pk.f * rate_bare,
+                Some((rate, _)) => rate,
                 None => pk.f * T::from_f64(d.rate),
             };
             match pk_model.topology().dose_channel(d.cmt_raw()) {
@@ -1157,8 +1162,9 @@ fn obs_boundary_correction<T: PkNum>(
 /// value: `grad = ∂(truncated value)/∂θ`, with no value/gradient mismatch to stall the outer
 /// line search. The variational recursion shares the value iteration's monodromy, so the
 /// derivative tails contract at the same geometric rate — but they lag the value by a constant
-/// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, see
-/// `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`) survives the value stop.
+/// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, measured by the
+/// pre-#2093 `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`, retired in
+/// #2093) survives the value stop.
 /// That residual is
 /// 3–4 orders below the `1e-3` gradient-validation tolerance and NONMEM's SE-matching precision,
 /// so the surviving gradient is faithful for every reported purpose; chasing it to zero would
@@ -1354,9 +1360,10 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     // peak — production's clamped value — and drops the `−d(lag)` jet with it, since the jet
     // reaches the state only through `apply_step_g`. Writing the clamp a second time into
     // `phase` itself would reject exactly these inputs, so neither copy could fail on its own
-    // (#1229, "two redundant gates cover for each other"). Measured: with the single gate
-    // below removed, `ss_bolus_lag_at_least_interval_matches_production` fails; with the
-    // clamp *also* written into `phase`, it passed.
+    // (#1229, "two redundant gates cover for each other"). Measured before #2093: with the
+    // single gate below removed, the retired `ss_bolus_lag_at_least_interval_matches_production`
+    // failed; with the clamp *also* written into `phase`, it passed. Its adjoint successor is
+    // `ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd`.
     //
     // Past `lag >= II` the clamped phase is locally constant, so keeping `−d(lag)` would
     // differentiate a function production does not predict, and the negative step would

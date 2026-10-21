@@ -2381,6 +2381,9 @@ pub(crate) enum SolverStatsPhase {
     PostfitPredictions,
     /// One [`crate::api::predict_diag`] pass.
     Predict,
+    /// One [`crate::api::predict_survival_diag`] pass (#2164).
+    #[cfg(feature = "survival")]
+    PredictSurvival,
     /// One [`crate::api::simulate_with_options_diag`] pass.
     Simulate,
     /// One [`crate::api::simulate_adaptive`] pass.
@@ -2395,6 +2398,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "postfit_predictions",
             Self::Predict => "predict",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "predict_survival",
             Self::Simulate => "simulate",
             Self::SimulateAdaptive => "simulate_adaptive",
             Self::SimulateUncertainty => "simulate_with_uncertainty",
@@ -2411,6 +2416,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "at the final estimates",
             Self::Predict | Self::Simulate | Self::SimulateAdaptive => "at the supplied parameters",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "at the supplied parameters",
             // Many parameter sets, none of them the caller's argument as such.
             Self::SimulateUncertainty => "at the drawn parameter sets",
         }
@@ -2428,6 +2435,8 @@ impl SolverStatsPhase {
         match self {
             Self::PostfitPredictions => "the fit",
             Self::Predict => "this predict() pass",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => "this predict_survival() pass",
             Self::Simulate => "this simulate() pass",
             Self::SimulateAdaptive => "this simulate_adaptive() run",
             Self::SimulateUncertainty => "this simulate_with_uncertainty() run",
@@ -2446,6 +2455,10 @@ impl SolverStatsPhase {
                 "Counters are from the post-fit prediction pass over all subjects."
             }
             Self::Predict => "Counters are from this predict() pass over all subjects.",
+            #[cfg(feature = "survival")]
+            Self::PredictSurvival => {
+                "Counters are from this predict_survival() pass over all subjects."
+            }
             Self::Simulate => {
                 "Counters are from this simulate() pass over all subjects and replicates."
             }
@@ -2516,10 +2529,10 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 
 /// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
 ///
-/// **One implementation, four callers.** `predict_diag`, `simulate_with_options_diag`,
-/// `simulate_adaptive` and `simulate_with_uncertainty_diag` (#1645) all report exactly this
-/// list, so a diagnostic added to any source below reaches all four at once and none of them
-/// can carry a different subset than the others —
+/// **One implementation, five callers.** `predict_diag`, `predict_survival_diag` (#2164),
+/// `simulate_with_options_diag`, `simulate_adaptive` and `simulate_with_uncertainty_diag`
+/// (#1645) all report exactly this list, so a diagnostic added to any source below reaches all
+/// five at once and none of them can carry a different subset than the others —
 /// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
 /// them on a fixture that trips both halves.
 ///
@@ -2547,13 +2560,16 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `AMT` column with dose rows) is not: the controller supplies the regimen, so a dose-free
 ///    dataset is the expected input on that entry point.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
-///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
+///    `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
 ///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
 ///    argued rather than inherited (#1405 review): a declared per-CMT entry that no
 ///    observation matched is a statement about the model and the data the caller handed
 ///    in, and `predict()` dispatches through the same map, so the entry is exactly as
 ///    inert there as in a fit. `predict_and_simulate_report_it_too` pins it on both
 ///    paths.
+///    Followed by `W_NEGATIVE_LAGTIME`, the non-fit severity of `fit()`'s
+///    `E_NEGATIVE_LAGTIME` (#1189): one predicate, an error where data errors run and a
+///    warning where the lag is served.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
 ///    experimental whichever door you use it through.
 /// 5. The ODE-solver diagnostics of the pass that just ran.
@@ -2626,6 +2642,12 @@ pub(crate) fn non_fit_diagnostics(
             .into_iter()
             .map(|d| d.message),
     );
+    // `fit()` refuses a negative lag (`E_NEGATIVE_LAGTIME`, #1189); these entry points run no
+    // data errors and serve it, so they report the same predicate as a warning.
+    out.extend(
+        crate::api::validation::negative_lagtime_warning(model, population, &params.theta)
+            .map(|d| d.message),
+    );
     out.extend(
         crate::api::check_experimental_features(model)
             .into_iter()
@@ -2695,7 +2717,7 @@ pub(crate) fn with_solver_stats<T>(
 /// integration deposits in the scope.
 ///
 /// It must be the **same** provider the fit ran, for two reasons. The scope gates differ:
-/// `ode_inner_grad_supported_model` describes the ODE provider's analytical reach and says
+/// the adjoint's `recorder_in_scope` describes the ODE recorder's analytical reach and says
 /// nothing about `gradient_method = fd`, SDE, or the other escape hatches, so it alone would
 /// sweep a dual solve for a fit that computed every gradient by finite differences and report
 /// counters from a code path that fit never took. `analytic_inner_common_bail` is the
@@ -2704,14 +2726,13 @@ pub(crate) fn with_solver_stats<T>(
 /// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
 /// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
 /// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
-/// for. When the model has an analytic **outer** gradient the sweep runs the second-order
-/// [`crate::sens::provider::subject_sensitivities`] (`Dual2`, gradient *and* Hessian), which
-/// is what FOCEI differentiates; when only the inner loop is analytic it runs the light
-/// first-order [`crate::sens::provider::subject_eta_grad`], which is all that fit computes.
+/// for. When the model has an analytic **outer** gradient the sweep runs the unified
+/// recorder's second-order η-jets (`adjoint::exact_inner_hessian`), which is what FOCEI
+/// differentiates; when only the inner loop is analytic it runs the first-order
+/// `adjoint::exact_obs_grads`, which is all that fit computes.
 ///
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
-/// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
-/// observe.
+/// a model outside the adjoint's `recorder_in_scope` has no dual ODE solve to observe.
 ///
 /// Like [`compute_subject_results`], this runs one independent task per subject on the fit's
 /// own pool and **returns** its counters rather than depositing them in a scope the caller
@@ -2727,7 +2748,8 @@ pub(crate) fn sweep_sensitivity_solver_stats(
     mixest: Option<&[usize]>,
 ) -> crate::ode::solver::OdeSolverStats {
     let mut merged = crate::ode::solver::OdeSolverStats::default();
-    if !crate::sens::provider::ode_inner_grad_supported_model(model)
+    if model.ode_spec.is_none()
+        || !crate::sens::ode_provider::adjoint::recorder_in_scope(model)
         || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
     {
         return merged;
@@ -2750,9 +2772,12 @@ pub(crate) fn sweep_sensitivity_solver_stats(
                 .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
             let (theta, eta) = (&params.theta, eta.as_slice());
             if second_order {
-                let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+                let _ = crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                    model, subject, params, eta,
+                );
             } else {
-                let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+                let _ =
+                    crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta);
             }
             stats_scope.collected()
         })

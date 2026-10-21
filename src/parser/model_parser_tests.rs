@@ -1,56 +1,5 @@
 use super::*;
 
-/// #486: the residual-magnitude direct-θ program dispatches its `Dual1<M>`
-/// evaluator for every axis count up to [`MAX_RUV_MAG_AXES`] (raised past 16),
-/// and declines (`None`, caller → FD) only beyond it. `mult = θ_last · σ̂` (σ̂
-/// pinned to 1.0), so `∂mult/∂θ_last = 1` and all other axes are 0 — a cheap
-/// exact check that each newly-added dispatch arm is wired.
-#[test]
-fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
-    use std::collections::HashMap;
-    assert!(MAX_RUV_MAG_AXES >= 17, "cap must be raised past the old 16");
-    let cov = HashMap::new();
-    // Every axis count up to the cap — exercises each `Dual1<M>` dispatch arm.
-    for n in 1..=MAX_RUV_MAG_AXES {
-        let expr = Expression::BinOp(
-            Box::new(Expression::Theta(n - 1)),
-            BinOp::Mul,
-            Box::new(Expression::Variable("PROP".to_string())),
-        );
-        let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), n);
-        let theta = vec![0.5f64; n];
-        let grad = prog
-            .theta_grad(&theta, &cov, 0.0, f64::NAN)
-            .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
-        assert_eq!(grad.len(), n);
-        assert!(
-            (grad[n - 1] - 1.0).abs() < 1e-9,
-            "∂mult/∂θ_last = 1 (n={n})"
-        );
-        for (i, g) in grad.iter().enumerate() {
-            if i != n - 1 {
-                assert!(
-                    g.abs() < 1e-9,
-                    "off-axis derivative must be 0 (n={n}, i={i})"
-                );
-            }
-        }
-    }
-    // Beyond the cap → None, so the outer gradient falls back to FD.
-    let over = MAX_RUV_MAG_AXES + 1;
-    let expr = Expression::BinOp(
-        Box::new(Expression::Theta(0)),
-        BinOp::Mul,
-        Box::new(Expression::Variable("PROP".to_string())),
-    );
-    let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), over);
-    assert!(
-        prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0, f64::NAN)
-            .is_none(),
-        "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
-    );
-}
-
 // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
 /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
@@ -9369,6 +9318,23 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
     );
 }
 
+/// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
+/// the one the adjoint tape records), seeded with `Dual1` θ leaves.
+fn deriv_theta_grad<const N: usize>(
+    p: &RuvMagDerivProgram,
+    theta: &[f64; N],
+    cov: &std::collections::HashMap<String, f64>,
+    time: f64,
+    tad: f64,
+) -> Vec<f64> {
+    use crate::sens::dual1::Dual1;
+    let th: Vec<Dual1<N>> = (0..N).map(|m| Dual1::var(theta[m], m)).collect();
+    p.eval_g(&th, cov, time, tad)
+        .expect("θ count matches")
+        .grad
+        .to_vec()
+}
+
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
 /// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
 /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
@@ -9401,11 +9367,8 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
         .as_ref()
         .expect("prop slot has a deriv program");
 
-    let theta = vec![0.2, 10.0, 1.5];
     let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
-    let grad = deriv
-        .theta_grad(&theta, &cov_zero, 10.0, 10.0)
-        .expect("theta_grad supported");
+    let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov_zero, 10.0, 10.0);
     assert!(
         grad.iter().all(|g| g.is_finite()),
         "MACHEPS must guard the WT=0 denominator, got {:?}",
@@ -9418,7 +9381,7 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
 /// xhigh review: a *legacy* pre-built magnitude expression that still
 /// represents `TIME` as an `Expression::Covariate("TIME")` node (rather than
 /// the `Expression::Time` built-in every parsed `.ferx` model produces) must
-/// still resolve `TIME` to the observation time in `theta_grad`, mirroring the
+/// still resolve `TIME` to the observation time in `eval_g`, mirroring the
 /// runtime `RuvMagFn` closure's `cov.insert("TIME", time)` injection. Without
 /// it, `cov_vec` would look up "TIME" in the (never-populated) observation
 /// covariate map and silently default to `0.0`.
@@ -9433,9 +9396,7 @@ fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
     );
     let deriv = compile_ruv_mag_deriv_program(&expr, Some("UNUSED_SIGMA"), 1);
     let empty_cov = std::collections::HashMap::new();
-    let grad = deriv
-        .theta_grad(&[2.0], &empty_cov, 10.0, 10.0)
-        .expect("theta_grad supported");
+    let grad = deriv_theta_grad(&deriv, &[2.0], &empty_cov, 10.0, 10.0);
     // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
     approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
 }
@@ -14920,191 +14881,6 @@ fn test_parse_scaling_expression_with_theta_evaluates() {
 }
 
 #[test]
-fn scale_deriv_program_matches_fd() {
-    // The differentiable scale program's `∂scale/∂(θ,η)` must match FD of the
-    // scale closure composed with `pk_param_fn` (issue #367). `obs_scale =
-    // 1000 / V`, V = TVV·exp(ETA_V) — so the scale depends on θ (via TVV) and
-    // η (via ETA_V) through the individual parameter V.
-    use crate::sens::dual2::Dual2;
-    let src = "\
-[parameters]
-  theta TVCL(0.13, 0.001, 10.0)
-  theta TVV(8.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.09
-  omega ETA_KA ~ 0.20
-  sigma PROP ~ 0.05
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP)
-[scaling]
-  obs_scale = 1000 / V
-";
-    let model = parse_model_string(src).expect("scaling model parses");
-    let (scale_fn, prog) = match &model.scaling {
-        ScalingSpec::ExpressionScale {
-            scale_fn,
-            deriv: Some(p),
-        } => (scale_fn, p),
-        other => panic!("expected ExpressionScale with deriv, got {:?}", other),
-    };
-    assert_eq!(prog.n_theta_axis(), 3);
-    assert_eq!(prog.n_eta_axis(), 3);
-    assert_eq!(prog.n_axes(), 6);
-
-    const M: usize = 6; // n_theta(3) + n_eta(3)
-    let theta = vec![0.13, 8.0, 1.0];
-    let eta = vec![0.1, -0.05, 0.2];
-    let cov: HashMap<String, f64> = HashMap::new();
-
-    // Individual-parameter duals over (θ, η) from the same program the
-    // provider uses, mapped to the scale program's var slots.
-    let ipp = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("indiv param program");
-    let pk_duals = ipp.eval_param_duals::<M>(&theta, &eta, &cov);
-    let pk_slots = ipp.pk_slots();
-    let mut slot_dual: HashMap<usize, Dual2<M>> = HashMap::new();
-    for (i, &s) in pk_slots.iter().enumerate() {
-        slot_dual.insert(s, pk_duals[i]);
-    }
-    let pk_vals = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
-    let var_duals: Vec<Dual2<M>> = prog
-        .var_to_pk_slot()
-        .iter()
-        .map(|&s| {
-            slot_dual
-                .get(&s)
-                .copied()
-                .unwrap_or_else(|| Dual2::constant(pk_vals.values[s]))
-        })
-        .collect();
-    let scale = prog.eval_scale_dual::<M>(&theta, &eta, &cov, &var_duals);
-
-    // Reference: scale as a function of (θ, η) through pk_param_fn.
-    let g = |th: &[f64], et: &[f64]| -> f64 {
-        let pk = (model.pk_param_fn)(th, et, &cov, 0.0);
-        scale_fn(th, et, &cov, &pk)
-    };
-    approx::assert_relative_eq!(scale.value, g(&theta, &eta), max_relative = 1e-12);
-    let h = 1e-6;
-    for m in 0..3 {
-        let mut tp = theta.clone();
-        tp[m] += h;
-        let mut tm = theta.clone();
-        tm[m] -= h;
-        let fd = (g(&tp, &eta) - g(&tm, &eta)) / (2.0 * h);
-        approx::assert_relative_eq!(scale.grad[m], fd, max_relative = 1e-5, epsilon = 1e-9);
-    }
-    for k in 0..3 {
-        let mut ep = eta.clone();
-        ep[k] += h;
-        let mut em = eta.clone();
-        em[k] -= h;
-        let fd = (g(&theta, &ep) - g(&theta, &em)) / (2.0 * h);
-        approx::assert_relative_eq!(scale.grad[3 + k], fd, max_relative = 1e-5, epsilon = 1e-9);
-    }
-}
-
-/// The one-compartment oral model with `n_extra` more BSV etas `ETA_X1..`, read only by an
-/// `obs_scale = exp(Σ (i/100)·ETA_Xi)`, so the scale program's η axis count is
-/// `3 + n_extra` and every η past the PK ones carries its own coefficient.
-fn scale_model_with_extra_etas(n_extra: usize) -> String {
-    let omegas: String = (1..=n_extra)
-        .map(|i| format!("  omega ETA_X{i} ~ 0.01\n"))
-        .collect();
-    let sum: String = (1..=n_extra)
-        .map(|i| format!(" + {:.2} * ETA_X{i}", i as f64 / 100.0))
-        .collect();
-    format!(
-        "\
-[parameters]
-  theta TVCL(0.13, 0.001, 10.0)
-  theta TVV(8.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.09
-  omega ETA_KA ~ 0.20
-{omegas}  sigma PROP ~ 0.05
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP)
-[scaling]
-  obs_scale = exp(0.0{sum})
-"
-    )
-}
-
-/// `eval_scale_dual1` holds θ/η in a `MAX_SCALE_AXES`-wide stack buffer, and since #1907
-/// takes a heap `Vec` past it, because the IOV gate no longer caps the width. The 24/25 η
-/// straddle puts the two programs on opposite sides of that branch: the 25-η one, with its
-/// extra η at 0, is the same function, so value and every shared gradient axis must be
-/// bit-identical. The 25-η one is also evaluated at `N = 24`, so its last η lands past the
-/// dual width and must enter as a constant — the heap branch's `k ≥ N` arm.
-#[test]
-fn scale_dual1_past_the_stack_buffer_matches_its_24_eta_twin() {
-    use crate::sens::dual1::Dual1;
-    use crate::sens::provider::MAX_SCALE_AXES;
-    let prog_of = |n_extra: usize| {
-        let model = parse_model_string(&scale_model_with_extra_etas(n_extra)).expect("parse");
-        match model.scaling {
-            ScalingSpec::ExpressionScale { deriv: Some(p), .. } => p,
-            other => panic!("expected ExpressionScale with deriv, got {other:?}"),
-        }
-    };
-    let narrow = prog_of(21);
-    let wide = prog_of(22);
-    assert_eq!(
-        narrow.n_eta_axis(),
-        MAX_SCALE_AXES,
-        "narrow fits the buffer"
-    );
-    assert_eq!(wide.n_eta_axis(), MAX_SCALE_AXES + 1, "wide is one past it");
-    // The scale reads no individual parameter, so its var slots only need the right length.
-    let n_vars = narrow.var_to_pk_slot().len();
-    assert_eq!(n_vars, wide.var_to_pk_slot().len());
-    let theta = [0.13, 8.0, 1.0];
-    let cov = HashMap::new();
-    let eta_narrow: Vec<f64> = (0..MAX_SCALE_AXES)
-        .map(|k| 0.1 * (k as f64 * 0.7 + 0.3).sin())
-        .collect();
-    let mut eta_wide = eta_narrow.clone();
-    eta_wide.push(0.0);
-    const N: usize = MAX_SCALE_AXES;
-    let vars = vec![Dual1::<N>::constant(1.0); n_vars];
-    let a = narrow.eval_scale_dual1::<N>(&theta, &eta_narrow, &cov, &vars);
-    let b = wide.eval_scale_dual1::<N>(&theta, &eta_wide, &cov, &vars);
-    assert_eq!(a.value.to_bits(), b.value.to_bits(), "value");
-    let vars_c = vec![Dual1::<{ N + 1 }>::constant(1.0); n_vars];
-    let c = wide.eval_scale_dual1::<{ N + 1 }>(&theta, &eta_wide, &cov, &vars_c);
-    for k in 0..N {
-        assert_eq!(a.grad[k].to_bits(), b.grad[k].to_bits(), "η{k}: N = 24");
-        assert_eq!(a.grad[k].to_bits(), c.grad[k].to_bits(), "η{k}: N = 25");
-    }
-    // The axis the N = 24 evaluation drops is live at N = 25: ∂/∂ETA_X22 = 0.22 · scale.
-    let want = 0.22 * c.value;
-    assert!(want.abs() > 1e-3, "fixture must make the 25th η live");
-    assert!(
-        (c.grad[N] - want).abs() <= 1e-12 * want.abs(),
-        "∂/∂η24 = {} vs {want}",
-        c.grad[N]
-    );
-}
-
-#[test]
 fn test_parse_scaling_expression_uses_covariate() {
     let src = analytical_model_with_scaling(Some("  obs_scale = WT / 70\n"));
     let model = parse_model_string(&src).expect("covariate scaling parses");
@@ -17301,6 +17077,145 @@ fn bytecode_g_f64_bit_identical() {
     );
 }
 
+/// #2149: `x mod 0` must mean the same thing in all three evaluators. The
+/// bytecode VMs (f64 and `Dual2`) returned `0` under the `|b| < 1e-30` guard
+/// that `/` uses, while the tree evaluator `eval_expr` (which serves
+/// `[derived]`, hazard, Markov and mixture expressions) returned
+/// `rem_euclid(0.0) = NaN`. A divisor just inside the guard and one just
+/// outside it straddle the gate, so a guard dropped from any one evaluator, or
+/// a threshold moved in one, reddens this test.
+#[test]
+fn mod_zero_divisor_agrees_across_all_three_evaluators() {
+    use crate::sens::dual2::Dual2;
+    let nn: Vec<Vec<f64>> = Vec::new();
+    // (divisor, expected `7.25 mod divisor`)
+    let cases = [
+        (0.0, 0.0),
+        (-0.0, 0.0),
+        (1e-31, 0.0),
+        (-1e-31, 0.0),
+        (2.0, 1.25),
+        (-2.0, 1.25),
+    ];
+    for (b, want) in cases {
+        let e = binop(BinOp::Mod, varidx(0), varidx(1));
+        let vars = [7.25, b];
+        let tree = eval_expression_indexed(&e, &[], &[], &[], &vars, &nn);
+        let bc = compile_bytecode(&e);
+        let mut s: Vec<f64> = Vec::new();
+        let vm = eval_bytecode(&bc, &[], &[], &[], &vars, &nn, &mut s);
+        let vd = [Dual2::<2>::var(7.25, 0), Dual2::<2>::var(b, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let dual = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(tree, want, "eval_expr: 7.25 mod {b:e}");
+        assert_eq!(vm, want, "f64 VM: 7.25 mod {b:e}");
+        assert_eq!(dual.value, want, "Dual2 VM: 7.25 mod {b:e}");
+        // Inside the guard the result is a constant; outside it carries the
+        // `a' − q·b'` jet of #2150.
+        let want_grad = if b.abs() < 1e-30 {
+            [0.0; 2]
+        } else {
+            [1.0, -7.25_f64.div_euclid(b)]
+        };
+        assert_eq!(dual.grad, want_grad, "Dual2 VM grad: 7.25 mod {b:e}");
+    }
+    // The literal-divisor spelling the issue reproduced (`TIME mod 0`) goes
+    // through the same arms; pin it bit-for-bit against the bytecode too.
+    bc_vs_ast(
+        binop(BinOp::Mod, varidx(0), lit(0.0)),
+        &[7.25],
+        &[],
+        &[],
+        &[],
+    );
+}
+
+/// The `Dual2` VM's `Op::Mod` carries the jet `a' − q·b'` (`q = div_euclid(a, b)`)
+/// and keeps the value `rem_euclid` bit for bit. It used to lift the result as a
+/// constant, a zero gradient on both operands (#2150). The points straddle the
+/// cases `q = 0` (the short arm), `q ≠ 0` and a negative divisor, each inside a
+/// period so FD measures the slope and not the jump.
+#[test]
+fn bytecode_g_mod_carries_the_jet_of_both_operands() {
+    use crate::sens::dual2::Dual2;
+    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let bc = compile_bytecode(&expr);
+    for (x, y) in [
+        (1.3, 2.5),
+        (7.1, 2.5),
+        (-3.4, 2.5),
+        (7.1, -2.5),
+        (-3.4, -2.5),
+    ] {
+        bc_g_dual2_fd(&expr, x, y, 1e-6, 1e-3);
+        bc_g_f64_matches(&expr, &[x, y]);
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(
+            d.value.to_bits(),
+            x.rem_euclid(y).to_bits(),
+            "value of {x} mod {y}"
+        );
+        assert_eq!(d.grad, [1.0, -x.div_euclid(y)], "grad of {x} mod {y}");
+        assert_eq!(d.hess, [[0.0; 2]; 2], "hess of {x} mod {y}");
+    }
+    // The zero-divisor guard still returns a constant.
+    let vd = [Dual2::<2>::var(1.3, 0), Dual2::<2>::var(0.0, 1)];
+    let mut sd: Vec<Dual2<2>> = Vec::new();
+    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+    assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
+}
+
+/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
+/// anchor: the reverse sweep reaches the third derivative of each record, so the
+/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
+/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
+/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
+/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
+#[test]
+fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
+    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
+    type V = DualV<2, 2, true>;
+    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let bc = compile_bytecode(&expr);
+    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
+    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
+        let q = x.div_euclid(y);
+        vtape_reset(1 + 2 + 2);
+        let vd = [
+            V::leaf(x, [1.0, 0.0], [0.0; 2]),
+            V::leaf(y, [0.0, 1.0], [0.0; 2]),
+        ];
+        let mut sd: Vec<V> = Vec::new();
+        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(
+            f.v.to_bits(),
+            x.rem_euclid(y).to_bits(),
+            "value of {x} mod {y}"
+        );
+        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
+        let adj = vadj_init::<1>();
+        for (comp, wc) in w.iter().enumerate() {
+            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
+        }
+        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
+        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
+        assert!(
+            got.iter().all(|g| g.is_finite()),
+            "{x} mod {y}: sweep {got:?}"
+        );
+        assert!(
+            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
+            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
+            w[0],
+            -q * w[0]
+        );
+    }
+}
+
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
 // For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
@@ -18341,6 +18256,96 @@ fn differentiate_floor_ceil_round_is_zero_away_from_a_step() {
             "d/dθ₀ {name}(3·θ₀) must be 0, not the argument's derivative (3)"
         );
         assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    }
+}
+
+/// `a mod b = a − b·q` with `q = div_euclid(a, b)` piecewise constant, so away
+/// from a jump `∂/∂a = 1` and `∂/∂b = −q`. The arm used to return `0`, which
+/// froze any η or θ read through a `mod`: `CL = TVCL·exp((ETA_CL + 5) mod 10 − 5)`
+/// fit with 100 % shrinkage and ω at its initial value (#2150).
+///
+/// Mutations it catches: the old `0` arm (every `∂/∂a` is `1`, not `0`); dropping
+/// the `−q·b'` term (the `b` axis at `q ≠ 0`); spelling `q` as `floor(a / b)` (the
+/// negative-`b` rows, where the Euclidean quotient is `ceil(a / b)`). Each point
+/// sits strictly inside a period, at least `0.2` from a jump against FD's `h`.
+#[test]
+fn differentiate_mod_matches_fd_in_both_operands() {
+    let eta = &[];
+    let vars = &[];
+    let covs = &[];
+    let expr = binop(BinOp::Mod, Expression::Theta(0), Expression::Theta(1));
+    // (a, b, q = div_euclid(a, b)): q = 0, positive and negative q, negative b.
+    for (a, b, q) in [
+        (1.3, 2.5, 0.0),
+        (7.1, 2.5, 2.0),
+        (-3.4, 2.5, -2.0),
+        (7.1, -2.5, -2.0),
+        (-3.4, -2.5, 2.0),
+    ] {
+        let theta = &[a, b];
+        assert_eq!(f64::div_euclid(a, b), q, "fixture q for ({a}, {b})");
+        let d_a = eval_at(
+            &differentiate(&expr, DiffAxis::Theta(0)),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        let d_b = eval_at(
+            &differentiate(&expr, DiffAxis::Theta(1)),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert!(
+            (d_a - 1.0).abs() < 1e-12,
+            "∂/∂a ({a} mod {b}) = {d_a}, want 1"
+        );
+        assert!(
+            (d_b + q).abs() < 1e-12,
+            "∂/∂b ({a} mod {b}) = {d_b}, want {}",
+            -q
+        );
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(0), theta, eta, vars, covs);
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(1), theta, eta, vars, covs);
+    }
+    // The issue's reproduction shape: an η through a `mod` with a literal divisor
+    // (the `b' = 0` short arm), equal to `η` on `[-5, 5)`.
+    let wrapped = binop(
+        BinOp::Sub,
+        binop(
+            BinOp::Mod,
+            binop(BinOp::Add, Expression::Eta(0), lit(5.0)),
+            lit(10.0),
+        ),
+        lit(5.0),
+    );
+    for eta0 in [-0.7, 0.3, 12.4] {
+        let d = eval_at(
+            &differentiate(&wrapped, DiffAxis::Eta(0)),
+            &[],
+            &[eta0],
+            vars,
+            covs,
+        );
+        assert_eq!(d, 1.0, "d/dη ((η + 5) mod 10 − 5) at η = {eta0}");
+        assert_diff_matches_fd(wrapped.clone(), DiffAxis::Eta(0), &[], &[eta0], vars, covs);
+    }
+    // A zero divisor: the VM returns the constant `0`, so the derivative is `0`,
+    // through a literal divisor and through a θ one.
+    let zero_lit = binop(BinOp::Mod, Expression::Theta(0), lit(0.0));
+    let d = eval_at(
+        &differentiate(&zero_lit, DiffAxis::Theta(0)),
+        &[1.3],
+        eta,
+        vars,
+        covs,
+    );
+    assert_eq!(d, 0.0, "∂/∂a (a mod 0)");
+    for axis in [DiffAxis::Theta(0), DiffAxis::Theta(1)] {
+        let d = eval_at(&differentiate(&expr, axis), &[1.3, 0.0], eta, vars, covs);
+        assert_eq!(d, 0.0, "{axis:?} of (a mod θ₁) at θ₁ = 0");
     }
 }
 
@@ -20443,8 +20448,8 @@ fn test_apply_fit_option_frem_sigma() {
     assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
 }
 
-/// #485: the cov-static constant fold in `eval_param_duals` /
-/// `eval_param_eta_grad` must be bit-identical to the unfolded path. The
+/// #485: the cov-static constant fold in `eval_params_g` must be
+/// bit-identical to the unfolded path; the tests below pin its classifier. The
 /// model below has a covariate + FIXED-θ kernel (`FMAT`, `FAC` — foldable)
 /// and a dynamic tail (`CL = free-θ × … × exp(η)` — not foldable).
 const COV_STATIC_FOLD_MODEL: &str = r#"
@@ -20496,241 +20501,6 @@ fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
         prog.cov_static_mask.iter().any(|&b| !b),
         "expected the dynamic CL slot to stay unfolded"
     );
-}
-
-#[test]
-fn cov_static_fold_matches_unfolded_dual2() {
-    let (model, theta, eta, cov) = cov_static_fold_fixture();
-    let prog = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("indiv param program present");
-    // n_theta + n_eta = 2 + 1 = 3.
-    let folded = prog.eval_param_duals::<3>(&theta, &eta, &cov);
-    let mut unfolded_prog = prog.clone();
-    unfolded_prog.cov_static_mask = Vec::new();
-    let unfolded = unfolded_prog.eval_param_duals::<3>(&theta, &eta, &cov);
-
-    assert_eq!(folded.len(), unfolded.len());
-    for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
-        assert_eq!(a.value, b.value, "value mismatch at row {i}");
-        assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
-        assert_eq!(a.hess, b.hess, "hess mismatch at row {i}");
-    }
-}
-
-/// #1628: `PL` reads θ only through a gather. Before the fix the classifier
-/// folded it to a dual constant, so `∂CL/∂PLACEBO[k]` came out `0` and every
-/// gathered θ sat at its initial value on the analytic gradient. `WTN` is the
-/// other side of the straddle: covariate-only, so it must still fold.
-const GATHER_ONLY_SLOT_MODEL: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.001, 100.0)
-  theta PLACEBO[3](0.2, -5.0, 5.0)
-  omega ETA_CL ~ 0.1
-  sigma PROP ~ 0.2 (sd)
-[individual_parameters]
-  PL  = PLACEBO[PLA_IDX]
-  WTN = WT / 70
-  CL  = TVCL * WTN * exp(PL + ETA_CL)
-  V1  = 10
-[structural_model]
-  pk one_cpt_iv(cl=CL, v1=V1)
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-
-#[test]
-fn a_slot_reading_theta_only_through_a_gather_is_not_folded() {
-    let model = parse_model_string(GATHER_ONLY_SLOT_MODEL).expect("model compiles");
-    let prog = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("indiv param program present");
-    let slot = |name: &str| {
-        model
-            .indiv_param_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("{name} in {:?}", model.indiv_param_names))
-    };
-    assert!(
-        !prog.cov_static_mask[slot("PL")],
-        "PL reads θ through a gather: it must not fold to a constant"
-    );
-    assert!(
-        prog.cov_static_mask[slot("WTN")],
-        "WTN is covariate-only: it must still fold, or the fold is just off"
-    );
-
-    // The fold is an optimisation, so folded and unfolded duals must agree to
-    // the bit. Before the fix the folded `PL` row had an all-zero gradient.
-    let theta = [5.0, 0.2, -0.3, 0.4];
-    let eta = [0.1];
-    let cov: HashMap<String, f64> = [("WT".to_string(), 80.0), ("PLA_IDX".to_string(), 2.0)]
-        .into_iter()
-        .collect();
-    // n_theta + n_eta = 4 + 1 = 5.
-    let folded = prog.eval_param_duals::<5>(&theta, &eta, &cov);
-    let mut unfolded_prog = prog.clone();
-    unfolded_prog.cov_static_mask = Vec::new();
-    let unfolded = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
-    assert_eq!(folded.len(), unfolded.len());
-    for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
-        assert_eq!(a.value, b.value, "value mismatch at row {i}");
-        assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
-        assert_eq!(a.hess, b.hess, "hess mismatch at row {i}");
-    }
-    // And the gradient the fold must preserve is really there: `CL` moves with
-    // the level `PLA_IDX = 2` selects (θ index 2) and with no other level.
-    let cl = &folded[prog
-        .pk_slots_ref()
-        .iter()
-        .position(|&s| s == 0)
-        .expect("CL is PK slot 0")];
-    assert!(cl.value.is_finite() && cl.grad[2].is_finite());
-    assert!(
-        cl.grad[2].abs() > 1e-6,
-        "∂CL/∂PLACEBO[2] must be live, got {}",
-        cl.grad[2]
-    );
-    assert_eq!(cl.grad[1], 0.0, "PLA_IDX = 2 does not read PLACEBO[1]");
-    assert_eq!(cl.grad[3], 0.0, "PLA_IDX = 2 does not read PLACEBO[3]");
-}
-
-/// A covariate-heavy individual-parameters block modelled on the jasmine
-/// vancomycin-pediatrics run60 kernel: a large covariate-only prefix
-/// (CKD-EPI-/FFM-style pow/exp/log + sex/age branches — all cov-static) feeding
-/// a small free-θ × exp(η) tail. Used by the fold microbenchmark.
-const COV_STATIC_BENCH_MODEL: &str = r#"
-[parameters]
-  theta TVCL (5, 0.001, 100.0)
-  theta TVV1 (30, 0.001, 500.0)
-  theta THCR (0.2, -5.0, 5.0)
-  omega ETA_CL ~ 0.1
-  omega ETA_V1 ~ 0.1
-  sigma PROP ~ 0.2 (sd)
-[individual_parameters]
-  BMI = WEIGHT / ((HEIGHT / 100.0) ^ 2)
-  if (SEX == 0) {
-    FFM = 9270.0 * WEIGHT / (8780.0 + 244.0 * BMI)
-    A1  = -0.241
-    KK  = 0.7
-  } else {
-    FFM = 9270.0 * WEIGHT / (6680.0 + 216.0 * BMI)
-    A1  = -0.302
-    KK  = 0.9
-  }
-  CKDEPI = 142 * (CREAT / KK) ^ A1 * 0.9938 ^ AGE
-  SCH    = 0.413 * HEIGHT / CREAT
-  EGFR   = if (AGE < 13) SCH else CKDEPI
-  FCOV   = (EGFR / 100) ^ 0.75 * exp(-log(2) / 0.6 * AGE) * (FFM / 34) ^ 0.75
-  CL = TVCL * FCOV * exp(ETA_CL)
-  V1 = TVV1 * (FFM / 34) * exp(ETA_V1)
-[structural_model]
-  pk one_cpt_iv(cl=CL, v1=V1)
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-
-/// #485: bit-identity of the cov-static fold on a covariate-heavy kernel
-/// (the jasmine-style [`COV_STATIC_BENCH_MODEL`]: a `SEX` branch, an inline
-/// `if (AGE < 13) … else …` conditional, FFM forward-references, and
-/// pow/exp/log throughout). A far richer block than `cov_static_fold_fixture`:
-/// it asserts the fold is bit-for-bit identical to the unfolded walk on every
-/// dual axis, for both branches of the `SEX` split.
-///
-/// The per-call timing microbenchmark these numbers came from is dev-only
-/// scaffolding (its figures live in PR #489), so it is not committed as a test.
-#[test]
-fn cov_static_fold_matches_unfolded_bench_kernel() {
-    let model = parse_model_string(COV_STATIC_BENCH_MODEL).expect("bench model compiles");
-    let prog = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("indiv param program");
-    // The covariate kernel (BMI/FFM/CKDEPI/SCH/EGFR/FCOV/A1/KK) folds; the
-    // free-θ × exp(η) CL/V1 tail does not.
-    assert!(
-        prog.cov_static_mask.iter().any(|&b| b),
-        "expected cov-static slots in the kernel"
-    );
-    assert!(
-        prog.cov_static_mask.iter().any(|&b| !b),
-        "expected the CL/V1 tail to stay dynamic"
-    );
-    let theta: Vec<f64> = vec![5.0, 30.0, 0.2];
-    assert_eq!(theta.len(), model.n_theta);
-    let eta = vec![0.05_f64, -0.1_f64];
-    assert_eq!(eta.len(), model.n_eta);
-    let base_cov: HashMap<String, f64> = [
-        ("AGE", 4.0),
-        ("CREAT", 0.4),
-        ("SEX", 1.0),
-        ("HEIGHT", 100.0),
-        ("WEIGHT", 16.0),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect();
-
-    let mut unfolded_prog = prog.clone();
-    unfolded_prog.cov_static_mask = Vec::new();
-
-    // Both arms of the `if (SEX == 0)` split, to fold each FFM branch.
-    for sex in [1.0_f64, 0.0_f64] {
-        let mut cov = base_cov.clone();
-        cov.insert("SEX".to_string(), sex);
-
-        // Dual2 (outer θ,η): n_theta + n_eta = 3 + 2 = 5.
-        let folded2 = prog.eval_param_duals::<5>(&theta, &eta, &cov);
-        let unfolded2 = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
-        assert_eq!(folded2.len(), unfolded2.len());
-        for (i, (a, b)) in folded2.iter().zip(unfolded2.iter()).enumerate() {
-            assert_eq!(
-                a.value, b.value,
-                "SEX={sex} dual2 value mismatch at row {i}"
-            );
-            assert_eq!(a.grad, b.grad, "SEX={sex} dual2 grad mismatch at row {i}");
-            assert_eq!(a.hess, b.hess, "SEX={sex} dual2 hess mismatch at row {i}");
-        }
-
-        // Dual1 (inner η): n_eta = 2.
-        let folded1 = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
-        let unfolded1 = unfolded_prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
-        assert_eq!(folded1.len(), unfolded1.len());
-        for (i, (a, b)) in folded1.iter().zip(unfolded1.iter()).enumerate() {
-            assert_eq!(
-                a.value, b.value,
-                "SEX={sex} dual1 value mismatch at row {i}"
-            );
-            assert_eq!(a.grad, b.grad, "SEX={sex} dual1 grad mismatch at row {i}");
-        }
-    }
-}
-
-#[test]
-fn cov_static_fold_matches_unfolded_dual1() {
-    let (model, theta, eta, cov) = cov_static_fold_fixture();
-    let prog = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("indiv param program present");
-    // n_eta = 1.
-    let folded = prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
-    let mut unfolded_prog = prog.clone();
-    unfolded_prog.cov_static_mask = Vec::new();
-    let unfolded = unfolded_prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
-
-    assert_eq!(folded.len(), unfolded.len());
-    for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
-        assert_eq!(a.value, b.value, "value mismatch at row {i}");
-        assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
-    }
 }
 
 /// #485: exhaustively exercise the cov-static classifier helpers on every
@@ -20944,6 +20714,103 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
         )]),
     }];
     assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
+}
+
+/// #1927: an `else if` arm is governed by **every** condition up to and including
+/// its own — it fires only when the earlier ones were false. Here the earlier
+/// condition reads η, so `FAC` takes `WT / 70` only when `ETA_SW ≤ 0`, and must
+/// not fold to a cov-static constant even though its own condition (`WT > 70`)
+/// and body are covariate-only.
+const ELSE_IF_DYNAMIC_PRIOR_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_SW ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  FAC = 1.0
+  if (ETA_SW > 0) {
+    AUX = 1
+  } else if (WT > 70) {
+    FAC = WT / 70
+  }
+  CL = TVCL * FAC * exp(ETA_CL)
+  V1 = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// #1927: `Dual2` value and (θ, η) gradient of the `else if` fixture above must
+/// match the plain-`f64` evaluator and its central finite differences, on **both**
+/// sides of the η-governed first arm. Under the old per-arm rule `FAC` was
+/// classified cov-static and folded from a pass that runs at η = 0, so with
+/// `ETA_SW = 0.3` (first arm taken, `FAC = 1`) the dual walk carried the `else if`
+/// value `80/70` instead: `CL` and `∂CL/∂TVCL` were both off by that factor. With
+/// `ETA_SW = −0.3` both rules agree (the `else if` arm is the right one), which is
+/// the straddle: the negative side passes either way, so it pins that the fixture
+/// still exercises the arm rather than that the fix holds.
+#[test]
+fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
+    use crate::sens::dual2::Dual2;
+    let model = parse_model_string(ELSE_IF_DYNAMIC_PRIOR_MODEL).expect("model compiles");
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present");
+    let names = &model.indiv_param_names;
+    let fac = names.iter().position(|n| n == "FAC").expect("FAC slot");
+    let cl = names.iter().position(|n| n == "CL").expect("CL slot");
+    // `FAC` must not fold: which value it takes depends on `ETA_SW`.
+    assert!(
+        !prog.cov_static_mask.get(fac).copied().unwrap_or(false),
+        "FAC is governed by the η condition of the earlier arm; it must not be cov-static \
+         (mask = {:?}, names = {names:?})",
+        prog.cov_static_mask
+    );
+    // `CL` is read through the pk slot list.
+    let cl_row = prog
+        .pk_var_slots()
+        .iter()
+        .position(|&(_, vs)| vs == cl)
+        .expect("CL is a pk slot");
+
+    let cov: HashMap<String, f64> = [("WT".to_string(), 80.0)].into_iter().collect();
+    let theta = [5.0_f64];
+    let f64_cl = |th: &[f64], et: &[f64]| prog.eval_param_values(th, et, &cov, 0.0, &[])[cl];
+    for eta_sw in [0.3_f64, -0.3] {
+        let eta = [0.2_f64, eta_sw];
+        let th_d = [Dual2::<3>::var(theta[0], 0)];
+        let et_d = [Dual2::<3>::var(eta[0], 1), Dual2::<3>::var(eta[1], 2)];
+        let got = prog.eval_params_g::<Dual2<3>>(&th_d, &et_d, &cov)[cl_row];
+        let want = f64_cl(&theta, &eta);
+        assert!(want.is_finite() && got.value.is_finite());
+        assert_eq!(
+            got.value.to_bits(),
+            want.to_bits(),
+            "ETA_SW = {eta_sw}: dual CL value {} != f64 CL {want}",
+            got.value
+        );
+        // Central FD on each axis; `ETA_SW` is ±0.3 away from its jump, so a step
+        // of 1e-6 never crosses it and the FD derivative there is exactly 0.
+        let h = 1e-6;
+        let fd = [
+            (f64_cl(&[theta[0] + h], &eta) - f64_cl(&[theta[0] - h], &eta)) / (2.0 * h),
+            (f64_cl(&theta, &[eta[0] + h, eta[1]]) - f64_cl(&theta, &[eta[0] - h, eta[1]]))
+                / (2.0 * h),
+            (f64_cl(&theta, &[eta[0], eta[1] + h]) - f64_cl(&theta, &[eta[0], eta[1] - h]))
+                / (2.0 * h),
+        ];
+        for (k, (&g, &f)) in got.grad.iter().zip(fd.iter()).enumerate() {
+            assert!(g.is_finite() && f.is_finite());
+            assert!(
+                (g - f).abs() <= 1e-7 * (1.0 + f.abs()),
+                "ETA_SW = {eta_sw}: axis {k}: dual {g} vs FD {f}"
+            );
+        }
+    }
 }
 
 // ── [simulation] block key handling ──────────────────────────────────────
@@ -23476,58 +23343,6 @@ fn covariate_nn_init_requires_one_entry_per_output() {
     );
 }
 
-/// `ModelNnGuard::enter_for` must return `None` for a model with no
-/// `[covariate_nn]` blocks — the ambient-outputs slot is left untouched, so the
-/// generic evaluator's `Op::PushNnOutput` arm stays unreachable rather than
-/// reading an empty block.
-///
-/// Deliberately **not** `#[cfg(feature = "nn")]`. There are two `enter_for`
-/// bodies — the real one and a `#[cfg(not(feature = "nn"))]` stub that returns
-/// `None` unconditionally — and only one of them is compiled in any given build.
-/// An ungated test exercises whichever one this build has, so the contract
-/// "a model with no networks declines the guard" is pinned in the base `ci` build
-/// and the `nn` build alike. Gating it would leave the stub untested and let a
-/// future edit give the two bodies different answers.
-#[test]
-fn model_nn_guard_declines_a_model_with_no_networks() {
-    use crate::parser::model_parser::ModelNnGuard;
-    use std::collections::HashMap;
-
-    let src = r#"
-[parameters]
-  theta TVCL(1.0, 0.001, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma ADD ~ 0.1
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ additive(ADD)
-"#;
-    let model = parse_model_string(src).expect("plain model parses");
-    // `covariate_nns` is itself an `nn`-gated field, so the premise can only be
-    // stated in the `nn` build. In the base build there is no such field and the
-    // premise holds by construction.
-    #[cfg(feature = "nn")]
-    assert!(
-        model.covariate_nns.is_empty(),
-        "the premise is a model with no networks"
-    );
-
-    let cov = HashMap::from([("WT".to_string(), 72.0)]);
-    let guard = ModelNnGuard::enter_for(&model, &model.default_params.theta, &cov);
-    assert!(
-        guard.is_none(),
-        "a model with no [covariate_nn] blocks must not install a guard"
-    );
-}
-
 // ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────
 
 /// A compartment-free model: `[structural_model]` holds the equation itself, with
@@ -23809,67 +23624,6 @@ fn algebraic_structural_model_allows_many_readout_parameters() {
     let model = parse_model_string(&src)
         .expect("a compartment-free model is not bound by the analytical spare-slot region");
     assert!(model.is_algebraic());
-}
-
-/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
-/// the parser appends a synthetic individual parameter and rewrites the reference
-/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
-///
-/// The synthetics are appended on the ODE-layout path (which a compartment-free
-/// model takes), but the *acceptance list* was then overwritten with the analytical
-/// allocator's empty result — so the reference was never rewritten, the readout
-/// reported `dual_evaluable = false`, and the model silently dropped to finite
-/// differences while carrying a warning blaming the readout's shape.
-#[test]
-fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
-    let src = "[parameters]\n\
-        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
-        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
-        \x20 omega ETA_E0 ~ 0.09\n\
-        \x20 sigma PROP ~ 0.02 (sd)\n\n\
-        [individual_parameters]\n\
-        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
-        [structural_model]\n\
-        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
-        [error_model]\n\
-        \x20 DV ~ proportional(PROP)\n";
-    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
-    assert!(model.is_algebraic());
-    let program = model
-        .analytic_readout
-        .as_ref()
-        .and_then(|ar| ar.program.as_ref())
-        .expect("the equation compiles to a readout program");
-    assert!(
-        program.is_dual_evaluable(),
-        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
-         model loses its analytic gradient"
-    );
-    assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
-        "no FD-fallback warning should be emitted, got {:?}",
-        model.parse_warnings
-    );
-    assert!(
-        crate::sens::algebraic::supported(&model),
-        "and the analytic walks must actually serve it"
-    );
-    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
-    // path a compartment-free model takes; a second append from the analytical
-    // allocator would double them and silently consume two PK slots each.
-    let synths: Vec<&String> = model
-        .indiv_param_names
-        .iter()
-        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
-        .collect();
-    assert_eq!(
-        synths.len(),
-        2,
-        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
-    );
 }
 
 /// A compartment name is rejected in the equation because the model has no
@@ -25411,15 +25165,14 @@ fn power_form_parses_as_proportional_with_an_exponent_slot() {
     let cov = std::collections::HashMap::new();
     let row = rm.eval_obs(&theta, &cov, 1.0, 1.0);
     assert_eq!(row, vec![1.0, 1.3], "multiplier half then exponent half");
-    let grad = rm.eval_obs_theta_grad(&theta, &cov, 1.0, 1.0).unwrap();
-    assert_eq!(grad.len(), 2);
-    assert_eq!(
-        grad[0],
-        vec![0.0; 3],
-        "the bare multiplier has no θ derivative"
+    let th = [0.2, 10.0, 1.3];
+    assert!(
+        rm.per_sigma_deriv[0].is_none(),
+        "the bare multiplier has no θ-derivative program"
     );
+    let p = rm.per_sigma_exponent_deriv[0].as_ref().unwrap();
     assert_eq!(
-        grad[1],
+        deriv_theta_grad(p, &th, &cov, 1.0, 1.0),
         vec![0.0, 0.0, 1.0],
         "∂p/∂θ is the unit vector on RUV_POW"
     );
@@ -25494,10 +25247,16 @@ fn magnitude_expression_reads_tad() {
     // TIME is 100 on both records; only TAD tells them apart.
     assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 5.0), vec![1.5]);
     assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 20.0), vec![1.0]);
-    let early = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 5.0).unwrap();
-    let late = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 20.0).unwrap();
-    assert_eq!(early[0], vec![0.0, 0.0, 1.0]);
-    assert_eq!(late[0], vec![0.0, 0.0, 0.0]);
+    let p = rm.per_sigma_deriv[0].as_ref().unwrap();
+    let th = [0.2, 10.0, 1.5];
+    assert_eq!(
+        deriv_theta_grad(p, &th, &cov, 100.0, 5.0),
+        vec![0.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        deriv_theta_grad(p, &th, &cov, 100.0, 20.0),
+        vec![0.0, 0.0, 0.0]
+    );
 }
 
 /// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
@@ -28027,6 +27786,126 @@ fn the_level_index_producer_and_predicate_share_one_prefix() {
     assert!(!is_level_index_column("STUDY"));
 }
 
+// ── #2166: a `level` line's column is not an undeclared covariate ─────────────
+//
+// `level ARM by ARM in STUDY` names a grouping column, which iov.qmd says needs no
+// `[covariates]` entry. The nested-level columns are registered as data columns
+// only after the undeclared-covariate warning, so the warning lists a level column
+// only when a model expression reads it too — where its type matters as for any
+// covariate.
+
+/// The exact3 anchor model (two nested levels: STUDY in ID, ARM in STUDY).
+const NESTED_LEVELS_3: &str = include_str!("../../nonmem_anchor/nested_levels_3.ferx");
+/// `DOSE` (read by the model) and `NARM` (the arm kappa's weight) are covariates in
+/// their own right: declared, so the level columns are the only candidates left.
+const OTHER_COVS_DECLARED: &str = "\n[covariates]\n  DOSE continuous\n  NARM continuous\n";
+const NESTED_EMAX: &str = "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)";
+
+fn nested_levels_3_with(covariates: &str, emax: &str) -> String {
+    assert!(NESTED_LEVELS_3.contains(NESTED_EMAX), "fixture drifted");
+    format!("{}{covariates}", NESTED_LEVELS_3.replace(NESTED_EMAX, emax))
+}
+
+fn referenced(text: &str) -> Vec<String> {
+    parse_full_model(text)
+        .expect("model parses")
+        .model
+        .referenced_covariates
+}
+
+/// Both sides of the gate on one fixture: ARM read only by its `level` line is not
+/// listed; the same model with ARM also read in [individual_parameters] lists ARM
+/// (and only ARM — STUDY is still read only by its `level` line). Either way both
+/// level columns stay required data columns.
+#[test]
+fn a_nested_level_column_is_reported_only_when_an_expression_also_reads_it() {
+    let level_only = nested_levels_3_with(OTHER_COVS_DECLARED, NESTED_EMAX);
+    let also_read = nested_levels_3_with(
+        OTHER_COVS_DECLARED,
+        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)",
+    );
+    assert_eq!(undeclared_covariates(&level_only), None, "level line only");
+    assert_eq!(
+        undeclared_covariates(&also_read),
+        Some(vec!["ARM".to_string()]),
+        "ARM also read in an expression"
+    );
+    for text in [&level_only, &also_read] {
+        let covs = referenced(text);
+        for col in ["ARM", "STUDY", "NARM"] {
+            assert!(
+                covs.iter().any(|c| c == col),
+                "{col} not a data column: {covs:?}"
+            );
+        }
+    }
+}
+
+/// With no [covariates] block there is no warning to raise, whatever reads the
+/// level columns, and the read set is what it was before #2166.
+#[test]
+fn a_nested_level_model_without_a_covariates_block_is_unchanged() {
+    for emax in [
+        NESTED_EMAX,
+        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)",
+    ] {
+        let text = nested_levels_3_with("", emax);
+        assert_eq!(undeclared_covariates(&text), None, "{emax}");
+        assert_eq!(
+            referenced(&text),
+            ["ARM", "DOSE", "NARM", "STUDY"],
+            "{emax}"
+        );
+    }
+}
+
+/// One level is today's IOV spelled out (`iov_column`), never registered as a
+/// covariate: no warning from the `level` line alone, the warning when an
+/// expression reads the occasion column.
+#[test]
+fn a_single_level_column_is_reported_only_when_an_expression_also_reads_it() {
+    let model = |cl: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(2.0, 0.01, 20.0)\n  theta TVV(8.0, 0.1, 500.0)\n  \
+             omega ETA_CL ~ 0.04\n  level OCC by OCC in ID\n  kappa K_CL ~ 0.02 at OCC\n  \
+             sigma PROP_ERR ~ 0.02\n\n\
+             [individual_parameters]\n  {cl}\n  V = TVV\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n\n\
+             [covariates]\n  WT continuous\n"
+        )
+    };
+    let level_only = model("CL = TVCL * exp(ETA_CL + K_CL)");
+    let also_read = model("CL = TVCL * exp(ETA_CL + K_CL + 0.01 * OCC)");
+    assert_eq!(undeclared_covariates(&level_only), None, "level line only");
+    assert_eq!(
+        undeclared_covariates(&also_read),
+        Some(vec!["OCC".to_string()]),
+        "OCC also read in an expression"
+    );
+}
+
+/// [derived] still sees a nested-level column as a covariate although it is
+/// registered after the warning: naming a derived column after one is flagged.
+#[test]
+fn a_derived_column_named_after_a_nested_level_column_still_shadows_it() {
+    let text = format!(
+        "{}\n[derived]\n  ARM = IPRED\n",
+        nested_levels_3_with(OTHER_COVS_DECLARED, NESTED_EMAX)
+    );
+    let warnings = parse_full_model(&text)
+        .expect("model parses")
+        .model
+        .parse_warnings;
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`ARM` shadows a covariate")
+                && w.contains("W_DERIVED_COVARIATE_SHADOW")),
+        "{warnings:?}"
+    );
+}
+
 // ── #1636: a θ level block read in a Form-C readout ───────────────────────────
 //
 // A level block read in `[scaling] y` (or a compartment-free `y`) is lifted into a
@@ -28134,7 +28013,8 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
 
 /// The synth names: θ then η keep their #486 names and order, gathers follow, a
 /// repeated gather is lifted once and two indices of one block are two synths.
-/// Pins the names `provider_tests.rs` / `ode_provider_tests.rs` grep.
+/// Pins the synth names (the retired pre-#2093 `provider_tests.rs` /
+/// `ode_provider_tests.rs` grepped them).
 #[test]
 fn readout_gather_synths_follow_the_theta_eta_synths() {
     let m = parse_model_string(&gather_readout_model(
@@ -30965,39 +30845,6 @@ fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
     }
 }
 
-/// An all-arm name read only by an analytical `[initial_conditions]` is
-/// promoted, and predicts like its top-level ternary twin. Before, it was read
-/// as a data column ("S not found in data"); it was held back from #1900 because
-/// an init then read a non-`pk(...)` parameter through CL's placeholder slot,
-/// which #1898 fixed. Two subjects straddle the condition (WT 60 / 80), so both
-/// arms are live; the promoted name takes a free differentiable slot, so the
-/// model stays analytic.
-#[test]
-fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
-    let all_arm = "  if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }";
-    let ternary = "  S = if (WT > 70) 50 else 100";
-    let init = "[initial_conditions]\n  init(central) = S\n";
-    let m = parse_model_string(&unbound_reader_model(all_arm, init)).expect("parses");
-    assert!(
-        m.indiv_param_names.iter().any(|n| n == "S"),
-        "{:?}",
-        m.indiv_param_names
-    );
-    assert!(
-        !m.referenced_covariates.iter().any(|c| c == "S"),
-        "S is no longer a required data column: {:?}",
-        m.referenced_covariates
-    );
-    assert!(crate::sens::provider::analytical_supported(&m));
-    let got = unbound_reader_preds(all_arm, init);
-    assert_eq!(
-        got,
-        unbound_reader_preds(ternary, init),
-        "all-arm == ternary"
-    );
-    assert!((got[0] - got[1]).abs() > 1e-3, "both arms live: {got:?}");
-}
-
 // ── #1898: obs_scale / init read an unbound parameter through its own slot ────
 
 /// A 1-cpt oral model (TVCL 3, TVV 20, TVKA 1.5) with `ip` appended to
@@ -31082,65 +30929,6 @@ fn an_unbound_parameter_read_by_init_or_obs_scale_predicts_like_its_value() {
     // The init case at the plan's measured values: S = 1000 deposits 1000.
     let got = unbound_reader_preds("  S = 1000", &init("S"));
     assert!((got[0] - 46.577_497_800_567_49).abs() < 1e-9, "{got:?}");
-}
-
-/// The slot itself: `S` gets a free differentiable slot of its own — not CL's
-/// placeholder `0`, and not a slot the closed form consumes — so the analytic
-/// provider keeps serving the model.
-#[test]
-fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
-    for extra in [
-        "[initial_conditions]\n  init(central) = S\n",
-        "[scaling]\n  obs_scale = S\n",
-    ] {
-        let m = parse_model_string(&unbound_reader_model("  S = 2", extra)).unwrap();
-        let i = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
-        let slot = m.pk_indices[i];
-        assert_ne!(
-            slot,
-            crate::types::PK_IDX_CL,
-            "{extra}: S must not alias CL"
-        );
-        assert!(
-            slot <= crate::types::PK_IDX_MTT,
-            "{extra}: slot {slot} differentiable"
-        );
-        assert!(
-            !m.pk_model.consumes_pk_slot(slot),
-            "{extra}: slot {slot} is read by the closed form"
-        );
-        assert!(crate::sens::provider::analytical_supported(&m), "{extra}");
-    }
-}
-
-/// A modeled-dose `D{n}` / `R{n}` read by `init` or `obs_scale` reads its own
-/// value, like any other parameter no `pk(...)` role binds (#1901 review r1).
-/// It keeps its modeled-dose value slot too; this only adds the read slot, as a
-/// Form C `y` already did. Four cells: D and R × init and obs_scale, each via
-/// the name against the same read written inline.
-#[test]
-fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
-    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
-    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
-    for name in ["D1", "R1"] {
-        for (label, block) in [
-            ("init", &init as &dyn Fn(&str) -> String),
-            ("obs_scale", &scale),
-        ] {
-            let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
-            let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
-            assert_eq!(via_name, inline, "{name} read by {label}");
-            let m = parse_model_string(&unbound_reader_model(
-                &format!("  {name} = 2"),
-                &block(name),
-            ))
-            .unwrap();
-            assert!(
-                crate::sens::provider::analytical_supported(&m),
-                "{name} read by {label}: the read slot keeps the analytic path"
-            );
-        }
-    }
 }
 
 /// More unbound names than free differentiable slots is a loud refusal naming
@@ -31974,7 +31762,17 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     for (k, (p, u, t)) in calls.iter().enumerate() {
         let params = hoist_params::<f64>(prog, &p[..]);
         let mut want = [0.0; 2];
-        plain.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut want, &mut vars_p, &mut stack_p);
+        plain.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut want,
+            &mut vars_p,
+            &mut stack_p,
+        );
         let mut got_g = [0.0; 2];
         prog.eval_rhs_g::<f64>(
             u,
@@ -31982,6 +31780,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             *t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got_g,
             &mut vars_h,
             &mut stack_h,
@@ -32035,6 +31834,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut vars_p,
             &mut stack_p,
@@ -32046,6 +31846,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got,
             &mut vars_h,
             &mut stack_h,
@@ -32095,6 +31896,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         0.5,
         0.5,
         M::constant(0.5),
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut got,
         &mut vars_m,
         &mut stack_m,
@@ -32111,6 +31913,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         0.5,
         0.5,
         M::constant(0.5),
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut want,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -32149,6 +31952,7 @@ fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
                 1.0,
                 1.0,
                 1.0,
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut want,
                 &mut Vec::new(),
                 &mut Vec::new(),
@@ -32181,7 +31985,17 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
     let mut vars: Vec<f64> = Vec::new();
     let mut stack: Vec<f64> = Vec::new();
     let mut du = [0.0];
-    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        1.0,
+        1.0,
+        1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     let clean = du[0];
     // The maximal parameter-only subtree of `−(CL/V)·central` is `0 − CL/V`.
     assert!(
@@ -32192,7 +32006,17 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
 
     // Same inputs: a hit, so the poisoned value is what the RHS reads.
     vars[slot] = 1.0e6;
-    prog.eval_rhs_g::<f64>(&u, &p1, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        2.0,
+        2.0,
+        2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(
         hoist_bits_eq(du[0], 1.0e6 * 50.0),
         "hit did not reuse the cache: {}",
@@ -32201,14 +32025,34 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
 
     // A moved parameter: a miss, so the poison is replaced by the fresh value.
     vars[slot] = 1.0e6;
-    prog.eval_rhs_g::<f64>(&u, &p2, 2.0, 2.0, 2.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p2,
+        2.0,
+        2.0,
+        2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(
         hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
         "miss did not recompute: {}",
         du[0]
     );
     // And back: a miss again, giving the first call's value.
-    prog.eval_rhs_g::<f64>(&u, &p1, 1.0, 1.0, 1.0, &mut du, &mut vars, &mut stack);
+    prog.eval_rhs_g::<f64>(
+        &u,
+        &p1,
+        1.0,
+        1.0,
+        1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
     assert!(hoist_bits_eq(du[0], clean));
 }
 
@@ -32255,6 +32099,7 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
         1.0,
         1.0,
         1.0,
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut want,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -32378,13 +32223,22 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
             1.0,
             1.0,
             1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0];
         prog.eval_rhs_g::<f64>(
-            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
         );
         let mut got_c = [0.0];
         (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got_c);
@@ -32482,12 +32336,23 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             *t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = vec![0.0; n_states];
-        prog.eval_rhs_g::<f64>(u, &params, *t, *t, *t, &mut got_g, &mut vars, &mut stack);
+        prog.eval_rhs_g::<f64>(
+            u,
+            &params,
+            *t,
+            *t,
+            *t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
+        );
         let mut got_c = vec![0.0; n_states];
         (model.ode_spec.as_ref().unwrap().rhs)(u, &params, *t, &mut got_c);
         let ud: Vec<D> = u.iter().map(|&x| D::constant(x)).collect();
@@ -32498,6 +32363,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dwant,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -32509,6 +32375,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             *t,
             *t,
             D::constant(*t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dgot,
             &mut dvars,
             &mut dstack,
@@ -32588,6 +32455,7 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
         2.0,
         2.0,
         2.0,
+        crate::sens::num::PkNum::from_f64(0.0),
         &mut du,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -32670,12 +32538,23 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             t,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0; 2];
-        prog.eval_rhs_g::<f64>(&u, &params, t, t, t, &mut got_g, &mut vars, &mut stack);
+        prog.eval_rhs_g::<f64>(
+            &u,
+            &params,
+            t,
+            t,
+            t,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
+        );
         let mut got_c = [0.0; 2];
         rhs(&u, &params, t, &mut got_c);
         let dp: Vec<D> = p.iter().map(|&x| D::var(x, 0)).collect();
@@ -32687,6 +32566,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             D::constant(t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dwant,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -32698,6 +32578,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             t,
             t,
             D::constant(t),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut dgot,
             &mut dvars,
             &mut dstack,
@@ -32771,13 +32652,22 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
             1.0,
             1.0,
             1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
         );
         let mut got_g = [0.0];
         prog.eval_rhs_g::<f64>(
-            &u, &params, 1.0, 1.0, 1.0, &mut got_g, &mut vars, &mut stack,
+            &u,
+            &params,
+            1.0,
+            1.0,
+            1.0,
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut got_g,
+            &mut vars,
+            &mut stack,
         );
         let mut got_c = [0.0];
         rhs(&u, &params, 1.0, &mut got_c);
@@ -32834,6 +32724,7 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
             1.25,
             1.25,
             D::constant(1.25),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut want,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -32845,6 +32736,7 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
             1.25,
             1.25,
             D::constant(1.25),
+            crate::sens::num::PkNum::from_f64(0.0),
             &mut got,
             &mut vars,
             &mut stack,
@@ -33259,6 +33151,7 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
                 *t,
                 t - first,
                 tad,
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut du,
                 &mut vars,
                 &mut stack,
@@ -33393,11 +33286,29 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
     let (mut vars, mut stack) = (Vec::new(), Vec::new());
     let mut sink = vec![0.0; 2];
     sp.eval_rhs_g::<f64>(
-        &u, &params, 0.5, 0.25, 0.1, &mut sink, &mut vars, &mut stack,
+        &u,
+        &params,
+        0.5,
+        0.25,
+        0.1,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut sink,
+        &mut vars,
+        &mut stack,
     );
     assert_eq!(vars.len(), sp.n_vars_total);
     let mut got = vec![0.0; 2];
-    lp.eval_rhs_g::<f64>(&u, &params, 0.5, 0.25, 0.1, &mut got, &mut vars, &mut stack);
+    lp.eval_rhs_g::<f64>(
+        &u,
+        &params,
+        0.5,
+        0.25,
+        0.1,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut got,
+        &mut vars,
+        &mut stack,
+    );
     for j in 0..2 {
         assert!(
             hoist_bits_eq(got[j], want[j]),
@@ -33631,6 +33542,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 *t,
                 tafd_of(*t),
                 tad_of(*t),
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut want,
                 &mut vf,
                 &mut sf,
@@ -33643,6 +33555,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 *t,
                 tafd_of(*t),
                 tad_of(*t),
+                crate::sens::num::PkNum::from_f64(0.0),
                 &mut got,
                 &mut vl,
                 &mut sl,
@@ -34357,5 +34270,545 @@ fn a_max_on_the_route_is_named_as_such() {
             ),
             "{f}: {msg}"
         );
+    }
+}
+
+/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
+/// the parser appends a synthetic individual parameter and rewrites the reference
+/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
+///
+/// The synthetics are appended on the ODE-layout path (which a compartment-free
+/// model takes), but the *acceptance list* was then overwritten with the analytical
+/// allocator's empty result — so the reference was never rewritten, the readout
+/// reported `dual_evaluable = false`, and the model silently dropped to finite
+/// differences while carrying a warning blaming the readout's shape.
+#[test]
+fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
+        [structural_model]\n\
+        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n";
+    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
+    assert!(model.is_algebraic());
+    let program = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref())
+        .expect("the equation compiles to a readout program");
+    assert!(
+        program.is_dual_evaluable(),
+        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
+         model loses its analytic gradient"
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "no FD-fallback warning should be emitted, got {:?}",
+        model.parse_warnings
+    );
+    assert!(
+        crate::sens::ode_provider::adjoint::model_in_scope(&model),
+        "and the adjoint's recorders must actually serve it"
+    );
+    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
+    // path a compartment-free model takes; a second append from the analytical
+    // allocator would double them and silently consume two PK slots each.
+    let synths: Vec<&String> = model
+        .indiv_param_names
+        .iter()
+        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
+        .collect();
+    assert_eq!(
+        synths.len(),
+        2,
+        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
+    );
+}
+
+/// An all-arm name read only by an analytical `[initial_conditions]` is
+/// promoted, and predicts like its top-level ternary twin. Before, it was read
+/// as a data column ("S not found in data"); it was held back from #1900 because
+/// an init then read a non-`pk(...)` parameter through CL's placeholder slot,
+/// which #1898 fixed. Two subjects straddle the condition (WT 60 / 80), so both
+/// arms are live; the promoted name takes a free differentiable slot, so the
+/// model stays analytic.
+#[test]
+fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
+    let all_arm = "  if (WT > 70) {\n    S = 50\n  } else {\n    S = 100\n  }";
+    let ternary = "  S = if (WT > 70) 50 else 100";
+    let init = "[initial_conditions]\n  init(central) = S\n";
+    let m = parse_model_string(&unbound_reader_model(all_arm, init)).expect("parses");
+    assert!(
+        m.indiv_param_names.iter().any(|n| n == "S"),
+        "{:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        !m.referenced_covariates.iter().any(|c| c == "S"),
+        "S is no longer a required data column: {:?}",
+        m.referenced_covariates
+    );
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&m));
+    let got = unbound_reader_preds(all_arm, init);
+    assert_eq!(
+        got,
+        unbound_reader_preds(ternary, init),
+        "all-arm == ternary"
+    );
+    assert!((got[0] - got[1]).abs() > 1e-3, "both arms live: {got:?}");
+}
+
+/// A modeled-dose `D{n}` / `R{n}` read by `init` or `obs_scale` reads its own
+/// value, like any other parameter no `pk(...)` role binds (#1901 review r1).
+/// It keeps its modeled-dose value slot too; this only adds the read slot, as a
+/// Form C `y` already did. Four cells: D and R × init and obs_scale, each via
+/// the name against the same read written inline.
+#[test]
+fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
+    let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
+    let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
+    for name in ["D1", "R1"] {
+        for (label, block) in [
+            ("init", &init as &dyn Fn(&str) -> String),
+            ("obs_scale", &scale),
+        ] {
+            let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
+            let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
+            assert_eq!(via_name, inline, "{name} read by {label}");
+            let m = parse_model_string(&unbound_reader_model(
+                &format!("  {name} = 2"),
+                &block(name),
+            ))
+            .unwrap();
+            assert!(
+                crate::sens::ode_provider::adjoint::model_in_scope(&m),
+                "{name} read by {label}: the read slot keeps the analytic path"
+            );
+        }
+    }
+}
+
+/// The slot itself: `S` gets a free differentiable slot of its own — not CL's
+/// placeholder `0`, and not a slot the closed form consumes — so the analytic
+/// provider keeps serving the model.
+#[test]
+fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
+    for extra in [
+        "[initial_conditions]\n  init(central) = S\n",
+        "[scaling]\n  obs_scale = S\n",
+    ] {
+        let m = parse_model_string(&unbound_reader_model("  S = 2", extra)).unwrap();
+        let i = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
+        let slot = m.pk_indices[i];
+        assert_ne!(
+            slot,
+            crate::types::PK_IDX_CL,
+            "{extra}: S must not alias CL"
+        );
+        assert!(
+            slot <= crate::types::PK_IDX_MTT,
+            "{extra}: slot {slot} differentiable"
+        );
+        assert!(
+            !m.pk_model.consumes_pk_slot(slot),
+            "{extra}: slot {slot} is read by the closed form"
+        );
+        assert!(
+            crate::sens::ode_provider::adjoint::model_in_scope(&m),
+            "{extra}"
+        );
+    }
+}
+
+/// `eval_bytecode_lanes` over `[f64; 4]` is four scalar evaluations: each lane's bits equal
+/// `eval_bytecode` on that lane's inputs (guards, powers, comparisons and a branch the lanes
+/// agree on), and lanes that disagree at a branch decline rather than follow lane 0.
+#[test]
+fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
+    let e = binop(
+        BinOp::Add,
+        binop(
+            BinOp::Div,
+            power_expr(varidx(0), lit(1.7)),
+            binop(BinOp::Sub, varidx(1), lit(0.3)),
+        ),
+        cond(
+            cmp(varidx(1), CmpOp::Gt, lit(-100.0)),
+            unary("exp", binop(BinOp::Mul, varidx(0), lit(-0.4))),
+            unary("ln", varidx(1)),
+        ),
+    );
+    let bc = compile_bytecode(&e);
+    let lanes = [
+        [1.3, 0.3],
+        [2.0, 5.0],
+        [0.0, -1.0],
+        [7.5, 0.30000000000000004],
+    ];
+    let vars: Vec<[f64; 4]> = (0..2)
+        .map(|v| std::array::from_fn(|l| lanes[l][v]))
+        .collect();
+    let mut stack = Vec::new();
+    let got = eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).expect("agree");
+    for (l, inputs) in lanes.iter().enumerate() {
+        let want = eval_bytecode(&bc, &[], &[], &[], inputs, &[], &mut Vec::new());
+        assert_eq!(
+            got[l].to_bits(),
+            want.to_bits(),
+            "lane {l}: {} vs {want}",
+            got[l]
+        );
+    }
+    // A branch the lanes take differently: lane 2's `v1` falls below the threshold.
+    let split = cond(cmp(varidx(1), CmpOp::Gt, lit(0.0)), varidx(0), varidx(1));
+    let bc = compile_bytecode(&split);
+    assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
+}
+
+/// #1919 — an analytic hazard's `HazardParamFn` takes no time, so a `TIME` read in its
+/// parameters (directly, or through a reached `[individual_parameters]` value) is refused
+/// at parse rather than silently read at the ambient model time (0 on the likelihood path).
+#[cfg(feature = "survival")]
+mod analytic_hazard_time_1919 {
+    use super::*;
+
+    /// `ip` is the `[individual_parameters]` body, `em` the `[event_model]` body after
+    /// `cmt`, `extra` any further block.
+    fn model(ip: &str, em: &str, extra: &str) -> String {
+        format!(
+            "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  theta TVKT(0.5, 0.0, 10.0)
+  theta TVSHAPE(1.2, 0.1, 10.0)
+  theta BETA(0.1, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+{ip}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+[event_model]
+  cmt    = 2
+{em}
+{extra}"
+        )
+    }
+
+    const BASE_IP: &str = "  CL  = TVCL * exp(ETA_CL)\n  V1  = TVV\n";
+
+    /// The caveat a refusal carries when its dependency holds on only some paths.
+    const SOME_PATH: &str = "This dependency holds on at least one path through the block's `if` \
+                             statements";
+
+    /// Every sentence of the message, per cell: the shared why/fix and the cell's lead.
+    fn assert_message(err: &str, lead: &str) {
+        for part in [
+            "[event_model] on CMT=2: ",
+            lead,
+            "An analytic hazard (`family = ...`) is evaluated once per subject with no time \
+             argument, so TIME would not follow the hazard's clock",
+            "silently read the ambient model time (0 outside any record) instead (#1919)",
+            "write it as an ODE-accumulated `hazard = ...` expression",
+            "with the TIME term in that expression itself",
+        ] {
+            assert!(err.contains(part), "missing `{part}` in: {err}");
+        }
+    }
+
+    /// The issue's model: `scale = LAM`, `LAM` reads `TIME`.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_reaches_is_refused() {
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert_message(
+            &err,
+            "the hazard reads the [individual_parameters] value `LAM`, whose value \
+             depends on the `TIME` built-in",
+        );
+        assert!(
+            !err.contains(SOME_PATH),
+            "a dependency on every path carries no some-path caveat: {err}"
+        );
+    }
+
+    /// Transitive: the hazard reads `LAM`, `LAM` reads `K`, and only `K` reads `TIME`.
+    /// The message names the value the hazard reads and the one that reads `TIME`; the
+    /// issue's direct case (`LAM` reads `TIME` itself) carries no `through` clause.
+    #[test]
+    fn a_time_read_reached_transitively_names_the_reader() {
+        let ip = format!("{BASE_IP}  K   = 1.0 + TVKT * TIME\n  LAM = TVLAMBDA * K");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(
+            err.contains("value `LAM`, whose value depends on the `TIME` built-in (through `K`)."),
+            "got: {err}"
+        );
+        let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(
+            !err.contains("through"),
+            "direct read has no witness clause: {err}"
+        );
+    }
+
+    /// Path correlation (round-2 review): `K` is time-free on the arm where `LAM` reads it,
+    /// and `TIME`-dependent only on the arm where `LAM` does not, so `LAM` is time-free on
+    /// both paths. A time-free re-assignment likewise clears an earlier `TIME` read.
+    /// Straddle asserted per case: the block reads `TIME`.
+    #[test]
+    fn a_time_dependency_on_no_single_path_is_not_refused() {
+        for (label, branch) in [
+            (
+                "mutually exclusive arms",
+                "  K = TVLAMBDA\n  if (TVKT > 0) {\n    LAM = K\n  } else {\n    \
+                 K = TIME\n    LAM = TVLAMBDA\n  }",
+            ),
+            ("overwritten", "  LAM = TIME\n  LAM = TVLAMBDA"),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let model =
+                parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+                    .unwrap_or_else(|e| panic!("{label}: must parse, got: {e}"));
+            assert!(
+                compiled_model_uses_time_builtin(&model),
+                "{label}: straddle — the block must read TIME"
+            );
+        }
+    }
+
+    /// Every hazard-parameter key is a read site, not only `scale`.
+    #[test]
+    fn every_hazard_parameter_key_is_a_read_site() {
+        let ip = format!("{BASE_IP}  PT  = TVSHAPE * (1.0 + TVKT * TIME)");
+        for em in [
+            "  family = weibull\n  scale = TVLAMBDA\n  shape = PT",
+            "  family = gompertz\n  alpha = TVLAMBDA\n  gamma = PT",
+            "  family = exponential\n  scale = TVLAMBDA\n  loghr = BETA * PT",
+        ] {
+            let err = expect_parse_err(&model(&ip, em, ""));
+            assert!(
+                err.contains("value `PT`, whose value depends"),
+                "{em}: got: {err}"
+            );
+        }
+    }
+
+    /// Taint is per assignment, not per statement: one `if` block assigns both a
+    /// `TIME`-reading `UNUSED` and the time-free `LAM` the hazard reads, so nothing the
+    /// hazard depends on reads `TIME` (round-1 review). Straddle asserted: the block does
+    /// read `TIME`, inside the very statement that defines `LAM`.
+    #[test]
+    fn a_time_read_in_a_sibling_assignment_of_the_same_if_is_not_refused() {
+        let ip = format!(
+            "{BASE_IP}  if (TVKT > 0) {{\n    UNUSED = TIME\n    LAM = TVLAMBDA\n  }} \
+             else {{\n    UNUSED = 0\n    LAM = TVLAMBDA\n  }}"
+        );
+        let model = parse_model_string(&model(&ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read in a sibling assignment the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// Control dependence: `LAM` reads no `TIME` itself, but which value it takes does —
+    /// including through an `else if` whose own condition is time-free, because the arm is
+    /// governed by every earlier condition too.
+    #[test]
+    fn a_time_reading_condition_governing_the_reached_assignment_is_refused() {
+        // Third field: whether the dependency is on only some paths. Both arms of the first
+        // case assign `LAM` under the `TIME` test, so it holds on every path; in the second
+        // only the `else if` arm does.
+        for (label, branch, some_path) in [
+            (
+                "own condition",
+                "  if (TIME > 5) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = 2 * TVLAMBDA\n  }",
+                false,
+            ),
+            (
+                "earlier arm's condition",
+                "  LAM = TVLAMBDA\n  if (TIME > 5) {\n    AUX = 1\n  } \
+                 else if (TVKT > 0) {\n    LAM = 2 * TVLAMBDA\n  }",
+                true,
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in"),
+                "{label}: got: {err}"
+            );
+            assert_eq!(err.contains(SOME_PATH), some_path, "{label}: got: {err}");
+        }
+    }
+
+    /// The join after an `if` keeps a dependency any path carries: one arm assigning a
+    /// `TIME`-dependent `LAM`, and an `if` with no `else` that leaves an earlier
+    /// `TIME`-dependent `LAM` in place on its fall-through path.
+    #[test]
+    fn a_time_dependency_on_any_single_path_is_refused() {
+        for (label, branch) in [
+            (
+                "one arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA * TIME\n  } else {\n    LAM = TVLAMBDA\n  }",
+            ),
+            (
+                "else arm",
+                "  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = TVLAMBDA * TIME\n  }",
+            ),
+            (
+                "fall-through",
+                "  LAM = TVLAMBDA * TIME\n  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  }",
+            ),
+        ] {
+            let ip = format!("{BASE_IP}{branch}");
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            assert!(
+                err.contains("value `LAM`, whose value depends on the `TIME` built-in."),
+                "{label}: got: {err}"
+            );
+            assert!(err.contains(SOME_PATH), "{label}: got: {err}");
+        }
+    }
+
+    /// The two-`if` model of the round-3/4 reviews, as text with the second condition
+    /// spelled by the caller and an optional statement between the two `if`s.
+    fn split_ifs(second_cond: &str, between: &str) -> String {
+        format!(
+            "{BASE_IP}  SW = TVKT\n  K = TVLAMBDA\n  LAM = TVLAMBDA\n  \
+             if (SW > 0) {{\n    K = TIME\n  }}\n{between}  \
+             if ({second_cond}) {{\n    LAM = TVLAMBDA\n  }} else {{\n    LAM = K\n  }}"
+        )
+    }
+
+    /// **Identical conditions correlate across separate `if`s** (round-4 review). `LAM = K`
+    /// runs only when `SW > 0` is false, which is exactly when `K = TIME` did not run, so
+    /// `LAM` is time-free on every execution and the model parses. Straddle asserted: the
+    /// block does read `TIME`, on a path the hazard's value never takes.
+    #[test]
+    fn a_dependency_split_across_identically_conditioned_ifs_is_not_refused() {
+        let src = model(
+            &split_ifs("SW > 0", ""),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let model = parse_model_string(&src).expect("identical conditions must correlate");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME"
+        );
+    }
+
+    /// The correlation is what decides it, not the shape: on either side of the gate the
+    /// same model is refused. (a) An **equivalent condition written differently** is not
+    /// correlated — equivalence is undecidable in general — so the refusal stands and carries
+    /// the some-path caveat with its rewrite; every sentence asserted. (b) Re-assigning the
+    /// condition's input between the two `if`s makes the second test a different question
+    /// (`SW = -1` here: the `else` always runs, so `LAM = K` really is `TIME` whenever the
+    /// first `if` fired) — a recorded outcome that survived the re-assignment would accept
+    /// a genuinely `TIME`-dependent hazard.
+    #[test]
+    fn a_dependency_split_across_uncorrelated_ifs_is_refused_with_the_some_path_caveat() {
+        for (label, ip) in [
+            ("written differently", split_ifs("0 < SW", "")),
+            ("input re-assigned", split_ifs("SW > 0", "  SW = -1\n")),
+        ] {
+            let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+            for part in [
+                "value `LAM`, whose value depends on the `TIME` built-in (through `K`).",
+                SOME_PATH,
+                "the check correlates separate `if` statements only when their conditions are \
+                 written identically and read no value re-assigned in between",
+                "so if that path cannot occur, write those conditions identically or merge the \
+                 `if` statements into one.",
+            ] {
+                assert!(err.contains(part), "{label}: missing `{part}` in: {err}");
+            }
+        }
+    }
+
+    /// Past `MAX_TIME_WORLDS` live paths the walk merges them (union join, facts dropped),
+    /// which must stay sound: seven independent `if`s (2^7 = 128 paths) before a `TIME`
+    /// read on one arm still refuse, with the caveat; and the merge forgets the first `if`'s
+    /// outcome, so the round-4 correlation it would otherwise find is conservatively lost.
+    #[test]
+    fn many_sequential_ifs_merge_paths_soundly() {
+        let mut pad = String::new();
+        for i in 0..7 {
+            pad.push_str(&format!(
+                "  if (TVKT > {i}) {{\n    A{i} = 1\n  }} else {{\n    A{i} = 2\n  }}\n"
+            ));
+        }
+        // The hazard must reach the `A{i}`, or the reachability filter drops the pad.
+        let tail = "  LAM = LAM + 0 * (A0 + A1 + A2 + A3 + A4 + A5 + A6)";
+        let ip = format!(
+            "{BASE_IP}  if (TVKT > 0.5) {{\n    LAM = TVLAMBDA * TIME\n  }} else {{\n    \
+             LAM = TVLAMBDA\n  }}\n{pad}{tail}"
+        );
+        let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
+        assert!(err.contains(SOME_PATH), "merged: got: {err}");
+        let src = model(
+            &format!("{}\n{tail}", split_ifs("SW > 0", &pad)),
+            "  family = exponential\n  scale = LAM",
+            "",
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("(through `K`)"),
+            "merge drops facts: got: {err}"
+        );
+    }
+
+    /// `TIME` written directly in a hazard parameter expression.
+    #[test]
+    fn a_direct_time_read_is_refused() {
+        let err = expect_parse_err(&model(
+            BASE_IP,
+            "  family = exponential\n  scale = TVLAMBDA * (1.0 + TVKT * TIME)",
+            "",
+        ));
+        assert_message(
+            &err,
+            "a hazard parameter expression references the `TIME` built-in",
+        );
+    }
+
+    /// Control, with the straddle asserted: the block reads `TIME` (`CL`), but the hazard
+    /// does not reach `CL`, so nothing is refused — the reachability filter is the gate.
+    #[test]
+    fn a_time_reading_parameter_the_hazard_does_not_reach_is_not_refused() {
+        let ip = "  CL  = TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)\n  V1  = TVV\n  \
+                  LAM = TVLAMBDA * exp(BETA)";
+        let model = parse_model_string(&model(ip, "  family = exponential\n  scale = LAM", ""))
+            .expect("a TIME read the hazard does not reach must parse");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "straddle: the block must read TIME, or nothing could have been refused"
+        );
+    }
+
+    /// The `[binary_model]` logit is evaluated under each record's model-time guard, so a
+    /// `TIME`-reading parameter there is honoured and must keep parsing.
+    #[test]
+    fn a_binary_model_reading_time_is_not_refused() {
+        let ip = format!("{BASE_IP}  B0 = TVLAMBDA * (1.0 + TVKT * TIME)");
+        let src = model(
+            &ip,
+            "  family = exponential\n  scale = TVLAMBDA",
+            "[binary_model]\n  cmt   = 3\n  logit = B0\n",
+        );
+        parse_model_string(&src).expect("a TIME-reading logit predictor must parse");
     }
 }

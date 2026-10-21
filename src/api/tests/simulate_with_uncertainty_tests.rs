@@ -3494,3 +3494,137 @@ fn every_public_options_struct_implements_default() {
     let _ = assert_default::<SimulateUncertaintyOptions>();
     let _ = assert_default::<crate::AdaptiveSimulateOptions>();
 }
+
+// ── #1928: the NPDE / NPD reference distribution's own η loop ────────────────
+// `compute_npde_npd_diag` draws its reference replicates from N(0, Ω) itself rather than
+// through `simulate_inner_with_draw`, so before #1928 a twin-less transit / IG replicate
+// whose η crossed the tilting abscissa entered the reference as an undosed profile on no
+// channel at all.
+
+/// The crossers an NPDE reference run at `seed` draws on [`tiny_population`] under
+/// [`INDOMAIN_TWINLESS_TRANSIT_SRC`] at ω²(ETA_CL) = `var`, counted **outside** the engine:
+/// the subject-`i` stream is `StdRng::seed_from_u64(seed + i)`, each replicate draws one η
+/// normal then one ε normal per observation (a single σ, no `block_sigma`, so the per-row
+/// draw), and the domain test is the closed form — `CL/V = 0.5·e^η/4 ≥ KTR = (3+1)/20`
+/// ⇔ `η ≥ ln 1.6`. Coupled to the draw order on purpose: an exact count is what lets the
+/// test tell "the tally saw every replicate" from "the tally saw some".
+fn npde_reference_crossers(var: f64, nsim: usize, seed: u64) -> usize {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let pop = tiny_population();
+    let threshold = 1.6_f64.ln();
+    let mut crossed = 0;
+    for (i, s) in pop.subjects.iter().enumerate() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
+        for _ in 0..nsim {
+            let eta = var.sqrt() * normal.sample(&mut rng);
+            for _ in &s.observations {
+                let _eps: f64 = normal.sample(&mut rng);
+            }
+            if eta >= threshold {
+                crossed += 1;
+            }
+        }
+    }
+    crossed
+}
+
+/// The NPDE reference run's single `W_SIMULATED_FLIP_FLOP` warning at ω² = `var`.
+fn npde_flip_flop_run(model: &CompiledModel, var: f64, nsim: usize, seed: u64) -> Option<String> {
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let (scores, warnings) = crate::stats::npde::compute_npde_npd_diag(
+        model,
+        &tiny_population(),
+        &params,
+        nsim,
+        Some(seed),
+        None,
+    )
+    .expect("an in-domain point estimate scores");
+    assert_eq!(scores.len(), 2);
+    flip_flop_warning(&warnings)
+}
+
+/// #1928: the NPDE reference counts its crossing replicates, every one of them, and says
+/// what they corrupt. The count is checked against [`npde_reference_crossers`]'s
+/// out-of-engine replay; the denominator is every replicate of both subjects (each is
+/// dosed at t = 0, before its observations).
+///
+/// Measured: 120 of 2000 at ω² = 0.09, seed 7 — against an analytic
+/// `2000 · P(z ≥ ln 1.6 / 0.3) = 2000 · 0.0586 ≈ 117`.
+#[test]
+fn npde_reference_reports_its_flip_flop_crossers() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (nsim, seed) = (1000, 7);
+    let want = npde_reference_crossers(0.09, nsim, seed);
+    assert!(want > 0, "the fixture must produce crossers");
+    let msg = npde_flip_flop_run(&model, 0.09, nsim, seed).expect("crossing replicates report");
+    assert!(
+        msg.contains(&format!(
+            "W_SIMULATED_FLIP_FLOP: {want} of 2000 NPDE/NPD reference replicates dosed before"
+        )),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("reference distribution every observation is scored against"),
+        "the consequence names the reference, not a VPC: {msg}"
+    );
+    assert!(!msg.contains("VPC band"), "{msg}");
+    // It classifies with its `simulate()` sibling.
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(entry.category, crate::types::WarningCode::FlipFlop, "{msg}");
+}
+
+/// #1928: the straddle partners — at a ω² narrow enough that no replicate crosses (the
+/// replay agrees), on a twin-*carrying* model at ω² 44× wider, which reroutes every crosser
+/// to its exact ODE twin, and on a non-absorption model, nothing is reported.
+#[test]
+fn npde_reference_flip_flop_silent_without_a_crosser() {
+    assert_eq!(npde_reference_crossers(1e-4, 300, 7), 0);
+    for (name, model, var) in [
+        (
+            "narrow ω",
+            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
+            1e-4,
+        ),
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
+        ("non-absorption", tiny_model(), 4.0),
+    ] {
+        assert_eq!(npde_flip_flop_run(&model, var, 300, 7), None, "{name}");
+    }
+}
+
+/// #1928: `fit()`'s post-fit NPDE step surfaces the count on `FitResult.warnings` — the
+/// only channel it has, since `fit()` calls the score-only wrapper's `_diag` form itself.
+/// Evaluated at the initial estimates (`outer_maxiter = 0`), so the reference is drawn at
+/// the fixture's ω² = 0.09 and the count is the replay's.
+#[test]
+fn fit_surfaces_the_npde_reference_flip_flop_count() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (nsim, seed) = (1000, 7);
+    let opts = crate::types::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        npde_nsim: nsim,
+        npde_seed: Some(seed),
+        ..crate::types::FitOptions::default()
+    };
+    let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &opts)
+        .expect("an in-domain fit evaluates");
+    let msg = flip_flop_warning(&res.warnings).expect("the fit reports the reference crossers");
+    let want = npde_reference_crossers(0.09, nsim, seed);
+    assert!(
+        msg.contains(&format!("{want} of 2000 NPDE/NPD reference replicates")),
+        "{msg}"
+    );
+    // The same fit without NPDE has nothing to report: the warning is the reference's.
+    let off = crate::types::FitOptions {
+        npde_nsim: 0,
+        ..opts
+    };
+    let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &off)
+        .expect("an in-domain fit evaluates");
+    assert_eq!(flip_flop_warning(&res.warnings), None);
+}

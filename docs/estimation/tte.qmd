@@ -204,6 +204,9 @@ When `loghr` is omitted it defaults to 0 (no effect).
 > The same freeze on the `TIME` axis — an individual parameter that reads `TIME` and is
 > integrated by a drug-driven hazard — is refused too; see
 > [A `TIME`-dependent disposition is refused](#time-dependent-disposition) (#1853).
+> On an **analytic** hazard the `TIME` axis is refused at parse: a `scale` / `shape` /
+> `alpha` / `gamma` / `loghr` that reads `TIME`, directly or through an individual parameter,
+> would be evaluated with no time argument and silently read 0 (#1919).
 
 ## Estimation
 
@@ -276,7 +279,11 @@ compartments** so the data reader can route Gaussian rows and TTE rows unambiguo
 `predict_survival()` returns `S(t)` / `H(t)` / `h(t)` for the endpoint by integrating
 the same augmented system at the typical values (its `mean_survival` is `NaN` — an
 `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
-the cumulative-hazard grid).
+the cumulative-hazard grid). `predict_survival_diag()` returns the same rows together
+with the diagnostics `predict_diag()` carries — parse and data-reader warnings, the
+model/data checks, and the ODE-solver diagnostics of that integration
+([#2164](https://github.com/FeRx-NLME/ferx-core/issues/2164); see
+[the non-fit bundle](../warnings.qmd#non-fit-bundle)).
 
 **A hazard time at or before the subject's first record.** A `TENTRY` (left truncation) or
 an interval-censored left bound below the start of the integration contributes nothing:

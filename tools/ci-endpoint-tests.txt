@@ -1,0 +1,44 @@
+# Integration-test binaries run by `Tests + coverage (TTE/CTMM endpoints)` (#2167).
+#
+# Exactly the `tests/*.rs` that compile `survival`-, `markov`- or `nn`-gated code:
+# `tests/ci_workflow_endpoint_coverage.rs` asserts that equality, so a new gated
+# test file that is not listed here fails CI instead of silently reading as
+# uncovered. `tools/ci-test-shard.py` checks every name against `cargo metadata`.
+# The base suite's other binaries already run, and are already measured, in
+# `Tests + coverage (core)`; re-running them under a second feature set bought no
+# coverage (Codecov sums hits across flags) and cost ~15 min of compile.
+#
+# The Tier-3 files (`tte_convergence`, `categorical_convergence`, `nn_fit_smoke`,
+# `nn_fit_convergence`) are listed on purpose: without `slow-tests` their tests stay
+# `#[ignore]`d, so they cost one cheap compile each and keep the invariant a plain
+# set equality with no exemption rule to get wrong.
+agq
+branch_only_param_hazard
+categorical_convergence
+categorical_smoke
+cmt_data_selection_scope
+cmt_endpoint_scope
+ctmm_time_dependent_pk
+dose_compartment_routing
+kappa_correlation_auto_lbfgs_fits
+lagged_zero_order_break_times
+level_no_gaussian_nonmem_anchor
+markov_nonmem
+markov_smoke
+nn_dcm_smoke
+nn_fit_convergence
+nn_fit_smoke
+nn_regularization
+non_gaussian_score
+one_snapshot_dose_reads_survival
+pktte_prestart_entry
+pktte_tdep_nonmem_anchor
+profiled_levels_fits
+reset_clock_nonmem_anchor
+sampler_covariance_non_gaussian
+ss_chz_nonmem_anchor
+survival_time_dependent_pk
+tte_convergence
+tte_smoke
+vi_dcm_omega_recovery
+zero_omega_fit

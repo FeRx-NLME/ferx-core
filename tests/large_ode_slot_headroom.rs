@@ -19,24 +19,26 @@
 //!   exercises the plain `f64` stack arrays used everywhere along the
 //!   value path — `PkParams::values` (`[f64; MAX_PK_PARAMS]`) and the
 //!   `ode/predictions.rs` extended-params buffers (`[f64; MAX_PK_PARAMS
-//!   + 2]`). Since #1661 a model this wide takes the analytic ODE
-//!   sensitivity provider's event-driven walk, sized on `θ + η` rather
-//!   than on `pk_indices.len()`; the static superposition walk, whose
-//!   `MAX_ODE_SENS_DIM = 12` cap used to decline the whole model, is not
-//!   used. This test asserts only that the fit runs and stays finite.
+//!   + 2]`). Since #1661 a model this wide took the (pre-#2093) forward
+//!   ODE sensitivity provider's event-driven walk, sized on `θ + η` rather
+//!   than on `pk_indices.len()`; the outer gradient now comes from the
+//!   adjoint (`sens::ode_provider::adjoint`), whose only width limit is the
+//!   per-subject random-effect count (`MAX_WIDTH = 24`). This test asserts
+//!   only that the fit runs and stays finite.
 //!
 //! - **Closed-form analytic path**
 //!   (`bloated_slot_closed_form_model_engages_dual2_stack_arrays`):
-//!   exercises the `[Dual2<M>; N_PK]` stack arrays that
-//!   `src/sens/provider.rs` builds inside the per-observation loop, sized
-//!   `N_PK = MAX_PK_PARAMS`. Uses the closed-form `pk one_cpt_oral(...)`
-//!   provider (`analytical_supported` has no `MAX_ODE_SENS_DIM`-style
-//!   cap) with unused-structural fillers to bloat the slot layout past
-//!   the pre-bump ceiling; the analytic dispatch stays engaged and the
-//!   dual arrays are actually constructed per observation on rayon
-//!   workers. A `sens_supported`/`analytical_supported` assertion before
-//!   the fit guards against a silent FD fallback that would degenerate
-//!   the test into the `f64`-only case.
+//!   exercises the per-observation dual stack arrays sized
+//!   `N_PK = MAX_PK_PARAMS` on the analytic gradient path (written for the
+//!   pre-#2093 `[Dual2<M>; N_PK]` arrays in `src/sens/provider.rs`; the
+//!   adjoint recorder now runs the same predictor over a dual type). Uses
+//!   the closed-form `pk one_cpt_oral(...)` model (the adjoint's scope,
+//!   `adjoint::model_in_scope`, has no slot-count cap) with
+//!   unused-structural fillers to bloat the slot layout past the pre-bump
+//!   ceiling; the analytic dispatch stays engaged on rayon workers. An
+//!   `analytic_outer_gradient_available` assertion before the fit guards
+//!   against a silent FD fallback that would degenerate the test into the
+//!   `f64`-only case.
 //!
 //! - **Bloated-vs-unbloated analytic parity**
 //!   (`bloated_slot_filler_positions_dont_shift_analytic_fit`): fits the
@@ -76,15 +78,15 @@
 //!
 //! ## Analytic path scope
 //!
-//! Until #1661, bloated-slot ODE models declined the analytic ODE
-//! sensitivity provider because `MAX_ODE_SENS_DIM = 12`, the static
+//! Until #1661, bloated-slot ODE models declined the (pre-#2093 forward)
+//! ODE sensitivity provider because `MAX_ODE_SENS_DIM = 12`, the static
 //! superposition walk's cap on `pk_indices.len()`, sat on the model-level
-//! gate. That cap now bounds the static walk only, and a wider model takes
-//! the event-driven walk, which is sized on `θ + η`. Exactness at the
-//! parser's own slot ceiling is pinned by
-//! `ode_widest_parsable_model_is_analytic_and_exact` in
-//! `src/sens/ode_provider_tests.rs`. The closed-form analytic path
-//! (`analytical_supported`) has no such cap and is exercised here as well.
+//! gate. Since #2093 the analytic gradient is the adjoint, whose scope
+//! (`sens::ode_provider::adjoint::model_in_scope`) carries no slot cap; its
+//! only width limit is the per-subject random-effect count
+//! (`subject_width` / `MAX_WIDTH = 24`). Adjoint-vs-FD parity lives in
+//! `src/sens/ode_adjoint_tests.rs`. The closed-form analytic path has no
+//! slot cap either and is exercised here as well.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, GradientMethod, OmegaMatrix, Population, Subject};
@@ -150,10 +152,10 @@ fn model_src_ode() -> String {
 }
 
 /// Bloated-slot closed-form variant: `pk one_cpt_oral(cl=CL, v=V, ka=KA)`
-/// structural model. `analytical_supported` (`src/sens/provider.rs`) has
-/// no `MAX_ODE_SENS_DIM`-style cap, so the analytic sensitivity provider
-/// stays engaged even at N_FILLER = 15; every observation constructs
-/// `[Dual2<M>; MAX_PK_PARAMS]` stack arrays on the rayon worker threads.
+/// structural model. The adjoint's scope (`adjoint::model_in_scope`) has
+/// no slot-count cap, so the analytic gradient path stays engaged even at
+/// N_FILLER = 15; every observation constructs `MAX_PK_PARAMS`-wide dual
+/// stack arrays on the rayon worker threads.
 fn model_src_closed_form() -> String {
     format!(
         "\
@@ -252,7 +254,7 @@ fn fit_short_with(
     // Both the inner and outer loops key off the gradient method: `opts`
     // controls the inner loop, but `model.gradient_method` is what
     // `analytic_outer_gradient_available` reads to decide whether the
-    // outer loop uses the analytic sensitivity provider or FD. Callers
+    // outer loop uses the analytic (adjoint) gradient or FD. Callers
     // built via `parse_model_string` get `Auto` by default; set both so
     // the two loops agree and `Fd` actually disables the analytic outer
     // path.
@@ -355,9 +357,9 @@ fn bloated_slot_ode_model_parses_simulates_and_fits() {
 }
 
 /// Parse → simulate → fit end-to-end on a bloated-slot **closed-form**
-/// model. Guaranteed to engage the analytic sensitivity provider (asserted
-/// via `sens_supported`/`analytical_supported`), which constructs
-/// `[Dual2<M>; MAX_PK_PARAMS]` stack arrays inside the per-observation
+/// model. Guaranteed to engage the analytic gradient path (asserted via
+/// `analytic_outer_gradient_available`), which constructs
+/// `MAX_PK_PARAMS`-wide dual stack arrays inside the per-observation
 /// loop. Those arrays are the largest stack allocations affected by the
 /// ceiling bump — up to hundreds of KB per array at the maximum dual
 /// width — and this test exercises them across the rayon worker-thread
@@ -371,17 +373,17 @@ fn bloated_slot_closed_form_model_engages_dual2_stack_arrays() {
     );
 
     // Hard guard: this test's whole reason for existing is to exercise
-    // the `[Dual2<M>; N_PK]` stack arrays inside the analytic sensitivity
-    // provider. A silent FD fallback would build no dual arrays and
+    // the `N_PK`-wide dual stack arrays on the analytic gradient path.
+    // A silent FD fallback would build no dual arrays and
     // reduce this to a duplicate of the ODE test above.
     assert!(
-        ferx_core::sens::provider::analytical_supported(&model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&model),
         "closed-form analytic path must be armed on the bloated-slot model; \
          otherwise this test degenerates to the FD-only case already covered \
          by the ODE variant"
     );
     assert!(
-        ferx_core::sens::provider::sens_supported(&model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&model),
         "sens_supported must be true so the fit dispatches through the analytic \
          outer-gradient path (which is what constructs the Dual2 stack arrays)"
     );
@@ -457,11 +459,11 @@ fn bloated_slot_filler_positions_dont_shift_analytic_fit() {
     let mut m_plain =
         parse_model_string(&model_src_closed_form_unbloated()).expect("unbloated model must parse");
     assert!(
-        ferx_core::sens::provider::analytical_supported(&m_bloat),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&m_bloat),
         "analytic path must be armed on the bloated model"
     );
     assert!(
-        ferx_core::sens::provider::analytical_supported(&m_plain),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&m_plain),
         "analytic path must be armed on the unbloated model too"
     );
 

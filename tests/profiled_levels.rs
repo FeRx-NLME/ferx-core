@@ -14,6 +14,7 @@
 //! the profile solve, the objective, the profiled `R` and the level SEs at once, against
 //! a reference that profiles nothing.
 
+use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::types::{FitOptions, FitResult, OmegaMatrix};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
@@ -145,13 +146,22 @@ fn at_nonmem_optimum(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::Prepa
     (p, f)
 }
 
+/// The profiled `at_nonmem_optimum(true, None)`, evaluated once for the three tests that
+/// read it. Each evaluation carries the covariance step, and three identical copies running
+/// on parallel test threads made this the slowest binary in `Tests + coverage (core)`
+/// (661 s, #2167).
+fn profiled_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
+    static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
+    F.get_or_init(|| at_nonmem_optimum(true, None))
+}
+
 // ── A2: NONMEM, every level a THETA ─────────────────────────────────────────────
 
 #[test]
 fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
     let (est, se) = ext("profile_mbma.ext");
     let cov = cov_thetas("profile_mbma.cov", 39);
-    let (p, f) = at_nonmem_optimum(true, None);
+    let (p, f) = profiled_at_nonmem_optimum();
     let model = &p.parsed.model;
     assert_eq!(model.n_theta, 39, "3 structural θ and 36 free levels");
     assert_eq!(f.profiled_blocks, ["PLACEBO"]);
@@ -290,7 +300,7 @@ const A2_LEVEL_SE: f64 = 2e-2;
 /// matrix rather than the exact Hessian.
 #[test]
 fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
-    let (_, prof) = at_nonmem_optimum(true, None);
+    let (_, prof) = profiled_at_nonmem_optimum();
     let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta));
     assert!(
         (prof.ofv - plain.ofv).abs() < 1e-6,
@@ -361,34 +371,54 @@ const C1_BOUND: f64 = 1e-2;
 const C1_CORR_BOUND: f64 = 2.5e-2;
 
 /// `run_covariance` on a profiled fit replays the profiled step the fit ran: the same
-/// standard errors, levels included. The unprofiled step it would otherwise take is the
-/// 41-coordinate stencil the profile avoids (at 800 levels, routed to `s`).
+/// covariance matrix, levels included, **bit for bit** (#2173) — in memory and after a
+/// `.fitrx` round trip. The unprofiled step it would otherwise take is the 41-coordinate
+/// stencil the profile avoids (at 800 levels, routed to `s`).
+///
+/// Bit-equality holds because the inline step and the replay share one implementation
+/// (`ProfileCtx::covariance_at_estimate`): each re-profiles from the reported levels and
+/// EBEs before the stencil. Before #2173 the inline step used the optimizer's own solve and
+/// the replay a fresh one, and this fixture measured a worst SE gap of 7.6e-7 (3.9e-3 on
+/// the worst covariance entry), macOS arm64.
 #[test]
 fn run_covariance_replays_the_profiled_step() {
-    let (p, f) = at_nonmem_optimum(true, None);
+    let (p, f) = profiled_at_nonmem_optimum();
     let opts = FitOptions {
         verbose: false,
         ..p.parsed.fit_options.clone()
     };
-    let r = ferx_core::run_covariance(&f, Some(&p.parsed.model), Some(&p.population), &opts)
-        .unwrap_or_else(|e| panic!("{e}"));
-    let (a, b) = (
-        f.se_theta.as_ref().unwrap(),
-        r.se_theta.as_ref().expect("replayed SE"),
-    );
-    let worst = (0..a.len())
-        .map(|k| ((a[k] - b[k]) / a[k]).abs())
-        .fold(0.0_f64, |m, v| {
-            assert!(v.is_finite());
-            m.max(v)
-        });
-    eprintln!("replay: worst SE gap {worst:.3e}");
-    assert!(worst < REPLAY_BOUND, "{worst}");
-}
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    assert!(want.iter().all(|v| v.is_finite()));
+    let replay = |fit: &FitResult, how: &str| {
+        let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
+            .unwrap_or_else(|e| panic!("{how}: {e}"));
+        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
+        assert_eq!(got.shape(), want.shape(), "{how}");
+        let differing = got
+            .iter()
+            .zip(want.iter())
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
+        assert_eq!(r.se_theta, f.se_theta, "{how}");
+    };
+    replay(f, "in memory");
 
-/// Worst realised 5.5e-6: the replay re-profiles from the fit's levels, already at the
-/// optimum, so only the re-solved EBEs differ; 18× headroom.
-const REPLAY_BOUND: f64 = 1e-4;
+    let model_text = std::fs::read_to_string(root().join(F2)).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("ferx_profiled_replay_{}.fitrx", std::process::id()));
+    save_fit(
+        f,
+        &p.population,
+        &model_text,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .expect("saves");
+    let loaded = load_fit(&path).expect("loads");
+    let _ = std::fs::remove_file(&path);
+    replay(&loaded.fit, "after .fitrx reload");
+}
 
 // ── A1: the existing level-SE anchor, profiled (#2130 review #8) ───────────────────
 
@@ -481,9 +511,10 @@ const A1_SE: f64 = 1e-2;
 
 // ── EBE convergence: counted and guarded, as unprofiled (#2130 review #2) ──────────
 
-/// A starved inner solve (`inner_maxiter = 12` on F1: 4 subjects unconverged, 11 Nelder–Mead
-/// fallbacks, measured; fewer iterations fail the profile solve outright) leaves EBEs
-/// unconverged. The profiled fit
+/// A starved inner solve (`inner_maxiter = 0` on F1: no step from the start, 6 subjects
+/// unconverged, measured) leaves EBEs unconverged. Since #2093's step-scaled first iterate a
+/// single inner iteration already converges every F1 subject at this point (measured over
+/// budgets 1..=12), so only the zero budget still starves it. The profiled fit
 /// publishes that count, and the unprofiled loop's EBE guard applies to it: under
 /// `max_unconverged_frac = 0` the evaluation is rejected and no objective is reported,
 /// while under `1.0` (the guard off) the same evaluation is accepted. The pair straddles
@@ -496,7 +527,7 @@ fn a_profiled_fit_counts_and_guards_unconverged_ebes() {
             verbose: false,
             outer_maxiter: 0,
             run_covariance_step: false,
-            inner_maxiter: 12,
+            inner_maxiter: 0,
             max_unconverged_frac: frac,
             ..p.parsed.fit_options.clone()
         };

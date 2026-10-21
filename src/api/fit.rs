@@ -149,8 +149,10 @@ pub fn fit_from_files(
     let (data_path, data_path_warning) =
         resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
     let data_path = data_path.as_str();
-    let (mut population, covariate_table) =
-        read_population_with_diag(&parsed.model, &reader_settings, data_path)
+    // One read of the dataset (#2140): the population and `data_hash` are the same
+    // bytes, so a CSV edited while the fit runs is not recorded as the fitted data.
+    let (mut population, covariate_table, data_hash) =
+        crate::api::run::read_population_hashed_diag(&parsed.model, &reader_settings, data_path)
             .map_err(EngineError::from_diagnostic)?;
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
@@ -176,13 +178,12 @@ pub fn fit_from_files(
         result.warnings.push(w);
         rebuild_warnings_structured(&mut result);
     }
-    // The model's hash and text are the read that was parsed and fitted (#1752).
-    // The CSV is hashed post-fit; a failure there is non-fatal and just disables
-    // the data integrity check in `run_sir`.
+    // The model's hash and text, and the data's hash, are the reads that were
+    // parsed and fitted (#1752, #2140).
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
     result.model_hash = Some(model_hash);
-    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.data_hash = Some(data_hash);
     result.model_text = Some(model_text);
     result.reader_settings = Some(reader_settings);
     Ok(result)
@@ -439,7 +440,7 @@ pub(crate) fn nn_regularization_unapplied_warning(
     .filter(|(_, l)| *l > 0.0)
     .map(|(k, _)| k)
     .collect();
-    if set.is_empty() || !model_has_covariate_nn(model) {
+    if set.is_empty() || !model.has_covariate_nn() {
         return None;
     }
     let last = *chain.last()?;
@@ -455,16 +456,6 @@ pub(crate) fn nn_regularization_unapplied_warning(
         if set.len() == 1 { "is" } else { "are" },
         last.label(),
     ))
-}
-
-#[cfg(feature = "nn")]
-fn model_has_covariate_nn(model: &CompiledModel) -> bool {
-    !model.covariate_nns.is_empty()
-}
-
-#[cfg(not(feature = "nn"))]
-fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
-    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -768,6 +759,9 @@ fn fit_unstamped(
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
     first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // The same freeze on a drug-driven CTMM generator's `[odes]` solve (#1918).
+    #[cfg(feature = "markov")]
+    first_error(&check_ctmm_time_dependent_pk_diags(model))?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
@@ -1518,10 +1512,19 @@ fn fit_inner(
     // count cannot wrap and produce a bogus estimate; on overflow we still warn
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
+    // The route is predicted from the covariance step's own scope walk (#2054): no note on
+    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    let covariance_route = crate::estimation::covariance::predicted_r_route(
+        model,
+        population,
+        options,
+        init_params.mixture.is_some(),
+    );
     let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
         n_params_pre,
         options,
         !model.priors.is_empty(),
+        covariance_route,
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
@@ -1568,7 +1571,7 @@ fn fit_inner(
     );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
-    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // (but not all) subjects fall outside the analytic (adjoint) scope, surface
     // it through warnings (not just the startup banner) per the AGENTS.md rule.
     if chain.iter().any(|m| {
         matches!(
@@ -1631,9 +1634,11 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) =
-        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
-    {
+    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
+        n_params_pre,
+        covariance_cost,
+        covariance_route,
+    ) {
         accumulated_warnings.push(note);
     }
 
@@ -2530,7 +2535,7 @@ fn fit_inner(
     // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
     // nothing. Subjects are built in population order, so the zip aligns.
     if options.npde_nsim > 0 {
-        let per_subj = crate::stats::npde::compute_npde_npd(
+        let (per_subj, npde_warnings) = crate::stats::npde::compute_npde_npd_diag(
             model,
             population,
             &result.params,
@@ -2540,6 +2545,14 @@ fn fit_inner(
             // (`fitted_population`), so there is no rule to apply here (#1980).
             None,
         )?;
+        // The reference distribution's flip-flop count (#1928) has no other channel: the
+        // η = 0 refusal and the #785 EBE warning never see the reference draws. Only that
+        // one — the no-occasion warning is the fit's own, already reported for the fit.
+        result.warnings.extend(
+            npde_warnings
+                .into_iter()
+                .filter(|w| w.starts_with("W_SIMULATED_FLIP_FLOP")),
+        );
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;

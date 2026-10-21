@@ -3317,36 +3317,38 @@ impl RuvMagnitude {
         out
     }
 
-    /// Per-sigma `∂(multiplier)/∂θ` vector for one observation (#576/#486). Slot
-    /// `k` evaluates its `Dual1` program's gradient; a bare slot (multiplier ≡ 1)
-    /// contributes an all-zero row. With a power exponent active the result has
-    /// the same two-half layout as [`eval_obs`](Self::eval_obs): row `n_sigma + k`
-    /// is `∂p_k/∂θ`. `None` when any active slot's program declines (θ-axis
-    /// count mismatch / beyond `MAX_RUV_MAG_AXES`) — the caller then falls back
-    /// to FD for the magnitude's direct-θ gradient channel.
-    pub fn eval_obs_theta_grad(
+    /// [`eval_obs`](Self::eval_obs) over any VM number type, from the compiled slot
+    /// programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same two-half row
+    /// (multipliers, then exponents when a power form is active), each a function of the
+    /// caller's θ. `None` when an active slot has no compiled program.
+    pub(crate) fn eval_obs_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
+        theta: &[T],
         obs_covariates: &HashMap<String, f64>,
         time: f64,
         tad: f64,
-    ) -> Option<Vec<Vec<f64>>> {
-        let mut out: Vec<Vec<f64>> = self
-            .per_sigma_deriv
-            .iter()
-            .map(|slot| match slot {
-                Some(p) => p.theta_grad(theta, obs_covariates, time, tad),
-                None => Some(vec![0.0; theta.len()]),
-            })
-            .collect::<Option<_>>()?;
+    ) -> Option<Vec<T>> {
+        let half = |fns: &[Option<RuvMagFn>],
+                    progs: &[Option<crate::parser::model_parser::RuvMagDerivProgram>]|
+         -> Option<Vec<T>> {
+            (0..self.per_sigma.len())
+                .map(|k| match fns.get(k) {
+                    Some(Some(_)) => {
+                        progs
+                            .get(k)?
+                            .as_ref()?
+                            .eval_g(theta, obs_covariates, time, tad)
+                    }
+                    _ => Some(T::from_f64(1.0)),
+                })
+                .collect()
+        };
+        let mut out = half(&self.per_sigma, &self.per_sigma_deriv)?;
         if self.has_exponent() {
-            let n = self.per_sigma.len();
-            for k in 0..n {
-                out.push(match self.per_sigma_exponent_deriv.get(k) {
-                    Some(Some(p)) => p.theta_grad(theta, obs_covariates, time, tad)?,
-                    _ => vec![0.0; theta.len()],
-                });
-            }
+            out.extend(half(
+                &self.per_sigma_exponent,
+                &self.per_sigma_exponent_deriv,
+            )?);
         }
         Some(out)
     }
@@ -3493,7 +3495,7 @@ pub struct AnalyticReadout {
     /// readout enum and its f64 `OdeOutputFn` closure(s).
     pub readout: crate::ode::OdeReadout,
     /// Sensitivity program for the uniform `Single` readout (issue #650), so the
-    /// analytic provider can differentiate it over `Dual2`/`Dual1`. `None` for
+    /// analytic gradient can differentiate it over a dual type. `None` for
     /// per-CMT (each `PerCmtReadout` carries its own program) and for readouts
     /// that are not dual-evaluable (those fall back to FD, matching ODE).
     pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
@@ -3552,7 +3554,7 @@ pub enum ScalingSpec {
     /// Per-subject divisor evaluated from `(theta, eta, covariates, pk)`.
     /// Used for expressions like `obs_scale = 1000 / V`. `deriv` is the same
     /// expression compiled to a `Dual2`-differentiable program (issue #367), so
-    /// the analytic sensitivity provider can differentiate `f / scale` exactly;
+    /// the analytic gradient path can differentiate `f / scale` exactly;
     /// `None` for hand-constructed specs / closures with no parsed expression
     /// (those fall back to finite differences).
     ExpressionScale {
@@ -4100,6 +4102,15 @@ pub enum EndpointLikelihood {
         link: LinkFn,
         /// Linear predictor `lp` (log-odds) as a function of (theta, eta, covariates).
         lp_fn: LinearPredictorFn,
+        /// Resolved, dual-evaluable form of the same predictor, for the **analytic**
+        /// inner gradient: it yields `∂lp/∂(θ,η)` exactly, which the endpoint chains
+        /// through the closed-form Bernoulli score `(p − y)` instead of
+        /// finite-differencing the whole data term (#2024).
+        ///
+        /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
+        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
+        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
         /// snapshot (the [`LinearPredictorFn`] takes no time argument), so a covariate
@@ -4984,6 +4995,15 @@ impl GradientMethod {
 }
 
 impl CompiledModel {
+    /// Whether the model carries a `[covariate_nn]` block (always `false` without the
+    /// `nn` feature).
+    pub(crate) fn has_covariate_nn(&self) -> bool {
+        #[cfg(feature = "nn")]
+        return !self.covariate_nns.is_empty();
+        #[cfg(not(feature = "nn"))]
+        return false;
+    }
+
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
     /// This metadata lives behind the existing opaque `indiv_param_partials`
@@ -5182,13 +5202,13 @@ impl CompiledModel {
     /// tolerances. Used by [`FitOptions::effective_inner_tol`] /
     /// [`FitOptions::effective_cov_inner_tol`].
     ///
-    /// **IOV is included as of #486.** The `n_kappa == 0` carve-out that used to sit here
-    /// was justified solely by LTBS × IOV routing its inner loop to FD — which
-    /// `analytic_inner_common_bail` no longer does, since `run_obs_iov_eta` now applies
-    /// the same `ln` jet over the stacked axes. A κ-carrying closed-form LTBS model
-    /// therefore runs the *same* analytic ln-jet inner gradient, carries the *same* gap,
-    /// and needs the same tolerances; leaving it out would have produced quietly inflated
-    /// standard errors with unchanged point estimates. This predicate must move with
+    /// **IOV is included as of #486.** The `n_kappa == 0` carve-out that used to sit here was
+    /// justified solely by LTBS × IOV routing its inner loop to FD — which
+    /// `analytic_inner_common_bail` no longer does, since the closed-form event recorder
+    /// (`record_analytic_events`) now applies the same `ln` over the stacked axes. A κ-carrying
+    /// closed-form LTBS model therefore runs the *same* analytic ln-jet inner gradient, carries the
+    /// *same* gap, and needs the same tolerances; leaving it out would have produced quietly
+    /// inflated standard errors with unchanged point estimates. This predicate must move with
     /// `analytic_inner_common_bail`'s `log_transform` scope, not independently of it.
     pub fn uses_closed_form_ltbs_inner(&self) -> bool {
         self.log_transform && self.ode_spec.is_none()
@@ -5499,7 +5519,7 @@ impl CompiledModel {
     /// own: a role binding, a spare readout / `obs_scale` / `init` slot (#650,
     /// #1898), a modeled-dose `D{n}`/`R{n}` value slot, and on the ODE layout every
     /// declared name. Order is the program's (analytical: alphabetical by PK name),
-    /// so it matches `IndivParamProgram::pk_slots` row for row — which is what lets
+    /// so it matches `IndivParamProgram::pk_slots_ref` row for row — which is what lets
     /// the sensitivity fallback hand its caller the same `(rows, slots)` shape the
     /// program path does.
     ///
@@ -5512,8 +5532,7 @@ impl CompiledModel {
     /// consumers rely on; `rows.len()` is **not** bounded by `pk_indices.len()`. What
     /// bounds it for the sensitivity fallback is
     /// `sens::provider::closed_form_slot_count_supported`, which caps the program's
-    /// own pair list — of which these rows are a subset — at the `const_dispatch!`
-    /// table width.
+    /// own pair list — of which these rows are a subset — at `MAX_CLOSED_FORM_SLOTS`.
     ///
     /// Falls back to `pk_indices` — placeholder and all — for a hand-built
     /// `CompiledModel` carrying no program (test fixtures, `generate_data`), where
@@ -5599,8 +5618,9 @@ impl CompiledModel {
     ///   3. A numeric **literal** on the analytical line (`lagtime=0.5`) writes
     ///      the slot with no variable behind it, so `pk_indices` cannot record
     ///      it; the parser lists such slots in `indiv_param_partials`. Measured
-    ///      before this arm existed (review of #1441): `analytical_supported`
-    ///      was true, the sensitivity provider ran the lag-free walk and its
+    ///      before this arm existed (review of #1441): the (pre-#2093) closed-form
+    ///      scope gate admitted the model, the forward sensitivity provider ran the
+    ///      lag-free walk and its
     ///      values sat 120 % (oral, first sample) / 11 % (IV bolus) from the
     ///      production predictor that applied the lag — a wrong gradient on the
     ///      default estimator. A literal lag is a *fixed* break, but every
@@ -5674,9 +5694,9 @@ impl CompiledModel {
     /// or a per-route `lag=` on the forcing ([`crate::pk::absorption::InputRateForcing`]'s
     /// `lag_slot`, #859). All are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER`
     /// / `E_ABSORPTION_SS_LAG`, `api::check_absorption_dosing` — whose `has_ss_lag`
-    /// covers a per-route lag via `route_lag_cmts`); the ODE support gates
-    /// (`ode_tvcov_supported`, `ode_iov_subject_supported`) and the IOV FD-reason
-    /// attribution (`iov_fd_reason`) re-check it as belt-and-suspenders so the
+    /// covers a per-route lag via `route_lag_cmts`); the ODE walk gates
+    /// (`event_walk_scope` behind `event_walk_subject_supported`, and `ode_iov_walk_scope`)
+    /// re-check it as belt-and-suspenders so the
     /// analytic-vs-FD routing stays self-consistent if either upstream check is
     /// relaxed. This must therefore mirror the upstream predicate exactly — the
     /// per-route `lag_slot` clause was added with #859 (which made a `first_order`
@@ -5717,7 +5737,7 @@ impl CompiledModel {
     /// and is not a bioavailability here (#1359). A literal `f=0.8` is not one
     /// either, deliberately: unlike the lag (route 3 of [`Self::has_lagtime`]) a
     /// constant `F` is read off the slot by both the production predictor and the
-    /// sensitivity provider (measured equal to 1e-9 in the #1441 review), and this
+    /// (then forward) sensitivity path (measured equal to 1e-9 in the #1441 review), and this
     /// predicate's one consumer asks whether `F` can *change* across the inner
     /// search, which a literal cannot. Used with
     /// [`Subject::has_rate_defined_infusion`] to skip the event-driven
@@ -5750,7 +5770,7 @@ impl CompiledModel {
         self.residual_cov_with(&self.residual_correlations, theta)
     }
 
-    fn residual_cov_with<'a>(
+    pub(crate) fn residual_cov_with<'a>(
         &'a self,
         pairs: &'a [ResidualCorrelation],
         theta: &[f64],
@@ -5836,38 +5856,6 @@ impl CompiledModel {
         Some(out)
     }
 
-    /// Per-observation `∂(residual-magnitude multiplier)/∂θ` for `subject` at
-    /// `theta` (#576/#486), as an `[obs][sigma-slot][theta]` tensor, or `None`
-    /// when no custom magnitude is active *or* any active slot's `Dual1` program
-    /// declines (θ-axis count beyond `crate::parser::model_parser::MAX_RUV_MAG_AXES`
-    /// — the analytic outer gradient's own gate,
-    /// [`crate::sens::provider::analytic_outer_gradient_available`], bounds
-    /// `model.n_theta` against the same constant, so this should only return
-    /// `None` here for a model that gate already declined). Feeds the outer θ/σ
-    /// gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`) — the
-    /// magnitude enters `R` through θ directly, not only through the prediction.
-    pub fn ruv_obs_mult_theta_grad(
-        &self,
-        subject: &Subject,
-        theta: &[f64],
-    ) -> Option<Vec<Vec<Vec<f64>>>> {
-        let rm = self.ruv_magnitude.as_ref()?;
-        if !rm.is_active() {
-            return None;
-        }
-        let n = subject.observations.len();
-        let mut out = Vec::with_capacity(n);
-        for j in 0..n {
-            out.push(rm.eval_obs_theta_grad(
-                theta,
-                subject.obs_cov(j),
-                subject.readout_time(j),
-                rm.tad_for(subject, j),
-            )?);
-        }
-        Some(out)
-    }
-
     /// True when a residual error model is defined for `cmt` *and* its sigmas
     /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
     /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
@@ -5908,18 +5896,16 @@ impl CompiledModel {
         }
     }
 
-    /// Whether a custom residual-error magnitude (#484) is active. The
-    /// per-observation magnitude expression makes the residual variance depend
-    /// on θ directly (not only through the prediction `f`). The analytic gradient
-    /// now carries this via a direct-θ channel (`mag_variance_dtheta` in
-    /// `sens_outer_gradient::prepare_stacked` / `theta_block`; the inner loop via
-    /// `residual_inner_obs`), so **both** loops are analytic on FOCE and FOCEI
-    /// (#644/#659) — including combined with `iiv_on_ruv` on the closed-form
-    /// (#673/#677) and ODE (#486) paths, since the outer assembly is
-    /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude
-    /// combined with an M3-censored row, a correlated `block_sigma`, or more than
-    /// `MAX_RUV_MAG_AXES` θ (see #486's remaining-FD register). The FD forward NLL
-    /// is itself magnitude-aware, so those fallbacks stay exact.
+    /// Whether a custom residual-error magnitude (#484) is active. The per-observation magnitude
+    /// expression makes the residual variance depend on θ directly (not only through the prediction
+    /// `f`). The analytic gradient now carries this via a direct-θ channel (recorded on the adjoint
+    /// tape via `RuvMagDerivProgram::eval_g`; the inner loop via `residual_inner_obs`), so **both**
+    /// loops are analytic on FOCE and FOCEI (#644/#659) — including combined with `iiv_on_ruv` on
+    /// the closed-form (#673/#677) and ODE (#486) paths, since the outer assembly is
+    /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude combined with an
+    /// M3-censored row or more θ than the magnitude program's `Dual1`
+    /// dispatch serves (see #486's remaining-FD register). The FD forward NLL is itself
+    /// magnitude-aware, so those fallbacks stay exact.
     #[inline]
     pub fn has_custom_ruv_magnitude(&self) -> bool {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
@@ -7200,6 +7186,23 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on `data_quality`. That arm serves several unrelated inputs, so a test
         // asserting only the category asserts almost nothing — assert the token.
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_covariate_missing") {
+        // #2041: a covariate column with no value for some subjects. A token arm
+        // ahead of every prose arm, because the message interpolates the
+        // covariate's name and the subjects' IDs — strings the *data* spells — so
+        // a covariate called `DURBIN` would otherwise be claimed by the
+        // Durbin-Watson arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("covariance step failed") {
+        // #2158: every covariance-step failure reason starts with this prefix (after the
+        // chain tag stripped above), and the prefix — not a phrase inside the reason —
+        // decides the class. First of the prose arms, because a reason goes on to say why
+        // the step failed, in words the arms below claim: the profiled step's "the profile
+        // solve did not converge at the estimates" was filed `Convergence` by the arm below,
+        // reporting a covariance failure on a converged fit as optimizer non-convergence.
+        // After the token arms, which classify their own (`W_COV_NON_STATIONARY_ESTIMATE`'s
+        // failure form starts with its token, not with this prefix).
+        (WarningSeverity::Critical, WarningCode::CovarianceFailed)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
@@ -7666,10 +7669,14 @@ pub struct FitResult {
     pub nlopt_missing_algorithms: Vec<String>,
     /// Estimated OFV evaluations for the covariance step's `R` matrix on the
     /// finite-difference route (`2·n_params²`), set when `run_covariance_step =
-    /// true`, `n_parameters > 30` and the step's estimator reads `R` — never
-    /// under `covariance_method = s`, which builds no `R` (#1803). The count does
-    /// not yet check whether the analytic `R` assembly (`analytic_cov_hessian`)
-    /// applies, which evaluates none of them.
+    /// true`, `n_parameters > 30`, the step's estimator reads `R` — never under
+    /// `covariance_method = s`, which builds no `R` (#1803) — and `R` is not
+    /// expected on the analytic assembly (`analytic_cov_hessian`) for every
+    /// subject, which evaluates none of them (#2054). When only a minority of
+    /// subjects falls outside the analytic scope, the count is the same
+    /// `2·n_params²` but each evaluation covers just those subjects (#1514). A
+    /// prediction made before the fit: a subject can still bail out of the
+    /// analytic assembly at run time.
     pub covariance_n_evals_estimated: Option<usize>,
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
@@ -7689,8 +7696,8 @@ pub struct FitResult {
     /// `R⁻¹SR⁻¹` sandwich (#1382).
     ///
     /// **Not a copy of [`FitOptions::covariance_method`].** Above
-    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` is routed onto
-    /// the cross-product (#1064), so the estimator that ran is not always the
+    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` off the analytic
+    /// R-matrix is routed onto the cross-product (#1064), so the estimator that ran is not always the
     /// one that was asked for; this field is the one that ran, carried up from
     /// the covariance step rather than re-derived.
     ///
@@ -9498,7 +9505,7 @@ impl CompiledModel {
 pub enum Optimizer {
     /// Pick the outer optimizer automatically from the model (the default).
     /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
-    /// gradient is available (the model is in the sensitivity provider's scope
+    /// gradient is available (the model is in the analytic (adjoint) gradient's scope
     /// and the user did not force `gradient_method = fd`), and to
     /// [`Optimizer::Bobyqa`] otherwise (a model outside the analytic scope, or
     /// `gradient_method = fd`, where the outer loop must fall back to finite
@@ -9724,17 +9731,17 @@ impl Optimizer {
     /// Resolve [`Optimizer::Auto`] to a concrete optimizer for `model`; every
     /// other variant is returned unchanged (idempotent). `auto` picks
     /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
-    /// available — the model is in the sensitivity provider's scope and the user
+    /// available — the model is in the analytic (adjoint) gradient's scope and the user
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
-    /// otherwise, with two exceptions that take L-BFGS on a finite-difference
-    /// gradient: more than [`BOBYQA_MAX_DIM`] free parameters (#1064), and a
-    /// residual `correlation` line together with kappa (#2122). Outside those two
-    /// exceptions this mirrors the analytic-vs-FD predicate the outer loop uses
+    /// otherwise, with one exception that takes L-BFGS on a finite-difference
+    /// gradient: more than [`BOBYQA_MAX_DIM`] free parameters (#1064). Outside it this
+    /// mirrors the analytic-vs-FD predicate the outer loop uses
     /// (see `build_info::gradient_method_outer`): `auto` takes the
     /// gradient-based optimizer when there is an exact gradient to feed it, and
     /// BOBYQA on a finite-difference one, where #490 found it fastest and most
-    /// reliable. #2122 is one FD route where that finding reverses; whether it
-    /// reverses on others is open (#1782, #2048, #2031).
+    /// reliable. (A residual `correlation` line with kappa, which #2122 sent to L-BFGS
+    /// on its finite-difference gradient, is analytic since #2093 and takes the
+    /// general rule.)
     ///
     /// `interaction` is `options.interaction` (`true` for `method = focei`,
     /// `false` for plain `method = foce`) — a custom residual-magnitude model's
@@ -9780,16 +9787,6 @@ impl Optimizer {
         if model.free_packed_dim() > BOBYQA_MAX_DIM {
             return Optimizer::NloptLbfgs;
         }
-        // #2122: a residual `correlation` line with kappa is FD-only (#2101), and on it
-        // BOBYQA's `FtolReached` stopped mbma_placebo + car1 at a different OFV per start
-        // ρ (104.72 / 111.60 / 98.31 for ρ₀ = 0.01 / 0.3 / 0.6, Linux aarch64), all three
-        // above the nested kappa-only optimum (97.07); L-BFGS on the same FD gradient
-        // reached 89.4513 from all three (`tests/kappa_correlation_auto_lbfgs_fits.rs`).
-        // Only this route: other FD → BOBYQA routes (#1782, #2048, #2031) are unmeasured
-        // here.
-        if crate::sens::provider::kappa_residual_correlation_fd_route(model) {
-            return Optimizer::NloptLbfgs;
-        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -9812,9 +9809,10 @@ impl Optimizer {
 pub const BOBYQA_MAX_DIM: usize = 64;
 
 /// Free packed dimension above which a *defaulted* `covariance_method = r`
-/// routes to the cross-product (#1064).
+/// routes to the cross-product (#1064), when its `R` would be the stencil — a fit
+/// the analytic R-matrix serves keeps `r` at any size.
 ///
-/// The `R` matrix is a finite-difference Hessian of the objective that
+/// The stencil `R` matrix is a finite-difference Hessian of the objective that
 /// reconverges every subject's EBEs at each of `2·n²` objective
 /// evaluations. At n = 100 that is ~20,000 reconverged population objectives;
 /// at n = 800 it is ~1.3 million, which will not finish. The cross-product `S`

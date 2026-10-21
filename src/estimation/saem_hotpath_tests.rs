@@ -953,8 +953,9 @@ fn m_step_objective_consumes_the_cached_schedule_on_both_arms() {
 /// number, because a fit also builds a handful of schedules **outside** the
 /// hot path and pinning a magic total would be pinning those too. Measured,
 /// for the analytic fixture: `build_schedule_cache` builds one per subject, and
-/// the post-loop final-EBE pass (`run_inner_loop_warm` → `find_ebe` →
-/// `sens::provider::run_obs_grad_tvcov`) builds two more per subject. All three
+/// the post-loop final-EBE pass (`run_inner_loop_warm` → `find_ebe` → the adjoint
+/// recorder; measured when that was the pre-#2093 `sens::provider::run_obs_grad_tvcov`)
+/// builds two more per subject. All three
 /// are once per fit. The E-step and M-step — the `n_iter`-proportional part —
 /// must contribute **zero**, and that is exactly what invariance across
 /// `n_iter` asserts, with no magic constant and no knowledge of how many

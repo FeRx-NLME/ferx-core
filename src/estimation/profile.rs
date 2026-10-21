@@ -50,8 +50,8 @@ use crate::estimation::outer_optimizer::{
     OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, pack_with_bounds, theta_packs_log, unpack_params, PackedBounds,
-    PackedStart,
+    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
+    packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
 use crate::types::{
@@ -957,7 +957,7 @@ pub(crate) fn optimize_profiled(
     }
 
     let cov = if options.run_covariance_step {
-        let out = ctx.covariance(&hold, &x_hat, &free, &solve);
+        let out = ctx.covariance_at_estimate(&hold, &x_hat, &free, &solve.params, &solve.etas);
         warnings.extend(out.warnings.iter().cloned());
         Some(out)
     } else {
@@ -1003,15 +1003,31 @@ pub(crate) fn optimize_profiled(
     }
 }
 
+/// The warning `covariance_at_estimate` returns when the profile solve at the estimates
+/// fails, on the inline `fit()` step and on `replay_covariance` alike.
+/// A function rather than an inline `format!` so the `classify_warning` table test
+/// (`types_tests.rs`) classifies the text this site emits, not a copy of it (#2158).
+pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
+    format!(
+        "Covariance step failed: the profile solve did not converge at the \
+         estimates ({e:?}). SE estimates not available."
+    )
+}
+
 /// The covariance step of a profiled fit, re-run on its estimates (`run_covariance`), or
 /// `None` when `model` profiles nothing. The levels are re-profiled from the fit's own
 /// values first, so a reloaded fit gets the step the fit ran — not the unprofiled `R`
 /// over every level, which at a few hundred levels is the stencil profiling exists to
 /// avoid. As in `fit()`, only `r` is computed (#2108).
+///
+/// `x_hat` is the packed point the step runs at — the fit's own packed vector when
+/// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
+/// bits through the log and Cholesky transforms.
 pub(crate) fn replay_covariance(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
+    x_hat: &[f64],
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
 ) -> Option<CovStepOutcome> {
@@ -1031,10 +1047,8 @@ pub(crate) fn replay_covariance(
         });
     }
     let hold = hold_template(&layout, params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
-    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let fixed = packed_fixed_mask(&hold);
+    let free: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
     let ctx = ProfileCtx {
         model,
         population,
@@ -1042,30 +1056,7 @@ pub(crate) fn replay_covariance(
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
     };
-    let warm = ProfileWarm {
-        beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
-        etas: (eta_hats.len() == population.subjects.len()).then(|| eta_hats.to_vec()),
-    };
-    let solve = match ctx.solve(params, &warm) {
-        Ok(s) => s,
-        Err(e) => {
-            return Some(CovStepOutcome {
-                matrix: None,
-                wall_time_secs: 0.0,
-                warnings: vec![format!(
-                    "Covariance step failed: the profile solve did not converge at the \
-                     estimates ({e:?}). SE estimates not available."
-                )],
-                sir_fallback_proposal: None,
-                method: None,
-            })
-        }
-    };
-    let mut x_hat = x;
-    for &k in &layout.coords {
-        x_hat[k] = packed_theta(&hold, k, solve.params.theta[k]);
-    }
-    Some(ctx.covariance(&hold, &x_hat, &free, &solve))
+    Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats))
 }
 
 /// EBE convergence over a profiled run, as the unprofiled NLopt loop keeps it: the worst
@@ -1129,6 +1120,44 @@ impl ProfileCtx<'_> {
             .map_or(f64::NAN, |s| s.ofv)
     }
 
+    /// The covariance step at an estimate: re-profile the levels from `params`' own values
+    /// and `eta_hats`, then [`Self::covariance`] at that solve. `fit()` and
+    /// `replay_covariance` both go through here, so a replay handed the fit's estimates
+    /// and EBEs repeats the inline step bit for bit (#2173).
+    pub(crate) fn covariance_at_estimate(
+        &self,
+        hold: &ModelParameters,
+        x: &[f64],
+        free: &[usize],
+        params: &ModelParameters,
+        eta_hats: &[DVector<f64>],
+    ) -> CovStepOutcome {
+        let layout = self.layout;
+        let warm = ProfileWarm {
+            beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
+            etas: (eta_hats.len() == self.population.subjects.len()).then(|| eta_hats.to_vec()),
+        };
+        let solve = match self.solve(params, &warm) {
+            Ok(s) => s,
+            Err(e) => {
+                return CovStepOutcome {
+                    matrix: None,
+                    wall_time_secs: 0.0,
+                    warnings: vec![profile_solve_failed_msg(&e)],
+                    sir_fallback_proposal: None,
+                    method: None,
+                }
+            }
+        };
+        // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
+        // overwrite is a bitwise no-op; it matters only when the re-solve moves the levels.
+        let mut x_hat = x.to_vec();
+        for &k in &layout.coords {
+            x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
+        }
+        self.covariance(hold, &x_hat, free, &solve)
+    }
+
     /// `covariance_method = r` for a profiled fit, as the full packed covariance the
     /// unprofiled step would publish (levels included), so every downstream reader —
     /// `se_theta`, the level SEs and their delta method for a `NegSum` dependent, SIR's
@@ -1174,9 +1203,17 @@ impl ProfileCtx<'_> {
                     .to_string(),
             );
         }
-        let Some(stencil) =
-            fd_ofv_hessian(n, x_hat, free, options.fd_hessian_step, f0, &f, options)
-        else {
+        let floor = fd_step_floors(hold, &self.model.default_params);
+        let Some(stencil) = fd_ofv_hessian(
+            n,
+            x_hat,
+            free,
+            &floor,
+            options.fd_hessian_step,
+            f0,
+            &f,
+            options,
+        ) else {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
         };
         if !stencil.diag_nan.is_empty() || !stencil.offdiag_nan.is_empty() {
@@ -1279,7 +1316,10 @@ impl ProfileCtx<'_> {
         let l = layout.coords.len();
         let theta_steps: Vec<f64> = free
             .iter()
-            .map(|&i| self.options.fd_hessian_step * (1.0 + x_hat[i].abs()))
+            .map(|&i| {
+                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                fd_step(self.options.fd_hessian_step, x_hat[i], floor)
+            })
             .collect();
         let level_steps: Vec<f64> = solve.se_scale.iter().map(|s| COV_STEP_SE * s).collect();
         if !level_steps.iter().all(|s| s.is_finite() && *s > 0.0) {

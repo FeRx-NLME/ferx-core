@@ -6,6 +6,10 @@ use crate::types::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Opens the message of a dataset file that cannot be opened or read, whichever of
+/// the reader or [`crate::DataSource::read`] reads it.
+pub(crate) const ERR_OPEN_CSV: &str = "Failed to open CSV: ";
+
 /// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
 /// Passed into `read_nonmem_csv_impl` so filtering happens at read time.
 pub struct SelectionFilter {
@@ -743,7 +747,18 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
     path: &Path,
     routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, None, &[], None, None, None, routing, &[]).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        CsvInput::Path(path),
+        None,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        routing,
+        &[],
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// The one reader every wrapper above delegates to: it builds the covariate
@@ -760,6 +775,40 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed(
     path: &Path,
+    covariate_columns: Option<&[&str]>,
+    decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    routing: &ObsRouting,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    read_nonmem_csv_routed_from(
+        CsvInput::Path(path),
+        covariate_columns,
+        decls,
+        extra_columns,
+        iov_column,
+        filter,
+        routing,
+        column_map,
+    )
+}
+
+/// Where the CSV reader takes its bytes from: a file it opens itself, or bytes a
+/// caller already read (#2140), so the population and the `data_hash` stamped
+/// beside it can describe the same read of the file.
+#[derive(Clone, Copy)]
+pub(crate) enum CsvInput<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+/// [`read_nonmem_csv_routed`] over a [`CsvInput`]; the one body both spellings
+/// share, so a read of bytes and a read of the file holding them agree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_nonmem_csv_routed_from(
+    input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
     decls: Option<&[CovariateDecl]>,
     extra_columns: &[String],
@@ -790,16 +839,57 @@ pub(crate) fn read_nonmem_csv_routed(
     let cols_ref: Option<Vec<&str>> = cols
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
+    let exact = exact_case_extras(
+        // The declared branch ignores the caller's list, so it exempts nothing there.
+        covariate_columns.filter(|_| decls.is_none()),
+        extra_columns,
+        filter,
+    );
     read_nonmem_csv_impl(
-        path,
+        input,
         cols_ref.as_deref(),
         extra_columns,
+        &exact,
         iov_column,
         decls,
         filter,
         routing,
         column_map,
     )
+}
+
+/// The model extras that must bind a header by exact case (#1946): every
+/// `extra_columns` entry the caller did not name in its explicit list (exact
+/// spelling) and no `[data_selection]` filter references (case-insensitively; a
+/// filter lowercases its column names). On the `[covariates]` path the extras are
+/// the referenced-but-*undeclared* columns, so no declared name is ever among
+/// them and a declaration needs no exemption here; the caller passes `None` for
+/// `covariate_columns` on that path, since declarations take precedence over a
+/// fallback list and that list is never read there.
+///
+/// The one rule across all three read paths: a column the *model* references
+/// binds only the header it spells exactly, so a case-differing reference stays
+/// unread (and `check_covariates` reports it) instead of binding a header the
+/// caller left out. The case-insensitive fallback in `cov_indices` is kept for the
+/// names a caller or filter supplied. On the auto-detect path the extras are
+/// already matched against headers exactly, so the list is inert there.
+fn exact_case_extras(
+    covariate_columns: Option<&[&str]>,
+    extra_columns: &[String],
+    filter: Option<&SelectionFilter>,
+) -> Vec<String> {
+    let filter_cols = filter
+        .map(|f| f.referenced_covariate_columns())
+        .unwrap_or_default();
+    extra_columns
+        .iter()
+        .filter(|e| {
+            let listed = covariate_columns.is_some_and(|l| l.iter().any(|c| c == *e));
+            let filtered = filter_cols.iter().any(|c| c.eq_ignore_ascii_case(e));
+            !listed && !filtered
+        })
+        .cloned()
+        .collect()
 }
 
 /// Shared CSV reader. `table_decls`, when `Some`, requests building a
@@ -814,13 +904,19 @@ pub(crate) fn read_nonmem_csv_routed(
 /// the `iov_column` (#1936). Matched to headers exactly (case-sensitive), so a
 /// case-differing spelling stays unread rather than silently binding.
 ///
+/// `exact_extras`: on an explicit-list or declared read, the listed names that
+/// must resolve to a header by exact case — the model extras the caller did not
+/// name (see [`exact_case_extras`]). Every other listed name keeps the
+/// case-insensitive fallback, so the auto-detect rule above holds on every path.
+///
 /// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
 /// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
 /// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
 fn read_nonmem_csv_impl(
-    path: &Path,
+    input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
     auto_extras: &[String],
+    exact_extras: &[String],
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
@@ -828,11 +924,19 @@ fn read_nonmem_csv_impl(
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     routing.validate()?;
+    // `ReaderBuilder::from_path` is `File::open` + `from_reader`, and a csv I/O
+    // error displays as the I/O error itself, so opening the file here keeps the
+    // message `from_path` gave, byte for byte.
+    let source: Box<dyn std::io::Read + '_> = match input {
+        CsvInput::Path(path) => {
+            Box::new(std::fs::File::open(path).map_err(|e| format!("{ERR_OPEN_CSV}{}", e))?)
+        }
+        CsvInput::Bytes(bytes) => Box::new(bytes),
+    };
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("Failed to open CSV: {}", e))?;
+        .from_reader(source);
 
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
@@ -960,9 +1064,11 @@ fn read_nonmem_csv_impl(
             // Prefer an exact header match; fall back to case-insensitive so a
             // filter-injected lowercase name (e.g. "study" from
             // `referenced_covariate_columns`) still resolves to a "STUDY" header.
+            // A model extra the caller did not name gets no fallback (#1946).
             // Store the actual header name so covariate keys match the dataset.
+            let exact_only = exact_extras.iter().any(|e| e == name);
             col_idx_cs(name)
-                .or_else(|| col_idx_ci(name))
+                .or_else(|| (!exact_only).then(|| col_idx_ci(name)).flatten())
                 .map(|idx| (headers[idx].clone(), idx))
         })
         .collect();
@@ -1417,8 +1523,10 @@ fn read_nonmem_csv_impl(
 
     // A covariate column that exists but carries no finite value for some
     // subjects is stored as `NaN` (see the per-subject reader). Report it once
-    // per covariate: without a `present(COV)` guard those subjects evaluate the
-    // covariate expression to `NaN`, and the fit will fail on them.
+    // per covariate. The message does not promise a `NaN` outcome: `/`, `^`,
+    // `exp` keep it (non-finite objective), but `log` / `sqrt` floor it and
+    // `min` / `max` / comparisons return a finite value, so for those relations
+    // this warning is the only sign anything is wrong (#2041).
     let mut population_warnings = population_warnings;
     for name in &existing_cov_names {
         let missing: Vec<&str> = subjects
@@ -1429,13 +1537,7 @@ fn read_nonmem_csv_impl(
         if missing.is_empty() {
             continue;
         }
-        population_warnings.push(format!(
-            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
-            missing.len(),
-            subjects.len(),
-            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-            if missing.len() > 5 { ", ..." } else { "" },
-        ));
+        population_warnings.push(covariate_missing_warning(name, &missing, subjects.len()));
     }
 
     Ok((
@@ -1449,6 +1551,22 @@ fn read_nonmem_csv_impl(
         },
         table,
     ))
+}
+
+/// The `W_COVARIATE_MISSING` warning for covariate `name`, which has no finite
+/// value for the subjects `missing` out of `n_subjects`. At most five IDs are
+/// listed; a longer list ends in `...`.
+pub(crate) fn covariate_missing_warning(name: &str, missing: &[&str], n_subjects: usize) -> String {
+    format!(
+        "W_COVARIATE_MISSING: covariate {name} has no value for {} of {n_subjects} subjects \
+         ({}{}), so it is NaN for them. A relation that reads it is then NaN, which makes \
+         the objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, \
+         a finite value with no further warning. Impute the column, exclude the subjects, \
+         or guard the relation with `present({name})`.",
+        missing.len(),
+        missing[..missing.len().min(5)].join(", "),
+        if missing.len() > 5 { ", ..." } else { "" },
+    )
 }
 
 /// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
@@ -1934,7 +2052,7 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// than -1, 0 or 1 (#1496).
 ///
 /// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
-/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `foce_tail_jet`,
+/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `focei_kernel::m3_terms`,
 /// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
 /// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
 /// see `bloq_method`, so the message states both methods. `cell` is quoted as
