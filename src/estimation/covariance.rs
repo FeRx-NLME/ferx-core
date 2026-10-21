@@ -2055,6 +2055,11 @@ pub(crate) fn compute_covariance_for(
         }
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
+    // The SIR fallback proposal of every `FailedNonPd` arm below. One spelling, so the
+    // equilibration mask (#2179) is passed in one place and the test that pins it on one arm
+    // pins it on all three.
+    let fallback_proposal =
+        || build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0, &equilibrate);
 
     let inv = match invert_psd_with_floor(&hess_free_sym, &equilibrate) {
         Some(inv) => inv,
@@ -2073,16 +2078,9 @@ pub(crate) fn compute_covariance_for(
             // So only build the proposal when the eigenvalues are finite.
             match extract_eigenvalues(&hess_free_sym) {
                 Some(eigvals) => {
-                    let fallback_proposal = build_non_pd_fallback_proposal(
-                        &hess_free_sym,
-                        &free_idx,
-                        n,
-                        4.0,
-                        &equilibrate,
-                    );
                     return CovarianceStepResult::FailedNonPd {
                         reason: format_non_pd_warning(&eigvals),
-                        fallback_proposal,
+                        fallback_proposal: fallback_proposal(),
                     };
                 }
                 None => {
@@ -2166,13 +2164,7 @@ pub(crate) fn compute_covariance_for(
             Err(reason) if fallback_to_s => {
                 return CovarianceStepResult::FailedNonPd {
                     reason: non_stationary(Some(&reason)),
-                    fallback_proposal: build_non_pd_fallback_proposal(
-                        &hess_free_sym,
-                        &free_idx,
-                        n,
-                        4.0,
-                        &equilibrate,
-                    ),
+                    fallback_proposal: fallback_proposal(),
                 }
             }
             Err(reason) => return CovarianceStepResult::Unusable(reason),
@@ -2189,13 +2181,7 @@ pub(crate) fn compute_covariance_for(
                         "S is singular or rank-deficient: typically fewer subjects than free \
                          parameters, or collinear per-subject scores",
                     )),
-                    fallback_proposal: build_non_pd_fallback_proposal(
-                        &hess_free_sym,
-                        &free_idx,
-                        n,
-                        4.0,
-                        &equilibrate,
-                    ),
+                    fallback_proposal: fallback_proposal(),
                 };
             }
         }
