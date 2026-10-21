@@ -202,6 +202,7 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         &model.default_params,
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
     .frozen
     .expect("the unmapped TVFLAT must be detected and frozen");
@@ -1705,6 +1706,7 @@ fn test_polish_is_wired_and_an_unfinished_polish_is_not_converged() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
+            &[],
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         (
@@ -1816,6 +1818,7 @@ fn test_short_window_latch_is_wired_and_plateau_checked() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
+            &[],
         )
     };
     let (on, on_outcome) = run(true);
@@ -2110,6 +2113,7 @@ fn preflight_freezes_flat_theta() {
         &model.default_params,
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
     .frozen
     .expect("flat TVV must be detected");
@@ -2138,6 +2142,7 @@ fn preflight_no_freeze_when_all_thetas_active() {
             &model.default_params,
             &options,
             &OuterFdDeclineLog::new(pop.subjects.len()),
+            false,
         )
         .frozen
         .is_none(),
@@ -2172,6 +2177,7 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
         &model.default_params,
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
     .frozen
     .expect("flat TVV must be detected");
@@ -3430,6 +3436,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &declines,
         None,
         None,
+        &[],
     )
     .0
     .params;
@@ -3443,6 +3450,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &declines,
         None,
         None,
+        &[],
     );
     let (from_reference, reference_outcome) = optimize_nlopt_once(
         &model,
@@ -3456,6 +3464,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
             spent_evals: 0,
         }),
         None,
+        &[],
     );
 
     // The straddle itself, asserted so it cannot silently become a tautology: the
@@ -8433,6 +8442,7 @@ fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
         None,
+        &[],
     );
     eprintln!("{label}: OFV {}", result.ofv);
     assert!(
@@ -8927,6 +8937,7 @@ fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
             init,
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
+            false,
         )
     });
     assert!(
@@ -8951,6 +8962,7 @@ fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
                 &OuterFdDeclineLog::new(pop.subjects.len()),
                 None,
                 seed,
+                &[],
             )
             .0
         })
@@ -9001,7 +9013,7 @@ fn measure_preflight_reuse(
     };
     let declines = || OuterFdDeclineLog::new(pop.subjects.len());
     let (preflight, pre_n) = count_multistarts(|| {
-        freeze_flat_thetas(model, pop, &model.default_params, &opts, &declines())
+        freeze_flat_thetas(model, pop, &model.default_params, &opts, &declines(), false)
     });
     let (fit, fit_n) =
         count_multistarts(|| optimize_population(model, pop, &model.default_params, &opts));
@@ -9011,7 +9023,7 @@ fn measure_preflight_reuse(
         .as_ref()
         .map_or(&model.default_params, |(p, _)| p);
     let cold_n = count_multistarts(|| match optimizer {
-        Optimizer::Bobyqa => optimize_nlopt(model, pop, init, &opts, &declines(), None),
+        Optimizer::Bobyqa => optimize_nlopt(model, pop, init, &opts, &declines(), None, &[]),
         Optimizer::Bfgs => optimize_bfgs(model, pop, init, &opts, &declines(), None),
         _ => crate::estimation::trust_region::optimize_trust_region(model, pop, init, &opts),
     })
@@ -9127,4 +9139,662 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
             m.cold_n
         );
     }
+}
+
+// ── identity_theta_scales: near-zero identity-packed θ (#2159) ───────────
+
+/// A fake objective, quadratic in each θ separately: `f = base + w·k·(v − m)²` minus
+/// its value at the start, with `k` a replication factor. Its Newton step from the
+/// three probes is exact, so the decision is pinned without solver noise.
+fn quadratic_probe(
+    theta: &[f64],
+    minimizers: &[f64],
+    weight: f64,
+    k: f64,
+    base: f64,
+) -> impl Fn(usize, f64) -> f64 {
+    let theta = theta.to_vec();
+    let minimizers = minimizers.to_vec();
+    move |i, v| {
+        let m = minimizers[i];
+        base + k * weight * ((v - m).powi(2) - (theta[i] - m).powi(2))
+    }
+}
+
+/// The candidate filter and the decision. θ in order: `[TVCL 0.2 (log-packed),
+/// NEAR 1e-5 (minimizer 7.74e-6), FAR 0.001 (minimizer 0.65), HELD 1e-5, ZERO 0,
+/// AT_GATE 0.1, NEG_NEAR -2e-3 (minimizer -3e-3), NEG_FAR -0.05 (minimizer 2.0)]`.
+///
+/// `NEAR` and `NEG_NEAR` have their minimizers within a few `|θ₀|` (0.23 and 0.5), so
+/// only they are scaled, by `|θ₀|` (the `abs` pinned by `NEG_NEAR`). `FAR` (649 `|θ₀|`)
+/// and `NEG_FAR` (41) keep scale 1. Each candidate is probed at `θ₀ ∓ ½|θ₀|`, lower
+/// point first;
+/// `TVCL`, `HELD`, `ZERO` and `AT_GATE` are never probed.
+#[test]
+fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size() {
+    let theta = [0.2, 1e-5, 0.001, 1e-5, 0.0, 0.1, -2e-3, -0.05];
+    let minimizers = [
+        f64::NAN,
+        7.74e-6,
+        0.65,
+        f64::NAN,
+        f64::NAN,
+        f64::NAN,
+        -3e-3,
+        2.0,
+    ];
+    let lower = [0.001, -5e-4, -5.0, -5e-4, -1.0, -1.0, -1.0, -5.0];
+    let upper = [10.0, 5e-4, 5.0, 5e-4, 1.0, 1.0, 1.0, 5.0];
+    // Weight 1e12: halving `NEAR` costs 25 OFV units, well above the noise floor.
+    let f = quadratic_probe(&theta, &minimizers, 1e12, 1.0, -180.0);
+    let mut probed = Vec::new();
+    let got = identity_theta_scales(
+        &theta,
+        &lower,
+        &upper,
+        |i| i == 3,
+        || -180.0,
+        |i, v| {
+            probed.push((i, v));
+            f(i, v)
+        },
+    );
+    assert_eq!(got, vec![(1, 1e-5), (6, 2e-3)]);
+    let want = [
+        (1, 0.5e-5),
+        (1, 1.5e-5),
+        (2, 0.0005),
+        (2, 0.0015),
+        (6, -3e-3),
+        (6, -1e-3),
+        (7, -0.075),
+        (7, -0.025),
+    ];
+    assert_eq!(probed.len(), want.len(), "{probed:?}");
+    for ((i, v), (wi, wv)) in probed.iter().zip(want) {
+        assert_eq!(*i, wi);
+        assert!(
+            (v - wv).abs() <= 1e-12 * wv.abs(),
+            "θ{i}: probed {v:e}, want {wv:e}"
+        );
+    }
+}
+
+/// The decision's edges, on one candidate θ₀ = 1e-3 in `(-1, 1)`.
+#[test]
+fn identity_theta_scales_edges() {
+    let decide = |minimizer: f64| {
+        let f = quadratic_probe(&[1e-3], &[minimizer], 1e6, 1.0, 50.0);
+        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, f)
+    };
+    // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
+    assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
+    assert_eq!(decide(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
+    assert_eq!(decide(1e-3 + 10.1e-3), vec![], "past the bar");
+
+    let with = |f_minus: f64, f_plus: f64| {
+        identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_, v| if v < 1e-3 { f_minus } else { f_plus },
+        )
+    };
+    assert_eq!(with(f64::NAN, 50.0), vec![(0, 1e-3)], "a NaN probe scales");
+    assert_eq!(with(50.0, 2e20), vec![(0, 1e-3)], "a diverged probe scales");
+    assert_eq!(with(49.0, 49.0), vec![], "concave: no step to trust");
+    assert_eq!(with(49.0, 51.0), vec![], "linear: no curvature");
+    // A curvature at the tolerance, 1e-6·(1 + 50), is noise; twice it is not — and
+    // with no gradient the predicted step is zero.
+    let tol = 1e-6 * 51.0;
+    assert_eq!(with(50.0 + tol / 2.0, 50.0 + tol / 2.0), vec![]);
+    assert_eq!(with(50.0 + tol, 50.0 + tol), vec![(0, 1e-3)]);
+
+    // No room on either side for a spacing of 0.05·|θ₀|: nothing is probed.
+    let mut probed = Vec::new();
+    let boxed = identity_theta_scales(
+        &[1e-3],
+        &[0.99e-3],
+        &[1.01e-3],
+        |_| false,
+        || 50.0,
+        |_, v| {
+            probed.push(v);
+            f64::NAN
+        },
+    );
+    assert_eq!((boxed, probed.len()), (vec![], 0));
+}
+
+/// `identity_probe_points` keeps every probe inside the declared box, equally spaced
+/// and through θ₀, over a grid of starts and boxes that includes a negative-only box,
+/// a positive-only one, θ₀ on either bound, and boxes tight on one side (#2159
+/// review: the first version probed `θ₀·(1 − h)`, above a negative upper bound).
+#[test]
+fn identity_probe_points_stay_in_the_box() {
+    let cases = [
+        // (θ₀, lower, upper, central?)
+        (1e-3, -1.0, 1.0, true),
+        (-1e-3, -1.0, 1.0, true),
+        (-1e-3, -5.0, -0.0009, false), // negative-only, near its upper bound
+        (1e-3, -5.0, 1e-3, false),     // at its upper (outward) bound
+        (-1e-3, -1e-3, 5.0, false),    // at its lower (outward) bound
+        (1e-3, 0.99e-3, 5.0, false),   // tight below
+        (1e-5, -5e-4, 5e-4, true),
+        (0.05, -0.06, 0.051, false),
+    ];
+    for (t, lo, hi, central) in cases {
+        let p = identity_probe_points(t, lo, hi).unwrap_or_else(|| panic!("{t} in [{lo}, {hi}]"));
+        assert!(
+            p.iter().all(|&x| (lo..=hi).contains(&x)),
+            "{p:?} outside [{lo}, {hi}]"
+        );
+        assert!(p.contains(&t), "{p:?} misses θ₀ = {t}");
+        let (d0, d1) = (p[1] - p[0], p[2] - p[1]);
+        assert!(
+            d0 > 0.0 && (d0 - d1).abs() <= 1e-12 * d0,
+            "{p:?} not equally spaced"
+        );
+        assert!(d0 >= IDENTITY_PROBE_MIN_FRACTION * t.abs(), "{p:?}");
+        assert_eq!(p[1] == t, central, "{p:?} for {t} in [{lo}, {hi}]");
+    }
+    assert_eq!(identity_probe_points(1e-3, 0.99e-3, 1.01e-3), None);
+}
+
+/// The two boxes the review named, end to end through the decision: a negative-only
+/// box (`theta X(-0.001, -5, -0.0009)`) whose minimizer is at -1.2e-3, and a θ
+/// started on its outward bound (`(0.001, -5, 0.001)`) whose minimizer is inward at
+/// 8e-4. Both are scaled, and no probe leaves the box.
+#[test]
+fn identity_theta_scales_handles_one_sided_boxes() {
+    for (t, lo, hi, m) in [(-1e-3, -5.0, -0.0009, -1.2e-3), (1e-3, -5.0, 1e-3, 8e-4)] {
+        let f = quadratic_probe(&[t], &[m], 1e9, 1.0, 50.0);
+        let mut probed = Vec::new();
+        let got = identity_theta_scales(
+            &[t],
+            &[lo],
+            &[hi],
+            |_| false,
+            || 50.0,
+            |i, v| {
+                probed.push(v);
+                f(i, v)
+            },
+        );
+        assert_eq!(got, vec![(0, t.abs())], "θ₀ = {t} in [{lo}, {hi}]");
+        assert_eq!(probed.len(), 2);
+        assert!(probed.iter().all(|&v| (lo..=hi).contains(&v)), "{probed:?}");
+    }
+}
+
+/// `identity_probe_objective` is the objective the optimizer sees: the value, or the
+/// `1e20` wall when the EBE guard rejects the point — more than
+/// `max_unconverged_frac` of the subjects unconverged, or any hard-rejected start —
+/// or the value is not finite.
+#[test]
+fn identity_probe_objective_applies_the_ebe_guard() {
+    let stats = |n_unconverged: usize, n_start_rejected: usize| InnerLoopStats {
+        n_unconverged,
+        n_fallback: 0,
+        n_start_rejected,
+    };
+    let at = |raw: f64, s: InnerLoopStats| identity_probe_objective(raw, &s, 20, 0.1);
+    assert_eq!(
+        at(-100.0, stats(2, 0)),
+        -100.0,
+        "2 of 20 is the bar, not past it"
+    );
+    assert_eq!(at(-100.0, stats(3, 0)), 1e20, "3 of 20 crosses 0.1");
+    assert_eq!(at(-100.0, stats(0, 1)), 1e20, "a hard-rejected start");
+    assert_eq!(at(f64::NAN, stats(0, 0)), 1e20);
+}
+
+/// A probe point only the EBE guard rejects decides the scale as the optimizer would
+/// see it. The objective is a slope whose minimizer is 649 `|θ₀|` away — unit scale
+/// on its likelihood alone — but at the upper probe 3 of 20 subjects fail to
+/// converge (`max_unconverged_frac = 0.1`): the optimizer could not take that move,
+/// so the θ is scaled. With 2 of 20 unconverged (at the bar) it keeps scale 1.
+#[test]
+fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
+    let f = quadratic_probe(&[1e-3], &[0.65], 13.8, 1.0, -1000.0);
+    for (unconverged_at_upper, want) in [(2usize, vec![]), (3, vec![(0, 1e-3)])] {
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-5.0],
+            &[5.0],
+            |_| false,
+            || -1000.0,
+            |i, v| {
+                let n_unconverged = if v > 1e-3 { unconverged_at_upper } else { 0 };
+                let s = InnerLoopStats {
+                    n_unconverged,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                };
+                identity_probe_objective(f(i, v), &s, 20, 0.1)
+            },
+        );
+        assert_eq!(
+            got, want,
+            "{unconverged_at_upper} unconverged at the upper probe"
+        );
+    }
+}
+
+/// The base objective is evaluated only when there is a candidate, and a start whose
+/// objective is the divergence sentinel (or `NaN`) probes nothing.
+#[test]
+fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start() {
+    let no_probe = |_: usize, _: f64| -> f64 { panic!("nothing may be probed") };
+    let none = identity_theta_scales(
+        &[0.2, 0.5],
+        &[0.001, -1.0],
+        &[1.0, 1.0],
+        |_| false,
+        || panic!("no candidate, so no base"),
+        no_probe,
+    );
+    assert_eq!(none, vec![]);
+    for base in [2e20, f64::NAN] {
+        let got = identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || base, no_probe);
+        assert_eq!(got, vec![], "base {base}");
+    }
+}
+
+/// Repeating every likelihood contribution `k` times — whole subjects, or each
+/// observation within a subject — multiplies the objective, and every difference
+/// of it, by `k` and leaves the minimizer where it was, so it must not change which
+/// θ are scaled (#2159 review, both rounds). The two θ are the issue's: a volume
+/// whose minimizer is 0.23 `|θ₀|` away and a slope whose is 649 `|θ₀|` away, with
+/// curvatures giving warfarin- and `two_cpt_oral_cov`-sized ΔOFVs at `k = 1`. A cut
+/// on a ΔOFV's size, total or per subject, flips the slope at some `k`: at `k = 1e4`
+/// its halving ΔOFV is ~90.
+#[test]
+fn identity_theta_scales_is_invariant_to_replicating_likelihood_contributions() {
+    let theta = [1e-5, 0.001];
+    let minimizers = [7.74e-6, 0.65];
+    let lower = [-5e-4, -5.0];
+    let upper = [5e-4, 5.0];
+    for k in [1.0, 200.0, 1e4, 1e7] {
+        let base = -1033.3637 * k;
+        // Weights: halving the volume and the slope costs ~30 and ~0.009 OFV units at k = 1.
+        let volume = quadratic_probe(&theta, &minimizers, 3e11, k, base);
+        let slope = quadratic_probe(&theta, &minimizers, 13.8, k, base);
+        let f = |i: usize, v: f64| if i == 0 { volume(i, v) } else { slope(i, v) };
+        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, f);
+        assert_eq!(got, vec![(0, 1e-5)], "k = {k}");
+    }
+}
+
+/// The issue's warfarin fixture with `V = TVV_S / 1e-6`, `TVV_S` started at 1e-5
+/// (the minimum is at 7.7377e-6). Shared by the two #2159 pre-flight tests below.
+#[cfg(test)]
+const NEAR_ZERO_V_WARFARIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV_S / 1e-6 * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The pre-flight probe on real objectives, both sides of the decision (#2159).
+///
+/// Warfarin's `TVV_S` at 1e-5 is a volume in units of 1e-6 L: halving it moves the
+/// OFV by tens of units, so it is scaled by 1e-5. `two_cpt_oral_cov`'s covariate
+/// exponents started at 0.001 are O(1) slopes (0.65 and 0.3 at the minimum): halving
+/// either moves the OFV by under 0.01, so neither is scaled — scaling them by 0.001
+/// is the rule the issue measured costing BOBYQA 14 OFV units. And with the probe
+/// switched off (an explicit `none` / `rescale2`, or a non-NLopt optimizer) nothing
+/// is probed.
+#[test]
+fn preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope() {
+    use crate::parser::model_parser::{parse_model_file, parse_model_string};
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let preflight = |model: &CompiledModel, pop: &Population, probe: bool| {
+        freeze_flat_thetas(
+            model,
+            pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            probe,
+        )
+    };
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let on = preflight(&model, &pop, true);
+    assert!(on.frozen.is_none());
+    assert_eq!(on.identity_scales, vec![(1, 1e-5)], "TVV_S is scaled");
+    assert_eq!(preflight(&model, &pop, false).identity_scales, vec![]);
+
+    let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    let (wt, crcl) = (5, 6);
+    assert_eq!(model.default_params.theta_names[wt], "THETA_WT");
+    assert_eq!(model.default_params.theta_names[crcl], "THETA_CRCL");
+    for i in [wt, crcl] {
+        model.default_params.theta[i] = 0.001;
+        model.default_params.theta_lower[i] = -5.0;
+    }
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    assert_eq!(
+        preflight(&model, &pop, true).identity_scales,
+        vec![],
+        "a near-zero slope keeps scale 1"
+    );
+}
+
+/// The scale reaches the optimizer (#2159): `optimize_nlopt_once` on the warfarin
+/// fixture, BOBYQA, a short evaluation budget, with and without `TVV_S`'s entry.
+/// Without it BOBYQA's first probes put the volume at ±5e-4 (V = ±500 L, the negative
+/// side infeasible); with it they stay at half and one and a half times θ₀.
+#[test]
+fn bobyqa_reads_the_identity_theta_scale() {
+    use crate::estimation::outer_optimizer::EVAL_BUDGET_OVERRIDE;
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let run = |scales: &[(usize, f64)]| {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            scales,
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        out.0
+    };
+    // Measured (macOS arm64) after 40 evaluations: scaled OFV −264.85 with `TVV_S` at
+    // 9.0e-6; unit OFV +2725.78 with `TVV_S` at 3.9e-4. The start is −182.67 and the
+    // minimum −286.00, so the scaled arm must have descended well past the start and
+    // the unit arm must not have — each bound sits ≥ 15 units from its measurement.
+    const BUDGET: u32 = 40;
+    let scaled = run(&[(1, 1e-5)]);
+    let unit = run(&[]);
+    assert!(
+        scaled.ofv.is_finite() && scaled.ofv < -250.0,
+        "scaled: OFV {}",
+        scaled.ofv
+    );
+    let tvv_s = scaled.params.theta[1];
+    assert!(
+        (5e-6..1.5e-5).contains(&tvv_s),
+        "scaled: TVV_S {tvv_s:e} left the region the scaled probes cover"
+    );
+    assert!(
+        !(unit.ofv < -200.0),
+        "unit: OFV {} — the fixture no longer needs the scale",
+        unit.ofv
+    );
+}
+
+/// `two_cpt_oral_cov` with both exponents at 0.001 and every subject repeated 200
+/// times (6000 subjects): the same minimizer, so the slopes must still keep scale 1
+/// (#2159 review). Under the absolute 1.0-unit bar the first version used, the
+/// replicated ΔOFVs (≈ 1.8 and 1.1) both crossed it and the slopes got the 0.001
+/// scale the issue measured costing BOBYQA 14 OFV units. ~40 s in a debug build
+/// (6000 cold inner solves per evaluation), so nightly; the per-PR twin is
+/// `identity_theta_scales_is_invariant_to_replicating_likelihood_contributions`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn preflight_keeps_a_near_zero_slope_unscaled_on_a_replicated_population() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    for i in [5, 6] {
+        model.default_params.theta[i] = 0.001;
+        model.default_params.theta_lower[i] = -5.0;
+    }
+    let mut pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    let originals = pop.subjects.clone();
+    const K: usize = 200;
+    pop.subjects = (0..K)
+        .flat_map(|r| {
+            originals.iter().map(move |s| {
+                let mut s = s.clone();
+                s.id = format!("{}_{r}", s.id);
+                s
+            })
+        })
+        .collect();
+    assert_eq!(pop.subjects.len(), 30 * K);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(
+        got.identity_scales,
+        vec![],
+        "a replicated slope keeps scale 1"
+    );
+}
+
+/// The issue's small-unit volume inside a two-class mixture
+/// (`tests/nonmem/mixture_iv.csv`, 30 subjects), next to a weight exponent started
+/// at 0.001. The flat-θ pre-flight never runs for a mixture, so the probe has its own
+/// path on the mixture objective: `TVV_S` is scaled, the exponent is not.
+#[cfg(test)]
+const NEAR_ZERO_V_MIXTURE: &str = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.001, -5.0, 5.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV_S / 1e-6 * (WT / 70)^BWT
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn a_mixture_is_probed_on_its_own_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_MIXTURE).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let p = &model.default_params;
+    assert!(p.mixture.is_some());
+    assert_eq!(p.theta_names[2], "TVV_S");
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, p, &opts),
+        vec![(2, 1e-5)],
+        "TVV_S is scaled, BWT and the zero MIXL are not"
+    );
+}
+
+/// The probe sees the objective the optimizer minimises, priors included (#2159
+/// review). `two_cpt_oral_cov`'s `THETA_WT` started at 0.001 keeps scale 1 on the
+/// clean −2LL (`preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope`);
+/// with a `prior(0.0012, rse = 10%)` (sd 1.2e-4) its penalized minimizer sits 0.2
+/// `|θ₀|` away and the halving probes' second difference is ≈ 35, so it is scaled.
+/// `THETA_CRCL`, with no prior, is not.
+#[test]
+fn preflight_probes_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("example reads");
+    let src = src
+        .replace(
+            "theta THETA_WT(0.6, 0.01, 5.0)",
+            "theta THETA_WT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+        )
+        .replace(
+            "theta THETA_CRCL(0.3, 0.01, 5.0)",
+            "theta THETA_CRCL(0.001, -5.0, 5.0)",
+        );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(got.identity_scales, vec![(5, 0.001)], "THETA_WT is scaled");
+}
+
+/// The mixture path adds the penalties too: the mixture fixture's `BWT`, unscaled on
+/// the clean objective (`a_mixture_is_probed_on_its_own_objective`), is scaled under
+/// the same tight prior.
+#[test]
+fn a_mixture_probe_sees_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = NEAR_ZERO_V_MIXTURE.replace(
+        "theta BWT(0.001, -5.0, 5.0)",
+        "theta BWT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, &model.default_params, &opts),
+        vec![(2, 1e-5), (4, 0.001)]
+    );
+}
+
+/// The pre-flight hands the inner loop's statistics to the guard (#2159 review). On
+/// the warfarin fixture with the inner solve starved to one iteration, some subjects
+/// stop unconverged at the start: with `max_unconverged_frac = 0` the optimizer
+/// would refuse the start itself, so nothing is probed and `TVV_S` keeps scale 1;
+/// with the guard off (`1.0`) the same starved solves still scale it.
+#[test]
+fn preflight_reads_the_ebe_guard_on_real_solves() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let scales = |max_unconverged_frac: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            inner_maxiter: 1,
+            max_unconverged_frac,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+        )
+        .identity_scales
+    };
+    assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
+    assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }
