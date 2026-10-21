@@ -1917,20 +1917,6 @@ fn cross_rate_switch<T: crate::sens::num::PkNum>(
     }
 }
 
-/// Whether two per-segment PK snapshots are equal (by value). Under a covariate that is
-/// constant across a boundary — or a model with no TV covariates at all — consecutive
-/// records share their covariate values, so the deterministic (non-IOV) PK map yields
-/// identical duals (values *and* jets); value-equality is therefore sufficient to detect
-/// "no Jacobian jump". Lets a rate-off boundary take the cheap [`cross_rate_switch`] (the
-/// switching rate over one shared base field) instead of the general
-/// [`cross_moving_boundary`] with separately parameterised pre/post velocities whenever the
-/// Jacobian does not actually jump (#653 review — avoids the extra RHS evals on every
-/// lagtime-only / covariate-constant inner-EBE and outer-gradient evaluation).
-#[inline]
-fn pk_snapshot_equal<T: crate::sens::num::PkNum>(a: &[T], b: &[T]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.val() == y.val())
-}
-
 /// Dual steady-state equilibration: the analytic-sensitivity counterpart of production's
 /// `equilibrate_ss_state`. NONMEM SS=1 loads the compartments with the steady-state
 /// amounts of an infinite-past pulse train of interval `II`. There is no closed form for
@@ -3164,59 +3150,30 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
         v
     };
 
-    // The PK snapshot governing the flow immediately AFTER a moving boundary at timeline
-    // slot `p`: the params of the first event STRICTLY later than it.
+    // Every moving boundary reads ONE PK snapshot on both sides: the enclosing segment's
+    // `params` below — the record terminating the interval the boundary lies in (#1073) —
+    // and never a lookahead to a later record. A record is stationary, so its field jump
+    // is not the moving boundary's to charge; reading a strictly-later record on the post
+    // side adds `(f_pre − f_post)(x)·δ`, a first-order term on neither one-sided branch.
     //
-    // **Only the rate-offs may call this** (`K_INF_END` = 7 / `K_ZO_END` = 8, #653). The
-    // *arrival* boundaries — the bolus and the lagged rate-on at `K_DOSE` = 3, the per-route
-    // onset at `K_ROUTE_ONSET` = 4 — must NOT: they sort BEFORE the record kinds
-    // (`K_PKONLY` = 5, `K_OBS` = 6), so they report the one-sided limit from below and both
-    // their sides read the enclosing record's `params`. Calling this at an arrival is the
-    // #1068 defect: on a record co-timed with the arrival it returns a strictly-later
-    // record and charges a *moving* boundary with a *stationary* record's field jump,
-    // yielding a derivative on neither branch. The rate-offs are safe precisely because no
-    // record kind sorts after 7 at the same instant, so for them both sides resolve to the
-    // same strictly-later record anyway (#1160/#1072) and this scan is a no-op in the
-    // coincidence rather than a wrong answer.
+    // - At an **arrival** (`K_DOSE` = 3, `K_ROUTE_ONSET` = 4) that was #1068: those kinds
+    //   sort BEFORE the record kinds (`K_PKONLY` = 5, `K_OBS` = 6), so a co-timed record
+    //   is still ahead and is the enclosing record on both sides.
+    // - At a **rate-off** (`K_INF_END` = 7, `K_ZO_END` = 8) it was #1160. They sort AFTER
+    //   every record kind, so a bit-equal co-timed record is already behind and both sides
+    //   resolve to the next one. The general `(J⁺ − J⁻)` arm (#653 review #3) read its post
+    //   side from the first record later by more than `INFUSION_EPS`, which parted from
+    //   `params` only when float arithmetic put the window end a few ULPs *below* a record
+    //   (`0.7 + 0.1 = 0.7999999999999999` against an observation at `0.8`). There the flow
+    //   immediately past the boundary is still that record's, and the first derivative is
+    //   continuous across it — moving a rate-off only shifts `rate·δ` of input across a
+    //   stationary jump — so the arm's extra term was wrong (1.4e-2 on
+    //   `rate_off_a_few_ulps_below_a_covariate_record_is_the_backward_limit`), not a
+    //   correction. Interior to an interval there is no jump to recover, so the arm is gone.
     //
-    // Generally that means the first event **strictly** later, not simply the next one: the
-    // loop below integrates a segment only `if t_event > cur_t`, so a co-timed event opens a
-    // zero-length segment that is never integrated and its own snapshot governs nothing after
-    // the boundary. That covers the co-timed rate-off / route-onset siblings the old copies
-    // skipped by kind, and also the co-timed *record* they did not (#1060 review #6) — a
-    // record sitting exactly on a moving arrival is the #1068 coincidence.
-    //
-    // Since #1073 only a **record** carries parameters, so the scan skips past every
-    // non-record instead of stopping at one: an arrival, a rate-off or a route onset in
-    // between contributes nothing and the governing snapshot is the next record beyond it.
-    //
-    // That also retires the co-timed-sibling-dose exception this scan used to carry. It
-    // existed because two doses arriving together were each a parameter source, so the pair's
-    // saltations only telescoped if the first one's post side was the second one's own
-    // `pk_at_dose`. Neither arrival is a parameter source now — both sides of each read the
-    // same enclosing record — so every term in that sum carries identical parameters and the
-    // telescoping is trivial. The exception is not ported; it would re-introduce exactly the
-    // dose-row stretch #1073 removed.
-    //
-    // `None` means no record follows (only rate boundaries or a reset, or the timeline ends);
-    // each caller falls back to `last_params`, the same fallback the value walk uses when its
-    // forward lookahead runs off the end.
-    let post_snapshot = |p: usize, t_ev: f64| -> Option<&[T]> {
-        let leps = crate::ode::predictions::INFUSION_EPS;
-        for q in (p + 1)..tl.len() {
-            let (tq, kq, iq) = tl[q];
-            if tq - t_ev <= leps {
-                continue;
-            }
-            match kq {
-                K_DOSE_REC | K_SS_SEED => return Some(&pk_at_dose[iq]),
-                K_PKONLY => return Some(&pk_at_pk_only[iq]),
-                K_OBS => return Some(&pk_at_obs[iq]),
-                _ => continue,
-            }
-        }
-        None
-    };
+    // Consequence for `boundary_velocity`'s membership gates (`ResetGate::live`, the
+    // `CMT = 0` test): at the rate-offs `v⁻` and `v⁺` share one field, so a window both
+    // sides include identically cancels from `v⁻ − v⁺` and from `½(J⁻ − J⁺)·r·δ²`.
 
     // TAD anchor: the most recent dose at or before the current segment start. The
     // timeline is sorted and doses sort before a co-timed obs, so this only advances
@@ -3620,7 +3577,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                             // enclosing record's snapshot, for the reason spelled out at the
                             // bolus arrival below (#1073/#1068) — `K_DOSE` sorts before the
                             // record kinds, so the onset reports the limit from below and both
-                            // sides read one snapshot. No lookahead — see `post_snapshot`'s doc.
+                            // sides read one snapshot. No lookahead — see the one-snapshot note above
+                            // `last_dose_eff`.
                             // (Until #1569 the kernel and `frac` were read from that snapshot
                             // too, because production's forcing was — #880.)
                             // The onset rate at time `τ` after the true arrival: every unlagged
@@ -3901,9 +3859,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         // `K_OBS` = 6, so the arrival reports the limit from below, which is
                         // the enclosing record's field on both sides.
                         //
-                        // So do NOT reintroduce `post_snapshot` here (it is correct only at
-                        // the rate-offs, which sort *after* the record kinds and therefore
-                        // cannot part their two snapshots). Mixing snapshots across this
+                        // So do NOT reintroduce a strictly-later lookahead here, nor at the
+                        // rate-offs (#1160, where it parted only on a ULP sliver and was
+                        // wrong there too). Mixing snapshots across this
                         // boundary biased `∂f/∂η_lag` by the ratio of the two
                         // covariate-scaled fields — 6% on #1060's reproducer, and invisible
                         // in the value because `δlag` is jet-only.
@@ -4197,10 +4155,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // never turned on, #1587), so its rate-off correction must not fire (#472 review
             // #2).
             //
-            // When a time-varying covariate changes the segment's PK params across this
-            // (non-record) boundary the RHS **Jacobian jumps** (#653 review #3), so the
-            // crossing always takes the two-sided `cross_moving_boundary` with each side's own
-            // params; where they coincide it reduces to the one-field case.
+            // Both sides read the enclosing segment's `params` (#1160 — see the one-snapshot
+            // note above `last_dose_eff`): the boundary is not a record, so no field jumps
+            // across it and only the infusion's own rate switches off.
             let d = &subject.doses[idx];
             let is_rate_defined = matches!(d.infusion_def, crate::types::InfusionDef::RateDefined);
             // #530: a modeled-duration dose's window end `t+dur` moves with `D` (the `dtinf`
@@ -4237,21 +4194,13 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 };
                 let dtinf = jet_only(inf_eff[idx].1);
                 let d_off = dlag + dtinf;
-                // Pre-boundary params = the segment ending here. Since #1073 a non-record
-                // boundary belongs to the interval the NEXT record terminates rather than
-                // reusing the previous one, which is what the outer `params` resolved.
-                // Post-boundary params = the first strictly-later record's snapshot (NONMEM
-                // end-of-interval, #653 review #2). Interior to one interval the two
-                // coincide.
-                let pre_params = params;
-                let post_params: &[T] = post_snapshot(p, t_event).unwrap_or(last_params);
                 // Inclusive membership: the ending infusion is on both sides of `base`, and
                 // comes off the post side here.
                 let inf_rate = inf_eff[idx].0;
                 let mut pre = |x: &[T], s: T, out: &mut [T]| {
                     out.copy_from_slice(&boundary_velocity(
                         x,
-                        pre_params,
+                        params,
                         t_event,
                         s,
                         last_dose_eff,
@@ -4262,7 +4211,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 let mut post = |x: &[T], s: T, out: &mut [T]| {
                     out.copy_from_slice(&boundary_velocity(
                         x,
-                        post_params,
+                        params,
                         t_event,
                         s,
                         last_dose_eff,
@@ -4281,28 +4230,17 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // active — one whose dose was recorded before an intervening EVID 3/4 reset (#1587)
             // was already dropped from `active_zero`, so its rate-off correction must not.
             //
-            // The state is continuous across `w_end`; only `du/dt` jumps. Unlike the static
-            // walk (one param set) or a lagtime-only walk, TV covariates make the walk break at
-            // `w_end` (which is NOT a record) with the *previous* record's params on the pre-side
-            // (`last_params`) and the *next* record's params on the post-side (NONMEM
-            // end-of-interval convention) — so the RHS **Jacobian jumps** across `w_end`, not
-            // just the forcing. A forcing-only crossing (`cross_rate_switch`, one shared field)
-            // would then miss the `(J⁺−J⁻)·x` term (empirically a several-percent error).
-            // So on a genuine jump use the two-sided [`cross_moving_boundary`] with `pre`/`post`
-            // velocities that include EVERY concurrently-active forcing (other zero-order
-            // windows — e.g. `dur` > dosing interval — infusions, and a `mixed` leg's pointwise
-            // first-order R_in), so every order is exact when `J⁺ ≠ J⁻` (#653 review #1). When
-            // `pre == post` (no TV-cov, or `w_end` between equal covariate records) the two
-            // fields differ only by the rate, so take the cheaper `cross_rate_switch` (#653
-            // review #5).
+            // The state is continuous across `w_end`; only `du/dt` jumps, by the rates
+            // switching off. `w_end` is not a record, so both sides read the enclosing segment's
+            // `params` (#1160 — see the one-snapshot note above `last_dose_eff`) and the crossing
+            // is the cheap `cross_rate_switch` over that one field. The two-sided `(J⁺ − J⁻)`
+            // arm #653 review #3 added here is gone: since #1073 it was reachable only on a ULP
+            // sliver below a record, and wrong there.
             //
             // Co-terminating windows (two doses whose `t+lag+dur` coincide) share one physical
             // boundary: they are processed together as a cohort at the first of their `K_ZO_END`
-            // events so the covariate (`J⁺−J⁻`) correction fires ONCE, not once per window
-            // (#653 review #2); `zo_end_done` no-ops the siblings. (Residual exotic limitation:
-            // a zero-order window and an infusion — or a window with an *independent* `dur` jet —
-            // co-terminating at the exact same instant under a covariate varying across it would
-            // double-count that one covariate correction; the rates themselves stay exact.)
+            // events, each switching off at its own shift over the field with the windows
+            // already off removed (#653 review #2); `zo_end_done` no-ops the siblings.
             if !zo_end_done[idx] {
                 let ceps = crate::ode::predictions::INFUSION_EPS;
                 // Active windows sharing this boundary instant (the cohort); mark them (and this
@@ -4323,71 +4261,34 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 }
                 zo_end_done[idx] = true;
                 if !cohort.is_empty() {
-                    // Shared shift `δ = δlag + δdur (+ δlag_route)` (co-terminating ⇒ same
-                    // `t + lag + lag_route + dur` ⇒ same jet in the common case). Use the
-                    // representative (first) cohort window.
-                    let (cmt_rep, _, _, _, dur_rep, k_rep) = zero_windows[cohort[0]];
-                    let dlag = if has_lagtime {
-                        jet_only(pk_at_dose[k_rep][dose_lag_slot[k_rep]])
-                    } else {
-                        T::from_f64(0.0)
+                    // One field across the boundary: each window switches off at its own shift
+                    // `δ = δlag + δdur (+ δlag_route)` (cohort members may differ in
+                    // `dur`/`lag`), in turn, over the field with the windows already off removed.
+                    let velocity = |x: &[T], s: T| {
+                        boundary_velocity(x, params, t_event, s, last_dose_eff, reset_floor, false)
                     };
-                    // #859 Slice 2: a route-lagged window's end `w_end = t + lag_cmt + lag_route
-                    // + dur` also moves with `lag_route`, so its jet joins the rate-off shift.
-                    let route_lag_rep = zero_order_route_lag(ode, cmt_rep, &pk_at_dose[k_rep])
-                        .map_or_else(|| T::from_f64(0.0), jet_only);
-                    let d_off = dlag + jet_only(dur_rep) + route_lag_rep;
-                    // Pre-boundary params = the segment ending at `w_end`. Since #1073 a
-                    // non-record boundary no longer reuses the PREVIOUS record: it belongs
-                    // to the interval the next record terminates, which is what the outer
-                    // `params` resolved. Post-boundary params = the first strictly-later
-                    // record's snapshot (#653 #2). With no record co-timed with `w_end` the
-                    // two now coincide and the cheap path below fires — correctly, since
-                    // there is no field jump across a boundary interior to one interval.
-                    let pre_params = params;
-                    let post_params: &[T] = post_snapshot(p, t_event).unwrap_or(last_params);
-                    let velocity = |x: &[T], side: &[T], s: T| {
-                        boundary_velocity(x, side, t_event, s, last_dose_eff, reset_floor, false)
-                    };
-                    if pk_snapshot_equal(pre_params, post_params) {
-                        // One field across the boundary: each window switches off at its own
-                        // shift (cohort members may differ in `dur`/`lag`), in turn, over the
-                        // field with the windows already off removed.
-                        let mut off: Vec<(usize, T)> = Vec::new();
-                        for &j in &cohort {
-                            let (cmt, rate, _, _, dur_j, k_j) = zero_windows[j];
-                            let dlag_j = if has_lagtime {
-                                jet_only(pk_at_dose[k_j][dose_lag_slot[k_j]])
-                            } else {
-                                T::from_f64(0.0)
-                            };
-                            let route_lag_j = zero_order_route_lag(ode, cmt, &pk_at_dose[k_j])
-                                .map_or_else(|| T::from_f64(0.0), jet_only);
-                            let d_off_j = dlag_j + jet_only(dur_j) + route_lag_j;
-                            let mut base = |x: &[T], s: T, out: &mut [T]| {
-                                out.copy_from_slice(&velocity(x, pre_params, s));
-                                for &(c, r) in &off {
-                                    out[c] = out[c] - r;
-                                }
-                                // Inclusive membership put this window in `base`;
-                                // `cross_rate_switch` adds it back on the side that has it.
-                                out[cmt] = out[cmt] - rate;
-                            };
-                            cross_rate_switch(&mut u, d_off_j, cmt, &|_| rate, false, &mut base);
-                            off.push((cmt, rate));
-                        }
-                    } else {
-                        let mut pre = |x: &[T], s: T, out: &mut [T]| {
-                            out.copy_from_slice(&velocity(x, pre_params, s));
+                    let mut off: Vec<(usize, T)> = Vec::new();
+                    for &j in &cohort {
+                        let (cmt, rate, _, _, dur_j, k_j) = zero_windows[j];
+                        let dlag_j = if has_lagtime {
+                            jet_only(pk_at_dose[k_j][dose_lag_slot[k_j]])
+                        } else {
+                            T::from_f64(0.0)
                         };
-                        let mut post = |x: &[T], s: T, out: &mut [T]| {
-                            out.copy_from_slice(&velocity(x, post_params, s));
-                            for &j in &cohort {
-                                let (cmt, rate, _, _, _, _) = zero_windows[j];
-                                out[cmt] = out[cmt] - rate;
+                        let route_lag_j = zero_order_route_lag(ode, cmt, &pk_at_dose[k_j])
+                            .map_or_else(|| T::from_f64(0.0), jet_only);
+                        let d_off_j = dlag_j + jet_only(dur_j) + route_lag_j;
+                        let mut base = |x: &[T], s: T, out: &mut [T]| {
+                            out.copy_from_slice(&velocity(x, s));
+                            for &(c, r) in &off {
+                                out[c] = out[c] - r;
                             }
+                            // Inclusive membership put this window in `base`;
+                            // `cross_rate_switch` adds it back on the side that has it.
+                            out[cmt] = out[cmt] - rate;
                         };
-                        cross_moving_boundary(&mut u, d_off, &mut pre, &mut post, &|_| {});
+                        cross_rate_switch(&mut u, d_off_j, cmt, &|_| rate, false, &mut base);
+                        off.push((cmt, rate));
                     }
                 }
             }
