@@ -179,8 +179,13 @@ impl<T: PkNum> SeededPkDuals<T> {
         }
     }
 
-    /// Build the disposition the `flags` class superposes over, once.
+    /// Build the disposition the `flags` class superposes over, once. Not for a degenerate
+    /// `CL` or `V` (#2104): [`superpose_doses`] drops every dose then and never reads it,
+    /// and its macro rates would be `NaN` (`CL = +inf` gives `inf − inf` in the roots).
     fn with_disposition(mut self, flags: PkClassFlags) -> Self {
+        if self.cl_or_v_degenerate() {
+            return self;
+        }
         if flags.three_cpt {
             self.three = Some(super::three_cpt::ThreeCpt::new(
                 self.cl_d, self.v1_d, self.q_d, self.v2_d, self.q3_d, self.v3_d,
@@ -191,6 +196,13 @@ impl<T: PkNum> SeededPkDuals<T> {
             ));
         }
         self
+    }
+
+    /// The degenerate-parameter rule both closed-form engines apply
+    /// ([`crate::sens::propagate::cl_or_v_degenerate`], #2104), on the seeded values.
+    #[inline]
+    fn cl_or_v_degenerate(&self) -> bool {
+        crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
     }
 }
 
@@ -236,7 +248,15 @@ fn superpose_doses<T: PkNum>(
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
             continue;
         };
-        let c = if flags.transit {
+        // A degenerate `CL` or `V` drops the dose: the value path's own early return in
+        // `pk::single_dose_concentration`, on the same predicate, so this recording and
+        // the prediction it differentiates serve the same constant 0 (#2104). Before it a
+        // `CL = +inf` reached the kernels, whose guards test only `≤ 0`, and recorded `NaN`
+        // where the prediction was 0. First in the ladder, so a disposition
+        // `with_disposition` declined to build is never asked for.
+        let c = if d.cl_or_v_degenerate() {
+            T::from_f64(0.0)
+        } else if flags.transit {
             one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
         } else if flags.two_cpt_transit {
             two_cpt_transit_conc_g(
@@ -1696,3 +1716,7 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
         // let the dual walk mirror production, instead of falling to FD.
         || (subject.has_resets() && subject.doses.iter().any(|d| d.ss))
 }
+
+#[cfg(test)]
+#[path = "provider_degenerate_tests.rs"]
+mod degenerate_tests;
