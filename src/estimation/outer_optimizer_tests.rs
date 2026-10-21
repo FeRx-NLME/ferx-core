@@ -4422,7 +4422,15 @@ fn select_fd_step_no_halving_needed() {
     let x_hat = [1.0f64, 2.0];
     let free_idx = [0usize, 1];
     let f0 = ofv(&x_hat);
-    let step = select_fd_step(&x_hat, &free_idx, 0.01, f0, &ofv, &FitOptions::default());
+    let step = select_fd_step(
+        &x_hat,
+        &free_idx,
+        &[1.0; 2],
+        0.01,
+        f0,
+        &ofv,
+        &FitOptions::default(),
+    );
     let (eps, halvings) = (step.eps, step.n_halvings);
     assert_eq!(eps, 0.01, "step should be unchanged");
     assert_eq!(halvings, 0, "no halvings expected");
@@ -4446,7 +4454,15 @@ fn select_fd_step_halves_on_overflow() {
     // initial_eps=1.0 → hi=1.0 → x=1.0 ≥ 0.5 → NaN → halve
     // eps=0.5 → hi=0.5 → x=0.5 ≥ 0.5 → NaN → halve
     // eps=0.25 → hi=0.25 → x=0.25 < 0.5 → 0.0625 → OK
-    let step = select_fd_step(&x_hat, &free_idx, 1.0, f0, &ofv, &FitOptions::default());
+    let step = select_fd_step(
+        &x_hat,
+        &free_idx,
+        &[1.0],
+        1.0,
+        f0,
+        &ofv,
+        &FitOptions::default(),
+    );
     let (eps, halvings) = (step.eps, step.n_halvings);
     assert_eq!(eps, 0.25, "should have halved twice");
     assert_eq!(halvings, 2);
@@ -4461,7 +4477,7 @@ fn select_fd_step_halves_on_overflow() {
 #[test]
 fn select_fd_step_empty_free_idx() {
     let ofv = |_x: &[f64]| f64::NAN; // would fail any real stencil
-    let step = select_fd_step(&[1.0], &[], 0.01, 0.0, &ofv, &FitOptions::default());
+    let step = select_fd_step(&[1.0], &[], &[1.0], 0.01, 0.0, &ofv, &FitOptions::default());
     let (eps, halvings) = (step.eps, step.n_halvings);
     assert_eq!(eps, 0.01);
     assert_eq!(halvings, 0);
@@ -4500,6 +4516,7 @@ fn select_fd_step_rejects_finite_numerator_infinite_quotient() {
     let halvings = select_fd_step(
         &x_hat,
         &free_idx,
+        &[1.0],
         initial_eps,
         f0,
         &ofv,

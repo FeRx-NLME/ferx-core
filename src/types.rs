@@ -7186,6 +7186,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on `data_quality`. That arm serves several unrelated inputs, so a test
         // asserting only the category asserts almost nothing — assert the token.
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_covariate_missing") {
+        // #2041: a covariate column with no value for some subjects. A token arm
+        // ahead of every prose arm, because the message interpolates the
+        // covariate's name and the subjects' IDs — strings the *data* spells — so
+        // a covariate called `DURBIN` would otherwise be claimed by the
+        // Durbin-Watson arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("covariance step failed") {
         // #2158: every covariance-step failure reason starts with this prefix (after the
         // chain tag stripped above), and the prefix — not a phrase inside the reason —
