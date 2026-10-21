@@ -243,7 +243,11 @@ A wrapper prints the same rows through the engine's own formatter, at print time
 `format_kappa_rows_from`. A covariance step run later therefore changes the printed
 notes, just as it does in the CLI. `KappaRowsOptions { ascii: true }` spells `→` as `->`
 and `κ` as `kappa` for a console that cannot print UTF-8. Names are printed as
-given.
+given. A `block_kappa`'s correlations are not part of the
+rows: `ferx_core::io::output::offdiag_corrs` over `omega_iov`,
+`omega_iov_param_corr` and the kappa names returns the pairs the console's
+`--- Correlations ---` block reports, with each correlation's source (#2231; see
+[Printing the OMEGA rows from a wrapper](individual-parameters.qmd#printing-the-omega-rows-from-a-wrapper)).
 
 ### Rules and diagnostics
 

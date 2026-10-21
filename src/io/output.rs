@@ -688,28 +688,59 @@ fn eta_name(result: &FitResult, k: usize) -> &str {
     result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA")
 }
 
-/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
-/// covariance matrix: the names, the covariance and its parameter correlation.
-struct OffDiagCorr<'a> {
-    i: usize,
-    j: usize,
-    name_i: &'a str,
-    name_j: &'a str,
-    cov: f64,
-    corr: f64,
+/// Where an [`OffDiagCorr::corr`] came from, so a wrapper can label it: the
+/// covariance step's parameter-correlation matrix, or the cov/√var fallback
+/// when none was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffDiagCorrSource {
+    /// The `param_corr` matrix entry `(i, j)`.
+    ParamCorr,
+    /// `cov / (√var_i · √var_j)`, or 0 when either variance is not positive.
+    /// Used when no `param_corr` matrix was given, or it has no `(i, j)` entry.
+    Fallback,
 }
 
-/// The off-diagonal entries of `m` the console and `format_summary` report, in
-/// row-major lower-triangle order: every `|cov| > 1e-15`, its correlation from
-/// `param_corr` or the cov/√var fallback ([`param_corr_fallback`]). The four
-/// correlation walks (Ω and Ω_IOV, console and summary) all read this, so they
-/// cannot disagree on which pairs are correlated (#1682); each keeps its own
-/// line format.
-fn offdiag_corrs<'a>(
+/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
+/// covariance matrix: the names, the covariance and its correlation. Returned
+/// by [`offdiag_corrs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffDiagCorr<'a> {
+    /// Row of the entry (the later random effect).
+    pub i: usize,
+    /// Column of the entry, `j < i`.
+    pub j: usize,
+    /// Name of random effect `i`.
+    pub name_i: &'a str,
+    /// Name of random effect `j`.
+    pub name_j: &'a str,
+    /// The covariance `m[(i, j)]`.
+    pub cov: f64,
+    /// The correlation, from the source named by `corr_source`.
+    pub corr: f64,
+    /// Whether `corr` is the `param_corr` entry or the cov/√var fallback.
+    pub corr_source: OffDiagCorrSource,
+}
+
+/// The off-diagonal entries of the random-effect covariance matrix `m` (Ω, or
+/// Ω_IOV of a `block_kappa`) that the console's `--- Correlations ---` blocks
+/// and [`format_summary`] report, in row-major lower-triangle order: every
+/// `(i, j)`, `j < i`, with `|cov| > 1e-15`. Its correlation is the
+/// `param_corr` entry when the matrix is given (`FitResult::omega_param_corr`
+/// / `omega_iov_param_corr`), else `cov / (√var_i · √var_j)` (0 when either
+/// variance is not positive); [`OffDiagCorr::corr_source`] says which.
+///
+/// `names` is indexed like `m`; a missing name reads as `default_name` (the
+/// console uses `ETA` for Ω and `KAPPA` for Ω_IOV). The console and summary
+/// walks for Ω and Ω_IOV all read this, so they cannot disagree on which pairs
+/// are correlated (#1682); a wrapper (ferx-r's `print.ferx_fit()`, #2231)
+/// reads the same facts and formats each line itself.
+pub fn offdiag_corrs<'a>(
     m: &nalgebra::DMatrix<f64>,
     param_corr: Option<&nalgebra::DMatrix<f64>>,
-    name: impl Fn(usize) -> &'a str,
+    names: &'a [String],
+    default_name: &'a str,
 ) -> Vec<OffDiagCorr<'a>> {
+    let name = |k: usize| names.get(k).map_or(default_name, |s| s.as_str());
     let mut out = Vec::new();
     for i in 0..m.nrows() {
         for j in 0..i {
@@ -717,13 +748,21 @@ fn offdiag_corrs<'a>(
             if cov.abs() <= 1e-15 {
                 continue;
             }
+            let (corr, corr_source) = match param_corr.and_then(|pc| pc.get((i, j))) {
+                Some(&c) => (c, OffDiagCorrSource::ParamCorr),
+                None => (
+                    param_corr_fallback(None, cov, m[(i, i)], m[(j, j)], i, j),
+                    OffDiagCorrSource::Fallback,
+                ),
+            };
             out.push(OffDiagCorr {
                 i,
                 j,
                 name_i: name(i),
                 name_j: name(j),
                 cov,
-                corr: param_corr_fallback(param_corr, cov, m[(i, i)], m[(j, j)], i, j),
+                corr,
+                corr_source,
             });
         }
     }
@@ -735,9 +774,12 @@ fn offdiag_corrs<'a>(
 fn format_omega_corr_rows(result: &FitResult) -> String {
     use std::fmt::Write;
     let n_eta = result.omega.nrows();
-    let corrs = offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-        eta_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        &result.omega,
+        result.omega_param_corr.as_ref(),
+        &result.eta_names,
+        "ETA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -764,9 +806,12 @@ fn format_kappa_corr_rows(result: &FitResult) -> String {
     let Some(iov) = result.omega_iov.as_ref() else {
         return String::new();
     };
-    let corrs = offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-        kappa_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        iov,
+        result.omega_iov_param_corr.as_ref(),
+        &result.kappa_names,
+        "KAPPA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -1526,9 +1571,12 @@ pub fn format_summary(result: &FitResult) -> String {
         // (#1657), so the two cannot drift.
         out.push_str(&format_omega_rows(result));
         // Off-diagonal correlations (block omega).
-        for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-            eta_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            &result.omega,
+            result.omega_param_corr.as_ref(),
+            &result.eta_names,
+            "ETA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -1540,9 +1588,12 @@ pub fn format_summary(result: &FitResult) -> String {
         out.push_str(&format_kappa_rows(result));
         // Off-diagonal correlations (block_kappa, #1667), in the OMEGA style
         // above and from the same matrix the console reads.
-        for c in offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-            kappa_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            iov,
+            result.omega_iov_param_corr.as_ref(),
+            &result.kappa_names,
+            "KAPPA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -7547,6 +7598,78 @@ mod tests {
         r.omega_iov_param_corr = Some(kc);
         r.kappa_names.truncate(2);
         r
+    }
+
+    /// #2231: the public `offdiag_corrs` facts a wrapper formats itself —
+    /// which pairs (the `1e-15` cut on `|cov|`, row-major lower triangle), their
+    /// names with the caller's default for a missing one, and the correlation
+    /// with its source: the `param_corr` entry when given, the cov/√var
+    /// fallback without one, and the fallback (not a panic) when a wrapper's
+    /// `param_corr` is smaller than the matrix.
+    #[test]
+    fn offdiag_corrs_public_facts() {
+        let r = corr_result();
+        let iov = r.omega_iov.as_ref().unwrap();
+        let facts = |m,
+                     pc,
+                     names,
+                     default|
+         -> Vec<(usize, usize, String, String, f64, f64, OffDiagCorrSource)> {
+            offdiag_corrs(m, pc, names, default)
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.i,
+                        c.j,
+                        c.name_i.to_string(),
+                        c.name_j.to_string(),
+                        c.cov,
+                        c.corr,
+                        c.corr_source,
+                    )
+                })
+                .collect()
+        };
+        use OffDiagCorrSource::{Fallback, ParamCorr};
+        let s = |x: &str| x.to_string();
+
+        assert_eq!(
+            facts(&r.omega, r.omega_param_corr.as_ref(), &r.eta_names, "ETA"),
+            vec![
+                (1, 0, s("eta_V"), s("eta_CL"), 0.02, -0.25, ParamCorr),
+                (2, 1, s("ETA"), s("eta_V"), 2e-15, 0.0, ParamCorr),
+            ],
+            "Ω with param_corr"
+        );
+        assert_eq!(
+            facts(
+                iov,
+                r.omega_iov_param_corr.as_ref(),
+                &r.kappa_names,
+                "KAPPA"
+            ),
+            vec![
+                (1, 0, s("K_ADD"), s("K_LN"), 0.5, 0.7, ParamCorr),
+                (2, 1, s("KAPPA"), s("K_ADD"), -3e-15, 0.0, ParamCorr),
+            ],
+            "Ω_IOV with param_corr"
+        );
+
+        let want_fb = 0.02 / (0.1f64.sqrt() * 0.2f64.sqrt());
+        let fb = facts(&r.omega, None, &r.eta_names, "ETA");
+        assert_eq!(fb.len(), 2, "fallback keeps the same pairs");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "no param_corr");
+
+        // A 1x1 param_corr has no (1, 0) entry: fallback, no out-of-bounds panic.
+        let short = DMatrix::identity(1, 1);
+        let fb = facts(&r.omega, Some(&short), &r.eta_names, "ETA");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "short param_corr");
+
+        // A non-positive variance makes the fallback 0, not NaN.
+        let mut m = r.omega.clone();
+        m[(0, 0)] = 0.0;
+        let fb = facts(&m, None, &[], "X");
+        assert_eq!((fb[0].2.as_str(), fb[0].5, fb[0].6), ("X", 0.0, Fallback));
     }
 
     /// The console's correlation blocks and `format_summary`'s `corr(...)`
