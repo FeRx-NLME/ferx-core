@@ -1137,14 +1137,25 @@ where
 /// Divide the `auc_target` window AUCs, integrated on the bare readout, by the
 /// monitor's `[scaling]` divisor (#2129).
 ///
-/// One subject-wide η and the static covariate snapshot give the divisor, so dividing
-/// the window AUC equals dividing every grid point only while the divisor cannot move
-/// inside the horizon: no decision-window κ and no per-event PK. The `auc_target`
-/// refusal in `run_adaptive_population` keeps both out today. The `debug_assert!`
-/// states the property itself, written independently of that refusal's predicate, so a
-/// widened refusal fails here instead of mis-dividing (#2156; the per-grid-point
-/// conversion belongs to the #943 rewrite of the window pass). Pinned by
-/// `adaptive_frem_tests::window_auc_divide_asserts_a_constant_divisor`.
+/// The divisor is evaluated once per subject: under `eta_slice` (κ = 0) and, as
+/// `apply_scaling` always does, on the static covariate snapshot at t = 0. Dividing the
+/// window AUC by it is exact while two conditions hold, and each `debug_assert!` below
+/// states one of them:
+///
+/// - **No decision-window κ.** Under IOV each window reads under its own `[η | κ_g]`, so
+///   a κ the divisor reads moves it between windows, and one κ = 0 divisor is wrong.
+/// - **No per-event PK.** This divide is right for such a subject, since the divisor
+///   never follows the covariates. The AUC it divides is not: the window pass integrates
+///   one frozen PK snapshot, so a time-varying covariate or `TIME` in the PK leaves the
+///   integrand itself wrong.
+///
+/// The `auc_target` refusal in `run_adaptive_population` keeps both cases out today, so
+/// neither fires in production. They state the conditions at the place that relies on
+/// them, so a widened refusal fails here in debug builds. The second one calls the same
+/// `subject_needs_per_event_pk` the refusal calls, so it shares that predicate's
+/// definition of per-event PK. Both go when #943 rewrites the window pass per grid point
+/// (#2156). Pinned by `adaptive_frem_tests::window_auc_divide_asserts_no_decision_kappa`
+/// and `adaptive_frem_tests::window_auc_divide_asserts_no_per_event_pk`.
 pub(crate) fn adaptive_window_aucs_to_model_scale(
     model: &CompiledModel,
     subject: &Subject,
@@ -1154,10 +1165,16 @@ pub(crate) fn adaptive_window_aucs_to_model_scale(
     aucs: Vec<f64>,
 ) -> Vec<f64> {
     debug_assert!(
-        eta_occ.is_none() && !crate::pk::subject_needs_per_event_pk(model, subject),
-        "auc_target: the window AUC is divided by one subject-wide [scaling] divisor, but \
-         subject '{}' has a divisor that can change across the horizon (IOV κ or per-event \
-         PK); convert per grid point instead (#943)",
+        eta_occ.is_none(),
+        "auc_target: subject '{}' has a decision-window κ, so its [scaling] divisor can \
+         change between windows, but the window AUCs are divided by one κ = 0 divisor; \
+         convert per grid point instead (#943)",
+        subject.id
+    );
+    debug_assert!(
+        !crate::pk::subject_needs_per_event_pk(model, subject),
+        "auc_target: subject '{}' needs per-event PK, but the window AUCs integrate one \
+         frozen PK snapshot; integrate per event instead (#943)",
         subject.id
     );
     aucs.into_iter()
