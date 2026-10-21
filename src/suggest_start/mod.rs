@@ -21,6 +21,7 @@ use rayon::prelude::*;
 
 use crate::diagnostics::first_error;
 
+use crate::parser::model_parser::PKTIME_SYNTH_PREFIX;
 use crate::types::{
     CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_F,
     PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
@@ -559,7 +560,8 @@ fn try_biexp_peel(
 /// Find which theta index drives a given PK slot.
 ///
 /// Three-layer lookup (model-agnostic, works with or without mu-referencing):
-/// 1. [`CompiledModel::indiv_param_for_pk_slot`]: the `indiv_param_names` entry
+/// 1. [`nca_owner`] ([`CompiledModel::indiv_param_for_pk_slot`] minus the
+///    synthetic `TIME` parameter): the `indiv_param_names` entry
 ///    whose **own** PK slot matches, then the mu-reference that parameter's
 ///    effective (last) assignment carries, `CompiledModel::mu_ref_owner`. Not a `pk_indices` scan: an analytical model gives every
 ///    unbound intermediate the placeholder slot `0`, so `CLWT = exp(CLWT_EXP *
@@ -600,7 +602,7 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
     let params = &model.default_params;
 
     // No owning parameter: the role is bound to a literal or to `TIME`.
-    let indiv_pos = model.indiv_param_for_pk_slot(pk_slot)?;
+    let indiv_pos = nca_owner(model, pk_slot)?;
 
     // Layer 1: owning individual parameter → its own mu-reference → theta index.
     if let Some((_, theta_name)) = model.mu_ref_owner(indiv_pos) {
@@ -626,6 +628,19 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
         .position(|n| n.to_ascii_uppercase().contains(canonical))
 }
 
+/// The individual parameter that owns `pk_slot` **for NCA routing**:
+/// [`CompiledModel::indiv_param_for_pk_slot`], except that the parser's
+/// synthetic `__ferx_pktime_<role>` parameter — what a direct `pk(...=TIME)`
+/// binding desugars to (#486) — counts as no owner. Its value is `TIME`, read
+/// from no θ, so like a literal binding it has nothing for NCA to estimate;
+/// taking it as an owner sent the role through to layer 3, where `cl=TIME` wrote
+/// the pooled clearance onto any θ whose name contains `CL` (#1930 review r2).
+fn nca_owner(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
+    model
+        .indiv_param_for_pk_slot(pk_slot)
+        .filter(|&i| !model.indiv_param_names[i].starts_with(PKTIME_SYNTH_PREFIX))
+}
+
 /// Find the omega diagonal index for the eta driving a given PK slot.
 ///
 /// Resolves the owning individual parameter through
@@ -640,7 +655,7 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
 /// parameter's mu-reference also reads is declined: its variance is not `CL`'s
 /// alone, so `CL`'s inter-subject CV² is no estimate of it.
 fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
-    let indiv_pos = model.indiv_param_for_pk_slot(pk_slot)?;
+    let indiv_pos = nca_owner(model, pk_slot)?;
     let (eta_name, _) = model.mu_ref_owner(indiv_pos)?;
     let shared = (0..model.indiv_param_names.len())
         .filter(|&j| j != indiv_pos)
@@ -663,7 +678,7 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
 /// to estimate (#1930), while a role whose parameter exists but resolves to no θ
 /// is a model the lookup could not read.
 fn unmapped_role_warning(model: &CompiledModel, pk_slot: usize, role: &str) -> String {
-    if model.indiv_param_for_pk_slot(pk_slot).is_none() {
+    if nca_owner(model, pk_slot).is_none() {
         format!(
             "inits_from_nca: {role} is bound to a literal or TIME on the [structural_model] \
              line, so there is no theta to write the NCA estimate to; left as declared"
@@ -1316,80 +1331,103 @@ mod tests {
         );
     }
 
-    /// #1930, first shape: a PK role bound to a **literal** (`cl=1.0`). No
-    /// individual parameter owns the slot, so there is nothing for NCA to estimate
-    /// and the lookup must answer `None`. Before the fix layer 3 searched every θ
-    /// for the canonical slot name and answered `THCL_A` — a readout coefficient —
-    /// because it contains `CL`, and `build_params` pinned it at its upper bound
-    /// (measured 5.0 against the model default 0.5).
+    /// #1930, first shape: a PK role bound to a **literal** (`cl=1.0`) or to
+    /// `TIME` (`cl=TIME`). Neither has a θ behind it, so there is nothing for NCA
+    /// to estimate and the lookup must answer `None`. Before the fix layer 3
+    /// searched every θ for the canonical slot name and answered `THCL_A` — a
+    /// readout coefficient — because it contains `CL`, and `build_params` pinned it
+    /// at its upper bound (measured 5.0 against the model default 0.5).
+    ///
+    /// The two bindings reach the lookup differently, which is why both are here:
+    /// a literal leaves the slot with no owning parameter at all, while `TIME` is
+    /// desugared to a synthetic `__ferx_pktime_cl` parameter that *does* own it, so
+    /// only [`nca_owner`]'s filter keeps it out of layer 3 (#1930 review r2). The
+    /// owner premise is asserted per binding, so the `TIME` case cannot silently
+    /// become a second literal case.
     ///
     /// The fixture keeps `THCL_A` as the *only* θ containing `CL`, so a layer-3
     /// search that ran for an ownerless role would find it: the premise is asserted.
     #[test]
-    fn nca_leaves_a_literal_bound_role_unrouted() {
-        let src = "[parameters]\n  theta THCL_A(0.5, 0.0, 5.0)\n  \
-             theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
-             omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
-             [individual_parameters]\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n  \
-             BASE = THCL_A\n\
-             [structural_model]\n  pk one_cpt_oral(cl=1.0, v=V, ka=KA)\n\
-             [scaling]\n  y = central / V + BASE\n\
-             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
-        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
-        // The premise: no individual parameter owns CL's slot, because a literal
-        // binds the role — and a canonical-name search would have a θ to find.
-        assert_eq!(
-            m.indiv_param_for_pk_slot(PK_IDX_CL),
-            None,
-            "a literal-bound role owns no individual parameter"
-        );
-        assert!(
-            m.default_params
-                .theta_names
-                .iter()
-                .any(|n| n.to_ascii_uppercase().contains("CL")),
-            "some theta must contain `CL`, or skipping layer 3 is not what is tested"
-        );
-        assert_eq!(
-            find_theta_for_slot(&m, PK_IDX_CL),
-            None,
-            "#1930: a literal-bound role has no estimate to route"
-        );
-        assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None);
-        // The slots that do have owners are unaffected.
-        let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
-        assert_eq!(m.default_params.theta_names[v], "TVV");
-
-        // The user-visible half: `build_params` must not write the pooled clearance
-        // anywhere. `NcaInit::Nca`, so no sweep can move a theta instead.
+    fn nca_leaves_a_literal_or_time_bound_role_unrouted() {
         let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
             .expect("data loads");
-        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
-        let i = out
-            .params
-            .theta_names
-            .iter()
-            .position(|n| n == "THCL_A")
-            .expect("THCL_A");
-        assert_eq!(
-            out.params.theta[i], m.default_params.theta[i],
-            "#1930: THCL_A must not receive the pooled clearance when `cl` is a literal"
-        );
-        assert!(
-            out.warnings
+        for binding in ["1.0", "TIME"] {
+            let src = format!(
+                "[parameters]\n  theta THCL_A(0.5, 0.0, 5.0)\n  \
+                 theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+                 omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+                 [individual_parameters]\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n  \
+                 BASE = THCL_A\n\
+                 [structural_model]\n  pk one_cpt_oral(cl={binding}, v=V, ka=KA)\n\
+                 [scaling]\n  y = central / V + BASE\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            );
+            let m = crate::parser::model_parser::parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("cl={binding}: {e}"));
+            // The premise, per binding: what owns CL's slot before NCA's filter.
+            let owner = m
+                .indiv_param_for_pk_slot(PK_IDX_CL)
+                .map(|i| m.indiv_param_names[i].as_str());
+            if binding == "TIME" {
+                assert!(
+                    owner.is_some_and(|n| n.starts_with(PKTIME_SYNTH_PREFIX)),
+                    "cl=TIME must be owned by the synthetic TIME parameter, or the \
+                     filter is not what is tested: {owner:?}"
+                );
+            } else {
+                assert_eq!(owner, None, "a literal-bound role owns no parameter");
+            }
+            assert_eq!(nca_owner(&m, PK_IDX_CL), None, "cl={binding}");
+            assert!(
+                m.default_params
+                    .theta_names
+                    .iter()
+                    .any(|n| n.to_ascii_uppercase().contains("CL")),
+                "some theta must contain `CL`, or skipping layer 3 is not what is tested"
+            );
+            assert_eq!(
+                find_theta_for_slot(&m, PK_IDX_CL),
+                None,
+                "#1930: cl={binding} has no estimate to route"
+            );
+            assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None, "cl={binding}");
+            // The slots that do have owners are unaffected.
+            let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
+            assert_eq!(m.default_params.theta_names[v], "TVV", "cl={binding}");
+
+            // The user-visible half: `build_params` must not write the pooled
+            // clearance anywhere. `NcaInit::Nca`, so no sweep can move a theta.
+            let out = inits_from_nca(&m, &pop, NcaInit::Nca)
+                .unwrap_or_else(|e| panic!("cl={binding}: {e}"));
+            let i = out
+                .params
+                .theta_names
                 .iter()
-                .any(|w| w.contains("CL is bound to a literal or TIME")),
-            "the unrouted clearance must be reported: {:?}",
-            out.warnings
-        );
-        // V is still routed, so this is not a run in which NCA wrote nothing at all.
-        let vi = out
-            .params
-            .theta_names
-            .iter()
-            .position(|n| n == "TVV")
-            .unwrap();
-        assert_ne!(out.params.theta[vi], m.default_params.theta[vi]);
+                .position(|n| n == "THCL_A")
+                .expect("THCL_A");
+            assert_eq!(
+                out.params.theta[i], m.default_params.theta[i],
+                "#1930: THCL_A must not receive the pooled clearance when cl={binding}"
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("CL is bound to a literal or TIME")),
+                "cl={binding}: the unrouted clearance must be reported: {:?}",
+                out.warnings
+            );
+            // V is still routed, so this is not a run in which NCA wrote nothing.
+            let vi = out
+                .params
+                .theta_names
+                .iter()
+                .position(|n| n == "TVV")
+                .unwrap();
+            assert_ne!(
+                out.params.theta[vi], m.default_params.theta[vi],
+                "cl={binding}"
+            );
+        }
     }
 
     /// The #1930 two-qualifying-η model: `CL = TVCL * exp(ETA_CL)` and an unbound
