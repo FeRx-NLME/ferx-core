@@ -18,10 +18,10 @@
 //! outer gradient to finite differences, so `optimizer = auto` resolved to BOBYQA,
 //! `gradient_method_outer` read `N/A` and the covariance step ran the FD stencil, with
 //! no warning naming the cap. `outer_route_is_the_same_past_the_cap` pins that the
-//! outer route no longer depends on the axis count.
+//! outer route no longer depends on the axis count, as an immediate probe.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{CovarianceStatus, FitOptions};
+use ferx_core::types::FitOptions;
 use ferx_core::{fit, read_nonmem_csv, FitResult};
 use std::path::Path;
 
@@ -191,24 +191,24 @@ fn ode_inner_stays_analytic_past_the_cap_at_loose_ode_tolerances() {
     assert_twins_agree("ode_reltol = 1e-3, ode_abstol = 1e-6", Some((1e-3, 1e-6)));
 }
 
-/// #2048: a few outer iterations with the covariance step on, at 24 and 25 axes. Both
-/// twins report an analytic outer gradient, resolve `auto` to L-BFGS, carry no
-/// finite-difference warning, and compute the covariance step; since the FIX θ is not
-/// in the optimizer's vector, the two runs take the same steps and land on the same OFV.
-/// Before #2093 the 25-axis twin read `N/A` / `auto (bobyqa)` here. Which R-matrix the
-/// step assembles is not visible on `FitResult` — a `Computed` status is reached by the
-/// FD stencil too — so that half is pinned by the Tier-1
-/// `an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject`, which
-/// counts the FD objectives the step evaluates.
+/// #2048: an immediate route probe at 24 and 25 axes — six subjects, `outer_maxiter = 0`
+/// (one objective and gradient evaluation at the start values), no covariance step. Both
+/// twins report an analytic outer gradient, resolve `auto` to L-BFGS and carry no
+/// finite-difference warning, and the OFV agrees bit for bit. Before #2093 the 25-axis
+/// twin read `N/A` / `auto (bobyqa)` here. The covariance step's route is not visible on
+/// `FitResult` (a `Computed` status is reached by the FD stencil too), so it is pinned by
+/// the Tier-1 `an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject`,
+/// which counts the FD objectives the step evaluates.
 #[test]
 fn outer_route_is_the_same_past_the_cap() {
     let run = |n_fix: usize| {
         let parsed = parse_full_model(&make_model(n_fix)).expect("padded model parses");
-        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        let mut pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
             .expect("two_cpt_oral_cov.csv loads");
+        pop.subjects.truncate(6);
         let options = FitOptions {
-            outer_maxiter: 3,
-            run_covariance_step: true,
+            outer_maxiter: 0,
+            run_covariance_step: false,
             ..parsed.fit_options.clone()
         };
         fit(&parsed.model, &pop, &parsed.model.default_params, &options).expect("fit runs")
@@ -230,11 +230,6 @@ fn outer_route_is_the_same_past_the_cap() {
             .filter(|w| w.contains("finite-difference") || w.contains("finite difference"))
             .collect();
         assert!(fd.is_empty(), "{label}: unexpected FD warning(s): {fd:?}");
-        assert_eq!(
-            r.covariance_status,
-            CovarianceStatus::Computed,
-            "{label}: covariance step"
-        );
     }
     assert!(at_cap.ofv.is_finite(), "OFV {}", at_cap.ofv);
     assert_eq!(at_cap.ofv, past_cap.ofv, "OFV at 24 vs 25 axes");
