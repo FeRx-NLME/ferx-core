@@ -556,7 +556,7 @@ fabricated provenance.
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
-| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's `R` matrix runs on the finite-difference route (`2n²`; the analytic assembly, where it applies, runs none, which this count does not yet check), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R` |
+| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's `R` matrix runs on the finite-difference route (`2n²`), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R`, and never when the analytic `R` assembly (`analytic_cov_hessian`, the default) is expected to cover every subject, since it runs none. When only a minority of subjects is outside the analytic scope, the count is the same `2n²` but each evaluation covers just those subjects. Predicted before the fit, so a subject that bails out of the analytic assembly at run time can still make the step costlier than this says |
 | `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |
 
 ### Environment Info

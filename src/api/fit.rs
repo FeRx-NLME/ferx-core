@@ -1512,16 +1512,19 @@ fn fit_inner(
     // count cannot wrap and produce a bogus estimate; on overflow we still warn
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
+    // The route is predicted from the covariance step's own scope walk (#2054): no note on
+    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    let covariance_route = crate::estimation::covariance::predicted_r_route(
+        model,
+        population,
+        options,
+        init_params.mixture.is_some(),
+    );
     let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
         n_params_pre,
         options,
         !model.priors.is_empty(),
-        crate::estimation::covariance::analytic_r_expected(
-            model,
-            population,
-            options,
-            init_params.mixture.is_some(),
-        ),
+        covariance_route,
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
@@ -1631,9 +1634,11 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) =
-        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
-    {
+    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
+        n_params_pre,
+        covariance_cost,
+        covariance_route,
+    ) {
         accumulated_warnings.push(note);
     }
 
