@@ -17115,6 +17115,54 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
 }
 
+/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
+/// anchor: the reverse sweep reaches the third derivative of each record, so the
+/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
+/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
+/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
+/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
+#[test]
+fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
+    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
+    type V = DualV<2, 2, true>;
+    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let bc = compile_bytecode(&expr);
+    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
+    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
+        let q = x.div_euclid(y);
+        vtape_reset(1 + 2 + 2);
+        let vd = [
+            V::leaf(x, [1.0, 0.0], [0.0; 2]),
+            V::leaf(y, [0.0, 1.0], [0.0; 2]),
+        ];
+        let mut sd: Vec<V> = Vec::new();
+        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(
+            f.v.to_bits(),
+            x.rem_euclid(y).to_bits(),
+            "value of {x} mod {y}"
+        );
+        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
+        let adj = vadj_init::<1>();
+        for (comp, wc) in w.iter().enumerate() {
+            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
+        }
+        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
+        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
+        assert!(
+            got.iter().all(|g| g.is_finite()),
+            "{x} mod {y}: sweep {got:?}"
+        );
+        assert!(
+            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
+            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
+            w[0],
+            -q * w[0]
+        );
+    }
+}
+
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
 // For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and

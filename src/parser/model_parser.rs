@@ -27201,11 +27201,14 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                 // constant, so an η read through `mod` had a zero gradient). The
                 // value stays `rem_euclid` bit for bit: `a`'s jet is lifted onto
                 // it, and the `q·b` term enters with its value cancelled exactly.
+                // The lift is `lift4`, not `lift2`: the map is affine, so every
+                // higher derivative is a known `0`, and the taped-Hessian `DualV`
+                // of the Laplace/AGQ exact anchor poisons a `lift2` with a `NaN` `φ‴`.
                 let (av, bv) = (a.val(), b.val());
                 push!(if bv.abs() < 1e-30 {
                     k(0.0)
                 } else {
-                    let out = a.lift2(av.rem_euclid(bv), 1.0, 0.0);
+                    let out = a.lift4(av.rem_euclid(bv), 1.0, 0.0, 0.0, 0.0);
                     let q = av.div_euclid(bv);
                     if q == 0.0 {
                         out
