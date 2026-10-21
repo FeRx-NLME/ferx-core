@@ -525,84 +525,113 @@ impl MlpMapper {
         let n_out = self.n_outputs();
         let mut jac = DMatrix::<f64>::zeros(n_out, self.n_params);
 
-        // Backprop one output at a time. For each output dimension k:
-        //   - seed the adjoint da_L = e_k
-        //   - propagate backward through the activation derivative at each
-        //     layer, accumulating grad_W_l and grad_b_l into `jac` row k.
-        //
-        // Plain slice loops rather than `nalgebra` products (#1300 follow-up): the
-        // hot DCM paths call this once per event per gradient, and the former
-        // `weight_matrix` + `transpose()` built two fresh matrices per layer per
-        // output. The transposed product accumulates over `i` in increasing order,
-        // which is the order `gemv` over the transposed matrix's columns took, so the
-        // adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
-        let mut adjoint: Vec<f64> = vec![0.0; n_out];
-        let mut dz_l: Vec<f64> = Vec::new();
+        // Backprop one output at a time, seeded `da_L = e_k` ([`Self::backprop`]).
+        let mut seed = vec![0.0; n_out];
+        let mut row = vec![0.0; self.n_params];
         for k in 0..n_out {
-            adjoint.clear();
-            adjoint.resize(n_out, 0.0);
-            adjoint[k] = 1.0;
-
-            // Walk layers L, L-1, ..., 1.
-            for l in (1..self.layers.len()).rev() {
-                let is_output_layer = l == self.layers.len() - 1;
-                let activation = if is_output_layer {
-                    self.output_activation
-                } else {
-                    self.hidden_activation
-                };
-
-                // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
-                // output layer is seeded directly at z_L, so its activation
-                // derivative is skipped — every deeper layer is unaffected.
-                let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
-                dz_l.clear();
-                if preactivation && is_output_layer {
-                    dz_l.extend_from_slice(&adjoint);
-                } else {
-                    dz_l.extend(
-                        adjoint
-                            .iter()
-                            .zip(z_l.iter())
-                            .map(|(&a, &z)| a * activation.derivative(z)),
-                    );
-                }
-
-                // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j].
-                // We unflatten into the row-major W block within `jac` row k.
-                let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
-
-                let w_start = self.offsets[l - 1];
-                let n_l = self.layers[l];
-                let n_lm1 = self.layers[l - 1];
-                for i in 0..n_l {
-                    let dz_i = dz_l[i];
-                    let row_offset = w_start + i * n_lm1;
-                    for j in 0..n_lm1 {
-                        jac[(k, row_offset + j)] = dz_i * a_prev[j];
-                    }
-                    // bias gradient
-                    jac[(k, w_start + n_l * n_lm1 + i)] = dz_i;
-                }
-
-                // Propagate to layer l-1: da_{l-1} = W_lᵀ · dz_l, read straight off
-                // the row-major weight block: `adj[j] = Σ_i W[i][j]·dz[i]`.
-                if l > 1 {
-                    let w = &weights[w_start..w_start + n_l * n_lm1];
-                    adjoint.clear();
-                    adjoint.resize(n_lm1, 0.0);
-                    for i in 0..n_l {
-                        let dz_i = dz_l[i];
-                        let row = &w[i * n_lm1..(i + 1) * n_lm1];
-                        for (adj_j, &w_ij) in adjoint.iter_mut().zip(row) {
-                            *adj_j += w_ij * dz_i;
-                        }
-                    }
-                }
+            seed.iter_mut().for_each(|v| *v = 0.0);
+            seed[k] = 1.0;
+            self.backprop(x, weights, &pre, &post, &seed, preactivation, &mut row);
+            for (c, &v) in row.iter().enumerate() {
+                jac[(k, c)] = v;
             }
         }
 
         Ok((output, jac))
+    }
+
+    /// The vector–Jacobian product `seedᵀ·∂a_L/∂weights` (post-activation): one backward
+    /// pass, the row [`Self::jacobian`] would return combined by `seed`, at the cost of a
+    /// single output's backprop.
+    /// `None` when `x`, `weights` or `seed` has the wrong length.
+    pub(crate) fn vjp(&self, x: &[f64], weights: &[f64], seed: &[f64]) -> Option<Vec<f64>> {
+        if self.check_shapes(x, weights).is_err() || seed.len() != self.n_outputs() {
+            return None;
+        }
+        let (pre, post) = self.forward_cache(x, weights);
+        let mut out = vec![0.0; self.n_params];
+        self.backprop(x, weights, &pre, &post, seed, false, &mut out);
+        Some(out)
+    }
+
+    /// One backward pass from `da_L = seed` at the cached forward pass `(pre, post)`,
+    /// writing `∂(seedᵀa_L)/∂weights` into `out` (every entry is written).
+    ///
+    /// Plain slice loops rather than `nalgebra` products (#1300 follow-up): the
+    /// hot DCM paths call this once per event per gradient, and the former
+    /// `weight_matrix` + `transpose()` built two fresh matrices per layer per
+    /// output. The transposed product accumulates over `i` in increasing order,
+    /// which is the order `gemv` over the transposed matrix's columns took, so the
+    /// adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
+    #[allow(clippy::too_many_arguments)]
+    fn backprop(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+        pre: &[Vec<f64>],
+        post: &[Vec<f64>],
+        seed: &[f64],
+        preactivation: bool,
+        out: &mut [f64],
+    ) {
+        let mut adjoint: Vec<f64> = seed.to_vec();
+        let mut dz_l: Vec<f64> = Vec::new();
+        // Walk layers L, L-1, ..., 1.
+        for l in (1..self.layers.len()).rev() {
+            let is_output_layer = l == self.layers.len() - 1;
+            let activation = if is_output_layer {
+                self.output_activation
+            } else {
+                self.hidden_activation
+            };
+
+            // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
+            // output layer is seeded directly at z_L, so its activation
+            // derivative is skipped — every deeper layer is unaffected.
+            let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
+            dz_l.clear();
+            if preactivation && is_output_layer {
+                dz_l.extend_from_slice(&adjoint);
+            } else {
+                dz_l.extend(
+                    adjoint
+                        .iter()
+                        .zip(z_l.iter())
+                        .map(|(&a, &z)| a * activation.derivative(z)),
+                );
+            }
+
+            // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j], into the row-major W block.
+            let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
+
+            let w_start = self.offsets[l - 1];
+            let n_l = self.layers[l];
+            let n_lm1 = self.layers[l - 1];
+            for i in 0..n_l {
+                let dz_i = dz_l[i];
+                let row_offset = w_start + i * n_lm1;
+                for j in 0..n_lm1 {
+                    out[row_offset + j] = dz_i * a_prev[j];
+                }
+                // bias gradient
+                out[w_start + n_l * n_lm1 + i] = dz_i;
+            }
+
+            // Propagate to layer l-1: da_{l-1} = W_lᵀ · dz_l, read straight off
+            // the row-major weight block: `adj[j] = Σ_i W[i][j]·dz[i]`.
+            if l > 1 {
+                let w = &weights[w_start..w_start + n_l * n_lm1];
+                adjoint.clear();
+                adjoint.resize(n_lm1, 0.0);
+                for i in 0..n_l {
+                    let dz_i = dz_l[i];
+                    let row = &w[i * n_lm1..(i + 1) * n_lm1];
+                    for (adj_j, &w_ij) in adjoint.iter_mut().zip(row) {
+                        *adj_j += w_ij * dz_i;
+                    }
+                }
+            }
+        }
     }
 
     /// Local flat-vector indices of the **weight-matrix** parameters, excluding
@@ -1287,6 +1316,18 @@ impl NamedMlpMapper {
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.jacobian_preactivation(&x, weights)
+    }
+
+    /// `seedᵀ·∂y/∂weights` for [`Self::forward_raw`]'s output `y`, with the same zero-fill
+    /// inputs: one backward pass ([`MlpMapper::vjp`]).
+    pub(crate) fn vjp_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+        seed: &[f64],
+    ) -> Option<Vec<f64>> {
+        let x = self.build_input_vec_zero_fill(covariates);
+        self.mlp.vjp(&x, weights, seed)
     }
 
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
@@ -2055,6 +2096,32 @@ mod tests {
                 assert_relative_eq!(jac[(i, j)], fd, epsilon = 1e-6, max_relative = 1e-5);
             }
         }
+    }
+
+    /// One seeded backward pass is the seed's combination of the Jacobian's rows: on a
+    /// `tanh`/`softplus` network at a non-trivial point, with every output seeded; a
+    /// wrongly sized seed is refused.
+    #[test]
+    fn vjp_is_the_seed_combination_of_the_jacobian_rows() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let n_w = mlp.n_weights();
+        let weights: Vec<f64> = (0..n_w)
+            .map(|i| 0.4 * (i as f64).sin() + 0.2 * ((i * 7) as f64).cos())
+            .collect();
+        let x = vec![0.3, -0.7];
+        let seed = [0.7, -1.3, 2.1];
+        let jac = mlp.jacobian(&x, &weights).unwrap();
+        let vjp = mlp.vjp(&x, &weights, &seed).unwrap();
+        assert_eq!(vjp.len(), n_w);
+        let mut live = 0;
+        for (c, &v) in vjp.iter().enumerate() {
+            let want: f64 = (0..3).map(|k| seed[k] * jac[(k, c)]).sum();
+            assert_relative_eq!(v, want, epsilon = 1e-15, max_relative = 1e-13);
+            live += usize::from(want.abs() > 1e-3);
+        }
+        assert!(live > n_w / 2, "a vanishing product tests nothing");
+        assert!(mlp.vjp(&x, &weights, &seed[..2]).is_none());
+        assert!(mlp.vjp(&x, &weights[1..], &seed).is_none());
     }
 
     /// ReLU has a kink at 0; verify the jacobian matches FD on the smooth

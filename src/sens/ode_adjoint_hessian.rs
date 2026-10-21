@@ -434,19 +434,22 @@ fn nn_reduce_off() -> bool {
 /// with `η′` along `a` equal to `η′_z J_z[:, a]`. The passes through the recorders are then over
 /// `|B| = n_r + n_z + N` directions instead of `n` (16 against 147 on the 141-weight
 /// `warfarin_dcm`), and the weights' own curvature comes from the networks alone.
+///
+/// The outer gradient (`run`) reads the same reduction: the outputs as tape leaves, and the
+/// weights' adjoint as one backward pass through each network.
 #[cfg(feature = "nn")]
-struct NnReduction {
+pub(super) struct NnReduction {
     /// Raw outputs per network at the current weights.
-    z: Vec<Vec<f64>>,
+    pub(super) z: Vec<Vec<f64>>,
     /// Per network: its first packed weight coordinate, its weight count, and its inputs.
-    nets: Vec<(usize, usize, std::collections::HashMap<String, f64>)>,
+    pub(super) nets: Vec<(usize, usize, std::collections::HashMap<String, f64>)>,
 }
 
 #[cfg(feature = "nn")]
 impl NnReduction {
     /// `None` when the reduction does not hold (a weight read directly, an input that
     /// varies over the subject's records) or does not pay (fewer weights than outputs).
-    fn build(
+    pub(super) fn build(
         model: &CompiledModel,
         subject: &Subject,
         template: &ModelParameters,

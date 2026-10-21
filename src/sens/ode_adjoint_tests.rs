@@ -3674,6 +3674,74 @@ fn covariate_nn_matches_reconverged_fd() {
     assert!(fd < 1e-5, "covariate NN FOCEI Hessian vs FD {fd:.2e}");
 }
 
+/// The outer gradient of a covariate-NN subject reads the networks' outputs as tape leaves
+/// and pulls their adjoints back through each network (`nn_output_leaves`), and must equal
+/// the gradient with every network taped over its weights, under FOCEI, FOCE, Laplace's
+/// exact anchor (the taped second-order recording) and AGQ's Gauss–Newton one. Only the
+/// summation order of the weights' chain rule differs. The counter shows the leaves were
+/// read, the switch that they stood aside; the weight block is asserted live.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_output_leaf_gradient_equals_the_taped_networks() {
+    use super::{NN_OUTPUT_LEAF_HITS, NN_OUTPUT_LEAVES_OFF};
+    let (model, s) = covariate_nn_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let w = model.covariate_nns[0].weights_offset;
+    let n_w = model.covariate_nns[0].mapper.mlp().n_weights();
+    let mut worst = 0.0f64;
+    for (objective, interaction, name) in [
+        (Objective::Focei, true, "FOCEI"),
+        (Objective::Foce, false, "FOCE"),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            true,
+            "Laplace",
+        ),
+        (
+            Objective::Agq {
+                n_agq: 3,
+                exact: false,
+            },
+            true,
+            "AGQ-3",
+        ),
+    ] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let run = |off: bool| {
+            NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
+            NN_OUTPUT_LEAF_HITS.with(|c| c.set(0));
+            let g = subject_adjoint_gradient(&model, &s, &params, &x, eta.as_slice(), objective);
+            NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
+            (g, NN_OUTPUT_LEAF_HITS.with(|c| c.get()))
+        };
+        let (taped, off_hits) = run(true);
+        let (leaves, hits) = run(false);
+        let (taped, leaves) = (
+            taped.expect("taped gradient in scope"),
+            leaves.expect("leaf gradient in scope"),
+        );
+        assert_eq!(off_hits, 0, "{name}: the switch must tape the networks");
+        assert_eq!(hits, 1, "{name}: the output leaves were not read");
+        assert!(
+            (w..w + n_w).filter(|&i| taped[i].abs() > 1e-3).count() > n_w / 2,
+            "{name}: a vanishing weight gradient tests nothing"
+        );
+        for (a, b) in leaves.iter().zip(&taped) {
+            assert!(a.is_finite() && b.is_finite(), "{name}: {a} vs {b}");
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+    }
+    eprintln!("covariate NN: output-leaf vs taped-network gradient {worst:.2e}");
+    assert!(
+        worst < 1e-12,
+        "output-leaf vs taped-network gradient {worst:.2e}"
+    );
+}
+
 /// The covariance Hessian of a covariate-NN subject is assembled in the networks' output
 /// basis (`NnReduction`: 1 + 3 + 2 directions here against 21 weights), and must equal the
 /// one assembled along every packed axis, under each objective. Dropping the weights' own
