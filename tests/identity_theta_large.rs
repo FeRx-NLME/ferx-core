@@ -46,14 +46,14 @@ const MODEL: &str = r#"
 
 /// The minimum of the warfarin fixture, reached from θ₀ = 10 on the plain model.
 const WARFARIN_MIN: f64 = -286.0042;
-/// The gradient optimizers' band. L-BFGS (`auto`, 33 iterations), L-BFGS under an
-/// explicit `abs`, and SLSQP (105) each print −286.0042 (macOS arm64); the stalled
-/// arms sit ~20.6 units away.
-const TOL_GRADIENT: f64 = 1e-2;
-/// BOBYQA's band. It printed −286.0042 here (macOS arm64, 335 iterations), but the
-/// #2146 plan measured it 0.02 short at θ₀ = 1e6 on an earlier tree, so the band
-/// leaves room for that.
-const TOL_BOBYQA: f64 = 5e-2;
+/// The gradient optimizers' band. L-BFGS (`auto`, and `abs` explicitly) and SLSQP each
+/// reach −286.004220 on Linux arm64 (`tools/linux-test.sh`), 2e-5 from the constant;
+/// macOS arm64 prints −286.0042 for all three. The stalled arms sit ~20.6 units away.
+const TOL_GRADIENT: f64 = 1e-3;
+/// BOBYQA's band. It reaches −286.004206 on Linux arm64 (macOS arm64: −286.0042, 335
+/// iterations); the #2146 plan measured it 0.02 short at θ₀ = 1e6 on an earlier tree,
+/// so the band keeps room for that and stays 2000× tighter than the stall.
+const TOL_BOBYQA: f64 = 1e-2;
 
 fn warfarin(optimizer: Optimizer, scaling: ParameterScaling) -> FitResult {
     let parsed = parse_full_model(MODEL).expect("model parses");
