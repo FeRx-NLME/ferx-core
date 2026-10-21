@@ -3363,26 +3363,18 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt model has
 /// nothing to do with absorption.
 ///
-/// **Two failure modes, not one, and the second is worse.** A non-finite lag or `F`
-/// makes the timeline unorderable and every prediction `NaN` — loud. A non-finite
-/// modeled `D{n}`/`R{n}` never becomes a `NaN` at all:
-/// [`DoseEvent::resolve_rate`](crate::types::DoseEvent) derives the missing half of the
-/// pair by division, and clamps to `DURATION_FLOOR` / `RATE_FLOOR` (`x > floor` is false
-/// for `NaN`), so the fit returns finite, silently wrong numbers. Measured on a 1-cpt
-/// ODE, `CL/V = 0.1`, `V = 10`, one 100-unit coded-`RATE` dose, observations at
-/// `t = 1, 4, 8`:
-///
-/// | | served | vs the correct infusion |
-/// |---|---|---|
-/// | `D1 = +inf` | `rate = amt/inf = 0` ⇒ not an infusion ⇒ instantaneous bolus | **1.90× high** at `t = 1` |
-/// | `R1 = +inf` | `duration = amt/inf = 0` ⇒ the same bolus | the same |
-/// | `D1 = NaN` | clamped to `DURATION_FLOOR = 1e-8` ⇒ a bolus again | the same |
-/// | `R1 = NaN` | clamped to `RATE_FLOOR = 1e-8` ⇒ `duration = amt/1e-8` | essentially nothing delivered |
-///
-/// The three bolus rows land within **8.2e-7** (1.8e-7 relative — the ODE tolerance) of
-/// the exact bolus solution `10·e^(−0.1t)`. That is why the value check for
-/// `D{n}`/`R{n}` lives here and not only in [`check_modeled_dose_rates`], which
-/// validates that the *slot exists* and never what it holds.
+/// **One consequence for all four attributes.** A non-finite lag or `F` makes
+/// `dose.time + lag`, and every break derived from it, non-finite, so the subject's
+/// timeline cannot be ordered and every prediction is `NaN`. A non-finite modeled
+/// `D{n}`/`R{n}` used to be the quiet exception — `resolve_rate` derived the missing half
+/// of the pair by division and clamped to a floor, serving the dose as an instantaneous
+/// bolus and returning finite, silently wrong numbers. Since #1284
+/// [`DoseEvent::resolve_rate`](crate::types::DoseEvent) maps it to a non-finite dose
+/// instead, whose `NaN` time reaches the same timeline guard, so the subject is repelled
+/// like a lag or `F` (#2151). The value check for `D{n}`/`R{n}` still lives here and not
+/// only in [`check_modeled_dose_rates`], which validates that the *slot exists* and never
+/// what it holds: this is the fit-init front door that names the subject, where the
+/// engine guard alone would only produce an all-`NaN` subject.
 ///
 /// Only compartments the data actually doses into are examined; a model with neither `F`
 /// nor a lag reads the `PkParams` defaults (1.0 / 0.0), finite by construction, so this
@@ -3405,7 +3397,10 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// covariate model on an unscaled covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the
 /// hundreds) overflows to `+inf` — that is the reachable route at typical values, and it
 /// is what the regression test uses. Mid-fit, any θ/η excursion into the same overflow
-/// does it, which is what the engine-side guard covers.
+/// does it, which is what the engine-side guard covers. Two more routes need no overflow
+/// at all: a covariate missing at the record is `NaN`, which passes through arithmetic,
+/// `^` and `exp` unchanged, and `^` is a bare `powf`, so a fractional power of a negative
+/// value (`(WT/70)^0.75` with `WT < 0`) is `NaN` too. The message names all three.
 pub(crate) fn check_dose_attr_finiteness(
     model: &CompiledModel,
     population: &Population,
@@ -3417,26 +3412,12 @@ pub(crate) fn check_dose_attr_finiteness(
     // `PK_IDX_F` with an empty indexed map. Gating there would skip exactly the
     // everyday case this exists for.
     let map = model.active_dose_attr_map();
-    // What a non-finite value *does*, per attribute. The two differ and the difference is
-    // the point: lag / `F` make the timeline unorderable (loud), while a modeled
-    // duration / rate is clamped to a floor and returns a silently wrong number.
+    // What a non-finite value *does* — the same for every attribute. A lag / `F` puts it
+    // in `dose.time + lag` directly; a modeled duration / rate reaches the same place
+    // through `DoseEvent::resolve_rate`, which returns a dose with a `NaN` time (#1284).
     const TIMELINE: &str = "The engine applies this at the dose event, so a non-finite \
          value makes the subject's whole integration timeline non-finite and every \
-         prediction NaN.";
-    const CLAMPED_DURATION: &str = "This never reaches you as a NaN: \
-         `DoseEvent::resolve_rate` derives `rate = amt / duration`, so an infinite \
-         duration gives rate 0 — not an infusion at all — and a NaN is pulled to \
-         DURATION_FLOOR = 1e-8 (`x > floor` is false for NaN). Either way the engine \
-         serves this dose as an instantaneous bolus instead of the infusion the data \
-         asks for, and returns finite, silently wrong numbers (measured 1.90x high at \
-         one elimination half-time on a 1-cpt model).";
-    const CLAMPED_RATE: &str = "This never reaches you as a NaN: \
-         `DoseEvent::resolve_rate` derives `duration = amt / rate`, so an infinite rate \
-         gives duration 0 — an instantaneous bolus — and a NaN is pulled to \
-         RATE_FLOOR = 1e-8 (`x > floor` is false for NaN), spreading the dose over \
-         `amt / 1e-8` time units so that essentially nothing is delivered. Either way \
-         the engine returns finite, silently wrong numbers instead of the infusion the \
-         data asks for.";
+         prediction NaN: the subject is repelled as a diverged solve.";
     // One scratch for the population: `typical_dose_snapshots` resizes and refills it per
     // subject, reusing the allocation.
     let mut scratch = TypicalSnapshotScratch::default();
@@ -3465,34 +3446,21 @@ pub(crate) fn check_dose_attr_finiteness(
             // here rather than reported twice.
             let modeled = match dose.rate_mode {
                 RateMode::Fixed => None,
-                RateMode::ModeledDuration => Some((
-                    DoseAttr::Duration,
-                    "modeled infusion duration (`D`)",
-                    CLAMPED_DURATION,
-                )),
-                RateMode::ModeledRate => {
-                    Some((DoseAttr::Rate, "modeled infusion rate (`R`)", CLAMPED_RATE))
+                RateMode::ModeledDuration => {
+                    Some((DoseAttr::Duration, "modeled infusion duration (`D`)"))
                 }
+                RateMode::ModeledRate => Some((DoseAttr::Rate, "modeled infusion rate (`R`)")),
             }
-            .and_then(|(attr, what, consequence)| {
+            .and_then(|(attr, what)| {
                 let slot = map.indexed_slot(attr, dose.cmt_raw())?;
-                Some((
-                    what,
-                    snap.values.get(slot).copied().unwrap_or(0.0),
-                    consequence,
-                ))
+                Some((what, snap.values.get(slot).copied().unwrap_or(0.0)))
             });
-            for (what, value, consequence) in [
+            for (what, value) in [
                 Some((
                     "lag time (`lagtime` / `ALAG`)",
                     map.lagtime(cmt, snap.values),
-                    TIMELINE,
                 )),
-                Some((
-                    "bioavailability (`F`)",
-                    map.f_bio(cmt, snap.values),
-                    TIMELINE,
-                )),
+                Some(("bioavailability (`F`)", map.f_bio(cmt, snap.values))),
                 modeled,
             ]
             .into_iter()
@@ -3503,12 +3471,16 @@ pub(crate) fn check_dose_attr_finiteness(
                         "E_DOSE_ATTR_NONFINITE",
                         format!(
                             "Dose {what} for compartment {cmt} is {value} at typical values \
-                             (subject {}, {}). {consequence} The usual cause is an \
+                             (subject {}, {}). {TIMELINE} The usual cause is a covariate \
+                             relationship that is undefined for this subject: a covariate \
+                             missing at that record (a missing value is NaN, and NaN passes \
+                             through arithmetic, `^` and `exp`), a fractional power of a \
+                             negative value (`(WT/70)^0.75` with a negative `WT`), or an \
                              overflowing `exp(...)` — an exponential covariate model on an \
-                             unscaled covariate — since `exp` is the one arithmetic here with \
-                             no domain guard (`/` by ~0 returns 0, and `ln`/`sqrt` floor their \
-                             argument). Check this subject's covariate values at that record, \
-                             and any `TIME` the expression reads.",
+                             unscaled covariate, since `exp` has no domain guard (`/` by ~0 \
+                             returns 0, and `ln`/`sqrt` floor their argument). Check this \
+                             subject's covariate values at that record, and any `TIME` the \
+                             expression reads.",
                             subject.id,
                             snap.record_label(),
                         ),
