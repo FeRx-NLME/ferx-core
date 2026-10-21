@@ -102,7 +102,7 @@ pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
 }
 
 /// A single dose event (bolus, infusion, or oral)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DoseEvent {
     pub time: f64,
     pub amt: f64,
@@ -132,6 +132,25 @@ pub struct DoseEvent {
     /// engines treat identically but which is a second data record (#2104's warning counts
     /// records). Crate-private, like `cmt`, so it widens no public API.
     pub(crate) evid4: bool,
+}
+
+/// The derived rendering minus `evid4`: ferx-tools' search journal hashes `{doses:?}` into
+/// its data fingerprint, and the flag labels a record for a warning without changing what
+/// any fit sees, so printing it would move every journal's digest and refuse every resume.
+impl std::fmt::Debug for DoseEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoseEvent")
+            .field("time", &self.time)
+            .field("amt", &self.amt)
+            .field("cmt", &self.cmt)
+            .field("rate", &self.rate)
+            .field("duration", &self.duration)
+            .field("ss", &self.ss)
+            .field("ii", &self.ii)
+            .field("rate_mode", &self.rate_mode)
+            .field("infusion_def", &self.infusion_def)
+            .finish()
+    }
 }
 
 impl DoseEvent {

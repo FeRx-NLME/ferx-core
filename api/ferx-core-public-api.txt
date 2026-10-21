@@ -2960,6 +2960,8 @@ pub fn ferx_core::DoseEvent::is_fixed(&self) -> bool
 pub fn ferx_core::DoseEvent::is_infusion(&self) -> bool
 pub fn ferx_core::DoseEvent::modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: ferx_core::RateMode) -> Self
 pub fn ferx_core::DoseEvent::new(time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64) -> Self
+impl core::fmt::Debug for ferx_core::DoseEvent
+pub fn ferx_core::DoseEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ferx_core::types::EndpointError
 pub ferx_core::types::EndpointError::error_model: ferx_core::ErrorModel
 pub ferx_core::types::EndpointError::sigma_idx: alloc::vec::Vec<usize>
@@ -4460,6 +4462,8 @@ pub fn ferx_core::DoseEvent::is_fixed(&self) -> bool
 pub fn ferx_core::DoseEvent::is_infusion(&self) -> bool
 pub fn ferx_core::DoseEvent::modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: ferx_core::RateMode) -> Self
 pub fn ferx_core::DoseEvent::new(time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64) -> Self
+impl core::fmt::Debug for ferx_core::DoseEvent
+pub fn ferx_core::DoseEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ferx_core::DoseLedgerEntry
 pub ferx_core::DoseLedgerEntry::amt: f64
 pub ferx_core::DoseLedgerEntry::cmt: usize

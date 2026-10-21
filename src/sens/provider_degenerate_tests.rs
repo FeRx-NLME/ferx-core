@@ -92,7 +92,8 @@ fn subject(first_rate: f64) -> Subject {
 
 /// Every closed-form model × every degenerate `CL` / `V`: the recording's value equals the
 /// prediction it differentiates (`pk::predict_concentration`) — the same number, or both
-/// `NaN` — and on a degenerate case its jet is a constant 0, with no `NaN` derivative.
+/// `NaN` — and on a degenerate case its jet is a constant 0, with no `NaN` derivative, while
+/// a `NaN` one carries a `NaN` jet.
 ///
 /// Mutation (run): drop the `d.cl_or_v_degenerate()` arm of `superpose_doses`' ladder → the
 /// `CL = +inf` rows die (first at `OneCptIv`, `t = 0`: the kernels' `≤ 0` guards let it
@@ -167,6 +168,15 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
                         w.is_nan() && g.is_nan() && jet.value.is_nan(),
                         "{at} t={t}: prediction {w}, recording {g}, jet {}",
                         jet.value
+                    );
+                    // A `NaN` value with a finite jet lets FOCEI's `H̃` factor and the
+                    // subject's `NaN` objective escape the `1e20` repel (#2134): measured
+                    // on a 1-cpt oral fit with one subject's covariate `NaN`, OFV `NaN`
+                    // with a bare `NaN`, 2e20 with `nan_jet`.
+                    assert!(
+                        jet.grad.iter().all(|x| x.is_nan()),
+                        "{at} t={t}: a NaN recording needs a NaN jet ({:?})",
+                        jet.grad
                     );
                     continue;
                 }
@@ -347,6 +357,44 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
                     c1.is_nan() && c2.is_nan() && c3.is_nan(),
                     "{at}: 1/2/3-cpt kernels gave {c1}, {c2}, {c3}"
                 );
+                // And a `NaN` jet, not a zero one (see the static-recording test).
+                let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
+                let k = Dual1::<2>::constant;
+                let jets = [
+                    one_cpt_conc_g(dose, k(t), d(cl, 0), d(v, 1), k(ka), k(f), *oral),
+                    two_cpt_conc_g(
+                        dose,
+                        k(t),
+                        d(cl, 0),
+                        d(v, 1),
+                        k(q),
+                        k(v2),
+                        k(ka),
+                        k(f),
+                        *oral,
+                    ),
+                    three_cpt_conc_g(
+                        dose,
+                        k(t),
+                        d(cl, 0),
+                        d(v, 1),
+                        k(q),
+                        k(v2),
+                        k(q3),
+                        k(v3),
+                        k(ka),
+                        k(f),
+                        *oral,
+                    ),
+                ];
+                for (n, j) in jets.iter().enumerate() {
+                    assert!(
+                        j.grad.iter().all(|x| x.is_nan()),
+                        "{at}: {}-cpt jet {:?}",
+                        n + 1,
+                        j.grad
+                    );
+                }
             }
             // Before the arrival nothing has been given: 0, not `NaN`.
             let before = one_cpt_conc_g::<f64>(dose, -1.0, cl, v, ka, f, *oral)
@@ -377,16 +425,14 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
     }
 }
 
-/// The transit / inverse-Gaussian closed forms keep their own convention: a `NaN` `CL` or
-/// `V` on a static subject is still served 0 there, as their kernels and their IOV /
-/// time-varying absorption walk (`WalkDomain::Invalid`) both do — #2104's `NaN` override is
-/// gated to the six IV / oral models, so it cannot make the static and walked subjects of
-/// one transit model disagree. A separate issue owns those models' `NaN` handling.
-///
-/// Mutation (run): drop the `cl_v_rule_governs` gate in `pk::single_dose_concentration` →
-/// every row here dies (`NaN` served).
+/// The transit / inverse-Gaussian closed forms reach the same values as the six IV / oral
+/// models through their own kernels: since #2221 (#2134) a `NaN` `CL` or `V` serves `NaN`
+/// there, and a non-positive or infinite one the non-physical penalty, 0. #2104's override
+/// stays gated to the six IV / oral models (`cl_v_rule_governs`), since #2134 owns these
+/// kernels' handling (their walk, `nan_onset`, and their `NaN` jets) — so no value here can
+/// tell the gate apart; this pins that the two conventions agree.
 #[test]
-fn transit_and_ig_keep_their_own_nan_convention() {
+fn transit_and_ig_agree_with_the_rule_through_their_own_kernels() {
     let doses = [DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
     for model in [
         PkModel::OneCptTransit,
@@ -407,9 +453,15 @@ fn transit_and_ig_keep_their_own_nan_convention() {
             pk.values[crate::types::PK_IDX_CV2] = 0.3;
             let live = crate::pk::predict_concentration(model, &doses, 4.0, &pk);
             assert!(live > 0.0, "{model:?}: fixture is live ({live})");
-            pk.values[idx] = f64::NAN;
-            let c = crate::pk::predict_concentration(model, &doses, 4.0, &pk);
-            assert_eq!(c, 0.0, "{model:?} {label}=NaN keeps its 0");
+            for x in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+                pk.values[idx] = x;
+                let c = crate::pk::predict_concentration(model, &doses, 4.0, &pk);
+                if x.is_nan() {
+                    assert!(c.is_nan(), "{model:?} {label}={x}: {c}, not NaN");
+                } else {
+                    assert_eq!(c, 0.0, "{model:?} {label}={x}");
+                }
+            }
         }
     }
 }

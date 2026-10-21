@@ -87,6 +87,21 @@ pub(crate) fn superposed_dose_override(cl: f64, v: f64) -> Option<f64> {
     }
 }
 
+/// [`superposed_dose_override`] over the generic type: the degenerate 0 is a constant, and
+/// a `NaN` is returned through `nan_jet`, so its derivatives are `NaN` too. A bare
+/// `T::from_f64(f64::NAN)` carries a zero jet: next to a finite `∂f/∂η` it lets the FOCEI
+/// curvature `H̃` factor, and the subject's `NaN` objective escapes the `1e20` repel (#2134).
+#[inline]
+pub(crate) fn dose_override_g<T: PkNum>(cl: T, v: T) -> Option<T> {
+    superposed_dose_override(cl.val(), v.val()).map(|c| {
+        if c.is_nan() {
+            crate::sens::one_cpt::nan_jet(cl * v)
+        } else {
+            T::from_f64(c)
+        }
+    })
+}
+
 /// The walk's half of [`cl_or_v_degenerate`], applied ahead of every propagation step:
 /// returns `true` when the caller must skip the closed-form step.
 ///
@@ -1529,8 +1544,9 @@ pub(crate) fn observe_central_g<T: PkNum>(
     }
     if cl.val().is_nan() || v.val().is_nan() {
         // `!= 0.0` is true for a `NaN` amount, which is then kept either way.
+        // Through `nan_jet`, not a bare `NaN`: see `dose_override_g`.
         return if dosed || read.iter().any(|a| a.val() != 0.0) {
-            T::from_f64(f64::NAN)
+            crate::sens::one_cpt::nan_jet(cl * v)
         } else {
             T::from_f64(0.0)
         };
@@ -2030,9 +2046,12 @@ mod tests {
         let d = |amount: Dual2<1>, v: Dual2<1>| {
             observe_central_g::<Dual2<1>>(&[amount], 0, Dual2::constant(5.0), v, true)
         };
-        assert!(d(Dual2::constant(50.0), Dual2::constant(f64::NAN))
-            .value
-            .is_nan());
+        let nan_v = d(Dual2::constant(50.0), Dual2::var(f64::NAN, 0));
+        // A `NaN` jet too: a zero one lets the subject escape the `1e20` repel (#2134).
+        assert!(
+            nan_v.value.is_nan() && nan_v.grad[0].is_nan(),
+            "a NaN volume reads NaN with a NaN jet"
+        );
         assert!(d(Dual2::var(f64::NAN, 0), Dual2::constant(10.0))
             .value
             .is_nan());

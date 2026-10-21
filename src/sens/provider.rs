@@ -205,15 +205,15 @@ impl<T: PkNum> SeededPkDuals<T> {
         crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
     }
 
-    /// [`crate::sens::propagate::superposed_dose_override`] on the seeded values, for the
+    /// `crate::sens::propagate::dose_override_g` on the seeded values, for the
     /// six IV / oral classes only — `None` for transit / IG, as the value path's
     /// `cl_v_rule_governs` gate gives (#2104).
     #[inline]
-    fn dose_override(&self, flags: PkClassFlags) -> Option<f64> {
+    fn dose_override(&self, flags: PkClassFlags) -> Option<T> {
         if flags.transit || flags.two_cpt_transit || flags.ig || flags.two_cpt_ig {
             return None;
         }
-        crate::sens::propagate::superposed_dose_override(self.cl_d.val(), self.v1_d.val())
+        crate::sens::propagate::dose_override_g(self.cl_d, self.v1_d)
     }
 }
 
@@ -265,7 +265,7 @@ fn superpose_doses<T: PkNum>(
         // (#2104). First in the ladder, so a disposition `with_disposition` declined to
         // build is never asked for.
         let c = if let Some(v) = d.dose_override(flags) {
-            T::from_f64(v)
+            v
         } else if flags.transit {
             one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
         } else if flags.two_cpt_transit {

@@ -40,8 +40,8 @@ pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     let k = cl / v;
     (amt / v) * (-(k * t)).exp()
@@ -60,8 +60,8 @@ pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) 
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if ka.val() <= 0.0 {
         return T::from_f64(0.0);
@@ -183,8 +183,8 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if dur <= 0.0 {
         return one_cpt_iv_bolus_g(amt, t, cl, v);
@@ -218,8 +218,8 @@ pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if dur.val() <= 0.0 {
         return T::from_f64(0.0);
@@ -242,8 +242,8 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if ii <= 0.0 {
         return T::from_f64(0.0);
@@ -263,8 +263,8 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if ka.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
@@ -308,8 +308,8 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
     // numerical guards (which would otherwise read a `NaN` disposition as 0).
-    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-        return T::from_f64(c);
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+        return c;
     }
     if ii <= 0.0 {
         return T::from_f64(0.0);
@@ -372,8 +372,8 @@ pub fn one_cpt_conc_g<T: PkNum>(
     // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
     // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
     if t.val() >= 0.0 {
-        if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
-            return T::from_f64(c);
+        if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
+            return c;
         }
     }
     let oral_bolus = oral && !dose.is_infusion();
