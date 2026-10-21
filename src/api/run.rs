@@ -8,10 +8,12 @@ use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
 };
 use crate::estimation::saem;
+use crate::io::data_source::DataSource;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    MissingDvPolicy, ObsRouting, SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+    read_nonmem_csv_routed_from, read_nonmem_csv_with_covariates_filtered_mapped,
+    read_nonmem_csv_with_covariates_mapped, CsvInput, MissingDvPolicy, ObsRouting, SelectionFilter,
+    ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -204,8 +206,10 @@ pub fn prepare_run_with_inits(
 
     // The settings this read uses are the ones the fit records (#1685).
     let reader_settings = ReaderSettings::from_parsed(&parsed);
-    let (mut population, covariate_table) =
-        read_population_with_diag(&parsed.model, &reader_settings, &data_path)
+    // One read of the dataset (#2140): the population and `data_hash` are the same
+    // bytes, so an edit to the CSV after this point is never recorded as fitted.
+    let (mut population, covariate_table, data_hash) =
+        read_population_hashed_diag(&parsed.model, &reader_settings, &data_path)
             .map_err(EngineError::from_diagnostic)?;
 
     // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
@@ -229,12 +233,11 @@ pub fn prepare_run_with_inits(
     parsed.model.gradient_method =
         crate::types::GradientMethod::effective(&parsed.model, &parsed.fit_options);
 
-    // Hash the data up front (needed before the fit for the checkpoint integrity
-    // check, #755) and reuse the digest for the post-fit result stamping. An error
-    // is non-fatal: a missing hash just disables the resume/integrity checks. The
-    // model's hash is the one read above.
+    // Both hashes are taken before the fit (the checkpoint integrity check needs the
+    // data's, #755) and reused for the post-fit result stamping. Each is the hash of
+    // the read above that was parsed (#1752, #2140).
     let model_hash = Some(model_hash);
-    let data_hash = crate::io::hash::sha256_file(Path::new(&data_path)).ok();
+    let data_hash = Some(data_hash);
 
     Ok(PreparedRun {
         parsed,
@@ -1398,21 +1401,92 @@ pub(crate) fn read_population_with_diag(
     settings: &ReaderSettings,
     data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
-    let filter = settings
+    let filter = reader_filter(settings)?;
+    read_population_filtered(
+        model,
+        settings,
+        filter.as_ref(),
+        CsvInput::Path(Path::new(data_path)),
+    )
+}
+
+/// [`read_population_with`] over a dataset already read into a [`DataSource`]
+/// (#2140): the population is parsed from [`DataSource::bytes`], so it and
+/// [`DataSource::hash`] describe the same read, where reading the path for the
+/// population and hashing it separately could see two versions of the file. A
+/// caller holding the dataset in memory builds the source with
+/// [`DataSource::from_bytes`] and needs no file at all.
+///
+/// The same reader as [`read_population_with`], so a source read from a file gives
+/// the population, the codes and the messages a read of that file's path gives.
+pub fn read_population_with_source(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    source: &DataSource,
+) -> Result<(Population, Option<CovariateTable>), EngineError> {
+    reader_filter(settings)
+        .and_then(|filter| {
+            read_population_filtered(
+                model,
+                settings,
+                filter.as_ref(),
+                CsvInput::Bytes(&source.bytes),
+            )
+        })
+        .map_err(EngineError::from_diagnostic)
+}
+
+/// Read `data_path` once with `settings` and return the population with the
+/// SHA-256 of the bytes it was parsed from (#2140): the read the file entry points
+/// stamp `data_hash` from. Failures are [`read_population_with_diag`]'s, in its
+/// order: a selection clause that does not compile is reported before the file is
+/// opened.
+pub(crate) fn read_population_hashed_diag(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    data_path: &str,
+) -> Result<(Population, Option<CovariateTable>, String), crate::Diagnostic> {
+    let filter = reader_filter(settings)?;
+    let source =
+        DataSource::read(data_path).map_err(|e| super::validation::data_read_diagnostic(&e))?;
+    let (population, table) = read_population_filtered(
+        model,
+        settings,
+        filter.as_ref(),
+        CsvInput::Bytes(&source.bytes),
+    )?;
+    Ok((population, table, source.hash))
+}
+
+/// The `[data_selection]` filter `settings` read with, coded as `ferx check` codes
+/// a clause that does not compile.
+fn reader_filter(settings: &ReaderSettings) -> Result<Option<SelectionFilter>, crate::Diagnostic> {
+    settings
         .selection_filter()
-        .map_err(super::validation::selection_filter_diagnostic)?;
+        .map_err(super::validation::selection_filter_diagnostic)
+}
+
+/// The one body behind every [`ReaderSettings`] read: [`read_population_for`] with
+/// its arguments taken from `settings`, over a path or bytes.
+fn read_population_filtered(
+    model: &CompiledModel,
+    settings: &ReaderSettings,
+    filter: Option<&SelectionFilter>,
+    input: CsvInput<'_>,
+) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
     let fallback: Option<Vec<&str>> = settings
         .fallback_columns
         .as_ref()
         .map(|cols| cols.iter().map(String::as_str).collect());
-    read_population_for(
+    read_population_for_policy(
         model,
         &settings.covariate_decls,
-        data_path,
+        input,
         fallback.as_deref(),
         settings.iov_column.as_deref(),
-        filter.as_ref(),
+        filter,
         &settings.column_map,
+        MissingDvPolicy::Skip,
     )
     .map_err(|e| super::validation::data_read_diagnostic(&e))
 }
@@ -1472,7 +1546,7 @@ pub fn read_population_for(
     read_population_for_policy(
         model,
         covariate_decls,
-        data_path,
+        CsvInput::Path(Path::new(data_path)),
         fallback_columns,
         iov_column,
         filter,
@@ -1511,7 +1585,7 @@ pub fn read_population_for_simulation(
     read_population_for_policy(
         model,
         covariate_decls,
-        data_path,
+        CsvInput::Path(Path::new(data_path)),
         fallback_columns,
         iov_column,
         filter,
@@ -1527,7 +1601,7 @@ pub fn read_population_for_simulation(
 fn read_population_for_policy(
     model: &CompiledModel,
     covariate_decls: &Option<Vec<CovariateDecl>>,
-    data_path: &str,
+    input: CsvInput<'_>,
     fallback_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
@@ -1540,8 +1614,8 @@ fn read_population_for_policy(
         // No block: still read every column the model references (#1936).
         None => (None, referenced_columns(model)),
     };
-    read_nonmem_csv_routed(
-        Path::new(data_path),
+    read_nonmem_csv_routed_from(
+        input,
         fallback_columns,
         decls,
         &extra,

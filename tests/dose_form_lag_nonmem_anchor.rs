@@ -80,9 +80,11 @@
 //! ferx's per-route absorption lag (`fn(..., lag = L)`, #859) composes a second
 //! delay *inside one compartment*, which NONMEM cannot express: `ALAGn` is
 //! per-compartment, so two composing lags need two compartments and stop being the
-//! same object. That case is covered by the `Dual2`-vs-FD parity tests and the
-//! ODE-twin equivalence in `sens/ode_provider_tests.rs` instead, with no external
-//! anchor — see the note in `tvcov_route_lagged_zero_order_matches_production`.
+//! same object. That case is covered by the adjoint-vs-FD parity tests in
+//! `sens/ode_adjoint_tests.rs` (before #2093, by the `Dual2`-vs-FD parity and ODE-twin
+//! equivalence in the since-deleted `sens/ode_provider_tests.rs`) instead, with no external
+//! anchor (the rationale sat in that file's `tvcov_route_lagged_zero_order_matches_production`,
+//! retired in #2093).
 //!
 //! Tier 3: ODE evaluations over eight subjects; gated for **runtime**, not because
 //! they run a convergence loop (`maxiter = 0`).
@@ -142,7 +144,8 @@ const NM_OBJV_SS_INFUSION: f64 = -458.896_244_660_178_47;
 /// quiet one — rather than decaying monotonically.
 ///
 /// That branch had unit coverage under *flat* covariates only
-/// (`ode_provider_ss_lagtime_infusion_matches_production`), and nothing anchored it
+/// (the pre-#2093 `ode_provider_ss_lagtime_infusion_matches_production`, retired in #2093),
+/// and nothing anchored it
 /// under varying ones — a gap in precisely the code this issue changed. 1-cpt IV,
 /// `RATE`-defined (`AMT 100 / RATE 100`, a 1 h window), `II = 12`, with a sample at
 /// `t = 0.5` inside every subject's pre-arrival window.

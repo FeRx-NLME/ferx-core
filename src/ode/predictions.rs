@@ -1140,8 +1140,8 @@ where
     // A top-level entry in its own right: `sens::ode_provider` calls this directly for the dual
     // SS equilibration, not only through `equilibrate_ss_pk_state`. Neither arm below ever
     // reaches `note_ss_nonconvergence_if_capped`, so clear the warning observation here too or
-    // that caller reads an earlier capped run's `true` (#1289, PR #1392 review).
-    crate::dosing::record_ss_nonconvergence_warned(false);
+    // that caller reads an earlier capped run's warning (#1289, PR #1392 review).
+    crate::dosing::record_ss_nonconvergence_warning(None);
     // `&F` still implements `Fn` when `F: Fn`, so borrowing lets the linear attempt and the
     // Anderson fallback share the same two closures without moving them.
     if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
@@ -1218,8 +1218,8 @@ fn equilibrate_ss_pk_state(
     crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::None);
     // Same reasoning for the warning observation (#1289): the exact affine fixed point and the
     // input-rate closed form below return without ever reaching `note_ss_nonconvergence_if_capped`,
-    // so without this an earlier capped run's `true` would be reported as *this* call's answer.
-    crate::dosing::record_ss_nonconvergence_warned(false);
+    // so without this an earlier capped run's warning would be reported as *this* call's answer.
+    crate::dosing::record_ss_nonconvergence_warning(None);
     let n = ode.n_states;
     let chz = &ode.chz_state_slots[..];
     // The model's own RHS with the accumulator derivatives held at zero. Everything the
@@ -2416,7 +2416,7 @@ impl ResetGate {
 ///
 /// Generic over the numeric type `T: PkNum` so the **single** superposition loop
 /// serves both the production `f64` predictor (`T = f64`, byte-identical to the
-/// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
+/// original) and the analytic ODE dual walk (`T = Dual*`, recorded by the adjoint),
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
 /// #4 / #451). The two dual callers each feed one branch live: the TV-cov
 /// event-driven walk (`integrate_tvcov_g`) passes the tracked dual `dose_lagtimes`
@@ -2552,11 +2552,90 @@ fn wrap_rhs_with_forcings<'a>(
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    let force = forcing_adder(
+        ode,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        reset_floor,
+        t_seg,
+        prepared,
+        infusions,
+        zero_order,
+    );
+    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        force(t, dy);
+    }
+}
+
+/// `ode.rhs` plus `force` — [`wrap_rhs_with_forcings`] over a caller-held forcing, so the
+/// same forcing can serve [`forced_columns`].
+fn forced<'a>(
+    ode: &'a OdeSpec,
+    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        force(t, dy);
+    }
+}
+
+/// [`forced`]'s forward-difference Jacobian columns in one lane pass
+/// (`OdeRhsProgram::rhs_columns`, then `force` per column, as the scalar RHS adds it).
+/// `None` when the program does not run on lanes.
+fn forced_columns<'a>(
+    ode: &'a OdeSpec,
+    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+) -> Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a> {
+    let raw = ode.rhs_program.as_ref()?.rhs_columns()?;
+    let n = ode.n_states;
+    Some(
+        move |y: &[f64], p: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
+            raw(y, p, t, cols, out) && {
+                for c in 0..cols.len() {
+                    force(t, &mut out[c * n..(c + 1) * n]);
+                }
+                true
+            }
+        },
+    )
+}
+
+/// Register `columns` as `rhs`'s batched Jacobian for the guard's lifetime
+/// (`rosenbrock::FdColumnsGuard`): a stiff step's `J` then costs one lane pass rather than
+/// `n` right-hand-side calls, with the same bits.
+fn register_columns<'a>(
+    rhs: &'a impl Fn(&[f64], &[f64], f64, &mut [f64]),
+    columns: &'a Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a>,
+) -> crate::ode::rosenbrock::FdColumnsGuard {
+    crate::ode::rosenbrock::FdColumnsGuard::register(
+        rhs,
+        columns
+            .as_ref()
+            .map(|c| c as &crate::ode::rosenbrock::FdColumns<'_>),
+    )
+}
+
+/// The state-independent inputs [`wrap_rhs_with_forcings`] adds to the model's `du` at
+/// time `t`: zero-order windows, infusions and the prepared absorption input rates, in
+/// that order.
+#[allow(clippy::too_many_arguments)]
+fn forcing_adder<'a>(
+    ode: &'a OdeSpec,
+    doses: &'a [DoseEvent],
+    dose_lagtimes: &'a [f64],
+    dose_f_bio: &'a [f64],
+    reset_floor: f64,
+    t_seg: f64,
+    prepared: &'a PreparedForcings,
+    infusions: InfusionInput,
+    zero_order: &'a [(usize, f64)],
+) -> impl Fn(f64, &mut [f64]) + 'a {
     // Built once per closure: `t_seg` and `reset_floor` are fixed for the segment it
     // integrates.
     let gate = ResetGate::at_segment(doses, reset_floor, t_seg);
-    move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-        (ode.rhs)(y, p, t, dy);
+    move |t: f64, dy: &mut [f64]| {
         // Zero-order absorption (#504): a constant rate per *segment*, injected the
         // same way as a spanning infusion (independent of the infusion gating
         // shape). The caller passes only the windows that fully contain this
@@ -2636,9 +2715,9 @@ pub enum OdeReadout {
 
 /// One per-CMT Form-C readout (`y[CMT=N] = <expr>`): the f64 closure the production
 /// predictor calls, plus the optional `PkNum`-differentiable program the analytic
-/// sensitivity provider evaluates over `Dual2`/`Dual1` (issue #439). `program` is
+/// gradient path evaluates over a dual number type (issue #439). `program` is
 /// `None` for hand-constructed readouts that bypass the parser — those keep the f64
-/// FD path (the dual provider declines them).
+/// FD path (the dual walks decline them).
 pub struct PerCmtReadout {
     pub out_fn: OdeOutputFn,
     pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
@@ -3511,8 +3590,8 @@ pub struct OdeSpec {
     /// `transit()`/etc. input-rate term (the historical default).
     pub input_rate: Vec<crate::pk::absorption::InputRateForcing>,
     /// Compiled RHS program for the analytic-sensitivity path (issue #367,
-    /// Option A): lets the sensitivity provider evaluate the same RHS over
-    /// `Dual2<N>` to obtain exact PK-parameter derivatives. `None` for
+    /// Option A): lets the analytic gradient path evaluate the same RHS over
+    /// a dual type to obtain exact PK-parameter derivatives. `None` for
     /// hand-built specs (tests, EKF) and any model outside the ODE-sensitivity
     /// scope gate; those fall back to the gradient-free path.
     pub rhs_program: Option<crate::parser::model_parser::OdeRhsProgram>,
@@ -3625,9 +3704,8 @@ impl OdeSpec {
     }
 
     /// True when any built-in absorption input-rate forcing carries a per-route
-    /// lag (`fn(..., lag=L)`, #859). The single predicate shared by the sensitivity
-    /// gates (`ode_analytical_supported`'s subject variants), the IOV gate
-    /// (`ode_iov_supported`), the event-driven walk (`integrate_tvcov_g`), the
+    /// lag (`fn(..., lag=L)`, #859). The single predicate shared by the ODE walks'
+    /// scope gates (`sens/ode_provider.rs`), the event-driven walk (`integrate_tvcov_g`), the
     /// initial-point diagnostics (`api::check_absorption_dosing`), and
     /// `crate::types::CompiledModel::has_route_absorption_lag` — so the "does this
     /// model have a route lag?" test cannot drift between them.
@@ -3787,7 +3865,7 @@ fn integrate_segment(
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
-    let wrapped_rhs = wrap_rhs_with_forcings(
+    let force = forcing_adder(
         ode,
         &subject.doses,
         dose_lagtimes,
@@ -3798,6 +3876,9 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
+    let wrapped_rhs = forced(ode, &force);
+    let columns = forced_columns(ode, &force);
+    let _fd_columns = register_columns(&wrapped_rhs, &columns);
     let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
@@ -3973,9 +4054,10 @@ pub(crate) fn ode_predictions_with_extra_breaks(
 ///
 /// `pk_for_dose(k)` is the PK snapshot dose `k`'s route lag and zero-order window are read
 /// from. Every prediction engine that calls this has one subject-wide snapshot and passes
-/// `|_| pk_params_flat`; the covariance step's kink bound ([`dose_break_times_per_dose`],
-/// #1505) passes the per-record snapshot so a time-varying-covariate subject's events land
-/// where its own event-driven walk puts them.
+/// `|_| pk_params_flat`. The per-dose form was for the covariance step's kink bound
+/// (`dose_break_times_per_dose`, #1505, retired in #2093), which passed the per-record
+/// snapshot so a time-varying-covariate subject's events landed where its own event-driven
+/// walk put them.
 fn collect_dose_break_times<'a>(
     break_times: &mut Vec<f64>,
     ode: &OdeSpec,
@@ -4017,42 +4099,6 @@ fn collect_dose_break_times<'a>(
         zero_order_dur_and_frac_for_dose(ode, d, pk_for_dose(k))
     });
     push_zero_order_break_times(break_times, &zo_windows);
-}
-
-/// Every timeline break the subject's pre-scheduled doses contribute under the per-dose PK
-/// snapshots `pk_for_dose(k)`, in the deterministic per-dose order
-/// [`collect_dose_break_times`] pushes them — **unsorted and undeduplicated**, so two calls
-/// at nearby parameter points can be compared entry by entry.
-///
-/// This is the moving-event enumerator behind the covariance step's kink bound (#1505):
-/// every entry that depends on an estimated quantity — a lagged arrival `t + ALAG`, an
-/// infusion end `t + ALAG + F·dur`, a per-route onset `t + ALAG + lag_route`, a
-/// `zero_order` window edge — moves when that parameter is perturbed, and an entry that does
-/// not (a dose record time under `SS`, an unlagged arrival) comes back bit-identical, so the
-/// caller finds the moving ones by differencing the two lists rather than by re-spelling
-/// which break depends on what. Reusing the engines' own builder is what keeps the bound
-/// honest: a new kind of moving break added there is seen here without a second edit.
-///
-/// Modeled-`RATE` doses (`RATE=-1/-2`) are read as coded — the covariance scope declines
-/// them before this runs (`ode_analytical_supported`'s `all_doses_fixed` gate), and a
-/// caller that admits them must resolve the doses first
-/// ([`crate::dosing::resolve_subject_doses`]).
-pub(crate) fn dose_break_times_per_dose<'a>(
-    ode: &OdeSpec,
-    subject: &Subject,
-    pk_for_dose: impl Fn(usize) -> &'a [f64] + Copy,
-) -> Vec<f64> {
-    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs_with(subject, ode, pk_for_dose);
-    let mut out = Vec::with_capacity(2 * subject.doses.len());
-    collect_dose_break_times(
-        &mut out,
-        ode,
-        subject,
-        &dose_lagtimes,
-        &dose_f_bio,
-        pk_for_dose,
-    );
-    out
 }
 
 /// Re-seed the state `u` for every pre-scheduled **steady-state** dose landing at
@@ -7361,7 +7407,7 @@ pub fn ode_predictions_event_driven(
             // time-varying covariates).
             let zero_order =
                 active_zero_order_inputs(&zo_windows, &subject.doses, cur_t, t_event, reset_floor);
-            let wrapped_rhs = wrap_rhs_with_forcings(
+            let force = forcing_adder(
                 ode,
                 &subject.doses,
                 &dose_lagtimes,
@@ -7372,6 +7418,9 @@ pub fn ode_predictions_event_driven(
                 InfusionInput::Spanning(active),
                 &zero_order,
             );
+            let wrapped_rhs = forced(ode, &force);
+            let columns = forced_columns(ode, &force);
+            let _fd_columns = register_columns(&wrapped_rhs, &columns);
             let saveat = vec![t_event];
             let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
@@ -7932,7 +7981,7 @@ pub fn ode_predictions_with_states(
         );
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -7943,6 +7992,9 @@ pub fn ode_predictions_with_states(
             InfusionInput::Gated(gated),
             &zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8242,6 +8294,14 @@ struct SegmentForcings {
     reset_floor: f64,
     gated: Vec<(usize, f64, f64, f64)>,
     zero_order: Vec<(usize, f64)>,
+    /// The earliest record time among the events applied on this break — a reset row, an
+    /// SS record-time seed, a dose arrival — or `+∞` when none fired. A break's band
+    /// `[t_start, t_start + EVENT_MATCH_TOL)` can hold a record strictly *earlier* than an
+    /// event matched to it (the break is the earlier of the two times, e.g. the integration
+    /// start at an observation the reader moved one ULP below a co-timed dose, #614/#1810);
+    /// the caller reads such a record from the pre-boundary state, as the event-driven
+    /// engine's exact-time ordering does (#2139).
+    first_event: f64,
 }
 
 /// Apply a dose segment's boundary events and resolve its forcings — the shared
@@ -8290,10 +8350,18 @@ fn apply_segment_boundary(
     // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
     // precedes it, as an observation between the two rows does in the event-driven walk.
     // On the final break (`t_end == t_start`) nothing later exists.
+    let on_this_break =
+        |rt: f64| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start);
+    let mut first_event = subject
+        .reset_times
+        .iter()
+        .copied()
+        .filter(|&rt| on_this_break(rt))
+        .fold(f64::INFINITY, f64::min);
     if let Some(r) = subject
         .reset_times
         .iter()
-        .rposition(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL && (rt < t_end || t_end <= t_start))
+        .rposition(|&rt| on_this_break(rt))
     {
         *u = ode.initial_state(init_reads.reset(disposition, r));
     }
@@ -8307,6 +8375,7 @@ fn apply_segment_boundary(
         }
         if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
             seed_applied[i] = true;
+            first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
             *u = ss_state_at_phase(
                 ode,
@@ -8350,6 +8419,7 @@ fn apply_segment_boundary(
         if (t_eff - t_start).abs() < EVENT_MATCH_TOL {
             // One arrival event: equilibrate + bolus + infusion push (#1186).
             applied[dose_idx] = true;
+            first_event = first_event.min(t_eff);
             let f = dose_f_bio[dose_idx];
             let live = gate.live(&subject.doses, dose_idx);
             if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
@@ -8412,6 +8482,7 @@ fn apply_segment_boundary(
         reset_floor,
         gated,
         zero_order,
+        first_event,
     }
 }
 
@@ -8590,6 +8661,12 @@ fn ode_dense_solve_states_seeded(
         }
         let t_end = next.unwrap_or(t_start);
 
+        // The band is collected *before* the boundary events, so a grid point strictly
+        // earlier than every event on this break can be read from the state they find
+        // (#2139); `u_before` is cloned only when the band holds a point at all.
+        saveat_index.records_at_break(t_start, &mut boundary_saveat);
+        let u_before = (!boundary_saveat.is_empty()).then(|| u.clone());
+
         let forcings = apply_segment_boundary(
             ode,
             subject,
@@ -8614,9 +8691,18 @@ fn ode_dense_solve_states_seeded(
         // convention) — the whole `EVENT_MATCH_TOL` band, through the same helper (#1226).
         // `u` here is the post-dose state; `apply_segment_boundary` set ext_params and
         // resolved forcings but did not touch `u` after the dose pulses.
-        saveat_index.records_at_break(t_start, &mut boundary_saveat);
+        //
+        // Except a point strictly earlier than the first event applied here (#2139): the
+        // break can be the earlier of two times within `EVENT_MATCH_TOL` — the integration
+        // start at an observation listed before a co-timed dose, which the reader moved one
+        // ULP below it (#614/#1810) — and the dose then matches this break too. The
+        // event-driven engine orders the two by exact time and reads the observation
+        // pre-dose, as NONMEM does; read off the post-dose `u` it was the seed plus the dose.
         for &i in &boundary_saveat {
-            result[i] = u.clone();
+            result[i] = match &u_before {
+                Some(pre) if saveat[i] < forcings.first_event => pre.clone(),
+                _ => u.clone(),
+            };
         }
 
         let Some(t_end) = next else {
@@ -8625,7 +8711,7 @@ fn ode_dense_solve_states_seeded(
 
         let seg_saveat = segment_saveat(saveat, t_start, t_end);
 
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -8636,6 +8722,9 @@ fn ode_dense_solve_states_seeded(
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8803,7 +8892,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &mut applied,
         );
 
-        let wrapped_rhs = wrap_rhs_with_forcings(
+        let force = forcing_adder(
             ode,
             &subject.doses,
             &dose_lagtimes,
@@ -8814,6 +8903,9 @@ pub(crate) fn ode_solve_until_chz_threshold(
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
         );
+        let wrapped_rhs = forced(ode, &force);
+        let columns = forced_columns(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns);
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.

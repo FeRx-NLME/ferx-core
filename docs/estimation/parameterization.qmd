@@ -67,6 +67,60 @@ parameters, and neural-network weights. Log-packing those would clamp them at
 boundary), so declaring a lower bound of exactly zero does not silently change
 the parameterization.
 
+#### An identity-packed θ started near zero {#identity-theta-near-zero}
+
+An identity-packed θ reaches the NLopt outer optimizers on its natural scale
+unless its initial magnitude exceeds 10, when it is divided by that magnitude
+([`parameter_scaling`](../model-file/fit-options.qmd#parameter-scaling-and-ebe-convergence),
+#2146). So one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of
+magnitude below the optimizer's unit step and its stopping tolerances (#2159).
+Whether that matters depends on what the θ is. A volume written in small units
+(`V = TVV_S / 1e-6`) does need moves of its own size; a covariate exponent started
+at `0.001` is usually an O(1) slope and needs unit-sized moves.
+
+The value alone cannot tell the two apart, so before the outer optimizer starts,
+each free identity-packed θ with $0 < |\theta_0| < 0.1$ is evaluated at two more
+points inside its declared bounds — $\theta_0 \mp \delta$ with
+$\delta = |\theta_0|/2$, or, when θ₀ sits near a bound, $\theta_0 + \delta$ and
+$\theta_0 + 2\delta$ on the side with room (two extra inner solves per such θ).
+The quadratic through the three equally spaced points $x_0 < x_1 < x_2$ has its
+minimizer at
+
+$$
+x^* = x_1 - \delta\,\frac{f_2 - f_0}{2\,(f_0 - 2f_1 + f_2)},
+$$
+
+and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when
+$|x^* - \theta_0| \le 10\,|\theta_0|$: the minimizer is predicted within a few
+times the θ's own size. Otherwise — and when the second difference shows no
+positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale.
+A probe the optimizer could not take — a `NaN` or diverged objective, or one the
+EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
+or a hard-rejected start) — scales the θ, since a move of its own size already
+leaves the feasible region. A start the guard rejects is not probed.
+
+The statistic is a ratio of objective differences, so the decision does not change
+when every likelihood contribution is repeated — more subjects, or more
+observations per subject — which multiplies the objective without moving its
+minimizer. The objective probed is the one the optimizer minimises: parameter
+priors and the covariate-NN regularizer are included, so a θ whose small moves a
+tight prior makes matter is scaled. This applies to `bobyqa`, `slsqp`,
+`nlopt_lbfgs` and `mma` under the default `parameter_scaling = auto` and under
+`abs`, `[mixture]` models included (probed on the mixture objective); `none` and
+`rescale2` keep their own vectors.
+
+Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5`
+(macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS
+at −269.47, each reporting convergence; all three now reach the minimum,
+−286.0042, the same as the plain model from `TVV = 10`. The probes predict
+`TVV_S`'s minimizer 0.12·|θ₀| away (second difference 124). On `two_cpt_oral_cov`
+with both covariate exponents started at `0.001` the second differences are
+6.3e-6 and 1.1e-5, under the 1.0e-3 floor at OFV −1033 (read anyway, the
+predicted steps are 708 and 261·|θ₀|), so neither is rescaled and all three
+optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with
+the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
+301.58, its plain model's minimum.
+
 ## Bounds
 
 `compute_bounds()` returns a box in packed space:

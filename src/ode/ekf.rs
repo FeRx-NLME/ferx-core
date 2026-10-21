@@ -2248,10 +2248,6 @@ mod tests {
     /// constant step per cycle and no periodic steady state exists.
     #[test]
     fn ekf_ss_run_in_without_a_steady_state_warns() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
         fn saturated_rhs(y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]) {
             dy[0] = -5.0 * y[0] / (50.0 + y[0]);
         }
@@ -2277,13 +2273,13 @@ mod tests {
             crate::dosing::last_ss_equilibration_warned(),
             "the EKF run-in must record its own non-convergence"
         );
-        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface the #867 warning from the \
-             EKF run-in; got: {warnings:?}"
+             EKF run-in; got: {warning:?}"
         );
     }
 

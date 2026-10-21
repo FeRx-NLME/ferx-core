@@ -7,7 +7,9 @@ use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
-use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
+use crate::estimation::inner_optimizer::{
+    run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed, InnerSolvePolicy,
+};
 use crate::estimation::outer_optimizer::{
     gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
@@ -39,6 +41,10 @@ struct FoceiProblem<'a> {
     init_params: &'a ModelParameters,
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
+    /// `cached_etas` are converged modes at the start point, not yet consumed: the next
+    /// inner pass takes them as warm starts whatever their values
+    /// (`InnerSolvePolicy::init_is_mode`, #2076) and clears the flag.
+    cached_etas_are_modes: std::sync::atomic::AtomicBool,
     grad_cache: std::sync::Mutex<Option<GradCache>>,
     /// Covariate-NN (DCM) regularizer. No-op when both λ are 0. Added to the
     /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
@@ -59,7 +65,11 @@ impl FoceiProblem<'_> {
             Some(warm.as_slice())
         };
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
-        let (etas, h_mats, _, _kappas) = run_inner_loop_warm_seeded(
+        // `run_inner_loop_warm_seeded`'s solve, with the #2076 certificate carried through.
+        let init_is_mode = self
+            .cached_etas_are_modes
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let (etas, h_mats, _, _kappas, _) = run_inner_loop_warm_map(
             self.model,
             self.population,
             &params,
@@ -69,8 +79,13 @@ impl FoceiProblem<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
-            InnerHessianSeed::for_options(self.options),
-            self.options,
+            InnerSolvePolicy {
+                seed: InnerHessianSeed::for_options(self.options),
+                init_is_mode,
+                ..InnerSolvePolicy::for_stage(self.options, self.model)
+            },
+            None,
+            |_, _| (),
         );
         *self.cached_etas.lock().unwrap() = etas.clone();
         (etas, h_mats)
@@ -677,6 +692,20 @@ pub fn optimize_trust_region(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
+    optimize_trust_region_seeded(model, population, init_params, options, None)
+}
+
+/// [`optimize_trust_region`] with the first evaluation's EBEs supplied: `first_eval_etas`
+/// are the EBEs already solved at the packed, clamped `init_params` (the flat-theta
+/// pre-flight's, #2076), so the first inner solve starts at that mode instead of solving
+/// it cold a second time. `None` is the cold start.
+pub(crate) fn optimize_trust_region_seeded(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    first_eval_etas: Option<&[DVector<f64>]>,
+) -> OuterResult {
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -704,7 +733,13 @@ pub fn optimize_trust_region(
         options,
         init_params,
         bounds,
-        cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
+        cached_etas: std::sync::Mutex::new(match first_eval_etas {
+            Some(etas) if etas.len() == n_subj => etas.to_vec(),
+            _ => vec![DVector::zeros(n_eta); n_subj],
+        }),
+        cached_etas_are_modes: std::sync::atomic::AtomicBool::new(
+            first_eval_etas.is_some_and(|e| e.len() == n_subj),
+        ),
         grad_cache: std::sync::Mutex::new(None),
         priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
         nn_reg,
@@ -1007,6 +1042,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
+            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1307,6 +1343,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
+                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
                 grad_cache: std::sync::Mutex::new(None),
                 priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
@@ -1401,6 +1438,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
+                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),

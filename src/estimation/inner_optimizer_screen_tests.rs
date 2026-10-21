@@ -423,7 +423,12 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    for outer_maxiter in [2, 0] {
+    // `outer_maxiter = 10` is a converged estimating fit (−604.046643 with or without the
+    // screen), whose final cold re-solve still needs the screen to put S1 in its deeper mode.
+    // It was `2` until #2093; since a curvature-free first step is bounded, the cold solve at
+    // that run's final θ reaches the deeper mode on its own (the screen had moved S1 earlier
+    // in the fit, 3.15 OFV lower), so there was nothing left for the warning to name.
+    for outer_maxiter in [10, 0] {
         let w = screen_warning(100, outer_maxiter)
             .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: the screen moved S1"));
         assert!(
@@ -564,7 +569,9 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
         .collect();
     assert!(subj.has_tv_covariates());
     let mut straddles = 0;
-    for max_iter in 40..=60 {
+    // From 1: since #2093 a bounded first step converges the axis seeds sooner, so the
+    // straddling budgets sit below the 40..=60 this scan started at.
+    for max_iter in 1..=60 {
         let o = FitOptions {
             inner_maxiter: max_iter,
             inner_tol: 1e-5,

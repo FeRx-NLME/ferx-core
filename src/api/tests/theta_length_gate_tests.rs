@@ -607,3 +607,123 @@ fn compute_npde_npd_refuses_a_missing_covariate_and_an_unbound_block() {
     .expect_err("compute_npde_npd, unbound model");
     assert_unbound_names(&e, "compute_npde_npd");
 }
+
+/// `pop` without the covariate `name`: off every map, `covariate_names` and the header.
+#[cfg(feature = "survival")]
+fn without_covariate(mut pop: Population, name: &str) -> Population {
+    for s in &mut pop.subjects {
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.remove(name);
+        }
+    }
+    pop.covariate_names.retain(|c| c != name);
+    pop.input_columns.retain(|c| c != name);
+    pop
+}
+
+/// #1798 (a): "covariates present" is model-wide on every entry point. The selector of a
+/// covariate-selected `[error_model]` is required by `predict_survival` and
+/// `predict_categorical` too, though neither reads the Gaussian residual: without it each
+/// is `E_MISSING_COVARIATE` naming it, as `predict_diag` is; with it each returns finite,
+/// non-empty rows. This pins the decision, so narrowing either entry to its endpoint's own
+/// covariates is a red test, not a silent change of contract.
+///
+/// Mutation — drop the selector from either entry's covariate check: that entry's
+/// refusal goes `Ok`, naming itself.
+#[cfg(feature = "survival")]
+#[test]
+fn an_error_model_selector_is_required_by_the_survival_predictors_too() {
+    let grid = [1.0, 10.0, 50.0];
+    let selector = "if (ASSAY == 1) { DV ~ proportional(PROP_ERR) } else { DV ~ \
+                    proportional(PROP_B) }";
+    let (_, tte, pop) = edited_example(
+        "pktte_joint.ferx",
+        "data/pktte_joint.csv",
+        &[
+            (
+                "sigma PROP_ERR ~ 0.05 (sd)",
+                "sigma PROP_ERR ~ 0.05 (sd)\n  sigma PROP_B ~ 0.1 (sd)",
+            ),
+            (
+                "DV ~ proportional(PROP_ERR)   # applies to the Gaussian PK rows (CMT 2); TTE \
+                 rows (CMT 3) route to the event likelihood",
+                selector,
+            ),
+        ],
+    );
+    assert!(tte.model.referenced_covariates.iter().any(|c| c == "ASSAY"));
+    let e = predict_survival(&tte.model, &pop, &tte.model.default_params, &grid)
+        .expect_err("predict_survival, no ASSAY");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): ASSAY."), "{e}");
+    let mut with = pop;
+    for (i, s) in with.subjects.iter_mut().enumerate() {
+        let v = (i % 2 + 1) as f64;
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.insert("ASSAY".to_string(), v);
+        }
+    }
+    with.covariate_names.push("ASSAY".to_string());
+    let rows = predict_survival(&tte.model, &with, &tte.model.default_params, &grid)
+        .expect("predict_survival, with ASSAY");
+    assert!(!rows.is_empty());
+    for r in &rows {
+        assert!(r.survival.is_finite(), "{}", r.survival);
+    }
+
+    // A Gaussian + binary model whose Gaussian residual is selected by `ASSAY`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv = dir.path().join("mixed.csv");
+    let mut body = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,ASSAY\n");
+    for i in 1..=6 {
+        let assay = i % 2 + 1;
+        body.push_str(&format!("{i},0,.,1,100,1,1,{assay}\n"));
+        for t in [1, 2, 4] {
+            let conc = 10.0 * (-0.2 * t as f64).exp();
+            body.push_str(&format!("{i},{t},{conc},0,.,1,0,{assay}\n"));
+            body.push_str(&format!("{i},{t},{},0,.,3,0,{assay}\n", (i + t) % 2));
+        }
+    }
+    std::fs::write(&csv, body).expect("write csv");
+    let mixed = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+        theta TH0(-0.4, -10.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n  \
+        sigma PROP_B ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+        V  = TVV\n  LO = TH0\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+        [binary_model]\n  cmt   = 3\n  logit = LO\n[error_model]\n  if (ASSAY == 1) { DV ~ \
+        proportional(PROP) } else { DV ~ proportional(PROP_B) }\n";
+    let bin = crate::parser::model_parser::parse_full_model(mixed).expect("parse");
+    assert!(bin.model.referenced_covariates.iter().any(|c| c == "ASSAY"));
+    let with = crate::api::read_population_for(
+        &bin.model,
+        &None,
+        csv.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("routed read")
+    .0;
+    let without = without_covariate(with.clone(), "ASSAY");
+    let e = predict_categorical(&bin.model, &without, &bin.model.default_params)
+        .expect_err("predict_categorical, no ASSAY");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): ASSAY."), "{e}");
+    let rows = predict_categorical(&bin.model, &with, &bin.model.default_params)
+        .expect("predict_categorical, with ASSAY");
+    assert_eq!(rows.len(), 18, "6 subjects x 3 binary records");
+    for r in &rows {
+        let crate::types::Prediction::CatProbs { probs } = &r.prediction else {
+            panic!("category probabilities expected");
+        };
+        for p in probs {
+            assert!(p.is_finite() && *p > 0.0 && *p < 1.0, "{p}");
+        }
+    }
+}

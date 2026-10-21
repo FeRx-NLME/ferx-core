@@ -448,6 +448,11 @@ pub struct AdaptiveSubjectMetrics {
     /// scheduled decisions coincide (the common case, and what the bundled example
     /// exercises).
     pub auc_target_attainment: Option<f64>,
+    /// Whether this subject's η was supplied (`AdaptiveInputs::with_etas`, #1594)
+    /// rather than drawn from Ω. Its between-subject variability is then conditioned
+    /// on, not simulated: across replicates it varies by κ and a `Dv` monitor's assay
+    /// only (adaptive trajectories carry no residual error).
+    pub eta_supplied: bool,
 }
 
 /// `true` if any logged decision is a `Stop` that *also* issued a dose — the
@@ -576,6 +581,8 @@ pub(crate) fn compute_subject_metrics(
         signal_mean,
         pct_time_in_window,
         auc_target_attainment,
+        // The caller knows where the η came from; the ledger does not.
+        eta_supplied: false,
     }
 }
 

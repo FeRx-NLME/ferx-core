@@ -6,6 +6,10 @@ use crate::types::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Opens the message of a dataset file that cannot be opened or read, whichever of
+/// the reader or [`crate::DataSource::read`] reads it.
+pub(crate) const ERR_OPEN_CSV: &str = "Failed to open CSV: ";
+
 /// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
 /// Passed into `read_nonmem_csv_impl` so filtering happens at read time.
 pub struct SelectionFilter {
@@ -743,7 +747,17 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
     path: &Path,
     routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, None, &[], None, None, None, routing, &[]).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        CsvInput::Path(path),
+        None,
+        &[],
+        None,
+        None,
+        None,
+        routing,
+        &[],
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// The one reader every wrapper above delegates to: it builds the covariate
@@ -760,6 +774,40 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed(
     path: &Path,
+    covariate_columns: Option<&[&str]>,
+    decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    routing: &ObsRouting,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    read_nonmem_csv_routed_from(
+        CsvInput::Path(path),
+        covariate_columns,
+        decls,
+        extra_columns,
+        iov_column,
+        filter,
+        routing,
+        column_map,
+    )
+}
+
+/// Where the CSV reader takes its bytes from: a file it opens itself, or bytes a
+/// caller already read (#2140), so the population and the `data_hash` stamped
+/// beside it can describe the same read of the file.
+#[derive(Clone, Copy)]
+pub(crate) enum CsvInput<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+/// [`read_nonmem_csv_routed`] over a [`CsvInput`]; the one body both spellings
+/// share, so a read of bytes and a read of the file holding them agree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_nonmem_csv_routed_from(
+    input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
     decls: Option<&[CovariateDecl]>,
     extra_columns: &[String],
@@ -791,7 +839,7 @@ pub(crate) fn read_nonmem_csv_routed(
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
     read_nonmem_csv_impl(
-        path,
+        input,
         cols_ref.as_deref(),
         extra_columns,
         iov_column,
@@ -818,7 +866,7 @@ pub(crate) fn read_nonmem_csv_routed(
 /// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
 /// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
 fn read_nonmem_csv_impl(
-    path: &Path,
+    input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
     auto_extras: &[String],
     iov_column: Option<&str>,
@@ -828,11 +876,19 @@ fn read_nonmem_csv_impl(
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     routing.validate()?;
+    // `ReaderBuilder::from_path` is `File::open` + `from_reader`, and a csv I/O
+    // error displays as the I/O error itself, so opening the file here keeps the
+    // message `from_path` gave, byte for byte.
+    let source: Box<dyn std::io::Read + '_> = match input {
+        CsvInput::Path(path) => {
+            Box::new(std::fs::File::open(path).map_err(|e| format!("{ERR_OPEN_CSV}{}", e))?)
+        }
+        CsvInput::Bytes(bytes) => Box::new(bytes),
+    };
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("Failed to open CSV: {}", e))?;
+        .from_reader(source);
 
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
@@ -1934,7 +1990,7 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// than -1, 0 or 1 (#1496).
 ///
 /// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
-/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `foce_tail_jet`,
+/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `focei_kernel::m3_terms`,
 /// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
 /// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
 /// see `bloq_method`, so the message states both methods. `cell` is quoted as

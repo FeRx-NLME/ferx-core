@@ -1,4 +1,3 @@
-use crate::stats::stacked_layout::block_diag_stack;
 use crate::types::{
     CompiledModel, ModelParameters, MuTransform, OmegaMatrix, ResidualCorrelation, SigmaVector,
 };
@@ -2010,39 +2009,6 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
     debug_assert!(i >= j && i < n);
     let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
     col_offset + (i - j)
-}
-
-/// Map a sub-block natural symmetric Ω-gradient to packed Cholesky space:
-/// `∂F/∂L = 2·M_sub·L` (L lower-triangular), with the diagonal log-chain
-/// (`x_ii = ln L_ii ⇒ ×L_ii`) and raw off-diagonals — the same convention/order
-/// as `pack_params`. Shared with `crate::estimation::agq`.
-pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
-    let n = l.nrows();
-    let gl = (m_sub * l).scale(2.0);
-    // `lower_tri_iter` yields only `(i,i)` when diagonal, where the `i == j` arm
-    // (diagonal log-chain `×L_ii`) applies; off-diagonals are raw.
-    lower_tri_iter(n, diagonal)
-        .map(|(i, j)| {
-            if i == j {
-                gl[(i, j)] * l[(i, j)]
-            } else {
-                gl[(i, j)]
-            }
-        })
-        .collect()
-}
-
-/// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
-/// prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`.
-pub(crate) fn block_chol_full(
-    l_bsv: &DMatrix<f64>,
-    l_iov: &DMatrix<f64>,
-    k: usize,
-    n_eta: usize,
-    n_iov: usize,
-) -> DMatrix<f64> {
-    debug_assert_eq!((l_bsv.nrows(), l_iov.nrows()), (n_eta, n_iov));
-    block_diag_stack(l_bsv, l_iov, k)
 }
 
 #[cfg(test)]
