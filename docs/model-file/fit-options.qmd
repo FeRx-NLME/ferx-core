@@ -407,6 +407,15 @@ population has no labels and its reference is built at κ = 0 (#1980).
 `compute_npde_npd_diag` reports a subject left without a label as
 `W_IOV_NO_OCCASIONS`.
 
+On a transit or inverse-Gaussian absorption closed form with no ODE twin, a reference
+replicate whose sampled η puts it in the flip-flop regime (disposition rate ≥ the
+tilting abscissa) has its whole dose-driven concentration clamped to zero, so it
+enters the reference as an undosed profile and shifts every NPDE / NPD scored against
+it. The point estimate being in-domain does not rule this out. Both the post-fit step
+(on `FitResult::warnings`) and `compute_npde_npd_diag` report how many replicates
+crossed as `W_SIMULATED_FLIP_FLOP` (#1928); rewriting the model as an explicit ODE
+removes the clamp.
+
 **Under a correctly specified model, NPDE follows a standard normal distribution.**
 On the warfarin example (`examples/warfarin.ferx`, `data/warfarin.csv`), a converged
 FOCEI fit with `npde_nsim = 1000` gives the expected mean-zero, unit-variance

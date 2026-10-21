@@ -4979,24 +4979,54 @@ impl SimulatedFlipFlopTally {
         }
     }
 
+    /// Fold another tally into this one — the per-subject tallies of a parallel walk
+    /// (the NPDE reference, #1928), which cannot share one `&mut` accumulator.
+    pub(crate) fn absorb(&mut self, other: SimulatedFlipFlopTally) {
+        self.crossed += other.crossed;
+        self.total += other.total;
+    }
+
     /// The one `W_SIMULATED_FLIP_FLOP` warning this run owes its caller, or `None` when no
     /// simulated individual crossed (the common case, and every non-absorption model).
     pub(crate) fn warning(&self, model: &CompiledModel) -> Option<String> {
+        self.message(
+            model,
+            "simulated individuals",
+            "Those rows are still returned and still summarised, so every VPC band, \
+             prediction interval or mean computed over them describes an undosed subject.",
+        )
+    }
+
+    /// The `W_SIMULATED_FLIP_FLOP` warning for the NPDE / NPD reference distribution
+    /// (#1928), or `None` when no reference replicate crossed. Same finding and code as
+    /// [`warning`](Self::warning) — the replicates are simulated individuals drawn from
+    /// N(0, Ω) — but what the clamped rows corrupt is the empirical CDF every observation
+    /// is scored against, not a returned row set, so the consequence sentence says that.
+    pub(crate) fn npde_reference_warning(&self, model: &CompiledModel) -> Option<String> {
+        self.message(
+            model,
+            "NPDE/NPD reference replicates",
+            "Those replicates are still part of the reference distribution every observation \
+             is scored against, so the NPDE and NPD of every subject they belong to are \
+             computed against a reference mixed with undosed profiles.",
+        )
+    }
+
+    fn message(&self, model: &CompiledModel, who: &str, consequence: &str) -> Option<String> {
         if self.crossed == 0 {
             return None;
         }
         let (domain, ode_fn) = absorption_flip_flop_wording(model);
         let confluent = absorption_confluent_clause(model);
         Some(format!(
-            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} {who} dosed before one of \
              their observations were evaluated at an η inside the flip-flop regime \
              (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
              closed form has no solution and clamps its dose-driven concentration to zero. \
              None of their rows carries any contribution from the doses the subject was \
              given — by that clamp, or, for an individual whose absorption never reaches an \
              observation (a `lagtime` past it, or `f = 0`), because the dose never arrived. \
-             Those rows are still returned and still summarised, so every VPC band, \
-             prediction interval or mean computed over them describes an undosed subject. \
+             {consequence} \
              Whether they read as a literal `ipred = 0` depends on what this model layers \
              on the closed form's output afterwards, so searching the output for a zero row \
              will not reliably find them. \

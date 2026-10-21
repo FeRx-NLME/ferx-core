@@ -2530,7 +2530,7 @@ fn fit_inner(
     // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
     // nothing. Subjects are built in population order, so the zip aligns.
     if options.npde_nsim > 0 {
-        let per_subj = crate::stats::npde::compute_npde_npd(
+        let (per_subj, npde_warnings) = crate::stats::npde::compute_npde_npd_diag(
             model,
             population,
             &result.params,
@@ -2540,6 +2540,14 @@ fn fit_inner(
             // (`fitted_population`), so there is no rule to apply here (#1980).
             None,
         )?;
+        // The reference distribution's flip-flop count (#1928) has no other channel: the
+        // η = 0 refusal and the #785 EBE warning never see the reference draws. Only that
+        // one — the no-occasion warning is the fit's own, already reported for the fit.
+        result.warnings.extend(
+            npde_warnings
+                .into_iter()
+                .filter(|w| w.starts_with("W_SIMULATED_FLIP_FLOP")),
+        );
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
