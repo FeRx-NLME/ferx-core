@@ -757,16 +757,16 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     simulate(&c).expect("a derived occasion rule labels the simulated population");
 
     // The dose rule, which the message rules out: every `[simulation]` subject gets
-    // one dose, so the rule derives one occasion and `fit()` refuses it. If
-    // `[simulation]` ever grows a multiple-dose design this cell fails, and the
-    // message's sentence about the dose rule has to change with it.
+    // one dose, so the rule derives one occasion. If `[simulation]` ever grows a
+    // multiple-dose design this cell fails, and the message's sentence about the dose
+    // rule has to change with it.
     let d = warfarin_iov_sim_model(|s| {
         no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = dose\n")
     });
     let msg = simulate(&d)
         .expect_err("the dose rule cannot label a [simulation] population")
         .to_string();
-    assert!(msg.contains("produced only a single occasion"), "{msg}");
+    assert!(msg.contains("derives only a single occasion"), "{msg}");
 
     // The data path keeps the dataset advice, both remedies included.
     let msg = crate::api::run_model_with_data(
@@ -778,6 +778,137 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     assert!(msg.contains(dataset_advice), "{msg}");
     assert!(msg.contains("`iov_occasion = dose`"), "{msg}");
     assert!(!msg.contains("[simulation]"), "{msg}");
+}
+
+/// The `fit()` refusal of a single-occasion derived rule, which the data path still
+/// gives: it names all three remedies, the dataset ones included.
+const SINGLE_OCCASION_DATA_ADVICE: &str =
+    "`iov_occasion = dose` on a multiple-dose design, or supply an `iov_column`";
+
+// #2052: a derived `iov_occasion` rule that leaves every `[simulation]` subject with one
+// occasion is refused before anything is simulated, and with advice that can work there.
+// `time(24)` straddles the gate (a breakpoint inside the `times` grid, so it simulates and
+// fits), and the data path keeps `fit()`'s three-remedy text, so a gate stuck on either
+// branch, or a message switched on the wrong side, fails this test. Each assertion on the
+// refusal names one sentence of the message.
+#[test]
+fn simulate_refuses_a_single_occasion_rule_before_simulating() {
+    let simulate = |f: &tempfile::NamedTempFile| {
+        crate::api::run_model_simulate_with_overrides(
+            f.path().to_str().unwrap(),
+            &crate::api::RunOverrides::default(),
+        )
+    };
+    let with_rule = |rule: &'static str| {
+        warfarin_iov_sim_model(move |s| {
+            assert!(s.contains("  iov_column = OCC\n"));
+            s.replace("  iov_column = OCC\n", "").replace(
+                "[fit_options]\n",
+                &format!("[fit_options]\n  iov_occasion = {rule}\n"),
+            )
+        })
+    };
+    // What every refusal says, whichever rule produced it.
+    let assert_common = |msg: &str| {
+        assert!(
+            msg.contains(
+                "The `iov_occasion` rule derives only a single occasion for every subject \
+                 simulated from the [simulation] block"
+            ),
+            "names the cause: {msg}"
+        );
+        assert!(
+            msg.contains("cannot be separated from between-subject variability"),
+            "says why that is refused: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Set `iov_occasion = time(...)` in [fit_options], with a breakpoint between \
+                 the first and last of the [simulation] `times`"
+            ),
+            "names the remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("iov_column"),
+            "names the dataset remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple-dose design"),
+            "names the multiple-dose remedy: {msg}"
+        );
+        assert!(!msg.contains(SINGLE_OCCASION_DATA_ADVICE), "{msg}");
+    };
+
+    // `dose`: one dose per simulated subject, so one occasion.
+    let dose = with_rule("dose");
+    let msg = simulate(&dose)
+        .expect_err("the dose rule derives one occasion on [simulation]")
+        .to_string();
+    assert_common(&msg);
+    assert!(
+        msg.contains(
+            "`iov_occasion = dose` derives one occasion here: each simulated subject \
+             receives the [simulation] block's single dose."
+        ),
+        "says why the dose rule cannot: {msg}"
+    );
+    assert!(!msg.contains("No `time(...)` breakpoint"), "{msg}");
+
+    // `time(200)`: the breakpoint lies after the last of the `times` (120).
+    let late = with_rule("time(200)");
+    let msg = simulate(&late)
+        .expect_err("a breakpoint after the last sampling time derives one occasion")
+        .to_string();
+    assert_common(&msg);
+    assert!(
+        msg.contains(
+            "No `time(...)` breakpoint lies after the simulated dose at time 0 and at or \
+             before the last of the [simulation] `times`, so every record falls in one window."
+        ),
+        "says why the time rule cannot: {msg}"
+    );
+    assert!(!msg.contains("`iov_occasion = dose` derives"), "{msg}");
+
+    // `time(24)`: a breakpoint inside the grid gets through, and is fitted.
+    simulate(&with_rule("time(24)")).expect("a breakpoint inside `times` labels two occasions");
+
+    // The data path keeps `fit()`'s own refusal and its three remedies.
+    let msg = crate::api::run_model_with_data(
+        late.path().to_str().unwrap(),
+        Some(concat!(env!("CARGO_MANIFEST_DIR"), "/data/warfarin.csv")),
+    )
+    .expect_err("a breakpoint after every warfarin record derives one occasion")
+    .to_string();
+    assert!(msg.contains("produced only a single occasion"), "{msg}");
+    assert!(msg.contains(SINGLE_OCCASION_DATA_ADVICE), "{msg}");
+    assert!(!msg.contains("[simulation]"), "{msg}");
+}
+
+#[test]
+fn simulation_single_occasion_check_has_the_fit_gate() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for subj in &mut pop.subjects {
+        subj.occasions.clear();
+        subj.dose_occasions.clear();
+    }
+    let check = super::check_simulation_iov_single_occasion;
+    // `make_iov_population` doses at 0.0 and 3.5 with observations at 1..6.
+    assert!(check(&model, &pop, &IovOccasionRule::PerDose).is_none());
+    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![3.5])).is_none());
+    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_some());
+    // No derived rule, or no kappa: not this check's refusal.
+    assert!(check(&model, &pop, &IovOccasionRule::Column).is_none());
+    let mut no_kappa = make_iov_model();
+    no_kappa.n_kappa = 0;
+    assert!(check(&no_kappa, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_none());
+    // The count is `fit()`'s: the rule the check refuses, `fit()` refuses too.
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+    let msg = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("a breakpoint after every record derives one occasion")
+        .to_string();
+    assert!(msg.contains("produced only a single occasion"), "{msg}");
 }
 
 // TimeWindows breakpoints bucket obs and doses by (raw) time: `time(3.5)`
