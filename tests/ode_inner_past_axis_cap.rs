@@ -13,9 +13,15 @@
 //! the likelihood is unchanged: `n_fix = 14` gives 24 axes (at the cap) and
 //! `n_fix = 15` gives 25 (past it). The two fits are evaluated at the start
 //! values (`outer_maxiter = 0`) and must agree subject by subject.
+//!
+//! The outer half (#2048): before the adjoint (#2093) the 25th axis also dropped the
+//! outer gradient to finite differences, so `optimizer = auto` resolved to BOBYQA,
+//! `gradient_method_outer` read `N/A` and the covariance step ran the FD stencil, with
+//! no warning naming the cap. `outer_route_is_the_same_past_the_cap` pins that the
+//! outer route no longer depends on the axis count.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::FitOptions;
+use ferx_core::types::{CovarianceStatus, FitOptions};
 use ferx_core::{fit, read_nonmem_csv, FitResult};
 use std::path::Path;
 
@@ -183,4 +189,51 @@ fn ode_inner_stays_analytic_one_axis_past_the_cap() {
 #[test]
 fn ode_inner_stays_analytic_past_the_cap_at_loose_ode_tolerances() {
     assert_twins_agree("ode_reltol = 1e-3, ode_abstol = 1e-6", Some((1e-3, 1e-6)));
+}
+
+/// #2048: a few outer iterations with the covariance step on, at 24 and 25 axes. Both
+/// twins report an analytic outer gradient, resolve `auto` to L-BFGS, carry no
+/// finite-difference warning, and compute the covariance step; since the FIX θ is not
+/// in the optimizer's vector, the two runs take the same steps and land on the same OFV.
+/// Before #2093 the 25-axis twin read `N/A` / `auto (bobyqa)` here. Which R-matrix the
+/// step assembles is not visible on `FitResult`; that half is pinned by the Tier-1
+/// `an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes`.
+#[test]
+fn outer_route_is_the_same_past_the_cap() {
+    let run = |n_fix: usize| {
+        let parsed = parse_full_model(&make_model(n_fix)).expect("padded model parses");
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("two_cpt_oral_cov.csv loads");
+        let options = FitOptions {
+            outer_maxiter: 3,
+            run_covariance_step: true,
+            ..parsed.fit_options.clone()
+        };
+        fit(&parsed.model, &pop, &parsed.model.default_params, &options).expect("fit runs")
+    };
+    let at_cap = run(14);
+    let past_cap = run(15);
+    for (label, r) in [("24 axes", &at_cap), ("25 axes", &past_cap)] {
+        assert_eq!(
+            r.gradient_method_outer, "analytic (Dual2)",
+            "{label}: the adjoint outer gradient has no θ + η cap"
+        );
+        assert_eq!(
+            r.optimizer, "auto (nlopt_lbfgs)",
+            "{label}: `auto` takes L-BFGS on an analytic outer gradient"
+        );
+        let fd: Vec<&String> = r
+            .warnings
+            .iter()
+            .filter(|w| w.contains("finite-difference") || w.contains("finite difference"))
+            .collect();
+        assert!(fd.is_empty(), "{label}: unexpected FD warning(s): {fd:?}");
+        assert_eq!(
+            r.covariance_status,
+            CovarianceStatus::Computed,
+            "{label}: covariance step"
+        );
+    }
+    assert!(at_cap.ofv.is_finite(), "OFV {}", at_cap.ofv);
+    assert_eq!(at_cap.ofv, past_cap.ofv, "OFV at 24 vs 25 axes");
 }

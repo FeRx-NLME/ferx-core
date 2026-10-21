@@ -3148,6 +3148,89 @@ mod tests {
         ));
     }
 
+    /// #2048: an ODE model past the retired forward provider's 24-axis `θ + η` cap keeps every
+    /// analytic route the fit reports. Before #2093 the 25th axis (here a FIX θ, which counts)
+    /// dropped the outer gradient to FD, sent `auto` to BOBYQA and the covariance step to the
+    /// stencil, with nothing in the fit saying why. The adjoint has no θ cap, so the three
+    /// predicates the fit routes on must read the same at 24 and past it — asserted on both
+    /// sides of the old cap so a reinstated cap reddens the far side by name, and on a
+    /// `gradient = fd` control so the predicates are shown able to decline at all.
+    #[test]
+    fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::sens::provider::{
+            analytic_outer_gradient_for_interaction, analytic_outer_gradient_in_scope,
+        };
+        use crate::types::{FitOptions, GradientMethod, Optimizer, Population, Subject};
+        // 2 θ + 2 η plus `n_fix` FIX θ, each a factor of exactly 1 on CL.
+        let model = |n_fix: usize| {
+            let thetas: String = (0..n_fix)
+                .map(|k| format!("  theta TH_{k}(0.0, -3.0, 3.0) FIX\n"))
+                .collect();
+            let factors: String = (0..n_fix).map(|k| format!(" * (1 + TH_{k})")).collect();
+            crate::parser::model_parser::parse_model_string(&format!(
+                "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
+                 {thetas}  omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.15\n  sigma PROP_ERR ~ 0.04\n\
+                 [individual_parameters]\n  CL = TVCL{factors} * exp(ETA_CL)\n\
+                 V = TVV * exp(ETA_V)\n\
+                 [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+                 [odes]\n  d/dt(central) = -(CL/V) * central\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            ))
+            .unwrap()
+        };
+        let population = Population {
+            subjects: vec![Subject::default()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let options = FitOptions::default();
+        for n_fix in [20, 21, 40] {
+            let m = model(n_fix);
+            let axes = m.n_theta + m.n_eta;
+            assert_eq!(axes, 4 + n_fix, "the FIX θ are counted as θ");
+            assert!(m.ode_spec.is_some(), "{axes} axes: an ODE model");
+            assert!(
+                analytic_outer_gradient_in_scope(&m),
+                "{axes} axes: the outer gradient must stay analytic"
+            );
+            for interaction in [true, false] {
+                assert_eq!(
+                    Optimizer::Auto.resolve_auto(&m, interaction),
+                    Optimizer::NloptLbfgs,
+                    "{axes} axes, interaction = {interaction}: `auto` must take L-BFGS"
+                );
+            }
+            assert_eq!(
+                super::analytic_cov_declines(&m, &population, &options, false),
+                vec![CovScopeDecline::PerSubjectBail],
+                "{axes} axes: no model-level clause may decline the analytic R-matrix"
+            );
+            assert!(super::analytic_r_expected(&m, &population, &options, false));
+
+            let mut fd = model(n_fix);
+            fd.gradient_method = GradientMethod::Fd;
+            assert!(
+                !analytic_outer_gradient_for_interaction(&fd, true),
+                "{axes} axes, FD"
+            );
+            assert_eq!(
+                Optimizer::Auto.resolve_auto(&fd, true),
+                Optimizer::Bobyqa,
+                "{axes} axes, FD"
+            );
+            assert!(!super::analytic_r_expected(
+                &fd,
+                &population,
+                &options,
+                false
+            ));
+        }
+    }
+
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
 
     /// The diagonal of a covariance, as the inflation metric consumes it.
