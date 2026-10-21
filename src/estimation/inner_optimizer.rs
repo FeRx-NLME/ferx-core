@@ -4647,16 +4647,28 @@ fn lbfgs_core(
         }
 
         let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-        let (alpha, f_new) = backtracking_line_search(
+        let (alpha, f_new) = match exact_step_verified_by_gradient(
             obj,
+            grad,
             x,
             &d,
-            &g,
             f_cur,
-            &mut line_search_point,
-            short_line_search,
-            floor,
-        );
+            &g,
+            stop_precond,
+            enable_stall,
+        ) {
+            Some(fc) => (1.0, fc),
+            None => backtracking_line_search(
+                obj,
+                x,
+                &d,
+                &g,
+                f_cur,
+                &mut line_search_point,
+                short_line_search,
+                floor,
+            ),
+        };
         // At the noise floor an unverifiable step is convergence, not a failure — unless the
         // gradient verifies it ([`gradient_verified_step`]).
         let (alpha, f_new) = if alpha == 0.0 && floor {
@@ -4692,7 +4704,7 @@ fn lbfgs_core(
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
-        if sy > 1e-12 {
+        if curvature_pair_accepted(sy, l2_norm(&s), l2_norm(&y)) {
             if s_hist.len() == LBFGS_MEMORY {
                 s_hist.remove(0);
                 y_hist.remove(0);
@@ -4834,16 +4846,28 @@ fn dense_bfgs_core(
                 cap_curvature_free_step(&mut d, precond);
             }
             let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-            let (alpha, f_new) = backtracking_line_search(
+            let (alpha, f_new) = match exact_step_verified_by_gradient(
                 obj,
+                grad,
                 x,
                 &d,
-                &g,
                 f_cur,
-                &mut line_search_point,
-                short_line_search,
-                floor,
-            );
+                &g,
+                stop_precond,
+                enable_stall,
+            ) {
+                Some(fc) => (1.0, fc),
+                None => backtracking_line_search(
+                    obj,
+                    x,
+                    &d,
+                    &g,
+                    f_cur,
+                    &mut line_search_point,
+                    short_line_search,
+                    floor,
+                ),
+            };
             // At the noise floor an unverifiable step is convergence, not a failure — unless
             // the gradient verifies it ([`gradient_verified_step`]).
             let (alpha, f_new) = if alpha == 0.0 && floor {
@@ -4873,16 +4897,28 @@ fn dense_bfgs_core(
         }
 
         let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-        let (alpha, f_new) = backtracking_line_search(
+        let (alpha, f_new) = match exact_step_verified_by_gradient(
             obj,
+            grad,
             x,
             &d,
-            &g,
             f_cur,
-            &mut line_search_point,
-            short_line_search,
-            floor,
-        );
+            &g,
+            stop_precond,
+            enable_stall,
+        ) {
+            Some(fc) => (1.0, fc),
+            None => backtracking_line_search(
+                obj,
+                x,
+                &d,
+                &g,
+                f_cur,
+                &mut line_search_point,
+                short_line_search,
+                floor,
+            ),
+        };
         // At the noise floor an unverifiable step is convergence, not a failure — unless the
         // gradient verifies it ([`gradient_verified_step`]).
         let (alpha, f_new) = if alpha == 0.0 && floor {
@@ -4918,7 +4954,7 @@ fn dense_bfgs_core(
         s_vec.as_mut_slice().copy_from_slice(&s);
         y_vec.as_mut_slice().copy_from_slice(&y);
         let sy = s_vec.dot(&y_vec);
-        if sy > 1e-12 {
+        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm()) {
             let rho = 1.0 / sy;
             let s_yt = rho * &s_vec * y_vec.transpose();
             let y_st = rho * &y_vec * s_vec.transpose();
@@ -5266,11 +5302,69 @@ fn iov_prior_maha(
 /// the stall stop's own plateau guard, so a solve whose gradient is still falling keeps
 /// descending even when each step is flat.
 fn step_below_noise_floor(enable_stall: bool, d: &[f64], g: &[f64], f: f64) -> bool {
-    if !enable_stall {
-        return false;
-    }
+    enable_stall && step_below_resolution(d, g, f)
+}
+
+/// Whether the full step along `d` predicts a decrease (`|∇f·d|`) no larger than the flat-step
+/// threshold `INNER_FTOL_REL·(1 + |f|)`: a gain the objective cannot resolve, so no Armijo test
+/// along `d` can verify it. [`step_below_noise_floor`] arms this on an ODE objective's noise
+/// floor; [`exact_step_verified_by_gradient`] on an exact one's rounding.
+fn step_below_resolution(d: &[f64], g: &[f64], f: f64) -> bool {
     let dg: f64 = d.iter().zip(g).map(|(di, gi)| di * gi).sum();
     dg < 0.0 && -dg <= INNER_FTOL_REL * (1.0 + f.abs())
+}
+
+/// On an **exact** objective (`!enable_stall`), a step whose predicted gain is below the
+/// objective's resolution ([`step_below_resolution`]) is taken when the gradient verifies it
+/// ([`gradient_verified_step`]: the objective stays within its resolution and the gradient norm
+/// at least halves), without a line search. Returns the objective at `x + d` when it is; `None`
+/// sends the step to the line search as before.
+///
+/// Why (#2270): next to the mode the gain a good step can make is below the objective's rounding,
+/// so the Armijo test reads noise. Measured on `examples/warfarin_iov` started from the previous
+/// mode at ‖∇‖ = 25–28·`tol`: the full step's gain was ~1e-14 against `f ≈ 6`, the line search
+/// backtracked to α ≈ 1e-10, accepted `f_new == f` there (`c1·α·∇f·d` is below ulp(f)), and the
+/// same non-move repeated to `max_iter`, so the subject went to the Nelder–Mead fallback. The
+/// gradient is exact and still resolves the mode. This never declares convergence: a verified step
+/// is an accepted step, and the solve still stops only on `gnorm < tol` (#1527).
+#[allow(clippy::too_many_arguments)]
+fn exact_step_verified_by_gradient(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    f: f64,
+    g: &[f64],
+    stop_precond: Option<&[f64]>,
+    enable_stall: bool,
+) -> Option<f64> {
+    if enable_stall || !step_below_resolution(d, g, f) {
+        return None;
+    }
+    gradient_verified_step(obj, grad, x, d, f, g, stop_precond)
+}
+
+/// Relative curvature a BFGS pair must carry to update the metric, beside the absolute
+/// `sᵀy > 1e-12` (see [`curvature_pair_accepted`]).
+const CURVATURE_PAIR_REL: f64 = 1e-8;
+
+/// Whether an accepted step's pair `(s, y)` updates the BFGS metric: `sᵀy > 1e-12`, or
+/// `sᵀy > CURVATURE_PAIR_REL·‖s‖·‖y‖` — positive curvature resolvable relative to the pair
+/// itself, which does not depend on the step's length.
+///
+/// Why (#2270): the absolute test alone rejects every pair of a search whose steps are small, and
+/// near the mode they all are: `sᵀy ≈ λ‖s‖²`. Measured on `nonmem_anchor/nested_levels_3` with
+/// the IOV solve started from the previous mode (‖∇‖ = 7–28·`tol`, curvature ~1e4): `sᵀy` was
+/// 1e-13–1e-14 from the second step on, so the metric stayed the identity, the search zigzagged
+/// and stalled at ‖∇‖ ~ 2–3e-5 > `tol = 1e-5` until `max_iter`, and 24 solves went to Nelder–Mead.
+/// The union only *adds* pairs, all in the small-step regime: a pair the absolute test accepted is
+/// still accepted.
+fn curvature_pair_accepted(sy: f64, s_norm: f64, y_norm: f64) -> bool {
+    sy > 1e-12 || sy > CURVATURE_PAIR_REL * s_norm * y_norm
+}
+
+fn l2_norm(v: &[f64]) -> f64 {
+    v.iter().map(|vi| vi * vi).sum::<f64>().sqrt()
 }
 
 /// At the noise floor, whether the full step `x + d` that the objective could not verify is

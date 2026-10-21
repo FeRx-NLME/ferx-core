@@ -4957,3 +4957,122 @@ fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engin
         assert!(worst > 0.0, "{label}: no FD comparison ran");
     }
 }
+
+/// An IOV solve started next to its own mode converges in the BFGS, without the Nelder–Mead
+/// fallback (#2270). Since #2261 every IOV warm start is the mode the previous outer evaluation
+/// found, (η̂, κ̂), handed to a solve at nearby parameters: the common case. Fixture:
+/// `examples/warfarin_iov` at NONMEM's FOCE estimates `p`; each subject with occasions is solved
+/// at `p` to `1e-12`, and that mode starts a `tol = 1e-5` solve at `p` with every θ scaled by
+/// `1 + δ`, `δ` chosen so the start's gradient there is `near_mode·tol` — the 7–28·`tol` that
+/// #2261's fits measured. Before the fix these starts stalled: the absolute `sᵀy > 1e-12` gate
+/// rejected every curvature pair of so short a search ([`curvature_pair_accepted`]), and the line
+/// search could not resolve the last steps' gain ([`exact_step_verified_by_gradient`]).
+#[test]
+fn iov_solve_started_next_to_its_mode_converges_without_the_fallback() {
+    use crate::stats::likelihood::individual_nll_iov_frozen;
+    const TOL: f64 = 1e-5;
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let mut p = prep.init_params.clone();
+    let (model, pop) = (prep.parsed.model, prep.population);
+    p.theta = vec![0.315410, 8.38248, 2.64431];
+    p.omega =
+        OmegaMatrix::from_diagonal(&[0.446654, 0.0125169, 1.07769], p.omega.eta_names.clone());
+    let names = p.omega_iov.as_ref().unwrap().eta_names.clone();
+    p.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04258], names));
+    p.sigma.values = vec![0.0370648_f64.sqrt()];
+    let (n_eta, n_k) = (model.n_eta, model.n_kappa);
+    let nll = |q: &ModelParameters, s: &Subject, b: &[f64]| {
+        let kappas: Vec<Vec<f64>> = b[n_eta..].chunks(n_k).map(|c| c.to_vec()).collect();
+        individual_nll_iov_frozen(
+            &model,
+            s,
+            &q.theta,
+            &b[..n_eta],
+            &kappas,
+            &q.omega,
+            q.omega_iov.as_ref(),
+            &q.sigma.values,
+            &mut pk::EventPkParams::default(),
+            None,
+            None,
+        )
+    };
+    let gnorm = |q: &ModelParameters, s: &Subject, x: &[f64]| {
+        (0..x.len())
+            .map(|k| {
+                let h = 1e-6 * (1.0 + x[k].abs());
+                let (mut a, mut b) = (x.to_vec(), x.to_vec());
+                a[k] += h;
+                b[k] -= h;
+                ((nll(q, s, &a) - nll(q, s, &b)) / (2.0 * h)).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt()
+    };
+    let moved = |delta: f64| {
+        let mut q = p.clone();
+        q.theta.iter_mut().for_each(|t| *t *= 1.0 + delta);
+        q
+    };
+    let mut fell_back = Vec::new();
+    let mut solved = 0;
+    for s in pop.subjects.iter().filter(|s| !s.occasions.is_empty()) {
+        let mode = find_ebe_iov(
+            &model,
+            s,
+            &p,
+            500,
+            1e-12,
+            None,
+            None,
+            EbeVariance::Conditional,
+            false,
+        );
+        assert!(
+            mode.converged,
+            "subject {}: reference solve must converge",
+            s.id
+        );
+        let mut start: Vec<f64> = mode.eta.iter().copied().collect();
+        start.extend(mode.kappas.iter().flat_map(|k| k.iter().copied()));
+        let per_delta = gnorm(&moved(1e-6), s, &start) / 1e-6;
+        for near_mode in [8.0, 25.0] {
+            let q = moved(near_mode * TOL / per_delta);
+            let ratio = gnorm(&q, s, &start) / TOL;
+            assert!(
+                (0.5 * near_mode..2.0 * near_mode).contains(&ratio),
+                "subject {}: fixture premise, the start's ‖∇‖/tol is {ratio:.1}",
+                s.id
+            );
+            let r = find_ebe_iov(
+                &model,
+                s,
+                &q,
+                200,
+                TOL,
+                Some(&start),
+                None,
+                EbeVariance::Conditional,
+                false,
+            );
+            assert!(
+                r.converged,
+                "subject {}: near-mode solve did not converge",
+                s.id
+            );
+            if r.used_fallback {
+                fell_back.push(format!("{} at {near_mode}·tol", s.id));
+            }
+            solved += 1;
+        }
+    }
+    assert!(solved >= 20, "fixture premise: {solved} IOV solves");
+    assert!(
+        fell_back.is_empty(),
+        "{} of {solved} IOV solves started next to their mode went to the Nelder–Mead fallback: \
+         {fell_back:?}",
+        fell_back.len()
+    );
+}

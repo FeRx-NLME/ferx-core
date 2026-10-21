@@ -4768,6 +4768,118 @@ fn the_identity_first_step_scaling_is_decided_once() {
     );
 }
 
+/// A BFGS started next to the mode of an ill-conditioned objective learns its curvature (#2270).
+/// Fixture: `f = ½(1e6·x₀² + x₁²)` from the steepest-descent worst case, `g ∝ (1, 1)` with
+/// ‖g‖ = 25·`tol`. Every accepted step is short there, so `sᵀy = sᵀHs` is ~1e-13: under the
+/// absolute `sᵀy > 1e-12` gate alone no pair updated the identity metric, and the search
+/// zigzagged (each step shrinking ‖g‖ by about `1 − 2/κ`) to `max_iter` — in both drivers.
+#[test]
+fn bfgs_started_next_to_the_mode_learns_its_curvature() {
+    let lambda = [1e6, 1.0];
+    let tol = 1e-5;
+    let obj = |x: &[f64]| 0.5 * x.iter().zip(&lambda).map(|(v, l)| l * v * v).sum::<f64>();
+    let grad = |x: &[f64]| {
+        x.iter()
+            .zip(&lambda)
+            .map(|(v, l)| l * v)
+            .collect::<Vec<_>>()
+    };
+    let never = |_: &[f64]| false;
+    let start: Vec<f64> = lambda
+        .iter()
+        .map(|l| 25.0 * tol / 2f64.sqrt() / l)
+        .collect();
+    let gn = |x: &[f64]| grad(x).iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!((gn(&start) / tol - 25.0).abs() < 1e-9, "fixture premise");
+    for (label, lbfgs) in [("dense", false), ("lbfgs", true)] {
+        let calls = std::cell::Cell::new(0usize);
+        let counted = |x: &[f64]| {
+            calls.set(calls.get() + 1);
+            obj(x)
+        };
+        let mut x = start.clone();
+        let ok = if lbfgs {
+            lbfgs_core(
+                &counted, &grad, &mut x, 2, 200, tol, None, None, &never, false,
+            )
+        } else {
+            dense_bfgs_core(
+                &counted, &grad, &mut x, 2, 200, tol, None, None, None, &never, false,
+            )
+        };
+        assert!(
+            ok && gn(&x) < tol,
+            "{label}: not converged from 25·tol (‖g‖ = {:.3e} after {} objective calls)",
+            gn(&x),
+            calls.get()
+        );
+    }
+}
+
+/// On an exact objective, a step whose gain is below what the objective resolves is taken on
+/// the gradient's word (#2270). Fixture: `f = 10 + ½(1e5·x₀² + 1e3·x₁²) + e(x)`, where `e` is a
+/// deterministic ±5e-11 evaluation error (a hash of `x`'s bits) and the gradient is exact, as
+/// the analytic inner gradient is. From eight starts at ‖g‖ = 25·`tol` the seeded Newton step
+/// gains ~1.6e-11, under the error, so the Armijo test reads noise. Without the gradient
+/// verification the line search collapsed and the solve ran to `max_iter` from some of them.
+#[test]
+fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
+    let lambda = [1e5, 1e3];
+    let tol = 1e-5;
+    let error = |x: &[f64]| {
+        let mut h = x[0].to_bits() ^ x[1].to_bits().rotate_left(32);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        1e-10 * ((h >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+    };
+    let obj = |x: &[f64]| {
+        10.0 + 0.5 * x.iter().zip(&lambda).map(|(v, l)| l * v * v).sum::<f64>() + error(x)
+    };
+    let grad = |x: &[f64]| {
+        x.iter()
+            .zip(&lambda)
+            .map(|(v, l)| l * v)
+            .collect::<Vec<_>>()
+    };
+    let gn = |x: &[f64]| grad(x).iter().map(|v| v * v).sum::<f64>().sqrt();
+    let never = |_: &[f64]| false;
+    let seed = DMatrix::from_diagonal(&DVector::from_column_slice(&lambda));
+    let mut stuck = Vec::new();
+    for k in 0..8 {
+        let angle = std::f64::consts::PI * (k as f64 + 0.5) / 8.0;
+        let g0 = [angle.cos(), angle.sin()].map(|c| 25.0 * tol * c);
+        let start: Vec<f64> = g0.iter().zip(&lambda).map(|(g, l)| g / l).collect();
+        // The premise: the Newton step's gain is below the evaluation error's spread.
+        let gain = 0.5 * g0.iter().zip(&lambda).map(|(g, l)| g * g / l).sum::<f64>();
+        assert!(
+            gain < 1e-10 && gain > 0.0,
+            "fixture premise: gain {gain:.3e}"
+        );
+        let mut x = start.clone();
+        let ok = dense_bfgs_core(
+            &obj,
+            &grad,
+            &mut x,
+            2,
+            200,
+            tol,
+            None,
+            Some(&seed),
+            None,
+            &never,
+            false,
+        );
+        if !(ok && gn(&x) < tol) {
+            stuck.push((k, gn(&x)));
+        }
+    }
+    assert!(
+        stuck.is_empty(),
+        "starts that did not converge (index, final ‖g‖): {stuck:?}"
+    );
+}
+
 /// L-BFGS's empty-history direction on the identity path takes the same 1/‖g‖ first-step
 /// scaling dense BFGS always had (#2099): from a steep start the first trial point is one unit
 /// along `−g/‖g‖`.
