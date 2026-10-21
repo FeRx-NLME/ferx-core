@@ -657,6 +657,51 @@ fn a_power_of_a_negative_covariate_is_rejected_and_the_message_names_the_power()
     );
 }
 
+/// The `NaN` claims in `individual-parameters.qmd`'s *Values outside an operation's
+/// domain*, one lag expression per claim, each read at `WT` as given (#2040, review of
+/// #2152). Whether `E_DOSE_ATTR_NONFINITE` is raised is the observable: it fires exactly
+/// when the lag is non-finite.
+///
+/// The `min`/`max` rows are the point. They desugar to `if (a <= b) a else b` and
+/// `if (a >= b) a else b`, and a comparison with `NaN` is false, so the result depends on
+/// which argument is missing: the first gives the finite second, the second gives `NaN`.
+/// Both orders sit in one table, so a page (or a desugaring) that treats them alike
+/// reddens a row either way.
+#[test]
+fn the_documented_nan_cases_are_what_the_dose_attribute_check_sees() {
+    let nan = f64::NAN;
+    // (lag expression, WT, the lag is non-finite)
+    let cases: [(&str, f64, bool); 8] = [
+        ("TVLAG * min(WT / 70, 1.5)", nan, false),
+        ("TVLAG * min(1.5, WT / 70)", nan, true),
+        ("TVLAG * max(WT / 70, 0.5)", nan, false),
+        ("TVLAG * max(0.5, WT / 70)", nan, true),
+        // `^`'s two IEEE exceptions: `x ^ 0` and `1 ^ y` are 1 whatever the other is.
+        ("TVLAG * (WT / 70)^0", nan, false),
+        ("TVLAG * 1^WT", nan, false),
+        // The control for the two above: any other exponent passes the `NaN` through.
+        ("TVLAG * (WT / 70)^0.75", nan, true),
+        // `0 ^ y` with a negative `y` is `+inf`.
+        ("TVLAG * (WT / 70)^(0 - 0.5)", 0.0, true),
+    ];
+    for (expr, wt, nonfinite) in cases {
+        let model = crate::parser::model_parser::parse_full_model(
+            &EXP_LAG_MODEL.replace("TVLAG * exp(WT)", expr),
+        )
+        .unwrap_or_else(|e| panic!("`{expr}` parses: {e}"))
+        .model;
+        let diags = crate::api::check_model_data(&model, &population_with_wt(wt));
+        let raised = diags.iter().any(|d| d.code == "E_DOSE_ATTR_NONFINITE");
+        assert_eq!(
+            raised,
+            nonfinite,
+            "ALAG1 = {expr} at WT = {wt}: expected the lag to be {}, got {:?}",
+            if nonfinite { "non-finite" } else { "finite" },
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// The bound on #1196's behaviour change. Unifying the two infusion resolvers on one
 /// membership predicate changes what a `CMT=0` or out-of-range **infusion** contributes —
 /// `active_infusions` used to admit both and `gated_infusions` dropped them. That cannot

@@ -130,21 +130,26 @@ or a `NaN`. They do it silently: nothing is warned or reported.
 | `logit(x)` | `x` below `1e-15` or above `1 - 1e-15` | the value at that bound, about `-34.54` or `34.54` |
 
 `exp` and `^` are not guarded. `exp(x)` is `inf` once `x` is above about
-`709.78`, and `x ^ y` is `NaN` when `x` is negative and `y` is not a whole
-number, as in `(WT / 70)^0.75` for a negative `WT`. A non-finite individual
+`709.78`. `x ^ y` is `NaN` when `x` is negative and `y` is not a whole
+number, as in `(WT / 70)^0.75` for a negative `WT`, and `inf` when `x` is `0`
+and `y` is negative, as in `(CRCL / 100)^THETA` for `CRCL = 0` and a negative
+`THETA`. A non-finite individual
 parameter makes the subject's predictions `NaN`, and the fit reports the
 non-finite objective that results
 ([A non-finite objective](../warnings.qmd#non-finite-objective)).
 
 A missing covariate is `NaN` (see [`present(...)`](#present...-guarding-a-covariate-that-may-be-missing)
 below). `NaN` passes through arithmetic, `^`, `exp` and `logit`, so a missing
-covariate in any of them gives a `NaN` parameter. The constructs below give a
-finite value instead, so a missing covariate under any of them gives a finite,
-wrong parameter and no error:
+covariate in any of them gives a `NaN` parameter. The two exceptions are
+`x ^ 0` and `1 ^ y`, which are `1` even when the other operand is `NaN`. The
+constructs below give a finite value instead, so a missing covariate under any
+of them gives a finite, wrong parameter and no error:
 
 - `log` and `sqrt` floor it, to `-69.08` and `0`;
-- `min` and `max` drop it and return the other argument, so
-  `min(CRCL / 100, 1.5)` is `1.5`;
+- `min(a, b)` and `max(a, b)` return `b` when `a` is `NaN`, so
+  `min(CRCL / 100, 1.5)` is `1.5`. The order matters: they are
+  `if (a <= b) a else b` and `if (a >= b) a else b`, so when `b` is the `NaN`
+  they return it, and `min(1.5, CRCL / 100)` is `NaN`;
 - `<`, `<=`, `>`, `>=` and `==` are false for `NaN`, and `!=` is true, so
   `if (CRCL > 60) 1.0 else 2.0` takes the `else` branch and is `2.0`.
 
