@@ -345,8 +345,11 @@ The second step follows the parameter's own η, whatever it is called: `ETA_V`,
 matched the mu-reference by η **name** (`<PARAM>` or `…_<PARAM>`), which missed
 `ETA_VOL` and, when two η names qualified — `ETA_CL` on the clearance and an
 `IIV_CL` on another parameter — picked one in hash order, so start values could
-differ between runs of the same model on the same data (#1930). An η read by two
-parameters is not followed, since its one mu-reference cannot belong to both.
+differ between runs of the same model on the same data (#1930). A reassigned
+parameter is read from its **last** assignment, as the model itself reads it; when
+that one is `if`-wrapped or carries no η, the name search below is used instead. An
+η read by two parameters still routes each to its own θ, but the CL η's variance is
+then left at the model default, since it is not clearance's alone.
 
 A parameter without such an η falls through to the name search, which takes the
 first θ whose name *contains* the parameter's name — so a parameter whose name is a

@@ -590,12 +590,61 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
 /// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
 /// entries because the structured name doesn't appear in `theta_names`;
 /// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
+///
+/// Test-only since #1930: the parser calls [`detect_mu_refs_with_owners`], which
+/// returns this map alongside the per-parameter owner record.
+#[cfg(test)]
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
+    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs).0
+}
+
+/// [`detect_mu_refs`], plus which mu-reference each assigned name **ends up
+/// with**: `owners[name]` is `Some((eta_name, theta_name))` when the *last*
+/// write to `name` is a top-level assignment classified as a mu-reference, and
+/// `None` when the last write is anything else — a plain assignment, or an
+/// assignment anywhere inside an `if`, whose value is conditional.
+///
+/// `mu_refs` cannot answer this: it is keyed by η, so it says nothing about
+/// which parameter an η's θ belongs to, keeps only the last assignment that
+/// used an η, and keeps an η a later reassignment has superseded
+/// (`CL = TVOLD * exp(ETA_OLD)` then `CL = TVCL * exp(IIV_CL)` leaves
+/// `ETA_OLD -> TVOLD` in it). Neither can `eta_map`, which keeps the *first* η
+/// any assignment to a name reads. The owner is what NCA start values route
+/// through (#1930).
+fn detect_mu_refs_with_owners(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> (
+    HashMap<String, MuRef>,
+    HashMap<String, Option<(String, String)>>,
+) {
+    fn assigned_in(stmts: &[Statement], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(n, _) => out.push(n.clone()),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        assigned_in(body, out);
+                    }
+                    if let Some(eb) = else_body {
+                        assigned_in(eb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut owners: HashMap<String, Option<(String, String)>> = HashMap::new();
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
     // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
@@ -618,13 +667,23 @@ fn detect_mu_refs(
                 let inlined = scope.view(at, raw_expr);
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
+            let owner = found
+                .as_ref()
+                .map(|(eta_idx, mu_ref)| (eta_names[*eta_idx].clone(), mu_ref.theta_name.clone()));
+            owners.insert(name.clone(), owner);
             if let Some((eta_idx, mu_ref)) = found {
                 result.insert(eta_names[eta_idx].clone(), mu_ref);
             }
             scope.record(at, name, raw_expr);
+        } else if let Statement::If { .. } = s {
+            let mut names = Vec::new();
+            assigned_in(std::slice::from_ref(s), &mut names);
+            for n in names {
+                owners.insert(n, None);
+            }
         }
     }
-    result
+    (result, owners)
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -4979,12 +5038,13 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs = detect_mu_refs(
+    let (all_mu_refs, mu_ref_owners) = detect_mu_refs_with_owners(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
     );
+    indiv_param_partials.mu_ref_owners = mu_ref_owners;
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -30867,6 +30927,12 @@ pub struct IndivParamPartials {
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
     pub(crate) nested_levels: Option<crate::types::NestedLevels>,
+    /// The mu-reference each `[individual_parameters]` name ends up with —
+    /// `Some((eta_name, theta_name))` when its last write is a top-level
+    /// mu-referenced assignment, `None` otherwise — from
+    /// `detect_mu_refs_with_owners`. Read through
+    /// [`crate::CompiledModel::mu_ref_owner`]. Empty for hand-built fixtures.
+    pub(crate) mu_ref_owners: HashMap<String, Option<(String, String)>>,
 }
 
 impl IndivParamPartials {
@@ -30886,6 +30952,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
+            mu_ref_owners: HashMap::new(),
         }
     }
 
@@ -30995,6 +31062,7 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
+        mu_ref_owners: HashMap::new(),
     }
 }
 

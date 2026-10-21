@@ -5577,6 +5577,23 @@ impl CompiledModel {
         }
     }
 
+    /// The mu-reference individual parameter `indiv_pos` **ends up with**, as
+    /// `(eta_name, theta_name)`: its last write is a top-level assignment of a
+    /// mu-referenced form. `None` when the parameter reads no η, when a later
+    /// plain or `if`-wrapped assignment supersedes the mu-referenced one, and
+    /// for a hand-built model with no parsed statements.
+    ///
+    /// The association [`mu_refs`](Self::mu_refs) cannot give — it is keyed by η
+    /// and keeps whatever assignment last used each one (#1930).
+    pub(crate) fn mu_ref_owner(&self, indiv_pos: usize) -> Option<(&str, &str)> {
+        let name = self.indiv_param_names.get(indiv_pos)?;
+        self.indiv_param_partials
+            .mu_ref_owners
+            .get(name)?
+            .as_ref()
+            .map(|(e, t)| (e.as_str(), t.as_str()))
+    }
+
     /// The [`indiv_param_names`](Self::indiv_param_names) index whose **own** PK slot
     /// is `pk_slot`, or `None` when no parameter owns that slot.
     ///

@@ -560,8 +560,8 @@ fn try_biexp_peel(
 ///
 /// Three-layer lookup (model-agnostic, works with or without mu-referencing):
 /// 1. [`CompiledModel::indiv_param_for_pk_slot`]: the `indiv_param_names` entry
-///    whose **own** PK slot matches, then its own η ([`owned_eta`]) and that η's
-///    mu-reference. Not a `pk_indices` scan: an analytical model gives every
+///    whose **own** PK slot matches, then the mu-reference that parameter's
+///    effective (last) assignment carries, `CompiledModel::mu_ref_owner`. Not a `pk_indices` scan: an analytical model gives every
 ///    unbound intermediate the placeholder slot `0`, so `CLWT = exp(CLWT_EXP *
 ///    log(WT/70))` declared above `CL` answered for `PK_IDX_CL` and layer 2 then
 ///    wrote NCA's clearance onto the allometric exponent `CLWT_EXP` (#1899). And
@@ -602,16 +602,10 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
     // No owning parameter: the role is bound to a literal or to `TIME`.
     let indiv_pos = model.indiv_param_for_pk_slot(pk_slot)?;
 
-    // Layer 1: owning individual parameter → its own η → mu_refs → theta index.
-    if let Some(eta_name) = owned_eta(model, indiv_pos) {
-        if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if let Some(idx) = params
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
-            {
-                return Some(idx);
-            }
+    // Layer 1: owning individual parameter → its own mu-reference → theta index.
+    if let Some((_, theta_name)) = model.mu_ref_owner(indiv_pos) {
+        if let Some(idx) = params.theta_names.iter().position(|n| n == theta_name) {
+            return Some(idx);
         }
     }
 
@@ -632,37 +626,6 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
         .position(|n| n.to_ascii_uppercase().contains(canonical))
 }
 
-/// The η that individual parameter `indiv_pos` **itself** reads, by its
-/// `eta_map` entry — the parser's record of which η the assignment references —
-/// or `None` when it reads none, or when another individual parameter reads the
-/// same η.
-///
-/// This is the association, not a name rule, so it needs no uniqueness check over
-/// η names and does not depend on `mu_refs`' iteration order (#1930). The shared-η
-/// refusal is what keeps it exact: `mu_refs` holds one entry per η, so for
-/// `CL = TVCL * exp(ETA)` alongside `V = TVV * exp(ETA)` it records whichever
-/// assignment came last, and the η alone cannot say which θ belongs to `CL`.
-fn owned_eta(model: &CompiledModel, indiv_pos: usize) -> Option<&str> {
-    let eta_idx = *model.eta_map.get(indiv_pos)?;
-    if eta_idx < 0 {
-        return None;
-    }
-    let shared = model
-        .eta_map
-        .iter()
-        .enumerate()
-        .any(|(j, &e)| j != indiv_pos && e == eta_idx);
-    if shared {
-        return None;
-    }
-    model
-        .default_params
-        .omega
-        .eta_names
-        .get(eta_idx as usize)
-        .map(String::as_str)
-}
-
 /// Find the omega diagonal index for the eta driving a given PK slot.
 ///
 /// Resolves the owning individual parameter through
@@ -670,13 +633,19 @@ fn owned_eta(model: &CompiledModel, indiv_pos: usize) -> Option<&str> {
 /// [`find_theta_for_slot`] does: a `pk_indices` scan answers an unbound
 /// intermediate for `PK_IDX_CL` (#1899), and its name then matches no eta, so the
 /// slot's omega came back `None` and NCA left `ETA_CL`'s variance at the default.
-/// The η is the parameter's own ([`owned_eta`]), not the first mu-referenced η
-/// whose name contains the parameter's: that scan iterated a `HashMap` and could
-/// pick `IIV_CL` on an unrelated parameter over `CL`'s `ETA_CL` (#1930).
+/// The η is the one in the parameter's own mu-reference
+/// (`CompiledModel::mu_ref_owner`), not the first mu-referenced η whose name
+/// contains the parameter's: that scan iterated a `HashMap` and could pick
+/// `IIV_CL` on an unrelated parameter over `CL`'s `ETA_CL` (#1930). An η another
+/// parameter's mu-reference also reads is declined: its variance is not `CL`'s
+/// alone, so `CL`'s inter-subject CV² is no estimate of it.
 fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
     let indiv_pos = model.indiv_param_for_pk_slot(pk_slot)?;
-    let eta_name = owned_eta(model, indiv_pos)?;
-    if !model.mu_refs.contains_key(eta_name) {
+    let (eta_name, _) = model.mu_ref_owner(indiv_pos)?;
+    let shared = (0..model.indiv_param_names.len())
+        .filter(|&j| j != indiv_pos)
+        .any(|j| model.mu_ref_owner(j).is_some_and(|(e, _)| e == eta_name));
+    if shared {
         return None;
     }
     model
@@ -685,6 +654,26 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
         .eta_names
         .iter()
         .position(|n| n == eta_name)
+}
+
+/// The warning for a pooled NCA estimate [`find_theta_for_slot`] found no θ for.
+///
+/// Two different situations, which need different advice: a role bound to a
+/// literal or `TIME` on the `[structural_model]` line has no parameter and nothing
+/// to estimate (#1930), while a role whose parameter exists but resolves to no θ
+/// is a model the lookup could not read.
+fn unmapped_role_warning(model: &CompiledModel, pk_slot: usize, role: &str) -> String {
+    if model.indiv_param_for_pk_slot(pk_slot).is_none() {
+        format!(
+            "inits_from_nca: {role} is bound to a literal or TIME on the [structural_model] \
+             line, so there is no theta to write the NCA estimate to; left as declared"
+        )
+    } else {
+        format!(
+            "inits_from_nca: could not map {role} to a theta (its parameter carries no \
+             mu-referenced eta and no theta name contains its name); using model default"
+        )
+    }
 }
 
 /// Route pooled NCA estimates to theta slots and return updated ModelParameters.
@@ -780,7 +769,7 @@ fn build_params(
                 warnings,
             );
         } else {
-            warnings.push("inits_from_nca: could not map CL to a theta (no mu-referencing for CL eta); using model default".into());
+            warnings.push(unmapped_role_warning(model, PK_IDX_CL, "CL"));
         }
     } else {
         warnings.push("inits_from_nca: CL not estimable from NCA; using model default".into());
@@ -797,8 +786,7 @@ fn build_params(
                 warnings,
             );
         } else {
-            warnings
-                .push("inits_from_nca: could not map V/V1 to a theta; using model default".into());
+            warnings.push(unmapped_role_warning(model, PK_IDX_V, "V/V1"));
         }
     } else {
         warnings.push("inits_from_nca: V/V1 not estimable from NCA; using model default".into());
@@ -811,9 +799,7 @@ fn build_params(
                 if let Some(idx) = ka_idx {
                     write_theta(&mut params, idx, ka, "Ka", warnings);
                 } else {
-                    warnings.push(
-                        "inits_from_nca: could not map Ka to a theta; using model default".into(),
-                    );
+                    warnings.push(unmapped_role_warning(model, PK_IDX_KA, "Ka"));
                 }
             } else {
                 warnings
@@ -1392,7 +1378,7 @@ mod tests {
         assert!(
             out.warnings
                 .iter()
-                .any(|w| w.contains("could not map CL to a theta")),
+                .any(|w| w.contains("CL is bound to a literal or TIME")),
             "the unrouted clearance must be reported: {:?}",
             out.warnings
         );
@@ -1465,20 +1451,20 @@ mod tests {
         }
     }
 
-    /// The refusal that keeps the association exact: one η read by two parameters.
-    /// `mu_refs` holds one entry per η — whichever assignment the parser saw last,
-    /// here `V`'s `TVV` — so following `CL`'s η would write the clearance onto
-    /// `TVV`. [`owned_eta`] declines a shared η and layer 2 finds `THCL` by name.
-    /// (`THCL`, not `TVCL`: `TVCL` contains `V`, and #1922 would send V to it.)
+    /// One η read by two parameters. `mu_refs` holds one entry per η — whichever
+    /// assignment the parser saw last, here `V`'s `TVV` — so an η-keyed lookup
+    /// would write the clearance onto `TVV`. The owner record is per parameter, so
+    /// `CL` reaches `TVCL` and `V` reaches `TVV`, both through layer 1: `TVCL`
+    /// contains `V`, so a `V` that fell to layer 2 would land on `TVCL` (#1922)
+    /// and fail here too.
     ///
-    /// The premise that `mu_refs` really does carry `V`'s θ is asserted: without it
-    /// the shared-η guard could be deleted and this test stay green.
+    /// The shared η's variance is declined, not overwritten with `CL`'s CV².
     #[test]
-    fn nca_declines_an_eta_shared_by_two_parameters() {
-        let src = "[parameters]\n  theta THCL(0.2, 0.001, 10.0)\n  \
+    fn nca_routes_each_parameter_of_a_shared_eta_to_its_own_theta() {
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
              theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
              omega ETA_S ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\
-             [individual_parameters]\n  CL = THCL * exp(ETA_S)\n  \
+             [individual_parameters]\n  CL = TVCL * exp(ETA_S)\n  \
              V = TVV * exp(ETA_S)\n  KA = TVKA\n\
              [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
              [error_model]\n  DV ~ proportional(PROP_ERR)\n";
@@ -1488,14 +1474,150 @@ mod tests {
             Some("TVV"),
             "premise: the shared eta's single mu-ref points at V's theta"
         );
-        let cl =
-            find_theta_for_slot(&m, PK_IDX_CL).map(|i| m.default_params.theta_names[i].as_str());
-        assert_eq!(cl, Some("THCL"), "CL must not follow a shared eta to TVV");
-        let v = find_theta_for_slot(&m, PK_IDX_V).map(|i| m.default_params.theta_names[i].as_str());
-        assert_eq!(v, Some("TVV"));
-        // Nor is the shared eta's variance overwritten with CL's CV².
-        assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None);
+        let name = |i: Option<usize>| i.map(|i| m.default_params.theta_names[i].as_str());
+        assert_eq!(
+            name(find_theta_for_slot(&m, PK_IDX_CL)),
+            Some("TVCL"),
+            "CL must not follow the shared eta's mu_refs entry to TVV"
+        );
+        assert_eq!(name(find_theta_for_slot(&m, PK_IDX_V)), Some("TVV"));
+        assert_eq!(
+            find_omega_idx_for_slot(&m, PK_IDX_CL),
+            None,
+            "a shared eta's variance is not CL's alone"
+        );
     }
+
+    /// Review r1 of #1930: a parameter **reassigned** — supported, and the last
+    /// value is the one every consumer reads. `eta_map` keeps the *first* η any
+    /// assignment to `CL` reads, and `mu_refs` keeps the superseded
+    /// `ETA_OLD -> TVOLD`, so either would route NCA's clearance onto `TVOLD`,
+    /// which the model no longer uses for `CL` at all.
+    ///
+    /// Two reassignments, the pair straddling the owner record's one rule:
+    /// * a later **mu-referenced** assignment — routes to its θ, `TVCL`;
+    /// * a later **plain** assignment (`CL = TVCL * 2.0`, no η) — the parameter
+    ///   ends up with no mu-reference, so layer 1 must decline: the superseded
+    ///   `ETA_OLD -> TVOLD` must not answer for it. Layer 2 then finds `TVCL` by
+    ///   name, and `ETA_OLD`'s variance is left alone.
+    ///
+    /// And an `if`-wrapped reassignment, whose value is conditional, likewise
+    /// leaves no owner.
+    #[test]
+    fn nca_follows_a_reassigned_parameters_last_assignment() {
+        let model = |cl_lines: &str| {
+            format!(
+                "[parameters]\n  theta TVOLD(0.2, 0.001, 10.0)\n  \
+                 theta TVCL(0.5, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                 theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_OLD ~ 0.09\n  \
+                 omega IIV_CL ~ 0.25\n  omega ETA_V ~ 0.04\n  \
+                 sigma PROP_ERR ~ 0.02 (sd)\n\
+                 [individual_parameters]\n  CL = TVOLD * exp(ETA_OLD)\n{cl_lines}  \
+                 V = TVV * exp(ETA_V)\n  KA = TVKA\n\
+                 [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            )
+        };
+        let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).unwrap();
+        let theta = |m: &CompiledModel| {
+            find_theta_for_slot(m, PK_IDX_CL).map(|i| m.default_params.theta_names[i].clone())
+        };
+        let omega = |m: &CompiledModel| {
+            find_omega_idx_for_slot(m, PK_IDX_CL)
+                .map(|i| m.default_params.omega.eta_names[i].clone())
+        };
+
+        // Later mu-referenced assignment: its θ and η, not the superseded ones.
+        let m = parse(&model("  CL = TVCL * exp(IIV_CL)\n"));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        assert_eq!(
+            m.default_params.omega.eta_names[m.eta_map[cl_pos] as usize], "ETA_OLD",
+            "premise: eta_map keeps the superseded eta, so it cannot be the route"
+        );
+        assert_eq!(
+            m.mu_refs.get("ETA_OLD").map(|r| r.theta_name.as_str()),
+            Some("TVOLD"),
+            "premise: mu_refs still carries the superseded mu-reference"
+        );
+        assert_eq!(
+            theta(&m).as_deref(),
+            Some("TVCL"),
+            "mu-referenced reassignment"
+        );
+        assert_eq!(
+            omega(&m).as_deref(),
+            Some("IIV_CL"),
+            "mu-referenced reassignment"
+        );
+
+        // Later plain assignment: no owner, so neither TVOLD-by-ETA_OLD nor ETA_OLD.
+        let m = parse(&model("  CL = TVCL * 2.0\n"));
+        assert_eq!(
+            m.mu_ref_owner(cl_pos),
+            None,
+            "plain reassignment leaves no owner"
+        );
+        assert_eq!(
+            omega(&m),
+            None,
+            "plain reassignment: ETA_OLD is no longer CL's"
+        );
+        assert_eq!(
+            theta(&m).as_deref(),
+            Some("TVCL"),
+            "plain reassignment: layer 2 by name, not TVOLD via the superseded eta"
+        );
+
+        // Later if-wrapped assignment: conditional, so no owner either.
+        let m = parse(&model(
+            "  if (WT > 70) {\n    CL = TVCL * exp(IIV_CL)\n  }\n",
+        ));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        assert_eq!(
+            m.mu_ref_owner(cl_pos),
+            None,
+            "if-wrapped reassignment leaves no owner"
+        );
+        assert_eq!(omega(&m), None, "if-wrapped reassignment");
+    }
+
+    /// The two halves of [`unmapped_role_warning`], in one test so a gate stuck on
+    /// either branch reddens it: a literal-bound role is reported as having nothing
+    /// to estimate, and a role whose parameter exists but reaches no θ is reported
+    /// as unmapped — never the other way round (review r1 of #1930: the literal case
+    /// used to say "no mu-referencing for CL eta", about an η that does not exist).
+    #[test]
+    fn unmapped_role_warning_tells_a_literal_binding_from_an_unreadable_parameter() {
+        let model = |cl_bind: &str, indiv_cl: &str| {
+            format!(
+                "[parameters]\n  theta TH_A(0.5, 0.01, 5.0)\n  \
+                 theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+                 omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+                 [individual_parameters]\n{indiv_cl}  V = TVV * exp(ETA_V)\n  \
+                 KA = TVKA\n  BASE = TH_A\n\
+                 [structural_model]\n  pk one_cpt_oral(cl={cl_bind}, v=V, ka=KA)\n\
+                 [scaling]\n  y = central / V + BASE\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            )
+        };
+        let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).unwrap();
+        let literal = parse(&model("1.0", ""));
+        let owned = parse(&model("CL", "  CL = 2.0 * TH_A\n"));
+        // Premise: neither model resolves CL, so the warning is what differs.
+        assert_eq!(find_theta_for_slot(&literal, PK_IDX_CL), None);
+        assert_eq!(find_theta_for_slot(&owned, PK_IDX_CL), None);
+
+        let lit = unmapped_role_warning(&literal, PK_IDX_CL, "CL");
+        let own = unmapped_role_warning(&owned, PK_IDX_CL, "CL");
+        assert!(lit.contains("CL is bound to a literal or TIME"), "{lit}");
+        assert!(
+            !lit.contains("mu-referenc"),
+            "a literal binding has no eta to blame: {lit}"
+        );
+        assert!(own.contains("could not map CL to a theta"), "{own}");
+        assert!(!own.contains("literal"), "{own}");
+    }
+
     /// `docs/model-file/fit-options.qmd` offers two workarounds for the #1922
     /// collision and names a second η spelling that resolves. Each is a claim a
     /// reader will act on, so each gets an assertion:
