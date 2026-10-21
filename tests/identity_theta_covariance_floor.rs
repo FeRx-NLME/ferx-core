@@ -134,8 +134,9 @@ fn rescaling_an_identity_packed_theta_leaves_every_standard_error_where_it_was()
         //
         // Since #2239 steps an identity-packed θ relative to its θ₀, the FD stencils are
         // equivariant under the rescaling, so what is left is rounding. Measured worst relative
-        // difference over all seven SEs, macOS arm64: 8.2e-10 (`s`, k = 3e-6), 7.8e-11 (`rsr`,
-        // k = 1e6), 7.8e-16 (`r`, k = 1e6). The bound is 12× the worst.
+        // difference over all seven SEs, Linux x86_64 (glibc 2.28): 8.4e-10 (`s`, k = 3e-6),
+        // 1.0e-10 (`rsr`, k = 3e-6), 1.0e-15 (`r`, k = 1e6); macOS arm64: 8.2e-10, 7.8e-11
+        // (k = 1e6), 7.8e-16. The bound is 12× the worst.
         for k in [1e5, 1e6, 3e-6] {
             let label = format!("{method:?}, k = {k:e}");
             let got = natural_ses(&fit_scaled(k, method), k);
