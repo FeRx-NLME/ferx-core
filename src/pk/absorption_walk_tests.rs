@@ -929,3 +929,332 @@ fn route_is_decided_per_subject_at_its_parameters_on_both_sides_of_flip_flop() {
         );
     }
 }
+
+// ── A NaN parameter (#2134) ─────────────────────────────────────────────────────────────
+
+/// The four closed-form absorption models on a static subject, and the observation index
+/// of the first record after dose 2 (`t = 6`) has arrived: the record a `NaN` disposition
+/// starts on in [`a_nan_parameter_from_one_record_on_is_served_as_nan_by_the_walk`], and the
+/// first one a `NaN` kernel on dose 2 reaches.
+fn nan_cases() -> Vec<(CompiledModel, Subject, usize)> {
+    let static_subject = |doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]| {
+        let mut s = subject_from(doses, obs);
+        s.dose_covariates.clear();
+        s.obs_covariates.clear();
+        s
+    };
+    vec![
+        (model_1cpt("transit"), static_subject(&DOSES_1, &OBS_1), 5),
+        (model_1cpt("ig"), static_subject(&DOSES_1, &OBS_1), 5),
+        (model_2cpt("transit"), static_subject(&DOSES_2, &OBS_2), 4),
+        (model_2cpt("ig"), static_subject(&DOSES_2, &OBS_2), 4),
+    ]
+}
+
+/// #2134: a `NaN` `CL`, `V` or `V2` from one observation record on, or a `NaN` kernel
+/// parameter on one dose record, is served `NaN` from the record it reaches on, and every
+/// record before it keeps the walk's ordinary value — bit for bit, states included. The
+/// walk used to answer any `NaN` with `WalkDomain::Invalid` and an all-zero vector for the
+/// whole subject, so the records before the `NaN`, which had valid parameters, read 0 too.
+///
+/// Mutations (run): restore `return Some(preds)` for a `NaN` (send it to `Invalid` in
+/// `walk_domain`) → every row dies on its finite-before half; drop the `poisoned` state
+/// fill → the `NaN` rows read finite values from a stale state; drop
+/// `|| vol.val().is_nan()` from `per_volume` → the `V` rows read 0.
+#[test]
+fn a_nan_parameter_from_one_record_on_is_served_as_nan_by_the_walk() {
+    use crate::types::PK_IDX_V2;
+    use crate::types::{PK_IDX_CL, PK_IDX_CV2, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_V};
+    for (model, subject, bad_from) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let two_cpt = matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg);
+        let (slot_a, slot_b) = match model.pk_model {
+            PkModel::OneCptIg | PkModel::TwoCptIg => (PK_IDX_MAT, PK_IDX_CV2),
+            _ => (PK_IDX_N, PK_IDX_MTT),
+        };
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let obs = vec![pk; subject.obs_times.len()];
+        let mut clean_states = Vec::new();
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &obs,
+            &[],
+            Some(&mut clean_states),
+        )
+        .expect("inside the domain");
+        assert!(
+            subject.doses[1].time + pk.lagtime() < subject.obs_times[bad_from]
+                && subject.doses[1].time + pk.lagtime() > subject.obs_times[bad_from - 1],
+            "{name}: record {bad_from} is not the first after dose 2 arrives"
+        );
+        let mut rows: Vec<(String, Vec<PkParams>, Vec<PkParams>)> = Vec::new();
+        let mut disp = vec![("CL", PK_IDX_CL), ("V", PK_IDX_V)];
+        if two_cpt {
+            disp.push(("V2", PK_IDX_V2));
+        }
+        for (label, idx) in disp {
+            let mut bad = pk;
+            bad.values[idx] = f64::NAN;
+            let at_obs = (0..obs.len())
+                .map(|j| if j < bad_from { pk } else { bad })
+                .collect();
+            rows.push((format!("{label} on the observations"), dose.clone(), at_obs));
+        }
+        for (label, idx) in [("kernel a", slot_a), ("kernel b", slot_b)] {
+            let mut at_dose = dose.clone();
+            at_dose[1].values[idx] = f64::NAN;
+            rows.push((format!("{label} on dose 2"), at_dose, obs.clone()));
+        }
+        for (label, at_dose, at_obs) in rows {
+            let mut states = Vec::new();
+            let preds = absorption_walk_predictions(
+                model.pk_model,
+                &subject,
+                &at_dose,
+                &at_obs,
+                &[],
+                Some(&mut states),
+            )
+            .unwrap_or_else(|| panic!("{name} {label}: the walk serves a NaN, not the twin"));
+            for j in 0..preds.len() {
+                if j < bad_from {
+                    assert!(
+                        clean[j] > 0.0 && preds[j].to_bits() == clean[j].to_bits(),
+                        "{name} {label}: record {j} precedes the NaN and must keep its \
+                         walked value {}, not {}",
+                        clean[j],
+                        preds[j]
+                    );
+                    assert_eq!(states[j], clean_states[j], "{name} {label}: states {j}");
+                } else {
+                    assert!(
+                        preds[j].is_nan() && states[j].iter().all(|s| s.is_nan()),
+                        "{name} {label}: record {j} is at or after the NaN and must be NaN, \
+                         not {} / {:?}",
+                        preds[j],
+                        states[j]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// #2134: with `CL` `NaN` on every record, the walk and the static closed form
+/// (`compute_predictions`) both serve `NaN` at every observation, so whether a subject's
+/// unusable covariate is reported no longer depends on whether it happens to vary over
+/// time — the absorption-model row of #2039's event-driven parity. Both used to serve 0.
+///
+/// Mutation (run): restore `return T::from_f64(0.0)` for a `NaN` `ke` in
+/// `one_cpt_transit_amt_g` → the `OneCptTransit` superposition premise dies.
+#[test]
+fn walk_and_static_closed_form_agree_on_a_constant_nan_clearance() {
+    for (model, subject, _) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let theta = model.default_params.theta.clone();
+        let mut pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        pk.values[crate::types::PK_IDX_CL] = f64::NAN;
+        let superposition = crate::pk::compute_predictions(model.pk_model, &subject, &pk);
+        assert!(
+            superposition.iter().all(|p| p.is_nan()),
+            "{name}: the static closed form must serve NaN: {superposition:?}"
+        );
+        let walk = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &vec![pk; subject.doses.len()],
+            &vec![pk; subject.obs_times.len()],
+            &[],
+            None,
+        )
+        .expect("the walk serves a NaN");
+        assert!(
+            walk.iter().all(|p| p.is_nan()),
+            "{name}: the walk must serve the NaN the static closed form does: {walk:?}"
+        );
+    }
+}
+
+/// #2134 review: a `NaN` disposition on a record that governs no elapsed time — here the
+/// first dose record, whose interval has zero length — never acts, so it must poison
+/// nothing. The event-driven and ODE engines advance to the next record on that record's
+/// own (finite) snapshot; the walk once set its poison flag from any record's snapshot
+/// and served the whole profile `NaN`. Every prediction and state must equal the clean
+/// walk bit for bit.
+///
+/// Mutation (run): check `disposition_is_nan(pk_now)` before the `ev.time > cur_t` test
+/// → every row dies with an all-`NaN` profile.
+#[test]
+fn a_nan_disposition_on_a_record_governing_no_interval_poisons_nothing() {
+    use crate::types::{PK_IDX_CL, PK_IDX_V, PK_IDX_V2};
+    for (model, subject, _) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        assert!(
+            subject.doses[0].time < subject.obs_times[0],
+            "{name}: premise — the first dose record opens the timeline"
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let obs = vec![pk; subject.obs_times.len()];
+        let mut clean_states = Vec::new();
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &obs,
+            &[],
+            Some(&mut clean_states),
+        )
+        .expect("inside the domain");
+        let two_cpt = matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg);
+        let mut slots = vec![("CL", PK_IDX_CL), ("V", PK_IDX_V)];
+        if two_cpt {
+            slots.push(("V2", PK_IDX_V2));
+        }
+        for (label, idx) in slots {
+            let mut at_dose = dose.clone();
+            at_dose[0].values[idx] = f64::NAN;
+            let mut states = Vec::new();
+            let preds = absorption_walk_predictions(
+                model.pk_model,
+                &subject,
+                &at_dose,
+                &obs,
+                &[],
+                Some(&mut states),
+            )
+            .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, (p, c)) in preds.iter().zip(&clean).enumerate() {
+                assert!(
+                    *c > 0.0 && p.to_bits() == c.to_bits(),
+                    "{name} {label} = NaN on the first dose record only: record {j} must keep \
+                     {c}, not {p}"
+                );
+                assert_eq!(states[j], clean_states[j], "{name} {label}: states {j}");
+            }
+        }
+    }
+}
+
+/// #2134 review: a `NaN` still reaches the objective when a finite non-physical parameter
+/// elsewhere makes the subject `WalkDomain::Invalid`. The `0` penalty stands before the
+/// `NaN` onset and the `NaN` is served from it on, so the subject's objective is
+/// non-finite rather than a confident zero. Three ways to be `Invalid`: a finite `CL ≤ 0`
+/// on an interval before the onset, a finite non-physical kernel on dose 1 (the pre-scan),
+/// and — which must **not** count — one on a dose arriving only after the onset, which is
+/// never evaluated, so the records before the onset keep their walked values.
+///
+/// Mutation (run): answer `Invalid` with the bare all-zero `Some(preds)` → the first two
+/// rows die on their `NaN` half; scan every dose regardless of the onset → the third row
+/// dies on its finite half.
+#[test]
+fn a_nan_wins_over_a_finite_non_physical_parameter_in_the_walk() {
+    use crate::types::{PK_IDX_CL, PK_IDX_CV2, PK_IDX_MTT};
+    for (model, subject, bad_from) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let kernel_b = match model.pk_model {
+            PkModel::OneCptIg | PkModel::TwoCptIg => PK_IDX_CV2,
+            _ => PK_IDX_MTT,
+        };
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &vec![pk; subject.obs_times.len()],
+            &[],
+            None,
+        )
+        .expect("inside the domain");
+        let mut nan_cl = pk;
+        nan_cl.values[PK_IDX_CL] = f64::NAN;
+        let mut neg_cl = pk;
+        neg_cl.values[PK_IDX_CL] = -1.0;
+        // CL < 0 on record 1, NaN from `bad_from` on.
+        let at_obs_neg: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| match j {
+                1 => neg_cl,
+                j if j >= bad_from => nan_cl,
+                _ => pk,
+            })
+            .collect();
+        let at_obs_nan: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| if j >= bad_from { nan_cl } else { pk })
+            .collect();
+        let mut bad_kernel_1 = dose.clone();
+        bad_kernel_1[0].values[kernel_b] = -1.0;
+        let mut bad_kernel_last = dose.clone();
+        *bad_kernel_last.last_mut().unwrap() = {
+            let mut p = pk;
+            p.values[kernel_b] = -1.0;
+            p
+        };
+        assert!(
+            subject.doses.last().unwrap().time > subject.obs_times[bad_from],
+            "{name}: premise — the last dose arrives after the NaN onset"
+        );
+        for (label, at_dose, at_obs, zero_before) in [
+            ("CL < 0 before the onset", dose.clone(), at_obs_neg, true),
+            (
+                "dose 1 kernel non-physical",
+                bad_kernel_1,
+                at_obs_nan.clone(),
+                true,
+            ),
+            (
+                "a post-onset dose's kernel non-physical",
+                bad_kernel_last,
+                at_obs_nan,
+                false,
+            ),
+        ] {
+            let preds =
+                absorption_walk_predictions(model.pk_model, &subject, &at_dose, &at_obs, &[], None)
+                    .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, p) in preds.iter().enumerate() {
+                if j >= bad_from {
+                    assert!(
+                        p.is_nan(),
+                        "{name} {label}: record {j} must be NaN, not {p}"
+                    );
+                } else if zero_before {
+                    assert_eq!(*p, 0.0, "{name} {label}: record {j} keeps the 0 penalty");
+                } else {
+                    assert_eq!(
+                        p.to_bits(),
+                        clean[j].to_bits(),
+                        "{name} {label}: record {j} precedes everything wrong: {p} vs {}",
+                        clean[j]
+                    );
+                }
+            }
+        }
+    }
+}

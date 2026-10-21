@@ -12,6 +12,17 @@ use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
 
+/// A `NaN` with a `NaN` derivative jet, for a closed form that serves a `NaN` parameter as
+/// `NaN` before reaching its formula (#2134). `T::from_f64(f64::NAN)` alone would carry
+/// zero derivatives: a finite `∂f/∂η` next to a `NaN` prediction lets the FOCEI curvature
+/// `H̃` factor, and the subject's `NaN` objective escapes the `1e20` repel that a `NaN`
+/// propagated through the formula's own arithmetic gets. `NaN · x` is `NaN` in every
+/// component, whatever `x`'s seeds.
+#[inline]
+pub(crate) fn nan_jet<T: PkNum>(x: T) -> T {
+    T::from_f64(f64::NAN) * x
+}
+
 /// 1-cpt IV bolus: `C(t) = (D/V)·exp(−(CL/V)·t)`. `t` (elapsed time since dose) is
 /// generic so the caller can seed it as a dual carrying the lagtime sensitivity
 /// (`∂t/∂lagtime = −1`); pass an `f64` for the plain prediction.
@@ -82,18 +93,34 @@ pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_
 /// sibling closed forms' invalid-parameter convention (penalising the optimiser back
 /// into the valid region rather than letting `convolve_1cpt` emit a NaN; `mgf`'s own
 /// `debug_assert` then never fires on this guarded path).
+///
+/// A `NaN` `ke` or `KTR` (a `NaN` `CL`, `V`, `n` or `MTT`) is served as `NaN`, as the
+/// superposition, event-driven and ODE engines serve it (#2134), so the objective is
+/// repelled and `W_NONFINITE_OBJECTIVE` is raised. It used to clamp to `0.0` with the
+/// flip-flop (#386), and the subject was scored against a confident zero. It returns
+/// before `convolve_1cpt`, so `mgf`'s `debug_assert` still never sees it.
 pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
-    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // A `NaN` parameter is served as `NaN` (#2134), before — and in preference to — the
+    // non-physical-parameter penalty below, so a `NaN` alongside e.g. a finite `CL ≤ 0`
+    // still reaches the objective.
+    if [cl, v, n, mtt].iter().any(|x| x.val().is_nan()) {
+        return nan_jet(cl + v + n + mtt);
+    }
+    if v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     let ktr = (n + T::from_f64(1.0)) / mtt;
-    // NaN-safe: proceed only when `ke < KTR` is *definitely* true. Written
-    // `!(ke < ktr)` rather than `ke >= ktr` so a transient `NaN` `ke`/`KTR` (an
-    // additive-η or wide-FD excursion that yields e.g. `cl/v = ∞/∞`) also returns
-    // `0.0` — `NaN >= ktr` is false and would let the NaN slip past the guard into
-    // `mgf`'s `debug_assert`, panicking debug builds on otherwise-valid (e.g.
-    // mis-specified) fits (#386).
+    // `ke = ∞/∞` is `NaN` too, served the same way.
+    if ke.val().is_nan() || ktr.val().is_nan() {
+        return nan_jet(ke + ktr);
+    }
+    // Proceed only when `ke < KTR` is *definitely* true. Written `!(ke < ktr)` rather
+    // than `ke >= ktr` so nothing but a finite in-domain pair reaches `mgf`'s
+    // `debug_assert` (#386).
     if !(ke.val() < ktr.val()) {
         return T::from_f64(0.0);
     }
@@ -118,16 +145,27 @@ pub fn one_cpt_ig_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, mat: T, cv2: T, f_bio
 /// matching the sibling closed forms' invalid-parameter convention (penalising the
 /// optimiser back into the valid region rather than letting `convolve_1cpt` produce a
 /// wrong value; `mgf`'s own `debug_assert` then never fires on this guarded path).
-/// The `!(ke < abscissa)` form is NaN-safe (a transient `NaN` `ke`/`abscissa` also
-/// clamps to `0.0`), matching [`one_cpt_transit_amt_g`].
+/// A `NaN` `ke` or abscissa is served as `NaN` before the guard (#2134), matching
+/// [`one_cpt_transit_amt_g`].
 pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
-    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // A `NaN` parameter wins over the non-physical-parameter penalty (#2134), as in
+    // `one_cpt_transit_amt_g`.
+    if [cl, v, mat, cv2].iter().any(|x| x.val().is_nan()) {
+        return nan_jet(cl + v + mat + cv2);
+    }
+    if v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
-    // MGF abscissa of convergence: ke < 1/(2·MAT·CV²). `!(ke < abscissa)` clamps a
-    // transient NaN too (see `one_cpt_transit_amt_g`).
+    // MGF abscissa of convergence: ke < 1/(2·MAT·CV²). A `NaN` is served as `NaN`
+    // (#2134, see `one_cpt_transit_amt_g`).
     let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
+    if ke.val().is_nan() || abscissa.val().is_nan() {
+        return nan_jet(ke + abscissa);
+    }
     if !(ke.val() < abscissa.val()) {
         return T::from_f64(0.0);
     }
@@ -591,6 +629,96 @@ mod tests {
         assert_eq!(
             one_cpt_transit_g::<f64>(100.0, 1.0, 30.0, 10.0, 3.0, 1.5, 1.0),
             z
+        );
+    }
+
+    /// #2134: a `NaN` `CL`, `V` or kernel parameter is served as `NaN` by the static
+    /// transit and IG closed forms, on `f64` and on `Dual2`, where both used to return 0
+    /// through the flip-flop guard. `CL = V = ∞` (`ke = ∞/∞`, the transient #386 guarded
+    /// against) is served the same `NaN` and does not reach `mgf`'s `debug_assert`. A
+    /// finite flip-flop still reads 0, so the straddle is in this test.
+    ///
+    /// Mutations (run): restore `return T::from_f64(0.0)` for the `NaN` arm in either
+    /// closed form → that kernel's rows die; return a bare `T::from_f64(f64::NAN)` (zero
+    /// derivatives) → the `Dual2` rows die.
+    #[test]
+    fn transit_and_ig_serve_a_nan_parameter_as_nan_not_zero() {
+        let nan = f64::NAN;
+        let (cl, v) = (1.0, 10.0);
+        // transit (n, mtt) = (3, 1.5): KTR ≈ 2.67 > ke = 0.1. IG (mat, cv2) = (2, 0.5):
+        // abscissa 0.5 > ke.
+        let transit = |cl: f64, v: f64, a: f64, b: f64| {
+            one_cpt_transit_g::<f64>(100.0, 1.0, cl, v, a, b, 1.0)
+        };
+        let ig =
+            |cl: f64, v: f64, a: f64, b: f64| one_cpt_ig_g::<f64>(100.0, 1.0, cl, v, a, b, 1.0);
+        for (kernel, f, a, b) in [
+            (
+                "transit",
+                &transit as &dyn Fn(f64, f64, f64, f64) -> f64,
+                3.0,
+                1.5,
+            ),
+            ("ig", &ig, 2.0, 0.5),
+        ] {
+            assert!(f(cl, v, a, b) > 0.0, "{kernel}: the valid control");
+            assert_eq!(
+                f(30.0, 10.0, a, b),
+                0.0,
+                "{kernel}: a finite flip-flop reads 0"
+            );
+            for (label, p) in [
+                ("CL", (nan, v, a, b)),
+                ("V", (cl, nan, a, b)),
+                ("kernel a", (cl, v, nan, b)),
+                ("kernel b", (cl, v, a, nan)),
+                ("CL = V = inf", (f64::INFINITY, f64::INFINITY, a, b)),
+                // A NaN wins over a finite non-physical parameter (#2134 review).
+                ("CL = NaN, V < 0", (nan, -v, a, b)),
+                ("CL < 0, kernel a = NaN", (-cl, v, nan, b)),
+                ("V = 0, kernel b = NaN", (cl, 0.0, a, nan)),
+            ] {
+                let r = f(p.0, p.1, p.2, p.3);
+                assert!(r.is_nan(), "{kernel}, {label}: must be NaN, not {r}");
+            }
+        }
+        let d = one_cpt_transit_g::<Dual2<2>>(
+            100.0,
+            Dual2::constant(1.0),
+            Dual2::var(nan, 0),
+            Dual2::var(v, 1),
+            Dual2::constant(3.0),
+            Dual2::constant(1.5),
+            Dual2::constant(1.0),
+        );
+        // The jet is `NaN` too, or a finite `∂f/∂η` lets FOCEI's `H̃` factor and the
+        // subject's `NaN` objective escape the `1e20` repel (measured on the CLI).
+        assert!(
+            d.value.is_nan()
+                && d.grad
+                    .iter()
+                    .chain(d.hess.iter().flatten())
+                    .all(|g| g.is_nan()),
+            "transit Dual2 must be NaN in every component: {d:?}"
+        );
+        let d = one_cpt_ig_g::<Dual2<2>>(
+            100.0,
+            Dual2::constant(1.0),
+            Dual2::var(nan, 0),
+            Dual2::var(v, 1),
+            Dual2::constant(2.0),
+            Dual2::constant(0.5),
+            Dual2::constant(1.0),
+        );
+        // The jet is `NaN` too, or a finite `∂f/∂η` lets FOCEI's `H̃` factor and the
+        // subject's `NaN` objective escape the `1e20` repel (measured on the CLI).
+        assert!(
+            d.value.is_nan()
+                && d.grad
+                    .iter()
+                    .chain(d.hess.iter().flatten())
+                    .all(|g| g.is_nan()),
+            "IG Dual2 must be NaN in every component: {d:?}"
         );
     }
 

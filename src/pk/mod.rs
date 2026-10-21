@@ -178,7 +178,8 @@ fn pk_params_at_time(
 /// `|α − β| < 1e-12` clamp are honoured) — so the prediction and every sensitivity
 /// path make the *same* routing decision. Returns `false` for a non-absorption-closed-form
 /// model, and for invalid parameters — there the closed form's `0` is a deliberate
-/// optimiser penalty, not a flip-flop to reroute to the ODE twin.
+/// optimiser penalty, not a flip-flop to reroute to the ODE twin — or a `NaN` one, which
+/// the closed form serves as `NaN` itself (#2134).
 pub(crate) fn absorption_flip_flop_at(
     model: &CompiledModel,
     subject: &Subject,

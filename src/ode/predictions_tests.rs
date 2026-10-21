@@ -11312,7 +11312,7 @@ mod break_collision_1186 {
         );
     }
 
-    // ── #1189 item 2: negative lag — pinned, not changed ─────────────────────────
+    // ── #1189 item 2: negative lag — the engines' half ──────────────────────────
 
     /// A **negative** route lag is not an engine inconsistency: all four engines agree
     /// with each other and with the closed form measured from the *earlier* onset, and
@@ -11320,11 +11320,11 @@ mod break_collision_1186 {
     /// The integration start simply moves earlier, identically everywhere — the
     /// documented "onset earlier" semantics.
     ///
-    /// NONMEM's reference behaviour differs: it **aborts**
-    /// (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`).
-    /// Whether to match that is a user-visible policy decision, tracked on #1189; this
-    /// test pins what ferx does today so the decision is taken deliberately rather than
-    /// drifted into.
+    /// NONMEM **aborts** on a negative lag (`PK PARAMETER FOR ABSORPTION LAG IS
+    /// NEGATIVE`), and since #1189 `fit()` / `ferx check` refuse one at the initial
+    /// estimates (`E_NEGATIVE_LAGTIME`). The engines still serve it: a lag driven negative
+    /// mid-fit, or one handed to `predict()` / `simulate()` (which warn), reaches them, and
+    /// this pins that they agree on it.
     #[test]
     fn negative_route_lag_engines_agree_from_earlier_onset() {
         let mut ode = first_order_one_cpt_spec();

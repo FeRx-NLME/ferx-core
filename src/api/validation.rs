@@ -1829,6 +1829,7 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(check_dose_compartments(model, population));
     diags.extend(check_dose_attr_finiteness(model, population));
+    diags.extend(check_negative_lagtime(model, population, &params.theta));
     diags.extend(validate_output_columns(model, population));
     // `fit()` refuses both of these inline, ahead of this list, so they change no first
     // error of `fit()`'s; listed here so `ferx check` reports what `fit()` refuses (#1774).
@@ -3445,6 +3446,134 @@ pub(crate) fn check_dose_attr_finiteness(
         }
     }
     Vec::new()
+}
+
+/// The first dose record whose applied lag is negative at typical values (η = κ = 0),
+/// at `theta`. One predicate behind two severities: `E_NEGATIVE_LAGTIME` on `fit()` and
+/// `ferx check` ([`check_negative_lagtime`]), `W_NEGATIVE_LAGTIME` on `predict()` /
+/// `simulate()` ([`negative_lagtime_warning`]), which run no data errors at all.
+///
+/// Two lags reach a dose, and either may be the negative one: the compartment lag
+/// (`lagtime` / `ALAG{n}`, read through the dose-attribute map exactly as the engine reads
+/// it) and, on an `[odes]` model, the per-route `fn(..., lag=L)` of each forcing feeding
+/// the dose's compartment. Read per dose record, from that record's own snapshot — where
+/// the engine reads both (#1235, #1569) — so a covariate or `TIME`-driven lag that goes
+/// negative only at a later dose is caught. `-0.0` is not negative; a `NaN` is
+/// `E_DOSE_ATTR_NONFINITE`'s (or, for a route lag, `E_ABSORPTION_DOMAIN`'s), not this one's.
+struct NegativeLag {
+    subject: String,
+    record: String,
+    what: String,
+    cmt: usize,
+    value: f64,
+}
+
+fn first_negative_lag(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<NegativeLag> {
+    let map = model.active_dose_attr_map();
+    let route_lagged: Vec<&crate::pk::absorption::InputRateForcing> = model
+        .ode_spec
+        .as_ref()
+        .map(|ode| {
+            ode.input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Cost gate: a model with neither lag kind reads the `PkParams` default `0.0`, so no
+    // snapshot is built for it.
+    if !model.has_lagtime() && route_lagged.is_empty() {
+        return None;
+    }
+    let mut scratch = TypicalSnapshotScratch::default();
+    for subject in &population.subjects {
+        for snap in typical_dose_snapshots(model, subject, theta, &mut scratch) {
+            let cmt = subject.doses[snap.index].cmt_1based();
+            let cmt_lag = map.lagtime(cmt, snap.values);
+            let found = if cmt_lag < 0.0 {
+                Some(("lag time (`lagtime` / `ALAG`)".to_string(), cmt_lag))
+            } else {
+                route_lagged
+                    .iter()
+                    .filter(|f| f.cmt + 1 == cmt)
+                    .map(|f| (f, f.route_lag(snap.values)))
+                    .find(|(_, lag)| *lag < 0.0)
+                    .map(|(f, lag)| {
+                        (
+                            format!("per-route absorption lag (a `{:?}` route)", f.kind),
+                            lag,
+                        )
+                    })
+            };
+            if let Some((what, value)) = found {
+                return Some(NegativeLag {
+                    subject: subject.id.clone(),
+                    record: snap.record_label(),
+                    what,
+                    cmt,
+                    value,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// A dose lag must not be negative at the initial estimates (#1189). NONMEM refuses the
+/// run (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`), and
+/// `fit()` / `ferx check` refuse it the same way rather than starting the dose's input
+/// before its record time. Evaluated at `theta` — the fit's own initial estimates, which a
+/// caller may have replaced — per subject and per dose record ([`first_negative_lag`]).
+/// Reported once: a single fatal error already halts the fit.
+///
+/// Typical values only, like every fit-init dose-attribute check: a lag driven negative
+/// mid-fit by an η or θ excursion is still integrated from the earlier onset, identically
+/// on every engine (pinned by `negative_route_lag_engines_agree_from_earlier_onset`).
+pub(crate) fn check_negative_lagtime(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Vec<Diagnostic> {
+    let Some(neg) = first_negative_lag(model, population, theta) else {
+        return Vec::new();
+    };
+    vec![Diagnostic::error(
+        "E_NEGATIVE_LAGTIME",
+        format!(
+            "Dose {} for compartment {} is {:.4} (< 0) at the initial typical-value point \
+             (subject {}, {}). A negative lag would start the dose's input before its \
+             record time; NONMEM rejects it (PK PARAMETER FOR ABSORPTION LAG IS \
+             NEGATIVE) and so does ferx. Use a positive-link parameterisation \
+             (e.g. `ALAG1 = TVLAG * exp(ETA_LAG)`) or a lower bound of 0 on the lag's theta.",
+            neg.what, neg.cmt, neg.value, neg.subject, neg.record,
+        ),
+    )
+    .with_block("individual_parameters")]
+}
+
+/// The `predict()` / `simulate()` counterpart of [`check_negative_lagtime`]: those entry
+/// points run no data errors, so a negative lag is served — the dose's input starts at the
+/// earlier onset — and reported as `W_NEGATIVE_LAGTIME` instead.
+pub(crate) fn negative_lagtime_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<Diagnostic> {
+    let neg = first_negative_lag(model, population, theta)?;
+    Some(Diagnostic::warning(
+        "W_NEGATIVE_LAGTIME",
+        format!(
+            "Dose {} for compartment {} is {:.4} (< 0) at the typical-value point \
+             (subject {}, {}). It is applied as written, so the dose's input starts before \
+             its record time. fit() and `ferx check` reject this as E_NEGATIVE_LAGTIME, as \
+             NONMEM does.",
+            neg.what, neg.cmt, neg.value, neg.subject, neg.record,
+        ),
+    ))
 }
 
 /// A `[covariate_model]` relation stated with a symbolic statistic (#1111) is
@@ -8019,7 +8148,9 @@ pub(crate) fn check_packed_start_in_box(
 mod packed_start_box_tests;
 
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
-/// resets under an SDE model, and a negative typical-value lag time. These are
+/// resets under an SDE model, and the like. A negative typical-value lag time is
+/// not one of them since #1189: it is `E_NEGATIVE_LAGTIME` on the fatal list
+/// (`check_negative_lagtime`). These are
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
 /// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
 /// is identical to the historical inline strings.
@@ -8522,87 +8653,6 @@ pub(crate) fn check_model_data_warnings_rule(
              Use an ODE or analytical model if the lag matters."
                 .to_string(),
         ));
-    }
-
-    // Negative typical-value lag time at the initial point (eta = 0).
-    if model.has_lagtime() {
-        if let Some(first_subj) = population.subjects.first() {
-            let zero_eta = vec![0.0_f64; model.n_eta];
-            // Negative-lag warning at the initial point: typical values at t=0.
-            let pk =
-                (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
-            if pk.lagtime() < 0.0 {
-                diags.push(Diagnostic::warning(
-                    "W_NEGATIVE_LAGTIME",
-                    format!(
-                        "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
-                         point (eta = 0). Negative lagtimes are physically nonsensical \
-                         and are not clamped — consider an exp() or other positive-link \
-                         parameterisation.",
-                        pk.lagtime()
-                    ),
-                ));
-            }
-            // Compartment-indexed `ALAGn` lags (issue #369) live in their own
-            // spare slots, so the bare check above never sees them — flag each one
-            // that is negative at the typical-value point. Ordered by compartment
-            // for deterministic diagnostics.
-            if let Some(ode) = &model.ode_spec {
-                for cmt in 1..=ode.n_states {
-                    let Some(slot) = ode
-                        .dose_attr_map
-                        .indexed_slot(crate::types::DoseAttr::Lag, cmt)
-                    else {
-                        continue;
-                    };
-                    let lag = pk.values.get(slot).copied().unwrap_or(0.0);
-                    if lag < 0.0 {
-                        diags.push(Diagnostic::warning(
-                            "W_NEGATIVE_LAGTIME",
-                            format!(
-                                "ALAG{cmt} (compartment-{cmt} lag) evaluates to {lag:.4} (< 0) \
-                                 at the initial typical-value point (eta = 0). Negative lagtimes \
-                                 are physically nonsensical and are not clamped — consider an \
-                                 exp() or other positive-link parameterisation."
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // Negative per-route absorption lag (`fn(..., lag=L)`) at the initial typical-value
-    // point (η = 0). A per-route lag lives on the forcing (its own `lag_slot`), NOT the
-    // dose-attribute lag machinery, so `model.has_lagtime()` does not cover it and the
-    // block above never sees it — this check stands on its own, gated on a forcing
-    // actually carrying a `lag_slot`. Same convention as `W_NEGATIVE_LAGTIME`: warned,
-    // not clamped (a negative lag shifts the onset earlier rather than crashing).
-    if let Some(ode) = &model.ode_spec {
-        if ode.has_route_lag() {
-            if let Some(first_subj) = population.subjects.first() {
-                let zero_eta = vec![0.0_f64; model.n_eta];
-                let pk =
-                    (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
-                for f in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
-                    let lag = f.route_lag(&pk.values);
-                    if lag < 0.0 {
-                        diags.push(Diagnostic::warning(
-                            "W_NEGATIVE_LAGTIME",
-                            format!(
-                                "Per-route absorption lag (a `{:?}` route on compartment {}) \
-                                 evaluates to {lag:.4} (< 0) at the initial typical-value point \
-                                 (eta = 0). Negative lagtimes are physically nonsensical and are \
-                                 not clamped — consider an exp() or other positive-link \
-                                 parameterisation.",
-                                f.kind,
-                                f.cmt + 1
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
     }
 
     // Analytic absorption flip-flop diagnostic (#634 review finding 3; IG #790). The

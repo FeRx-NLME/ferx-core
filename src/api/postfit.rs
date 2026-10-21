@@ -2561,13 +2561,16 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `AMT` column with dose rows) is not: the controller supplies the regimen, so a dose-free
 ///    dataset is the expected input on that entry point.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
-///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
+///    `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
 ///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
 ///    argued rather than inherited (#1405 review): a declared per-CMT entry that no
 ///    observation matched is a statement about the model and the data the caller handed
 ///    in, and `predict()` dispatches through the same map, so the entry is exactly as
 ///    inert there as in a fit. `predict_and_simulate_report_it_too` pins it on both
 ///    paths.
+///    Followed by `W_NEGATIVE_LAGTIME`, the non-fit severity of `fit()`'s
+///    `E_NEGATIVE_LAGTIME` (#1189): one predicate, an error where data errors run and a
+///    warning where the lag is served.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
 ///    experimental whichever door you use it through.
 /// 5. The ODE-solver diagnostics of the pass that just ran.
@@ -2638,6 +2641,12 @@ pub(crate) fn non_fit_diagnostics(
     out.extend(
         crate::api::check_model_data_warnings(model, population, params)
             .into_iter()
+            .map(|d| d.message),
+    );
+    // `fit()` refuses a negative lag (`E_NEGATIVE_LAGTIME`, #1189); these entry points run no
+    // data errors and serve it, so they report the same predicate as a warning.
+    out.extend(
+        crate::api::validation::negative_lagtime_warning(model, population, &params.theta)
             .map(|d| d.message),
     );
     out.extend(
