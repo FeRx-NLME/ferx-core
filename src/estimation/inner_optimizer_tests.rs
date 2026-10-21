@@ -819,7 +819,7 @@ fn legacy_dense_bfgs(
         if d.iter().zip(&g).map(|(di, gi)| di * gi).sum::<f64>() >= 0.0 {
             h_inv = DMatrix::identity(n, n);
             let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
-            let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+            let (alpha, f_new) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
             if alpha == 0.0 {
                 return false;
             }
@@ -831,7 +831,7 @@ fn legacy_dense_bfgs(
             continue;
         }
 
-        let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+        let (alpha, f_new) = legacy_step(obj, grad, x, &d, &g, n, f_cur);
         if alpha == 0.0 {
             return false;
         }
@@ -846,7 +846,7 @@ fn legacy_dense_bfgs(
         let s_vec = DVector::from_column_slice(&s);
         let y_vec = DVector::from_column_slice(&y);
         let sy = s_vec.dot(&y_vec);
-        if sy > 1e-12 {
+        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), false) {
             let rho = 1.0 / sy;
             let eye = DMatrix::identity(n, n);
             let s_yt = rho * &s_vec * y_vec.transpose();
@@ -857,6 +857,23 @@ fn legacy_dense_bfgs(
         g = g_new;
     }
     false
+}
+
+/// The step rule both drivers apply since #2270: a gradient-verified step below the objective's
+/// resolution first, else the line search.
+fn legacy_step(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    g: &[f64],
+    n: usize,
+    f0: f64,
+) -> (f64, f64) {
+    match exact_step_verified_by_gradient(obj, grad, x, d, f0, g, None, false) {
+        Some(fc) => (1.0, fc),
+        None => legacy_line_search(obj, x, d, g, n, f0),
+    }
 }
 
 fn legacy_line_search(
@@ -4877,6 +4894,50 @@ fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
     assert!(
         stuck.is_empty(),
         "starts that did not converge (index, final ‖g‖): {stuck:?}"
+    );
+}
+
+/// The gradient-verified step of #2270 is for exact objectives only; an ODE objective
+/// (`enable_stall`) keeps its line search and its own noise-floor exit. A differential pair
+/// across the gate: `f = 10 + ½·256·x² + e(x)` with `e(0) = 5e-11` and `e = 0` elsewhere,
+/// started at `x₀ = 2⁻²³`, Newton-seeded (256 = 16², so the seed inverts exactly) so the full
+/// step lands exactly on `0`. There `f` is
+/// higher by ~4.8e-11, inside the resolution `1e-11·(1 + |f|)`, while the gradient is 0. One
+/// iteration: the exact objective takes the step (x = 0), the line search rejects it and takes a
+/// shorter one (x ≠ 0).
+#[test]
+fn only_an_exact_objective_takes_the_gradient_verified_step() {
+    let lambda = 256.0;
+    let obj = |x: &[f64]| 10.0 + 0.5 * lambda * x[0] * x[0] + if x[0] == 0.0 { 5e-11 } else { 0.0 };
+    let grad = |x: &[f64]| vec![lambda * x[0]];
+    let seed = DMatrix::from_element(1, 1, lambda);
+    let x0 = 2f64.powi(-23);
+    let run = |stall: &dyn Fn(&[f64]) -> bool| {
+        let mut x = vec![x0];
+        dense_bfgs_core(
+            &obj,
+            &grad,
+            &mut x,
+            1,
+            1,
+            1e-14,
+            None,
+            Some(&seed),
+            None,
+            stall,
+            false,
+        );
+        x[0]
+    };
+    let exact = run(&|_| false);
+    let ode = run(&|_| true);
+    assert_eq!(
+        exact, 0.0,
+        "the exact objective must take the gradient-verified step"
+    );
+    assert!(
+        ode != 0.0 && ode.abs() < x0,
+        "the ODE objective must leave the step to its line search, which shortens it: x = {ode:e}"
     );
 }
 

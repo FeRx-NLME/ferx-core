@@ -4704,7 +4704,7 @@ fn lbfgs_core(
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
-        if curvature_pair_accepted(sy, l2_norm(&s), l2_norm(&y)) {
+        if curvature_pair_accepted(sy, l2_norm(&s), l2_norm(&y), enable_stall) {
             if s_hist.len() == LBFGS_MEMORY {
                 s_hist.remove(0);
                 y_hist.remove(0);
@@ -4954,7 +4954,7 @@ fn dense_bfgs_core(
         s_vec.as_mut_slice().copy_from_slice(&s);
         y_vec.as_mut_slice().copy_from_slice(&y);
         let sy = s_vec.dot(&y_vec);
-        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm()) {
+        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
             let rho = 1.0 / sy;
             let s_yt = rho * &s_vec * y_vec.transpose();
             let y_st = rho * &y_vec * s_vec.transpose();
@@ -5348,9 +5348,9 @@ fn exact_step_verified_by_gradient(
 /// `sᵀy > 1e-12` (see [`curvature_pair_accepted`]).
 const CURVATURE_PAIR_REL: f64 = 1e-8;
 
-/// Whether an accepted step's pair `(s, y)` updates the BFGS metric: `sᵀy > 1e-12`, or
-/// `sᵀy > CURVATURE_PAIR_REL·‖s‖·‖y‖` — positive curvature resolvable relative to the pair
-/// itself, which does not depend on the step's length.
+/// Whether an accepted step's pair `(s, y)` updates the BFGS metric: `sᵀy > 1e-12`, or — on an
+/// **exact** objective (`!enable_stall`) — `sᵀy > CURVATURE_PAIR_REL·‖s‖·‖y‖`, positive curvature
+/// resolvable relative to the pair itself, which does not depend on the step's length.
 ///
 /// Why (#2270): the absolute test alone rejects every pair of a search whose steps are small, and
 /// near the mode they all are: `sᵀy ≈ λ‖s‖²`. Measured on `nonmem_anchor/nested_levels_3` with
@@ -5359,8 +5359,13 @@ const CURVATURE_PAIR_REL: f64 = 1e-8;
 /// and stalled at ‖∇‖ ~ 2–3e-5 > `tol = 1e-5` until `max_iter`, and 24 solves went to Nelder–Mead.
 /// The union only *adds* pairs, all in the small-step regime: a pair the absolute test accepted is
 /// still accepted.
-fn curvature_pair_accepted(sy: f64, s_norm: f64, y_norm: f64) -> bool {
-    sy > 1e-12 || sy > CURVATURE_PAIR_REL * s_norm * y_norm
+///
+/// Not on an ODE objective: there a short step's `y` is the solver's gradient noise, and the
+/// relative test admits it as curvature. Measured on `per_route_lag_matches_reconverged_fd`
+/// (`reltol = 1e-12`): the reconverged-FD reference's EBE re-solves fell from 5.4e-8 to 1.04e-6
+/// in stationarity with the relative arm on there.
+fn curvature_pair_accepted(sy: f64, s_norm: f64, y_norm: f64, enable_stall: bool) -> bool {
+    sy > 1e-12 || (!enable_stall && sy > CURVATURE_PAIR_REL * s_norm * y_norm)
 }
 
 fn l2_norm(v: &[f64]) -> f64 {

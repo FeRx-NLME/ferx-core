@@ -3134,12 +3134,15 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
 /// |---|---|---|---|
 /// | 1e-8 | fix | `true` | **1.49e-9** |
 /// | 1e-8 | stall keyed on `effective_for` | `true` | **2.03e-8** (above `tol`) |
-/// | 1e-10 | fix | **`false`** | 1.49e-9 (the exact objective's floor) |
+/// | 1e-10 | fix | **`false`** | 1.49e-9 (where the search stalled) |
 /// | 1e-10 | stall keyed on `effective_for` | **`true`** | 2.03e-8 |
 ///
 /// So at `tol = 1e-8` a converged solve must have a gradient below `tol` — 6.7× headroom over
-/// the realised 1.49e-9, and the mutation lands 2× above it — and at `tol = 1e-10`, below the
-/// floor, it must not claim convergence at all. Both are asserted; either catches the mutation.
+/// the realised 1.49e-9, and the mutation lands 2× above it — and at `tol = 1e-10` a solve that
+/// claims convergence must have its gradient below `tol` too. Both are asserted; either catches
+/// the mutation. The 1.49e-9 at `tol = 1e-10` was the search stalling, not the objective's floor:
+/// since #2270 (relative BFGS pair gate, gradient-verified steps below the objective's
+/// resolution) that solve converges, at max |g| 1.12e-12.
 #[test]
 fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
@@ -3223,9 +3226,9 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     );
     let (conv, gmax) = solve(1e-10);
     assert!(
-        !conv,
-        "below the exact objective's floor the solve must not claim convergence on a plateau \
-         (max |g| {gmax:e})"
+        !conv || gmax < 1e-10,
+        "a solve that claims convergence at tol 1e-10 must have its gradient below it, not stop \
+         on a plateau (max |g| {gmax:e})"
     );
 }
 
@@ -3452,9 +3455,9 @@ fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
 /// rebuild per call is invisible in every number the search returns; only the count
 /// (`LAYOUT_BUILDS`: every `StackedLayout::new` and `NestedLayout::of`) can see it.
 ///
-/// Measured: 1–3 builds per whole `find_ebe_for_stage` call against 56–208 analytic
-/// gradient steps and their
-/// line-search objectives. Before #2037 every objective built two layouts and every
+/// Measured: 2–5 builds per whole `find_ebe_for_stage` call against 40–72 analytic
+/// gradient steps and their line-search objectives (56–208 steps before #2270's BFGS
+/// pair gate shortened the searches). Before #2037 every objective built two layouts and every
 /// analytic gradient three or four, so the same searches built hundreds. The bound is
 /// the measured worst plus two. The FD-inner case pins the objective's prediction path
 /// alone: its gradient is FD of that objective.
@@ -3510,7 +3513,7 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
         if *analytic_route {
             // The bound must be far below the work, or it could not tell the two apart.
             assert!(
-                analytic >= 50 && fd == 0,
+                analytic >= 30 && fd == 0,
                 "{label}: {analytic} analytic / {fd} FD steps"
             );
         }
