@@ -63,7 +63,7 @@
 //! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
 //! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature; the filter is covariance-only, so the state mean is never corrected by the data (see Feature Maturity and the SDE page) |
 //! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
-//! | `W_NEGATIVE_LAGTIME`      | a lag time is negative at the initial estimates |
+//! | `W_NEGATIVE_LAGTIME`      | `predict()` / `simulate()` only: a lag time is negative at the typical values, and is served — the non-fit severity of `E_NEGATIVE_LAGTIME` (#1189) |
 //! | `E_DERIVED_NAME_CONFLICT` | `[derived]` name clashes with a built-in sdtab column, theta, eta, or indiv-param name |
 //! | `W_DERIVED_COVARIATE_SHADOW` | `[derived]` name shadows a covariate (allowed but may be confusing) |
 //! | `W_DERIVED_STEP_IGNORED`  | `step=` given for a DV-based integral (ignored; DV integrals use observation times) |
@@ -211,6 +211,7 @@
 //! | `W_DERIVED_INIT_ANALYTICAL` | analytical model with an `[initial_conditions]` baseline and a `[derived]` expression reading `compartments[i]`; compartment states are not available, so the expression is NaN (#521) |
 //! | `E_RUV_MAGNITUDE_NONPOSITIVE` | a custom residual-error magnitude (e.g. a `weight = ...` modifier) or a `power(SIGMA, P)` exponent evaluates to zero, negative or non-finite at an observation, at the model's initial θ (#484, #1182) |
 //! | `E_DOSE_ATTR_DOUBLE_USE` | a dose attribute the engine applies at the dose event (`F`, `LAGTIME`/`ALAG`, `F{n}`/`ALAG{n}`, or a `D{n}`/`R{n}` a coded `RATE` lands on) is also read by the model, so it is applied twice (#993, #1004) |
+//! | `E_NEGATIVE_LAGTIME` | a dose lag (`lagtime` / `ALAG{n}`, or a per-route `lag=` on the dosed compartment) is negative at the fit's initial typical values at some dose record's own snapshot; NONMEM refuses the same run (#1189) |
 //! | `E_DOSE_ATTR_NONFINITE` | a dose attribute (lag time, bioavailability, or a modeled `D{n}`/`R{n}` behind a coded `RATE`) is `NaN` or infinite at typical values at some dose record's own snapshot (#1189, #1235) |
 //! | `E_ETA_NOT_DECLARED` | an unresolved identifier reads as a random effect (`ETA…` / `KAPPA…`) but no `omega` / `kappa` declaration defines it and the data has no such column |
 //! | `W_ETA_NOT_DECLARED` | as `E_ETA_NOT_DECLARED`, reported without `--data`, where the dataset might still supply the column |

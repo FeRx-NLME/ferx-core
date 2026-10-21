@@ -443,9 +443,9 @@ impl InputRateForcing {
         // A per-route lag (`fn(..., lag=L)`) must be finite: it shifts the effective
         // onset `t_eff = t_dose + lag_cmt + lag_route`, so a NaN/inf would poison
         // every `tad` for this route and propagate as `NaN` through the RHS. A
-        // *negative* lag is not rejected here — it is physically odd but handled
-        // (onset earlier), warned via `W_NEGATIVE_LAGTIME` at fit-init like the
-        // compartment lag.
+        // *negative* lag is not rejected here: the engines handle it (onset earlier),
+        // and the fit-init refusal is `E_NEGATIVE_LAGTIME` (#1189), which checks it
+        // per dose alongside the compartment lag.
         let route_lag = self.route_lag(params);
         if !route_lag.is_finite() {
             return Err(format!(
