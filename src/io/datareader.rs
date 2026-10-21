@@ -1473,8 +1473,10 @@ fn read_nonmem_csv_impl(
 
     // A covariate column that exists but carries no finite value for some
     // subjects is stored as `NaN` (see the per-subject reader). Report it once
-    // per covariate: without a `present(COV)` guard those subjects evaluate the
-    // covariate expression to `NaN`, and the fit will fail on them.
+    // per covariate. The message does not promise a `NaN` outcome: `/`, `^`,
+    // `exp` keep it (non-finite objective), but `log` / `sqrt` floor it and
+    // `min` / `max` / comparisons return a finite value, so for those relations
+    // this warning is the only sign anything is wrong (#2041).
     let mut population_warnings = population_warnings;
     for name in &existing_cov_names {
         let missing: Vec<&str> = subjects
@@ -1485,13 +1487,7 @@ fn read_nonmem_csv_impl(
         if missing.is_empty() {
             continue;
         }
-        population_warnings.push(format!(
-            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
-            missing.len(),
-            subjects.len(),
-            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-            if missing.len() > 5 { ", ..." } else { "" },
-        ));
+        population_warnings.push(covariate_missing_warning(name, &missing, subjects.len()));
     }
 
     Ok((
@@ -1505,6 +1501,22 @@ fn read_nonmem_csv_impl(
         },
         table,
     ))
+}
+
+/// The `W_COVARIATE_MISSING` warning for covariate `name`, which has no finite
+/// value for the subjects `missing` out of `n_subjects`. At most five IDs are
+/// listed; a longer list ends in `...`.
+pub(crate) fn covariate_missing_warning(name: &str, missing: &[&str], n_subjects: usize) -> String {
+    format!(
+        "W_COVARIATE_MISSING: covariate {name} has no value for {} of {n_subjects} subjects \
+         ({}{}), so it is NaN for them. A relation that reads it is then NaN, which makes \
+         the objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, \
+         a finite value with no further warning. Impute the column, exclude the subjects, \
+         or guard the relation with `present({name})`.",
+        missing.len(),
+        missing[..missing.len().min(5)].join(", "),
+        if missing.len() > 5 { ", ..." } else { "" },
+    )
 }
 
 /// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
