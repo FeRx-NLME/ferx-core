@@ -207,8 +207,8 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // aarch64 and the x86_64 CI dispatch agree to every printed digit): the first outer
     // evaluation now warm-starts from the pre-flight EBEs, so the inner solves stop at a
     // slightly different point. The FOCEI literals above stayed inside `ESS_REL_TOL`.
-    // #2217 moved it by −9.1e-6 relative (402.38567292526295 → 402.3820222439373, Linux
-    // aarch64): the first outer evaluation now starts every occasion's κ at the pre-flight's
+    // #2217 moved it by −9.1e-6 relative (402.38567292526295 → 402.3820222439373; Linux
+    // aarch64 and the x86_64 CI dispatch, run 39559756945, agree to every printed digit): the first outer evaluation now starts every occasion's κ at the pre-flight's
     // κ̂ instead of 0, so its inner solves stop at a different point inside `inner_tol`, the
     // outer path from there differs, and the fixed-seed SIR proposal is built from the
     // covariance at a slightly different point of the same optimum. Measured base against
