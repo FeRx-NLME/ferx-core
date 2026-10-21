@@ -230,6 +230,174 @@ fn modeled_duration_under_a_lag_matches_reconverged_fd() {
     assert!(grad < 9e-7, "modeled D1 + lag gradient: {grad:.2e}");
 }
 
+// ---- a moving rate-off a few ULPs below a covariate record (#1160) --------------------
+
+/// The infusion arm: a modeled duration `D1`, so the window end is a `K_INF_END`.
+const MODELED_DUR_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVD1(0.1, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The zero-order arm: the same geometry through `zero_order(dur)`, a `K_ZO_END`.
+const ZERO_ORDER_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVDUR(0.1, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1160: a moving rate-off a few ULPs **below** a covariate-changing record. A window
+/// `0.7 + 0.1` ends at `0.7999999999999999`, so the timeline sorts its rate-off before the
+/// observation at `0.8` (`WT = 70`), and the next record (`WT = 95`, at `2.0`) lies beyond
+/// `INFUSION_EPS`. The flow on both sides of that window end is the one the `0.8` record
+/// governs; and since moving a rate-off only shifts `rate·δ` of input across the stationary
+/// `0.8` field jump, the first derivative is continuous there — the one-sided limits agree
+/// (asserted), so either is the oracle.
+///
+/// The removed lookahead read the post side from the first record strictly later by more
+/// than `INFUSION_EPS` — the `2.0` one — and so charged the *stationary* `0.8` record's field
+/// jump `(f₇₀ − f₉₅)(x)·δ` to the moving boundary: a first-order term on neither branch (the
+/// #1068 shape, on the rate-off side). Returns `(exact vs backward limit, |fwd − bwd|)` on the
+/// window-length η's column, over the rows past the boundary.
+fn ulp_below_rate_off_gaps(src: &str, mode: RateMode, label: &str) -> (f64, f64) {
+    let m = tight(parse_model_string(src).unwrap());
+    let (t_dose, t_rec) = (0.7, 0.8);
+    let theta = m.default_params.theta.clone();
+    let w_end = t_dose + theta[3];
+    // The sliver itself, asserted so the fixture cannot silently stop being one.
+    assert!(
+        w_end < t_rec && t_rec - w_end <= crate::ode::predictions::INFUSION_EPS,
+        "{label}: window end {w_end:e} must sit within INFUSION_EPS below {t_rec}"
+    );
+    let times = [t_rec, 2.0, 3.0, 5.0];
+    let wts = [70.0, 95.0, 95.0, 95.0];
+    // An earlier dose, so the window ends onto drug that is not just its own.
+    let doses = vec![
+        DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, mode),
+        DoseEvent::modeled(t_dose, 100.0, 1, false, 0.0, mode),
+    ];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut s = subject_shell(doses, &times);
+    s.covariates.insert("WT".into(), 70.0);
+    s.dose_covariates = vec![wt(70.0), wt(70.0)];
+    s.obs_covariates = wts.iter().map(|&w| wt(w)).collect();
+    assert!(s.has_tv_covariates(), "{label}");
+
+    // The window-length η at exactly 0, so the window is `TV = 0.1` and ends on the sliver.
+    let eta = [0.05, 0.0];
+    let jac = exact_eta_jacobian(&m, &s, &theta, &eta)
+        .unwrap_or_else(|| panic!("{label}: the recorder must serve this subject"));
+    let pred =
+        |e: f64| crate::pk::compute_predictions_with_tv(&m, &s, &theta, &[eta[0], eta[1] + e]);
+    // Live: the covariate jump moves the post-record rows, so a snapshot read from the wrong
+    // side of it is visible (the `WT = 95` field is what the old post side read).
+    let f0 = pred(0.0);
+    let flat = {
+        let mut t = s.clone();
+        t.obs_covariates = times.iter().map(|_| wt(70.0)).collect();
+        crate::pk::compute_predictions_with_tv(&m, &t, &theta, &eta)
+    };
+    let jump = (f0[1] - flat[1]).abs() / flat[1].abs();
+    assert!(
+        jump > 1e-2,
+        "{label}: the WT change must move the t = 2 row ({jump:.2e})"
+    );
+    // One-sided Richardson limits, h ≫ the ULP gap: backward stays below the `0.8` record,
+    // forward crosses it.
+    let h = 1e-5;
+    let (fm, fm2, fp, fp2) = (pred(-h), pred(-2.0 * h), pred(h), pred(2.0 * h));
+    let (mut worst_bwd, mut fwd_gap, mut col) = (0.0f64, 0.0f64, 0.0f64);
+    for j in 1..times.len() {
+        let bwd = (3.0 * f0[j] - 4.0 * fm[j] + fm2[j]) / (2.0 * h);
+        let fwd = (-3.0 * f0[j] + 4.0 * fp[j] - fp2[j]) / (2.0 * h);
+        let got = jac[(j, 1)];
+        assert!(
+            got.is_finite() && bwd.is_finite() && fwd.is_finite(),
+            "{label}, row {j}: non-finite {got} / {bwd} / {fwd}"
+        );
+        worst_bwd = worst_bwd.max((got - bwd).abs() / (1.0 + bwd.abs()));
+        fwd_gap = fwd_gap.max((fwd - bwd).abs() / (1.0 + bwd.abs()));
+        col = col.max(bwd.abs());
+    }
+    assert!(
+        col > 1e-3,
+        "{label}: the window length moves no row past it ({col:.1e})"
+    );
+    eprintln!("{label}: exact vs backward {worst_bwd:.2e}; |fwd − bwd| {fwd_gap:.2e}");
+    (worst_bwd, fwd_gap)
+}
+
+#[test]
+fn infusion_end_a_few_ulps_below_a_covariate_record_reads_one_snapshot() {
+    let (gap, fwd_bwd) = ulp_below_rate_off_gaps(
+        MODELED_DUR_TVCOV_ODE,
+        RateMode::ModeledDuration,
+        "K_INF_END",
+    );
+    // Measured 1.0e-10 and |fwd − bwd| 1.1e-10 on macOS, 1.41e-2 before #1160; the bounds
+    // sit ~10× and ~30× above the first two and seven decades below the defect.
+    assert!(
+        fwd_bwd < 3e-9,
+        "K_INF_END: the one-sided limits must agree ({fwd_bwd:.2e})"
+    );
+    assert!(
+        gap < 1e-9,
+        "K_INF_END: exact ∂f/∂η_D1 vs backward limit {gap:.2e}"
+    );
+}
+
+#[test]
+fn zero_order_end_a_few_ulps_below_a_covariate_record_reads_one_snapshot() {
+    let (gap, fwd_bwd) = ulp_below_rate_off_gaps(ZERO_ORDER_TVCOV_ODE, RateMode::Fixed, "K_ZO_END");
+    // Measured 1.3e-10 and |fwd − bwd| 2.6e-10 on macOS, 1.41e-2 before #1160.
+    assert!(
+        fwd_bwd < 3e-9,
+        "K_ZO_END: the one-sided limits must agree ({fwd_bwd:.2e})"
+    );
+    assert!(
+        gap < 1e-9,
+        "K_ZO_END: exact ∂f/∂η_DUR vs backward limit {gap:.2e}"
+    );
+}
+
 // ---- steady state into a built-in absorption kernel; SS on the non-linear walk -------
 
 const SS_FIRST_ORDER_F: &str = r#"
