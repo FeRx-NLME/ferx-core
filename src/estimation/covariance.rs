@@ -831,26 +831,87 @@ fn analytic_cov_declines(
     out
 }
 
-/// Whether the covariance step is expected to take the analytic R-matrix: no clause of
-/// [`analytic_cov_declines`]'s walk fires. A subject can still bail at run time (a trial point
-/// the recorder cannot form), and then only that subject takes the stencil (the hybrid route).
+/// Which route the covariance step is expected to build `R` on, predicted before the fit from
+/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates, then
+/// `cov_width_declines` per subject, then the salvage cut [`salvages_declined`] the assembly
+/// itself applies. The prediction can still be wrong when a subject bails at run time (a trial
+/// point the recorder cannot form) — then that subject joins the salvaged minority, or, past
+/// the cut, the whole population takes the stencil — which is why every message built from it
+/// is worded as an expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredictedRRoute {
+    /// Every subject on the analytic assembly: no finite-difference objective at all.
+    Analytic,
+    /// A strict minority of subjects declines; the `2·n²`-point stencil runs over those
+    /// `declined` of `n_subjects` alone (#1514).
+    Salvage { declined: usize, n_subjects: usize },
+    /// The whole-population stencil.
+    Stencil,
+}
+
+/// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
+/// stencil, rather than taking the population stencil — the one cut both
+/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
+    (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
+}
+
+/// The covariance step's expected `R` route; see [`PredictedRRoute`].
 ///
 /// What this decides is the *cost* of `R`: one profile-Hessian pass per subject instead of
 /// `fd_r_objective_evals(n)` reconverged population objectives, so the large-problem reroute to
-/// `S` and the pre-fit cost note, both written for the stencil, do not apply.
+/// `S` and the pre-fit cost note, both written for the stencil, do not apply on
+/// [`PredictedRRoute::Analytic`].
+pub(crate) fn predicted_r_route(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> PredictedRRoute {
+    if !analytic_cov_model_declines(model, options, is_mixture).is_empty() {
+        return PredictedRRoute::Stencil;
+    }
+    let n_subjects = population.subjects.len();
+    match width_declined_subjects(model, population, options) {
+        0 => PredictedRRoute::Analytic,
+        declined if salvages_declined(declined, n_subjects) => PredictedRRoute::Salvage {
+            declined,
+            n_subjects,
+        },
+        _ => PredictedRRoute::Stencil,
+    }
+}
+
+/// Whether the covariance step is expected to take the analytic R-matrix for every subject:
+/// [`predicted_r_route`] is [`PredictedRRoute::Analytic`], i.e. no clause of
+/// [`analytic_cov_declines`]'s walk fires.
 pub(crate) fn analytic_r_expected(
     model: &CompiledModel,
     population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> bool {
-    analytic_cov_scope_declines(model, population, options, is_mixture).is_empty()
+    predicted_r_route(model, population, options, is_mixture) == PredictedRRoute::Analytic
 }
 
 /// The clauses of [`analytic_cov_declines`], empty when none fires.
 fn analytic_cov_scope_declines(
     model: &CompiledModel,
     population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> Vec<CovScopeDecline> {
+    let mut out = analytic_cov_model_declines(model, options, is_mixture);
+    if width_declined_subjects(model, population, options) > 0 {
+        out.push(CovScopeDecline::TooManyRandomEffects);
+    }
+    out
+}
+
+/// The model-level clauses of [`analytic_cov_declines`] — every one that sends the whole
+/// population to the stencil, whatever the subjects look like.
+fn analytic_cov_model_declines(
+    model: &CompiledModel,
     options: &FitOptions,
     is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
@@ -873,15 +934,22 @@ fn analytic_cov_scope_declines(
     if model.has_non_gaussian() {
         out.push(CovScopeDecline::NonGaussianEndpoint);
     }
+    out
+}
+
+/// How many subjects are too wide for the profile Hessian's buckets under the fit's
+/// objective — the per-subject clause, through the rule the Hessian dispatch itself runs on.
+fn width_declined_subjects(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> usize {
     let objective = cov_objective(options);
-    if population
+    population
         .subjects
         .iter()
-        .any(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
-    {
-        out.push(CovScopeDecline::TooManyRandomEffects);
-    }
-    out
+        .filter(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
+        .count()
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1088,7 +1156,7 @@ pub(super) fn analytic_cov_assembly(
     if declined.is_empty() {
         return AnalyticCovAssembly::Full(acc);
     }
-    if declined.len() as f64 >= SALVAGE_MAX_DECLINED_FRACTION * population.subjects.len() as f64 {
+    if !salvages_declined(declined.len(), population.subjects.len()) {
         return AnalyticCovAssembly::Unavailable;
     }
     AnalyticCovAssembly::Partial {
@@ -2712,17 +2780,20 @@ pub(crate) fn routed_covariance_method(
 }
 
 /// The count for `fit()`'s pre-fit covariance cost note, at `n` free coordinates: `None` when
-/// no note is due — the step is off, `n ≤ 30`, or the estimator the step will actually run
-/// (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
-/// `fd_r_objective_evals`, itself `None` on overflow (#1803). Before #1803 the note fired under
-/// `covariance_method = s` too, and quoted `n²`.
+/// no note is due — the step is off, `n ≤ 30`, `R` is expected on the analytic assembly for
+/// every subject (`route`, see [`predicted_r_route`]; #2054), or the estimator the step will
+/// actually run (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
+/// `fd_r_objective_evals`, itself `None` on overflow (#1803). On
+/// [`PredictedRRoute::Salvage`] the count is the same `2·n²`, but each evaluation covers only
+/// the declined subjects; [`pre_fit_covariance_cost_note`] says so. Before #1803 the note fired
+/// under `covariance_method = s` too, and quoted `n²`; before #2054 it ignored the route.
 pub(crate) fn pre_fit_covariance_cost(
     n: usize,
     options: &FitOptions,
     has_priors: bool,
-    analytic_r: bool,
+    route: PredictedRRoute,
 ) -> Option<Option<usize>> {
-    if !options.run_covariance_step || n <= 30 || analytic_r {
+    if !options.run_covariance_step || n <= 30 || route == PredictedRRoute::Analytic {
         return None;
     }
     let (routed, _) = routed_covariance_method(n, options, has_priors, false);
@@ -2730,23 +2801,37 @@ pub(crate) fn pre_fit_covariance_cost(
 }
 
 /// The pre-fit cost note for a [`pre_fit_covariance_cost`] result at `n` free coordinates, or
-/// `None` when no note is due. On overflow it still warns, without the (wrapped) number.
+/// `None` when no note is due. On overflow it still warns, without the (wrapped) number. On
+/// [`PredictedRRoute::Salvage`] it names the subject subset the stencil is expected to cover.
+/// Worded as an expectation: a subject the walk predicts in scope can still bail at run time.
 pub(crate) fn pre_fit_covariance_cost_note(
     n: usize,
     cost: Option<Option<usize>>,
+    route: PredictedRRoute,
 ) -> Option<String> {
-    match cost? {
-        Some(n_evals) => Some(format!(
-            "Covariance step: {n} parameters → {n_evals} OFV evaluations \
-             (finite-difference Hessian). This may take several minutes \
-             on complex models."
-        )),
-        None => Some(format!(
-            "Covariance step: {n} parameters → 2n² OFV evaluations \
-             (finite-difference Hessian). Estimate exceeds usize range; \
-             expect this to be very slow."
-        )),
-    }
+    let count = match cost? {
+        Some(n_evals) => n_evals.to_string(),
+        None => "2n²".to_string(),
+    };
+    let scope = match route {
+        PredictedRRoute::Salvage {
+            declined,
+            n_subjects,
+        } => format!(
+            " over {declined} of {n_subjects} subjects (finite-difference Hessian for the \
+             subjects outside the analytic R-matrix; the rest are analytic)"
+        ),
+        PredictedRRoute::Analytic | PredictedRRoute::Stencil => {
+            " (finite-difference Hessian)".to_string()
+        }
+    };
+    let tail = match cost? {
+        Some(_) => "This may take several minutes on complex models.",
+        None => "Estimate exceeds usize range; expect this to be very slow.",
+    };
+    Some(format!(
+        "Covariance step: {n} parameters → {count} OFV evaluations expected{scope}. {tail}"
+    ))
 }
 
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
@@ -3118,11 +3203,11 @@ mod tests {
             ..defaulted.clone()
         };
         assert_eq!(
-            super::pre_fit_covariance_cost(n, &explicit, false, true),
+            super::pre_fit_covariance_cost(n, &explicit, false, super::PredictedRRoute::Analytic),
             None
         );
         assert_eq!(
-            super::pre_fit_covariance_cost(n, &explicit, false, false),
+            super::pre_fit_covariance_cost(n, &explicit, false, super::PredictedRRoute::Stencil),
             Some(Some(20_402))
         );
 
@@ -3662,8 +3747,9 @@ mod tests {
     /// which is what decides if the step runs `R` or the routed `S⁻¹`.
     #[test]
     fn the_pre_fit_cost_note_counts_r_only_when_the_step_builds_r() {
-        let cost =
-            |n, o: &crate::types::FitOptions, p| super::pre_fit_covariance_cost(n, o, p, false);
+        let cost = |n, o: &crate::types::FitOptions, p| {
+            super::pre_fit_covariance_cost(n, o, p, super::PredictedRRoute::Stencil)
+        };
         let opts = |method: CovarianceMethod, set: bool| crate::types::FitOptions {
             run_covariance_step: true,
             covariance_method: method,
@@ -3719,33 +3805,56 @@ mod tests {
         );
     }
 
-    /// #1803: the note's text, pinned whole on both arms so deleting any sentence reddens it,
-    /// and still classified as the `covariance_step` Info it was before the count changed.
+    /// #1803 / #2054: the note's text, pinned whole on every arm so deleting any sentence
+    /// reddens it, and still classified as the `covariance_step` Info it was before the count
+    /// changed. The salvage arm names the declined subset; the stencil arm does not.
     #[test]
     fn the_pre_fit_cost_note_quotes_the_r_count_or_says_it_overflowed() {
         use super::pre_fit_covariance_cost_note as note;
+        use super::PredictedRRoute;
         use crate::types::{classify_warning, WarningCode, WarningSeverity};
-        let counted = note(31, Some(Some(1922))).expect("a note is due");
+        let salvage = PredictedRRoute::Salvage {
+            declined: 2,
+            n_subjects: 20,
+        };
+        let counted = note(31, Some(Some(1922)), PredictedRRoute::Stencil).expect("a note is due");
         assert_eq!(
             counted,
-            "Covariance step: 31 parameters → 1922 OFV evaluations (finite-difference \
+            "Covariance step: 31 parameters → 1922 OFV evaluations expected (finite-difference \
              Hessian). This may take several minutes on complex models."
         );
-        let overflowed = note(31, Some(None)).expect("a note is due");
+        let overflowed = note(31, Some(None), PredictedRRoute::Stencil).expect("a note is due");
         assert_eq!(
             overflowed,
-            "Covariance step: 31 parameters → 2n² OFV evaluations (finite-difference \
+            "Covariance step: 31 parameters → 2n² OFV evaluations expected (finite-difference \
              Hessian). Estimate exceeds usize range; expect this to be very slow."
         );
-        for msg in [&counted, &overflowed] {
+        let salvaged = note(31, Some(Some(1922)), salvage).expect("a note is due");
+        assert_eq!(
+            salvaged,
+            "Covariance step: 31 parameters → 1922 OFV evaluations expected over 2 of 20 \
+             subjects (finite-difference Hessian for the subjects outside the analytic \
+             R-matrix; the rest are analytic). This may take several minutes on complex models."
+        );
+        let salvaged_overflow = note(31, Some(None), salvage).expect("a note is due");
+        assert_eq!(
+            salvaged_overflow,
+            "Covariance step: 31 parameters → 2n² OFV evaluations expected over 2 of 20 \
+             subjects (finite-difference Hessian for the subjects outside the analytic \
+             R-matrix; the rest are analytic). Estimate exceeds usize range; expect this to be \
+             very slow."
+        );
+        for msg in [&counted, &overflowed, &salvaged, &salvaged_overflow] {
             let entry = classify_warning(msg);
             assert_eq!(
                 (entry.severity, entry.category),
                 (WarningSeverity::Info, WarningCode::CovarianceStep),
                 "{msg}"
             );
+            // ferx-r's `ferx_get_warnings()` advice arm matches this exact token.
+            assert!(msg.contains("OFV evaluations"), "{msg}");
         }
-        assert_eq!(note(31, None), None, "no cost, no note");
+        assert_eq!(note(31, None, salvage), None, "no cost, no note");
     }
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
