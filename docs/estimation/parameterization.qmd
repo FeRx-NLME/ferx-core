@@ -97,6 +97,20 @@ EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
 or a hard-rejected start) — scales the θ, since a move of its own size already
 leaves the feasible region. A start the guard rejects is not probed.
 
+When every subject is inside the exact R-matrix's scope (a Gaussian endpoint, no
+`gradient = fd`, the subject's random effects within the
+[analytic widths](foce.qmd#known-fd-fallbacks)), the same
+quadratic is read off exact derivatives at θ₀ instead of the two probes: the
+adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate,
+penalties included. The second difference is then $f''\delta^2$ and the minimizer's
+distance the Newton step $|f'/f''|$, with the same two cuts. That costs one
+R-matrix pass along the candidates — no inner solve at all — where the probes cost
+two population inner solves per candidate, which grew with the number of θ: on a
+1,317-θ covariate network the probes took 68 of an 87 s fit. With no probe there
+is no infeasible probe either, so the "a probe the optimizer could not take" arm
+applies to the probe route only. `[mixture]` models, and any fit with a subject
+outside that scope, take the probes.
+
 The statistic is a ratio of objective differences, so the decision does not change
 when every likelihood contribution is repeated — more subjects, or more
 observations per subject — which multiplies the objective without moving its

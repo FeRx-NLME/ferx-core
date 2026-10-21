@@ -135,6 +135,36 @@ pub(crate) fn subject_adjoint_cov_hessian(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
+    cov_hessian_on(model, subject, template, x, eta_hat, objective, None)
+}
+
+/// [`subject_adjoint_cov_hessian`] restricted to the packed `axes`: the `axes.len()`-square
+/// block `H[axes, axes]`, in `axes` order, at a cost of `axes.len()` directions instead of
+/// `x.len()` — what the #2159 identity-scale pre-flight reads its candidates' curvature from.
+pub(crate) fn subject_adjoint_cov_hessian_on(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<DMatrix<f64>> {
+    if axes.iter().any(|&i| i >= x.len()) {
+        return None;
+    }
+    cov_hessian_on(model, subject, template, x, eta_hat, objective, Some(axes))
+}
+
+fn cov_hessian_on(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: Option<&[usize]>,
+) -> Option<DMatrix<f64>> {
     let mut sc = scope(model, subject, template, x, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
@@ -144,13 +174,21 @@ pub(crate) fn subject_adjoint_cov_hessian(
     // stack: this runs on the fit pool's workers (`FIT_RAYON_STACK_SIZE`), on the caller's
     // thread so every fit-scoped override (`bloq_method`, …) it reads is the fit's.
     let h = match (bucket, exact) {
-        (4, true) => hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective),
-        (8, true) => hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective),
-        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
-        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
-        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
-        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
-        (48, _) => hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
+        (4, true) => {
+            hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective, axes)
+        }
+        (8, true) => {
+            hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective, axes)
+        }
+        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective, axes),
+        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective, axes),
+        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective, axes),
+        (24, _) => {
+            hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective, axes)
+        }
+        (48, _) => {
+            hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective, axes)
+        }
         _ => None,
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
@@ -330,14 +368,15 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     template: &ModelParameters,
     x: &[f64],
     objective: Objective,
+    axes: Option<&[usize]>,
 ) -> Option<DMatrix<f64>> {
     let (model, params) = (sc.model, &sc.params);
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
     #[cfg(feature = "nn")]
-    if let Some(red) =
-        NnReduction::build(model, subject, template, &params.theta).filter(|_| !nn_reduce_off())
+    if let Some(red) = NnReduction::build(model, subject, template, &params.theta)
+        .filter(|_| axes.is_none() && !nn_reduce_off())
     {
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(
@@ -361,10 +400,14 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let pass = |dirs: &[Dir<N>]| {
         pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
     };
-    let (w, eta_x, nodes) = mode_response::<N>(&pass, &x_dirs(n))?;
+    let axes: Vec<usize> = axes.map_or_else(|| (0..n).collect(), <[usize]>::to_vec);
+    let along: Vec<Dir<N>> = axes.iter().map(|&i| Dir::x(i, [0.0; N])).collect();
+    let (w, eta_x, nodes) = mode_response::<N>(&pass, &along)?;
     // Uᵀ∇²Ψ U along u_a = (e_a, η′e_a).
-    let dirs: Vec<Dir<N>> = (0..n)
-        .map(|i| Dir::x(i, std::array::from_fn(|k| eta_x[(k, i)])))
+    let dirs: Vec<Dir<N>> = axes
+        .iter()
+        .enumerate()
+        .map(|(c, &i)| Dir::x(i, std::array::from_fn(|k| eta_x[(k, c)])))
         .collect();
     let (_, hess) = psi_along(&pass, &w, &dirs, pass_width(nodes))?;
     hess.iter().all(|v| v.is_finite()).then_some(hess)

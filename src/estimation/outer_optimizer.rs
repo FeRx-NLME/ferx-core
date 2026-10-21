@@ -485,24 +485,25 @@ fn freeze_flat_thetas(
         )
     };
     let reconverged_ofv = |theta_i: usize, value: f64| reconverged(theta_i, value).0;
+    // The clean −2LL gradient at the start: the flat-θ test below, and the slope of the
+    // #2159 identity-scale rule.
+    let mut grad_eval_idx = 0usize;
+    let grad = population_gradient(
+        &x,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        &bounds,
+        options,
+        &mut grad_eval_idx,
+        OuterTrial::unknown(),
+        declines,
+    );
     let frozen = 'freeze: {
-        let mut grad_eval_idx = 0usize;
-        let grad = population_gradient(
-            &x,
-            n_subj,
-            init_params,
-            model,
-            population,
-            &ehs,
-            &hms,
-            &kappas,
-            &bounds,
-            options,
-            &mut grad_eval_idx,
-            OuterTrial::unknown(),
-            declines,
-        );
-
         // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
         // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
         // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
@@ -624,13 +625,39 @@ fn freeze_flat_thetas(
                 options.max_unconverged_frac,
             )
         };
+        // The slope and curvature of the penalized objective along each candidate, from the
+        // gradient above and the exact R-matrix's candidate block; `None` (and the probes)
+        // when a subject is outside the recorders' scope.
+        let exact = |candidates: &[usize]| {
+            identity_exact_derivatives(
+                model,
+                population,
+                init_params,
+                &params.theta,
+                &x,
+                &grad,
+                (&ehs, &kappas),
+                options,
+                (&nn_reg, &priors),
+                candidates,
+            )
+        };
         identity_theta_scales(
             &params.theta,
             &init_params.theta_lower,
             &init_params.theta_upper,
             held,
             || objective(base_ofv(), &params, &base_stats),
+            |candidates: &[usize]| {
+                #[cfg(test)]
+                if IDENTITY_EXACT_OFF.with(std::cell::Cell::get) {
+                    return None;
+                }
+                exact(candidates)
+            },
             |i, value| {
+                #[cfg(test)]
+                IDENTITY_PROBE_SOLVES.with(|c| c.set(c.get() + 1));
                 let (clean, stats) = reconverged(i, value);
                 objective(clean, &with_theta(i, value), &stats)
             },
@@ -646,6 +673,52 @@ fn freeze_flat_thetas(
             .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
     }
+}
+
+/// The slope and curvature `(∂f/∂x_i, ∂²f/∂x_i²)` of the penalized objective the #2159
+/// pre-flight probes, along each of `candidates`, at the start: `clean_grad` (the clean
+/// −2LL's adjoint gradient there) plus the penalties' gradient, and the exact R-matrix's
+/// candidate block ([`crate::estimation::covariance::analytic_hessian_block`]) plus the
+/// penalties' curvature. `None` when a subject is outside the R-matrix's scope.
+#[allow(clippy::too_many_arguments)]
+fn identity_exact_derivatives(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    theta: &[f64],
+    x: &[f64],
+    clean_grad: &[f64],
+    (ehs, kappas): (&[DVector<f64>], &[Vec<DVector<f64>>]),
+    options: &FitOptions,
+    (nn_reg, priors): (
+        &crate::estimation::nn_reg::NnRegularizer,
+        &crate::estimation::priors::PriorSet,
+    ),
+    candidates: &[usize],
+) -> Option<Vec<(f64, f64)>> {
+    let h = crate::estimation::covariance::analytic_hessian_block(
+        model, population, template, x, ehs, kappas, options, candidates,
+    )?;
+    let mut g = clean_grad.to_vec();
+    nn_reg.penalty_and_gradient(theta, &mut g);
+    priors.penalty_and_gradient(x, &mut g);
+    let mut curvature: Vec<f64> = (0..candidates.len()).map(|c| h[(c, c)]).collect();
+    let mut add_diagonal = |a: usize, b: usize, v: f64| {
+        if a == b {
+            if let Some(c) = candidates.iter().position(|&i| i == a) {
+                curvature[c] += v;
+            }
+        }
+    };
+    nn_reg.add_packed_hessian(theta, &mut add_diagonal);
+    priors.add_hessian(&mut add_diagonal);
+    Some(
+        candidates
+            .iter()
+            .zip(curvature)
+            .map(|(&i, h)| (g.get(i).copied().unwrap_or(f64::NAN), h))
+            .collect(),
+    )
 }
 
 /// An identity-packed θ (negative lower bound) whose initial magnitude is below this
@@ -722,6 +795,7 @@ fn identity_theta_scales(
     theta_upper: &[f64],
     held: impl Fn(usize) -> bool,
     base_ofv: impl FnOnce() -> f64,
+    exact: impl FnOnce(&[usize]) -> Option<Vec<(f64, f64)>>,
     mut probe_ofv: impl FnMut(usize, f64) -> f64,
 ) -> Vec<(usize, f64)> {
     let n = theta.len().min(theta_lower.len()).min(theta_upper.len());
@@ -741,13 +815,30 @@ fn identity_theta_scales(
     if !ofv_is_valid(base) {
         return Vec::new();
     }
+    // The same quadratic from exact derivatives at θ₀, when every subject has them: its
+    // second difference over the probe spacing is `f″·δ²` and its minimizer is the Newton
+    // step `−f′/f″` (#2159 follow-up).
+    let exact = exact(&candidates).filter(|d| {
+        d.len() == candidates.len() && d.iter().all(|(g, h)| g.is_finite() && h.is_finite())
+    });
     let mut scales = Vec::new();
-    for i in candidates {
+    for (c, i) in candidates.into_iter().enumerate() {
         let t = theta[i];
         let magnitude = t.abs();
         let Some(points) = identity_probe_points(t, theta_lower[i], theta_upper[i]) else {
             continue;
         };
+        if let Some(d) = &exact {
+            let (g, h) = d[c];
+            let delta = points[1] - points[0];
+            if !(h * delta * delta > 1e-6 * (1.0 + base.abs())) {
+                continue;
+            }
+            if (g / h).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude {
+                scales.push((i, magnitude));
+            }
+            continue;
+        }
         // Objectives at the three points in ascending order; θ₀ is one of them.
         let mut f = [0.0; 3];
         for (fk, &xk) in f.iter_mut().zip(&points) {
@@ -869,6 +960,8 @@ fn mixture_identity_theta_scales(
         &init_params.theta_upper,
         |i| init_params.theta_fixed.get(i).copied().unwrap_or(false),
         || ofv_at(&params),
+        // The R-matrix recorders do not differentiate the K-fold mixture objective.
+        |_| None,
         |i, value| {
             let mut p = params.clone();
             p.theta[i] = value;
@@ -3511,6 +3604,11 @@ fn tight_per_subject_gradients(
 
 #[cfg(test)]
 thread_local! {
+    /// The #2159 pre-flight's probe re-solves on this thread: one population inner solve
+    /// each, the cost the exact rule exists to remove.
+    pub(crate) static IDENTITY_PROBE_SOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: decide the #2159 identity scales from the probes alone.
+    pub(crate) static IDENTITY_EXACT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

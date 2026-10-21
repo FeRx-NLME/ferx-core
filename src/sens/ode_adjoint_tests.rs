@@ -3242,6 +3242,90 @@ fn the_covariance_width_rule_is_the_dispatchs() {
     assert_eq!(super::hessian::EXACT_ANCHOR_HESSIAN_WIDTH, 8);
 }
 
+/// `subject_adjoint_cov_hessian_on` is the full Hessian's `axes` block, in `axes` order: on a
+/// five-effect subject (bucket 6) under FOCEI, FOCE and Laplace's exact anchor (bucket 8),
+/// with the axes out of order and spanning θ, Ω and σ. Each entry is one lane of the same
+/// sweep on either route, so the block is the full Hessian's to the bit: measured worst 0
+/// on Linux.
+#[test]
+fn cov_hessian_on_axes_is_the_full_hessians_block() {
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    let params = moved_params(&five);
+    let x = pack_params(&params);
+    let axes = [x.len() - 1, 0, 4, 2];
+    let mut worst = 0.0f64;
+    for objective in [
+        Objective::Focei,
+        Objective::Foce,
+        Objective::Agq {
+            n_agq: 1,
+            exact: true,
+        },
+    ] {
+        let interaction = !matches!(objective, Objective::Foce);
+        let eta = ebe_for(&five, &s, &params, 1e-10, interaction);
+        let (full, block) = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    (
+                        subject_adjoint_cov_hessian(
+                            &five,
+                            &s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            objective,
+                        )
+                        .expect("full Hessian served"),
+                        subject_adjoint_cov_hessian_on(
+                            &five,
+                            &s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            objective,
+                            &axes,
+                        )
+                        .expect("block served"),
+                    )
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        });
+        assert_eq!(block.shape(), (axes.len(), axes.len()));
+        for (r, &a) in axes.iter().enumerate() {
+            for (c, &b) in axes.iter().enumerate() {
+                let (got, want) = (block[(r, c)], full[(a, b)]);
+                assert!(got.is_finite(), "{objective:?} [{a},{b}] {got}");
+                worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+            }
+        }
+    }
+    eprintln!("axes block vs full Hessian: worst rel {worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
+    let bad = subject_adjoint_cov_hessian_on(
+        &five,
+        &s,
+        &params,
+        &x,
+        &[0.0; 5],
+        Objective::Focei,
+        &[x.len()],
+    );
+    assert!(bad.is_none(), "an axis past x is refused");
+}
+
 /// The Hessian buckets past the first: a five-effect subject runs FOCEI / FOCE on the
 /// 6-wide bucket and Laplace's exact anchor on its 8-wide one (padded), each against the
 /// reconverged FD of the adjoint gradient.

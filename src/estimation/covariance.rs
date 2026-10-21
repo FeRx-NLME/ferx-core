@@ -1047,6 +1047,77 @@ pub(super) enum AnalyticCovAssembly {
 /// the same matrix by one fewer route.
 const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 
+/// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
+/// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
+/// subject's occasions.
+fn stacked_mode<'a>(
+    model: &CompiledModel,
+    subject: &Subject,
+    eta_hat: &'a DVector<f64>,
+    kappas: Option<&Vec<DVector<f64>>>,
+) -> Option<std::borrow::Cow<'a, [f64]>> {
+    if model.n_kappa == 0 {
+        return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
+    }
+    let kap = kappas?;
+    if kap.len() != crate::stats::stacked_layout::group_count(subject)
+        || kap.iter().any(|k| k.len() != model.n_kappa)
+    {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(
+        eta_hat
+            .iter()
+            .copied()
+            .chain(kap.iter().flat_map(|k| k.iter().copied()))
+            .collect(),
+    ))
+}
+
+/// The exact OFV Hessian's `axes` block, `∂²OFV/∂x_a∂x_b` for `a, b` in `axes` (packed
+/// coordinates, `axes` order), at the modes `eta_hats`/`kappas` — the R-matrix of
+/// [`analytic_cov_assembly`] restricted to a few coordinates, at `axes.len()` directions per
+/// subject instead of `x.len()`. `None` unless every subject is served: the #2159
+/// identity-scale pre-flight reads its candidates' curvature from it, and a partial sum is a
+/// different objective's curvature.
+pub(crate) fn analytic_hessian_block(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<DMatrix<f64>> {
+    if eta_hats.len() != population.subjects.len() || crate::types::GradientMethod::forced_fd(model)
+    {
+        return None;
+    }
+    let objective = cov_objective(options);
+    let per_subject: Vec<Option<DMatrix<f64>>> = population
+        .subjects
+        .par_iter()
+        .zip(eta_hats.par_iter())
+        .enumerate()
+        .map(|(i, (subject, eta_hat))| {
+            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+            crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_on(
+                model, subject, template, x, &b, objective, axes,
+            )
+            .filter(|h| h.iter().all(|v| v.is_finite()))
+        })
+        .collect();
+    rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
+    let k = axes.len();
+    let mut acc = DMatrix::<f64>::zeros(k, k);
+    for h in per_subject {
+        // ×2: the per-subject NLL Hessian to the OFV (see `analytic_cov_assembly`).
+        acc += 2.0 * h?;
+    }
+    Some(acc)
+}
+
 /// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
 /// the OFV convention, for as much of the population as is in scope.
 ///
@@ -1093,23 +1164,7 @@ pub(super) fn analytic_cov_assembly(
         .zip(eta_hats.par_iter())
         .enumerate()
         .map(|(i, (subject, eta_hat))| {
-            let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
-                let kap = kappas.get(i)?;
-                if kap.len() != crate::stats::stacked_layout::group_count(subject)
-                    || kap.iter().any(|k| k.len() != model.n_kappa)
-                {
-                    return None;
-                }
-                std::borrow::Cow::Owned(
-                    eta_hat
-                        .iter()
-                        .copied()
-                        .chain(kap.iter().flat_map(|k| k.iter().copied()))
-                        .collect(),
-                )
-            } else {
-                std::borrow::Cow::Borrowed(eta_hat.as_slice())
-            };
+            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
             // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
             // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
             // subject, and for the default `covariance_method = r` there is no later checkpoint

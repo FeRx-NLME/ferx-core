@@ -9574,6 +9574,7 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
         &upper,
         |i| i == 3,
         || -180.0,
+        |_| None,
         |i, v| {
             probed.push((i, v));
             f(i, v)
@@ -9600,12 +9601,72 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
     }
 }
 
+/// The exact arm makes the probes' decision from `(f′, f″)` at θ₀ and never probes: for a
+/// quadratic the Newton step is the minimizer's distance (9.9 vs 10.1 |θ₀| either side of
+/// the bar), the curvature floor is the probes' second difference `f″·δ²` with δ = ½|θ₀|,
+/// and a non-finite or wrongly sized answer falls back to the probes.
+#[test]
+fn identity_theta_scales_exact_arm() {
+    let never = |_: usize, _: f64| -> f64 { panic!("the exact arm probed") };
+    let decide = |g: f64, h: f64| {
+        identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |c: &[usize]| {
+                assert_eq!(c, [0]);
+                Some(vec![(g, h)])
+            },
+            never,
+        )
+    };
+    // f = w(θ − m)²: f′(θ₀) = 2w(θ₀ − m), f″ = 2w.
+    let w = 1e6;
+    let at = |m: f64| decide(2.0 * w * (1e-3 - m), 2.0 * w);
+    assert_eq!(at(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
+    assert_eq!(at(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
+    assert_eq!(at(1e-3 + 10.1e-3), vec![], "past the bar");
+    // δ = 5e-4, so f″·δ² = f″·2.5e-7 against the floor 1e-6·51 = 5.1e-5: f″ = 204.
+    assert_eq!(decide(0.0, 205.0), vec![(0, 1e-3)], "just above the floor");
+    assert_eq!(decide(0.0, 203.0), vec![], "just below the floor");
+    assert_eq!(
+        decide(0.0, -1e6),
+        vec![],
+        "negative curvature keeps the unit scale"
+    );
+    // Falls back to the probes: a quadratic with its minimizer at θ₀ is scaled.
+    let f = quadratic_probe(&[1e-3], &[1e-3], 1e6, 1.0, 50.0);
+    for (label, answer) in [
+        ("non-finite", Some(vec![(f64::NAN, 1.0)])),
+        ("wrong length", Some(vec![])),
+        ("unavailable", None),
+    ] {
+        let mut probes = 0;
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_: &[usize]| answer.clone(),
+            |i, v| {
+                probes += 1;
+                f(i, v)
+            },
+        );
+        assert_eq!(got, vec![(0, 1e-3)], "{label}");
+        assert_eq!(probes, 2, "{label}");
+    }
+}
+
 /// The decision's edges, on one candidate θ₀ = 1e-3 in `(-1, 1)`.
 #[test]
 fn identity_theta_scales_edges() {
     let decide = |minimizer: f64| {
         let f = quadratic_probe(&[1e-3], &[minimizer], 1e6, 1.0, 50.0);
-        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, f)
+        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, |_| None, f)
     };
     // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
     assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
@@ -9619,6 +9680,7 @@ fn identity_theta_scales_edges() {
             &[1.0],
             |_| false,
             || 50.0,
+            |_| None,
             |_, v| if v < 1e-3 { f_minus } else { f_plus },
         )
     };
@@ -9640,6 +9702,7 @@ fn identity_theta_scales_edges() {
         &[1.01e-3],
         |_| false,
         || 50.0,
+        |_| None,
         |_, v| {
             probed.push(v);
             f64::NAN
@@ -9698,6 +9761,7 @@ fn identity_theta_scales_handles_one_sided_boxes() {
             &[hi],
             |_| false,
             || 50.0,
+            |_| None,
             |i, v| {
                 probed.push(v);
                 f(i, v)
@@ -9746,6 +9810,7 @@ fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
             &[5.0],
             |_| false,
             || -1000.0,
+            |_| None,
             |i, v| {
                 let n_unconverged = if v > 1e-3 { unconverged_at_upper } else { 0 };
                 let s = InnerLoopStats {
@@ -9774,11 +9839,20 @@ fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start
         &[1.0, 1.0],
         |_| false,
         || panic!("no candidate, so no base"),
+        |_| None,
         no_probe,
     );
     assert_eq!(none, vec![]);
     for base in [2e20, f64::NAN] {
-        let got = identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || base, no_probe);
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || base,
+            |_| None,
+            no_probe,
+        );
         assert_eq!(got, vec![], "base {base}");
     }
 }
@@ -9803,7 +9877,7 @@ fn identity_theta_scales_is_invariant_to_replicating_likelihood_contributions() 
         let volume = quadratic_probe(&theta, &minimizers, 3e11, k, base);
         let slope = quadratic_probe(&theta, &minimizers, 13.8, k, base);
         let f = |i: usize, v: f64| if i == 0 { volume(i, v) } else { slope(i, v) };
-        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, f);
+        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, |_| None, f);
         assert_eq!(got, vec![(0, 1e-5)], "k = {k}");
     }
 }
@@ -9887,6 +9961,219 @@ fn preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope() {
         vec![],
         "a near-zero slope keeps scale 1"
     );
+}
+
+/// The pre-flight reads the #2159 decision off exact derivatives — the adjoint gradient
+/// and the R-matrix's candidate block — and runs no probe re-solve when every subject is
+/// served; the probes, switched on alone, reach the same decisions on both of the issue's
+/// fixtures. The count is the regression guard: two population inner solves per candidate
+/// made the pre-flight grow with the θ count (a 1317-θ network spent 78% of its fit there).
+#[test]
+fn preflight_decides_identity_scales_from_exact_derivatives_without_probe_solves() {
+    use crate::estimation::outer_optimizer::{IDENTITY_EXACT_OFF, IDENTITY_PROBE_SOLVES};
+    use crate::parser::model_parser::{parse_model_file, parse_model_string};
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let preflight = |model: &CompiledModel, pop: &Population, exact_off: bool| {
+        IDENTITY_EXACT_OFF.with(|c| c.set(exact_off));
+        IDENTITY_PROBE_SOLVES.with(|c| c.set(0));
+        let scales = freeze_flat_thetas(
+            model,
+            pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+        )
+        .identity_scales;
+        IDENTITY_EXACT_OFF.with(|c| c.set(false));
+        (scales, IDENTITY_PROBE_SOLVES.with(std::cell::Cell::get))
+    };
+
+    let warfarin = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let warfarin_pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let mut cov = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    for i in [5, 6] {
+        cov.default_params.theta[i] = 0.001;
+        cov.default_params.theta_lower[i] = -5.0;
+    }
+    let cov_pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    for (label, model, pop, want, candidates) in [
+        (
+            "warfarin TVV_S",
+            &warfarin,
+            &warfarin_pop,
+            vec![(1, 1e-5)],
+            1,
+        ),
+        ("two_cpt_oral_cov slopes", &cov, &cov_pop, vec![], 2),
+    ] {
+        let (exact, exact_solves) = preflight(model, pop, false);
+        let (probed, probe_solves) = preflight(model, pop, true);
+        assert_eq!(exact, want, "{label}: exact rule");
+        assert_eq!(probed, want, "{label}: probes");
+        assert_eq!(exact_solves, 0, "{label}: the exact rule re-solved");
+        assert_eq!(
+            probe_solves,
+            2 * candidates,
+            "{label}: two probes per candidate"
+        );
+    }
+}
+
+/// The exact rule's inputs against the objective the probes evaluate: along each
+/// candidate, `identity_exact_derivatives`' slope and curvature match a Richardson central
+/// difference of the penalized objective with the EBEs re-solved (tight, warm from the
+/// start's modes) at every point. On the issue's warfarin volume, and on
+/// `two_cpt_oral_cov` with one exponent under a tight prior (the penalties' gradient and
+/// curvature both enter) and one without.
+#[test]
+fn identity_exact_derivatives_match_fd_of_the_probed_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let cov_src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx")
+        .expect("example reads")
+        .replace(
+            "theta THETA_WT(0.6, 0.01, 5.0)",
+            "theta THETA_WT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+        )
+        .replace(
+            "theta THETA_CRCL(0.3, 0.01, 5.0)",
+            "theta THETA_CRCL(0.001, -5.0, 5.0)",
+        );
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let mut worst = (0.0f64, 0.0f64);
+    // The FD step per fixture: small against the volume's own size (2% of 1e-5), and for
+    // the O(1) exponents large enough that the second difference (f″·h² ≈ 4e-5 for
+    // THETA_CRCL) clears the inner solve's 1e-10 tolerance by orders of magnitude.
+    for (label, src, data, candidates, h) in [
+        (
+            "warfarin TVV_S",
+            NEAR_ZERO_V_WARFARIN.to_string(),
+            "data/warfarin.csv",
+            vec![1],
+            2e-7,
+        ),
+        (
+            "two_cpt_oral_cov, prior on THETA_WT",
+            cov_src,
+            "data/two_cpt_oral_cov.csv",
+            vec![5, 6],
+            1e-3,
+        ),
+    ] {
+        let model = parse_model_string(&src).expect("model parses");
+        let pop = read_nonmem_csv(Path::new(data), None, None).expect("data loads");
+        let n = pop.subjects.len();
+        let params = model.default_params.clone();
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(&params);
+        let solve = |p: &ModelParameters, from: &[DVector<f64>]| {
+            let mu = compute_mu_k(&model, &p.theta, opts.mu_referencing);
+            run_inner_loop_warm_seeded(
+                &model,
+                &pop,
+                p,
+                opts.inner_maxiter,
+                1e-10,
+                Some(from),
+                Some(&mu),
+                opts.min_obs_for_convergence_check as usize,
+                opts.inner_restarts,
+                InnerHessianSeed::for_options(&opts),
+                &opts,
+            )
+        };
+        let (ehs, hms, _, kappas) = solve(&params, &vec![DVector::zeros(model.n_eta); n]);
+        let grad = population_gradient(
+            &x,
+            n,
+            &params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            &opts,
+            &mut 0,
+            OuterTrial::unknown(),
+            &OuterFdDeclineLog::new(n),
+        );
+        let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+        let priors = build_prior_set(&model, &params);
+        let exact = identity_exact_derivatives(
+            &model,
+            &pop,
+            &params,
+            &params.theta,
+            &x,
+            &grad,
+            (&ehs, &kappas),
+            &opts,
+            (&nn_reg, &priors),
+            &candidates,
+        )
+        .expect("every subject is served");
+        let f = |i: usize, v: f64| {
+            let mut p = params.clone();
+            p.theta[i] = v;
+            let (e, h, _, k) = solve(&p, &ehs);
+            2.0 * pop_nll_opts(&model, &pop, &p, &e, &h, &k, &opts)
+                + identity_probe_penalty(&p, &nn_reg, &priors)
+        };
+        for (c, &i) in candidates.iter().enumerate() {
+            let t = params.theta[i];
+            let f0 = f(i, t);
+            let diffs = |h: f64| {
+                let (fp, fm) = (f(i, t + h), f(i, t - h));
+                ((fp - fm) / (2.0 * h), (fp - 2.0 * f0 + fm) / (h * h))
+            };
+            let ((g1, c1), (g2, c2)) = (diffs(h), diffs(2.0 * h));
+            let (g_fd, c_fd) = ((4.0 * g1 - g2) / 3.0, (4.0 * c1 - c2) / 3.0);
+            let (g, curv) = exact[c];
+            assert!(
+                [g, curv, g_fd, c_fd].iter().all(|v| v.is_finite()),
+                "{label} θ{i}: {g} {curv} {g_fd} {c_fd}"
+            );
+            let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+            let (eg, ec) = (rel(g, g_fd), rel(curv, c_fd));
+            eprintln!(
+                "{label} θ{i}: f′ {g:.8e} vs FD {g_fd:.8e} ({eg:.2e}); \
+                 f″ {curv:.8e} vs FD {c_fd:.8e} ({ec:.2e})"
+            );
+            worst = (worst.0.max(eg), worst.1.max(ec));
+        }
+    }
+    eprintln!(
+        "worst relative error: slope {:.2e}, curvature {:.2e}",
+        worst.0, worst.1
+    );
+    // Measured worst on Linux: slope 9.2e-7 and curvature 5.8e-7 on TVV_S, curvature 2.8e-6
+    // on THETA_CRCL (the FD's own truncation and solve noise; the exact side has neither);
+    // ~10× headroom. THETA_WT's curvature is the prior's 2/sd² = 1.39e8 to 2e-12, so a
+    // dropped penalty Hessian misses by ~100%.
+    assert!(worst.0 < 1e-5 && worst.1 < 3e-5, "{worst:?}");
 }
 
 /// The scale reaches the optimizer (#2159): `optimize_nlopt_once` on the warfarin
