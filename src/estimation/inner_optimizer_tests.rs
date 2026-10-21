@@ -4863,8 +4863,10 @@ fn lbfgs_cold_multi_start_keeps_the_far_seed() {
 /// quadratic form `g₁ᵀH₁g₁` is tiny; the computed one comes out negative. Found by a
 /// float-for-float search of the update; the premise is asserted below rather than assumed.
 /// The reset direction `−diag(p)·g₁` is ~2e8 prior SDs long, so its first trial must sit on
-/// the runaway radius. Mutation: deleting the reset's `cap_curvature_free_step` call
-/// reddens the bound. (L-BFGS's non-descent fallback is bounded the same way; the same
+/// the runaway radius, and so must the step after it: the reset arm skips the BFGS update,
+/// so the third iteration's direction comes from the same unshaped metric. Mutations:
+/// deleting the reset's `cap_curvature_free_step` call reddens the first bound; dropping
+/// `h_unshaped` (capping only the first iterate) reddens the second. (L-BFGS's non-descent fallback is bounded the same way; the same
 /// search over its two-loop recursion found no such fixture.)
 #[test]
 fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
@@ -4875,14 +4877,11 @@ fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
     let r2 = RUNAWAY_EBE_MAHA_PER_ETA * 2.0;
     let never = |_: &[f64]| false;
     let trials: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
-    // Any move off the start is an accepted decrease; after that nothing is.
+    // Steep enough that the first step and the reset step both pass Armijo, so the solve
+    // reaches a third iteration from the still-unshaped reset metric.
     let obj = |x: &[f64]| {
         trials.borrow_mut().push(x.to_vec());
-        if x == [0.0, 0.0] {
-            1.0
-        } else {
-            0.0
-        }
+        -1e9 * (x[0] * x[0] + x[1] * x[1]).sqrt()
     };
     let grad = |x: &[f64]| {
         if x == [0.0, 0.0] {
@@ -4897,7 +4896,7 @@ fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
         &grad,
         &mut x,
         2,
-        2,
+        3,
         1e-8,
         Some(&p),
         None,
@@ -4941,6 +4940,18 @@ fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
         (step[0] / step[1] - sd[0] / sd[1]).abs() < 1e-9 * (sd[0] / sd[1]).abs(),
         "the reset step {step:?} must keep −diag(p)·g₁'s direction {sd:?}"
     );
+    // The reset step is accepted with no BFGS update (the reset arm skips it), so the third
+    // iteration's `−h_inv·g₁` is the same curvature-free direction and must be bounded too.
+    assert!(
+        t.len() >= 4,
+        "fixture premise: the reset step is accepted and a third iteration runs"
+    );
+    let next = [t[3][0] - t[2][0], t[3][1] - t[2][1]];
+    let m: f64 = next.iter().zip(&p).map(|(si, pi)| si * si / pi).sum();
+    assert!(
+        m.is_finite() && m <= r2 * (1.0 + 1e-9),
+        "the step after the reset, {next:?}, is {m:.3e} in the prior metric, radius² {r2}"
+    );
 }
 
 /// The identity-metric twin of the test above: the IOV inner solve passes `precond = None`,
@@ -4949,7 +4960,9 @@ fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
 /// `g₀ = (−2⁻¹⁰, 2⁻¹⁰)` (‖g₀‖ < 1, so the first step is the unscaled `−g₀`) and
 /// `g₁ = (2²³, 2²³)` everywhere else, for which the computed `H₁·g₁` gives `dᵀg = 0`. The
 /// reset's first trial must then be exactly one unit along `−g₁/‖g₁‖`, not the
-/// 1.2e7-long `−g₁`. Mutation: dropping the `None` arm's scaling reddens it.
+/// 1.2e7-long `−g₁`, and so must the next iteration's, which steps from the same reset
+/// metric. Mutations: dropping the reset's scaling reddens the first; scaling only the
+/// reset's direction, not `h_inv` (#2099 review 2), reddens the second.
 #[test]
 fn dense_bfgs_identity_steepest_descent_reset_takes_a_scaled_first_trial() {
     use std::cell::RefCell;
@@ -4957,14 +4970,11 @@ fn dense_bfgs_identity_steepest_descent_reset_takes_a_scaled_first_trial() {
     let g1 = [8388608.0, 8388608.0];
     let never = |_: &[f64]| false;
     let trials: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
-    // Any move off the start is an accepted decrease; after that nothing is.
+    // Steep enough that the first step and the reset step both pass Armijo, so the solve
+    // reaches a third iteration from the still-unshaped reset metric.
     let obj = |x: &[f64]| {
         trials.borrow_mut().push(x.to_vec());
-        if x == [0.0, 0.0] {
-            1.0
-        } else {
-            0.0
-        }
+        -1e9 * (x[0] * x[0] + x[1] * x[1]).sqrt()
     };
     let grad = |x: &[f64]| {
         if x == [0.0, 0.0] {
@@ -4975,7 +4985,7 @@ fn dense_bfgs_identity_steepest_descent_reset_takes_a_scaled_first_trial() {
     };
     let mut x = vec![0.0, 0.0];
     dense_bfgs_core(
-        &obj, &grad, &mut x, 2, 2, 1e-8, None, None, None, &never, false,
+        &obj, &grad, &mut x, 2, 3, 1e-8, None, None, None, &never, false,
     );
     let t = trials.borrow();
     let x1 = [-g0[0], -g0[1]];
@@ -5000,6 +5010,19 @@ fn dense_bfgs_identity_steepest_descent_reset_takes_a_scaled_first_trial() {
     assert!(
         (reset[0] - want[0]).abs() < 1e-12 && (reset[1] - want[1]).abs() < 1e-12,
         "the reset's first trial {reset:?} must be x₁ − g₁/‖g₁‖ = {want:?}"
+    );
+    // The reset step is accepted with no BFGS update, so the third iteration steps from the
+    // same reset metric: the scaling must live in `h_inv`, not only in the reset's direction.
+    assert!(
+        t.len() >= 4,
+        "fixture premise: the reset step is accepted and a third iteration runs"
+    );
+    let x2 = &t[2];
+    let want = [x2[0] - g1[0] / gn, x2[1] - g1[1] / gn];
+    assert!(
+        (t[3][0] - want[0]).abs() < 1e-12 && (t[3][1] - want[1]).abs() < 1e-12,
+        "the trial after the reset {:?} must be x₂ − g₁/‖g₁‖ = {want:?}",
+        t[3]
     );
 }
 
