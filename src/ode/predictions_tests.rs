@@ -15523,3 +15523,99 @@ fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
         );
     }
 }
+
+/// Every reader of the raw ODE observable in this file is registered with the code that
+/// puts its output into observation units (`[scaling]` / LTBS / FREM). #2129 was three
+/// unregistered readers returning the amount, with a replay that shared the defect, and
+/// #2156 a fourth step (FREM) the adaptive rows still skipped. The adaptive entries name
+/// the function whose parity test pins them against the full `pk` sink.
+///
+/// Regression caught: a new top-level function calling `read_observable` whose output
+/// nobody converts. Registering it here forces that decision to be made on purpose.
+/// (From the PR #2142 review, proposal 1.)
+#[test]
+fn every_raw_observable_reader_names_who_converts_it() {
+    const CONVERTED_BY: &[(&str, &str)] = &[
+        (
+            "record_observations",
+            "the pk sink (compute_predictions_with_tv)",
+        ),
+        (
+            "ode_predictions_event_driven",
+            "the pk sink (compute_predictions_with_tv)",
+        ),
+        (
+            "ode_predictions_adaptive_impl",
+            "rows: api::adaptive::adaptive_rows_to_model_scale; signals: \
+             AdaptiveMonitor::scale_readout",
+        ),
+        (
+            "adaptive_frozen_replay_tv",
+            "none: the verifier compares raw readouts by design",
+        ),
+        (
+            "adaptive_window_signal_aucs",
+            "api::adaptive::adaptive_window_aucs_to_model_scale",
+        ),
+    ];
+    let readers = raw_observable_readers(include_str!("predictions.rs"));
+    let mut found: Vec<&str> = readers.iter().map(String::as_str).collect();
+    let mut listed: Vec<&str> = CONVERTED_BY.iter().map(|(n, _)| *n).collect();
+    found.sort_unstable();
+    listed.sort_unstable();
+    assert_eq!(
+        found, listed,
+        "the raw `read_observable` readers changed: register each new one in CONVERTED_BY \
+         with the code that applies `[scaling]` / LTBS / FREM to its output (#2129, #2156), \
+         and drop any entry that no longer reads it"
+    );
+}
+
+/// The top-level (column-0) functions of `src` whose bodies call `read_observable(`.
+/// A nested helper `fn` counts as part of its enclosing engine; comment lines are
+/// skipped.
+fn raw_observable_readers(src: &str) -> Vec<String> {
+    let mut current: Option<String> = None;
+    let mut readers: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        if let Some(pos) = line.find("fn ") {
+            let is_def = !line.starts_with(char::is_whitespace)
+                && line[..pos]
+                    .split_whitespace()
+                    .all(|w| matches!(w, "pub" | "pub(crate)" | "const" | "unsafe"));
+            if is_def {
+                current = Some(
+                    line[pos + 3..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect(),
+                );
+                // No `continue`: a one-line `fn f() { read_observable(…) }` reads it too.
+            }
+        }
+        if code.contains("read_observable(") {
+            let name = current.clone().expect("a call sits inside a function");
+            if name != "read_observable" && !readers.contains(&name) {
+                readers.push(name);
+            }
+        }
+    }
+    readers
+}
+
+/// The scanner itself: a call inside a nested helper is attributed to the enclosing
+/// engine, a comment naming the call is not a reader, and every top-level reader is
+/// found. Without this, a scanner that returned the registered list for any input would
+/// pass the guard above.
+#[test]
+fn raw_observable_reader_scan_attributes_calls_to_their_engine() {
+    let src = "fn read_observable(x: f64) -> f64 { x }\n\
+               pub(crate) fn engine() {\n    fn inner() { read_observable(1.0); }\n}\n\
+               fn quiet() {\n    // read_observable(2.0) in a comment\n}\n\
+               pub fn other() { let _ = read_observable(3.0); }\n";
+    assert_eq!(raw_observable_readers(src), vec!["engine", "other"]);
+}

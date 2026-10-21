@@ -483,6 +483,11 @@ mod adaptive_sim_tests;
 #[path = "tests/adaptive_obs_scale_tests.rs"]
 mod adaptive_obs_scale_tests;
 
+// #2156: FREM covariate rows on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_frem_tests.rs"]
+mod adaptive_frem_tests;
+
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]
