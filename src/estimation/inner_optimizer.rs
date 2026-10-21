@@ -4717,6 +4717,12 @@ fn dense_bfgs_core(
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
     let mut first_step = true;
+    // `h_inv` is still a curvature-free metric — the initial one, or a steepest-descent
+    // reset — with no BFGS update since (#2099 review). Every direction taken from it is
+    // bounded like the first step, not only the first: an accepted step that fails the
+    // `sᵀy` test leaves the metric as it was, and the next `−h_inv·g` would otherwise be
+    // the full-gradient step again.
+    let mut h_unshaped = true;
     // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): gated on
     // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so
     // smooth analytical/FD fits stay bit-identical and a non-stationary mid-descent iterate
@@ -4757,9 +4763,9 @@ fn dense_bfgs_core(
         }
 
         // Scale the initial metric so the first step is O(1) not O(gnorm). Only for the
-        // identity-H0 path (`precond.is_none()`); a preconditioned first step is bounded
-        // below instead ([`cap_curvature_free_step`]), which keeps `diag(Ω)`'s per-axis
-        // shape. An accepted analytic seed already carries the scale, so it skips both; a
+        // identity-H0 path (`precond.is_none()`); a preconditioned step is bounded below
+        // instead ([`cap_curvature_free_step`], while `h_unshaped`), which keeps `diag(Ω)`'s
+        // per-axis shape. An accepted analytic seed already carries the scale, so it skips both; a
         // *rejected* one (`seed_inv.is_none()`) takes the curvature-free path.
         //
         // Decided once, at the first iterate (#2093): a later `gnorm > 1` must not rescale an
@@ -4778,7 +4784,7 @@ fn dense_bfgs_core(
         g_vec.as_mut_slice().copy_from_slice(&g);
         d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
         d.copy_from_slice(d_vec.as_slice());
-        if curvature_free_step {
+        if seed_inv.is_none() && h_unshaped {
             cap_curvature_free_step(&mut d, precond);
         }
 
@@ -4788,9 +4794,17 @@ fn dense_bfgs_core(
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
+            // A curvature-free metric like the first one, bounded the same way (#2099): the
+            // 1/‖g‖ scaling on the identity (the IOV inner solve passes `precond = None`),
+            // carried in `h_inv` so it holds until a BFGS update replaces it, as the first
+            // step's does; the runaway cap under a preconditioner, re-applied while
+            // `h_unshaped`.
+            if seed_inv.is_none() && precond.is_none() {
+                h_inv *= h0_step_scale(gnorm);
+            }
+            h_unshaped = true;
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
-            // A curvature-free step like the first one: bounded the same way (#2099).
             if seed_inv.is_none() {
                 cap_curvature_free_step(&mut d, precond);
             }
@@ -4885,6 +4899,7 @@ fn dense_bfgs_core(
             let y_st = rho * &y_vec * s_vec.transpose();
             let s_st = rho * &s_vec * s_vec.transpose();
             h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+            h_unshaped = false;
         }
 
         g = g_new;
