@@ -839,7 +839,12 @@ pub(crate) fn read_nonmem_csv_routed_from(
     let cols_ref: Option<Vec<&str>> = cols
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-    let exact = exact_case_extras(covariate_columns, extra_columns, filter);
+    let exact = exact_case_extras(
+        // The declared branch ignores the caller's list, so it exempts nothing there.
+        covariate_columns.filter(|_| decls.is_none()),
+        extra_columns,
+        filter,
+    );
     read_nonmem_csv_impl(
         input,
         cols_ref.as_deref(),
@@ -858,7 +863,9 @@ pub(crate) fn read_nonmem_csv_routed_from(
 /// spelling) and no `[data_selection]` filter references (case-insensitively; a
 /// filter lowercases its column names). On the `[covariates]` path the extras are
 /// the referenced-but-*undeclared* columns, so no declared name is ever among
-/// them and a declaration needs no exemption here.
+/// them and a declaration needs no exemption here; the caller passes `None` for
+/// `covariate_columns` on that path, since declarations take precedence over a
+/// fallback list and that list is never read there.
 ///
 /// The one rule across all three read paths: a column the *model* references
 /// binds only the header it spells exactly, so a case-differing reference stays

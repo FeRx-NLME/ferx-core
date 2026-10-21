@@ -285,7 +285,8 @@ fn explicit_list_does_not_bind_a_case_differing_reference() {
 /// T9 — declared path: a model declaring `WT` and reading `occ` against an `OCC`
 /// header leaves `OCC` unread (before #1946 it bound as `["WT", "OCC"]`). The
 /// declared `WT` still binds. Mutation: drop the `exact_only` gate in
-/// `cov_indices`, or skip `exact_case_extras` when `decls` is `Some`.
+/// `cov_indices`, skip `exact_case_extras` when `decls` is `Some`, or let an
+/// (ignored) fallback list exempt extras on the declared path.
 #[test]
 fn declared_path_does_not_bind_a_case_differing_reference() {
     let csv = iov_wt_csv();
@@ -294,6 +295,16 @@ fn declared_path_does_not_bind_a_case_differing_reference() {
     let pop = read(&parsed, csv.path().to_str().unwrap(), None);
     assert_eq!(pop.covariate_names, vec!["WT".to_string()]);
     assert_eq!(check_covariates(&parsed.model, &pop).len(), 1);
+
+    // A fallback list naming `occ` is ignored when declarations are present, so it
+    // must not exempt the extra either (review of #1946).
+    let with_list = read(&parsed, csv.path().to_str().unwrap(), Some(&["occ"]));
+    assert_eq!(
+        with_list.covariate_names,
+        vec!["WT".to_string()],
+        "fallback list"
+    );
+    assert_eq!(check_covariates(&parsed.model, &with_list).len(), 1);
 }
 
 /// T10 — the fallback the rule keeps: a model extra a `[data_selection]` filter
