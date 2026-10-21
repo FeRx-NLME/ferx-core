@@ -210,7 +210,13 @@ pub(crate) fn three_cpt_iv_peripherals(
     q3: f64,
     v3: f64,
 ) -> [f64; 2] {
-    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
+    if tau < 0.0
+        || v2 <= 0.0
+        || v3 <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl, v1)
+        || q2 < 0.0
+        || q3 < 0.0
+    {
         return [0.0; 2];
     }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
@@ -339,10 +345,9 @@ pub(crate) fn three_cpt_oral_peripherals(
         "three_cpt_oral_peripherals called with an infusion dose — route infusions through three_cpt_iv_peripherals"
     );
     if tau < 0.0
-        || v1 <= 0.0
         || v2 <= 0.0
         || v3 <= 0.0
-        || cl <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl, v1)
         || q2 < 0.0
         || q3 < 0.0
         || ka <= 0.0

@@ -321,7 +321,12 @@ fn a_nan_clearance_warns_with_its_own_outcome() {
     );
     assert!(msg.contains("first at TIME 1 in subject S1"), "{msg}");
     assert!(msg.contains("On 1 of them CL or V is NaN"), "{msg}");
-    assert!(msg.contains("repelled rather than scored"), "{msg}");
+    // The rule, not a per-record outcome: which of the two a record got depends on the
+    // timeline (a pre-dose `NaN` is served 0).
+    assert!(
+        msg.contains("predicted NaN once a dose has arrived") && msg.contains("0 before any dose"),
+        "{msg}"
+    );
     assert!(
         !msg.contains("serve a concentration of 0"),
         "a NaN record is not served 0: {msg}"
@@ -360,5 +365,59 @@ fn a_nan_clearance_warns_with_its_own_outcome() {
             details["n_nan_records"].as_u64()
         ),
         (Some(4), Some(1))
+    );
+}
+
+/// `$PK` runs at an EVID=3/4 row too, so a reset row whose own covariates (here AGE 200 on
+/// the TIME 2.5 reset, every other record at 40) make CL negative is reported — and on an
+/// IOV model a reset row reads its own occasion's κ (the TIME 2.5 reset labelled occasion
+/// 2, at κ = −2, between occasion-1 observations; occasion 2 must also carry an observation,
+/// TIME 3, or the stacked layout has no κ for it — the same map `predict_iov` reads).
+#[test]
+fn a_reset_record_is_scanned_under_its_own_snapshot() {
+    let model = parse(LINEAR_AGE_SRC);
+    let mut s1 = subject("S1", [40.0; 4]);
+    s1.reset_times = vec![2.5];
+    s1.reset_covariates = vec![age(200.0)];
+    let (msg, entry) = degenerate_cl_v_warning(
+        &model,
+        &population(vec![s1]),
+        &model.default_params.theta,
+        &etas(1, 0.0),
+        &[],
+        None,
+    )
+    .expect("a negative CL on the reset row must warn");
+    assert!(
+        msg.contains("on 1 record(s)") && msg.contains("first at TIME 2.5"),
+        "{msg}"
+    );
+    assert_eq!(
+        entry.details.unwrap()["subjects"][0]["times"],
+        serde_json::json!([2.5])
+    );
+
+    let iov = parse(IOV_SRC);
+    let mut s2 = subject("S2", [40.0; 4]);
+    s2.reset_times = vec![2.5];
+    s2.reset_covariates = vec![age(40.0)];
+    s2.reset_occasions = vec![2];
+    let kappas = vec![vec![
+        DVector::from_element(1, 0.0),
+        DVector::from_element(1, -2.0),
+    ]];
+    let (msg, _) = degenerate_cl_v_warning(
+        &iov,
+        &population(vec![s2]),
+        &iov.default_params.theta,
+        &etas(1, 0.0),
+        &kappas,
+        None,
+    )
+    .expect("an occasion-2 reset row with CL = -5 must warn");
+    // The TIME 3 observation is in occasion 2 too; the reset row is the earlier of the two.
+    assert!(
+        msg.contains("on 2 record(s)") && msg.contains("first at TIME 2.5"),
+        "{msg}"
     );
 }

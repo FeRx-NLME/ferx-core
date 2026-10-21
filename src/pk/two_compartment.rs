@@ -359,7 +359,7 @@ pub(crate) fn two_cpt_iv_peripheral(
     q: f64,
     v2: f64,
 ) -> f64 {
-    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
+    if tau < 0.0 || v2 <= 0.0 || crate::sens::propagate::cl_or_v_degenerate(cl, v1) || q < 0.0 {
         return 0.0;
     }
     let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
@@ -463,7 +463,12 @@ pub(crate) fn two_cpt_oral_peripheral(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 {
+    if tau < 0.0
+        || v2 <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl, v1)
+        || q < 0.0
+        || ka <= 0.0
+    {
         return 0.0;
     }
     let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);

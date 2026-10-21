@@ -2260,8 +2260,10 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 ///   dose, the event-driven walk empties every compartment over the interval the record
 ///   governs), so the fit completes and scores the subject against a confident, finite
 ///   prediction;
-/// - **`NaN`** (an invalid covariate expression, say) — served `NaN`, so the subject's
-///   likelihood is repelled through the sentinel rather than scored.
+/// - **`NaN`** (an invalid covariate expression, say) — served `NaN` once a dose has
+///   arrived, so the subject's likelihood is repelled through the sentinel, and 0 before
+///   any dose. Which of the two a record got depends on the timeline, so the message states
+///   the rule rather than claiming an outcome per record.
 ///
 /// NONMEM would not have made either prediction: PREDPP reports a non-positive PK parameter
 /// as a PRED error. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
@@ -2323,8 +2325,8 @@ pub(crate) fn degenerate_cl_v_warning(
     }
     if n_nan > 0 {
         msg.push_str(&format!(
-            " On {n_nan} of them CL or V is NaN: the prediction there is NaN, so that \
-             subject's likelihood was repelled rather than scored."
+            " On {n_nan} of them CL or V is NaN: an observation there is predicted NaN once a \
+             dose has arrived, which repels that subject's likelihood, and 0 before any dose."
         ));
     }
     msg.push_str(

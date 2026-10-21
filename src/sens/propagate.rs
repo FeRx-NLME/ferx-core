@@ -48,6 +48,45 @@ pub(crate) fn cl_or_v_degenerate(cl: f64, v: f64) -> bool {
     bad(cl) || bad(v)
 }
 
+/// Whether `pk_model` is one of the six 1-/2-/3-cpt IV / oral closed forms the #2104
+/// convention governs. The transit and inverse-Gaussian closed forms are deliberately
+/// outside it: their kernels and their IOV / time-varying absorption walk
+/// (`pk::absorption_walk`) share a convention of their own, which a separate fix owns, so
+/// applying this one to their static superposition alone would recreate the very
+/// engine-dependent prediction #2104 removes for the six.
+#[inline]
+pub(crate) fn cl_v_rule_governs(pk_model: PkModel) -> bool {
+    matches!(
+        pk_model,
+        PkModel::OneCptIv
+            | PkModel::OneCptOral
+            | PkModel::TwoCptIv
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIv
+            | PkModel::ThreeCptOral
+    )
+}
+
+/// The superposition half of the #2104 convention, for one arrived dose on a model
+/// [`cl_v_rule_governs`]: `Some(0.0)` when `CL` or `V` is degenerate
+/// ([`cl_or_v_degenerate`] — the dose is dropped), `Some(NaN)` when neither is degenerate
+/// but one is `NaN` (stated here rather than left to each closed form's arithmetic, which
+/// at the start of an infusion gave `NaN` on the 1-cpt form and 0 on the 2-cpt one), and
+/// `None` when the closed form should run. The value path (`pk::single_dose_concentration`
+/// / `single_dose_states`) and the adjoint's static recording (`provider::superpose_doses`)
+/// both read it; the event-driven walk's readout ([`observe_central_g`]) applies the same
+/// outcomes at an observation.
+#[inline]
+pub(crate) fn superposed_dose_override(cl: f64, v: f64) -> Option<f64> {
+    if cl_or_v_degenerate(cl, v) {
+        Some(0.0)
+    } else if cl.is_nan() || v.is_nan() {
+        Some(f64::NAN)
+    } else {
+        None
+    }
+}
+
 /// The walk's half of [`cl_or_v_degenerate`]: when the interval's `CL` or `V` is
 /// degenerate, empty every compartment and return `true`, so the caller skips the
 /// closed-form step. Matches superposition, which drops a dose with such parameters

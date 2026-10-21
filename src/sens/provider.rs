@@ -204,6 +204,17 @@ impl<T: PkNum> SeededPkDuals<T> {
     fn cl_or_v_degenerate(&self) -> bool {
         crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
     }
+
+    /// [`crate::sens::propagate::superposed_dose_override`] on the seeded values, for the
+    /// six IV / oral classes only — `None` for transit / IG, as the value path's
+    /// `cl_v_rule_governs` gate gives (#2104).
+    #[inline]
+    fn dose_override(&self, flags: PkClassFlags) -> Option<f64> {
+        if flags.transit || flags.two_cpt_transit || flags.ig || flags.two_cpt_ig {
+            return None;
+        }
+        crate::sens::propagate::superposed_dose_override(self.cl_d.val(), self.v1_d.val())
+    }
 }
 
 /// The reset segment floor at `t_obs`: the most recent EVID=3/4 reset at or before this
@@ -248,17 +259,13 @@ fn superpose_doses<T: PkNum>(
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
             continue;
         };
-        // A degenerate `CL` or `V` drops the dose: the value path's own early return in
-        // `pk::single_dose_concentration`, on the same predicate, so this recording and
-        // the prediction it differentiates serve the same constant 0 (#2104). Before it a
-        // `CL = +inf` reached the kernels, whose guards test only `≤ 0`, and recorded `NaN`
-        // where the prediction was 0. First in the ladder, so a disposition
-        // `with_disposition` declined to build is never asked for.
-        let c = if d.cl_or_v_degenerate() {
-            T::from_f64(0.0)
-        } else if d.cl_d.val().is_nan() || d.v1_d.val().is_nan() {
-            // The value path's explicit `NaN` for an arrived dose, on the same test.
-            T::from_f64(f64::NAN)
+        // A degenerate `CL` or `V` drops the dose and a `NaN` one makes it `NaN`: the value
+        // path's own override in `pk::single_dose_concentration`, from the same helper, so
+        // this recording and the prediction it differentiates serve the same constant
+        // (#2104). First in the ladder, so a disposition `with_disposition` declined to
+        // build is never asked for.
+        let c = if let Some(v) = d.dose_override(flags) {
+            T::from_f64(v)
         } else if flags.transit {
             one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
         } else if flags.two_cpt_transit {

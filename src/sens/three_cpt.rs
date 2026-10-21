@@ -177,7 +177,11 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
         ..
     } = *d;
 
-    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0
+        || v2.val() <= 0.0
+        || v3.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
+    {
         return T::from_f64(0.0);
     }
 
@@ -239,7 +243,11 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0
+        || v2.val() <= 0.0
+        || v3.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
+    {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -338,10 +346,9 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
     } = *d;
 
     if t.val() < 0.0
-        || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
-        || cl.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
         || ka.val() <= 0.0
     {
         return T::from_f64(0.0);
@@ -419,10 +426,9 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
     } = *d;
 
     if t.val() < 0.0
-        || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
-        || cl.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
         || ii <= 0.0
     {
         return T::from_f64(0.0);
@@ -498,10 +504,9 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
     } = *d;
 
     if t.val() < 0.0
-        || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
-        || cl.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
         || ka.val() <= 0.0
         || ii <= 0.0
     {
@@ -595,10 +600,9 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
     } = *d;
 
     if t.val() < 0.0
-        || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
-        || cl.val() <= 0.0
+        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v1.val())
         || ii <= 0.0
     {
         return T::from_f64(0.0);

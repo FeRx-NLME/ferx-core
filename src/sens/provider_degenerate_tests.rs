@@ -196,3 +196,129 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
         }
     }
 }
+
+/// The degenerate rule lives in the closed forms themselves too, not only in the private
+/// dispatchers, so a caller of the exported kernels sees the same convention as
+/// `predict_concentration` (#2104 review). Every 1-/2-/3-cpt dispatcher × every dose kind ×
+/// every degenerate case returns exactly 0, and on `Dual1` a constant 0 — before, `CL = +inf`
+/// passed the kernels' `≤ 0` guards and came back `NaN` (`exp(−inf · 0)`). The f64 public
+/// entry points and the superposition state helpers (the peripheral forms) are checked too.
+///
+/// Mutation (run): restore any one kernel's `cl.val() <= 0.0` term in place of
+/// `cl_or_v_degenerate` → the `CL=+inf` rows reaching that kernel die.
+#[test]
+fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
+    use crate::sens::{
+        one_cpt::one_cpt_conc_g, three_cpt::three_cpt_conc_g, two_cpt::two_cpt_conc_g,
+    };
+    let mk = |rate: f64, ss: bool, ii: f64| DoseEvent::new(0.0, 500.0, 1, rate, ss, ii);
+    // (dose, oral) — bolus, infusion, oral bolus, and the SS form of each.
+    let doses: [(DoseEvent, bool); 6] = [
+        (mk(0.0, false, 0.0), false),
+        (mk(100.0, false, 0.0), false),
+        (mk(0.0, false, 0.0), true),
+        (mk(0.0, true, 12.0), false),
+        (mk(100.0, true, 12.0), false),
+        (mk(0.0, true, 12.0), true),
+    ];
+    let cases: [(&str, f64, f64); 5] = [
+        ("CL=+inf", f64::INFINITY, 80.0),
+        ("V=+inf", 5.0, f64::INFINITY),
+        ("CL=0", 0.0, 80.0),
+        ("CL=-1", -1.0, 80.0),
+        ("V=-80", 5.0, -80.0),
+    ];
+    let (q, v2, q3, v3, ka, f) = (3.0, 40.0, 2.0, 60.0, 1.2, 1.0);
+    for (dose, oral) in &doses {
+        for (label, cl, v) in cases {
+            for t in [0.0, 1.0, 10.0] {
+                let at = format!(
+                    "{label} rate={} ss={} oral={oral} t={t}",
+                    dose.rate, dose.ss
+                );
+                let c1 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, f, *oral);
+                let c2 = two_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, ka, f, *oral);
+                let c3 = three_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, q3, v3, ka, f, *oral);
+                assert_eq!((c1, c2, c3), (0.0, 0.0, 0.0), "{at}: 1/2/3-cpt kernels");
+                let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
+                let j2 = two_cpt_conc_g::<Dual1<2>>(
+                    dose,
+                    Dual1::constant(t),
+                    d(cl, 0),
+                    d(v, 1),
+                    Dual1::constant(q),
+                    Dual1::constant(v2),
+                    Dual1::constant(ka),
+                    Dual1::constant(f),
+                    *oral,
+                );
+                assert_eq!((j2.value, j2.grad), (0.0, [0.0; 2]), "{at}: 2-cpt jet");
+            }
+        }
+    }
+    // The f64 public wrappers and the state helpers.
+    let bolus = mk(0.0, false, 0.0);
+    let inf = f64::INFINITY;
+    assert_eq!(crate::pk::one_cpt_iv_bolus(&bolus, 0.0, inf, 80.0), 0.0);
+    assert_eq!(
+        crate::pk::one_cpt_predict(&bolus, 0.0, inf, 80.0, None, None),
+        0.0
+    );
+    assert_eq!(
+        crate::pk::two_compartment::two_cpt_iv_peripheral(&bolus, 1.0, inf, 80.0, q, v2),
+        0.0
+    );
+    assert_eq!(
+        crate::pk::two_compartment::two_cpt_oral_peripheral(&bolus, 1.0, inf, 80.0, q, v2, ka, f),
+        0.0
+    );
+    assert_eq!(
+        crate::pk::three_compartment::three_cpt_iv_peripherals(
+            &bolus, 1.0, inf, 80.0, q, v2, q3, v3
+        ),
+        [0.0; 2]
+    );
+    assert_eq!(
+        crate::pk::three_compartment::three_cpt_oral_peripherals(
+            &bolus, 1.0, inf, 80.0, q, v2, q3, v3, ka, f
+        ),
+        [0.0; 2]
+    );
+}
+
+/// The transit / inverse-Gaussian closed forms keep their own convention: a `NaN` `CL` or
+/// `V` on a static subject is still served 0 there, as their kernels and their IOV /
+/// time-varying absorption walk (`WalkDomain::Invalid`) both do — #2104's `NaN` override is
+/// gated to the six IV / oral models, so it cannot make the static and walked subjects of
+/// one transit model disagree. A separate issue owns those models' `NaN` handling.
+///
+/// Mutation (run): drop the `cl_v_rule_governs` gate in `pk::single_dose_concentration` →
+/// every row here dies (`NaN` served).
+#[test]
+fn transit_and_ig_keep_their_own_nan_convention() {
+    let doses = [DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+    for model in [
+        PkModel::OneCptTransit,
+        PkModel::TwoCptTransit,
+        PkModel::OneCptIg,
+        PkModel::TwoCptIg,
+    ] {
+        for (label, idx) in [("CL", PK_IDX_CL), ("V", PK_IDX_V)] {
+            let mut pk = crate::types::PkParams::default();
+            pk.values[PK_IDX_CL] = 5.0;
+            pk.values[PK_IDX_V] = 80.0;
+            pk.values[PK_IDX_Q] = 3.0;
+            pk.values[PK_IDX_V2] = 40.0;
+            pk.values[crate::types::PK_IDX_F] = 1.0;
+            pk.values[crate::types::PK_IDX_N] = 3.0;
+            pk.values[crate::types::PK_IDX_MTT] = 2.0;
+            pk.values[crate::types::PK_IDX_MAT] = 2.0;
+            pk.values[crate::types::PK_IDX_CV2] = 0.3;
+            let live = crate::pk::predict_concentration(model, &doses, 4.0, &pk);
+            assert!(live > 0.0, "{model:?}: fixture is live ({live})");
+            pk.values[idx] = f64::NAN;
+            let c = crate::pk::predict_concentration(model, &doses, 4.0, &pk);
+            assert_eq!(c, 0.0, "{model:?} {label}=NaN keeps its 0");
+        }
+    }
+}
