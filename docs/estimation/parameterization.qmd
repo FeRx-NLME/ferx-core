@@ -69,7 +69,11 @@ the parameterization.
 
 An identity-packed theta keeps its units, and so does its row of the matrices
 the covariance step inverts: writing the theta `k` times larger divides that row
-by `k`. Every other packed coordinate is dimensionless. The covariance step's
+by `k`. The log-packed theta, the log-packed diagonals of the Cholesky factor of
+Ω, log-σ and the Fisher-z residual correlations are dimensionless. An
+off-diagonal entry of the Cholesky factor is packed as-is, and carries the units
+of its random effect when that random effect is additive (`BASE = TVBASE +
+ETA_B`); it is not rescaled. The covariance step's
 eigenvalue floor, `max(1e-10·λ_max, 1e-12)`, is therefore applied after each
 free identity-packed theta's row and column are rescaled so that its diagonal
 entry equals the geometric mean of the other diagonal entries (#2145). The
@@ -77,11 +81,13 @@ inverse is scaled back afterwards, so the standard errors are those of the
 unscaled matrix. Rewriting the theta in other units then changes neither whether
 the step is regularised nor its standard errors. Before #2145, writing the
 warfarin example's `V` `1e5` times larger was enough to clip a positive-definite
-`R` and to fail the `s` estimator. The dimensionless coordinates are not rescaled, so a flat direction
+`R` and to fail the `s` estimator. The other coordinates are not rescaled, so a flat direction
 among them is still floored. When the model has a free identity-packed theta,
 the eigenvalues and the floor in the
-[`covariance_regularized`](../warnings.qmd#codes-covariance) warning describe the
-rescaled matrix.
+[`covariance_regularized`](../warnings.qmd#codes-covariance) warning, including
+its `W_COV_NON_STATIONARY_ESTIMATE` form, describe the rescaled matrix. The
+non-positive-definite message still reports the eigenvalues of the unscaled
+matrix.
 
 #### An identity-packed θ started near zero {#identity-theta-near-zero}
 

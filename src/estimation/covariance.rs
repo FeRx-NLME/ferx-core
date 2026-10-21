@@ -2485,15 +2485,18 @@ pub(crate) fn worst_variance_inflation(var: &[f64], var_ref: &[f64]) -> f64 {
 /// It is **not** invariant to rescaling one coordinate, and one kind of
 /// coordinate carries units: an identity-packed θ (`theta_packs_log` false — a
 /// θ whose lower bound is negative), whose row of `R` or `S` scales as `1/k²`
-/// when the θ is written `k` times larger. Every other packed coordinate (log-θ,
-/// Cholesky-Ω, log-σ) is already dimensionless. So `equilibrate[i] == true`
+/// when the θ is written `k` times larger. The log-θ, the log-packed Cholesky-Ω
+/// diagonals, log-σ and the Fisher-z residual correlations are dimensionless. An
+/// off-diagonal Cholesky-Ω entry is packed as-is and carries its η's units when
+/// that η is additive; it is not marked, so the floor still moves with them. So
+/// `equilibrate[i] == true`
 /// marks the coordinates to rescale before the floor is applied (#2145): each
 /// such row and column is divided by `dᵢ = sqrt(|Mᵢᵢ| / g)`, where `g` is the
 /// geometric mean of `|Mⱼⱼ|` over the unmarked coordinates (`1` when there are
 /// none), the eigendecomposition and the floor run on `C = D⁻¹ M D⁻¹`, and the
 /// result is returned as `D⁻¹ C⁻¹ D⁻¹`. A marked coordinate is moved to the
 /// typical magnitude of the others, so its units can no longer decide what the
-/// floor clips, while every dimensionless coordinate keeps the floor it had —
+/// floor clips, while every unmarked coordinate keeps the floor it had —
 /// a tiny diagonal there is a flat direction, and equilibrating it away would
 /// silence the alarm. A marked coordinate whose diagonal is zero or non-finite
 /// keeps `dᵢ = 1`, so a θ with no information is still clipped. An empty
