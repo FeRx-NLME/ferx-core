@@ -638,6 +638,13 @@ pub fn run_foce_gn(
         final_gradient = polish_result
             .final_gradient
             .zip(polish_result.final_gradient_source);
+        // Same reasoning for the warnings (#2098): the polish's outer path and
+        // its final cold EBE re-solve (`W_EBE_START_DEPENDENT`) describe the
+        // estimates now being reported. The GN phase's own warnings stay — they
+        // describe how the start of the polish was reached. A rejected polish's
+        // warnings are about estimates nobody sees, so the `else` arm drops them.
+        // Appended before the covariance step's, which run at the merged point.
+        warnings.extend(polish_result.warnings);
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -4528,6 +4535,146 @@ mod tests {
              phase's optimizer gradient"
         );
         assert!(hybrid.final_gradient.is_some());
+    }
+
+    /// The FOCEI polish run on its own from the GN phase's endpoint, exactly as
+    /// `run_foce_gn` launches it — an oracle for the polish's warnings and OFV
+    /// computed outside the merge under test.
+    fn standalone_polish(
+        model: &CompiledModel,
+        pop: &Population,
+        start: &ModelParameters,
+        opts: &FitOptions,
+    ) -> (OuterResult, OuterResult) {
+        let pure = run_foce_gn(
+            model,
+            pop,
+            start,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..opts.clone()
+            },
+        );
+        let polish_opts = FitOptions {
+            method: EstimationMethod::Foce,
+            outer_maxiter: 100,
+            global_search: false,
+            run_covariance_step: false,
+            ..opts.clone()
+        };
+        let polish = crate::estimation::outer_optimizer::optimize_population_warm(
+            model,
+            pop,
+            &pure.params,
+            &polish_opts,
+            &pure.eta_hats,
+            &pure.h_matrices,
+        );
+        (pure, polish)
+    }
+
+    /// L-BFGS polish on this fixture spends its fixed 100-evaluation budget and
+    /// says so with the generic outer non-convergence line — a warning only the
+    /// polish can raise (the GN phase never pushes it).
+    const POLISH_WARNING: &str = "Outer optimization did not converge";
+
+    fn lbfgs_hybrid_opts() -> FitOptions {
+        FitOptions {
+            optimizer: crate::types::Optimizer::Lbfgs,
+            ..hybrid_opts(false)
+        }
+    }
+
+    /// #2098: an accepted polish's warnings are the fit's. The merge used to move
+    /// OFV, parameters, EBEs, H, κ, `converged` and the gradient out of the polish
+    /// but never `warnings`, so `W_EBE_START_DEPENDENT` and every NLopt outer-path
+    /// warning about the reported estimates vanished under `gn_hybrid`.
+    ///
+    /// Mutation: deleting the `warnings.extend(polish_result.warnings)` line
+    /// fails the final assertion.
+    #[test]
+    fn an_accepted_polish_reports_its_own_warnings() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = lbfgs_hybrid_opts();
+
+        let (pure, polish) = standalone_polish(&model, &pop, &model.default_params, &opts);
+        assert!(
+            polish.ofv < pure.ofv,
+            "fixture precondition: the polish must be accepted — GN {:.6}, polish {:.6}",
+            pure.ofv,
+            polish.ofv
+        );
+        assert!(
+            polish.warnings.iter().any(|w| w == POLISH_WARNING),
+            "fixture precondition: the polish must warn, got {:?}",
+            polish.warnings
+        );
+        assert!(
+            !pure.warnings.iter().any(|w| w == POLISH_WARNING),
+            "fixture precondition: the GN phase must not raise the polish's warning \
+             itself, got {:?}",
+            pure.warnings
+        );
+
+        let hybrid = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert_eq!(
+            hybrid.ofv, polish.ofv,
+            "the hybrid reports the polish's OFV"
+        );
+        assert!(
+            hybrid.warnings.iter().any(|w| w == POLISH_WARNING),
+            "the accepted polish's warning must reach the fit, got {:?}",
+            hybrid.warnings
+        );
+        // The GN phase's own record of how the polish's start was reached stays.
+        for w in &pure.warnings {
+            assert!(
+                hybrid.warnings.contains(w),
+                "GN-phase warning {w:?} dropped: {:?}",
+                hybrid.warnings
+            );
+        }
+    }
+
+    /// The straddle for the test above: when the GN result is kept, the polish's
+    /// warnings describe estimates that are not reported and must stay out.
+    ///
+    /// Started at the accepted polish's own endpoint, the GN phase stays there
+    /// and the polish ties it (`polish < gn` is false), so the `else` arm runs —
+    /// while the polish, run standalone from the same point, still raises the
+    /// warning. Mutation: extending with the polish's warnings unconditionally
+    /// (before the `if`) fails the final assertion.
+    #[test]
+    fn a_rejected_polish_does_not_report_its_warnings() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = lbfgs_hybrid_opts();
+        let start = run_foce_gn(&model, &pop, &model.default_params, &opts).params;
+
+        let (pure, polish) = standalone_polish(&model, &pop, &start, &opts);
+        assert!(
+            polish.ofv >= pure.ofv,
+            "fixture precondition: the polish must be rejected — GN {:.6}, polish {:.6}",
+            pure.ofv,
+            polish.ofv
+        );
+        assert!(
+            polish.warnings.iter().any(|w| w == POLISH_WARNING),
+            "fixture precondition: the rejected polish must still warn, got {:?}",
+            polish.warnings
+        );
+
+        let hybrid = run_foce_gn(&model, &pop, &start, &opts);
+        assert_eq!(
+            hybrid.ofv, pure.ofv,
+            "the hybrid reports the GN phase's OFV"
+        );
+        assert!(
+            !hybrid.warnings.iter().any(|w| w == POLISH_WARNING),
+            "a rejected polish's warning describes estimates nobody sees, got {:?}",
+            hybrid.warnings
+        );
     }
 
     /// The GN phase reports its own gradient under its own `"optimizer"` label —
