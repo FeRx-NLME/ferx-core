@@ -1144,7 +1144,9 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
         details["reason"], "at the divergence sentinel",
         "the gate's own keys are kept: {details}"
     );
-    let subjects = details["subjects"].as_array().expect("a subjects array");
+    let subjects = details["unusable_subjects"]
+        .as_array()
+        .expect("an unusable_subjects array");
     assert_eq!(
         subjects,
         &vec![
@@ -1165,7 +1167,7 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
 /// payload exactly, rather than appending "0 of 2 subjects".
 ///
 /// Mutation (run): drop the `named.is_empty()` return → the message grows a
-/// "0 of 2 subjects" sentence and `details` a `subjects` key, and this fires.
+/// "0 of 2 subjects" sentence and `details` an `unusable_subjects` key, and this fires.
 #[test]
 fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
@@ -1202,7 +1204,32 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
         full.ends_with("B (contribution 2e20, a non-finite IPRED or PRED on 1 of 4 observations)."),
         "{full}"
     );
-    let subjects = entry.details.as_ref().expect("payload")["subjects"].clone();
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
+    assert_eq!(
+        subjects[0]["first_time"],
+        serde_json::Value::Null,
+        "{subjects}"
+    );
+    assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
+}
+
+/// **N3b — the third way `first_time` is `null`** (#2148 review): the subject is
+/// matched and has a non-finite prediction, but the written `TIME` of that record is
+/// itself not finite. JSON has no `NaN`, so serde writes `null`, while the message
+/// still prints the value. Pins the docs' list of the three `null` cases: with a
+/// finite `TIME` at that record the field would be a number.
+#[test]
+fn a_non_finite_written_time_is_carried_as_null() {
+    let mut data = shifted_subject("A");
+    data.obs_raw_times[2] = f64::NAN;
+    let pop = population_of(vec![data]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    a.ofv_contribution = 2e20;
+    a.ipred[2] = f64::NAN;
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop);
+    assert!(full.ends_with("the first at TIME NaN)."), "{full}");
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
     assert_eq!(
         subjects[0]["first_time"],
         serde_json::Value::Null,
@@ -1241,10 +1268,10 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         crate::api::postfit::NONFINITE_SUBJECTS_NAMED
     );
     assert!(
-        full.ends_with("; and 2 more, listed in the warning's details."),
+        full.ends_with("; and 2 more, listed only in the Rust API's structured warning."),
         "{full}"
     );
-    let listed = entry.details.as_ref().expect("payload")["subjects"]
+    let listed = entry.details.as_ref().expect("payload")["unusable_subjects"]
         .as_array()
         .expect("subjects")
         .len();
@@ -1328,14 +1355,14 @@ fn evaluate(model: &CompiledModel, pop: &Population) -> FitResult {
     fit(model, pop, &model.default_params, &opts).expect("fit")
 }
 
-/// The one `W_NONFINITE_OBJECTIVE` entry and its `subjects` payload.
+/// The one `W_NONFINITE_OBJECTIVE` entry and its `unusable_subjects` payload.
 fn named_subjects(result: &FitResult) -> (String, Vec<serde_json::Value>) {
     let entry = result
         .warnings_structured
         .iter()
         .find(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN))
         .unwrap_or_else(|| panic!("no {NONFINITE_OBJECTIVE_TOKEN}: {:?}", result.warnings));
-    let subjects = entry.details.as_ref().expect("payload")["subjects"]
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -1352,7 +1379,7 @@ fn named_subjects(result: &FitResult) -> (String, Vec<serde_json::Value>) {
 /// the fixture, and that a healthy fit stays silent.
 ///
 /// Mutation (run): delete the `name_nonfinite_subjects` call in `fit_inner` → the
-/// message names nobody and the `subjects` payload is absent. Moving it before the
+/// message names nobody and the `unusable_subjects` payload is absent. Moving it before the
 /// `warnings.retain(...)` de-duplication is caught by G1 and G10 instead, not here:
 /// the estimator's copy no longer ends with the extended message, so both copies
 /// survive, but at `outer_maxiter = 0` this fit has no estimator copy to keep.

@@ -379,7 +379,7 @@ covariance step that followed produced usable standard errors.
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `convergence` | Critical | Optimizer did not converge; **or** (`W_NONFINITE_OBJECTIVE`) the objective at the final estimates is `NaN`, infinite, or the clamped divergence sentinel; **or** (`W_NO_FEASIBLE_EVAL`) not one outer trial was feasible — the EBE guard rejected them all, or every objective was non-finite — so nothing was minimised and the estimates are the ones the fit started from (#1617). | Reject; adjust inits / method / bounds and refit. For `W_NONFINITE_OBJECTIVE`, first find the record or parameter that poisons the objective — see [A non-finite objective](#non-finite-objective). For `W_NO_FEASIBLE_EVAL`, act on the cause named: `inner_maxiter` / `max_unconverged_frac` for the guard, the offending record for a non-finite objective ([When no evaluation is feasible](estimation/foce.qmd#no-feasible-evaluation)). |
+| `convergence` | Critical | Optimizer did not converge; **or** (`W_NONFINITE_OBJECTIVE`) the objective at the final estimates is `NaN`, infinite, or at or above the `1e14` divergence cutoff; **or** (`W_NO_FEASIBLE_EVAL`) not one outer trial was feasible — the EBE guard rejected them all, or every objective was non-finite — so nothing was minimised and the estimates are the ones the fit started from (#1617). | Reject; adjust inits / method / bounds and refit. For `W_NONFINITE_OBJECTIVE`, first find the record or parameter that poisons the objective — see [A non-finite objective](#non-finite-objective). For `W_NO_FEASIBLE_EVAL`, act on the cause named: `inner_maxiter` / `max_unconverged_frac` for the guard, the offending record for a non-finite objective ([When no evaluation is feasible](estimation/foce.qmd#no-feasible-evaluation)). |
 | `optimizer_health` | Warning | Trust-radius collapse / degeneracy, or a fit that stopped mid-descent and was [restarted from the best point it reached](estimation/foce.qmd#stopping-without-converging). | Try a different optimizer or re-scale parameters. A restarted fit that ends converged needs no action; one that did not is usually short of `maxiter`. |
 | `ebe_start_dependent` | Warning | (`W_EBE_START_DEPENDENT`) The empirical Bayes estimates at the final parameters depend on where the inner loop starts: re-solving them cold scores materially worse than the EBEs the optimizer minimised against, or returns a non-finite objective (#833). Either the individual objective has more than one mode at these estimates, or the inner loop cannot reach it from a cold start within `inner_maxiter` — the message names both, since the two objectives do not distinguish them. The reported fit uses the best-scoring candidate. **Or**, in the other direction, the cold re-solve scores materially *lower* than the objective the optimizer minimised — some subjects' EBEs sat in a higher mode for the whole trajectory — and the restart that would have fixed it could not run or left a gap of its own; the fit is then `converged: false` (#1565, [details](estimation/foce.qmd#cold-solve-better)). | Worse direction: the estimates are usable; the EBE-derived diagnostics are the part to treat with care. Refit with a larger `inner_maxiter` (budget) and with `inner_restarts` raised (second mode) to tell the two apart, and compare `IPRED` / `IWRES` / shrinkage against that refit. *Lower* direction: the estimates are not the optimum — refit starting from them, with `maxiter` budget to spare. |
 | `vi_bad_basin` | Critical | VI's final ELBO tightness check found that a flat objective is an unusable variational bound, not convergence. | Reject the fit; use better starting values or initialize VI from a fitted point with `method = [focei, vi]`. |
@@ -465,15 +465,24 @@ infinite, or at or above the `1e14` cutoff, the fit comes back with
 `converged: false` and a `W_NONFINITE_OBJECTIVE` warning saying which it was:
 
 * `NaN` or `infinite`;
-* **at the divergence sentinel** — `1e20` or more, so at least one subject's
-  objective was clamped (one clamped subject alone contributes `2e20`);
-* **too large to be a fit** — finite, past the cutoff and below the sentinel, so
-  no subject was clamped and some subject's objective is that large on its own
-  terms. A proportional error on a prediction of `0` does this: the residual
-  variance bottoms out at its `1e-12` floor, and each such observation scores
-  about `DV² × 1e12`. That passes the cutoff once `|DV|` exceeds 10; below it the
-  objective is merely huge (`DV = 4.4` gives `1.9e13`), and this warning is not
-  raised.
+* **at the divergence sentinel** — `1e20` or more. Usually at least one
+  subject's objective was clamped (one clamped subject alone contributes `2e20`),
+  but a subject can reach it unclamped too: the zero prediction described next
+  scores `1.44e20` on a single observation with `DV = 12000`;
+* **too large to be a fit** — finite, past the cutoff and below the sentinel.
+  Usually no subject was clamped and some subject's objective is that large on
+  its own terms. A proportional error on a prediction of `0` does this: the
+  residual variance bottoms out at its `1e-12` floor, and each such observation
+  scores about `DV² × 1e12`. The cutoff applies to the summed objective, so the
+  warning is raised once the sum of `DV²` over those observations, across the
+  population, exceeds 100. One large `DV` can do it alone, and many small ones
+  can add up to it. A single `DV = 4.4` gives `1.9e13` and does not raise it on
+  its own. A subject the likelihood refuses outright lands here too, although
+  it was clamped: IOV combined with FREM is refused at `1e18`.
+
+The label is read from the population total, not from the subjects, so treat it
+as the likelier reading rather than a proof. [Which subjects](#which-subjects)
+looks at the subjects themselves.
 
 `is_finite()` is deliberately **not** the test. A *repelled* fit — one the
 optimizer walked into a region where an individual contribution blows up — is
@@ -532,21 +541,41 @@ first at TIME 4).
 ```
 
 Here the model's `CL` went non-finite at `TIME 4`, and every later prediction
-of the subject inherited it, so the first record is where to look, not the
-count. On that record the parameter model (a power of a negative covariate, a
+of the subject inherited it. The first record is then a better place to start
+than the count: on it the parameter model (a power of a negative covariate, a
 `log` of zero) or the structural model produced a value the likelihood could not
-score. When a named subject's predictions are all
-finite, the sentence says so (`every IPRED and PRED finite`), and the cause is
-the residual model on that subject rather than its predictions. A proportional
-error on a prediction of `0` is the usual case.
+score. It is a starting point, not always the cause. A runaway random effect can
+leave an earlier record with a finite prediction of `0` that the residual model
+already cannot score, and the first non-finite prediction then comes after it.
+The two engines can also disagree on the same subject: the closed form may
+report every prediction finite where the ODE solver reports most of them
+non-finite. So also read the records before the named `TIME`.
+
+When a named subject's predictions are all finite, the sentence says so
+(`every IPRED and PRED finite`), and the cause is not in the predictions. A
+proportional error on a prediction of `0` is the usual case. A non-Gaussian
+term can do it as well (a time-to-event, binary or Markov likelihood), as can a
+covariance matrix that is not positive definite, or a subject the likelihood
+refuses outright, such as IOV combined with FREM. A subject with no Gaussian
+observation meets the condition trivially.
 
 A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian
 observation, and that subject contributes nothing wrong. The message names at
-most ten subjects; the `subjects` array in the warning's `details` lists all of
-them. No sentence is added when every subject's contribution is valid. That
-happens when the objective was clamped at a point the subjects were not scored
-at.
+most ten subjects. The `unusable_subjects` array in the structured warning's
+`details` lists all of them. Only the Rust API carries it
+(`FitResult::warnings_structured`): the R package, the YAML output and a
+reloaded `.fitrx` file keep the message and drop `details`.
+
+No sentence is added when every subject's contribution is valid. That happens
+when:
+
+* the objective was clamped at a point the subjects were not scored at;
+* the subjects are each below the cutoff and only their sum is past it — ten
+  subjects of `1.6e13` each, for example;
+* the objective comes from a method other than FOCE or FOCEI. The contributions
+  are always the post-hoc FOCE/FOCEI score, so an AGQ, IMP, SAEM, Laplace or
+  mixture objective can be unusable while every contribution is valid.
 
 ### The one exception
 
@@ -584,7 +613,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (the sentinel threshold, `1e14`), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them, `null` when there is none) ([Which subjects](#which-subjects)) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite) ([Which subjects](#which-subjects)) |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 

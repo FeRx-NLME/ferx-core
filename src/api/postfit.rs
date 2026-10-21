@@ -1820,8 +1820,12 @@ pub(crate) fn nonfinite_objective_warning(
 pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 
 /// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
-/// sentence to `msg` and to `entry.message`, and a `subjects` array to
-/// `entry.details`. Returns `msg` unchanged when no subject qualifies.
+/// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
+/// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
+/// Returns `msg` unchanged when no subject qualifies. The `details` reach only the
+/// Rust API: the YAML writes the messages, a `.fitrx` reload rebuilds the entries
+/// without them, and the R package drops them, so the message says where the
+/// subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are.
 ///
 /// A subject qualifies when its own post-fit objective contribution fails
 /// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
@@ -1833,9 +1837,10 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// For each subject named, the sentence gives the contribution and the observations
 /// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
-/// none is, it says so, since that is a different defect: the predictions are finite
-/// and the subject's objective is huge anyway (a proportional error on a prediction
-/// of 0 scores `DV² × 1e12` per observation at the variance floor).
+/// none is, it says so, since the cause is then not in the predictions: usually a
+/// proportional error on a prediction of 0, which scores `DV² × 1e12` per
+/// observation at the variance floor, but also a non-Gaussian term, a non-PD
+/// covariance, or a refused subject.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
 /// whose position does not match `population` gets no `TIME`.
@@ -1891,7 +1896,7 @@ pub(crate) fn name_nonfinite_subjects(
         .join("; ");
     if named.len() > NONFINITE_SUBJECTS_NAMED {
         list.push_str(&format!(
-            "; and {} more, listed in the warning's details",
+            "; and {} more, listed only in the Rust API's structured warning",
             named.len() - NONFINITE_SUBJECTS_NAMED
         ));
     }
@@ -1915,7 +1920,10 @@ pub(crate) fn name_nonfinite_subjects(
         })
         .collect();
     if let Some(serde_json::Value::Object(map)) = entry.details.as_mut() {
-        map.insert("subjects".into(), serde_json::Value::Array(payload));
+        map.insert(
+            "unusable_subjects".into(),
+            serde_json::Value::Array(payload),
+        );
     }
     entry.message = full.clone();
     full

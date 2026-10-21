@@ -2340,10 +2340,17 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 ///   direction looks flat. The fit was *repelled*, not solved. See
 ///   [`DIVERGENCE_OFV`].
 /// * **too large to be a fit** — finite, at or above [`DIVERGENCE_OFV`] but below
-///   the sentinel, so no subject was clamped (#2038). A subject's own objective is
-///   that large on its own terms: measured, a proportional error on a prediction of
-///   0 bottoms out at the residual-SD floor and scores `4.6e14`. Calling that the
-///   sentinel sent the user looking for a clamp that never happened.
+///   the sentinel, so no subject sits on the `1e20` rail (#2038). Usually a
+///   subject's own objective is that large on its own terms: measured, a
+///   proportional error on a prediction of 0 bottoms out at the residual-SD floor
+///   and scores `4.6e14`. Calling that the sentinel sent the user looking for a
+///   clamp that never happened.
+///
+/// The line is drawn on the population total, so it is a reading, not a proof,
+/// in both directions: an unclamped subject can reach `1e20` on its own (the same
+/// zero prediction against a DV of 12000 scores `1.44e20`), and the IOV + FREM
+/// refusal in `crate::stats::likelihood` returns `1e18`, so a subject refused
+/// there reads as too large rather than as clamped.
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
@@ -2358,9 +2365,10 @@ pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
 
 /// The value the per-subject objective is clamped to when it is not finite — the
 /// `1e20` written as a literal at each guard in `crate::stats::likelihood`. A
-/// population objective at or above it therefore holds at least one clamped subject
-/// (one subject's `2 · 1e20` already exceeds it), and one below it holds none, which
-/// is the line [`nonfinite_objective_reason`] draws (#2038).
+/// population objective at or above it holds a clamped subject (one subject's
+/// `2 · 1e20` already exceeds it) or a subject whose own objective is that large;
+/// one below it holds no subject on this rail. That is the line
+/// [`nonfinite_objective_reason`] draws (#2038), and its caveats are listed there.
 pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
