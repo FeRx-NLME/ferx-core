@@ -267,9 +267,9 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
 /// V1: at ρ = 0 the composed model is the nested model without the line. ρ is a **free**
 /// θ at its initial value 0, not `RHO FIX 0` (which the parser drops, so the comparison
 /// would be a model against itself). With `outer_maxiter = 0` both evaluate one point.
-/// They are not bit-equal, and are not expected to be: the line moves the inner gradient
-/// to finite differences ("residual correlation") and FOCEI onto the dense-`R` marginal,
-/// whose sums associate differently. The bound is measured.
+/// They are not bit-equal, and are not expected to be: the line moves the EBE search onto
+/// the dense objective's exact gradient and FOCEI onto the dense-`R` marginal, whose sums
+/// associate differently. The bound is measured.
 ///
 /// V2: at ρ = 0.5 the OFV moves by whole units.
 ///
@@ -313,6 +313,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
                     m.residual_cov_theta(&p.theta),
                     &[],
                     None,
+                    m.residual_error_eta,
                 )
             } else {
                 crate::stats::likelihood::foce_subject_nll_interaction(
@@ -386,19 +387,17 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
         r_half.ofv,
         r_base.ofv
     );
-    // The route the line takes: every subject's EBE search on FD, named by its reason (the
-    // per-subject truth; `gradient_method_inner` is the model-level label, which this
-    // warning corrects), and no analytic outer gradient. Without the line both are
-    // analytic and nothing warns (the exact3 anchor's route).
+    // The route the line takes (#2101): the same as without it — every subject's EBE
+    // search and the outer gradient analytic, so nothing warns about finite differences.
     assert!(
-        r_zero.warnings.iter().any(|w| w.contains(
-            "12 of 12 subjects use finite-difference inner gradients in the IOV loop \
-             (residual correlation: 12)"
-        )),
+        !r_zero
+            .warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
         "{:?}",
         r_zero.warnings
     );
-    assert_ne!(
+    assert_eq!(
         r_zero.gradient_method_outer,
         GradientMethodKind::Analytic.as_str()
     );

@@ -927,12 +927,25 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
                 }
             }
             let f_var = frozen_var_preds.map_or(f_pred, |f0| f0[j]);
-            let v_resid = model.residual_variance_at_scaled(
-                err_keys[j],
-                f_var,
-                sigma_values,
-                ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
-            ) * ruv_scale;
+            // The live `block_sigma` correlations (`residual_cov.pairs`, #847), not the
+            // model's declaration: this row-wise branch serves a correlated model whenever
+            // it has censored or FREM rows, and its ρ must be the one being estimated.
+            // Identical to `residual_variance_at_scaled` when the two coincide.
+            let v_resid = match ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice) {
+                Some(m) => model.error_spec.variance_at_scaled(
+                    err_keys[j],
+                    f_var,
+                    sigma_values,
+                    residual_cov.pairs,
+                    m,
+                ),
+                None => model.error_spec.variance_at_with_correlations(
+                    err_keys[j],
+                    f_var,
+                    sigma_values,
+                    residual_cov.pairs,
+                ),
+            } * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if model.bloq_in_force().is_censored_row(cens) {
@@ -1133,6 +1146,10 @@ pub(crate) fn obs_nll_subject_from_preds(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+// The conditional semantics are constructed only by `conditional_obs_nll_from_preds`, a
+// test oracle since the AGQ path it served moved to the adjoint (#486); the shared body
+// below still branches on them.
+#[cfg_attr(not(test), allow(dead_code))]
 enum PredNllSemantics {
     Marginal,
     Conditional,
@@ -1261,42 +1278,6 @@ fn obs_nll_subject_from_preds_with_semantics(
     }
 
     nll
-}
-
-/// Conditional observation NLL from precomputed predictions, using the exact
-/// raw-prediction semantics of the inner/IOV likelihoods.
-///
-/// Unlike [`obs_nll_subject_from_preds`] (the SAEM/IS observation objective), this
-/// does not floor ordinary predictions or clamp residual variances. AGQ integrates
-/// the conditional likelihood used by the inner problem, so its fused value/score
-/// path must preserve those semantics exactly.
-#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn conditional_obs_nll_from_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    preds: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
-    iov: bool,
-) -> f64 {
-    let semantics = if iov {
-        PredNllSemantics::ConditionalIov
-    } else {
-        PredNllSemantics::Conditional
-    };
-    obs_nll_subject_from_preds_with_semantics(
-        model,
-        subject,
-        preds,
-        theta,
-        sigma_values,
-        residual_cov,
-        eta,
-        semantics,
-    )
 }
 
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
@@ -1622,9 +1603,14 @@ pub(crate) fn foce_subject_nll_cov(
     // accumulator [`foce_subject_nll_interaction`] would silently drop the
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
+    // The dense-R form applies exactly when the inner objective uses it: a subject with
+    // censored or FREM rows is scored row-wise by both (with the live correlated
+    // variance), so `F − ½log|H̃|` stays the inner objective `l`.
+    let rowwise = model.bloq_in_force().has_censored_row(&subject.cens)
+        || subject.fremtype.iter().any(|&ft| ft > 0);
     if interaction {
-        if !residual_cov.is_dense() {
-            foce_subject_nll_interaction(
+        if !residual_cov.is_dense() || rowwise {
+            foce_subject_nll_interaction_corr(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1637,6 +1623,7 @@ pub(crate) fn foce_subject_nll_cov(
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
+                residual_cov.pairs,
             )
         } else {
             foce_subject_nll_interaction_dense_cov(
@@ -1650,6 +1637,7 @@ pub(crate) fn foce_subject_nll_cov(
                 residual_cov,
                 &p_obs,
                 ruv_mult.as_deref(),
+                model.residual_error_eta,
             )
         }
     } else {
@@ -1979,6 +1967,43 @@ pub fn foce_subject_nll_interaction(
     // Per-observation custom residual magnitude (#484); `None` on legacy path.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_interaction_corr(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        residual_error_eta,
+        ruv_mult,
+        &[],
+    )
+}
+
+/// [`foce_subject_nll_interaction`] scoring each row's variance with the live
+/// `block_sigma` correlations: the row-wise FOCEI objective of a correlated model whose
+/// subject has censored or FREM rows, which the inner objective scores row-wise with
+/// the same correlated variance (`individual_nll_into_prepared_with_schedule_frozen`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_interaction_corr(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    residual_error_eta: Option<usize>,
+    ruv_mult: Option<&[Vec<f64>]>,
+    correlations: &[ResidualCorrelation],
+) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
@@ -1994,6 +2019,7 @@ pub fn foce_subject_nll_interaction(
         residual_error_eta,
         ruv_scale,
         ruv_mult,
+        Some(correlations),
     ) else {
         return 1e20;
     };
@@ -2067,6 +2093,7 @@ pub fn foce_subject_nll_interaction_dense(
         ResidualCov::block_sigma(correlations),
         p_obs,
         ruv_mult,
+        None,
     )
 }
 
@@ -2085,11 +2112,15 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
     p_obs: &[f64],
     // Per-observation custom residual magnitude (#484); `None` on the legacy path.
     ruv_mult: Option<&[Vec<f64>]>,
+    // IIV on the residual: `R` scales by `exp(2·η̂_r)` (as in the inner objective's
+    // dense data term), so `∂R/∂η_r = 2R` joins `B`.
+    residual_error_eta: Option<usize>,
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
+    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
 
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
     // the data term and FOCE-standard path assemble it.
@@ -2102,6 +2133,9 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
         residual_cov,
         ruv_mult,
     );
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
     for (j, v) in p_obs.iter().enumerate() {
         if j < r.nrows() {
             r[(j, j)] += *v;
@@ -2153,6 +2187,20 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
             if h_mk != 0.0 {
                 dr_k += h_mk * dr_m;
             }
+        }
+        if ruv_scale != 1.0 {
+            dr_k *= ruv_scale;
+        }
+        if Some(k) == residual_error_eta {
+            // `R = exp(2η_r)·R₀ (+ P)` ⇒ `∂R/∂η_r = 2(R − P)`: the SDE process-noise
+            // diagonal is η-independent, as on the diagonal path.
+            let mut r_ruv = r.clone();
+            for (j, v) in p_obs.iter().enumerate() {
+                if j < r_ruv.nrows() {
+                    r_ruv[(j, j)] -= *v;
+                }
+            }
+            dr_k += 2.0 * r_ruv;
         }
         m_mats.push(&r_inv * dr_k);
     }
@@ -2228,6 +2276,7 @@ fn foce_subject_nll_interaction_with_tte(
         residual_error_eta,
         ruv_scale,
         ruv_mult, // custom residual magnitude (#484) — scales the Gaussian PK rows
+        None,
     ) else {
         return 1e20;
     };
@@ -2306,6 +2355,10 @@ fn gaussian_foce_accum(
     // Per-observation custom residual magnitude (#484); `None` on the legacy
     // path. Scales the variance and its f-derivative per observation.
     ruv_mult: Option<&[Vec<f64>]>,
+    // The live `block_sigma` correlations when a correlated model's subject is scored
+    // row-wise (censored or FREM rows), `None` for the legacy variance. The caller makes
+    // that call (it has asked `ResidualCov::is_dense`), not an emptiness test here.
+    correlations: Option<&[ResidualCorrelation]>,
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
     let mult_row = |j: usize| -> Option<&[f64]> { ruv_mult.map(|m| m[j].as_slice()) };
@@ -2339,7 +2392,20 @@ fn gaussian_foce_accum(
         let (v_resid, dvar_df) = match frem_ov {
             Some(v) => (v, 0.0),
             None => {
-                let (rv, dv) = residual_rd(error_spec, err_keys[j], f, sigma_values, mult_row(j));
+                let (rv, dv) = match correlations {
+                    None => residual_rd(error_spec, err_keys[j], f, sigma_values, mult_row(j)),
+                    Some(c) => {
+                        let (v, d, _) = crate::stats::residual_error::residual_rd2_corr(
+                            error_spec,
+                            err_keys[j],
+                            f,
+                            sigma_values,
+                            c,
+                            mult_row(j),
+                        );
+                        (v, d)
+                    }
+                };
                 (rv * ruv_scale, dv * ruv_scale)
             }
         };
@@ -2386,7 +2452,17 @@ fn gaussian_foce_accum(
         // `v_resid`/`d`/`d2` all carry the same proportional-loading (`m²`) and
         // `exp(2·η_ruv)` scaling, so the censored curvature is built from mutually
         // consistent derivatives of one `v(f)`.
-        let (rv, dv, d2v) = residual_rd2(error_spec, cmt, f, sigma_values, mult_row(j));
+        let (rv, dv, d2v) = match correlations {
+            None => residual_rd2(error_spec, cmt, f, sigma_values, mult_row(j)),
+            Some(c) => crate::stats::residual_error::residual_rd2_corr(
+                error_spec,
+                cmt,
+                f,
+                sigma_values,
+                c,
+                mult_row(j),
+            ),
+        };
         let (v_resid, d, d2) = (rv * ruv_scale, dv * ruv_scale, d2v * ruv_scale);
         // Inflate by the EKF process-noise term exactly as the quantified rows do
         // (line above), so a censored row's `v` — in both the data term and `H̃` —
@@ -2694,27 +2770,6 @@ pub(crate) fn iov_linearization(
             h_full[(j, c)] = h_matrix[(j, c)];
         }
     }
-    // Reused κ buffer: perturb one element in place and restore it, rather than
-    // cloning all occasions' κ twice per FD step.
-    let mut kpert = kappa_slices.clone();
-    const EPS: f64 = 1e-6;
-    for k in 0..k_occ {
-        let col_base = layout.kappa_offset(k);
-        for ki in 0..n_iov {
-            let orig = kpert[k][ki];
-            let step = EPS * (1.0 + orig.abs());
-            kpert[k][ki] = orig + step;
-            let preds_plus = predict(&kpert);
-            kpert[k][ki] = orig - step;
-            let preds_minus = predict(&kpert);
-            kpert[k][ki] = orig;
-            let inv_2step = 1.0 / (2.0 * step);
-            for j in 0..n_obs {
-                h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
-            }
-        }
-    }
-
     // Joint EBE vector b̂ = [η̂, κ̂₁, …, κ̂_K].
     let mut b_hat = DVector::zeros(n_b);
     for i in 0..n_eta {
@@ -2723,6 +2778,45 @@ pub(crate) fn iov_linearization(
     for (k, kap) in kappas.iter().enumerate() {
         for ki in 0..n_iov {
             b_hat[layout.kappa_offset(k) + ki] = kap[ki];
+        }
+    }
+
+    // κ columns: the exact stacked η-Jacobian from the unified recording (one tape-free
+    // first-order pass over the same continuous prediction), else central differences of
+    // `predict_iov` (2·K·n_iov extra solves) for an engine no recorder serves.
+    let recorded = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        model,
+        subject,
+        theta,
+        b_hat.as_slice(),
+    )
+    .filter(|j| j.nrows() == n_obs && j.ncols() == n_b);
+    if let Some(jac) = recorded {
+        for j in 0..n_obs {
+            for c in n_eta..n_b {
+                h_full[(j, c)] = jac[(j, c)];
+            }
+        }
+    } else {
+        // Reused κ buffer: perturb one element in place and restore it, rather than
+        // cloning all occasions' κ twice per FD step.
+        let mut kpert = kappa_slices.clone();
+        const EPS: f64 = 1e-6;
+        for k in 0..k_occ {
+            let col_base = layout.kappa_offset(k);
+            for ki in 0..n_iov {
+                let orig = kpert[k][ki];
+                let step = EPS * (1.0 + orig.abs());
+                kpert[k][ki] = orig + step;
+                let preds_plus = predict(&kpert);
+                kpert[k][ki] = orig - step;
+                let preds_minus = predict(&kpert);
+                kpert[k][ki] = orig;
+                let inv_2step = 1.0 / (2.0 * step);
+                for j in 0..n_obs {
+                    h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                }
+            }
         }
     }
 
@@ -2800,8 +2894,12 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     if interaction {
         // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
         // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
-        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal.
-        if !residual_cov.is_dense() {
+        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal —
+        // except a subject with censored rows, which that dispatcher and the IOV EBE search
+        // (`individual_nll_iov_frozen_in`) both score row-wise; the marginal must too, or
+        // the objective is not the one its EBE minimised.
+        let rowwise = model.bloq_in_force().has_censored_row(&subject.cens);
+        if !residual_cov.is_dense() || rowwise {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -2828,6 +2926,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 residual_cov,
                 &p_obs_iov,
                 ruv_mult.as_deref(),
+                model.residual_error_eta,
             )
         }
     } else {
@@ -3274,8 +3373,8 @@ pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<
 }
 
 /// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
-/// returns). Shared by the closed-form (`build_iov_sources`) and ODE (`run_subject_iov` /
-/// `run_subject_iov_eta`) IOV providers so the occasion→group mapping is defined once
+/// returns). Shared by every IOV path through `StackedLayout` (`stats/stacked_layout.rs`),
+/// which the closed-form and ODE recorders both read, so the occasion→group mapping is defined once
 /// (#466 review round 2).
 pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashMap<u32, usize> {
     occ_groups
@@ -6838,4 +6937,43 @@ DV ~ proportional(PROP_ERR)
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
     }
+}
+
+/// Conditional observation NLL from precomputed predictions, using the exact
+/// raw-prediction semantics of the inner/IOV likelihoods.
+///
+/// Unlike [`obs_nll_subject_from_preds`] (the SAEM/IS observation objective), this
+/// does not floor ordinary predictions or clamp residual variances. AGQ integrates
+/// the conditional likelihood used by the inner problem, so its fused value/score
+/// path must preserve those semantics exactly. Kept as the tests' independent
+/// conditional objective (`nested_correlation_tests`) since the AGQ path it served moved to
+/// the adjoint (#486).
+#[cfg(test)]
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conditional_obs_nll_from_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    eta: &[f64],
+    iov: bool,
+) -> f64 {
+    let semantics = if iov {
+        PredNllSemantics::ConditionalIov
+    } else {
+        PredNllSemantics::Conditional
+    };
+    obs_nll_subject_from_preds_with_semantics(
+        model,
+        subject,
+        preds,
+        theta,
+        sigma_values,
+        residual_cov,
+        eta,
+        semantics,
+    )
 }

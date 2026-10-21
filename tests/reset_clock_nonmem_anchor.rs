@@ -129,7 +129,9 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
 /// Laplace), tte 6.2e-7 / 6.2e-7. Each bound sits ≥ 10× above both. The clock gaps they
 /// separate are 134 to 7648.
 const OFV_TOL_ODE: f64 = 5e-7;
+#[cfg(feature = "survival")]
 const OFV_TOL_CAT: f64 = 1e-3;
+#[cfg(feature = "survival")]
 const OFV_TOL_TTE: f64 = 5e-6;
 
 /// The clock gap the fixtures were built to produce: any reading of `TIME` that is not the

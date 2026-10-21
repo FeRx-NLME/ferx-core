@@ -1,0 +1,18 @@
+# Integration binaries the `Slow regression tests (nn)` job runs (#2182), next to
+# the lib unit tests: exactly the binaries that gain a runnable test when `nn` is on.
+# Every other binary runs an identical test set with and without `nn`, so the core
+# shards already cover it. Two guards hold this list to that definition:
+#   - `tests/ci_test_shards.rs` (per PR): it equals the test files that carry a
+#     positive `cfg(feature = "nn")`;
+#   - `ci-test-shard.py check-nn` (each nightly): it equals the binaries whose
+#     `--list` under `nn` holds a runnable test the core build's does not — read
+#     from the compiler, so a gate the source scan misses still counts.
+# A binary that only LOSES tests under `nn` (kappa_correlation_auto_lbfgs_fits and
+# profiled_levels_fits, `ignore`d there by #2138/#2144) is not listed: nothing new
+# would run. The weekly `full-nn` leg runs every binary with `nn`.
+nn_dcm_smoke
+nn_fit_convergence
+nn_fit_smoke
+nn_regularization
+tte_smoke
+vi_dcm_omega_recovery

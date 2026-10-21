@@ -95,6 +95,40 @@ validators feed `fit()` (via the internal `check_model_data` /
 `check_model_data_warnings` functions), so a clean `check` and a `fit()` agree
 on what is and isn't valid.
 
+### `validate_model_file_with()`
+
+`validate_model_file()` checks against the model file's own `[fit_options]` and
+`[data_selection]`. A fit run with call-time overrides — ferx-r's
+`ferx_fit(settings = list(iov_occasion = "dose", ignore = "TIME > 24"))` — reads
+other options, so the check can report a finding that fit would not produce and
+miss one it would. `validate_model_file_with()` takes the overrides as
+`(key, value)` pairs and checks against the merged options
+([#2165](https://github.com/FeRx-NLME/ferx-core/issues/2165)):
+
+```rust
+pub fn validate_model_file_with(
+    model_path: &str,
+    data_path: Option<&str>,
+    overrides: &[(String, String)],
+) -> CheckReport
+```
+
+Each pair is applied in order on top of the file's options with
+`apply_fit_option`, the function the parser reads `[fit_options]` with: a later
+scalar value wins, and an `ignore` / `accept` / `ignore_subjects` clause is added
+to the file's. Every check then reads the merged options — the method /
+covariance compatibility checks, the variance-rail, box and prior checks, the
+data read's selection filter and `iov_column`, and the `iov_occasion` the
+model–data checks group occasions by. A pair that cannot be applied is an
+`E_FIT_OPTION` error and ends the check, as a parse failure does. An empty list
+is exactly `validate_model_file()`.
+
+```rust
+let overrides = vec![("iov_occasion".to_string(), "dose".to_string())];
+let report = validate_model_file_with("warfarin_iov.ferx", Some("warfarin.csv"), &overrides);
+assert!(report.valid); // without the override: E_IOV_MISSING_OCC
+```
+
 ## Data Parsing
 
 ### `read_population_for()`

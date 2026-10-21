@@ -11,7 +11,7 @@ appropriate marginal likelihood.
 
 | Method | Binary | Notes |
 |--------|:------:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. A finite-difference Hessian of the data term w.r.t. η plus the `½ log\|H̃\|` correction (the logit likelihood has no closed-form analytic η-Hessian, so the inner gradient and outer Laplace are FD, as for TTE). |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses a finite-difference Hessian of the data term w.r.t. η, and the outer θ-gradient is FD, as for TTE. |
 | **SAEM** | ✓ | Preferred for sparse binary data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood; use a larger `isample` for non-Gaussian endpoints. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
@@ -20,6 +20,28 @@ appropriate marginal likelihood.
 The **fixed-effects** (`n_eta = 0`) case has no inner loop — the objective reduces to
 the plain Bernoulli likelihood `Σ_j −log L_j`, and the outer optimizer fits `θ` by
 direct maximum likelihood. This is ordinary logistic regression.
+
+### Analytic inner gradient
+
+The EBE search differentiates the Bernoulli data term **analytically** (#2024). The
+`logit` predictor is compiled to the same dual-evaluable bytecode the PK parameters use
+and replayed with θ and η seeded, giving an exact `∂lp/∂η` on every record; the logit
+likelihood then has a closed-form score,
+
+```
+∂/∂η [ softplus(lp) − y·lp ] = (p − y) · ∂lp/∂η,     p = inv_logit(lp)
+```
+
+which is added to the Gaussian rows' gradient on a joint PK + binary model. The
+objective is unchanged — only the search direction is exact instead of differenced — so
+EBEs agree with the FD route to the inner tolerance.
+
+A subject keeps the FD inner gradient for its whole objective when any record it
+carries has no analytic term: a time-to-event or count record beside the binary ones,
+or a predictor that cannot be compiled exactly (more than 24 θ + η, or an identifier
+the compiler cannot bind). The fit's `gradient_method_inner` label and its
+"*N* of *M* subjects use finite-difference inner gradients" warning report that route
+per subject.
 
 ## Objective function
 

@@ -367,7 +367,7 @@ fn iov_m3_analytic_matches_fd_estimates() {
         ferx_core::types::BloqMethod::M3
     ));
     // Gate: M3 + IOV (no iiv_on_ruv) is analytic on both loops.
-    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
         .expect("warfarin_iov_bloq data loads");
     assert!(
@@ -452,7 +452,7 @@ fn iov_m3_iiv_on_ruv_analytic_matches_fd_estimates() {
         ferx_core::types::BloqMethod::M3
     ));
     // Gate: the closed-form triple is analytic on both loops as of #591.
-    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
         .expect("warfarin_iov_bloq data loads");
     assert!(
@@ -532,7 +532,7 @@ fn iov_m3_foce_analytic_matches_fd_estimates() {
         model.bloq_method,
         ferx_core::types::BloqMethod::M3
     ));
-    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
         .expect("warfarin_iov_bloq data loads");
     assert!(
@@ -659,10 +659,8 @@ fn iov_m3_ode_matches_closed_form_estimates() {
         "ODE model must be on the ODE path"
     );
     // Both legs must be on the analytic gradient path (the thing the cross-check guards).
-    assert!(ferx_core::sens::provider::iov_analytical_supported(
-        &cf_model
-    ));
-    assert!(ferx_core::sens::ode_provider::ode_iov_supported(&ode_model));
+    assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&cf_model));
+    assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&ode_model));
 
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
         .expect("warfarin_iov_bloq data loads");
@@ -804,7 +802,7 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
     // below would quietly compare FD against FD and go green for a feature that never ran. Assert
     // the route that actually resolves: every subject's IOV provider must return `Some`.
     assert!(
-        ferx_core::sens::provider::iov_sens_supported(&model),
+        ferx_core::sens::provider::analytic_outer_gradient_available(&model),
         "lagtime + IOV must take the analytic gradient (#486)"
     );
 
@@ -818,7 +816,7 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
             let k_groups = ferx_core::stats::likelihood::iov_occasion_groups(s).len();
             let stacked = vec![0.0; model.n_eta + k_groups * n_kappa];
             assert!(
-                ferx_core::sens::provider::subject_sensitivities_iov(&model, s, theta, &stacked)
+                ferx_core::sens::provider::subject_eta_grad(&model, s, theta, &stacked)
                     .is_some(),
                 "subject {} must be served by the analytic IOV walk — if it declines, the whole                  population silently drops to FD and this test compares FD with FD",
                 s.id

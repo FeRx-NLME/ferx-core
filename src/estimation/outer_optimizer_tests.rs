@@ -202,7 +202,9 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         &model.default_params,
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
+    .frozen
     .expect("the unmapped TVFLAT must be detected and frozen");
     let idx = |name: &str| {
         model
@@ -832,6 +834,7 @@ fn test_invert_psd_with_floor_empty() {
 fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
+        cached_etas_are_modes: false,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
@@ -1703,6 +1706,8 @@ fn test_polish_is_wired_and_an_unfinished_polish_is_not_converged() {
             false,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
+            None,
+            &[],
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         (
@@ -1813,6 +1818,8 @@ fn test_short_window_latch_is_wired_and_plateau_checked() {
             false,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
+            None,
+            &[],
         )
     };
     let (on, on_outcome) = run(true);
@@ -2107,7 +2114,9 @@ fn preflight_freezes_flat_theta() {
         &model.default_params,
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
+    .frozen
     .expect("flat TVV must be detected");
     assert!(!frozen.theta_fixed[0], "active TVCL stays free");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
@@ -2134,7 +2143,9 @@ fn preflight_no_freeze_when_all_thetas_active() {
             &model.default_params,
             &options,
             &OuterFdDeclineLog::new(pop.subjects.len()),
+            false,
         )
+        .frozen
         .is_none(),
         "no theta is flat — nothing to freeze"
     );
@@ -2167,7 +2178,9 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
         &model.default_params,
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
     )
+    .frozen
     .expect("flat TVV must be detected");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen");
     assert!(
@@ -3423,6 +3436,8 @@ fn test_published_escape_verdict_uses_the_original_start() {
         false,
         &declines,
         None,
+        None,
+        &[],
     )
     .0
     .params;
@@ -3435,6 +3450,8 @@ fn test_published_escape_verdict_uses_the_original_start() {
         false,
         &declines,
         None,
+        None,
+        &[],
     );
     let (from_reference, reference_outcome) = optimize_nlopt_once(
         &model,
@@ -3447,6 +3464,8 @@ fn test_published_escape_verdict_uses_the_original_start() {
             escape_from: &reference,
             spent_evals: 0,
         }),
+        None,
+        &[],
     );
 
     // The straddle itself, asserted so it cannot silently become a tautology: the
@@ -5890,7 +5909,7 @@ mod outer_fd_fallback {
 
     /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
     /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
-    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// so the adjoint outer gradient (`subject_adjoint_packed_gradient`) declines that subject while every bolus-dosed one stays
     /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
     /// a property of the records — which is what makes it a stable fixture.
     const WARFARIN_F: &str = r#"
@@ -5899,6 +5918,7 @@ mod outer_fd_fallback {
   theta TVV(10.0, 0.1, 500.0)
   theta TVKA(1.5, 0.01, 50.0)
   theta TVF(0.7, 0.05, 1.0)
+  theta TVLAG(0.5, 0.01, 5.0)
 
   omega ETA_CL ~ 0.09
   omega ETA_V  ~ 0.04
@@ -5911,9 +5931,10 @@ mod outer_fd_fallback {
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
   F  = TVF
+  ALAG = TVLAG
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -5930,8 +5951,10 @@ mod outer_fd_fallback {
         }
     }
 
-    /// The analytic subject, and a twin whose bolus is replaced by a rate-defined
-    /// infusion the outer provider declines under `F ≠ 1`.
+    /// The analytic subject, and a twin whose bolus is replaced by a steady-state
+    /// infusion into the depot. An oral infusion routes the subject to the event walk,
+    /// and the walk declines an SS infusion under a lag time
+    /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
     fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
@@ -5941,7 +5964,7 @@ mod outer_fd_fallback {
         analytic.id = "IN_SCOPE".into();
         let mut declining = pop.subjects[0].clone();
         declining.id = "OUT_OF_SCOPE".into();
-        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0)];
         (model, analytic, declining)
     }
 
@@ -5981,26 +6004,6 @@ mod outer_fd_fallback {
         log
     }
 
-    /// Fixture precondition, asserted rather than assumed: the two subjects must land on
-    /// *opposite* sides of the provider gate. Without this the warning test below is
-    /// satisfied by a population where both decline (or neither does).
-    #[test]
-    fn fixture_subjects_straddle_the_provider_gate() {
-        let (model, analytic, declining) = analytic_and_declining();
-        let theta = &model.default_params.theta;
-        let zeros = vec![0.0; model.n_eta];
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &analytic, theta, &zeros)
-                .is_some(),
-            "in-scope subject must be served by the provider"
-        );
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &declining, theta, &zeros)
-                .is_none(),
-            "modeled-duration subject must be declined by the provider"
-        );
-    }
-
     /// The warning counts the subjects the assembly actually salvaged, and names one.
     /// Mutations that must redden it: dropping the `declines.record(i)` call, or reporting
     /// the first subject rather than the first *declining* one.
@@ -6037,7 +6040,12 @@ mod outer_fd_fallback {
     fn consequence_sentence_follows_the_salvage_route() {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
-        let log = record_one_gradient_eval(&model, &pop);
+        // A numerical (held-EBE) decline of subject 1, built directly: the fixture's real
+        // decline is structural (never servable), which takes the reconverged salvage on
+        // both sides of the gate and so cannot straddle the remedy sentence. The real
+        // evaluation is `warns_with_count_and_example_subject`'s.
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
         // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
         // read from the model inside the warning, so pairing the same log with each model
         // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
@@ -6091,12 +6099,9 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             their residuals are correlated across observation rows (a paired `block_sigma` or \
-             a `correlation` line) and the analytic outer gradient cannot serve them: the model \
-             pairs that correlation with `iiv_on_ruv`, FREM, M3, a custom residual magnitude \
-             (`weight =`, `power(...)`), a mixture, an SDE or a non-Gaussian endpoint, or the \
-             subject's dosing is outside the analytic sensitivities; those gradients include \
-             the EBE-response term but are slower.";
+             no analytic recorder serves them: their data shape is outside the recorders' scope \
+             at every parameter point (for example a steady-state infusion under a lag time on \
+             the event walk). Those gradients include the EBE-response term but are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
@@ -6253,84 +6258,6 @@ mod outer_fd_fallback {
         for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
             assert_eq!(structural_fill(nll), DeclinedFill::Zero, "nll = {nll}");
         }
-    }
-
-    /// #1960 straddle of [`is_structural_decline`]: a subject whose `block_sigma` pairs two
-    /// rows is a structural decline exactly when the dense assembly cannot serve it — on a
-    /// model outside `dense_outer_supported`, or because the sensitivity provider declines
-    /// the subject itself (a rate-defined infusion under `F ≠ 1`, #419) — and never for an
-    /// unpaired subject. Every cell is asserted, so dropping any of the three conditions
-    /// (the pairing, the dense-scope carve-out, the provider decline) reddens it.
-    #[test]
-    fn structural_decline_is_a_cross_row_residual_the_dense_assembly_cannot_serve() {
-        const SRC: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(0.7, 0.05, 1.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n  KA = TVKA\n  F  = TVF\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n";
-        let model = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
-        assert!(crate::estimation::sens_outer_gradient::dense_outer_supported(&model));
-        let mut outside = crate::parser::model_parser::parse_model_string(SRC).expect("parses");
-        // A dense-scope exclusion the sensitivity provider still serves (IOV would not
-        // do: the provider declines it too, so the two clauses would cover for each other
-        // and dropping the dense one would leave this test green).
-        outside.bloq_method = crate::types::BloqMethod::M3;
-        assert!(!crate::estimation::sens_outer_gradient::dense_outer_supported(&outside));
-
-        let subject = |times: &[f64]| {
-            let n = times.len();
-            let (_, analytic, _) = analytic_and_declining();
-            let mut s = analytic;
-            s.obs_times = times.to_vec();
-            s.obs_raw_times = Vec::new();
-            s.observations = vec![1.0; n];
-            s.obs_cmts = vec![1; n];
-            s.cens = vec![0; n];
-            s.occasions = vec![1; n];
-            s.obs_l2 = Vec::new();
-            s.obs_covariates = (0..n)
-                .map(|j| std::collections::HashMap::from([("FREE".into(), (j % 2) as f64)]))
-                .collect();
-            s
-        };
-        let paired = subject(&[1.0, 1.0, 4.0, 4.0]);
-        let unpaired = subject(&[1.0, 2.0, 4.0, 5.0]);
-        let params = &model.default_params;
-        let eta = vec![0.0; model.n_eta];
-        for (m, name, in_dense_scope) in [(&model, "in scope", true), (&outside, "outside", false)]
-        {
-            assert_eq!(
-                is_structural_decline(m, &paired, params, &eta),
-                !in_dense_scope,
-                "paired, {name}"
-            );
-            assert!(
-                !is_structural_decline(m, &unpaired, params, &eta),
-                "unpaired, {name}"
-            );
-        }
-        // The provider-decline cell: the same subjects with their bolus swapped for a
-        // rate-defined infusion, which the provider declines under `F ≠ 1` on the in-scope
-        // model. The straddle is asserted, so the cell cannot quietly stop declining.
-        let infused = |mut s: Subject| {
-            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
-            s
-        };
-        let (paired_inf, unpaired_inf) = (infused(paired.clone()), infused(unpaired.clone()));
-        let theta = &params.theta;
-        for m in [&model, &outside] {
-            assert!(
-                crate::sens::provider::subject_sensitivities(m, &paired, theta, &eta).is_some()
-            );
-        }
-        assert!(
-            crate::sens::provider::subject_sensitivities(&model, &paired_inf, theta, &eta)
-                .is_none()
-        );
-        assert!(
-            is_structural_decline(&model, &paired_inf, params, &eta),
-            "paired, provider declines"
-        );
-        assert!(
-            !is_structural_decline(&model, &unpaired_inf, params, &eta),
-            "unpaired, provider declines"
-        );
     }
 
     /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject
@@ -7108,157 +7035,6 @@ mod outer_fd_fallback {
     }
 
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
-
-    /// T7, the routing straddle. A subject whose `ARM` holds two or more rows has an `R`
-    /// that depends on ρ directly, so it takes the dense assembly, whose θ block carries
-    /// `∂R/∂ρ` (#1960; before, it declined to the reconverged FD gradient, #1536); a
-    /// subject whose arms are all singletons has an `R` free of ρ and stays on the scalar
-    /// assembly, with `∂/∂ρ = 0` correctly. Both are analytic and nothing declines; then
-    /// the population gradient's ρ component is checked against a central difference of
-    /// the population objective. Dies if `has_cross_observation_residual` ignores the
-    /// serial source (the paired subject then takes the scalar assembly and reports
-    /// `∂/∂ρ = 0`) or if the dense θ block drops the direct ρ channel. Run for `cs` (ρ
-    /// packed on the linear scale, its lower bound negative) and `car1` (lower bound 0,
-    /// so ρ is log-packed and the FD step is on `log ρ`), whose `R` reads ρ through
-    /// `ρ^|Δt|` at the fixture's non-integer gaps.
-    #[test]
-    fn serial_rho_routes_paired_subjects_to_the_dense_assembly() {
-        for (kind, lower) in [("cs", "-0.4"), ("car1", "0.0")] {
-            serial_rho_routes_paired_subjects_case(kind, lower);
-        }
-    }
-
-    fn serial_rho_routes_paired_subjects_case(kind: &str, lower: &str) {
-        let model = crate::parser::model_parser::parse_model_string(&format!(
-            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  theta RHO(0.4, {lower}, 0.95)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.15 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation {kind}(RHO) by ARM\n[fit_options]\n  method = focei\n",
-        ))
-        .expect("model parses");
-        let subject = |id: &str, arms: [f64; 6], scale: f64| {
-            let mut s = Subject {
-                id: id.into(),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
-                obs_cmts: vec![1; 6],
-                cens: vec![0; 6],
-                obs_covariates: arms
-                    .iter()
-                    .map(|a| HashMap::from([("ARM".to_string(), *a)]))
-                    .collect(),
-                ..Default::default()
-            };
-            let f = crate::pk::compute_predictions_with_tv(
-                &model,
-                &s,
-                &model.default_params.theta,
-                &[0.0],
-            );
-            s.observations = f
-                .iter()
-                .enumerate()
-                .map(|(j, v)| v * scale + if j % 2 == 0 { 0.4 } else { -0.3 })
-                .collect();
-            s.obs_rgroup = crate::stats::residual_error::residual_groups(&model, &s);
-            s
-        };
-        let paired = subject("PAIRED", [1.0, 1.0, 1.0, 2.0, 2.0, 2.0], 1.2);
-        let singles = subject("SINGLES", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0.85);
-        let pop = mk_pop(vec![paired, singles]);
-        let template = &model.default_params;
-        let PackedStart {
-            packed: x, bounds, ..
-        } = pack_with_bounds(template);
-        let opts = FitOptions {
-            method: EstimationMethod::FoceI,
-            interaction: true,
-            ..FitOptions::default()
-        };
-        let (ehs, hms, _) = solve_at(&model, &pop, template, &x, &opts);
-        // The straddle: cross-row on one side of the predicate, not on the other — and
-        // both analytic.
-        for (i, cross) in [(0, true), (1, false)] {
-            assert_eq!(
-                crate::stats::residual_error::has_cross_observation_residual(
-                    &model.error_spec,
-                    &pop.subjects[i],
-                    &template.sigma.values,
-                    model.residual_cov_at(template),
-                ),
-                cross,
-                "{kind}: subject {i}"
-            );
-        }
-        assert!(
-            subject_analytic_outer_gradient(
-                &model,
-                &pop.subjects[0],
-                template,
-                &x,
-                ehs[0].as_slice(),
-                true
-            )
-            .is_some(),
-            "{kind}: a subject with a multi-row block takes the dense assembly"
-        );
-        assert!(
-            subject_analytic_outer_gradient(
-                &model,
-                &pop.subjects[1],
-                template,
-                &x,
-                ehs[1].as_slice(),
-                true
-            )
-            .is_some(),
-            "{kind}: a subject of singleton blocks must stay analytic"
-        );
-        let log = OuterFdDeclineLog::new(pop.subjects.len());
-        let g = population_gradient_sens_mixed(
-            &x,
-            template,
-            &model,
-            &pop,
-            &ehs,
-            &hms,
-            &bounds,
-            &opts,
-            OuterTrial::unknown(),
-            &log,
-        );
-        assert!(
-            log.declined_indices().is_empty(),
-            "{kind}: nothing declines"
-        );
-        // ρ is θ index 2: linear-packed under `cs`, log-packed under `car1`.
-        assert_eq!(
-            crate::estimation::parameterization::theta_packs_log(template.theta_lower[2]),
-            kind == "car1"
-        );
-        let k = 2;
-        let h = 1e-5;
-        let ofv_at = |dx: f64| {
-            let mut xx = x.clone();
-            xx[k] += dx;
-            solve_at(&model, &pop, template, &xx, &opts)
-                .2
-                .iter()
-                .sum::<f64>()
-        };
-        let fd = (ofv_at(h) - ofv_at(-h)) / (2.0 * h);
-        assert!(
-            g[k].is_finite() && fd.is_finite(),
-            "{kind}: g {} fd {fd}",
-            g[k]
-        );
-        assert!(
-            fd.abs() > 1e-2,
-            "{kind}: fixture: ρ moves the objective ({fd})"
-        );
-        assert!(
-            (g[k] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
-            "{kind}: ∂OFV/∂ρ: assembled {} vs FD {fd}",
-            g[k]
-        );
-    }
 }
 
 // ── #1934: the BHHH Newton decrement and the latch-time veto ───────────────────────
@@ -7753,11 +7529,16 @@ fn predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one() {
         gain_is_negligible(Some(exact_optimum)),
         "optimum: {exact_optimum}"
     );
-    // The fixture's integrator noise is real: at the fit's tolerance the optimum reads as a
-    // creep, so a decrement that skipped the tight re-solve fails the agreement below.
+    // At the fit's own tolerance this read 1.85 at the optimum before #2093 — a creep, which
+    // is why #2001 re-solves tightly. Since #2093 it reads 0.0083989 (exact 0.0083205): the
+    // noise was in the fit-tolerance EBEs' stationarity, which the ODE noise-floor exit now
+    // carries past the objective's resolution when the gradient can still see the mode
+    // (`gradient_verified_step`). So on this fixture the tight re-solve is no longer what
+    // makes the decrement right, and skipping it no longer fails this test; the agreement
+    // rows below still pin that the tight re-solve itself returns the exact value.
     assert!(
-        !gain_is_negligible(Some(loose_optimum)),
-        "fit-tolerance optimum: {loose_optimum}"
+        gain_is_negligible(Some(loose_optimum)) && (loose_optimum - exact_optimum).abs() < 1e-3,
+        "fit-tolerance optimum: {loose_optimum} vs exact {exact_optimum}"
     );
     for (label, got, want) in [
         ("latch", rk45_latch, exact_latch),
@@ -8323,10 +8104,18 @@ fn predicted_remaining_gain_straddles_the_issue_1934_false_stop() {
 /// SLSQP on the #1934 model's ODE twin (`ode_method = auto`) from TVQ = 0.01 latched at
 /// −204.41 and reported converged, 227.8 short of NONMEM's −432.17 — the #1934 false stop
 /// again, one model block over. At both of #1934's points the decrement is the closed
-/// form's: measured on Linux x86_64, 14.832907993 vs 14.832907995 at the false stop and
-/// 5.7691e-7 vs 5.7670e-7 at NONMEM's optimum — 1.7e-9 and 2.1e-10 apart. The bound is
-/// 1e-7 absolute (60× the worse), a millionth of the 0.1 threshold, so the straddle
-/// carries over unchanged.
+/// form's, to the decrement's own floating-point floor, which is why the bound is relative.
+/// At the false stop (TVQ 0.011638) Q is nearly unidentified and the BHHH system
+/// ill-conditioned: re-evaluating the *closed form* with every EBE scaled by `1 ± k·ε`,
+/// k ≤ 8, spreads its gain over 2.37e-7 on Linux aarch64 (2.41e-7 on macOS arm64) — 1.6e-8
+/// relative — so any reordering of the arithmetic moves it by ~1e-7 (#2160: the former
+/// 1e-7 absolute bound, set in #2143 from a 1.7e-9 Linux x86_64 reading, went red on
+/// macOS at `c5e78b48` and sat at 3.2e-8 on Linux aarch64 at `badfdd5e`). Measured on Linux
+/// aarch64 at `badfdd5e`: 14.832907827586 vs 14.832907859785 at the false stop (3.2e-8,
+/// 2.2e-9 relative) and 5.77066912164e-7 vs 5.77066912252e-7 at NONMEM's optimum (8.7e-17,
+/// 1.5e-10 relative; floor 9.6e-18). The bound is 1e-6 relative — 60× the false stop's
+/// floor, 450× its reading — which is 1.5e-5 at the false stop, still four orders below the
+/// 0.1 threshold, so the straddle carries over unchanged.
 #[test]
 fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
     use crate::parser::model_parser::parse_model_string;
@@ -8374,7 +8163,7 @@ fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
         let got = gain_at(&ode, &pop, &opts).expect("exact ODE");
         eprintln!("closed {want:e}, exact ODE {got:e}");
         assert!(
-            got.is_finite() && (got - want).abs() <= 1e-7,
+            got.is_finite() && (got - want).abs() <= 1e-6 * want.abs(),
             "exact ODE {got} vs closed form {want}"
         );
         gains.push(got);
@@ -8653,6 +8442,8 @@ fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64
         false,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
+        None,
+        &[],
     );
     eprintln!("{label}: OFV {}", result.ofv);
     assert!(
@@ -8752,7 +8543,7 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
     let (alg_model, alg_pop) = fx::prepared(&fx::algebraic(), 1);
     for m in [&cf_model, &ode_model, &alg_model] {
         assert!(
-            crate::sens::provider::iov_sens_supported(m)
+            crate::sens::ode_provider::adjoint::model_in_scope(m)
                 && crate::sens::provider::analytic_outer_gradient_available(m),
             "the outer gradient must be analytic"
         );
@@ -8836,18 +8627,13 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
     }
 }
 
-/// #1082 PR5, V6: on an IOV model with a residual `correlation` line, the outer gradient
-/// handed to the optimizer is central differences of the (reconverged) OFV, on FOCE and on
-/// FOCEI. The IOV outer assemblies score a diagonal `R`: FOCEI's declines per subject, but
-/// FOCE's (`subject_packed_gradient_foce_iov`) would differentiate the diagonal `R⁰`, with
-/// no `∂/∂ρ` at all. So the one gate is the structural decline in
-/// `analytic_outer_gradient_in_scope`; the model without the line keeps the analytic
-/// gradient (the straddle, asserted).
-///
-/// Mutation: delete that decline → the FOCE gradient is the diagonal-`R⁰` analytic one, and
-/// its ρ component is 0 against a finite difference of 20.73 (measured). FOCE and FOCEI
-/// give the same number here: with additive error the Gauss–Newton Laplace marginal is the
-/// Sheiner–Beal one (Woodbury), so the two paths differ only in which assembly would run.
+/// #1082 PR5 / #2101: on a nested-level model with a residual `correlation ar1(RHO) by
+/// ARM` line, the outer gradient handed to the optimizer is the adjoint's — every subject
+/// served by it, no FD salvage — and matches central differences of the reconverged OFV on
+/// FOCE and FOCEI, ρ included (∂OFV/∂ρ ≈ 20.7, so a gradient that ignored the dense `R`'s
+/// off-diagonal, as the diagonal IOV assemblies would, is far off). FOCE and FOCEI give the
+/// same number here: with additive error the Gauss–Newton Laplace marginal is the
+/// Sheiner–Beal one (Woodbury).
 #[test]
 fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     use crate::stats::nested_levels::test_helpers as fx;
@@ -8864,9 +8650,7 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let (m, mut pop) = fx::prepared(&src, 1);
     crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
     let (m_plain, _) = fx::prepared(&plain, 1);
-    assert!(!crate::sens::provider::analytic_outer_gradient_available(
-        &m
-    ));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert!(crate::sens::provider::analytic_outer_gradient_available(
         &m_plain
     ));
@@ -8878,10 +8662,17 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
     let rho = params.theta.len() - 1;
     assert_eq!(m.residual_serial.as_ref().unwrap().rho_theta, rho);
     let n = pop.subjects.len();
+    // At the default `inner_tol` the gap measured 4.5e-6 (FOCE = FOCEI here). It does not
+    // shrink at 1e-8 or 1e-10 (1.2e-5, 5.3e-6): it is the stencil's truncation, as the
+    // Richardson oracle on the same subject without the line shows (#2101,
+    // `cov_hessian_matches_profile_fd_nested_residual_correlation`). Bound: ~2× the worst.
+    let inner_tol = FitOptions::default().inner_tol;
     for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
         let opts = FitOptions {
             method,
             interaction: method == EstimationMethod::FoceI,
+            inner_tol,
+            inner_maxiter: 2000,
             ..FitOptions::default()
         };
         let (ehs, hms, _, kappas) = run_inner_loop_warm(
@@ -8910,6 +8701,26 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             OuterTrial::unknown(),
             &OuterFdDeclineLog::new(n),
         );
+        // Every subject on the adjoint, so the comparison below is of its gradient.
+        for (i, s) in pop.subjects.iter().enumerate() {
+            let mut b = ehs[i].as_slice().to_vec();
+            for k in &kappas[i] {
+                b.extend(k.iter());
+            }
+            assert!(
+                crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+                    &m,
+                    s,
+                    params,
+                    &x,
+                    &b,
+                    opts.interaction,
+                )
+                .is_some(),
+                "{method:?}: subject {} declined the adjoint",
+                s.id
+            );
+        }
         let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
         assert_eq!(g.len(), fd.len());
         eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
@@ -8917,12 +8728,1074 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
             fd[rho].is_finite() && fd[rho].abs() > 0.1,
             "{method:?}: ρ is live"
         );
+        let mut worst = 0.0f64;
         for (k, (a, b)) in g.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && b.is_finite(), "{method:?}[{k}]");
-            assert!(
-                (a - b).abs() <= 1e-6 * (1.0 + b.abs()),
-                "{method:?}[{k}]: handed {a} vs FD of the OFV {b}"
-            );
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
         }
+        eprintln!("{method:?}: worst {worst:.2e} at inner_tol {inner_tol:e}");
+        assert!(
+            worst <= 1e-5,
+            "{method:?}: handed vs FD of the OFV {worst:.2e}"
+        );
     }
+}
+
+/// The mid-leg basin probe's schedule (#2093): 32, 64, 128, … feasible evaluations, so a
+/// leg pays a logarithmic number of cold passes and none before its 32nd evaluation.
+#[test]
+fn the_basin_probe_runs_on_a_geometric_schedule() {
+    let due: Vec<usize> = (1..=600).filter(|&n| basin_probe_due(n)).collect();
+    assert_eq!(due, vec![32, 64, 128, 256, 512]);
+}
+
+/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
+/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
+/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
+/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
+/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
+/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
+/// it does again. `main` and the previous head reached −1173.559691.
+#[cfg(feature = "nn")]
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+    let r = crate::fit_from_files(
+        "examples/warfarin_dcm.ferx",
+        Some("data/warfarin_dcm.csv"),
+        None,
+        None,
+    )
+    .expect("warfarin_dcm fits");
+    assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
+    assert!(
+        r.ofv < -1180.0,
+        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv
+    );
+}
+
+/// The restart chain (#2093): a basin-shift restart repeats while each one is adopted and
+/// its own leg ends in a basin shift, at most `MAX_BASIN_RESTARTS` more; a rejected restart
+/// ends the chain on the result it already had; a mid-descent stall's restart may be followed
+/// by a basin-shift one, but a second stall is not restarted again.
+#[test]
+fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() {
+    use crate::estimation::outer_optimizer::{
+        resolve_restart_chain, RestartCause, MAX_BASIN_RESTARTS,
+    };
+    use std::cell::Cell;
+    let ofv = |x: &f64| *x;
+
+    // Three basin shifts, then a clean leg: four legs, the last one reported.
+    let calls = Cell::new(0);
+    let legs = [
+        (-20.0, Some(RestartCause::BasinShift)),
+        (-30.0, Some(RestartCause::BasinShift)),
+        (-40.0, None),
+    ];
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::BasinShift)),
+        |_: &f64, c| {
+            assert_eq!(c, RestartCause::BasinShift);
+            let k = calls.get();
+            calls.set(k + 1);
+            legs[k]
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-40.0, 3));
+
+    // Every leg traps again: the chain stops after the first restart plus the cap.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (0.0, Some(RestartCause::BasinShift)),
+        |prev: &f64, _| {
+            calls.set(calls.get() + 1);
+            (prev - 1.0, Some(RestartCause::BasinShift))
+        },
+        ofv,
+    );
+    assert_eq!(calls.get(), 1 + MAX_BASIN_RESTARTS);
+    assert_eq!(got, -((1 + MAX_BASIN_RESTARTS) as f64));
+
+    // A restart that ends higher is rejected, and nothing is retried from it.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::BasinShift)),
+        |_: &f64, _| {
+            calls.set(calls.get() + 1);
+            (-5.0, Some(RestartCause::BasinShift))
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-10.0, 1));
+
+    // A mid-descent restart whose leg ends in a basin shift gets one basin restart…
+    let causes = std::cell::RefCell::new(Vec::new());
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::MidDescent)),
+        |prev: &f64, c| {
+            causes.borrow_mut().push(c);
+            let next = if c == RestartCause::MidDescent {
+                Some(RestartCause::BasinShift)
+            } else {
+                None
+            };
+            (prev - 1.0, next)
+        },
+        ofv,
+    );
+    assert_eq!(got, -12.0);
+    assert_eq!(
+        *causes.borrow(),
+        vec![RestartCause::MidDescent, RestartCause::BasinShift]
+    );
+
+    // …but a second mid-descent stall is reported as a stall, not restarted again.
+    let calls = Cell::new(0);
+    let got = resolve_restart_chain(
+        false,
+        false,
+        (-10.0, Some(RestartCause::MidDescent)),
+        |prev: &f64, _| {
+            calls.set(calls.get() + 1);
+            (prev - 1.0, Some(RestartCause::MidDescent))
+        },
+        ofv,
+    );
+    assert_eq!((got, calls.get()), (-11.0, 1));
+}
+
+/// Runs `f` on a one-thread pool and returns its result with the number of inner
+/// multi-starts it entered (#2076). The counter is thread-local, so the pool must be
+/// single-threaded for every solve to land on the thread that reads it.
+fn count_multistarts<R: Send>(f: impl FnOnce() -> R + Send) -> (R, usize) {
+    use crate::estimation::inner_optimizer::EBE_MULTISTARTS_STARTED;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let m0 = EBE_MULTISTARTS_STARTED.with(|n| n.get());
+        let r = f();
+        (r, EBE_MULTISTARTS_STARTED.with(|n| n.get()) - m0)
+    })
+}
+
+/// The `make_model` twin whose `TVV` never reaches the objective, so the flat-theta
+/// pre-flight freezes it (as in `preflight_freezes_flat_theta`).
+fn make_flat_tvv_model() -> CompiledModel {
+    let mut model = make_model();
+    model.pk_param_fn = Box::new(
+        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = 50.0;
+            p
+        },
+    );
+    model
+}
+
+/// #2076: the flat-theta pre-flight's cold solve and the optimizer's first evaluation are
+/// the same EBE problem, so the first evaluation is seeded from the pre-flight's EBEs and
+/// runs no multi-start of its own. Measured on the leg itself: the cold first evaluation
+/// costs exactly the pre-flight's multi-starts, the seeded one none, and both reach the
+/// same objective. The final cold re-solve multi-starts on both legs and cancels in the
+/// difference.
+#[test]
+fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
+    use crate::types::{EstimationMethod, FitOptions, Optimizer};
+    let model = make_model();
+    let pop = make_population(4);
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        optimizer: Optimizer::Bobyqa,
+        outer_maxiter: 1,
+        inner_restarts: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = &model.default_params;
+    let (preflight, pre) = count_multistarts(|| {
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            init,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            false,
+        )
+    });
+    assert!(
+        preflight.frozen.is_none(),
+        "every theta of make_model is live"
+    );
+    let etas = preflight.etas.expect("the pre-flight solved");
+    // The fixture must reach the gate: at least one multi-start per subject.
+    assert!(
+        pre >= pop.subjects.len(),
+        "pre-flight ran {pre} multi-starts on {} subjects",
+        pop.subjects.len()
+    );
+    let leg = |seed: Option<&[DVector<f64>]>| {
+        count_multistarts(|| {
+            optimize_nlopt_once(
+                &model,
+                &pop,
+                init,
+                &opts,
+                false,
+                &OuterFdDeclineLog::new(pop.subjects.len()),
+                None,
+                seed,
+                &[],
+            )
+            .0
+        })
+    };
+    let (cold, cold_n) = leg(None);
+    let (seeded, seeded_n) = leg(Some(&etas));
+    assert_eq!(
+        cold_n - seeded_n,
+        pre,
+        "the seeded first evaluation must skip exactly the pre-flight's multi-starts \
+         (cold leg {cold_n}, seeded leg {seeded_n}, pre-flight {pre})"
+    );
+    assert!(cold.ofv.is_finite() && seeded.ofv.is_finite());
+    assert!(
+        (cold.ofv - seeded.ofv).abs() < 1e-6 * (1.0 + cold.ofv.abs()),
+        "seeding moved the objective: cold {} vs seeded {}",
+        cold.ofv,
+        seeded.ofv
+    );
+}
+
+/// One #2076 measurement: the flat-theta pre-flight on its own, `optimize_population`,
+/// and the same optimizer run directly from a cold cache on the parameters
+/// `optimize_population` hands it, each with the multi-starts it ran.
+struct PreflightReuse {
+    preflight: FlatThetaPreflight,
+    pre_n: usize,
+    fit_n: usize,
+    cold_n: usize,
+}
+
+fn measure_preflight_reuse(
+    model: &CompiledModel,
+    pop: &Population,
+    optimizer: Optimizer,
+    inner_maxiter: usize,
+) -> PreflightReuse {
+    use crate::types::{EstimationMethod, FitOptions};
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        optimizer,
+        outer_maxiter: 1,
+        inner_maxiter,
+        inner_restarts: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let declines = || OuterFdDeclineLog::new(pop.subjects.len());
+    let (preflight, pre_n) = count_multistarts(|| {
+        freeze_flat_thetas(model, pop, &model.default_params, &opts, &declines(), false)
+    });
+    let (fit, fit_n) =
+        count_multistarts(|| optimize_population(model, pop, &model.default_params, &opts));
+    assert!(fit.ofv.is_finite(), "{optimizer:?}: non-finite OFV");
+    let init = preflight
+        .frozen
+        .as_ref()
+        .map_or(&model.default_params, |(p, _)| p);
+    let cold_n = count_multistarts(|| match optimizer {
+        Optimizer::Bobyqa => optimize_nlopt(model, pop, init, &opts, &declines(), None, &[]),
+        Optimizer::Bfgs => optimize_bfgs(model, pop, init, &opts, &declines(), None),
+        _ => crate::estimation::trust_region::optimize_trust_region(model, pop, init, &opts),
+    })
+    .1;
+    assert!(
+        pre_n >= pop.subjects.len(),
+        "{optimizer:?}: the pre-flight must reach the multi-start gate ({pre_n})"
+    );
+    PreflightReuse {
+        preflight,
+        pre_n,
+        fit_n,
+        cold_n,
+    }
+}
+
+const REUSE_OPTIMIZERS: [Optimizer; 3] =
+    [Optimizer::Bobyqa, Optimizer::Bfgs, Optimizer::TrustRegion];
+
+/// #2076, both sides of the "same point" gate end to end, per optimizer family. With
+/// nothing frozen the pre-flight's multi-starts stand in for the first evaluation's, so
+/// the fit costs exactly the cold run; with a theta frozen the pre-flight's EBEs are
+/// dropped, and the fit costs the pre-flight on top of the cold run.
+#[test]
+fn optimize_population_reuses_preflight_etas_only_when_nothing_is_frozen() {
+    let pop = make_population(4);
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 200);
+        assert!(
+            m.preflight.frozen.is_none(),
+            "every theta of make_model is live"
+        );
+        assert!(m.preflight.etas.is_some(), "{optimizer:?}: seed withheld");
+        assert_eq!(
+            m.fit_n, m.cold_n,
+            "{optimizer:?}: the first evaluation re-ran the multi-start \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n, m.fit_n, m.cold_n
+        );
+
+        let m = measure_preflight_reuse(&make_flat_tvv_model(), &pop, optimizer, 200);
+        assert!(m.preflight.frozen.is_some(), "the flat TVV must be frozen");
+        assert_eq!(
+            m.fit_n,
+            m.pre_n + m.cold_n,
+            "{optimizer:?}: a frozen fit must solve its first evaluation cold \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n,
+            m.fit_n,
+            m.cold_n
+        );
+    }
+}
+
+/// #2076 review: a subject with no observations has the prior's mode, η̂ = 0 exactly,
+/// which the value test alone reads as the cold placeholder. The pre-flight certifies it
+/// as a mode (`InnerSolvePolicy::init_is_mode`), so the first evaluation does not re-scan
+/// it either, and the fit still costs exactly the cold run.
+#[test]
+fn an_exactly_zero_preflight_mode_still_skips_the_first_eval_multistart() {
+    let mut pop = make_population(4);
+    let empty = &mut pop.subjects[3];
+    empty.id = "EMPTY".into();
+    empty.obs_times.clear();
+    empty.observations.clear();
+    empty.obs_cmts.clear();
+    empty.cens.clear();
+    empty.occasions.clear();
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 200);
+        let etas = m.preflight.etas.as_ref().expect("every subject converged");
+        assert!(
+            etas[3].iter().all(|&v| v == 0.0),
+            "fixture: the empty subject's mode must be exactly zero, got {:?}",
+            etas[3]
+        );
+        assert!(
+            etas[0].iter().any(|&v| v != 0.0),
+            "fixture: an informed subject's mode must be nonzero"
+        );
+        assert_eq!(
+            m.fit_n, m.cold_n,
+            "{optimizer:?}: the zero-mode subject was re-scanned on the first evaluation \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n, m.fit_n, m.cold_n
+        );
+    }
+}
+
+/// #2076 review: a pre-flight subject that exhausts `inner_maxiter` stopped on a partial
+/// descent, not a mode. Handing it over would make the first evaluation warm — no second
+/// Hessian metric, no multi-start, a fresh iteration budget — and change the first
+/// objective. So the pre-flight withholds every EBE, and the fit pays the pre-flight on
+/// top of the cold run, as before #2076. The converged side of the same gate is
+/// `optimize_population_reuses_preflight_etas_only_when_nothing_is_frozen`.
+#[test]
+fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
+    let pop = make_population(4);
+    for optimizer in REUSE_OPTIMIZERS {
+        let m = measure_preflight_reuse(&make_model(), &pop, optimizer, 1);
+        assert!(m.preflight.frozen.is_none());
+        assert!(
+            m.preflight.etas.is_none(),
+            "{optimizer:?}: an unconverged pre-flight must not seed the first evaluation"
+        );
+        assert_eq!(
+            m.fit_n,
+            m.pre_n + m.cold_n,
+            "{optimizer:?}: the first evaluation must solve cold \
+             (pre-flight {}, fit {}, cold run {})",
+            m.pre_n,
+            m.fit_n,
+            m.cold_n
+        );
+    }
+}
+
+// ── identity_theta_scales: near-zero identity-packed θ (#2159) ───────────
+
+/// A fake objective, quadratic in each θ separately: `f = base + w·k·(v − m)²` minus
+/// its value at the start, with `k` a replication factor. Its Newton step from the
+/// three probes is exact, so the decision is pinned without solver noise.
+fn quadratic_probe(
+    theta: &[f64],
+    minimizers: &[f64],
+    weight: f64,
+    k: f64,
+    base: f64,
+) -> impl Fn(usize, f64) -> f64 {
+    let theta = theta.to_vec();
+    let minimizers = minimizers.to_vec();
+    move |i, v| {
+        let m = minimizers[i];
+        base + k * weight * ((v - m).powi(2) - (theta[i] - m).powi(2))
+    }
+}
+
+/// The candidate filter and the decision. θ in order: `[TVCL 0.2 (log-packed),
+/// NEAR 1e-5 (minimizer 7.74e-6), FAR 0.001 (minimizer 0.65), HELD 1e-5, ZERO 0,
+/// AT_GATE 0.1, NEG_NEAR -2e-3 (minimizer -3e-3), NEG_FAR -0.05 (minimizer 2.0)]`.
+///
+/// `NEAR` and `NEG_NEAR` have their minimizers within a few `|θ₀|` (0.23 and 0.5), so
+/// only they are scaled, by `|θ₀|` (the `abs` pinned by `NEG_NEAR`). `FAR` (649 `|θ₀|`)
+/// and `NEG_FAR` (41) keep scale 1. Each candidate is probed at `θ₀ ∓ ½|θ₀|`, lower
+/// point first;
+/// `TVCL`, `HELD`, `ZERO` and `AT_GATE` are never probed.
+#[test]
+fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size() {
+    let theta = [0.2, 1e-5, 0.001, 1e-5, 0.0, 0.1, -2e-3, -0.05];
+    let minimizers = [
+        f64::NAN,
+        7.74e-6,
+        0.65,
+        f64::NAN,
+        f64::NAN,
+        f64::NAN,
+        -3e-3,
+        2.0,
+    ];
+    let lower = [0.001, -5e-4, -5.0, -5e-4, -1.0, -1.0, -1.0, -5.0];
+    let upper = [10.0, 5e-4, 5.0, 5e-4, 1.0, 1.0, 1.0, 5.0];
+    // Weight 1e12: halving `NEAR` costs 25 OFV units, well above the noise floor.
+    let f = quadratic_probe(&theta, &minimizers, 1e12, 1.0, -180.0);
+    let mut probed = Vec::new();
+    let got = identity_theta_scales(
+        &theta,
+        &lower,
+        &upper,
+        |i| i == 3,
+        || -180.0,
+        |i, v| {
+            probed.push((i, v));
+            f(i, v)
+        },
+    );
+    assert_eq!(got, vec![(1, 1e-5), (6, 2e-3)]);
+    let want = [
+        (1, 0.5e-5),
+        (1, 1.5e-5),
+        (2, 0.0005),
+        (2, 0.0015),
+        (6, -3e-3),
+        (6, -1e-3),
+        (7, -0.075),
+        (7, -0.025),
+    ];
+    assert_eq!(probed.len(), want.len(), "{probed:?}");
+    for ((i, v), (wi, wv)) in probed.iter().zip(want) {
+        assert_eq!(*i, wi);
+        assert!(
+            (v - wv).abs() <= 1e-12 * wv.abs(),
+            "θ{i}: probed {v:e}, want {wv:e}"
+        );
+    }
+}
+
+/// The decision's edges, on one candidate θ₀ = 1e-3 in `(-1, 1)`.
+#[test]
+fn identity_theta_scales_edges() {
+    let decide = |minimizer: f64| {
+        let f = quadratic_probe(&[1e-3], &[minimizer], 1e6, 1.0, 50.0);
+        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, f)
+    };
+    // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
+    assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
+    assert_eq!(decide(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
+    assert_eq!(decide(1e-3 + 10.1e-3), vec![], "past the bar");
+
+    let with = |f_minus: f64, f_plus: f64| {
+        identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_, v| if v < 1e-3 { f_minus } else { f_plus },
+        )
+    };
+    assert_eq!(with(f64::NAN, 50.0), vec![(0, 1e-3)], "a NaN probe scales");
+    assert_eq!(with(50.0, 2e20), vec![(0, 1e-3)], "a diverged probe scales");
+    assert_eq!(with(49.0, 49.0), vec![], "concave: no step to trust");
+    assert_eq!(with(49.0, 51.0), vec![], "linear: no curvature");
+    // A curvature at the tolerance, 1e-6·(1 + 50), is noise; twice it is not — and
+    // with no gradient the predicted step is zero.
+    let tol = 1e-6 * 51.0;
+    assert_eq!(with(50.0 + tol / 2.0, 50.0 + tol / 2.0), vec![]);
+    assert_eq!(with(50.0 + tol, 50.0 + tol), vec![(0, 1e-3)]);
+
+    // No room on either side for a spacing of 0.05·|θ₀|: nothing is probed.
+    let mut probed = Vec::new();
+    let boxed = identity_theta_scales(
+        &[1e-3],
+        &[0.99e-3],
+        &[1.01e-3],
+        |_| false,
+        || 50.0,
+        |_, v| {
+            probed.push(v);
+            f64::NAN
+        },
+    );
+    assert_eq!((boxed, probed.len()), (vec![], 0));
+}
+
+/// `identity_probe_points` keeps every probe inside the declared box, equally spaced
+/// and through θ₀, over a grid of starts and boxes that includes a negative-only box,
+/// a positive-only one, θ₀ on either bound, and boxes tight on one side (#2159
+/// review: the first version probed `θ₀·(1 − h)`, above a negative upper bound).
+#[test]
+fn identity_probe_points_stay_in_the_box() {
+    let cases = [
+        // (θ₀, lower, upper, central?)
+        (1e-3, -1.0, 1.0, true),
+        (-1e-3, -1.0, 1.0, true),
+        (-1e-3, -5.0, -0.0009, false), // negative-only, near its upper bound
+        (1e-3, -5.0, 1e-3, false),     // at its upper (outward) bound
+        (-1e-3, -1e-3, 5.0, false),    // at its lower (outward) bound
+        (1e-3, 0.99e-3, 5.0, false),   // tight below
+        (1e-5, -5e-4, 5e-4, true),
+        (0.05, -0.06, 0.051, false),
+    ];
+    for (t, lo, hi, central) in cases {
+        let p = identity_probe_points(t, lo, hi).unwrap_or_else(|| panic!("{t} in [{lo}, {hi}]"));
+        assert!(
+            p.iter().all(|&x| (lo..=hi).contains(&x)),
+            "{p:?} outside [{lo}, {hi}]"
+        );
+        assert!(p.contains(&t), "{p:?} misses θ₀ = {t}");
+        let (d0, d1) = (p[1] - p[0], p[2] - p[1]);
+        assert!(
+            d0 > 0.0 && (d0 - d1).abs() <= 1e-12 * d0,
+            "{p:?} not equally spaced"
+        );
+        assert!(d0 >= IDENTITY_PROBE_MIN_FRACTION * t.abs(), "{p:?}");
+        assert_eq!(p[1] == t, central, "{p:?} for {t} in [{lo}, {hi}]");
+    }
+    assert_eq!(identity_probe_points(1e-3, 0.99e-3, 1.01e-3), None);
+}
+
+/// The two boxes the review named, end to end through the decision: a negative-only
+/// box (`theta X(-0.001, -5, -0.0009)`) whose minimizer is at -1.2e-3, and a θ
+/// started on its outward bound (`(0.001, -5, 0.001)`) whose minimizer is inward at
+/// 8e-4. Both are scaled, and no probe leaves the box.
+#[test]
+fn identity_theta_scales_handles_one_sided_boxes() {
+    for (t, lo, hi, m) in [(-1e-3, -5.0, -0.0009, -1.2e-3), (1e-3, -5.0, 1e-3, 8e-4)] {
+        let f = quadratic_probe(&[t], &[m], 1e9, 1.0, 50.0);
+        let mut probed = Vec::new();
+        let got = identity_theta_scales(
+            &[t],
+            &[lo],
+            &[hi],
+            |_| false,
+            || 50.0,
+            |i, v| {
+                probed.push(v);
+                f(i, v)
+            },
+        );
+        assert_eq!(got, vec![(0, t.abs())], "θ₀ = {t} in [{lo}, {hi}]");
+        assert_eq!(probed.len(), 2);
+        assert!(probed.iter().all(|&v| (lo..=hi).contains(&v)), "{probed:?}");
+    }
+}
+
+/// `identity_probe_objective` is the objective the optimizer sees: the value, or the
+/// `1e20` wall when the EBE guard rejects the point — more than
+/// `max_unconverged_frac` of the subjects unconverged, or any hard-rejected start —
+/// or the value is not finite.
+#[test]
+fn identity_probe_objective_applies_the_ebe_guard() {
+    let stats = |n_unconverged: usize, n_start_rejected: usize| InnerLoopStats {
+        n_unconverged,
+        n_fallback: 0,
+        n_start_rejected,
+    };
+    let at = |raw: f64, s: InnerLoopStats| identity_probe_objective(raw, &s, 20, 0.1);
+    assert_eq!(
+        at(-100.0, stats(2, 0)),
+        -100.0,
+        "2 of 20 is the bar, not past it"
+    );
+    assert_eq!(at(-100.0, stats(3, 0)), 1e20, "3 of 20 crosses 0.1");
+    assert_eq!(at(-100.0, stats(0, 1)), 1e20, "a hard-rejected start");
+    assert_eq!(at(f64::NAN, stats(0, 0)), 1e20);
+}
+
+/// A probe point only the EBE guard rejects decides the scale as the optimizer would
+/// see it. The objective is a slope whose minimizer is 649 `|θ₀|` away — unit scale
+/// on its likelihood alone — but at the upper probe 3 of 20 subjects fail to
+/// converge (`max_unconverged_frac = 0.1`): the optimizer could not take that move,
+/// so the θ is scaled. With 2 of 20 unconverged (at the bar) it keeps scale 1.
+#[test]
+fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
+    let f = quadratic_probe(&[1e-3], &[0.65], 13.8, 1.0, -1000.0);
+    for (unconverged_at_upper, want) in [(2usize, vec![]), (3, vec![(0, 1e-3)])] {
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-5.0],
+            &[5.0],
+            |_| false,
+            || -1000.0,
+            |i, v| {
+                let n_unconverged = if v > 1e-3 { unconverged_at_upper } else { 0 };
+                let s = InnerLoopStats {
+                    n_unconverged,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                };
+                identity_probe_objective(f(i, v), &s, 20, 0.1)
+            },
+        );
+        assert_eq!(
+            got, want,
+            "{unconverged_at_upper} unconverged at the upper probe"
+        );
+    }
+}
+
+/// The base objective is evaluated only when there is a candidate, and a start whose
+/// objective is the divergence sentinel (or `NaN`) probes nothing.
+#[test]
+fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start() {
+    let no_probe = |_: usize, _: f64| -> f64 { panic!("nothing may be probed") };
+    let none = identity_theta_scales(
+        &[0.2, 0.5],
+        &[0.001, -1.0],
+        &[1.0, 1.0],
+        |_| false,
+        || panic!("no candidate, so no base"),
+        no_probe,
+    );
+    assert_eq!(none, vec![]);
+    for base in [2e20, f64::NAN] {
+        let got = identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || base, no_probe);
+        assert_eq!(got, vec![], "base {base}");
+    }
+}
+
+/// Repeating every likelihood contribution `k` times — whole subjects, or each
+/// observation within a subject — multiplies the objective, and every difference
+/// of it, by `k` and leaves the minimizer where it was, so it must not change which
+/// θ are scaled (#2159 review, both rounds). The two θ are the issue's: a volume
+/// whose minimizer is 0.23 `|θ₀|` away and a slope whose is 649 `|θ₀|` away, with
+/// curvatures giving warfarin- and `two_cpt_oral_cov`-sized ΔOFVs at `k = 1`. A cut
+/// on a ΔOFV's size, total or per subject, flips the slope at some `k`: at `k = 1e4`
+/// its halving ΔOFV is ~90.
+#[test]
+fn identity_theta_scales_is_invariant_to_replicating_likelihood_contributions() {
+    let theta = [1e-5, 0.001];
+    let minimizers = [7.74e-6, 0.65];
+    let lower = [-5e-4, -5.0];
+    let upper = [5e-4, 5.0];
+    for k in [1.0, 200.0, 1e4, 1e7] {
+        let base = -1033.3637 * k;
+        // Weights: halving the volume and the slope costs ~30 and ~0.009 OFV units at k = 1.
+        let volume = quadratic_probe(&theta, &minimizers, 3e11, k, base);
+        let slope = quadratic_probe(&theta, &minimizers, 13.8, k, base);
+        let f = |i: usize, v: f64| if i == 0 { volume(i, v) } else { slope(i, v) };
+        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, f);
+        assert_eq!(got, vec![(0, 1e-5)], "k = {k}");
+    }
+}
+
+/// The issue's warfarin fixture with `V = TVV_S / 1e-6`, `TVV_S` started at 1e-5
+/// (the minimum is at 7.7377e-6). Shared by the two #2159 pre-flight tests below.
+#[cfg(test)]
+const NEAR_ZERO_V_WARFARIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV_S / 1e-6 * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The pre-flight probe on real objectives, both sides of the decision (#2159).
+///
+/// Warfarin's `TVV_S` at 1e-5 is a volume in units of 1e-6 L: halving it moves the
+/// OFV by tens of units, so it is scaled by 1e-5. `two_cpt_oral_cov`'s covariate
+/// exponents started at 0.001 are O(1) slopes (0.65 and 0.3 at the minimum): halving
+/// either moves the OFV by under 0.01, so neither is scaled — scaling them by 0.001
+/// is the rule the issue measured costing BOBYQA 14 OFV units. And with the probe
+/// switched off (an explicit `none` / `rescale2`, or a non-NLopt optimizer) nothing
+/// is probed.
+#[test]
+fn preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope() {
+    use crate::parser::model_parser::{parse_model_file, parse_model_string};
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let preflight = |model: &CompiledModel, pop: &Population, probe: bool| {
+        freeze_flat_thetas(
+            model,
+            pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            probe,
+        )
+    };
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let on = preflight(&model, &pop, true);
+    assert!(on.frozen.is_none());
+    assert_eq!(on.identity_scales, vec![(1, 1e-5)], "TVV_S is scaled");
+    assert_eq!(preflight(&model, &pop, false).identity_scales, vec![]);
+
+    let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    let (wt, crcl) = (5, 6);
+    assert_eq!(model.default_params.theta_names[wt], "THETA_WT");
+    assert_eq!(model.default_params.theta_names[crcl], "THETA_CRCL");
+    for i in [wt, crcl] {
+        model.default_params.theta[i] = 0.001;
+        model.default_params.theta_lower[i] = -5.0;
+    }
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    assert_eq!(
+        preflight(&model, &pop, true).identity_scales,
+        vec![],
+        "a near-zero slope keeps scale 1"
+    );
+}
+
+/// The scale reaches the optimizer (#2159): `optimize_nlopt_once` on the warfarin
+/// fixture, BOBYQA, a short evaluation budget, with and without `TVV_S`'s entry.
+/// Without it BOBYQA's first probes put the volume at ±5e-4 (V = ±500 L, the negative
+/// side infeasible); with it they stay at half and one and a half times θ₀.
+#[test]
+fn bobyqa_reads_the_identity_theta_scale() {
+    use crate::estimation::outer_optimizer::EVAL_BUDGET_OVERRIDE;
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let run = |scales: &[(usize, f64)]| {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            scales,
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        out.0
+    };
+    // Measured (macOS arm64) after 40 evaluations: scaled OFV −264.85 with `TVV_S` at
+    // 9.0e-6; unit OFV +2725.78 with `TVV_S` at 3.9e-4. The start is −182.67 and the
+    // minimum −286.00, so the scaled arm must have descended well past the start and
+    // the unit arm must not have — each bound sits ≥ 15 units from its measurement.
+    const BUDGET: u32 = 40;
+    let scaled = run(&[(1, 1e-5)]);
+    let unit = run(&[]);
+    assert!(
+        scaled.ofv.is_finite() && scaled.ofv < -250.0,
+        "scaled: OFV {}",
+        scaled.ofv
+    );
+    let tvv_s = scaled.params.theta[1];
+    assert!(
+        (5e-6..1.5e-5).contains(&tvv_s),
+        "scaled: TVV_S {tvv_s:e} left the region the scaled probes cover"
+    );
+    assert!(
+        !(unit.ofv < -200.0),
+        "unit: OFV {} — the fixture no longer needs the scale",
+        unit.ofv
+    );
+}
+
+/// `two_cpt_oral_cov` with both exponents at 0.001 and every subject repeated 200
+/// times (6000 subjects): the same minimizer, so the slopes must still keep scale 1
+/// (#2159 review). Under the absolute 1.0-unit bar the first version used, the
+/// replicated ΔOFVs (≈ 1.8 and 1.1) both crossed it and the slopes got the 0.001
+/// scale the issue measured costing BOBYQA 14 OFV units. ~40 s in a debug build
+/// (6000 cold inner solves per evaluation), so nightly; the per-PR twin is
+/// `identity_theta_scales_is_invariant_to_replicating_likelihood_contributions`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn preflight_keeps_a_near_zero_slope_unscaled_on_a_replicated_population() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let mut model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    for i in [5, 6] {
+        model.default_params.theta[i] = 0.001;
+        model.default_params.theta_lower[i] = -5.0;
+    }
+    let mut pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    let originals = pop.subjects.clone();
+    const K: usize = 200;
+    pop.subjects = (0..K)
+        .flat_map(|r| {
+            originals.iter().map(move |s| {
+                let mut s = s.clone();
+                s.id = format!("{}_{r}", s.id);
+                s
+            })
+        })
+        .collect();
+    assert_eq!(pop.subjects.len(), 30 * K);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(
+        got.identity_scales,
+        vec![],
+        "a replicated slope keeps scale 1"
+    );
+}
+
+/// The issue's small-unit volume inside a two-class mixture
+/// (`tests/nonmem/mixture_iv.csv`, 30 subjects), next to a weight exponent started
+/// at 0.001. The flat-θ pre-flight never runs for a mixture, so the probe has its own
+/// path on the mixture objective: `TVV_S` is scaled, the exponent is not.
+#[cfg(test)]
+const NEAR_ZERO_V_MIXTURE: &str = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV_S(1e-05, -0.0005, 0.0005)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.001, -5.0, 5.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV_S / 1e-6 * (WT / 70)^BWT
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn a_mixture_is_probed_on_its_own_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_MIXTURE).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let p = &model.default_params;
+    assert!(p.mixture.is_some());
+    assert_eq!(p.theta_names[2], "TVV_S");
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, p, &opts),
+        vec![(2, 1e-5)],
+        "TVV_S is scaled, BWT and the zero MIXL are not"
+    );
+}
+
+/// The probe sees the objective the optimizer minimises, priors included (#2159
+/// review). `two_cpt_oral_cov`'s `THETA_WT` started at 0.001 keeps scale 1 on the
+/// clean −2LL (`preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope`);
+/// with a `prior(0.0012, rse = 10%)` (sd 1.2e-4) its penalized minimizer sits 0.2
+/// `|θ₀|` away and the halving probes' second difference is ≈ 35, so it is scaled.
+/// `THETA_CRCL`, with no prior, is not.
+#[test]
+fn preflight_probes_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("example reads");
+    let src = src
+        .replace(
+            "theta THETA_WT(0.6, 0.01, 5.0)",
+            "theta THETA_WT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+        )
+        .replace(
+            "theta THETA_CRCL(0.3, 0.01, 5.0)",
+            "theta THETA_CRCL(0.001, -5.0, 5.0)",
+        );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let got = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        true,
+    );
+    assert_eq!(got.identity_scales, vec![(5, 0.001)], "THETA_WT is scaled");
+}
+
+/// The mixture path adds the penalties too: the mixture fixture's `BWT`, unscaled on
+/// the clean objective (`a_mixture_is_probed_on_its_own_objective`), is scaled under
+/// the same tight prior.
+#[test]
+fn a_mixture_probe_sees_the_penalized_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let src = NEAR_ZERO_V_MIXTURE.replace(
+        "theta BWT(0.001, -5.0, 5.0)",
+        "theta BWT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), None, None)
+        .expect("mixture data loads");
+    assert!(build_prior_set(&model, &model.default_params).is_active());
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        mixture_identity_theta_scales(&model, &pop, &model.default_params, &opts),
+        vec![(2, 1e-5), (4, 0.001)]
+    );
+}
+
+/// The pre-flight hands the inner loop's statistics to the guard (#2159 review). On
+/// the warfarin fixture with the inner solve starved to one iteration, some subjects
+/// stop unconverged at the start: with `max_unconverged_frac = 0` the optimizer
+/// would refuse the start itself, so nothing is probed and `TVV_S` keeps scale 1;
+/// with the guard off (`1.0`) the same starved solves still scale it.
+#[test]
+fn preflight_reads_the_ebe_guard_on_real_solves() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let scales = |max_unconverged_frac: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            inner_maxiter: 1,
+            max_unconverged_frac,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+        )
+        .identity_scales
+    };
+    assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
+    assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }

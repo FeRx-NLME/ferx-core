@@ -35,15 +35,16 @@ pub use api::{
     bind_from_fit, bind_theta_levels, check_model_data, check_model_data_warnings,
     check_model_options, configure_global_thread_pool, fit, fit_from_files, install_on_engine_pool,
     layout_from_fit, predict, predict_diag, prepare_run, prepare_run_with_inits,
-    read_population_with, resolve_data_path, run_model_simulate, run_model_simulate_with_overrides,
-    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, simulate,
-    simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
-    simulate_adaptive_with_inputs, simulate_with_options, simulate_with_options_diag,
-    simulate_with_seed, simulate_with_uncertainty, simulate_with_uncertainty_diag, theta_level_map,
-    theta_level_values, validate_model_file, AdaptiveInputs, AdaptiveSimulateOptions,
-    AdaptiveSimulationResult, PoolPlan, PredictionOutput, PredictionResult, PreparedRun,
-    ReaderSettings, RunOverrides, SimulateOptions, SimulateUncertaintyOptions, SimulationOutput,
-    SimulationResult, SuppliedEtas, UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    read_population_with, read_population_with_source, resolve_data_path, run_model_simulate,
+    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
+    run_model_with_overrides, simulate, simulate_adaptive, simulate_adaptive_from_spec,
+    simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs, simulate_with_options,
+    simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty,
+    simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
+    validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
+    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
+    SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult, SuppliedEtas,
+    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
@@ -53,6 +54,7 @@ pub use estimation::run_covariance::run_covariance;
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};
+pub use io::data_source::DataSource;
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use io::model_source::ModelSource;
 pub use model_selection::{
@@ -77,7 +79,10 @@ pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
 
 #[cfg(feature = "survival")]
-pub use api::{predict_categorical, predict_survival, SurvivalPredictionResult};
+pub use api::{
+    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
+    SurvivalPredictionResult,
+};
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE
 /// (#344, #1248).

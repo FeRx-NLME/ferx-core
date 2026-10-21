@@ -7075,7 +7075,8 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
     // full-budget truncation was ~30% low). The fast case is deliberately not *extreme*
     // (ke·II ≫ 6): a near-total between-dose decay drives the trough toward the RK45 `abstol`
     // floor, where relative precision is lost — an integration-noise artifact, not the fixed
-    // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
+    // point being wrong (`ode_steady_state_dose_matches_reconverged_fd` in
+    // `sens/ode_adjoint_tests.rs` checks the gradient too).
     for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
         let pk = pk_one(cl, v);
         let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
@@ -7165,10 +7166,9 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
     let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
     assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
     // Read this equilibration's OWN answer, not the process-global sink (#1289). The sink is
-    // shared by every thread in the test binary and its reader guard serializes only readers,
-    // so `take_ss_nonconvergence_warnings().is_empty()` — what this line used to be — failed
-    // whenever any concurrently-running test capped an SS equilibration between the clear and
-    // the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
+    // shared by every thread in the test binary, so `take_ss_nonconvergence_warnings().is_empty()`
+    // — what this line used to be — failed whenever any concurrently-running test capped an SS
+    // equilibration between the clear and the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
     //
     // The `true` half of this differential pair is `ss_nonlinear_over_capacity_bolus_caps_and_warns`
     // below, on the same helper: without it a flag that was never written would satisfy this
@@ -7186,11 +7186,6 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
 /// input-rate branch). Predictions stay finite.
 #[test]
 fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     let ode = mm_disposition_spec();
     let mut pk = PkParams::default();
     pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
@@ -7204,9 +7199,9 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
     );
     // The `true` half of the #1289 differential pair — this equilibration's own answer, read
-    // per-thread. The sink assertion further down cannot serve that role: every writer emits
-    // the same deduplicated message, so `.any(|w| w.contains(…))` passes just as happily on a
-    // foreign test's warning as on this one's.
+    // per-thread. The text check further down is per-thread too, for the prediction pass: the
+    // process-global sink would pass on a foreign test's warning (#1289) and fail when a
+    // concurrent `api` call drains it between the write and the read (#2071).
     assert!(
         crate::dosing::last_ss_equilibration_warned(),
         "an over-capacity bolus must record a non-convergence warning for its own equilibration"
@@ -7219,12 +7214,12 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         preds.iter().all(|p| p.is_finite()),
         "predictions must stay finite: {preds:?}"
     );
-    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    let warning = crate::dosing::last_ss_equilibration_warning();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-        "an over-capacity bolus must surface a non-convergence warning; got: {warnings:?}"
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an over-capacity bolus must surface a non-convergence warning; got: {warning:?}"
     );
 }
 
@@ -7246,11 +7241,6 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
 /// the private function it has to call.
 #[test]
 fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     // 1. Produce a warning: the over-capacity MM disposition (mean input 6.25 > Vmax 5) has no
     //    periodic steady state, so the capped train runs the full budget and notes it.
     let mm = mm_disposition_spec();
@@ -7303,10 +7293,6 @@ fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
          reports the PREVIOUS capped run's warning as its own — the shape `sens::ode_provider` \
          hits, since it calls that helper directly"
     );
-
-    // Housekeeping: this test deliberately fills the sink, so drain it rather than leaving the
-    // entries for whichever reader runs next.
-    let _ = crate::dosing::take_ss_nonconvergence_warnings();
 }
 
 #[test]
@@ -8378,10 +8364,6 @@ fn ss_input_rate_over_capacity_deep_saturation_declines() {
 /// the caller falls to the capped pulse train, and the non-convergence warning fires.
 #[test]
 fn ss_input_rate_no_steady_state_warns() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
     let ode = mm_ss_absorption_spec();
     let mut pk = PkParams::default();
     pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
@@ -8407,19 +8389,19 @@ fn ss_input_rate_no_steady_state_warns() {
     // true periodic steady state" text are valid here — the capped drift can estimate ρ either
     // side of 1 — so assert on the shared prefix rather than one branch).
     //
-    // The per-thread flag first (#1289): it pins that *this* prediction pass warned, which the
-    // sink `.any(…)` below cannot, since every writer emits the same deduplicated message and a
-    // concurrently-running test's warning satisfies it identically.
+    // Both reads are per-thread (#1289, #2071): they pin that *this* prediction pass warned and
+    // with what text. The process-global sink can do neither in a lib test — a concurrent
+    // test's write satisfies a "present" check, and a concurrent `api` drain empties it.
     assert!(
         crate::dosing::last_ss_equilibration_warned(),
         "the input-rate train must record a non-convergence warning for its own equilibration"
     );
-    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    let warning = crate::dosing::last_ss_equilibration_warning();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-        "an input-above-capacity model must surface a non-convergence warning; got: {warnings:?}"
+        warning
+            .as_deref()
+            .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an input-above-capacity model must surface a non-convergence warning; got: {warning:?}"
     );
 }
 
@@ -11174,9 +11156,9 @@ mod break_collision_1186 {
         }
 
         // The analytic-sensitivity static walk carries the same timeline and was one of
-        // the `unwrap_or(Equal)` sites; its twin lives in `sens/provider_tests.rs`
-        // (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`), where the provider can be
-        // driven directly.
+        // the `unwrap_or(Equal)` sites; its twin lived in the since-deleted (#2093)
+        // `sens/provider_tests.rs` (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`),
+        // where the forward provider could be driven directly.
     }
 
     /// **The CHZ event-time search must report a non-finite timeline as `SolveFailed`.**
@@ -11330,7 +11312,7 @@ mod break_collision_1186 {
         );
     }
 
-    // ── #1189 item 2: negative lag — pinned, not changed ─────────────────────────
+    // ── #1189 item 2: negative lag — the engines' half ──────────────────────────
 
     /// A **negative** route lag is not an engine inconsistency: all four engines agree
     /// with each other and with the closed form measured from the *earlier* onset, and
@@ -11338,11 +11320,11 @@ mod break_collision_1186 {
     /// The integration start simply moves earlier, identically everywhere — the
     /// documented "onset earlier" semantics.
     ///
-    /// NONMEM's reference behaviour differs: it **aborts**
-    /// (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`).
-    /// Whether to match that is a user-visible policy decision, tracked on #1189; this
-    /// test pins what ferx does today so the decision is taken deliberately rather than
-    /// drifted into.
+    /// NONMEM **aborts** on a negative lag (`PK PARAMETER FOR ABSORPTION LAG IS
+    /// NEGATIVE`), and since #1189 `fit()` / `ferx check` refuse one at the initial
+    /// estimates (`E_NEGATIVE_LAGTIME`). The engines still serve it: a lag driven negative
+    /// mid-fit, or one handed to `predict()` / `simulate()` (which warn), reaches them, and
+    /// this pins that they agree on it.
     #[test]
     fn negative_route_lag_engines_agree_from_earlier_onset() {
         let mut ode = first_order_one_cpt_spec();
@@ -11985,8 +11967,8 @@ mod lag_arrival_read_1226 {
     /// doses at 17511.8 and 17520, sample at 17520) and tables
     /// `PRED = 1.4404316545059672E+02`. That run does double duty — it is also a *dose
     /// landing on the same time as an observation*, so it pins the ordering convention that
-    /// `provider_reads_a_dose_landing_on_the_last_observation` checks the sensitivity walk
-    /// against.
+    /// the pre-#2093 `provider_reads_a_dose_landing_on_the_last_observation` (retired in #2093)
+    /// checked the sensitivity walk against.
     ///
     /// Mutation: write either predicate in the sum form and `ode_predictions` reads the
     /// pre-dose 44.04 here while the event-driven control still reads 144.04.
@@ -15431,4 +15413,113 @@ fn adaptive_nan_amount_from_a_finite_state_is_still_a_controller_action() {
     assert!(msg.contains("decision 0 at t=1"), "{msg}");
     assert!(msg.contains("dose amount must be finite"), "{msg}");
     assert!(!msg.contains("diverged"), "{msg}");
+}
+
+/// A stiff, non-linear model integrated by Rosenbrock: `J` is filled from the batched lane
+/// evaluator (`OdeRhsProgram::rhs_columns` through `rosenbrock::FdColumnsGuard`), and the
+/// whole solve must be bit-identical to the scalar column loop. `cond` adds a branch on the
+/// state, whose lanes can disagree near the switch and then fall back to scalar columns.
+fn batched_jacobian_model(cond: bool) -> crate::types::CompiledModel {
+    let elim = if cond {
+        "(if (central > 20.0) VMAX else 0.5 * VMAX) * central / (KM + central)"
+    } else {
+        "VMAX * central / (KM + central)"
+    };
+    let src = format!(
+        "[parameters]
+  theta TVKA(1.2, 0.01, 10.0)
+  theta TVVMAX(40.0, 0.1, 1000.0)
+  theta TVKM(2.0, 0.01, 100.0)
+  omega ETA_KA ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  KA = TVKA * exp(ETA_KA)
+  VMAX = TVVMAX
+  KM = TVKM
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, periph])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - {elim} - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rodas4
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
+}
+
+#[test]
+fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
+    use crate::ode::rosenbrock::{FD_COLUMNS_HITS, FD_COLUMNS_OFF};
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            // An infusion: a forcing the batched columns must add per column too.
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
+        ],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
+    );
+    for cond in [false, true] {
+        let model = batched_jacobian_model(cond);
+        let run = |off: bool| {
+            FD_COLUMNS_OFF.with(|c| c.set(off));
+            FD_COLUMNS_HITS.with(|c| c.set(0));
+            let p = crate::pk::compute_predictions_with_tv(
+                &model,
+                &s,
+                &model.default_params.theta,
+                &[0.1],
+            );
+            FD_COLUMNS_OFF.with(|c| c.set(false));
+            (p, FD_COLUMNS_HITS.with(|c| c.get()))
+        };
+        let (batched, hits) = run(false);
+        let (scalar, scalar_hits) = run(true);
+        assert!(
+            hits > 0,
+            "cond={cond}: the batched columns must actually fill J (non-vacuity)"
+        );
+        assert_eq!(scalar_hits, 0);
+        assert!(batched.iter().all(|v| v.is_finite()), "{batched:?}");
+        for (j, (a, b)) in batched.iter().zip(&scalar).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "cond={cond} obs {j}: {a} vs {b}");
+        }
+    }
+}
+
+/// #2139: a `saveat` point one ULP **before** a dose that the integration start sits on is
+/// read pre-dose. The reader moves an observation listed before a co-timed dose one ULP
+/// earlier (#614/#1810), which makes that observation the subject's integration start, so
+/// the dose lands inside the first break's `EVENT_MATCH_TOL` band and used to be applied
+/// before the band was read — the observation came back as seed + dose. The straddle is
+/// asserted in one call: the ULP-earlier point reads the pre-dose state and the bit-equal
+/// point the post-dose one, so a walk that ignores the record/event order on either side
+/// fails here. Both magnitudes: `0.0` (one ULP is the smallest subnormal, and the two times
+/// merge into one break under the timeline's `1e-15` dedup) and `8.2` (one ULP is
+/// `1.8e-15`, two separate breaks).
+#[test]
+fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    for t_dose in [0.0_f64, 8.2] {
+        let t_pre = t_dose.next_down();
+        let subject = make_subject(
+            vec![DoseEvent::new(t_dose, 100.0, 1, 0.0, false, 0.0)],
+            vec![t_pre, t_dose],
+        );
+        let states =
+            ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &subject.obs_times);
+        assert_eq!(
+            states[0][0], 0.0,
+            "t = {t_dose}: one ULP before the dose reads pre-dose"
+        );
+        assert_eq!(
+            states[1][0], 100.0,
+            "t = {t_dose}: at the dose reads post-dose"
+        );
+    }
 }

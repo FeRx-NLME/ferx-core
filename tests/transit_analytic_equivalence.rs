@@ -443,8 +443,8 @@ fn transit_with_bioavailability_matches_ode() {
 
 /// Fixed-parameter population OFV (FOCEI marginal NLL) at several eta values: the
 /// analytic transit and its ODE twin must agree. Unlike the eta=0 `predict()` sweep
-/// above, this drives the analytic **sensitivity** path (`run_obs` transit branch,
-/// the exact `∂f/∂{cl,v,n,mtt,η}` jets), and adds a likelihood-level anchor. (A
+/// above, this drives the analytic **sensitivity** path (the transit closed form as the
+/// adjoint records it, the exact `∂f/∂{cl,v,n,mtt,η}` jets), and adds a likelihood-level anchor. (A
 /// fixed-parameter NLL, not a converged fit, so optimizer path / solver noise can't
 /// confound it — mirrors `analytical_ode_equivalence::assert_ofv_equiv`.)
 #[test]
@@ -976,13 +976,12 @@ fn transit_depot_init_rejected_central_ok() {
         .expect("transit central init should parse");
 }
 
-/// Short FOCEI fit (a couple of outer iterations) — this is the test that actually
-/// drives the analytic **sensitivity** path for transit: `run_obs` / `run_obs_grad`'s
-/// transit branch, `one_cpt_transit_conc_g`, `slot_to_dim` for `n`/`mtt`, and the
-/// `ExKind` arm. (The fixed-eta OFV test above evaluates `individual_nll` and does *not*
-/// go through the sens provider, so those exact `∂f/∂{cl,v,n,mtt}` jets the estimator
-/// seeds were otherwise only exercised by an uncommitted benchmark.) Tier-2: returns
-/// after a handful of iterations with a finite OFV, not convergence.
+/// Short FOCEI fit (a couple of outer iterations) — this is the test that actually drives the
+/// analytic **sensitivity** path for transit: the adjoint's closed-form recording of
+/// `one_cpt_transit_conc_g`, and `slot_to_dim` for `n`/`mtt`. (The fixed-eta OFV test above
+/// evaluates `individual_nll` and does *not* go through the sens provider, so those exact
+/// `∂f/∂{cl,v,n,mtt}` jets the estimator seeds were otherwise only exercised by an uncommitted
+/// benchmark.) Tier-2: returns after a handful of iterations with a finite OFV, not convergence.
 #[test]
 fn transit_short_fit_drives_analytic_sens() {
     let (an_src, _) = build_pair(false, false);
@@ -1224,8 +1223,8 @@ fn two_cpt_transit_with_bioavailability_matches_ode() {
 }
 
 /// Fixed-parameter population OFV at several eta values — drives the analytic
-/// **sensitivity** path (`run_obs` two_cpt_transit branch, the exact
-/// `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
+/// **sensitivity** path (the `two_cpt_transit` closed form as the adjoint records it, the
+/// exact `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
 /// Regression (2-cpt asymmetry): a `two_cpt_transit` model with a mid-profile `TIME`
 /// switch used to be **rejected** — the ODE-equivalent desugar was 1-cpt only — while
 /// the identical 1-cpt model transparently rerouted (cf.
@@ -1348,8 +1347,8 @@ fn two_cpt_transit_ofv_matches_ode() {
 }
 
 /// Short FOCEI fit (a couple of outer iterations) — drives the 2-cpt analytic
-/// sensitivity provider end-to-end (`run_obs_grad` two_cpt_transit branch,
-/// `two_cpt_transit_conc_g`). Tier-2: returns with a finite OFV, not convergence.
+/// gradient end-to-end (the adjoint recording `two_cpt_transit_conc_g`; before
+/// #2093 the forward provider's `run_obs_grad` two_cpt_transit branch). Tier-2: returns with a finite OFV, not convergence.
 #[test]
 fn two_cpt_transit_short_fit_drives_analytic_sens() {
     let (an_src, _) = build_pair_2cpt(false, false);

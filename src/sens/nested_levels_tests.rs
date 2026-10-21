@@ -1,13 +1,18 @@
-//! #1082 PR3: the six sensitivity walks — compartment-free, closed form and ODE, each
-//! outer `Dual2` and inner `Dual1` — on a model with nested levels, against central
-//! finite differences of the production `predict_iov` over the **compact** vector.
+//! #1082: the adjoint's recordings — compartment-free, closed form and ODE — on a model
+//! with nested levels, against central finite differences of the production `predict_iov`
+//! and `individual_nll_iov` over the **compact** vector.
 //!
-//! The walks read the per-cell stacked vector and seed each κ on its compact axis
-//! (`StackedLayout::kappa_axis`), so two arms of one study land their study-κ derivative on
-//! one axis. FD perturbs the compact vector and expands it, which is what the prediction
-//! the objective scores sees: a seed on the wrong axis, or one per cell instead of per
-//! group, is a disagreement here, and the failure names the axis — `level STUDY group 1 κ
-//! K_A` — so a mutation of one level's axes names that level.
+//! A recording reads the per-cell stacked vector and records over the compact axes it
+//! expands from (`ode_adjoint::expand_nested`: each cell's κ is its group's axis leaf), so
+//! two arms of one study land their study-κ derivative on one axis. FD perturbs the compact
+//! vector and expands it, which is what the prediction the objective scores sees: a leaf on
+//! the wrong axis, or one per cell instead of per group, is a disagreement here, and the
+//! failure names the axis — `level STUDY group 1 κ K_A` — so a mutation of one level's axes
+//! names that level. The second-order check runs through the exact inner Hessian, whose
+//! prior is the compact one `stacked_omega` places per group of each level.
+//!
+//! The θ side and the assembled packed gradient are checked end to end against the
+//! reconverged-FD oracle (`nested_packed_gradients_match_the_reconverged_fd_gradient`).
 //!
 //! The fixture (`stats::nested_levels::test_helpers`) keeps every side live: two levels
 //! with two and five groups, a weight that differs on every arm, an off-diagonal study
@@ -15,7 +20,9 @@
 //! present. The non-degeneracy of each of those is asserted, not assumed.
 
 use crate::pk::predict_iov;
-use crate::sens::provider::{subject_eta_grad_iov, subject_sensitivities_iov};
+use crate::sens::ode_provider::adjoint::{
+    exact_eta_jacobian, exact_inner_hessian, exact_obs_grads,
+};
 use crate::stats::nested_levels::test_helpers as fx;
 use crate::stats::nested_levels::NestedLayout;
 use crate::types::{CompiledModel, Subject};
@@ -35,23 +42,20 @@ fn fixture(walk: Walk) -> (CompiledModel, Subject) {
     };
     let (model, mut pop) = fx::prepared(&src, 1);
     assert!(model.has_nested_levels(), "{walk:?}: the fixture must nest");
-    // Which engine the jets come from — asserted, so a fixture that slid onto another walk
-    // (or onto FD) cannot pass for this one.
+    // Which engine the recording runs — asserted, so a fixture that slid onto another one
+    // (or out of the recorders' scope) cannot pass for this one.
     let engine = match walk {
-        Walk::Algebraic => model.is_algebraic() && crate::sens::algebraic::supported_iov(&model),
+        Walk::Algebraic => model.is_algebraic(),
         Walk::ClosedForm => {
             model.ode_spec.is_none()
                 && !model.is_algebraic()
                 && model.absorption_ode_equivalent.is_none()
-                && crate::sens::provider::iov_analytical_supported(&model)
         }
-        Walk::Ode => {
-            model.ode_spec.is_some() && crate::sens::ode_provider::ode_iov_supported(&model)
-        }
+        Walk::Ode => model.ode_spec.is_some(),
     };
-    assert!(engine, "{walk:?}: the fixture is not on its walk");
+    assert!(engine, "{walk:?}: the fixture is not on its engine");
     assert!(
-        crate::sens::provider::iov_sens_supported(&model),
+        crate::sens::ode_provider::adjoint::model_in_scope(&model),
         "{walk:?}"
     );
     (model, pop.subjects.remove(0))
@@ -98,52 +102,15 @@ impl Fd<'_> {
         let m = self.pred(&Self::shifted(b, &[(k, -h)]), theta);
         p.iter().zip(&m).map(|(a, c)| (a - c) / (2.0 * h)).collect()
     }
-
-    /// `∂²f/∂b_k∂b_l` for every observation.
-    fn hess(&self, b: &[f64], theta: &[f64], k: usize, l: usize) -> Vec<f64> {
-        let h = 1e-4;
-        let at = |sk: f64, sl: f64| self.pred(&Self::shifted(b, &[(k, sk), (l, sl)]), theta);
-        let (pp, pm, mp, mm) = (at(h, h), at(h, -h), at(-h, h), at(-h, -h));
-        (0..pp.len())
-            .map(|j| (pp[j] - pm[j] - mp[j] + mm[j]) / (4.0 * h * h))
-            .collect()
-    }
-
-    /// `∂f/∂θ_m` and `∂²f/∂b_k∂θ_m` for every observation.
-    fn theta(&self, b: &[f64], theta: &[f64], m: usize, k: Option<usize>) -> Vec<f64> {
-        let (h, s) = match k {
-            None => (0.0, 1e-6 * (1.0 + theta[m].abs())),
-            Some(_) => (1e-4, 1e-4 * (1.0 + theta[m].abs())),
-        };
-        let at = |sb: f64, st: f64| {
-            let bb = match k {
-                Some(k) => Self::shifted(b, &[(k, sb)]),
-                None => b.to_vec(),
-            };
-            self.pred(&bb, &Self::shifted(theta, &[(m, st)]))
-        };
-        match k {
-            None => {
-                let (p, q) = (at(0.0, s), at(0.0, -s));
-                p.iter().zip(&q).map(|(a, c)| (a - c) / (2.0 * s)).collect()
-            }
-            Some(_) => {
-                let (pp, pm, mp, mm) = (at(h, s), at(h, -s), at(-h, s), at(-h, -s));
-                (0..pp.len())
-                    .map(|j| (pp[j] - pm[j] - mp[j] + mm[j]) / (4.0 * h * s))
-                    .collect()
-            }
-        }
-    }
 }
 
-/// The compact layout, the evaluation point and the stacked vector the walks read.
+/// The compact layout, the evaluation point and the stacked vector the recordings read.
 fn point(model: &CompiledModel, subject: &Subject) -> (NestedLayout, Vec<f64>, Vec<f64>) {
     let layout = NestedLayout::of(model, subject).expect("prepared");
     let b = fx::point(&layout, 1.0);
     let stacked = fx::stacked(&layout, &b);
     // The straddle that makes the compact axes observable at all: the stacked vector the
-    // walks read is wider than the compact one they differentiate over.
+    // recordings read is wider than the compact one they differentiate over.
     assert!(layout.n_compact() < stacked.len());
     (layout, b, stacked)
 }
@@ -190,174 +157,131 @@ fn assert_non_degenerate(walk: Walk, model: &CompiledModel, layout: &NestedLayou
     );
 }
 
-/// The outer `Dual2` jet — value, `∂f/∂b`, `∂²f/∂b²`, `∂f/∂θ`, `∂²f/∂b∂θ` — against FD.
-fn check_outer(walk: Walk) {
+/// The first-order recording — value and `∂f/∂b` — against FD of the prediction.
+fn check_jacobian(walk: Walk) {
     let (model, subject) = fixture(walk);
     let theta = model.default_params.theta.clone();
     let (layout, b, stacked) = point(&model, &subject);
     let n = layout.n_compact();
-    let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked)
-        .unwrap_or_else(|| panic!("{walk:?}: the outer walk declined"));
+    let jac = exact_eta_jacobian(&model, &subject, &theta, &stacked)
+        .unwrap_or_else(|| panic!("{walk:?}: the recording declined"));
+    let rows = exact_obs_grads(&model, &subject, &theta, &stacked)
+        .unwrap_or_else(|| panic!("{walk:?}: the recording declined"));
     let fd = Fd {
         model: &model,
         subject: &subject,
         layout: &layout,
     };
     let f0 = fd.pred(&b, &theta);
-    assert_eq!(sens.obs.len(), f0.len());
-    let label = |i: usize| fx::axis_label(&model, &layout, i);
-    let mut worst = [0.0_f64; 5];
-    for (j, o) in sens.obs.iter().enumerate() {
-        assert_eq!(
-            o.df_deta.len(),
-            n,
-            "{walk:?}: the jet is not over the compact axes"
-        );
-        worst[0] = worst[0].max(margin(o.f, f0[j], 1e-9, 1e-12));
-        assert!(
-            worst[0] < 1.0,
-            "{walk:?} obs {j}: value {} vs {}",
-            o.f,
-            f0[j]
-        );
+    assert_eq!(jac.nrows(), f0.len());
+    assert_eq!(
+        jac.ncols(),
+        n,
+        "{walk:?}: the jet is not over the compact axes"
+    );
+    let mut worst = [0.0_f64; 2];
+    for (j, o) in rows.iter().enumerate() {
+        let e = margin(o.f, f0[j], 1e-9, 1e-12);
+        worst[0] = worst[0].max(e);
+        assert!(e < 1.0, "{walk:?} obs {j}: value {} vs {}", o.f, f0[j]);
+        assert_eq!(o.df_deta.len(), n, "{walk:?}");
     }
-    let grads: Vec<Vec<f64>> = (0..n).map(|k| fd.grad(&b, &theta, k)).collect();
     for k in 0..n {
-        for (j, o) in sens.obs.iter().enumerate() {
-            let e = margin(o.df_deta[k], grads[k][j], 2e-4, 1e-7);
+        let g = fd.grad(&b, &theta, k);
+        for j in 0..f0.len() {
+            // The two first-order entry points read one recording.
+            assert_eq!(
+                jac[(j, k)].to_bits(),
+                rows[j].df_deta[k].to_bits(),
+                "{walk:?}"
+            );
+            let e = margin(jac[(j, k)], g[j], 2e-4, 1e-7);
             worst[1] = worst[1].max(e);
             assert!(
                 e < 1.0,
-                "{walk:?} outer obs {j}: ∂f/∂[{}] {} vs FD {}",
-                label(k),
-                o.df_deta[k],
-                grads[k][j]
-            );
-        }
-        for l in k..n {
-            let h = fd.hess(&b, &theta, k, l);
-            for (j, o) in sens.obs.iter().enumerate() {
-                for (p, q) in [(k, l), (l, k)] {
-                    let e = margin(o.d2f_deta2[p * n + q], h[j], 3e-3, 1e-5);
-                    worst[2] = worst[2].max(e);
-                    assert!(
-                        e < 1.0,
-                        "{walk:?} outer obs {j}: ∂²f/∂[{}]∂[{}] {} vs FD {}",
-                        label(p),
-                        label(q),
-                        o.d2f_deta2[p * n + q],
-                        h[j]
-                    );
-                }
-            }
-        }
-    }
-    let n_theta = theta.len();
-    for m in 0..n_theta {
-        let g = fd.theta(&b, &theta, m, None);
-        for (j, o) in sens.obs.iter().enumerate() {
-            let e = margin(o.df_dtheta[m], g[j], 2e-4, 1e-7);
-            worst[3] = worst[3].max(e);
-            assert!(
-                e < 1.0,
-                "{walk:?} obs {j}: ∂f/∂θ{m} {} vs {}",
-                o.df_dtheta[m],
+                "{walk:?} obs {j}: ∂f/∂[{}] {} vs FD {}",
+                fx::axis_label(&model, &layout, k),
+                jac[(j, k)],
                 g[j]
             );
         }
-        for k in 0..n {
-            let h = fd.theta(&b, &theta, m, Some(k));
-            for (j, o) in sens.obs.iter().enumerate() {
-                let e = margin(o.d2f_deta_dtheta[k * n_theta + m], h[j], 3e-3, 1e-5);
-                worst[4] = worst[4].max(e);
+    }
+    let d: Vec<Vec<f64>> = rows.iter().map(|o| o.df_deta.clone()).collect();
+    assert_non_degenerate(walk, &model, &layout, &d);
+    eprintln!(
+        "MEASURE {walk:?} jacobian worst margin (1 fails): value {:.3e} ∂b {:.3e}",
+        worst[0], worst[1]
+    );
+}
+
+/// The second-order recording through the exact inner Hessian `∇²_b l` — the data term's
+/// `∂²f/∂b²` and the compact prior's precision — against a central second difference of
+/// the conditional objective over the compact vector.
+fn check_inner_hessian(walk: Walk) {
+    let (model, subject) = fixture(walk);
+    let params = model.default_params.clone();
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov");
+    let (layout, b, stacked) = point(&model, &subject);
+    let n = layout.n_compact();
+    let h = exact_inner_hessian(&model, &subject, &params, &stacked)
+        .unwrap_or_else(|| panic!("{walk:?}: the recording declined"));
+    assert_eq!((h.nrows(), h.ncols()), (n, n), "{walk:?}");
+    let nll = |bb: &[f64]| -> f64 {
+        crate::stats::likelihood::individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &bb[..model.n_eta],
+            &layout.expand(bb),
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    let step = 1e-4;
+    let at = |moves: &[(usize, f64)]| nll(&Fd::shifted(&b, moves));
+    let mut worst = 0.0_f64;
+    for k in 0..n {
+        for l in k..n {
+            let fd = if k == l {
+                (at(&[(k, step)]) - 2.0 * at(&[]) + at(&[(k, -step)])) / (step * step)
+            } else {
+                (at(&[(k, step), (l, step)])
+                    - at(&[(k, step), (l, -step)])
+                    - at(&[(k, -step), (l, step)])
+                    + at(&[(k, -step), (l, -step)]))
+                    / (4.0 * step * step)
+            };
+            for (p, q) in [(k, l), (l, k)] {
+                let e = margin(h[(p, q)], fd, 1e-4, 1e-5);
+                worst = worst.max(e);
                 assert!(
                     e < 1.0,
-                    "{walk:?} obs {j}: ∂²f/∂[{}]∂θ{m} {} vs FD {}",
-                    label(k),
-                    o.d2f_deta_dtheta[k * n_theta + m],
-                    h[j]
+                    "{walk:?}: ∂²l/∂[{}]∂[{}] {} vs FD {fd}",
+                    fx::axis_label(&model, &layout, p),
+                    fx::axis_label(&model, &layout, q),
+                    h[(p, q)]
                 );
             }
         }
     }
-    let d: Vec<Vec<f64>> = sens.obs.iter().map(|o| o.df_deta.clone()).collect();
-    assert_non_degenerate(walk, &model, &layout, &d);
-    eprintln!(
-        "MEASURE {walk:?} outer worst margin (1 fails): value {:.3e} ∂b {:.3e} ∂²b {:.3e} \
-         ∂θ {:.3e} ∂b∂θ {:.3e}",
-        worst[0], worst[1], worst[2], worst[3], worst[4]
-    );
-}
-
-/// The inner `Dual1` jet `∂f/∂b` against FD.
-fn check_inner(walk: Walk) {
-    let (model, subject) = fixture(walk);
-    let theta = model.default_params.theta.clone();
-    let (layout, b, stacked) = point(&model, &subject);
-    let n = layout.n_compact();
-    let grads = subject_eta_grad_iov(&model, &subject, &theta, &stacked)
-        .unwrap_or_else(|| panic!("{walk:?}: the inner walk declined"));
-    let fd = Fd {
-        model: &model,
-        subject: &subject,
-        layout: &layout,
-    };
-    let f0 = fd.pred(&b, &theta);
-    let mut worst = 0.0_f64;
-    for k in 0..n {
-        let g = fd.grad(&b, &theta, k);
-        for (j, o) in grads.iter().enumerate() {
-            assert_eq!(
-                o.df_deta.len(),
-                n,
-                "{walk:?}: the jet is not over the compact axes"
-            );
-            assert!(
-                margin(o.f, f0[j], 1e-9, 1e-12) < 1.0,
-                "{walk:?} obs {j}: value"
-            );
-            let e = margin(o.df_deta[k], g[j], 2e-4, 1e-7);
-            worst = worst.max(e);
-            assert!(
-                e < 1.0,
-                "{walk:?} inner obs {j}: ∂f/∂[{}] {} vs FD {}",
-                fx::axis_label(&model, &layout, k),
-                o.df_deta[k],
-                g[j]
-            );
-        }
-    }
-    let d: Vec<Vec<f64>> = grads.iter().map(|o| o.df_deta.clone()).collect();
-    assert_non_degenerate(walk, &model, &layout, &d);
-    eprintln!("MEASURE {walk:?} inner worst margin (1 fails): ∂b {worst:.3e}");
+    eprintln!("MEASURE {walk:?} inner Hessian worst margin (1 fails): {worst:.3e}");
 }
 
 #[test]
-fn nested_algebraic_outer_walk_matches_fd_over_the_compact_vector() {
-    check_outer(Walk::Algebraic);
+fn nested_algebraic_recording_matches_fd_over_the_compact_vector() {
+    check_jacobian(Walk::Algebraic);
+    check_inner_hessian(Walk::Algebraic);
 }
 
 #[test]
-fn nested_algebraic_inner_walk_matches_fd_over_the_compact_vector() {
-    check_inner(Walk::Algebraic);
+fn nested_closed_form_recording_matches_fd_over_the_compact_vector() {
+    check_jacobian(Walk::ClosedForm);
+    check_inner_hessian(Walk::ClosedForm);
 }
 
 #[test]
-fn nested_closed_form_outer_walk_matches_fd_over_the_compact_vector() {
-    check_outer(Walk::ClosedForm);
-}
-
-#[test]
-fn nested_closed_form_inner_walk_matches_fd_over_the_compact_vector() {
-    check_inner(Walk::ClosedForm);
-}
-
-#[test]
-fn nested_ode_outer_walk_matches_fd_over_the_compact_vector() {
-    check_outer(Walk::Ode);
-}
-
-#[test]
-fn nested_ode_inner_walk_matches_fd_over_the_compact_vector() {
-    check_inner(Walk::Ode);
+fn nested_ode_recording_matches_fd_over_the_compact_vector() {
+    check_jacobian(Walk::Ode);
+    check_inner_hessian(Walk::Ode);
 }

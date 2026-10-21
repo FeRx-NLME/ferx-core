@@ -13,8 +13,11 @@
 //! NONMEM equivalent: the quantity is which gradient row a PK slot maps to for a
 //! name that influences no prediction, and NONMEM's `$PK` has no slot map — every
 //! `$PK` variable is just a variable, so there is no control stream that spells the
-//! difference. The exact-derivative oracle (central FD of the production predictor)
-//! lives in the Tier-1 `an_unbound_lognormal_parameter_does_not_steal_cls_gradient_row`.
+//! difference. The exact-derivative oracle (central FD of the production predictor) lived
+//! in the Tier-1 `an_unbound_lognormal_parameter_does_not_steal_cls_gradient_row`, retired in
+//! #2093; the recorder side is pinned by
+//! `unbound_parameter_and_literal_pk_argument_stay_in_recorder_scope`
+//! (`sens/ode_adjoint_tests.rs`).
 //!
 //! Eval-only (`outer_maxiter = 0`), so this returns immediately.
 
@@ -55,7 +58,12 @@ const UNBOUND_AFTER_CL: &str = r"
 /// It is here to prove the `fallback.is_empty()` assertion below can observe an
 /// all-FD population at all: that warning is only emitted for a mixed population
 /// *or* a model that reports analytic, and a guard nothing can trip is not a guard.
-const DERIVED_INTERMEDIATE: &str = r"
+/// The inner-FD control: a lag time, with subject 0 given a steady-state infusion into the
+/// depot below (`ss_infusion_population`). The infusion routes that subject to the event
+/// walk, which declines an SS infusion under a lag, so it takes the finite-difference inner
+/// gradient. (Until #486 the control was an unused derived intermediate, `KEL = CL / V`,
+/// which every subject routed to FD on; the adjoint serves that model.)
+const LAGGED: &str = r"
 [parameters]
   theta THCL(0.134, 0.001, 10.0)
   theta THV(8.11, 0.1, 500.0)
@@ -65,19 +73,33 @@ const DERIVED_INTERMEDIATE: &str = r"
 [individual_parameters]
   CL = THCL * exp(ETA_CL)
   V = THV * exp(ETA_V)
-  KEL = CL / V
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0, lagtime=0.5)
 [error_model]
   DV ~ proportional(PROP_ERR)
 ";
-
 fn warfarin() -> Population {
     read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data must load")
 }
 
+/// Warfarin with subject 0's dose a steady-state infusion into the depot.
+fn ss_infusion_population() -> Population {
+    let mut pop = warfarin();
+    let d = &mut pop.subjects[0].doses[0];
+    *d = ferx_core::DoseEvent::new(d.time, d.amt, 1, 50.0, true, 24.0);
+    pop
+}
+
 /// OFV at the initial parameters under one inner-gradient route.
 fn eval_only_ofv(src: &str, gradient_method: GradientMethod) -> (f64, Vec<String>) {
+    eval_only_ofv_on(src, gradient_method, &warfarin())
+}
+
+fn eval_only_ofv_on(
+    src: &str,
+    gradient_method: GradientMethod,
+    population: &Population,
+) -> (f64, Vec<String>) {
     let model = parse_model_string(src).expect("model must parse");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -88,7 +110,7 @@ fn eval_only_ofv(src: &str, gradient_method: GradientMethod) -> (f64, Vec<String
         threads: Some(2),
         ..FitOptions::default()
     };
-    let r = fit(&model, &warfarin(), &model.default_params, &opts).expect("eval-only fit");
+    let r = fit(&model, population, &model.default_params, &opts).expect("eval-only fit");
     assert!(
         r.ofv.is_finite(),
         "{gradient_method:?}: OFV must be finite, got {}",
@@ -113,16 +135,17 @@ fn an_unbound_parameters_slot_does_not_move_the_objective() {
         fallback.is_empty(),
         "the Auto arm must stay on the analytic inner gradient: {fallback:?}"
     );
-    // The other side of that gate, in the same test: swap the unbound parameter for a
-    // derived one and every subject routes to FD, so the warning this filter looks for
-    // must appear. Without this the guard above is satisfied by a warning the fit never
-    // emits, by a reworded message, or by an eval-only fit that skips the check.
-    let (_, fd_warnings) = eval_only_ofv(DERIVED_INTERMEDIATE, GradientMethod::Auto);
+    // The other side of that gate, in the same test: a subject the adjoint declines takes
+    // the FD inner gradient, so the warning this filter looks for must appear. Without this
+    // the guard above is satisfied by a warning the fit never emits, by a reworded message,
+    // or by an eval-only fit that skips the check.
+    let (_, fd_warnings) =
+        eval_only_ofv_on(LAGGED, GradientMethod::Auto, &ss_infusion_population());
     assert!(
         fd_warnings
             .iter()
             .any(|w| w.contains("finite-difference inner gradient")),
-        "an all-FD population must report it, or the guard above is dead: {fd_warnings:?}"
+        "a declining subject must report it, or the guard above is dead: {fd_warnings:?}"
     );
 
     // Measured on the reference platform — `tools/linux-test.sh --jobs 2 -- test

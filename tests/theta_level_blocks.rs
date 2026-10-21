@@ -364,6 +364,34 @@ fn check_reports_level_binding_errors_directly() {
         .any(|d| { d.code == "E_THETA_LEVEL_BINDING" && d.message.contains("requires init = 0") }));
 }
 
+/// #2174: `ferx check` binds a constrained block with no bounds written, on the
+/// sign-free default box. Before, it reported `E_THETA_LEVEL_BINDING` "constrained
+/// level bounds must include 0 (got 0.000000001..1000000000)".
+///
+/// Mutation — revert the default-box arm in the parser: the report is invalid.
+#[test]
+fn check_binds_a_constrained_block_without_written_bounds() {
+    let text = level_block_model().replace(
+        "PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)",
+        "PLACEBO[STUDY, TIME](0.0)",
+    );
+    assert!(text.contains("PLACEBO[STUDY, TIME](0.0)\n"), "replaced");
+    let (_dir, model_path, data_path) = write_case(&text, DATA);
+    let report = validate_model_file(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_THETA_LEVEL_BINDING"),
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.valid, "{:?}", report.diagnostics);
+}
+
 #[test]
 fn predict_runs_on_a_bound_level_block_model() {
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);

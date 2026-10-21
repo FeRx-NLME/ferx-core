@@ -14,6 +14,25 @@ fn rse_pct(est: f64, se: f64) -> f64 {
     }
 }
 
+/// The `SE = …` text of a console row: the SE to six decimals, or `N/A` when
+/// there is none or it is not finite (#2225) — a `NaN` entry in an otherwise
+/// present `se_*` vector prints the same as a missing one, not `NaN`/`inf`.
+fn se_cell(se: Option<f64>) -> String {
+    match se.filter(|s| s.is_finite()) {
+        Some(s) => format!("{:.6}", s),
+        None => "N/A".to_string(),
+    }
+}
+
+/// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
+/// missing or not finite (#2225).
+fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
+    match se.filter(|s| s.is_finite()) {
+        Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
+        None => ("N/A".to_string(), "N/A".to_string()),
+    }
+}
+
 /// The CV of `P = TV · exp(η)`, `η ~ N(0, var)`, as a percent:
 /// `sqrt(exp(var) − 1) · 100`, exactly (#1858), or `0` for a non-positive
 /// variance. Not the first-order `sqrt(var) · 100`, which runs low and falls
@@ -224,7 +243,7 @@ pub struct OmegaRowsInput<'a> {
     pub omega_fixed: &'a [bool],
     /// The SEs as `run_covariance` writes `FitResult::se_omega`: one per ETA
     /// (diagonal Ω) or the packed lower triangle (block Ω), read through
-    /// [`crate::types::omega_se_at`]. `None` (or a missing entry) prints
+    /// [`crate::types::omega_se_at`]. `None` (or a missing or non-finite entry) prints
     /// `SE = N/A`.
     pub se_omega: Option<&'a [f64]>,
     /// Per-ETA scale, already resolved **by name** from
@@ -404,13 +423,11 @@ pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) ->
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match input
-                .se_omega
-                .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i))
-            {
-                Some(s) => format!("{:.6}", s),
-                None => "N/A".to_string(),
-            }
+            se_cell(
+                input
+                    .se_omega
+                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i)),
+            )
         };
         let eta_type = input.eta_param_types.get(i).copied().flatten();
         let mut note = variance_note(eta_type, var, false);
@@ -467,10 +484,7 @@ fn format_sigma_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match &result.se_sigma {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
+            se_cell(result.se_sigma.as_ref().and_then(|se| se.get(i).copied()))
         };
         let _ = match result.sigma_types.get(i).copied() {
             Some(SigmaType::Proportional) => writeln!(
@@ -525,7 +539,7 @@ pub struct KappaRowsInput<'a> {
     /// Per-kappa FIX flag: a fixed kappa is labelled `[FIX]` with `SE = ---`.
     pub kappa_fixed: &'a [bool],
     /// Diagonal SEs, one per kappa, as `run_covariance` writes them; `None`
-    /// (or a missing entry) prints `SE = N/A`.
+    /// (or a missing or non-finite entry) prints `SE = N/A`.
     pub se_kappa: Option<&'a [f64]>,
     /// Per-kappa scale (#1643). Empty means unknown (a fit saved before #1643)
     /// and prints the log-normal CV%.
@@ -612,10 +626,7 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match input.se_kappa {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
+            se_cell(input.se_kappa.and_then(|se| se.get(i).copied()))
         };
         let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
         let kappa_type = input.kappa_param_types.get(i).copied();
@@ -1152,14 +1163,7 @@ pub fn print_results(result: &FitResult) {
         let (se_str, rse_str) = if is_fixed {
             ("---".to_string(), "---".to_string())
         } else {
-            match &result.se_theta {
-                Some(se) => {
-                    let se_val = se[i];
-                    let rse = rse_pct(est, se_val);
-                    (format!("{:.6}", se_val), format!("{:.1}", rse))
-                }
-                None => ("N/A".to_string(), "N/A".to_string()),
-            }
+            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
@@ -1504,14 +1508,7 @@ pub fn format_summary(result: &FitResult) -> String {
         let (se_str, rse_str) = if is_fixed {
             ("---".to_string(), "---".to_string())
         } else {
-            match &result.se_theta {
-                Some(se) => {
-                    let se_val = se[i];
-                    let rse = rse_pct(est, se_val);
-                    (format!("{:.6}", se_val), format!("{:.1}", rse))
-                }
-                None => ("N/A".to_string(), "N/A".to_string()),
-            }
+            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
         };
         let _ = writeln!(
             out,
@@ -8169,6 +8166,93 @@ mod tests {
                 summary.contains(&format!("--- SIGMA (proportional) ---\n{want}")),
                 "summary fix={fix} se={se:?}:\n{summary}"
             );
+        }
+    }
+
+    /// #2225: a non-finite SE in an otherwise present `se_*` vector prints
+    /// `N/A`, the same as a missing one — never `NaN`/`inf` — in every console
+    /// row block (KAPPA, OMEGA, SIGMA, THETA; THETA's %RSE column too). Each
+    /// block carries a finite neighbour that must still print its value, so a
+    /// fix that blanked the whole vector would fail.
+    #[test]
+    fn non_finite_se_prints_na_in_every_row_block() {
+        // KAPPA: the ferx-r#546 shape, `se_kappa = c(0.01, NA)`, plus +inf.
+        let iov = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.09, 0.04, 0.25]));
+        let names = ["KA", "KB", "KC"].map(String::from).to_vec();
+        let se = [0.01, f64::NAN, f64::INFINITY];
+        let input = KappaRowsInput {
+            omega_iov: &iov,
+            kappa_names: &names,
+            kappa_fixed: &[],
+            se_kappa: Some(&se),
+            kappa_param_types: &[],
+            kappa_weights: &[],
+            kappa_weight_typical: &[],
+            kappa_levels: &[],
+            covariance_status: CovarianceStatus::Computed,
+        };
+        let rows = format_kappa_rows_from(&input, KappaRowsOptions::default());
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| l.rsplit("SE = ").next().unwrap())
+            .collect();
+        assert_eq!(ses, ["0.010000", "N/A", "N/A"], "kappa:\n{rows}");
+
+        // OMEGA: diagonal Ω, the first ETA's SE NaN, the second +inf.
+        let mut r = omega_rows_result(false, false, true, CovarianceStatus::Computed);
+        let se_omega = r.se_omega.as_mut().unwrap();
+        se_omega[0] = f64::NAN;
+        se_omega[1] = f64::INFINITY;
+        let rows = format_omega_rows(&r);
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| {
+                l.rsplit("SE = ")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ses,
+            ["N/A", "N/A", "0.003000", "0.004000", "0.005000", "0.006000"],
+            "omega:\n{rows}"
+        );
+
+        // THETA (the summary's table): a NaN SE blanks SE and %RSE alike.
+        r.se_theta = Some(vec![0.5, f64::NAN, 0.05, f64::NEG_INFINITY]);
+        let summary = format_summary(&r);
+        let theta_row = |label: &str, est: f64, se: &str, rse: &str| {
+            format!("  {:<16} {:>12.6} {:>12} {:>8}\n", label, est, se, rse)
+        };
+        for want in [
+            theta_row("TVCL", 5.0, "0.500000", "10.0"),
+            theta_row("TVV", 62.5, "N/A", "N/A"),
+            theta_row("TH_LP", 0.7, "N/A", "N/A"),
+        ] {
+            assert!(summary.contains(&want), "want {want:?} in:\n{summary}");
+        }
+
+        // SIGMA: the second σ's SE NaN, the fourth -inf.
+        let mut r = sigma_rows_result(false, Some(4));
+        r.se_sigma = Some(vec![0.01, f64::NAN, 0.03, f64::NEG_INFINITY]);
+        let rows = format_sigma_rows(&r);
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| l.rsplit("SE = ").next().unwrap())
+            .collect();
+        assert_eq!(
+            ses,
+            ["0.010000", "N/A", "0.030000", "N/A"],
+            "sigma:\n{rows}"
+        );
+
+        for text in [format_summary(&r), summary] {
+            for bad in ["NaN", "inf"] {
+                assert!(!text.contains(bad), "{bad} printed:\n{text}");
+            }
         }
     }
 }

@@ -40,10 +40,59 @@ fn subject() -> Subject {
     }
 }
 
+/// The prior `Ω ⊕ (I_K ⊗ Ω_iov)`: `Ω` top-left, one `Ω_iov` per group on the diagonal at
+/// the group's offset, and exact zeros everywhere else (no cross-group, no η–κ entry).
+#[test]
+fn prior_places_one_omega_iov_per_group_and_zeros_elsewhere() {
+    let s = subject();
+    let layout = StackedLayout::new(N_ETA, N_KAPPA, &s);
+    let omega = DMatrix::from_fn(N_ETA, N_ETA, |i, j| 1.0 + (i * N_ETA + j) as f64);
+    let omega_iov = DMatrix::from_fn(N_KAPPA, N_KAPPA, |i, j| 100.0 + (i * N_KAPPA + j) as f64);
+    let prior = layout.prior(&omega, &omega_iov);
+    let n = N_ETA + layout.n_groups() * N_KAPPA;
+    assert_eq!(prior.shape(), (n, n));
+    for r in 0..n {
+        for c in 0..n {
+            let want = if r < N_ETA && c < N_ETA {
+                omega[(r, c)]
+            } else if r >= N_ETA && c >= N_ETA && (r - N_ETA) / N_KAPPA == (c - N_ETA) / N_KAPPA {
+                omega_iov[((r - N_ETA) % N_KAPPA, (c - N_ETA) % N_KAPPA)]
+            } else {
+                0.0
+            };
+            assert_eq!(prior[(r, c)].to_bits(), want.to_bits(), "entry ({r}, {c})");
+        }
+    }
+}
+
 /// A stacked vector whose every entry is distinct, so a slice taken at the wrong offset
 /// cannot coincide with the right one.
 fn distinct(n: usize) -> Vec<f64> {
     (0..n).map(|i| 10.0 + i as f64).collect()
+}
+
+/// `kappa_chunks` serves the route decision, which must not panic on a vector of the
+/// wrong width: it cuts whatever κ tail there is, and nothing when there is none.
+#[test]
+fn kappa_chunks_cut_the_tail_and_tolerate_a_malformed_width() {
+    let s = subject();
+    let layout = StackedLayout::new(N_ETA, N_KAPPA, &s);
+    let stacked = distinct(layout.n_stacked());
+    let chunks = layout.kappa_chunks(&stacked);
+    assert_eq!(chunks.len(), layout.n_groups());
+    for (g, c) in chunks.iter().enumerate() {
+        assert_eq!(*c, layout.kappa(&stacked, g));
+    }
+    // One short: the last block is short rather than a panic.
+    let short = layout.kappa_chunks(&stacked[..stacked.len() - 1]);
+    assert_eq!(short.len(), layout.n_groups());
+    assert_eq!(short.last().unwrap().len(), N_KAPPA - 1);
+    // Shorter than η: no κ tail at all.
+    assert!(layout.kappa_chunks(&stacked[..N_ETA - 1]).is_empty());
+    // No κ declared: nothing to cut, whatever the vector.
+    assert!(StackedLayout::new(N_ETA, 0, &s)
+        .kappa_chunks(&stacked)
+        .is_empty());
 }
 
 /// #1082 PR1 is a pure refactor: the layout must reproduce, index for index, the stacked
@@ -98,53 +147,4 @@ fn layout_reproduces_the_pre_1082_stacked_convention_index_for_index() {
     let mut pk_only = stacked[..N_ETA].to_vec();
     pk_only.extend([0.0; N_KAPPA]);
     assert_eq!(layout.combined_pk_only(&stacked), pk_only);
-}
-
-/// The prior `Ω ⊕ (I_K ⊗ Ω_iov)`: `Ω` top-left, one `Ω_iov` per group on the diagonal at
-/// the group's offset, and exact zeros everywhere else (no cross-group, no η–κ entry).
-#[test]
-fn prior_places_one_omega_iov_per_group_and_zeros_elsewhere() {
-    let s = subject();
-    let layout = StackedLayout::new(N_ETA, N_KAPPA, &s);
-    let omega = DMatrix::from_fn(N_ETA, N_ETA, |i, j| 1.0 + (i * N_ETA + j) as f64);
-    let omega_iov = DMatrix::from_fn(N_KAPPA, N_KAPPA, |i, j| 100.0 + (i * N_KAPPA + j) as f64);
-    let prior = layout.prior(&omega, &omega_iov);
-    let n = N_ETA + layout.n_groups() * N_KAPPA;
-    assert_eq!(prior.shape(), (n, n));
-    for r in 0..n {
-        for c in 0..n {
-            let want = if r < N_ETA && c < N_ETA {
-                omega[(r, c)]
-            } else if r >= N_ETA && c >= N_ETA && (r - N_ETA) / N_KAPPA == (c - N_ETA) / N_KAPPA {
-                omega_iov[((r - N_ETA) % N_KAPPA, (c - N_ETA) % N_KAPPA)]
-            } else {
-                0.0
-            };
-            assert_eq!(prior[(r, c)].to_bits(), want.to_bits(), "entry ({r}, {c})");
-        }
-    }
-}
-
-/// `kappa_chunks` serves the route decision, which must not panic on a vector of the
-/// wrong width: it cuts whatever κ tail there is, and nothing when there is none.
-#[test]
-fn kappa_chunks_cut_the_tail_and_tolerate_a_malformed_width() {
-    let s = subject();
-    let layout = StackedLayout::new(N_ETA, N_KAPPA, &s);
-    let stacked = distinct(layout.n_stacked());
-    let chunks = layout.kappa_chunks(&stacked);
-    assert_eq!(chunks.len(), layout.n_groups());
-    for (g, c) in chunks.iter().enumerate() {
-        assert_eq!(*c, layout.kappa(&stacked, g));
-    }
-    // One short: the last block is short rather than a panic.
-    let short = layout.kappa_chunks(&stacked[..stacked.len() - 1]);
-    assert_eq!(short.len(), layout.n_groups());
-    assert_eq!(short.last().unwrap().len(), N_KAPPA - 1);
-    // Shorter than η: no κ tail at all.
-    assert!(layout.kappa_chunks(&stacked[..N_ETA - 1]).is_empty());
-    // No κ declared: nothing to cut, whatever the vector.
-    assert!(StackedLayout::new(N_ETA, 0, &s)
-        .kappa_chunks(&stacked)
-        .is_empty());
 }

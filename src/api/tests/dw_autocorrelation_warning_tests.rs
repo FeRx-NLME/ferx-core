@@ -90,20 +90,32 @@ fn non_finite_dw_never_warns() {
 ///
 /// It carries an `omega`, and that is measured rather than argued. An earlier
 /// version dropped it on the theory that a random effect on `CL` would absorb
-/// the drift through the EBE search; the numbers say otherwise, because a
-/// scalar on `CL` cannot bend a mono-exponential into a bi-exponential —
-/// ω collapses instead (η shrinkage 98 %). Durbin-Watson on this fixture, one
-/// variable changed at a time:
+/// the drift through the EBE search; it cannot, because a scalar on `CL` cannot
+/// bend a mono-exponential into a bi-exponential. Durbin-Watson on this fixture
+/// (the two subjects of `assert_fit_pushes_only_the_helpers_message`), one
+/// variable changed at a time — the same to four digits on native macOS arm64 and
+/// on Linux aarch64 (`tools/linux-test.sh`):
 ///
-/// | variant | `outer_maxiter: 1` | converged |
-/// |---|---|---|
-/// | no `omega` | 0.2645 | 0.2845 |
-/// | `omega ETA_CL ~ 0.09` | 0.2934 | 0.2845 |
+/// | variant | `outer_maxiter: 1` | converged | converged ω |
+/// |---|---|---|---|
+/// | no `omega` | 0.1448 | 0.1257 | — |
+/// | `omega ETA_CL ~ 0.09` (ODE arm) | 0.2394 | 0.2439 | 0.068 |
+/// | the same, `[diffusion]` arm | 0.2468 | 0.2468 | 0.069 |
 ///
-/// Worst case 0.29 against a bound of 1.5, so the `omega` is free. Keeping it
+/// Worst case 0.25 against a bound of 1.5, so the `omega` is free. Keeping it
 /// matters for what the test can *see*: with `n_eta = 0` the fixture cannot
 /// observe a suffix gated on `model.n_eta > 0`, and it sits off the analytic
 /// inner-gradient path (see #1432).
+///
+/// The ω has to be *identifiable*, not merely present: the subjects differ in
+/// their elimination rate (see `biexponential_subject`), so `ETA_CL` has an
+/// interior optimum. An earlier fixture differed only in an amount scale, which
+/// `CL` cannot express, so ω's optimum was 0 (η shrinkage 98 %) and whether the
+/// fit stopped just short of the packed-coordinate guard or on it depended on the
+/// platform: on native macOS arm64 the `[diffusion]` arm — whose FD fit is
+/// already converged at `outer_maxiter: 1` — reached the guard and emitted a
+/// collapse warning the allow-list rightly does not account for, while Linux
+/// stopped short and passed.
 ///
 /// `TVV` is `FIX`ed because the observation is the compartment **amount**, so
 /// `V` enters only through `CL / V` — free, it is a flat direction rather than
@@ -128,13 +140,18 @@ fn one_cpt_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
-/// The same model with a `[diffusion]` block, so the pair differs in exactly
-/// one thing: whether `model.is_sde()` holds.
+/// The same model with a `[diffusion]` block, so the pair differs in whether
+/// `model.is_sde()` holds — and in the `fd` gradient that block forces (below).
 ///
 /// Without this arm the test cannot see a recommendation gated on `is_sde()` —
 /// which is the population that must least of all be told to add process noise.
 /// `gradient_method = fd` because the EKF path has no analytic-sensitivity
 /// provider.
+///
+/// The diffusion is `FIX`ed: what the arm needs is `is_sde()`, not a diffusion
+/// estimate, and an estimated one competes with ω and σ for the same misfit —
+/// measured, it ran to 9 or 59 in variants of this fixture and drove σ to its floor
+/// (an `EPS shrinkage` warning) or ω to its guard.
 fn one_cpt_sde_model() -> CompiledModel {
     let src = r#"
 [parameters]
@@ -150,7 +167,7 @@ fn one_cpt_sde_model() -> CompiledModel {
 [odes]
   d/dt(central) = -(CL / V) * central
 [diffusion]
-  central ~ 0.01
+  central ~ 0.01 FIX
 [error_model]
   DV ~ proportional(PROP)
 [fit_options]
@@ -159,14 +176,16 @@ fn one_cpt_sde_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
-/// Observations from a two-compartment truth, `100·(0.6·e^{-0.5t} + 0.4·e^{-0.05t})`.
-/// Against the model's single `e^{-0.1t}` the residuals are a smooth U — strongly
-/// positively autocorrelated, which is the `DW < 1.5` branch.
-fn biexponential_subject(id: &str, scale: f64) -> Subject {
+/// Observations from a two-compartment truth,
+/// `scale·100·(0.6·e^{-0.5·rate·t} + 0.4·e^{-0.05·rate·t})`. Against the model's
+/// single `e^{-(CL/V)t}` the residuals are a smooth U — strongly positively
+/// autocorrelated, which is the `DW < 1.5` branch. `rate` differs between the two
+/// subjects so that `ETA_CL` is identifiable (see `one_cpt_model`).
+fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
     let obs_times: Vec<f64> = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
     let observations: Vec<f64> = obs_times
         .iter()
-        .map(|t| scale * 100.0 * (0.6 * (-0.5f64 * t).exp() + 0.4 * (-0.05f64 * t).exp()))
+        .map(|t| scale * 100.0 * (0.6 * (-0.5 * rate * t).exp() + 0.4 * (-0.05 * rate * t).exp()))
         .collect();
     let n = obs_times.len();
     Subject {
@@ -223,9 +242,13 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
 /// empty search.
 /// Every warning either fixture is *entitled* to emit, as (opening, closing)
 /// pairs. Both ends are pinned on purpose: with prefixes alone, appending the
-/// recommendation to an already-accounted warning — the shrinkage notice, say —
+/// recommendation to an already-accounted warning — the budget notice, say —
 /// stays accounted and the test passes (measured; that is how this list came to
 /// be anchored at both ends).
+///
+/// There is deliberately no `High ETA shrinkage` entry. With an identifiable ω
+/// (see `one_cpt_model`) neither arm emits one, and allowing it would let a
+/// regression back to the collapsing-ω fixture pass unaccounted.
 ///
 /// The thread notice opens with a machine-dependent count, so its "prefix" is
 /// `classify_warning`'s own key, matched anywhere in the string.
@@ -239,7 +262,6 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "increase maxiter for a tighter fit.",
     ),
     ("Outer optimization did not converge", "did not converge"),
-    ("High ETA shrinkage", "or collecting more informative data."),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
@@ -253,8 +275,8 @@ const ACCOUNTED: &[(&str, &str)] = &[
 fn assert_fit_pushes_only_the_helpers_message(model: &CompiledModel, label: &str) {
     let pop = Population {
         subjects: vec![
-            biexponential_subject("1", 1.0),
-            biexponential_subject("2", 1.1),
+            biexponential_subject("1", 1.0, 1.0),
+            biexponential_subject("2", 1.1, 2.5),
         ],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
