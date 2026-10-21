@@ -452,23 +452,30 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
 /// unidentified directions, so the cross-product estimator requires a full-rank
 /// `S`. `Sandwich` never inverts `S`, so it stays defined even when `S` is
 /// rank-deficient.
+///
+/// `unit_coords` flags the coordinates whose units the floor on `S` must not see
+/// ([`invert_psd_with_floor_unit_free`], #2145).
 pub(crate) fn combine_covariance(
     method: CovarianceMethod,
     r_inv: DMatrix<f64>,
     s: &DMatrix<f64>,
+    unit_coords: &[bool],
 ) -> Option<DMatrix<f64>> {
     match method {
         CovarianceMethod::Hessian => Some(r_inv),
         CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
-        CovarianceMethod::CrossProduct => invert_cross_product(s),
+        CovarianceMethod::CrossProduct => invert_cross_product(s, unit_coords),
     }
 }
 
 /// `S⁻¹`, accepted only when `S` is full-rank (no eigenvalue clipped); a rank-deficient or
 /// indefinite `S` yields `None`. The whole of the `CrossProduct` estimator — it reads no `R` —
 /// which is why `covariance_method = s` can call it without building one (#1803).
-fn invert_cross_product(s: &DMatrix<f64>) -> Option<DMatrix<f64>> {
-    match invert_psd_with_floor(s) {
+///
+/// The rank test is the floor of [`invert_psd_with_floor_unit_free`], so an identity-packed θ
+/// written in large or small units is not refused as rank-deficient (#2145).
+fn invert_cross_product(s: &DMatrix<f64>, unit_coords: &[bool]) -> Option<DMatrix<f64>> {
+    match invert_psd_with_floor_unit_free(s, unit_coords) {
         Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
         _ => None,
     }
@@ -535,9 +542,13 @@ pub(crate) fn combine_covariance_and_reference(
     r_inv: DMatrix<f64>,
     r_inv_ref: Option<DMatrix<f64>>,
     s: &DMatrix<f64>,
+    unit_coords: &[bool],
 ) -> Option<(DMatrix<f64>, Option<DMatrix<f64>>)> {
-    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s));
-    Some((combine_covariance(method, r_inv, s)?, reference))
+    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s, unit_coords));
+    Some((
+        combine_covariance(method, r_inv, s, unit_coords)?,
+        reference,
+    ))
 }
 
 /// Assemble the per-subject score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free
@@ -1793,6 +1804,8 @@ pub(crate) fn compute_covariance_for(
     // same mask, so there is one gate, not a second structural filter here.
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
+    // The free coordinates whose units the eigenvalue floor on `S` and `R` must not see (#2145).
+    let unit_coords = identity_theta_free_mask(template, &free_idx);
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
@@ -1831,7 +1844,7 @@ pub(crate) fn compute_covariance_for(
             Ok(s) => s,
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        let Some(cov_free) = invert_cross_product(&s_free) else {
+        let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
             return CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string());
         };
         if options.verbose {
@@ -2105,7 +2118,7 @@ pub(crate) fn compute_covariance_for(
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
 
-    let inv = match invert_psd_with_floor(&hess_free_sym) {
+    let inv = match invert_psd_with_floor_unit_free(&hess_free_sym, &unit_coords) {
         Some(inv) => inv,
         None => {
             // `invert_psd_with_floor` returns None in two distinct cases, and we
@@ -2220,7 +2233,7 @@ pub(crate) fn compute_covariance_for(
             }
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free) {
+        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free, &unit_coords) {
             Some(pair) => pair,
             None => {
                 debug_assert!(
@@ -2533,8 +2546,11 @@ pub(crate) fn worst_variance_inflation(var: &[f64], var_ref: &[f64]) -> f64 {
 /// recovers a PD inverse on near-singular or marginally-indefinite inputs.
 ///
 /// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` keeps the
-/// regularisation scale-equivariant; the absolute floor handles the edge case
-/// where the whole spectrum is tiny.
+/// regularisation equivariant to multiplying the **whole** matrix by a constant; the
+/// absolute floor handles the edge case where the whole spectrum is tiny. It is *not*
+/// invariant to rescaling one coordinate, which is what a change of units does to an
+/// identity-packed θ — the covariance step's callers go through
+/// [`invert_psd_with_floor_unit_free`] for that (#2145).
 ///
 /// Returns `None` only when the eigendecomposition fails or every eigenvalue
 /// is non-finite or non-positive — i.e. the Hessian carries no usable
@@ -2650,6 +2666,105 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
         n_clipped,
         unclipped_inverse,
     })
+}
+
+/// [`invert_psd_with_floor`] with the floor made independent of the units of the coordinates
+/// flagged in `unit_coords` (#2145).
+///
+/// An identity-packed θ (a negative lower bound, `theta_packs_log`) is the one packed
+/// coordinate that carries units: writing it in units `k` times larger divides its row and
+/// column of `R` or `S` by `k`. The floor, taken from the raw spectrum, then clips a
+/// well-determined fit purely because of those units — under `covariance_method = s` that is a
+/// rejected `S`, under `r`/`rsr` an understated SE. So each flagged coordinate with a positive,
+/// finite diagonal is rescaled first, `C = D⁻¹ M D⁻¹` with `dᵢ = sqrt(Mᵢᵢ / g)`, `g` the
+/// largest **unflagged** positive diagonal entry, so its diagonal entry in `C` is `g` whatever
+/// its units. With no usable unflagged entry (every free coordinate an identity-packed θ, e.g.
+/// Ω and σ FIX) `g = 1`, i.e. Jacobi scaling of the flagged block: any anchor read off a
+/// flagged diagonal would move with the units, and the absolute `1e-12` floor would clip on
+/// them again. The floor is applied to `C`'s
+/// spectrum and the result mapped back, `M⁻¹ = D⁻¹ C⁻¹ D⁻¹`.
+///
+/// The largest rather than a mean: a mean is dragged down by exactly the flat dimensionless
+/// direction the floor exists to catch, and would then pull a well-determined θ under the floor
+/// with it. At the largest entry the flagged coordinate leaves `λ_max`, and so the floor every
+/// other coordinate is tested against, where the dimensionless block alone puts it (within the
+/// factor the off-diagonals allow).
+///
+/// Every other coordinate keeps `dᵢ = 1`. Log-θ, the log-Cholesky Ω diagonal, log-σ and ρ are
+/// dimensionless, so there a tiny diagonal entry *is* a flat direction and the floor must keep seeing it — which
+/// full Jacobi scaling of every coordinate would hide, since a diagonal matrix equilibrates to
+/// the identity. A flagged coordinate with a non-positive or non-finite diagonal also keeps
+/// `dᵢ = 1`: a parameter with no information is still clipped.
+///
+/// Not covered: an Ω Cholesky **off-diagonal** is identity-packed and carries the units of its
+/// η's (an additive η, say), so a block Ω on such η's can still meet a unit-dependent floor.
+/// Only θ's are flagged by the covariance step (`identity_theta_free_mask`).
+///
+/// The returned `min_eigenvalue`, `max_eigenvalue` and `floor` are those of `C`, so the
+/// regularization warning built from them no longer moves with a θ's units either.
+pub(crate) fn invert_psd_with_floor_unit_free(
+    sym: &DMatrix<f64>,
+    unit_coords: &[bool],
+) -> Option<RegularizedInverse> {
+    let n = sym.nrows();
+    debug_assert_eq!(unit_coords.len(), n, "one flag per coordinate");
+    let Some(d) = unit_coordinate_scales(sym, unit_coords) else {
+        return invert_psd_with_floor(sym);
+    };
+    let mut c = sym.clone();
+    for i in 0..n {
+        for j in 0..n {
+            c[(i, j)] /= d[i] * d[j];
+        }
+    }
+    let mut inv = invert_psd_with_floor(&c)?;
+    for i in 0..n {
+        for j in 0..n {
+            let s = d[i] * d[j];
+            inv.inverse[(i, j)] /= s;
+            inv.unclipped_inverse[(i, j)] /= s;
+        }
+    }
+    Some(inv)
+}
+
+/// The diagonal scaling `d` of [`invert_psd_with_floor_unit_free`], or `None` when it is the
+/// identity (no flagged coordinate with a usable diagonal), so the unscaled path is taken
+/// unchanged.
+fn unit_coordinate_scales(sym: &DMatrix<f64>, unit_coords: &[bool]) -> Option<Vec<f64>> {
+    let usable = |i: usize| {
+        let m = sym[(i, i)];
+        m.is_finite() && m > 0.0
+    };
+    let n = sym.nrows();
+    if !(0..n).any(|i| unit_coords[i] && usable(i)) {
+        return None;
+    }
+    let g = (0..n)
+        .filter(|&i| !unit_coords[i] && usable(i))
+        .map(|i| sym[(i, i)])
+        .reduce(f64::max)
+        .unwrap_or(1.0);
+    Some(
+        (0..n)
+            .map(|i| {
+                if unit_coords[i] && usable(i) {
+                    (sym[(i, i)] / g).sqrt()
+                } else {
+                    1.0
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Which free coordinates of the covariance step carry units: the identity-packed θ's
+/// (`theta_packs_log` false), the mask [`invert_psd_with_floor_unit_free`] equilibrates (#2145).
+fn identity_theta_free_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
+    free_idx
+        .iter()
+        .map(|&i| i < template.theta.len() && !theta_packs_log(template.theta_lower[i]))
+        .collect()
 }
 
 /// Owned result of the gated covariance step, consumed by every estimator
@@ -3283,6 +3398,189 @@ mod tests {
         (0..m.nrows()).map(|k| m[(k, k)]).collect()
     }
 
+    /// `M` with coordinate `j` written in units `k` times larger: row and column `j` divided
+    /// by `k`, exactly what a change of units does to an identity-packed θ's block of `R` or `S`.
+    fn rescale_coordinate(m: &DMatrix<f64>, j: usize, k: f64) -> DMatrix<f64> {
+        let mut out = m.clone();
+        for i in 0..m.nrows() {
+            out[(i, j)] /= k;
+            out[(j, i)] /= k;
+        }
+        out
+    }
+
+    /// Worst entrywise relative gap — per entry, since the entries span `k²` in magnitude and a
+    /// gap normalised by the largest would not see the small ones.
+    fn max_rel_gap(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+        let mut worst = 0.0_f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let gap = (x - y).abs() / y.abs();
+            assert!(gap.is_finite(), "{x} vs {y}");
+            if gap > worst {
+                worst = gap;
+            }
+        }
+        worst
+    }
+
+    /// #2145: an identity-packed θ in large or small units is not clipped once its coordinate
+    /// is flagged, and its inverse is the rescaled inverse of the original — while the same
+    /// rescale on an **unflagged** coordinate is still clipped, so an implementation that
+    /// equilibrated every coordinate (full Jacobi) fails the second half.
+    #[test]
+    fn unit_free_floor_ignores_the_units_of_a_flagged_coordinate_only() {
+        // Well conditioned: eigenvalues ≈ 0.6 … 4.6, correlations ≤ 0.5.
+        let m = DMatrix::from_row_slice(3, 3, &[4.0, 0.6, 0.3, 0.6, 1.0, 0.2, 0.3, 0.2, 0.8]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        let flag_1 = [false, true, false];
+        let at_k1 = super::invert_psd_with_floor_unit_free(&m, &flag_1).expect("PD");
+        for k in [1e6, 1e-6] {
+            let mk = rescale_coordinate(&m, 1, k);
+            // The fixture straddles the floor: unscaled, the rescale alone is clipped.
+            let raw = super::invert_psd_with_floor(&mk).expect("PD");
+            assert!(
+                raw.n_clipped > 0,
+                "k = {k}: fixture must be under the raw floor"
+            );
+
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &flag_1).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = {k}: flagged coordinate was clipped");
+            // (Mₖ)⁻¹ = row/column 1 of M⁻¹ multiplied by k.
+            let want = rescale_coordinate(&m_inv, 1, 1.0 / k);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            let gap_ref = max_rel_gap(&inv.unclipped_inverse, &want);
+            eprintln!("k = {k:e}: inverse gap {gap:.2e}, reference gap {gap_ref:.2e}");
+            // Measured ≤ 6.4e-16 (macOS arm64) at both k: a few roundings per entry.
+            assert!(gap < 1e-12 && gap_ref < 1e-12, "k = {k}: {gap} / {gap_ref}");
+            // The spectrum the warning reports does not move with the units either.
+            for (got, want) in [
+                (inv.max_eigenvalue, at_k1.max_eigenvalue),
+                (inv.min_eigenvalue, at_k1.min_eigenvalue),
+                (inv.floor, at_k1.floor),
+            ] {
+                assert!(
+                    ((got - want) / want).abs() < 1e-12,
+                    "k = {k}: {got} vs k = 1 {want}"
+                );
+            }
+
+            // The same rescale on a coordinate that is not flagged: still clipped.
+            let unflagged =
+                super::invert_psd_with_floor_unit_free(&mk, &[true, false, false]).expect("PD");
+            assert!(
+                unflagged.n_clipped > 0,
+                "k = {k}: an unflagged coordinate escaped the floor"
+            );
+        }
+    }
+
+    /// #2145: the equilibration does not switch the floor off. A flagged coordinate that is
+    /// collinear with another (correlation `1 − 1e-14`) is still a flat direction, and so is a
+    /// flagged coordinate with no information at all; an uncorrelated tiny diagonal entry on a
+    /// dimensionless (unflagged) coordinate is still clipped beside a flagged one.
+    #[test]
+    fn unit_free_floor_still_clips_a_genuinely_flat_direction() {
+        let rho = 1.0 - 1e-14;
+        let corr = DMatrix::from_row_slice(2, 2, &[1.0, rho, rho, 1.0]);
+        for k in [1.0, 1e6, 1e-6] {
+            let mk = rescale_coordinate(&corr, 1, k);
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &[false, true]).expect("PSD");
+            assert_eq!(
+                inv.n_clipped, 1,
+                "k = {k}: collinear pair escaped the floor"
+            );
+            let both = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PSD");
+            assert_eq!(
+                both.n_clipped, 1,
+                "k = {k}: all-flagged collinear pair escaped"
+            );
+        }
+
+        let no_info = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![2.0, 0.0]));
+        let inv = super::invert_psd_with_floor_unit_free(&no_info, &[false, true]).expect("PSD");
+        assert_eq!(
+            inv.n_clipped, 1,
+            "a flagged coordinate with no score must stay clipped"
+        );
+
+        // Exactly one clip: the flat entry. The flagged θ's anchor is the largest unflagged
+        // diagonal; a geometric mean (1e-10 here) drags it onto the floor beside the flat one.
+        let flat = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-20, 1.0, 3e8]));
+        let inv = super::invert_psd_with_floor_unit_free(&flat, &[false, false, true]).expect("PD");
+        assert_eq!(
+            inv.n_clipped, 1,
+            "a flat dimensionless direction must stay clipped"
+        );
+    }
+
+    /// Review of #2145: with **every** coordinate flagged (Ω and σ FIX, only identity-packed θ's
+    /// free) there is no dimensionless diagonal to anchor on. An anchor read off the flagged
+    /// diagonals moves with the units, and `[1e-14]` — `[1]` in units 1e7 larger — fell under
+    /// the absolute `1e-12` floor. The straddle: unscaled it is clipped, flagged it is not, and
+    /// the inverse is exact; a two-coordinate block in mixed units likewise.
+    #[test]
+    fn unit_free_floor_is_unit_free_when_every_coordinate_is_flagged() {
+        let one = DMatrix::from_element(1, 1, 1e-14);
+        assert_eq!(super::invert_psd_with_floor(&one).expect("PD").n_clipped, 1);
+        let inv = super::invert_psd_with_floor_unit_free(&one, &[true]).expect("PD");
+        assert_eq!(
+            inv.n_clipped, 0,
+            "an all-flagged θ in large units was clipped"
+        );
+        assert!(
+            ((inv.inverse[(0, 0)] - 1e14) / 1e14).abs() < 1e-14,
+            "{}",
+            inv.inverse[(0, 0)]
+        );
+
+        let m = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        for (k0, k1) in [(1e7, 1e-7), (1e8, 1e8)] {
+            let mk = rescale_coordinate(&rescale_coordinate(&m, 0, k0), 1, k1);
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = ({k0}, {k1}): clipped");
+            let want = rescale_coordinate(&rescale_coordinate(&m_inv, 0, 1.0 / k0), 1, 1.0 / k1);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            // Measured ≤ 4e-16 (macOS arm64).
+            assert!(gap < 1e-12, "k = ({k0}, {k1}): gap {gap}");
+        }
+    }
+
+    /// The mask the covariance step passes: identity-packed θ's (a negative lower bound) only,
+    /// indexed over the free coordinates.
+    #[test]
+    fn identity_theta_free_mask_flags_identity_packed_thetas_only() {
+        let t = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![5.0, 2.0],
+            theta_names: vec!["SLOPE".into(), "TVCL".into()],
+            // Identity-packed (negative lower bound), then log-packed (a lower bound of 0).
+            theta_lower: vec![-100.0, 0.0],
+            theta_upper: vec![100.0, 50.0],
+            theta_fixed: vec![false; 2],
+            omega: crate::types::OmegaMatrix::from_diagonal(&[0.09], vec!["E1".into()]),
+            omega_fixed: vec![false],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        };
+        // Packed: θ₀, θ₁, ω, σ. All free; then with θ₀ FIX the free block starts at θ₁.
+        assert_eq!(
+            super::identity_theta_free_mask(&t, &[0, 1, 2, 3]),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            super::identity_theta_free_mask(&t, &[1, 2, 3]),
+            vec![false, false, false]
+        );
+    }
+
     #[test]
     fn invert_psd_with_floor_reports_the_spectrum_ends_and_no_inflation_when_clean() {
         // A positive-definite input is inverted exactly: nothing is clipped, so the floor
@@ -3437,6 +3735,7 @@ mod tests {
                 r_inv.clone(),
                 Some(r_inv_ref.clone()),
                 s,
+                &[false, false],
             )
             .expect("sandwich never inverts S");
             let cov_ref = cov_ref.expect("a reference was supplied");
@@ -3487,6 +3786,7 @@ mod tests {
             r_inv.clone(),
             Some(r_inv_ref.clone()),
             &s_asym,
+            &[false, false],
         )
         .expect("sandwich never inverts S");
         let reference = reference.expect("a reference was supplied");
@@ -3509,6 +3809,7 @@ mod tests {
             r_inv.clone(),
             None,
             &s_loaded,
+            &[false, false],
         )
         .expect("sandwich never inverts S");
         assert!(none_ref.is_none());
@@ -4967,7 +5268,7 @@ mod tests {
         )
         .expect("S");
         let want = super::embed_free(
-            &super::invert_cross_product(&s).expect("S⁻¹ exists"),
+            &super::invert_cross_product(&s, &vec![false; s.nrows()]).expect("S⁻¹ exists"),
             &free_idx,
             x.len(),
         );
