@@ -4193,8 +4193,9 @@ fn a_cens_cell_holding_no_flag_is_not_read_on_a_time_to_event_row() {
 
 /// B4 + B5. `W_CENS_UNEXPECTED` quotes the cell as written and names the tail the
 /// engines score it on. Every engine routes on `cens < 0` alone — pinned per site
-/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its three siblings
-/// in `stats::special` and `estimation::sens_cov_hessian`, and on the objective by
+/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its two siblings
+/// in `stats::special` (a third, in `estimation::sens_cov_hessian`, was deleted with
+/// that module in #2093), and on the objective by
 /// `an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop`
 /// — so a positive flag is the lower tail, like 1, and a negative one the upper
 /// tail, like -1. Both signs in one test, so a sign gate stuck on either branch

@@ -169,13 +169,11 @@ pub(crate) enum FirstRecord {
 /// (#1133), so a reset at or before the first other record overwrites whatever this seed
 /// put there before anything reads it.
 ///
-/// The prediction engines resolve the seed through this one function — the dense
-/// event-driven engine, the dual (`sens/ode_provider`) walk, and the adaptive driver with
-/// its frozen replay. They used to carry three scans that disagreed with each other and
-/// with the walk. **One exception remains:** the compartment-state pass behind
-/// `pk::compute_predictions_with_states` (sdtab states, `[derived]`), in
-/// `ode_predictions_event_driven_with_states`, seeds `init()` from the first
-/// *observation's* snapshot, not from this record (#2133).
+/// Every engine resolves the seed through this one function — the dense event-driven
+/// engine, the dual (`sens/ode_provider`) walk, the adaptive driver with its frozen replay,
+/// and the compartment-state pass behind `pk::compute_predictions_with_states` (sdtab
+/// states, `[derived]`). They used to carry scans that disagreed with each other and with
+/// the walk; the state pass seeded from the first *observation's* snapshot until #2133.
 pub(crate) fn first_record(subject: &Subject, n_doses: usize) -> Option<FirstRecord> {
     let mut best: Option<(f64, FirstRecord)> = None;
     // Kinds in walk order under a strict `<`, so a co-timed record of an earlier kind, and
@@ -327,20 +325,20 @@ where
 /// state (#519), which keeps its stop cycle identical to the f64 path's, so the truncated
 /// gradient is the exact derivative of the truncated value (see [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
 ///
-/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment
-/// is converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag`
-/// — negligible both relative to itself and relative to the dominant compartment. Testing the
+/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment is
+/// converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag` —
+/// negligible both relative to itself and relative to the dominant compartment. Testing the
 /// *increment* (not the magnitude) is what makes this safe in a scale-separated model: a small
-/// compartment still in transit (effect-site / metabolite many orders below central) keeps the
-/// loop running until it too stops moving, rather than being declared converged merely for
-/// being small. The `tol·max_mag` term is the absolute floor that lets a genuinely-settled
-/// near-zero compartment — where the pure relative test is ill-conditioned — pass; without it
-/// the loop could never stop. Because the stop only fires once every compartment's increment
-/// is below f64-relative precision, the value has reached its fixed point and the elided cycles
-/// do not move it — predictions are unchanged to f64 precision, and gradients match a full
-/// budget to `< 1e-6` (see `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`;
-/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on
-/// the nonlinear fallback).
+/// compartment still in transit (effect-site / metabolite many orders below central) keeps the loop
+/// running until it too stops moving, rather than being declared converged merely for being small.
+/// The `tol·max_mag` term is the absolute floor that lets a genuinely-settled near-zero compartment
+/// — where the pure relative test is ill-conditioned — pass; without it the loop could never stop.
+/// Because the stop only fires once every compartment's increment is below f64-relative precision,
+/// the value has reached its fixed point and the elided cycles do not move it — predictions are
+/// unchanged to f64 precision, and gradients match a full budget to `< 1e-6` (measured by the
+/// pre-#2093 `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`, retired in #2093;
+/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on the
+/// nonlinear fallback).
 ///
 /// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
 /// convergence — don't early-exit and silently return a poisoned state; run the full cycle
@@ -450,21 +448,40 @@ thread_local! {
     static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
         const { std::cell::Cell::new(SsBranch::None) };
 
-    /// Whether the most recent [`note_ss_nonconvergence_if_capped`] call on this thread
-    /// produced a warning — a **test-only** observation, and the only way to ask that question
-    /// without reading the process-global sink (#1289).
+    /// The warning the most recent [`note_ss_nonconvergence_if_capped`] call on this thread
+    /// produced, or `None` — a **test-only** observation, and the only way to ask "did *this*
+    /// equilibration warn, and with what text" without reading the process-global sink.
     ///
-    /// The sink is one `Mutex<BTreeSet<String>>` for the whole process, and
-    /// [`SS_WARN_SINK_READER_GUARD`] serializes only its *readers*. That is enough for a test
-    /// asserting its own warning is present, and not enough for one asserting the sink is
-    /// **empty**: any concurrently-running test that caps an SS equilibration inserts through
-    /// [`note_ss_nonconvergence_if_capped`], which never touches the guard, so the reader fails
-    /// on a warning it did not produce. Nothing about the guard can prevent that. This cell is
-    /// per-thread, so "did *my* equilibration warn" has a correct answer regardless of what
-    /// else is running — the same arrangement [`LAST_SS_EQUILIBRATION_CYCLES`] already uses,
+    /// The sink is one `Mutex<BTreeSet<String>>` for the whole process, so no lib test can
+    /// assert on it reliably in either direction:
+    ///
+    /// * **empty** (#1289): any concurrently-running test that caps an SS equilibration inserts
+    ///   through [`note_ss_nonconvergence_if_capped`], and the reader fails on a warning it did
+    ///   not produce;
+    /// * **present** (#2071): every draining `api` entry point (`fit`, `predict`/`predict_diag`,
+    ///   the `simulate*` family, the adaptive driver) clears the sink on entry, so any
+    ///   concurrently-running lib test calling one of them can empty it between a reader's write
+    ///   and its take, and the reader fails on a message it did write.
+    ///
+    /// A reader-side mutex could fix neither: the writers and drainers are production code. This
+    /// cell is per-thread, so "did *my* equilibration warn" has a correct answer regardless of
+    /// what else is running — the same arrangement [`LAST_SS_EQUILIBRATION_CYCLES`] already uses,
     /// and it carries the same caveat: it reports whichever call ran *last* on this thread, so
-    /// assert it only from a test that calls the equilibration helpers directly.
-    static LAST_SS_NONCONVERGENCE_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// assert it only from a test that calls the equilibration helpers (or a single-subject,
+    /// non-rayon predictor over them) directly. That the noted text then reaches
+    /// `FitResult.warnings` through the sink is pinned end to end by the Tier-2 binary
+    /// `tests/ss_absorption_nonmem_anchor.rs` (`SimulationOutput.warnings` and
+    /// `FitResult.warnings`), a separate process that takes one lock around every test touching
+    /// the sink, writers and drainers included.
+    static LAST_SS_NONCONVERGENCE_WARNING: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// How many times this thread has cleared or drained the SS non-convergence sink — a
+    /// **test-only** observation, so a test can assert that some call does **not** drain it
+    /// (#2071) without reading the process-global sink, which a concurrent drainer would empty
+    /// under it. Every draining `api` entry point clears on the thread that called it, so a
+    /// helper that wrongly routes through one moves this counter on the caller's thread.
+    static SS_SINK_DRAINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
     /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
@@ -473,18 +490,33 @@ thread_local! {
 }
 
 /// Whether the most recent SS equilibration on this thread warned (test observation; see
-/// [`LAST_SS_NONCONVERGENCE_WARNED`]). Prefer this to draining the sink whenever the question
-/// is about *this* call rather than about the message text (#1289).
+/// [`LAST_SS_NONCONVERGENCE_WARNING`]). Use this, never the sink, in a lib test (#1289, #2071).
 #[cfg(test)]
 pub(crate) fn last_ss_equilibration_warned() -> bool {
-    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.get())
+    LAST_SS_NONCONVERGENCE_WARNING.with(|c| c.borrow().is_some())
 }
 
-/// Record whether this SS equilibration warned (test observation; see
-/// [`LAST_SS_NONCONVERGENCE_WARNED`]).
+/// The warning text the most recent SS equilibration on this thread noted, or `None` (test
+/// observation; see [`LAST_SS_NONCONVERGENCE_WARNING`]). The same string
+/// [`note_ss_nonconvergence_if_capped`] inserts into the sink, so a lib test can check the
+/// message without racing the draining `api` entry points (#2071).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_warning() -> Option<String> {
+    LAST_SS_NONCONVERGENCE_WARNING.with(|c| c.borrow().clone())
+}
+
+/// How many times this thread has cleared or drained the SS non-convergence sink (test
+/// observation; see [`SS_SINK_DRAINS`]).
+#[cfg(test)]
+pub(crate) fn ss_sink_drains_on_this_thread() -> usize {
+    SS_SINK_DRAINS.with(|c| c.get())
+}
+
+/// Record the warning this SS equilibration produced, or `None` (test observation; see
+/// [`LAST_SS_NONCONVERGENCE_WARNING`]).
 ///
-/// Called with `false` at the **top of every top-level equilibration** and with the real answer
-/// by [`note_ss_nonconvergence_if_capped`]. The up-front `false` is what makes
+/// Called with `None` at the **top of every top-level equilibration** and with the real answer
+/// by [`note_ss_nonconvergence_if_capped`]. The up-front `None` is what makes
 /// [`last_ss_equilibration_warned`] mean "did *this* call warn" rather than "did any call on
 /// this thread ever warn": the paths that succeed without ever reaching the capped fallback —
 /// the exact affine fixed point, the input-rate closed form, and the `II <= 0` /
@@ -493,8 +525,8 @@ pub(crate) fn last_ss_equilibration_warned() -> bool {
 /// deterministic on a reused harness thread, not a race, and it is the same stale-state class
 /// the [`SsBranch::None`] reset exists for (PR #1392 review).
 #[cfg(test)]
-pub(crate) fn record_ss_nonconvergence_warned(warned: bool) {
-    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.set(warned));
+pub(crate) fn record_ss_nonconvergence_warning(warning: Option<&str>) {
+    LAST_SS_NONCONVERGENCE_WARNING.with(|c| *c.borrow_mut() = warning.map(str::to_owned));
 }
 
 #[cfg(test)]
@@ -518,7 +550,7 @@ pub(crate) fn record_ss_equilibration_cycles(n: usize) {
 /// **One cell per thread, shared across numeric types.** The recording sites live in
 /// helpers that are generic over `T: PkNum` (`equilibrate_ss_input_rate_g`,
 /// `anderson_ss_fixed_point_g`), and `sens::ode_provider` instantiates them with a dual
-/// `T`. So a test that drives a `fit()` or the analytic provider observes whichever walk
+/// `T`. So a test that drives a `fit()` or an analytic dual walk observes whichever walk
 /// ran *last*, f64 or dual — not necessarily the value-path run-in it means to pin. Assert
 /// this only from a test that calls the f64 helpers directly, as the #1139 tests do. The
 /// neighbouring cycle counter has the same property and the same caveat.
@@ -602,7 +634,7 @@ pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 /// each top-level equilibration is unconditional and costs nothing outside tests.
 #[cfg(not(test))]
 #[inline(always)]
-pub(crate) fn record_ss_nonconvergence_warned(_warned: bool) {}
+pub(crate) fn record_ss_nonconvergence_warning(_warning: Option<&str>) {}
 
 /// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
 /// non-converged (#867). The pulse-train equilibration
@@ -675,10 +707,10 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
 ) {
     let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
     // Recorded on EVERY call, not only the warning ones, so a capped run that converges clears
-    // a `true` left by an earlier capped run on the same harness thread (#1289). The paths that
-    // never reach here at all are covered by the up-front `false` each top-level equilibration
-    // records — see `record_ss_nonconvergence_warned`.
-    record_ss_nonconvergence_warned(warning.is_some());
+    // a warning left by an earlier capped run on the same harness thread (#1289). The paths that
+    // never reach here at all are covered by the up-front `None` each top-level equilibration
+    // records — see `record_ss_nonconvergence_warning`.
+    record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
         if let Ok(mut set) = ss_nonconvergence_sink().lock() {
             set.insert(msg);
@@ -776,24 +808,12 @@ fn ss_equilibration_tail_warning(
     None
 }
 
-/// Serializes the tests that *read* the process-global SS non-convergence sink
-/// ([`take_ss_nonconvergence_warnings`], #867) so cargo's parallel harness can't have one test
-/// drain another's entry mid-read. It does **not** serialize them against the draining `api`
-/// entry points (`fit`, `predict`/`predict_diag`, the `simulate*` family, the adaptive driver),
-/// which clear the sink on entry without taking this guard: a lib test calling one of those can
-/// empty the sink between a reader's write and its take. Known exposure, tracked separately
-/// (#1652 review r1 #2).
-/// Lives here rather than beside any one test module because the sink is now shared by the ODE
-/// (`ode::predictions`) and analytical (`pk::event_driven`) fallbacks, which sit in different
-/// files but the *same* lib-test binary — a per-file guard would not serialize them against
-/// each other (#908).
-#[cfg(test)]
-pub(crate) static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Drain and return the collected SS non-convergence warnings (#867). The `api` boundary calls
 /// this after its prediction pass and appends the result to `FitResult.warnings`. See
 /// [`ss_nonconvergence_sink`].
 pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
+    #[cfg(test)]
+    SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     ss_nonconvergence_sink()
         .lock()
         .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
@@ -803,6 +823,8 @@ pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
 /// Clear any residual SS non-convergence warnings so a top-level `api` call starts from a clean
 /// sink (#867). See [`ss_nonconvergence_sink`].
 pub(crate) fn clear_ss_nonconvergence_warnings() {
+    #[cfg(test)]
+    SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     if let Ok(mut set) = ss_nonconvergence_sink().lock() {
         set.clear();
     }
@@ -814,6 +836,33 @@ mod ss_warn_tests {
 
     // Args are `(early_stopped, abs_prev, abs_last, mag)`: absolute L∞ increments of the last two
     // non-converged cycles plus the final trough magnitude. `mag = 1.0` makes `abs == rel`.
+
+    /// The per-thread observation the lib-test readers assert on (#2071) must hold exactly the
+    /// text that goes into the sink, and a converged call must overwrite it with `None`.
+    #[test]
+    fn note_records_its_own_warning_text_per_thread() {
+        // Not contracting (`ρ = 2`) and past the noise floor (last step 20% of the trough).
+        let want = ss_equilibration_tail_warning(false, 1.0, 2.0, 10.0).expect("fixture warns");
+        note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
+        assert_eq!(
+            last_ss_equilibration_warning().as_deref(),
+            Some(want.as_str())
+        );
+        assert!(last_ss_equilibration_warned());
+        note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
+        assert_eq!(last_ss_equilibration_warning(), None);
+        assert!(!last_ss_equilibration_warned());
+    }
+
+    /// Every clear and every take counts as a drain on the calling thread (#2071).
+    #[test]
+    fn clear_and_take_each_count_as_a_drain() {
+        let before = ss_sink_drains_on_this_thread();
+        clear_ss_nonconvergence_warnings();
+        assert_eq!(ss_sink_drains_on_this_thread(), before + 1);
+        let _ = take_ss_nonconvergence_warnings();
+        assert_eq!(ss_sink_drains_on_this_thread(), before + 2);
+    }
 
     #[test]
     fn early_stop_never_warns() {
@@ -979,7 +1028,8 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
 /// timeline break fires on exactly the doses production seeds. A twin that seeded
 /// on a wider or narrower set would disagree with production in *value*, which is
-/// the one thing the `check_vs_production` parity tests cannot forgive.
+/// the one thing the `fd_oracle` / `parity` tests (`sens/ode_adjoint_tests.rs`), which
+/// difference the production objective, cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
 }

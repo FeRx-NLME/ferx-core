@@ -1,5 +1,4 @@
 use super::*;
-use crate::stats::likelihood::iov_occasion_groups;
 use crate::types::{
     BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
 };
@@ -111,7 +110,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
 /// analytic-supported model (previously the executor ignored
 /// `model.gradient_method`, so the option silently ran the Dual2 path while
 /// `build_info` reported FD). Uses the bundled warfarin model, which is in the
-/// analytic provider's scope (1-cpt oral, no LTBS / TV-cov / SDE).
+/// analytic (adjoint) scope (1-cpt oral, no LTBS / TV-cov / SDE).
 #[test]
 fn gradient_fd_forces_fd_inner_route() {
     use std::path::Path;
@@ -259,107 +258,16 @@ fn tvcov_ltbs_reports_analytic_inner() {
     );
 }
 
-#[test]
-fn iov_fd_fallback_warning_reports_subject_reason() {
-    // Covariate-free ODE IOV model the provider serves analytically, so the FD
-    // subject below is the *only* one out of scope — a genuinely mixed
-    // population (the all-FD case is suppressed, mirroring the non-IOV
-    // contract, #590 review).
-    let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse ODE IOV");
-    // Analytic subject: doses and observations in the same occasions.
-    let analytic_subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 7.0, 5.0],
-        obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    // FD subject: more occasion groups than the widened ODE IOV dispatch serves.
-    let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
-    let fd_subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "2".into(),
-        doses: (0..n_wide)
-            .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
-            .collect(),
-        obs_times: (0..n_wide).map(|i| i as f64 * 24.0 + 1.0).collect(),
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0; n_wide],
-        obs_cmts: vec![1; n_wide],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; n_wide],
-        occasions: (1..=n_wide as u32).collect(),
-        obs_l2: Vec::new(),
-        dose_occasions: (1..=n_wide as u32).collect(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let population = Population {
-        subjects: vec![analytic_subject, fd_subject],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: vec![],
-        exclusions: None,
-        warnings: vec![],
-    };
-
-    let warning = fd_fallback_warning(&model, &population, &model.default_params.theta)
-        .expect("mixed IOV population should warn with a reason");
-    assert!(warning.contains("1 of 2"), "got: {warning}");
-    assert!(
-        warning.contains("ODE IOV stacked axis cap"),
-        "got: {warning}"
-    );
-}
-
-/// An all-FD IOV population warns when the model-level label still says analytic — the
-/// #926 clause of the non-IOV twin, which the IOV warning lacked (#1907): with the label
-/// and the banner both claiming analytic, nothing else tells the user every subject ran
-/// FD. Both sides of the clause in one test: the same population is silent once
-/// `gradient = fd` makes the label say FD too.
+/// Uniform all-FD IOV populations are silent, matching the non-IOV contract:
+/// the `finite-difference` banner already makes a model-level fallback obvious.
 #[test]
 fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
     let auto = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
     )
     .expect("parse ODE IOV");
-    // Every subject has more occasion groups than the ODE IOV dispatch serves.
-    let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
+    // Every subject's stacked `[η, κ]` is wider than the adjoint's widest dispatch bucket.
+    let n_wide = crate::sens::ode_provider::adjoint::MAX_WIDTH;
     let wide_subject = |id: &str| Subject {
         obs_rgroup: Vec::new(),
         id: id.into(),
@@ -405,7 +313,7 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
         .expect("all-FD population under an analytic label must warn");
     assert!(warning.contains("2 of 2"), "got: {warning}");
     assert!(
-        warning.contains("ODE IOV stacked axis cap"),
+        warning.contains("stacked [η, κ] past the widest dispatch bucket"),
         "got: {warning}"
     );
 
@@ -519,59 +427,6 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
     );
 }
 
-/// Regression (#486): a modeled dose whose `D{cmt}`/`R{cmt}` slot is undeclared (normally
-/// rejected by `check_model_data`, but defended here) routes to FD and is attributed to the
-/// missing slot — not silently mis-resolved. The base model declares no `D1`, so the
-/// `ModeledDuration` dose finds no duration slot.
-#[test]
-fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
-    let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse ODE IOV without D1");
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![DoseEvent::modeled(
-            0.0,
-            100.0,
-            1,
-            false,
-            0.0,
-            crate::types::RateMode::ModeledDuration,
-        )],
-        obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 7.0, 5.0],
-        obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    assert!(
-        iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-        "modeled dose with missing slot must route to FD"
-    );
-    assert_eq!(
-        iov_fd_reason(&model, &subject),
-        "modeled RATE/DURATION dose with missing D/R slot"
-    );
-}
-
 /// #1613 G5: the IOV FD-fallback reason reads the **call's** `gradient = fd`
 /// (`GradientMethod::forced_fd`), so a direct `fit()` with `FitOptions { gradient_method: Fd }`
 /// on an unstamped model attributes its FD subjects to the setting the user chose, not to
@@ -611,7 +466,7 @@ fn iov_fd_reason_names_the_calls_gradient_fd() {
     };
     assert_eq!(
         iov_fd_reason(&model, &subject),
-        "modeled RATE/DURATION dose with missing D/R slot",
+        "subject outside IOV analytic scope",
         "control: unarmed, the subject's own scope reason"
     );
     let _fd = crate::types::arm_forced_fd(true);
@@ -622,107 +477,15 @@ fn iov_fd_reason_names_the_calls_gradient_fd() {
     );
 }
 
-#[test]
-fn iov_fd_reason_attributes_ss_input_rate() {
-    // #486: a steady-state dose + a built-in absorption forcing (`zero_order`) declines
-    // to FD under IOV; `iov_fd_reason` must name that combination (not the generic
-    // "outside IOV analytic scope"), mirroring `ode_iov_subject_supported`'s bail.
-    let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVDUR(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_DUR ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  DUR = TVDUR * exp(ETA_DUR)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse zero_order ODE IOV");
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
-        obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 7.0, 5.0],
-        obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    assert!(
-        iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-        "SS + zero_order must route to FD under IOV"
-    );
-    assert_eq!(
-        iov_fd_reason(&model, &subject),
-        "steady-state dose + built-in absorption forcing"
-    );
-}
-
-#[test]
-fn iov_fd_reason_attributes_infusion_into_absorption() {
-    // #719 gap 2 / #835 review: a finite infusion into a built-in absorption compartment
-    // declines to FD under IOV (the dual `+rate` would double-count the convolved `R_in_inf`
-    // mass). `iov_fd_reason` must name the infusion — mirroring `ode_iov_subject_supported`'s
-    // bail, which fires *before* its SS-absorption gate — not fall through to the generic
-    // "subject outside IOV analytic scope".
-    let model = crate::parser::model_parser::parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVDUR(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_DUR ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  DUR = TVDUR * exp(ETA_DUR)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse zero_order ODE IOV");
-    // Finite infusion (rate > 0, not steady state) into the absorption compartment.
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)],
-        obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 7.0, 5.0],
-        obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    assert!(
-        iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-        "infusion into absorption must route to FD under IOV"
-    );
-    assert_eq!(
-        iov_fd_reason(&model, &subject),
-        "infusion into built-in absorption compartment"
-    );
-}
-
 /// #835: an SS dose into a built-in absorption compartment is now analytic for the smooth
 /// density kernels, *including through a closed-form primary's ODE twin*. A closed-form
 /// `one_cpt_transit` + IOV subject with a steady-state dose reroutes to its ODE twin
 /// (`effective_for`, #719/#814); the twin carries a `transit()` forcing, which #835 admits, so
 /// the subject now routes to the analytic ODE-IOV inner gradient rather than FD. (Pre-#835 it
 /// declined with "steady-state dose + built-in absorption forcing"; the still-FD combinations —
-/// SS into a `zero_order` window, SS + absorption lagtime — remain covered by
-/// `iov_fd_reason_attributes_ss_input_rate`.)
+/// SS into a `zero_order` window, SS + absorption lagtime — are rejected upstream
+/// (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`); the pre-#2093
+/// `iov_fd_reason_attributes_ss_input_rate` that pinned their FD reason is retired.)
 #[test]
 fn transit_twin_ss_forcing_is_analytic_under_iov() {
     let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
@@ -913,328 +676,6 @@ fn test_find_ebe_iov_h_matrix_dimensions() {
     // H-matrix: n_obs × n_eta (BSV only, kappas fixed)
     assert_eq!(result.h_matrix.nrows(), subject.obs_times.len());
     assert_eq!(result.h_matrix.ncols(), model.n_eta);
-}
-
-/// The analytic ODE IOV inner gradient (`analytic_eta_nll_gradient_iov`) must match
-/// central finite differences of the inner objective `individual_nll_iov` over the
-/// stacked `[η_bsv, κ₁..κ_K]` vector — the gradient that now drives `find_ebe_iov`
-/// for ODE IOV models (#439 ODE IOV inner).
-#[test]
-fn analytic_iov_inner_grad_matches_fd_of_nll() {
-    use crate::parser::model_parser::parse_model_string;
-    let model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
-        )
-        .expect("parse ODE IOV");
-    assert!(crate::sens::ode_provider::ode_iov_supported(&model));
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 6],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    let stacked = vec![0.10, -0.05, 0.08, -0.12];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV inner gradient");
-
-    // Central FD of the inner objective (same NLL `find_ebe_iov` minimises).
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    for p in 0..n_stacked {
-        let h = 1e-6 * (1.0 + stacked[p].abs());
-        let mut sp = stacked.clone();
-        sp[p] += h;
-        let mut sm = stacked.clone();
-        sm[p] -= h;
-        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
-    }
-}
-
-/// Closed-form twin of [`analytic_iov_inner_grad_matches_fd_of_nll`] with an η-dependent
-/// `ExpressionScale` `obs_scale = V` divisor (#486): the analytic IOV inner gradient
-/// (`analytic_eta_nll_gradient_iov`, now fed the scaled `subject_eta_grad_iov`) must match
-/// central FD of the same objective `individual_nll_iov` (which applies `obs_scale`) over
-/// the stacked `[η_bsv, κ]` vector — the gradient that drives `find_ebe_iov` for a scaled
-/// closed-form IOV model.
-#[test]
-fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
-    use crate::parser::model_parser::parse_model_string;
-    let model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + obs_scale");
-    assert!(crate::sens::provider::iov_analytical_supported(&model));
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 6],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    let stacked = vec![0.10, -0.05, 0.08, -0.12];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV inner gradient");
-
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    for p in 0..n_stacked {
-        let h = 1e-6 * (1.0 + stacked[p].abs());
-        let mut sp = stacked.clone();
-        sp[p] += h;
-        let mut sm = stacked.clone();
-        sm[p] -= h;
-        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
-    }
-}
-
-/// LTBS × IOV closed-form **inner** EBE gradient vs central FD of its own objective (#486).
-///
-/// This is the cell that closed the last inner/outer scope split: the outer IOV gradient has
-/// served LTBS since #677, but the `Dual1` inner walk had no `ln` jet, so `find_ebe_iov`
-/// reconverged on finite differences. `run_obs_iov_eta` now applies the shared
-/// `apply_ltbs_transform_inner` last — after the per-occasion scale quotient — so the EBE
-/// gradient differentiates the same `ln(f/s)` the objective scores.
-///
-/// Run over BOTH fixtures because the ordering is the part that can silently go wrong:
-///   * plain LTBS × IOV — the bare `∂ln f/∂x = (∂f/∂x)/f` jet over the stacked `[η_bsv, κ]`;
-///   * LTBS × IOV × `ExpressionScale` — pins **scale-then-log** (`ln(f/s)`, production's
-///     order). Applying the jet before the quotient instead still yields a plausible
-///     gradient — it is just the gradient of `ln(f)/s`, a different function — and FD of the
-///     real objective is what catches it.
-///
-/// The κ columns need no special treatment (the transform is one per-observation scalar
-/// quotient, identical on every stacked axis), and that is exactly what this asserts: FD
-/// parity is checked on every stacked coordinate, κ blocks included.
-#[test]
-fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
-    use crate::parser::model_parser::parse_model_string;
-    let fixture = |scaling_block: &str| {
-        format!(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  \
-             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  \
-             sigma ADD_ERR ~ 0.2 (sd)\n[individual_parameters]\n  \
-             CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n\
-             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n{scaling_block}\
-             [error_model]\n  log(DV) ~ additive(ADD_ERR)\n[fit_options]\n  method = focei\n  \
-             iov_column = OCC\n"
-        )
-    };
-    for (label, scaling_block) in [
-        ("plain LTBS", ""),
-        ("LTBS + obs_scale", "[scaling]\n  obs_scale = 1000 / V\n"),
-    ] {
-        let model = parse_model_string(&fixture(scaling_block)).expect("parse LTBS IOV fixture");
-        assert!(model.log_transform, "{label}: fixture must be LTBS");
-        // Routing first: a scope gap must fail loudly here rather than quietly FD-ing and
-        // leaving the parity check below to pass against a gradient nobody ran.
-        assert!(
-            crate::sens::provider::iov_analytical_supported(&model),
-            "{label}: must be on the analytic closed-form IOV path"
-        );
-        assert!(
-            !analytic_inner_common_bail(&model),
-            "{label}: the analytic INNER must not be bailed (#486)"
-        );
-        // The tolerance predicate must move WITH the bail, not independently (PR #950
-        // review #1). `uses_closed_form_ltbs_inner` is the sole input to
-        // `effective_inner_tol` / `effective_cov_inner_tol`; while it carried an
-        // `n_kappa == 0` carve-out — justified only by the bail that just disappeared —
-        // this model ran the analytic ln-jet inner (with its ~1e-9
-        // provider-vs-`compute_predictions` gap) while the fit AND covariance steps stayed
-        // at the loose default, quietly inflating SEs with unchanged point estimates.
-        assert!(
-            model.uses_closed_form_ltbs_inner(),
-            "{label}: a model whose inner runs the analytic ln-jet must also take the \
-             tightened LTBS fit/covariance tolerances"
-        );
-
-        let subject = Subject {
-            obs_rgroup: Vec::new(),
-            id: "1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-            ],
-            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
-            obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cens: vec![0; 6],
-            occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-        let params = model.default_params.clone();
-        let n_eta = model.n_eta;
-        let n_kappa = model.n_kappa;
-        let k = iov_occasion_groups(&subject).len();
-        let n_stacked = n_eta + k * n_kappa;
-        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-        // Off-zero on every coordinate, and distinct per κ block, so a transform applied to
-        // the wrong occasion's jet cannot cancel.
-        let stacked = vec![0.10, -0.05, 0.08, -0.12];
-        assert_eq!(stacked.len(), n_stacked);
-
-        let g = analytic_eta_nll_gradient_iov(
-            &model,
-            &subject,
-            &params.theta,
-            &stacked,
-            &params.omega,
-            omega_iov,
-            &params.sigma.values,
-            None,
-        )
-        .expect("analytic IOV inner gradient");
-
-        let nll = |s: &[f64]| -> f64 {
-            let eta_t = &s[..n_eta];
-            let kappas: Vec<Vec<f64>> = (0..k)
-                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-                .collect();
-            individual_nll_iov(
-                &model,
-                &subject,
-                &params.theta,
-                eta_t,
-                &kappas,
-                &params.omega,
-                Some(omega_iov),
-                &params.sigma.values,
-            )
-        };
-        for p in 0..n_stacked {
-            let h = 1e-6 * (1.0 + stacked[p].abs());
-            let mut sp = stacked.clone();
-            sp[p] += h;
-            let mut sm = stacked.clone();
-            sm[p] -= h;
-            let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
-            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
-        }
-    }
 }
 
 // ----- #555 shared fixtures (two_cpt_oral_cov, η+covariate `obs_scale = V1`) -----
@@ -1548,6 +989,108 @@ fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
     assert!(reject_ode_iov_inner_start(&transit_iov, 20, f64::NAN));
 }
 
+/// #2212: since #2202 the first outer evaluation is warm-started from the pre-flight EBEs with
+/// `InnerSolvePolicy::init_is_mode`. The ODE+IOV degenerate-warm-start guard must not reject a
+/// start certified as the mode — on a fit whose initial estimate sits far from the data the NLL
+/// *at the mode* clears the threshold, and rejecting it hard-rejected every subject, so the fit
+/// never moved. Both sides of the gate, at the same subject and the same start.
+#[test]
+fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+    // Observations ~80× the prediction (≈10), so the NLL near any reachable mode is far
+    // above the 4-observation threshold of 1000.
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 25.0, 30.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![800.0, 600.0, 700.0, 500.0],
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    // η-only, `[η_CL, η_V]`: the shape the pre-flight hands the first evaluation (it drops
+    // κ̂, so `iov_initial_vector` starts every κ at 0). Nonzero, so an informative warm start.
+    let warm = [0.05, 0.0];
+    let start_nll = individual_nll_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &warm,
+        &[vec![0.0], vec![0.0]],
+        &params.omega,
+        params.omega_iov.as_ref(),
+        &params.sigma.values,
+    );
+    // The straddle: the start is on the rejecting side of the guard.
+    assert!(
+        reject_ode_iov_inner_start(&model, subject.obs_times.len(), start_nll),
+        "fixture drift: start NLL {start_nll} must clear the reject threshold"
+    );
+
+    // Through `find_ebe_cached`, the outer loop's entry, so the policy's hand-off to the IOV
+    // branch is under test as well as the gate itself.
+    let solve = |init_is_mode: bool| {
+        find_ebe_cached(
+            &model,
+            &subject,
+            &params,
+            200,
+            1e-5,
+            Some(&warm),
+            None,
+            0,
+            None,
+            InnerSolvePolicy {
+                init_is_mode,
+                ..InnerSolvePolicy::default()
+            },
+        )
+    };
+    let stale = solve(false);
+    assert!(
+        stale.hard_reject && stale.nll == start_nll,
+        "an uncertified warm start this far from the data must still be hard-rejected \
+         (hard_reject={}, nll={} vs start {start_nll})",
+        stale.hard_reject,
+        stale.nll
+    );
+    let mode = solve(true);
+    assert!(
+        !mode.hard_reject,
+        "#2212: a start certified as the mode must be solved, not hard-rejected"
+    );
+    assert!(
+        mode.nll.is_finite() && mode.nll < start_nll,
+        "the certified start must be optimised: nll {} vs start {start_nll}",
+        mode.nll
+    );
+}
+
 #[test]
 fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // #814: the inner objective-stall stop (#555) must key off the *effective* model, not the
@@ -1646,811 +1189,6 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     assert!(
         inner_stall_enabled_at_iov(&transit_iov, &subject, &theta, &flipped),
         "#814: a twin-served transit+IOV subject integrates with RK45 and needs the stall stop"
-    );
-}
-
-/// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
-/// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
-/// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` — including the `η_ruv` column
-/// (`Σ_j 1 − ε²/v`) and the `exp(2·η_ruv)` residual-variance scaling now woven into
-/// the IOV inner gradient. Proves the gate flip (`iov_analytical_supported`) ships a
-/// *correct* gradient, not just an enabled one.
-#[test]
-fn iov_iiv_on_ruv_inner_grad_matches_fd() {
-    use crate::parser::model_parser::parse_model_string;
-    let model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + iiv_on_ruv");
-    // Gate flip: the closed-form IOV + iiv_on_ruv path is now analytic on both loops.
-    assert_eq!(model.residual_error_eta, Some(3));
-    assert!(crate::sens::provider::iov_analytical_supported(&model));
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    assert!(!analytic_inner_common_bail(&model));
-
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 6],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    // Non-zero η_ruv (index 3) so the residual-variance scaling is genuinely exercised.
-    let stacked = vec![0.10, -0.05, 0.08, 0.15, 0.05, -0.07];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV + iiv_on_ruv inner gradient");
-
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    for p in 0..n_stacked {
-        let h = 1e-6 * (1.0 + stacked[p].abs());
-        let mut sp = stacked.clone();
-        sp[p] += h;
-        let mut sm = stacked.clone();
-        sm[p] -= h;
-        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
-    }
-}
-
-/// M3 BLOQ + IOV (#580): the analytic stacked-η inner gradient
-/// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
-/// `individual_nll_iov` over `[η_bsv, κ₁..κ_K]` when the subject carries M3-censored
-/// rows (data term `−logΦ(z)`, matching `individual_nll_iov`'s `−2·m3_logcdf`). The
-/// censored `h·m` f-coefficient rides the stacked Jacobian (κ columns included), so
-/// the EBE minimises the same censored objective. Proves the gate flip
-/// (`iov_analytical_supported` now admits M3) ships a *correct* censored gradient over
-/// the stacked layout, not just an enabled one.
-#[test]
-fn iov_m3_inner_grad_matches_fd() {
-    use crate::parser::model_parser::parse_model_string;
-    let mut model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + M3");
-    model.bloq_method = crate::types::BloqMethod::M3;
-    // Gate: M3 + IOV is now analytic on both loops (no `iiv_on_ruv`, so not the
-    // FD-only triple). `residual_error_eta` is `None`, so `iov_analytical_supported`
-    // does not early-return on M3.
-    assert_eq!(model.residual_error_eta, None);
-    assert!(crate::sens::provider::iov_analytical_supported(&model));
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    assert!(!analytic_inner_common_bail(&model));
-
-    let mut subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; 6],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        // The last two rows (occasion 2 tail) are M3 left-censored; the `−logΦ`
-        // term differentiates them.
-        cens: vec![0, 0, 0, 0, 1, 1],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    // Synthesize observations from the model at a reference (η, κ), scaled to 0.85·f
-    // — including the censored rows, so the carried LLOQ sits just below the
-    // prediction (z ≈ −0.75, the moderate regime where the A&S `log_normal_cdf` and
-    // the exact φ in `inv_mills` agree to FD precision; a deep-tail LLOQ would expose
-    // only the CDF-approximation floor, not the gradient's correctness).
-    let preds = crate::pk::predict_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &[0.12, -0.08, 0.2],
-        &[vec![0.05], vec![-0.07]],
-    );
-    subject.observations = preds.iter().map(|p| p * 0.85).collect();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV + M3 inner gradient");
-
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    // Richardson-extrapolated central FD: the censored `−logΦ` term has sharp
-    // curvature on the occasion-2 κ axis, so plain central FD is truncation-limited
-    // (~2e-4) there — Richardson removes it and validates the analytic to ~1e-7.
-    for p in 0..n_stacked {
-        let h = 1e-5 * (1.0 + stacked[p].abs());
-        let fd_at = |hh: f64| -> f64 {
-            let mut sp = stacked.clone();
-            sp[p] += hh;
-            let mut sm = stacked.clone();
-            sm[p] -= hh;
-            (nll(&sp) - nll(&sm)) / (2.0 * hh)
-        };
-        let f1 = fd_at(h);
-        let f2 = fd_at(h / 2.0);
-        let fd = (4.0 * f2 - f1) / 3.0;
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
-    }
-}
-
-/// Right-censored (above-ULOQ, `CENS = -1`) regression for the analytic IOV+M3
-/// inner gradient. The objective `individual_nll_iov` scores these rows with the
-/// **upper** tail (`m3_logcdf`, `z = (f − ULOQ)/√v`); the analytic gradient must use
-/// the same tail. Before the signed `m3_censored_kernel` (review of #591) the kernel
-/// always took the lower tail, so this gradient was wrong-signed for `CENS = -1` and
-/// `find_ebe_iov` pushed the EBE the wrong way. Same model/fixture as
-/// `iov_m3_inner_grad_matches_fd` with the occasion-2 tail flipped to `CENS = -1`.
-#[test]
-fn iov_m3_right_censored_inner_grad_matches_fd() {
-    use crate::parser::model_parser::parse_model_string;
-    let mut model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + M3");
-    model.bloq_method = crate::types::BloqMethod::M3;
-    assert!(crate::sens::provider::iov_analytical_supported(&model));
-
-    let mut subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; 6],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
-        cens: vec![0, 0, 0, 0, -1, -1],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    // Carry ULOQ at 0.85·f for the censored rows, so z = (f − ULOQ)/√v ≈ +0.15·f/√v
-    // sits in the moderate upper-tail regime (Φ(z) well away from 0/1), where the
-    // A&S `log_normal_cdf` and the exact φ in `inv_mills` agree to FD precision.
-    let preds = crate::pk::predict_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &[0.12, -0.08, 0.2],
-        &[vec![0.05], vec![-0.07]],
-    );
-    subject.observations = preds.iter().map(|p| p * 0.85).collect();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV + M3 inner gradient (right-censored)");
-
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    for p in 0..n_stacked {
-        let h = 1e-5 * (1.0 + stacked[p].abs());
-        let fd_at = |hh: f64| -> f64 {
-            let mut sp = stacked.clone();
-            sp[p] += hh;
-            let mut sm = stacked.clone();
-            sm[p] -= hh;
-            (nll(&sp) - nll(&sm)) / (2.0 * hh)
-        };
-        let f1 = fd_at(h);
-        let f2 = fd_at(h / 2.0);
-        let fd = (4.0 * f2 - f1) / 3.0;
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
-    }
-}
-
-/// **ODE** M3 BLOQ + IOV (#486): the ODE counterpart of
-/// [`iov_m3_inner_grad_matches_fd`]. The analytic stacked-η inner gradient produced
-/// via the **event-driven ODE sensitivity walk** (`ode_subject_eta_grad_iov`, not the
-/// closed-form Dual1 walk) must match Richardson central FD of `individual_nll_iov`
-/// over `[η_bsv, κ₁, κ₂]` on a censored subject. Censoring is provider-agnostic —
-/// the `−logΦ` coefficient rides the same `residual_inner_obs` path keyed on
-/// `subject.cens[j]` whether the walk was closed-form or ODE — so removing the gate
-/// clause is all that was needed. Both tails (`CENS = 1` left, `CENS = -1` right).
-#[test]
-fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
-    use crate::parser::model_parser::parse_model_string;
-    let model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  bloq_method = m3\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
-        )
-        .expect("parse ODE IOV + M3");
-    assert!(
-        matches!(model.bloq_method, crate::types::BloqMethod::M3),
-        "model must be M3"
-    );
-    assert!(model.is_ode_based(), "must be on the ODE path");
-    // After the #486 gate flip, the ODE IOV walk serves M3 analytically on the inner
-    // loop (single gate — no separate M3 bail).
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    assert!(!analytic_inner_common_bail(&model));
-
-    // Both tails: occasion-2 tail left-censored (CENS=1), then right-censored (CENS=-1).
-    for cens_sign in [1i8, -1] {
-        let mut subject = Subject {
-            obs_rgroup: Vec::new(),
-            id: "1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-            ],
-            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![0.0; 6],
-            obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
-            occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-        let params = model.default_params.clone();
-        // Carry the censoring limit at 0.85·f so z = (f − LIMIT)/√v sits in the
-        // moderate regime where the A&S `log_normal_cdf` and the exact φ in `inv_mills`
-        // agree to FD precision (a deep-tail limit would expose only the CDF floor).
-        let preds = crate::pk::predict_iov(
-            &model,
-            &subject,
-            &params.theta,
-            &[0.12, -0.08, 0.2],
-            &[vec![0.05], vec![-0.07]],
-        );
-        subject.observations = preds.iter().map(|p| p * 0.85).collect();
-        let n_eta = model.n_eta;
-        let n_kappa = model.n_kappa;
-        let k = iov_occasion_groups(&subject).len();
-        let n_stacked = n_eta + k * n_kappa;
-        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-        let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
-        assert_eq!(stacked.len(), n_stacked);
-
-        let g = analytic_eta_nll_gradient_iov(
-            &model,
-            &subject,
-            &params.theta,
-            &stacked,
-            &params.omega,
-            omega_iov,
-            &params.sigma.values,
-            None,
-        )
-        .expect("analytic ODE IOV + M3 inner gradient");
-
-        let nll = |s: &[f64]| -> f64 {
-            let eta_t = &s[..n_eta];
-            let kappas: Vec<Vec<f64>> = (0..k)
-                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-                .collect();
-            individual_nll_iov(
-                &model,
-                &subject,
-                &params.theta,
-                eta_t,
-                &kappas,
-                &params.omega,
-                Some(omega_iov),
-                &params.sigma.values,
-            )
-        };
-        for p in 0..n_stacked {
-            let h = 1e-5 * (1.0 + stacked[p].abs());
-            let fd_at = |hh: f64| -> f64 {
-                let mut sp = stacked.clone();
-                sp[p] += hh;
-                let mut sm = stacked.clone();
-                sm[p] -= hh;
-                (nll(&sp) - nll(&sm)) / (2.0 * hh)
-            };
-            let f1 = fd_at(h);
-            let f2 = fd_at(h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-5);
-        }
-    }
-}
-
-/// **ODE** triple M3 + IOV + `iiv_on_ruv` (#486): the ODE counterpart of
-/// [`iov_m3_iiv_on_ruv_inner_grad_matches_fd`]. The analytic stacked-η inner gradient
-/// from the **event-driven ODE walk** must match Richardson FD of `individual_nll_iov`
-/// over `[η_bsv, η_ruv, κ₁, κ₂]` when censored rows co-occur with the `exp(2·η_ruv)`
-/// residual-variance scaling. The ODE walk emits a zero `∂f/∂η_ruv` column (η_ruv is
-/// absent from CL/V/KA), so the residual-eta column comes entirely from the
-/// provider-agnostic `residual_inner_obs` term — exactly as on the closed-form path.
-/// Both tails.
-#[test]
-fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
-    use crate::parser::model_parser::parse_model_string;
-    let model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  bloq_method = m3\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
-        )
-        .expect("parse ODE IOV + M3 + iiv_on_ruv");
-    assert_eq!(model.residual_error_eta, Some(3));
-    assert!(model.is_ode_based(), "must be on the ODE path");
-    // The ODE triple is analytic on both loops as of #486.
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    assert!(!analytic_inner_common_bail(&model));
-
-    for cens_sign in [1i8, -1] {
-        let mut subject = Subject {
-            obs_rgroup: Vec::new(),
-            id: "1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-            ],
-            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![0.0; 6],
-            obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
-            occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-        let params = model.default_params.clone();
-        let preds = crate::pk::predict_iov(
-            &model,
-            &subject,
-            &params.theta,
-            &[0.12, -0.08, 0.2, 0.10],
-            &[vec![0.05], vec![-0.07]],
-        );
-        subject.observations = preds.iter().map(|p| p * 0.85).collect();
-        let n_eta = model.n_eta;
-        let n_kappa = model.n_kappa;
-        let k = iov_occasion_groups(&subject).len();
-        let n_stacked = n_eta + k * n_kappa;
-        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-        // Non-zero η_ruv (index 3) so the residual-variance scaling is exercised.
-        let stacked = vec![0.10, -0.05, 0.08, 0.12, 0.05, -0.07];
-        assert_eq!(stacked.len(), n_stacked);
-
-        let g = analytic_eta_nll_gradient_iov(
-            &model,
-            &subject,
-            &params.theta,
-            &stacked,
-            &params.omega,
-            omega_iov,
-            &params.sigma.values,
-            None,
-        )
-        .expect("analytic ODE IOV + M3 + iiv_on_ruv inner gradient");
-
-        let nll = |s: &[f64]| -> f64 {
-            let eta_t = &s[..n_eta];
-            let kappas: Vec<Vec<f64>> = (0..k)
-                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-                .collect();
-            individual_nll_iov(
-                &model,
-                &subject,
-                &params.theta,
-                eta_t,
-                &kappas,
-                &params.omega,
-                Some(omega_iov),
-                &params.sigma.values,
-            )
-        };
-        for p in 0..n_stacked {
-            let h = 1e-5 * (1.0 + stacked[p].abs());
-            let fd_at = |hh: f64| -> f64 {
-                let mut sp = stacked.clone();
-                sp[p] += hh;
-                let mut sm = stacked.clone();
-                sm[p] -= hh;
-                (nll(&sp) - nll(&sm)) / (2.0 * hh)
-            };
-            let f1 = fd_at(h);
-            let f2 = fd_at(h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-5);
-        }
-    }
-}
-
-/// The triple **M3 + IOV + `iiv_on_ruv`** (#591): the analytic stacked-η inner
-/// gradient (`analytic_eta_nll_gradient_iov`) must match Richardson FD of
-/// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` when censored rows co-occur with
-/// the `exp(2·η_ruv)` residual-variance scaling. `residual_inner_obs` returns the
-/// censored `(h·m, h·z)` pair (f-coefficient + residual-eta column) on a censored row
-/// under `iiv_on_ruv`, and the residual variance carries the `η_ruv` scale on every
-/// row. Proves the gate flip ships a correct *triple* inner gradient.
-#[test]
-fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
-    use crate::parser::model_parser::parse_model_string;
-    let mut model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + M3 + iiv_on_ruv");
-    model.bloq_method = crate::types::BloqMethod::M3;
-    // The closed-form triple is analytic on both loops as of #591; the ODE IOV triple
-    // is analytic as of #486 (see `analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode`).
-    assert_eq!(model.residual_error_eta, Some(3));
-    assert!(crate::sens::provider::iov_analytical_supported(&model));
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    assert!(!analytic_inner_common_bail(&model));
-
-    let mut subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; 6],
-        obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
-        cens: vec![0, 0, 0, 0, 1, 1],
-        occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    };
-    let params = model.default_params.clone();
-    // Shallow censoring (≈ 0.85·f → z ≈ −0.75), the regime where the A&S CDF and the
-    // exact φ in `inv_mills` agree to FD precision.
-    let preds = crate::pk::predict_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &[0.12, -0.08, 0.2, 0.10],
-        &[vec![0.05], vec![-0.07]],
-    );
-    subject.observations = preds.iter().map(|p| p * 0.85).collect();
-    let n_eta = model.n_eta;
-    let n_kappa = model.n_kappa;
-    let k = iov_occasion_groups(&subject).len();
-    let n_stacked = n_eta + k * n_kappa;
-    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
-    // Non-zero η_ruv (index 3) so the residual-variance scaling is exercised.
-    let stacked = vec![0.10, -0.05, 0.08, 0.12, 0.05, -0.07];
-    assert_eq!(stacked.len(), n_stacked);
-
-    let g = analytic_eta_nll_gradient_iov(
-        &model,
-        &subject,
-        &params.theta,
-        &stacked,
-        &params.omega,
-        omega_iov,
-        &params.sigma.values,
-        None,
-    )
-    .expect("analytic IOV + M3 + iiv_on_ruv inner gradient");
-
-    let nll = |s: &[f64]| -> f64 {
-        let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
-        individual_nll_iov(
-            &model,
-            &subject,
-            &params.theta,
-            eta_t,
-            &kappas,
-            &params.omega,
-            Some(omega_iov),
-            &params.sigma.values,
-        )
-    };
-    for p in 0..n_stacked {
-        let h = 1e-5 * (1.0 + stacked[p].abs());
-        let fd_at = |hh: f64| -> f64 {
-            let mut sp = stacked.clone();
-            sp[p] += hh;
-            let mut sm = stacked.clone();
-            sm[p] -= hh;
-            (nll(&sp) - nll(&sm)) / (2.0 * hh)
-        };
-        let f1 = fd_at(h);
-        let f2 = fd_at(h / 2.0);
-        let fd = (4.0 * f2 - f1) / 3.0;
-        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
-    }
-}
-
-/// The IOV inner loop must honour the same model-level FD bails as the non-IOV inner
-/// (#466 review #1/#3): `gradient = fd` / escape hatch, IIV-on-residual-error
-/// (`iiv_on_ruv`), and LTBS all force the FD inner gradient — the shared
-/// `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
-/// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
-/// variance, and `gradient = fd` would silently fail to disable the analytic inner.
-/// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
-/// it via the quotient rule. The **ODE** IOV path now serves an η-dependent `obs_scale`
-/// too via the post-walk quotient (#575/#590); the **closed-form** IOV
-/// path still declines it (`iov_analytical_supported` requires `ScalingSpec::None`) —
-/// both pinned by the `iov_sens_supported` assertions below.)
-#[test]
-fn iov_inner_honours_common_bails() {
-    use crate::parser::model_parser::parse_model_string;
-    let mut model = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse ODE IOV");
-    // Clean IOV model: no common bail → analytic inner runs.
-    assert!(!analytic_inner_common_bail(&model));
-    // `gradient = fd` (and the escape hatch) force FD (#466 review #3).
-    model.gradient_method = GradientMethod::Fd;
-    assert!(analytic_inner_common_bail(&model));
-    model.gradient_method = GradientMethod::default();
-    assert!(!analytic_inner_common_bail(&model));
-    // IIV on residual error is NO LONGER a blanket common bail (#4b): the inner
-    // gradient now carries the `exp(2·η_ruv)` scaling and the `η_ruv` variance column.
-    // For this **IOV** model (`n_kappa > 0`), even the M3 triple is analytic as of #486;
-    // the non-IOV ODE M3 + `iiv_on_ruv` combo is analytic as well (#623).
-    model.residual_error_eta = Some(0);
-    assert!(!analytic_inner_common_bail(&model));
-    model.bloq_method = crate::types::BloqMethod::M3;
-    assert!(!analytic_inner_common_bail(&model));
-    model.bloq_method = crate::types::BloqMethod::Drop;
-    model.residual_error_eta = None;
-    // LTBS is no longer a common bail at any κ count (#486): the closed-form IOV inner walk
-    // applies the `ln` jet last (`run_obs_iov_eta`), matching its outer twin. This model is
-    // **ODE**-based, though, and the ODE IOV path is a different story — `ode_iov_supported`
-    // declines `log_transform` outright (its walk applies LTBS in PK-param space *before* the
-    // η/θ/κ chain, so the production scale-then-log order can't be rebuilt post-walk). So the
-    // decline for an ODE IOV LTBS model must come from the support gate, NOT from the common
-    // bail. Pin both halves: dropping the bail clause must not have opened an analytic inner
-    // for a model whose outer still declines (that split is exactly what the scope rule forbids).
-    model.log_transform = true;
-    assert!(
-        !analytic_inner_common_bail(&model),
-        "LTBS is no longer a common bail — the closed-form IOV inner serves it (#486)"
-    );
-    assert!(
-        !crate::sens::provider::iov_sens_supported(&model),
-        "ODE IOV + LTBS still routes to FD via the ODE IOV support gate — the sole decline now"
-    );
-    model.log_transform = false;
-
-    // The *outer* IOV gate (`iov_sens_supported`) for this **ODE** model now admits
-    // `iiv_on_ruv` and the M3 triple (#486): the ODE walk emits a zero `∂f/∂η_ruv`
-    // column and the shared assembly applies the variance scaling — proven by the
-    // dedicated FD-comparison tests (`analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode`
-    // here and `iov_iiv_on_ruv_ode_packed_gradient_matches_reconverged_fd` in
-    // `sens_outer_gradient`). FREM still routes to FD.
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-    model.residual_error_eta = Some(0);
-    assert!(
-        crate::sens::provider::iov_sens_supported(&model),
-        "ODE IOV + iiv_on_ruv is analytic as of #486"
-    );
-    model.residual_error_eta = None;
-    assert!(crate::sens::provider::iov_sens_supported(&model));
-
-    // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is analytic (#575/#590):
-    // the post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so `ode_iov_supported`
-    // (and hence `iov_sens_supported`) admits it. LTBS still declines — pinned in
-    // `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
-    let iov_scaled = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse ODE IOV + obs_scale");
-    assert!(
-        matches!(
-            iov_scaled.scaling,
-            crate::types::ScalingSpec::ExpressionScale { .. }
-        ),
-        "obs_scale = 1000/V must parse as an η-dependent ExpressionScale"
-    );
-    assert!(
-        crate::sens::provider::iov_sens_supported(&iov_scaled),
-        "ODE IOV + η-dependent obs_scale is analytic via the post-walk quotient (#575/#590)"
-    );
-
-    // The CLOSED-FORM IOV path (`iov_analytical_supported`) now admits an η-dependent
-    // `ExpressionScale` `obs_scale` too (#486): the closed-form event-driven walk applies
-    // the same per-occasion-group post-walk quotient as the ODE path. LTBS is served on
-    // the OUTER gradient now (#486) — pinned in
-    // `sens::provider::tests::iov_analytical_expr_scale_supported_and_gated`.
-    let iov_scaled_cf = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
-        )
-        .expect("parse closed-form IOV + obs_scale");
-    assert!(matches!(
-        iov_scaled_cf.scaling,
-        crate::types::ScalingSpec::ExpressionScale { .. }
-    ));
-    assert!(
-        crate::sens::provider::iov_sens_supported(&iov_scaled_cf),
-        "closed-form IOV + η-dependent obs_scale is analytic via the post-walk quotient (#486)"
-    );
-    let mut iov_scaled_cf_ltbs = iov_scaled_cf;
-    iov_scaled_cf_ltbs.log_transform = true;
-    // Closed-form IOV + obs_scale + LTBS is served on BOTH loops now (#486): each applies the
-    // `ln(f)` jet after its own per-occasion scale quotient, so the EBE and the θ/Ω/σ gradient
-    // differentiate the same `ln(f/s)`. Pin the pair together — an analytic outer against an FD
-    // inner is the scope split the provider forbids, so these two must move as one.
-    assert!(
-        crate::sens::provider::iov_sens_supported(&iov_scaled_cf_ltbs),
-        "closed-form IOV + obs_scale + LTBS is served on the OUTER gradient (#486)"
-    );
-    assert!(
-        !analytic_inner_common_bail(&iov_scaled_cf_ltbs),
-        "closed-form IOV + obs_scale + LTBS is served on the INNER gradient too (#486)"
     );
 }
 
@@ -3887,6 +2625,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         None,
         None,
         EbeVariance::Conditional,
+        false,
     );
     assert!(
         !ebe.converged && ebe.used_fallback,
@@ -3910,6 +2649,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         None,
         None,
         EbeVariance::Conditional,
+        false,
     );
     assert!(full.converged, "reference solve must converge");
     assert!(
@@ -3942,27 +2682,45 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
 /// * with a normal budget the polish reaches the deep mode and reports `true` — the flag is
 ///   earned by the returned point, not inherited.
 ///
-/// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). Budgets:
+/// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). The deep well
+/// carries a quartic term, `d² + d⁴` with `d = x + 2`: since #2093 the certificate takes its own
+/// Newton step (within the same `max_iter` budget), and on a pure quadratic one step is exact,
+/// so the "budget too small to reach the mode" half would be vacuous. From `d = 0.5` one step
+/// reaches `d = 0.2`, `|g| ≈ 0.43`, far above `tol`. Budgets:
 /// `max_iter = 1` gives each NM 5 iterations — enough for a restart seeded on the shallow
-/// minimum to collapse its 0.1-wide simplex under `tol = 1e-3`, not enough for a polish
-/// from x = −1.5 to reach x = −2 within `tol` — and gives the stationarity certifier's
-/// gradient polish (#1527) one BFGS iteration, which ends before its next `gnorm < tol`
-/// test. Verified by mutation: returning the restart's flag turns the first half red.
+/// minimum to collapse its 0.1-wide simplex under `tol = 1e-6`, not enough for a polish
+/// from x = −1.5 to reach x = −2 within `tol` (it ends at x = −2.025) — one certificate
+/// Newton step, which lands at `|g| = 1.2e-4` (measured; at the earlier `tol = 1e-3` that
+/// step certified the point, correctly), and the stationarity certifier's gradient polish
+/// (#1527) one BFGS iteration, which ends before its next `gnorm < tol` test. Verified by
+/// mutation: returning the restart's flag turns the first half red.
 #[test]
 fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
-    let obj = bimodal_obj;
+    let obj = |x: &[f64]| {
+        let v = x[0];
+        if v < 0.0 {
+            let d = v + 2.0;
+            d * d + d.powi(4) - 10.0
+        } else {
+            (v - 2.0).powi(2) - 1.0
+        }
+    };
+    let grad = |x: &[f64]| {
+        let v = x[0];
+        vec![if v < 0.0 {
+            let d = v + 2.0;
+            2.0 * d + 4.0 * d.powi(3)
+        } else {
+            2.0 * (v - 2.0)
+        }]
+    };
     let _cold = arm_inner_settings(InnerSettings::default());
     let partial = [-1.5];
     let f_partial = obj(&partial);
 
     // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
     // polish cannot certify it.
-    let (eta, ok) = argmin_inner_fallback(
-        &obj,
-        &partial,
-        &[2.0],
-        &exact_cert(&bimodal_grad, 1, 1, 1e-3),
-    );
+    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], &exact_cert(&grad, 1, 1, 1e-6));
     assert!(eta[0] < 0.0, "must stay in the deep well, got {eta:?}");
     assert!(
         obj(&eta) <= f_partial,
@@ -3976,21 +2734,17 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     );
 
     // Normal budget: the polish reaches the deep mode and earns the flag.
-    let (eta2, ok2) = argmin_inner_fallback(
-        &obj,
-        &partial,
-        &[2.0],
-        &exact_cert(&bimodal_grad, 1, 200, 1e-8),
-    );
+    let (eta2, ok2) =
+        argmin_inner_fallback(&obj, &partial, &[2.0], &exact_cert(&grad, 1, 200, 1e-8));
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "polish must reach the deep mode, got {eta2:?}"
     );
     assert!(ok2, "a stationary returned point is certified");
     assert!(
-        bimodal_grad(&eta2)[0].abs() < 1e-8,
+        grad(&eta2)[0].abs() < 1e-8,
         "`converged` must mean stationary at the returned point (#1527), got |g| = {:.3e}",
-        bimodal_grad(&eta2)[0].abs()
+        grad(&eta2)[0].abs()
     );
 }
 
@@ -4166,43 +2920,57 @@ fn nelder_mead_recover_is_certified_and_honours_admissibility() {
     assert_eq!(y, nm_end, "the NM end point is returned unchanged");
 }
 
-/// The Newton test's **resolution arm** (#1527): a point whose remaining Newton decrease
-/// `½∇ᵀH⁻¹∇` is at or below `INNER_FTOL_REL·(1 + |f|)` is a mode to the objective's precision
-/// and is certified in place, whatever `tol` says. It is what keeps tight `inner_tol` fits —
-/// Schnider at 1e-8, the AGQ score fixtures at 1e-11 — from reporting their converged
-/// subjects unconverged. Straddle, one fixture, `f = 100 + ½(x − 1)²`, `tol = 1e-5`,
-/// threshold `1e-11·101 ≈ 1.0e-9`:
+/// The Newton test's two outcomes on one exact fixture, `f = 100 + ½(x − 1)²`, `tol = 1e-5`,
+/// resolution threshold `INNER_FTOL_REL·(1 + |f|) = 1e-11·101 ≈ 1.0e-9`.
 ///
-/// * `x = 1 + 3e-5`: `‖∇‖ = 3e-5` and Newton step `3e-5`, both above `tol`, but the decrease
-///   left is `4.5e-10` — certified, returned **unmoved**;
-/// * `x = 1 + 1e-4`: decrease `5e-9`, above the threshold — not certified in place; the
-///   polish certifies it at the mode instead, so the point **moves**.
+/// **It takes the Newton step it computes** (#2093). From `x = 1 + 3e-5` (`‖∇‖ = 3e-5`,
+/// above `tol`) the step lands on the mode, so the point is certified there rather than in
+/// place. Before #2093 the resolution arm certified it unmoved, 3e-5 from the mode; on a
+/// FOCEI marginal, which is not stationary in η, that miss enters the objective to first
+/// order — it was the noise floor of every reconverged-FD oracle. Mutation: dropping the
+/// step leaves `x` at `1 + 3e-5` and the first assertion reddens.
 ///
-/// Mutation: deleting the resolution arm sends the first case to the polish, which moves
-/// it, and the `assert_eq!` reddens.
+/// **The resolution arm (#1527) still certifies what no step can improve.** With the mode
+/// itself excluded (`admissible` rejects `|x − 1| < 1e-6`, so the step is refused), the
+/// straddle is the arm's threshold:
+///
+/// * `x = 1 + 3e-5`: decrease left `4.5e-10`, under the threshold — certified, **unmoved**;
+/// * `x = 1 + 1e-4`: decrease `5e-9`, over it — not certified (the polish reaches only the
+///   excluded mode), and returned unchanged.
+///
+/// Mutation: deleting the resolution arm reddens the first case.
 #[test]
 fn fallback_certifier_certifies_a_mode_resolved_to_the_objectives_precision() {
     let _cold = arm_inner_settings(InnerSettings::default());
     let tol = 1e-5;
     let f = |x: &[f64]| 100.0 + 0.5 * (x[0] - 1.0).powi(2);
     let g = |x: &[f64]| vec![x[0] - 1.0];
+    let cert = exact_cert(&g, 1, 50, tol);
 
+    let mut x = vec![1.0 + 3e-5];
+    assert!(cert.certify(&f, &mut x));
+    assert!(
+        (x[0] - 1.0).abs() < 1e-12,
+        "the certificate takes its Newton step to the mode, got {x:?}"
+    );
+
+    let off_mode = |e: &[f64]| (e[0] - 1.0).abs() >= 1e-6;
     let inside = vec![1.0 + 3e-5];
     let mut x = inside.clone();
-    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut x));
+    assert!(cert.certify_within(&f, &mut x, &off_mode));
     assert_eq!(
         x, inside,
-        "a decrease below the objective's resolution is certified in place"
+        "a decrease below the objective's resolution is certified in place when no step is \
+         admissible"
     );
 
     let outside = vec![1.0 + 1e-4];
     let mut y = outside.clone();
-    assert!(exact_cert(&g, 1, 50, tol).certify(&f, &mut y));
-    assert_ne!(
-        y, outside,
-        "a resolvable decrease is not certified in place — the polish takes it to the mode"
+    assert!(
+        !cert.certify_within(&f, &mut y, &off_mode),
+        "a resolvable decrease the certificate may not take is not certified, ended at {y:?}"
     );
-    assert!((y[0] - 1.0).abs() < tol, "polished to the mode, got {y:?}");
+    assert_eq!(y, outside, "an uncertified point is returned unchanged");
 }
 
 /// On a numerical objective (`stall_at` true) the certificate skips the Newton-step test —
@@ -4307,9 +3075,9 @@ fn hash_noise(x: f64) -> f64 {
 /// `1e-11·(1 + |f|) ≈ 1e-8` flatness threshold) and whose gradient carries `±1e-4` (ten
 /// times `tol`), so no point can pass `gnorm < tol` and the Newton-step test is skipped.
 ///
-/// Both sides of the gate, one fixture: with `stall_at = true` the certificate holds and the
-/// returned point is the mode to the floor's resolution; with `stall_at = false` (the
-/// exact-objective criterion) the same start is **not** certified. Mutation: handing the
+/// With `stall_at = true` the certificate holds and the returned point is the mode to the
+/// floor's resolution, and the fixture's gradient is asserted floored above `tol` around the
+/// mode, so that certificate can only be the stall stop's. Mutation: handing the
 /// polish a constant-`false` stall predicate instead of the certifier's reddens the first
 /// half; deleting the "skip test 2 on a numerical objective" guard does not (the Newton step
 /// from this start is ~3e-3, far above `tol`), which is stated rather than claimed.
@@ -4339,13 +3107,19 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
         "the stall-certified point must be the mode to the floor's resolution, got {x:?}"
     );
 
-    let mut y = start.clone();
-    assert!(
-        !exact_cert(&floored, 1, 200, tol).certify(&noisy, &mut y),
-        "without the stall stop a floor above `tol` cannot be certified — if this passes, the \
-         fixture no longer models a noise floor and the first half proves nothing"
-    );
-    assert_eq!(y, start, "an uncertified point is returned unchanged");
+    // Non-degeneracy: the fixture's gradient really is floored above `tol` across the
+    // neighbourhood of the mode, so no point can pass `gnorm < tol` and the first half's
+    // certificate can only have come from the stall stop. (Asserted on the gradient itself:
+    // since #2093 the exact path's Newton steps walk down to the floor and its resolution
+    // arm certifies the point there, so "the exact path does not certify" is no longer the
+    // floor's signature.)
+    for k in -200..=200 {
+        let e = [1.0 + f64::from(k) * 1e-7];
+        assert!(
+            floored(&e)[0].abs() > tol,
+            "the fixture's gradient must be floored above tol at {e:?}"
+        );
+    }
 }
 
 /// The behavioural side of `inner_stall_enabled_at_iov_tracks_the_effective_model`: a
@@ -4410,6 +3184,7 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
             None,
             None,
             EbeVariance::Conditional,
+            false,
         );
         let mut stacked: Vec<f64> = r.eta.as_slice().to_vec();
         for k in &r.kappas {
@@ -4438,9 +3213,12 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
         (r.converged, gmax)
     };
 
-    let (conv, gmax) = solve(1e-8);
+    // The inner gradient is the unified recorder's (the closed-form event walk over a dual),
+    // the objective the absorption walk's `f64` value: the two transit closed forms agree to
+    // ~1e-8, so the solve's floor sits there (measured max |g| 1.4e-8 at tol 1e-8, #486).
+    let (conv, gmax) = solve(1e-7);
     assert!(
-        conv && gmax < 1e-8,
+        conv && gmax < 1e-7,
         "an exact objective must stop on gnorm < tol: converged {conv}, max |g| {gmax:e}"
     );
     let (conv, gmax) = solve(1e-10);
@@ -4517,7 +3295,7 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
         let params = model.default_params.clone();
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov");
         assert!(
-            crate::sens::provider::iov_sens_eta_supported(&model),
+            analytic_iov_inner_supported(&model, subject, &params),
             "{label}: the inner gradient must be analytic"
         );
         let layout = NestedLayout::of(&model, subject).expect("prepared");
@@ -4577,15 +3355,17 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
 /// closed-form / ODE twins of each fixture are served, so the declines are the cases' own.
 #[test]
 fn the_nested_walks_decline_a_transit_twin_and_an_unprepared_subject() {
-    use crate::sens::provider::{subject_eta_grad_iov, subject_sensitivities_iov};
+    use crate::sens::ode_provider::adjoint::{exact_inner_hessian, exact_obs_grads};
     use crate::stats::nested_levels::test_helpers as fx;
+    // The first-order recording (inner gradient, η-Jacobian) and the second-order one
+    // (inner Hessian, the outer gradient's mode response): each must decline on its own.
     let walks = |m: &CompiledModel, s: &Subject| {
-        let k = iov_occasion_groups(s).len();
+        let k = crate::stats::likelihood::iov_occasion_groups(s).len();
         let stacked = vec![0.01; m.n_eta + k * m.n_kappa];
-        let th = &m.default_params.theta;
+        let p = &m.default_params;
         (
-            subject_sensitivities_iov(m, s, th, &stacked).is_some(),
-            subject_eta_grad_iov(m, s, th, &stacked).is_some(),
+            exact_inner_hessian(m, s, p, &stacked).is_some(),
+            exact_obs_grads(m, s, &p.theta, &stacked).is_some(),
         )
     };
     let (transit, pop) = fx::prepared(&fx::transit(), 1);
@@ -4692,8 +3472,8 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
         "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
     )
     .expect("parse one-level IOV");
-    // A dose without an occasion label is outside the closed-form walk's scope; labelled,
-    // the one-level search runs on the analytic gradient.
+    // Labelled, the one-level search runs on the analytic gradient (an unlabelled dose
+    // does too since #2065; `an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_…`).
     let mut labelled = make_iov_subject();
     labelled.dose_occasions = vec![1];
     // `(label, model, subject, takes the analytic gradient)`.
@@ -4741,18 +3521,18 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     }
 }
 
-/// #1082 PR5: an IOV subject whose residuals a `correlation … by` line couples across rows
-/// runs its EBE search on central differences of its (dense) objective, named "residual
-/// correlation"; a subject of the same model whose blocks are all singletons keeps the
-/// analytic gradient. Both sides in one test, read off `agrad` itself.
+/// #1082 PR5 / #2101: an IOV subject whose residuals a `correlation … by` line couples
+/// across rows runs its EBE search on the adjoint kernel's exact gradient of its (dense)
+/// objective; a subject of the same model whose blocks are all singletons keeps the per-row
+/// analytic gradient. Both take no FD step, read off `agrad` itself.
 ///
-/// The cross-row subject's EBE is also checked for stationarity on its own objective: the
-/// analytic IOV gradient differentiates the diagonal data term, so routing it there (the
-/// mutation: drop `iov_inner_residual_correlation` from the `analytic_iov_inner` gate)
-/// both flips the counter and leaves the search at a point that is not a mode of the
-/// objective it scores.
+/// Each EBE is checked for stationarity on its own objective by central differences, an
+/// oracle outside both gradients: the per-row gradient differentiates the diagonal data
+/// term, so routing the cross-row subject there (the mutation: drop
+/// `iov_inner_residual_correlation` from the `analytic_iov_inner` gate) leaves the search
+/// at a point that is not a mode of the objective it scores.
 #[test]
-fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
+fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() {
     use crate::stats::nested_levels::test_helpers as fx;
     let src = fx::algebraic()
         .replace(
@@ -4800,15 +3580,11 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
             "{}",
             s.id
         );
-        assert_eq!(
-            iov_inner_subject_route(&m, s, &p.theta).is_none(),
-            correlated,
+        assert!(
+            iov_inner_subject_route(&m, s, &p.theta).is_some(),
             "{}: the reported route",
             s.id
         );
-        if correlated {
-            assert_eq!(iov_fd_reason(&m, s), "residual correlation");
-        }
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
         let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
@@ -4818,19 +3594,11 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
             s.id,
             ebe.nll
         );
-        if correlated {
-            assert!(
-                analytic == 0 && fd >= 3,
-                "{}: {analytic} analytic / {fd} FD",
-                s.id
-            );
-        } else {
-            assert!(
-                analytic >= 3 && fd == 0,
-                "{}: {analytic} analytic / {fd} FD",
-                s.id
-            );
-        }
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{}: {analytic} analytic / {fd} FD",
+            s.id
+        );
         // Stationarity of the objective the search scored, over the compact vector.
         let layout = crate::stats::nested_levels::NestedLayout::of(&m, s).unwrap();
         let b = layout.compact(ebe.eta.as_slice(), &ebe.kappas).unwrap();
@@ -4857,5 +3625,1335 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_fd() {
             worst = worst.max(g.abs());
         }
         assert!(worst < 1e-4, "{}: |∇| {worst:.3e} at the EBE", s.id);
+    }
+}
+
+/// #2209: an IOV model with a residual `weight =` and a `correlation … by` line reports the
+/// analytic inner gradient its search runs on. The cross-row subject stays on the adjoint
+/// kernel's exact gradient (`iov_inner_residual_correlation`), the singleton-block twin on
+/// the per-row one; neither takes an FD step, and no FD-fallback warning is raised. The
+/// same model under `gradient = fd` reports FD. Kills: re-adding the magnitude × dense
+/// clause to `analytic_inner_common_bail` (label FD, subject route `None`);
+/// `inner_reports_analytic_model` forced `true` (the `gradient = fd` arm).
+#[test]
+fn an_iov_weighted_correlated_residual_reports_the_analytic_inner_gradient() {
+    use crate::build_info::{gradient_method_inner, GradientMethodKind, BUILD_INFO};
+    use crate::stats::nested_levels::test_helpers as fx;
+    let src = fx::algebraic()
+        .replace(
+            "  sigma ADD ~ 0.5\n",
+            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
+        )
+        .replace(
+            "[individual_parameters]\n",
+            "[covariates]\n  NARM continuous\n[individual_parameters]\n",
+        )
+        .replace(
+            "  DV ~ additive(ADD)\n",
+            "  DV ~ additive(ADD) weight = NARM\n  correlation ar1(RHO) by ARM\n",
+        );
+    let (m, mut pop) = fx::prepared(&src, 1);
+    assert!(m.has_custom_ruv_magnitude() && m.residual_is_dense());
+    let mut single = pop.subjects[0].clone();
+    single.id = "SINGLE".into();
+    let keep: Vec<usize> = (0..single.obs_times.len()).step_by(3).collect();
+    let pick = |v: &Vec<f64>| keep.iter().map(|&j| v[j]).collect::<Vec<f64>>();
+    single.obs_times = pick(&single.obs_times);
+    single.observations = pick(&single.observations);
+    single.obs_covariates = keep
+        .iter()
+        .map(|&j| single.obs_covariates[j].clone())
+        .collect();
+    single.obs_cmts = vec![1; keep.len()];
+    single.cens = vec![0; keep.len()];
+    pop.subjects.push(single);
+    crate::stats::nested_levels::assign_level_cells(&m, &mut pop);
+    crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
+
+    assert_eq!(
+        gradient_method_inner(&BUILD_INFO, &m),
+        GradientMethodKind::Analytic
+    );
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let p = &m.default_params;
+    assert_eq!(fd_fallback_warning(&m, &pop, &p.theta), None);
+    for (i, correlated) in [(0usize, true), (1, false)] {
+        let s = &pop.subjects[i];
+        assert_eq!(
+            iov_inner_residual_correlation(&m, s),
+            correlated,
+            "{}",
+            s.id
+        );
+        assert!(
+            iov_inner_subject_route(&m, s, &p.theta).is_some(),
+            "{}: the reported route",
+            s.id
+        );
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{}: {}",
+            s.id,
+            ebe.nll
+        );
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{}: {analytic} analytic / {fd} FD",
+            s.id
+        );
+    }
+
+    let (mut forced, _) = fx::prepared(&src, 1);
+    forced.gradient_method = GradientMethod::Fd;
+    assert_eq!(
+        gradient_method_inner(&BUILD_INFO, &forced),
+        GradientMethodKind::FiniteDifferences
+    );
+}
+
+/// #2093 review (round 2): `gradient = fd` takes the IOV inner search off every exact
+/// route. The adjoint kernel's `exact_inner_gradient_in` sat behind the non-analytic arm
+/// unconditionally, so a forced-FD fit ran the exact gradient while every report said FD.
+/// The straddle is `gradient_method` alone: `auto` takes analytic steps and no FD; `fd`
+/// takes FD steps and no exact one. The mutation this catches is dropping the opt-out
+/// check from the `exact` closure in `find_ebe_iov`.
+#[test]
+fn gradient_fd_keeps_the_iov_inner_search_off_the_exact_gradient() {
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let mut model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse one-level IOV");
+    let mut s = make_iov_subject();
+    s.dose_occasions = vec![1];
+    for (gm, label) in [(GradientMethod::Auto, "auto"), (GradientMethod::Fd, "fd")] {
+        model.gradient_method = gm;
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(
+            &model,
+            &s,
+            &model.default_params,
+            200,
+            1e-8,
+            None,
+            None,
+            0,
+            &stage,
+        );
+        let (exact, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{label}: {}",
+            ebe.nll
+        );
+        if gm == GradientMethod::Fd {
+            assert!(
+                exact == 0 && fd > 0,
+                "{label}: {exact} exact / {fd} FD steps"
+            );
+        } else {
+            assert!(
+                exact > 0 && fd == 0,
+                "{label}: {exact} exact / {fd} FD steps"
+            );
+        }
+    }
+}
+
+// ---- restored FD-parity tests of the kept analytic IOV inner gradient (#2093 review r2) ----
+
+/// **ODE** triple M3 + IOV + `iiv_on_ruv` (#486): the ODE counterpart of
+/// [`iov_m3_iiv_on_ruv_inner_grad_matches_fd`]. The analytic stacked-η inner gradient
+/// from the **event-driven ODE walk** must match Richardson FD of `individual_nll_iov`
+/// over `[η_bsv, η_ruv, κ₁, κ₂]` when censored rows co-occur with the `exp(2·η_ruv)`
+/// residual-variance scaling. The ODE walk emits a zero `∂f/∂η_ruv` column (η_ruv is
+/// absent from CL/V/KA), so the residual-eta column comes entirely from the
+/// provider-agnostic `residual_inner_obs` term — exactly as on the closed-form path.
+/// Both tails.
+#[test]
+fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  bloq_method = m3\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE IOV + M3 + iiv_on_ruv");
+    assert_eq!(model.residual_error_eta, Some(3));
+    assert!(model.is_ode_based(), "must be on the ODE path");
+    // The ODE triple is analytic on both loops as of #486.
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(!analytic_inner_common_bail(&model));
+
+    for cens_sign in [1i8, -1] {
+        let mut subject = Subject {
+            obs_rgroup: Vec::new(),
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 6],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &[0.12, -0.08, 0.2, 0.10],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        // Non-zero η_ruv (index 3) so the residual-variance scaling is exercised.
+        let stacked = vec![0.10, -0.05, 0.08, 0.12, 0.05, -0.07];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            None,
+        )
+        .expect("analytic ODE IOV + M3 + iiv_on_ruv inner gradient");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-5 * (1.0 + stacked[p].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut sp = stacked.clone();
+                sp[p] += hh;
+                let mut sm = stacked.clone();
+                sm[p] -= hh;
+                (nll(&sp) - nll(&sm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-5);
+        }
+    }
+}
+
+/// **ODE** M3 BLOQ + IOV (#486): the ODE counterpart of
+/// [`iov_m3_inner_grad_matches_fd`]. The analytic stacked-η inner gradient produced
+/// via the **event-driven ODE walk** (`adjoint::exact_obs_grads_in` → `record_ode_iov`, not
+/// the closed-form event recorder) must match Richardson central FD of `individual_nll_iov`
+/// over `[η_bsv, κ₁, κ₂]` on a censored subject. Censoring is provider-agnostic —
+/// the `−logΦ` coefficient rides the same `residual_inner_obs` path keyed on
+/// `subject.cens[j]` whether the walk was closed-form or ODE — so removing the gate
+/// clause is all that was needed. Both tails (`CENS = 1` left, `CENS = -1` right).
+#[test]
+fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  bloq_method = m3\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE IOV + M3");
+    assert!(
+        matches!(model.bloq_method, crate::types::BloqMethod::M3),
+        "model must be M3"
+    );
+    assert!(model.is_ode_based(), "must be on the ODE path");
+    // After the #486 gate flip, the ODE IOV walk serves M3 analytically on the inner
+    // loop (single gate — no separate M3 bail).
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(!analytic_inner_common_bail(&model));
+
+    // Both tails: occasion-2 tail left-censored (CENS=1), then right-censored (CENS=-1).
+    for cens_sign in [1i8, -1] {
+        let mut subject = Subject {
+            obs_rgroup: Vec::new(),
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 6],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        // Carry the censoring limit at 0.85·f so z = (f − LIMIT)/√v sits in the
+        // moderate regime where the A&S `log_normal_cdf` and the exact φ in `inv_mills`
+        // agree to FD precision (a deep-tail limit would expose only the CDF floor).
+        let preds = crate::pk::predict_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            None,
+        )
+        .expect("analytic ODE IOV + M3 inner gradient");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-5 * (1.0 + stacked[p].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut sp = stacked.clone();
+                sp[p] += hh;
+                let mut sm = stacked.clone();
+                sm[p] -= hh;
+                (nll(&sp) - nll(&sm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-5);
+        }
+    }
+}
+
+/// The analytic ODE IOV inner gradient (`analytic_eta_nll_gradient_iov`) must match
+/// central finite differences of the inner objective `individual_nll_iov` over the
+/// stacked `[η_bsv, κ₁..κ_K]` vector — the gradient that now drives `find_ebe_iov`
+/// for ODE IOV models (#439 ODE IOV inner).
+#[test]
+fn analytic_iov_inner_grad_matches_fd_of_nll() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE IOV");
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    let stacked = vec![0.10, -0.05, 0.08, -0.12];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV inner gradient");
+
+    // Central FD of the inner objective (same NLL `find_ebe_iov` minimises).
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    for p in 0..n_stacked {
+        let h = 1e-6 * (1.0 + stacked[p].abs());
+        let mut sp = stacked.clone();
+        sp[p] += h;
+        let mut sm = stacked.clone();
+        sm[p] -= h;
+        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+    }
+}
+
+/// Closed-form twin of [`analytic_iov_inner_grad_matches_fd_of_nll`] with an η-dependent
+/// `ExpressionScale` `obs_scale = V` divisor (#486): the analytic IOV inner gradient
+/// (`analytic_eta_nll_gradient_iov`, fed the scaled jet of `adjoint::exact_obs_grads_in`) must
+/// match central FD of the same objective `individual_nll_iov` (which applies `obs_scale`) over the
+/// stacked `[η_bsv, κ]` vector — the gradient that drives `find_ebe_iov` for a scaled closed-form
+/// IOV model.
+#[test]
+fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + obs_scale");
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    let stacked = vec![0.10, -0.05, 0.08, -0.12];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV inner gradient");
+
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    for p in 0..n_stacked {
+        let h = 1e-6 * (1.0 + stacked[p].abs());
+        let mut sp = stacked.clone();
+        sp[p] += h;
+        let mut sm = stacked.clone();
+        sm[p] -= h;
+        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+    }
+}
+
+/// LTBS × IOV closed-form **inner** EBE gradient vs central FD of its own objective (#486).
+///
+/// This is the cell that closed the last inner/outer scope split: the outer IOV gradient has
+/// served LTBS since #677, but the `Dual1` inner walk had no `ln` jet, so `find_ebe_iov`
+/// reconverged on finite differences. The adjoint's closed-form event recorder
+/// (`record_analytic_events`) now applies the LTBS log (`ltbs_log_g`) last — after the
+/// per-occasion scale quotient — so the EBE
+/// gradient differentiates the same `ln(f/s)` the objective scores.
+///
+/// Run over BOTH fixtures because the ordering is the part that can silently go wrong:
+///   * plain LTBS × IOV — the bare `∂ln f/∂x = (∂f/∂x)/f` jet over the stacked `[η_bsv, κ]`;
+///   * LTBS × IOV × `ExpressionScale` — pins **scale-then-log** (`ln(f/s)`, production's
+///     order). Applying the jet before the quotient instead still yields a plausible
+///     gradient — it is just the gradient of `ln(f)/s`, a different function — and FD of the
+///     real objective is what catches it.
+///
+/// The κ columns need no special treatment (the transform is one per-observation scalar
+/// quotient, identical on every stacked axis), and that is exactly what this asserts: FD
+/// parity is checked on every stacked coordinate, κ blocks included.
+#[test]
+fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
+    use crate::parser::model_parser::parse_model_string;
+    let fixture = |scaling_block: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  \
+             sigma ADD_ERR ~ 0.2 (sd)\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n{scaling_block}\
+             [error_model]\n  log(DV) ~ additive(ADD_ERR)\n[fit_options]\n  method = focei\n  \
+             iov_column = OCC\n"
+        )
+    };
+    for (label, scaling_block) in [
+        ("plain LTBS", ""),
+        ("LTBS + obs_scale", "[scaling]\n  obs_scale = 1000 / V\n"),
+    ] {
+        let model = parse_model_string(&fixture(scaling_block)).expect("parse LTBS IOV fixture");
+        assert!(model.log_transform, "{label}: fixture must be LTBS");
+        // Routing first: a scope gap must fail loudly here rather than quietly FD-ing and
+        // leaving the parity check below to pass against a gradient nobody ran.
+        assert!(
+            crate::sens::ode_provider::adjoint::model_in_scope(&model),
+            "{label}: must be on the analytic closed-form IOV path"
+        );
+        assert!(
+            !analytic_inner_common_bail(&model),
+            "{label}: the analytic INNER must not be bailed (#486)"
+        );
+        // The tolerance predicate must move WITH the bail, not independently (PR #950
+        // review #1). `uses_closed_form_ltbs_inner` is the sole input to
+        // `effective_inner_tol` / `effective_cov_inner_tol`; while it carried an
+        // `n_kappa == 0` carve-out — justified only by the bail that just disappeared —
+        // this model ran the analytic ln-jet inner (with its ~1e-9
+        // provider-vs-`compute_predictions` gap) while the fit AND covariance steps stayed
+        // at the loose default, quietly inflating SEs with unchanged point estimates.
+        assert!(
+            model.uses_closed_form_ltbs_inner(),
+            "{label}: a model whose inner runs the analytic ln-jet must also take the \
+             tightened LTBS fit/covariance tolerances"
+        );
+
+        let subject = Subject {
+            obs_rgroup: Vec::new(),
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        // Off-zero on every coordinate, and distinct per κ block, so a transform applied to
+        // the wrong occasion's jet cannot cancel.
+        let stacked = vec![0.10, -0.05, 0.08, -0.12];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            None,
+        )
+        .expect("analytic IOV inner gradient");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-6 * (1.0 + stacked[p].abs());
+            let mut sp = stacked.clone();
+            sp[p] += h;
+            let mut sm = stacked.clone();
+            sm[p] -= h;
+            let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+        }
+    }
+}
+
+/// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
+/// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
+/// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` — including the `η_ruv` column
+/// (`Σ_j 1 − ε²/v`) and the `exp(2·η_ruv)` residual-variance scaling now woven into
+/// the IOV inner gradient. Proves the gate flip (then `iov_analytical_supported`, now
+/// the adjoint's `model_in_scope`) ships a
+/// *correct* gradient, not just an enabled one.
+#[test]
+fn iov_iiv_on_ruv_inner_grad_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + iiv_on_ruv");
+    // Gate flip: the closed-form IOV + iiv_on_ruv path is now analytic on both loops.
+    assert_eq!(model.residual_error_eta, Some(3));
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(!analytic_inner_common_bail(&model));
+
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    // Non-zero η_ruv (index 3) so the residual-variance scaling is genuinely exercised.
+    let stacked = vec![0.10, -0.05, 0.08, 0.15, 0.05, -0.07];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV + iiv_on_ruv inner gradient");
+
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    for p in 0..n_stacked {
+        let h = 1e-6 * (1.0 + stacked[p].abs());
+        let mut sp = stacked.clone();
+        sp[p] += h;
+        let mut sm = stacked.clone();
+        sm[p] -= h;
+        let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+    }
+}
+
+/// The triple **M3 + IOV + `iiv_on_ruv`** (#591): the analytic stacked-η inner
+/// gradient (`analytic_eta_nll_gradient_iov`) must match Richardson FD of
+/// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` when censored rows co-occur with
+/// the `exp(2·η_ruv)` residual-variance scaling. `residual_inner_obs` returns the
+/// censored `(h·m, h·z)` pair (f-coefficient + residual-eta column) on a censored row
+/// under `iiv_on_ruv`, and the residual variance carries the `η_ruv` scale on every
+/// row. Proves the gate flip ships a correct *triple* inner gradient.
+#[test]
+fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + M3 + iiv_on_ruv");
+    model.bloq_method = crate::types::BloqMethod::M3;
+    // The closed-form triple is analytic on both loops as of #591; the ODE IOV triple
+    // is analytic as of #486 (see `analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode`).
+    assert_eq!(model.residual_error_eta, Some(3));
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(!analytic_inner_common_bail(&model));
+
+    let mut subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![0.0; 6],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
+        cens: vec![0, 0, 0, 0, 1, 1],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    // Shallow censoring (≈ 0.85·f → z ≈ −0.75), the regime where the A&S CDF and the
+    // exact φ in `inv_mills` agree to FD precision.
+    let preds = crate::pk::predict_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &[0.12, -0.08, 0.2, 0.10],
+        &[vec![0.05], vec![-0.07]],
+    );
+    subject.observations = preds.iter().map(|p| p * 0.85).collect();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    // Non-zero η_ruv (index 3) so the residual-variance scaling is exercised.
+    let stacked = vec![0.10, -0.05, 0.08, 0.12, 0.05, -0.07];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV + M3 + iiv_on_ruv inner gradient");
+
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    for p in 0..n_stacked {
+        let h = 1e-5 * (1.0 + stacked[p].abs());
+        let fd_at = |hh: f64| -> f64 {
+            let mut sp = stacked.clone();
+            sp[p] += hh;
+            let mut sm = stacked.clone();
+            sm[p] -= hh;
+            (nll(&sp) - nll(&sm)) / (2.0 * hh)
+        };
+        let f1 = fd_at(h);
+        let f2 = fd_at(h / 2.0);
+        let fd = (4.0 * f2 - f1) / 3.0;
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
+}
+
+/// M3 BLOQ + IOV (#580): the analytic stacked-η inner gradient
+/// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
+/// `individual_nll_iov` over `[η_bsv, κ₁..κ_K]` when the subject carries M3-censored
+/// rows (data term `−logΦ(z)`, matching `individual_nll_iov`'s `−2·m3_logcdf`). The
+/// censored `h·m` f-coefficient rides the stacked Jacobian (κ columns included), so
+/// the EBE minimises the same censored objective. Proves the gate flip
+/// (then `iov_analytical_supported`, now the adjoint's `model_in_scope`, admits M3)
+/// ships a *correct* censored gradient over
+/// the stacked layout, not just an enabled one.
+#[test]
+fn iov_m3_inner_grad_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + M3");
+    model.bloq_method = crate::types::BloqMethod::M3;
+    // Gate: M3 + IOV is now analytic on both loops (no `iiv_on_ruv`, so not the
+    // FD-only triple). `residual_error_eta` is `None`, so the scope check
+    // (`model_in_scope`; pre-#2093 `iov_analytical_supported`) does not early-return on M3.
+    assert_eq!(model.residual_error_eta, None);
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+    assert!(!analytic_inner_common_bail(&model));
+
+    let mut subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![0.0; 6],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        // The last two rows (occasion 2 tail) are M3 left-censored; the `−logΦ`
+        // term differentiates them.
+        cens: vec![0, 0, 0, 0, 1, 1],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    // Synthesize observations from the model at a reference (η, κ), scaled to 0.85·f
+    // — including the censored rows, so the carried LLOQ sits just below the
+    // prediction (z ≈ −0.75, the moderate regime where the A&S `log_normal_cdf` and
+    // the exact φ in `inv_mills` agree to FD precision; a deep-tail LLOQ would expose
+    // only the CDF-approximation floor, not the gradient's correctness).
+    let preds = crate::pk::predict_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &[0.12, -0.08, 0.2],
+        &[vec![0.05], vec![-0.07]],
+    );
+    subject.observations = preds.iter().map(|p| p * 0.85).collect();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV + M3 inner gradient");
+
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    // Richardson-extrapolated central FD: the censored `−logΦ` term has sharp
+    // curvature on the occasion-2 κ axis, so plain central FD is truncation-limited
+    // (~2e-4) there — Richardson removes it and validates the analytic to ~1e-7.
+    for p in 0..n_stacked {
+        let h = 1e-5 * (1.0 + stacked[p].abs());
+        let fd_at = |hh: f64| -> f64 {
+            let mut sp = stacked.clone();
+            sp[p] += hh;
+            let mut sm = stacked.clone();
+            sm[p] -= hh;
+            (nll(&sp) - nll(&sm)) / (2.0 * hh)
+        };
+        let f1 = fd_at(h);
+        let f2 = fd_at(h / 2.0);
+        let fd = (4.0 * f2 - f1) / 3.0;
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
+}
+
+/// Right-censored (above-ULOQ, `CENS = -1`) regression for the analytic IOV+M3
+/// inner gradient. The objective `individual_nll_iov` scores these rows with the
+/// **upper** tail (`m3_logcdf`, `z = (f − ULOQ)/√v`); the analytic gradient must use
+/// the same tail. Before the signed `m3_censored_kernel` (review of #591) the kernel
+/// always took the lower tail, so this gradient was wrong-signed for `CENS = -1` and
+/// `find_ebe_iov` pushed the EBE the wrong way. Same model/fixture as
+/// `iov_m3_inner_grad_matches_fd` with the occasion-2 tail flipped to `CENS = -1`.
+#[test]
+fn iov_m3_right_censored_inner_grad_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + M3");
+    model.bloq_method = crate::types::BloqMethod::M3;
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
+
+    let mut subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![0.0; 6],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
+        cens: vec![0, 0, 0, 0, -1, -1],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    // Carry ULOQ at 0.85·f for the censored rows, so z = (f − ULOQ)/√v ≈ +0.15·f/√v
+    // sits in the moderate upper-tail regime (Φ(z) well away from 0/1), where the
+    // A&S `log_normal_cdf` and the exact φ in `inv_mills` agree to FD precision.
+    let preds = crate::pk::predict_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &[0.12, -0.08, 0.2],
+        &[vec![0.05], vec![-0.07]],
+    );
+    subject.observations = preds.iter().map(|p| p * 0.85).collect();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let n_stacked = n_eta + k * n_kappa;
+    let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+    let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
+    assert_eq!(stacked.len(), n_stacked);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &stacked,
+        &params.omega,
+        omega_iov,
+        &params.sigma.values,
+        None,
+    )
+    .expect("analytic IOV + M3 inner gradient (right-censored)");
+
+    let nll = |s: &[f64]| -> f64 {
+        let eta_t = &s[..n_eta];
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &params.theta,
+            eta_t,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+        )
+    };
+    for p in 0..n_stacked {
+        let h = 1e-5 * (1.0 + stacked[p].abs());
+        let fd_at = |hh: f64| -> f64 {
+            let mut sp = stacked.clone();
+            sp[p] += hh;
+            let mut sm = stacked.clone();
+            sm[p] -= hh;
+            (nll(&sp) - nll(&sm)) / (2.0 * hh)
+        };
+        let f1 = fd_at(h);
+        let f2 = fd_at(h / 2.0);
+        let fd = (4.0 * f2 - f1) / 3.0;
+        approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
+}
+
+/// #2065: the one-level IOV models of the unlabelled-dose tests, one per engine, each in a
+/// static and a per-event spelling. `(1 + 0·TIME)` is the IEEE identity on `CL`, so the
+/// two spellings predict alike, but reading `TIME` sends each walk down its per-record
+/// seeding (`iov_walk_per_event`, the adjoint's `per_record`) instead of the shared
+/// per-group one, and both branches of each walk carry the new κ = 0 arm.
+fn unlabelled_dose_models() -> Vec<(&'static str, CompiledModel)> {
+    let header = "[parameters]\n  theta TVCL(5.0,0.01,100.0)\n  theta TVV(50.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n";
+    let tail = "[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n";
+    let closed = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n";
+    let ode = "[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n";
+    let cl = "  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n";
+    let cl_time = "  CL = TVCL * exp(ETA_CL + KAPPA_CL) * (1 + 0 * TIME)\n  V = TVV\n";
+    let mut out = Vec::new();
+    for (label, structural, params) in [
+        ("closed form", closed, cl),
+        ("closed form, per event", closed, cl_time),
+        ("ode", ode, cl),
+        ("ode, per event", ode, cl_time),
+    ] {
+        let m = crate::parser::model_parser::parse_model_string(&format!(
+            "{header}{params}{structural}{tail}"
+        ))
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(m.is_ode_based(), label.starts_with("ode"), "{label}");
+        assert_eq!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&m),
+            label.ends_with("per event"),
+            "{label}"
+        );
+        out.push((label, m));
+    }
+    out
+}
+
+/// #2065: three doses, 12 h apart, the third with no occasion label (`dose_occasions`
+/// shorter than `doses`, reachable only from a `Subject` built in memory). It lands at
+/// t = 24 on the residual of the first two, and occasion 0 has no κ group, so production
+/// evaluates it under κ = 0 while the observations after it read occasion 2's κ.
+fn unlabelled_dose_subject(model: &CompiledModel) -> Subject {
+    let mut s = make_iov_subject();
+    s.doses = [0.0, 12.0, 24.0]
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.obs_times = vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 34.0];
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 2, 2, 2];
+    s.obs_cmts = vec![1; 9];
+    s.cens = vec![0; 9];
+    s.dose_occasions = vec![1, 2];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1],
+        &[vec![0.15], vec![-0.2]],
+    );
+    s.observations = preds.iter().map(|p| p * 0.9).collect();
+    s
+}
+
+/// #2065: a dose with no occasion label runs its IOV EBE search on the analytic gradient
+/// on both engines, read off `agrad` itself (`IOV_AGRAD_ROUTE`). Before the fix the ODE
+/// walk's `seed_iov_events` declined such a dose (`dose_occasions.get(d)?`) and every
+/// step fell back to FD — 37 of 37 on this fixture's one-dose ancestor — while the fit
+/// still reported the analytic route.
+///
+/// The fixture is live on the field: labelling the third dose `2` (the neighbour's κ
+/// instead of κ = 0) moves every prediction after it, asserted first, so a walk that
+/// handed the dose any group's κ would be differentiating a different prediction.
+#[test]
+fn an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_on_both_engines() {
+    let stage = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    for (label, m) in unlabelled_dose_models() {
+        let s = unlabelled_dose_subject(&m);
+        let theta = &m.default_params.theta;
+        let kappas = [vec![0.15], vec![-0.2]];
+        let unlabelled = crate::pk::predict_iov(&m, &s, theta, &[0.1], &kappas);
+        let mut labelled = s.clone();
+        labelled.dose_occasions = vec![1, 2, 2];
+        let neighbour = crate::pk::predict_iov(&m, &labelled, theta, &[0.1], &kappas);
+        for j in 0..s.obs_times.len() {
+            let moved = (unlabelled[j] - neighbour[j]).abs() > 1e-3 * neighbour[j];
+            assert_eq!(
+                moved,
+                s.obs_times[j] > 24.0,
+                "{label}: obs {j} at t = {}",
+                s.obs_times[j]
+            );
+        }
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let ebe = find_ebe_for_stage(&m, &s, &m.default_params, 200, 1e-8, None, None, 0, &stage);
+        let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+        // `is_finite()` alone passes the `1e20` refusal sentinel.
+        assert!(
+            ebe.nll.is_finite() && ebe.nll < 1e19,
+            "{label}: EBE objective {}",
+            ebe.nll
+        );
+        assert!(
+            analytic >= 3 && fd == 0,
+            "{label}: {analytic} analytic / {fd} FD steps on the unlabelled-dose subject"
+        );
+    }
+}
+
+/// #2065: the inner walks' `∂f/∂[η, κ₁, κ₂]` on the unlabelled-dose subject match central
+/// FD of production `predict_iov`, the function the objective scores, on both engines and
+/// both seeding branches. The unlabelled dose is κ = 0 in production; a walk that seeded it
+/// under a group's κ instead (the neighbour's, say) would put a non-zero entry in that
+/// κ's column for the observations after t = 24 and differ from FD there. The walk is
+/// the adjoint's `exact_obs_grads_in`, which the inner gradient
+/// (`analytic_eta_nll_gradient_iov_frozen`) reads.
+#[test]
+fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engines() {
+    // Measured worst |walk − FD| / (1 + |FD|): 3.0e-10 closed form, 1.5e-10 ODE (h = 1e-6
+    // central differences, macOS arm64); the bound keeps ~300× headroom. Seeding the
+    // dose under occasion 2's κ instead — mutated on each walk's new arm, both branches —
+    // is caught first by the value check: obs 6 reads 2.3626 against `predict_iov`'s 2.3354.
+    const TOL: f64 = 1e-7;
+    for (label, m) in unlabelled_dose_models() {
+        let s = unlabelled_dose_subject(&m);
+        let theta = &m.default_params.theta;
+        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s)
+            .unwrap_or_else(|| panic!("{label}: no layout"));
+        assert_eq!(
+            layout.n_groups(),
+            2,
+            "{label}: occasions 1 and 2, no group for 0"
+        );
+        let stacked = [0.1, 0.15, -0.2];
+        let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+            &m,
+            &s,
+            Some(&layout),
+            theta,
+            &stacked,
+        )
+        .unwrap_or_else(|| panic!("{label}: the walk declined the unlabelled dose"));
+        let pred =
+            |x: &[f64]| crate::pk::predict_iov(&m, &s, theta, &x[..1], &[vec![x[1]], vec![x[2]]]);
+        let f0 = pred(&stacked);
+        let mut worst = 0.0f64;
+        for (j, row) in rows.iter().enumerate() {
+            assert!(row.f.is_finite(), "{label}: obs {j} value");
+            assert!(
+                (row.f - f0[j]).abs() <= 1e-12 * f0[j].abs(),
+                "{label}: obs {j} walk value {} vs predict_iov {}",
+                row.f,
+                f0[j]
+            );
+        }
+        for p in 0..stacked.len() {
+            let h = 1e-6;
+            let (mut xp, mut xm) = (stacked, stacked);
+            xp[p] += h;
+            xm[p] -= h;
+            let (fp, fm) = (pred(&xp), pred(&xm));
+            for (j, row) in rows.iter().enumerate() {
+                let fd = (fp[j] - fm[j]) / (2.0 * h);
+                let err = (row.df_deta[p] - fd).abs() / (1.0 + fd.abs());
+                assert!(err.is_finite(), "{label}: obs {j} axis {p}");
+                worst = worst.max(err);
+                assert!(
+                    err < TOL,
+                    "{label}: ∂f[{j}]/∂x[{p}] walk {} vs FD of predict_iov {fd} ({err:.3e})",
+                    row.df_deta[p]
+                );
+            }
+        }
+        assert!(worst > 0.0, "{label}: no FD comparison ran");
     }
 }

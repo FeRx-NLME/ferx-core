@@ -66,10 +66,12 @@ use nalgebra::{DMatrix, DVector};
 /// of their own warm-started mode solves. With both of those in place, every engine with
 /// an inline step — FOCE, FOCEI, Laplace, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP and VI —
 /// is repeated **bit for bit**, in memory and reloaded from a bundle `save_fit` wrote,
-/// which stores the EBEs exactly (#1847). A bundle saved before #1847 stored them to six
-/// decimals: such a reloaded fit runs from the cold solve, as it always did, which repeats
-/// FOCE / FOCEI / `gn_hybrid` exactly and the warm-started engines to finite-difference
-/// noise (about 1e-7 relative on the SEs). Bayes has no inline step to repeat.
+/// which stores the EBEs exactly (#1847). So is a fit with a `profile`d level block,
+/// whose step re-profiles the levels from the reported estimates (#2173). A bundle saved
+/// before #1847 stored them to six decimals: such a reloaded fit runs from the cold
+/// solve, as it always did, which repeats FOCE / FOCEI / `gn_hybrid` exactly and the
+/// warm-started engines to finite-difference noise (about 1e-7 relative on the SEs).
+/// Bayes has no inline step to repeat.
 ///
 /// # Failure semantics
 ///
@@ -201,6 +203,11 @@ fn run_covariance_scoped(
     // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
     crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
         .map_err(|e| e.in_context("run_covariance"))?;
+    // A drug-driven CTMM generator reading a TIME-dependent disposition is scored under a
+    // frozen TIME=0 `[odes]` solve (#1918). `fit()` refuses it; a fit from before that
+    // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
+    #[cfg(feature = "markov")]
+    crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -271,7 +278,7 @@ fn run_covariance_scoped(
         sir_fallback_proposal: _,
         method: covariance_method,
     } = crate::estimation::profile::replay_covariance(
-        model_ref, pop_ref, &params, &eta_hats, options,
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, options,
     )
     .unwrap_or_else(|| {
         run_covariance_step_inner(

@@ -200,7 +200,10 @@ fn fit_subjects_refusal(d: &PopulationDifference) -> EngineError {
 /// The checks after the subject list and the binding, in order: every categorical
 /// covariate value against the model's levels (`E_COV_LEVEL_UNKNOWN`, #1740: the
 /// subject IDs can match while a column was recoded), then, on a fit with a
-/// current fingerprint, the population's content against it (#1685).
+/// current fingerprint, the population's content against it (#1685). On a fit
+/// without one (absent or stale), the population's level index against the model's
+/// level table instead (#1793): nothing else would see a population bound on its own
+/// for other levels, or never or partly bound, and it would be scored silently.
 fn check_levels_and_content(
     fingerprint: Option<&PopulationFingerprint>,
     model: &CompiledModel,
@@ -208,7 +211,14 @@ fn check_levels_and_content(
     source: PopulationSource,
 ) -> Result<(), EngineError> {
     crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
-    match fingerprint.and_then(|fp| fp.first_content_difference(population)) {
+    let Some(fingerprint) = fingerprint else {
+        return crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+            model,
+            population,
+            crate::api::LevelDataEntry::PostHoc,
+        ));
+    };
+    match fingerprint.first_content_difference(population) {
         Some(d) => Err(population_mismatch(&d, model, population, source)),
         None => Ok(()),
     }
@@ -847,6 +857,12 @@ pub struct ScoringSettings {
     pub inner_tol: f64,
     /// `inner_restarts`: the inner multi-start of a cold EBE solve.
     pub inner_restarts: usize,
+    /// `inner_screen`: the Sobol screen of that multi-start (#2013).
+    ///
+    /// Absent from a record written before #2013, which reads `0`: such a fit ran no
+    /// screen, so a post-hoc step re-scores it without one.
+    #[serde(default)]
+    pub inner_screen: usize,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -885,6 +901,7 @@ impl ScoringSettings {
             inner_maxiter: options.inner_maxiter,
             inner_tol: options.inner_tol,
             inner_restarts: options.inner_restarts,
+            inner_screen: options.inner_screen,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -933,6 +950,7 @@ impl ScoringSettings {
             inner_maxiter,
             inner_tol,
             inner_restarts,
+            inner_screen,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -949,6 +967,7 @@ impl ScoringSettings {
             inner_maxiter,
             inner_tol,
             inner_restarts,
+            inner_screen,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -993,6 +1012,7 @@ pub(crate) fn with_scoring_record(
         inner_maxiter,
         inner_tol,
         inner_restarts,
+        inner_screen,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1016,6 +1036,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_maxiter);
     recorded!(inner_tol);
     recorded!(inner_restarts);
+    recorded!(inner_screen);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);

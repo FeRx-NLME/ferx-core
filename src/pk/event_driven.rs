@@ -525,9 +525,9 @@ fn equilibrate_ss_state_event_driven(
     // Clear the warning observation up front (#1289, PR #1392 review): the exact affine fixed
     // point below and the two bail-outs return without reaching
     // `note_ss_nonconvergence_if_capped`, so without this `last_ss_equilibration_warned()` would
-    // report an earlier capped run's `true` as this call's answer. Deterministic on a reused
+    // report an earlier capped run's warning as this call's answer. Deterministic on a reused
     // harness thread, not a race.
-    crate::dosing::record_ss_nonconvergence_warned(false);
+    crate::dosing::record_ss_nonconvergence_warning(None);
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
@@ -1094,15 +1094,12 @@ fn event_driven_predictions_with_schedule_impl(
                 // bolus path's `F·AMT` jump.
             }
             EventKind::Obs => {
-                let v = pk_now.v();
                 // Read from the central-compartment slot — depot for slot 0
-                // on oral models, central for slot 1.
-                let conc = if v > 0.0 {
-                    state[central_slot] / v
-                } else {
-                    0.0
-                };
-                preds[ev.orig_idx] = conc.max(0.0);
+                // on oral models, central for slot 1. A `NaN` is kept (#2039).
+                preds[ev.orig_idx] = crate::sens::propagate::central_concentration_g(
+                    state[central_slot],
+                    pk_now.v(),
+                );
             }
             EventKind::PkOnly => {
                 // EVID=2: $PK ran at this row but state is unchanged;
@@ -2563,6 +2560,106 @@ mod tests {
         p
     }
 
+    /// #2039: a subject whose `CL` or `V` is `NaN` from one record on (a covariate that
+    /// varies within the subject and is unusable on that record) is served `NaN` there
+    /// and after, and its finite value before. The walk used to serve 0 from that record
+    /// on, so the subject scored against a confident zero with a finite objective.
+    /// Both central slots are covered: slot 0 on an IV model, slot 1 on an oral one.
+    ///
+    /// Mutations (run): restore `conc.max(0.0)` as the floor in
+    /// `central_concentration_g` → every row dies (0 served); drop its
+    /// `|| v.val().is_nan()` → the `V` rows die; restore this walk's own inline
+    /// `if v > 0.0 { .. } else { 0.0 }` readout → every row dies.
+    #[test]
+    fn a_nan_clearance_or_volume_from_one_record_on_is_served_as_nan_not_zero() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let bad_from = 2; // TIME 4
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut good = pk_two(5.0, 80.0, 3.0, 40.0);
+                good.values[crate::types::PK_IDX_KA] = 1.2;
+                let mut bad = good;
+                bad.values[idx] = f64::NAN;
+                let pk_dose = vec![good; subj.doses.len()];
+                let pk_obs: Vec<PkParams> = (0..obs_times.len())
+                    .map(|j| if j < bad_from { good } else { bad })
+                    .collect();
+                let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
+                for (j, p) in preds.iter().enumerate() {
+                    if j < bad_from {
+                        assert!(
+                            p.is_finite() && *p > 0.0,
+                            "{model:?} {label}: record {j} precedes the NaN and must be \
+                             finite: {preds:?}"
+                        );
+                    } else {
+                        assert!(
+                            p.is_nan(),
+                            "{model:?} {label} = NaN from record {bad_from} on: record {j} \
+                             must be served NaN, not {p}: {preds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2039: with the parameter `NaN` on every record, the walk and the superposition
+    /// closed form give the same `NaN` (the superposition one since #1399), so whether a
+    /// subject's unusable covariate is reported no longer depends on whether that
+    /// covariate happens to vary over time. No observation sits on a dose time: there no
+    /// time has elapsed, the walk reads the dose itself, and a `NaN` `CL` has not yet
+    /// acted on it.
+    ///
+    /// Mutation (run): restore `conc.max(0.0)` → the walk serves 0, superposition `NaN`.
+    #[test]
+    fn event_driven_and_superposition_agree_on_a_constant_nan_parameter() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 4.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
+                pk.values[crate::types::PK_IDX_KA] = 1.2;
+                pk.values[idx] = f64::NAN;
+                let walk = event_driven_predictions(
+                    model,
+                    &subj,
+                    &vec![pk; subj.doses.len()],
+                    &vec![pk; obs_times.len()],
+                    &[],
+                );
+                let superposition: Vec<f64> = obs_times
+                    .iter()
+                    .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                    .collect();
+                assert!(
+                    superposition.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: premise — superposition serves NaN: {superposition:?}"
+                );
+                assert!(
+                    walk.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: the walk must serve the NaN superposition does, \
+                     not {walk:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn one_cpt_oral_matches_superposition_single_dose() {
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
@@ -3581,11 +3678,6 @@ mod tests {
     /// model validation would reject either parameter set.
     #[test]
     fn ss_equilibration_falls_back_when_no_steady_state_exists() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
         let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let n = crate::dosing::SS_EQUILIBRATION_CYCLES;
         for (label, model, pk) in [
@@ -3606,22 +3698,22 @@ mod tests {
             approx::assert_relative_eq!(state[0], n as f64 * 100.0, max_relative = 1e-12);
         }
 
-        // Per-thread, so it is this walk's own answer (#1289). The sink assertion below cannot
-        // serve that role on its own: every writer emits the same deduplicated message, so
-        // `.any(…)` is satisfied by a concurrently-running test's warning just as well as by
-        // this one's. Keep both — the flag pins *who* warned, the sink pins the message text
-        // that reaches `FitResult.warnings`.
+        // Per-thread, so it is this walk's own answer and its own text (#1289, #2071). Never
+        // read the process-global sink here: a concurrent test's write satisfies a "present"
+        // check just as well as this one's, and a concurrent `api` drain empties it under us.
+        // That the noted text reaches `FitResult.warnings` is pinned end to end by
+        // `tests/ss_absorption_nonmem_anchor.rs`.
         assert!(
             crate::dosing::last_ss_equilibration_warned(),
             "the analytical walk must record a non-convergence warning for its own equilibration"
         );
-        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface a non-convergence warning \
-             from the analytical walk; got: {warnings:?}"
+             from the analytical walk; got: {warning:?}"
         );
     }
 
@@ -3637,11 +3729,6 @@ mod tests {
     /// reach it from another file would be a wider change than the test is worth.
     #[test]
     fn an_exact_event_driven_ss_clears_a_previous_runs_warning_flag() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
         // `CL = 0` ⇒ `ke = 0` ⇒ `M = I`: nothing is ever eliminated, so no periodic steady state
         // exists, the exact solve declines and the capped train warns. (The same fixture
         // `ss_equilibration_falls_back_when_no_steady_state_exists` uses.)
@@ -3662,9 +3749,6 @@ mod tests {
             "the reset at the top of `equilibrate_ss_state_event_driven` is missing: an exact \
              analytical equilibration reports the PREVIOUS capped run's warning as its own"
         );
-
-        // This test fills the sink on purpose; drain it rather than leaving entries behind.
-        let _ = crate::dosing::take_ss_nonconvergence_warnings();
     }
 
     #[test]

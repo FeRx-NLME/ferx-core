@@ -322,8 +322,8 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     let ana = parse_model_string(ANALYTICAL).expect("parse analytical IOV");
     let ode = parse_model_string(ODE).expect("parse ODE IOV");
     assert!(
-        crate::sens::ode_provider::ode_iov_supported(&ode),
-        "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
+        crate::sens::ode_provider::adjoint::model_in_scope(&ode),
+        "ODE twin must be in the adjoint's scope (analytic inner+outer)"
     );
     let pop = make_iov_population();
     // Use the **default** optimizer (`Auto`) — exactly what a real user gets.
@@ -1135,8 +1135,8 @@ fn test_check_model_options_flags_trust_region_iov() {
 }
 
 // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
-// `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
+// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via the adjoint kernel's
+// `block_sigma` loadings variance, `focei_kernel::loadings_variance`, #251); the Gauss-Newton (gn / gn_hybrid) methods still
 // use diagonal residual-error derivatives and must be rejected up front.
 #[test]
 fn test_check_model_options_block_sigma_rejects_unsupported_methods() {

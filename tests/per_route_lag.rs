@@ -658,7 +658,17 @@ fn per_route_lag_fit_recovers_lag() {
     // fit moved them 48% and 13% off from these same starting values.
     let mut init = model.default_params.clone();
     init.theta[2] = 0.7; // KA off truth (1.0)
-    init.theta[3] = 3.0; // LAG off truth (2.0)
+
+    // LAG off truth (2.0), and off the observation grid. Not 3.0 (it was until #2093): that start
+    // puts the 3.0 h sample exactly on the route onset, where the prediction is 0 against a
+    // positive DV, on the proportional-variance floor (OFV 4.6e12). The documented one-sided onset
+    // derivative (#1068: an arrival reports the limit from below) is nonzero there, and weighted
+    // by that floor it sends the first steps into the fixture's degenerate basin — noise-free DV =
+    // 0 before the onset under pure proportional error rewards a tiny positive prediction without
+    // bound (−112.54 at lag 1e-10). From 3.01 (and 2.5) the fit recovers the truth to six figures
+    // (OFV −1024.67). Before #2093 the fit from 3.0 happened to miss that basin; nothing about
+    // the start made it safe.
+    init.theta[3] = 3.01;
     let fitted = fit(&model, &pop, &init, &FitOptions::default()).expect("fit converges");
     assert!(fitted.converged, "per-route-lag fit should converge");
     assert!(

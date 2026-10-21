@@ -204,11 +204,14 @@ fn sir_replays_a_caller_row_filter() {
 /// diagonal — flat objective", SIR `Ok` with ESS 298 of 300 — the objective is NaN
 /// everywhere). A bound level model handed a population never bound for it is now
 /// refused with #1647's text: the block and the binder, never the engine-internal
-/// column, a re-read or `[data_selection]`. The straddle: a fit without a
-/// fingerprint (an older `.fitrx`) keeps today's `Ok`.
+/// column, a re-read or `[data_selection]`. Since #1793 a fit without a fingerprint
+/// (an older `.fitrx`) is refused with the same text; the straddle is that fit on its
+/// own population, which runs.
 ///
 /// Mutations — skip the fingerprint check: both cells return `Ok`; drop the level
-/// classifier in `population_refusal`: the text is the covariate-columns row.
+/// classifier in `population_refusal`: the text is the covariate-columns row; drop
+/// the no-fingerprint level check in `check_levels_and_content`: the legacy cells
+/// return `Ok`.
 #[test]
 fn a_population_never_bound_for_the_level_block_hears_the_binder() {
     let c = case(Kind::Level);
@@ -256,12 +259,282 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
             assert!(!err.contains(never), "{entry}: says {never}: {err}");
         }
     }
+    // #1793 T2: a fit without a fingerprint (an older `.fitrx`) is refused with the
+    // same text; before, it ran on a NaN objective (covariance `Ok` with every θ flat,
+    // SIR `Ok` with ESS 298 of 300). The straddle: the same legacy fit on the fit's
+    // own population runs, with finite SEs.
+    let legacy = legacy_fit(&c);
+    let want = run_covariance(&c.fit, Some(model), Some(&never_bound), &c.opts)
+        .map(|_| ())
+        .expect_err("refused")
+        .message()
+        .to_string();
+    for entry in ["run_covariance", "run_sir"] {
+        let r = match entry {
+            "run_covariance" => run_covariance(&legacy, Some(model), Some(&never_bound), &c.opts),
+            _ => run_sir(&legacy, Some(model), Some(&never_bound), &c.opts),
+        };
+        let e = r.map(|_| ()).expect_err("a legacy fit refuses too");
+        assert_eq!(
+            (e.code(), e.context(), e.message()),
+            (
+                Some("E_THETA_LEVELS_DATA_UNBOUND"),
+                Some(entry),
+                want.as_str()
+            ),
+            "{entry}"
+        );
+    }
+    let own = run_covariance(&legacy, Some(model), Some(&c.prep.population), &c.opts)
+        .expect("the straddle: a legacy fit runs on the fit's own population");
+    let se = own
+        .se_theta
+        .as_ref()
+        .expect("SEs on the fit's own population");
+    assert!(se.iter().all(|v| v.is_finite()), "{se:?}");
+}
+
+/// The fit with no fingerprint and no reader settings: an older `.fitrx` (#1793).
+fn legacy_fit(c: &Case) -> FitResult {
     let mut legacy = c.fit.clone();
     legacy.reader_settings = None;
     legacy.population_fingerprint = None;
-    let old = run_covariance(&legacy, Some(model), Some(&never_bound), &c.opts)
-        .expect("a fit without a fingerprint is not verified");
-    assert!(old.se_theta.is_none(), "the old garbage: a flat objective");
+    legacy
+}
+
+/// `pop` with the level index removed from every map of the subjects at `which`.
+fn strip_level_index(pop: &mut Population, which: impl IntoIterator<Item = usize>) {
+    for i in which {
+        let s = &mut pop.subjects[i];
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+            .chain(s.pk_only_covariates.iter_mut())
+            .chain(s.reset_covariates.iter_mut())
+        {
+            m.remove("__level_SHIFT");
+        }
+    }
+}
+
+/// The fit's data with every `STUDY` mapped through `relabel`, bound on its own: it
+/// carries the index, written for its own level table.
+fn bound_on_its_own(c: &Case, relabel: fn(f64) -> f64) -> Population {
+    let text = std::fs::read_to_string(&c.model_path).unwrap();
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
+    let mut pop = crate::api::read_population_as_fitted(&parsed, data(c))
+        .unwrap()
+        .0;
+    for s in &mut pop.subjects {
+        for m in std::iter::once(&mut s.covariates).chain(s.obs_covariates.iter_mut()) {
+            if let Some(v) = m.get_mut("STUDY") {
+                *v = relabel(*v);
+            }
+        }
+    }
+    crate::api::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
+    pop
+}
+
+/// #1795 T1: "never bound" is decided from the subjects, not from `covariate_names`.
+/// The fit's population with the index stripped from every subject is never bound
+/// whether or not it lists the index column, and hears the byte-identical text from
+/// every entry point; before, the listed cell heard "30 of 30 subjects … they were not
+/// bound with the rest". Stripped from one subject, it is partly bound ("1 of 30"). An
+/// empty population is never bound, listed or not (chosen: it cannot be bound).
+///
+/// Mutations — gate `NeverBound` on the name not being listed: the listed cell says
+/// "30 of 30"; delete the `NeverBound` arm: both full cells say "30 of 30";
+/// `unbound.len() == of` → `>= 1`: the partly bound cell says "never bound".
+#[test]
+fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
+    let c = case(Kind::Level);
+    let model = &c.prep.parsed.model;
+    let n = c.prep.population.subjects.len();
+    let never = "`theta SHIFT[...]` is bound, but this population was never bound for it, so \
+                 its records carry no index into the block's levels. Bind the population with \
+                 `bind_from_fit(";
+    let message_of = |pop: &Population| -> Vec<(&str, String)> {
+        let check =
+            crate::api::check_level_index_columns(model, pop, crate::api::LevelDataEntry::Run);
+        assert_eq!(check.len(), 1, "{check:?}");
+        let e = |r: Result<(), EngineError>| r.expect_err("refused").message().to_string();
+        vec![
+            ("check_level_index_columns", check[0].message.clone()),
+            (
+                "predict_diag",
+                e(crate::api::predict_diag(model, pop, &model.default_params).map(|_| ())),
+            ),
+            (
+                "run_covariance",
+                e(run_covariance(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ())),
+            ),
+            (
+                "run_sir",
+                e(run_sir(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ())),
+            ),
+        ]
+    };
+
+    let mut unlisted = c.prep.population.clone();
+    strip_level_index(&mut unlisted, 0..n);
+    unlisted.covariate_names.retain(|n| n != "__level_SHIFT");
+    let mut listed = unlisted.clone();
+    listed.covariate_names.push("__level_SHIFT".to_string());
+    let unlisted = message_of(&unlisted);
+    let listed = message_of(&listed);
+    assert_eq!(listed, unlisted, "listed or not, the same text everywhere");
+    for (entry, m) in &listed {
+        assert!(m.starts_with(never), "{entry}: {m}");
+        assert!(!m.contains(&format!("{n} of {n}")), "{entry}: {m}");
+        assert!(!m.contains("not bound with the rest"), "{entry}: {m}");
+    }
+
+    let mut partly = c.prep.population.clone();
+    strip_level_index(&mut partly, [0]);
+    let id = partly.subjects[0].id.clone();
+    for (entry, m) in message_of(&partly) {
+        assert!(
+            m.starts_with(&format!(
+                "`theta SHIFT[...]` is bound, but 1 of {n} subjects in this population carry \
+                 no index into the block's levels, the first being subject {id}: they were \
+                 not bound with the rest."
+            )),
+            "{entry}: {m}"
+        );
+        assert!(!m.contains("never bound"), "{entry}: {m}");
+    }
+
+    let mut empty = c.prep.population.clone();
+    empty.subjects.clear();
+    for listed in [false, true] {
+        empty.covariate_names.retain(|n| n != "__level_SHIFT");
+        if listed {
+            empty.covariate_names.push("__level_SHIFT".to_string());
+        }
+        let d =
+            crate::api::check_level_index_columns(model, &empty, crate::api::LevelDataEntry::Run);
+        assert_eq!(d.len(), 1, "empty, listed = {listed}: {d:?}");
+        assert!(d[0].message.starts_with(never), "empty, listed = {listed}");
+    }
+}
+
+/// #1793 T3: on a fit without a fingerprint, `model = Some` and a supplied population
+/// are checked against the model's level table, since no fingerprint can see them.
+/// Three cells: partly bound (`Ok` at `ff594e7a`, every SE about 2% off); the fit's
+/// population with `STUDY → 4 − s` *after* binding, whose index still names the old
+/// levels (misindexed; nothing ran a level check on it, by trace); and `STUDY + 100`
+/// bound on its own, whose labels are not the fit's (unseen; `Ok` at `ff594e7a`). `STUDY → 4 − s` bound on its own is not
+/// here: its labels are the fit's and it is indexed for them, so it is different data,
+/// which only a fingerprint can see. The controls, in the same test: the fingerprinted
+/// fit keeps its codes on the same three populations.
+///
+/// Mutations — delete the new call: all three legacy cells `Ok`; check `PostHoc` as
+/// `Run`: the unseen cell's remedy dies; run the check on a fingerprinted fit too:
+/// the controls' `E_POPULATION_MISMATCH` becomes `E_THETA_LEVELS_DATA_MISMATCH`.
+#[test]
+fn a_fit_without_a_fingerprint_checks_the_population_s_level_index() {
+    let c = case(Kind::Level);
+    let model = &c.prep.parsed.model;
+    let legacy = legacy_fit(&c);
+    let n = c.prep.population.subjects.len();
+    let mut partly = c.prep.population.clone();
+    strip_level_index(&mut partly, [0]);
+    // The fit's population with `STUDY → 4 − s` after it was bound: the index still
+    // names the old levels.
+    let mut permuted = c.prep.population.clone();
+    for s in &mut permuted.subjects {
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+            .chain(s.pk_only_covariates.iter_mut())
+            .chain(s.reset_covariates.iter_mut())
+        {
+            if let Some(v) = m.get_mut("STUDY") {
+                *v = 4.0 - *v;
+            }
+        }
+    }
+    let shifted = bound_on_its_own(&c, |s| s + 100.0);
+    let run = |fit: &FitResult, pop: &Population, entry: &str| {
+        let r = match entry {
+            "run_covariance" => run_covariance(fit, Some(model), Some(pop), &c.opts),
+            _ => run_sir(fit, Some(model), Some(pop), &c.opts),
+        };
+        r.map(|_| ()).expect_err(entry)
+    };
+    for entry in ["run_covariance", "run_sir"] {
+        let e = run(&legacy, &partly, entry);
+        assert_eq!(
+            (e.code(), e.context()),
+            (Some("E_THETA_LEVELS_DATA_UNBOUND"), Some(entry)),
+            "{e}"
+        );
+        assert!(
+            e.message().contains(&format!("but 1 of {n} subjects")),
+            "{e}"
+        );
+
+        let e = run(&legacy, &permuted, entry);
+        assert_eq!(
+            (e.code(), e.context()),
+            (Some("E_THETA_LEVELS_DATA_MISMATCH"), Some(entry)),
+            "{e}"
+        );
+        let m = e.message();
+        assert!(
+            m.starts_with(
+                "`theta SHIFT[...]` is bound, but this population's index into its levels was \
+                 written for another level table: subject "
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains("Bind the population with `bind_from_fit("),
+            "{m}"
+        );
+
+        let e = run(&legacy, &shifted, entry);
+        assert_eq!(
+            (e.code(), e.context()),
+            (Some("E_THETA_LEVELS_DATA_MISMATCH"), Some(entry)),
+            "{e}"
+        );
+        let m = e.message();
+        assert!(
+            m.starts_with(
+                "`theta SHIFT[...]` is bound, but this population was bound for other levels: \
+                 it has 3 level(s) the model's block does not: "
+            ),
+            "{m}"
+        );
+        assert!(
+            m.ends_with(
+                "The θ being run has no value for them. So this is not the population the \
+                 fit was given: pass that one."
+            ),
+            "{m}"
+        );
+        assert!(
+            !m.contains("a fit of a model bound on this population"),
+            "{m}"
+        );
+
+        // The fingerprinted controls are unchanged.
+        let codes: Vec<_> = [&partly, &permuted, &shifted]
+            .into_iter()
+            .map(|p| run(&c.fit, p, entry).code().map(str::to_string))
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                Some("E_THETA_LEVELS_DATA_UNBOUND".to_string()),
+                Some("E_POPULATION_MISMATCH".to_string()),
+                Some("E_POPULATION_MISMATCH".to_string()),
+            ],
+            "{entry}: fingerprinted controls"
+        );
+    }
 }
 
 /// #1792 review r2 (a): the "`k` of `n`" cell of `E_THETA_LEVELS_DATA_UNBOUND` reaches
@@ -1412,6 +1685,7 @@ fn off_default_scoring() -> ScoringSettings {
         inner_maxiter: 17,
         inner_tol: 3e-4,
         inner_restarts: 4,
+        inner_screen: 7,
         mu_referencing: false,
         n_agq: 5,
         inner_optimizer: InnerOptimizer::Lbfgs,
@@ -1447,6 +1721,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         inner_maxiter: 18,
         inner_tol: 4e-4,
         inner_restarts: 5,
+        inner_screen: 8,
         mu_referencing: false,
         n_agq: 6,
         inner_optimizer: InnerOptimizer::NelderMead,
@@ -1465,6 +1740,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         inner_maxiter: _,
         inner_tol: _,
         inner_restarts: _,
+        inner_screen: _,
         mu_referencing: _,
         n_agq: _,
         inner_optimizer: _,
@@ -1494,6 +1770,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
     field!(inner_maxiter);
     field!(inner_tol);
     field!(inner_restarts);
+    field!(inner_screen);
     field!(mu_referencing);
     field!(n_agq);
     field!(inner_optimizer);
@@ -1602,6 +1879,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         inner_maxiter: 18,
         inner_tol: 4e-4,
         inner_restarts: 5,
+        inner_screen: 8,
         n_agq: 6,
         inner_optimizer: InnerOptimizer::NelderMead,
         ode_reltol: 2e-7,
@@ -1616,6 +1894,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         inner_maxiter: _,
         inner_tol: _,
         inner_restarts: _,
+        inner_screen: _,
         mu_referencing: _,
         n_agq: _,
         inner_optimizer: _,
@@ -1641,6 +1920,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
     differs!(inner_maxiter);
     differs!(inner_tol);
     differs!(inner_restarts);
+    differs!(inner_screen);
     differs!(mu_referencing);
     differs!(n_agq);
     differs!(inner_optimizer);

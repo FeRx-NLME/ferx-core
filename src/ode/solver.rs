@@ -937,6 +937,10 @@ pub(crate) trait Stepper<T: PkNum> {
     /// Hook fired once the driver commits a step (RK45 carries `k7` into the next `k1`).
     fn on_accept(&mut self);
 
+    /// Hook fired when the driver rejects the last attempt. A taping numeric type uses it to
+    /// drop the rejected attempt's records ([`PkNum::tape_rollback`]); no-op otherwise.
+    fn on_reject(&mut self) {}
+
     /// I-controller exponent `1/(p̂+1)` for this method's embedded pair.
     fn err_exp(&self) -> f64;
 
@@ -1024,6 +1028,8 @@ struct Rk45Stepper<T> {
     u_tmp: Vec<T>,
     u5: Vec<T>,
     have_k1: bool,
+    /// Tape mark taken after `k1` (see [`Stepper::on_reject`]).
+    mark: usize,
 }
 
 impl<T: PkNum> Rk45Stepper<T> {
@@ -1041,6 +1047,7 @@ impl<T: PkNum> Rk45Stepper<T> {
             u_tmp: vec![z; n],
             u5: vec![z; n],
             have_k1: false,
+            mark: 0,
         }
     }
 }
@@ -1074,7 +1081,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
             rhs(u, params, t, &mut self.k1);
             self.have_k1 = true;
         }
-        let h = T::from_f64(dt_eff);
+        self.mark = T::tape_mark();
 
         for i in 0..n {
             self.u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * self.k1[i];
@@ -1082,46 +1089,48 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         rhs(&self.u_tmp, params, t + A2 * dt_eff, &mut self.k2);
 
         for i in 0..n {
-            self.u_tmp[i] =
-                u[i] + h * (T::from_f64(B31) * self.k1[i] + T::from_f64(B32) * self.k2[i]);
+            self.u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[self.k1[i], self.k2[i]]);
         }
         rhs(&self.u_tmp, params, t + A3 * dt_eff, &mut self.k3);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B41) * self.k1[i]
-                    + T::from_f64(B42) * self.k2[i]
-                    + T::from_f64(B43) * self.k3[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B41, B42, B43],
+                &[self.k1[i], self.k2[i], self.k3[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + A4 * dt_eff, &mut self.k4);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B51) * self.k1[i]
-                    + T::from_f64(B52) * self.k2[i]
-                    + T::from_f64(B53) * self.k3[i]
-                    + T::from_f64(B54) * self.k4[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B51, B52, B53, B54],
+                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + A5 * dt_eff, &mut self.k5);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B61) * self.k1[i]
-                    + T::from_f64(B62) * self.k2[i]
-                    + T::from_f64(B63) * self.k3[i]
-                    + T::from_f64(B64) * self.k4[i]
-                    + T::from_f64(B65) * self.k5[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B61, B62, B63, B64, B65],
+                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i], self.k5[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + dt_eff, &mut self.k6);
 
         // 5th-order solution.
         for i in 0..n {
-            self.u5[i] = u[i]
-                + h * (T::from_f64(B71) * self.k1[i]
-                    + T::from_f64(B73) * self.k3[i]
-                    + T::from_f64(B74) * self.k4[i]
-                    + T::from_f64(B75) * self.k5[i]
-                    + T::from_f64(B76) * self.k6[i]);
+            self.u5[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B71, B73, B74, B75, B76],
+                &[self.k1[i], self.k3[i], self.k4[i], self.k5[i], self.k6[i]],
+            );
         }
 
         // Error estimate (5th − 4th). Computed on values only — the step sequence must not
@@ -1153,6 +1162,11 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn on_accept(&mut self) {
         // `k7` (at the accepted end point) becomes the next step's `k1`; it is dead otherwise.
         std::mem::swap(&mut self.k1, &mut self.k7);
+    }
+
+    fn on_reject(&mut self) {
+        // `k1` predates the mark, so it survives; every other stage is recomputed.
+        T::tape_rollback(self.mark);
     }
 
     fn err_exp(&self) -> f64 {
@@ -1301,6 +1315,9 @@ fn integrate_dense_g<T: PkNum>(
         }
 
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
+        if !accepted {
+            stepper.on_reject();
+        }
         // Mirrors `OdeSolverStats::record`'s clamp test, so the abort budget below counts
         // exactly the steps `min_step_clamped_steps` reports.
         if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
@@ -2131,6 +2148,17 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: while set, every certified-linear segment integrated on this thread is
+    /// declined by the matrix exponential and integrated instead, as a real decline would be
+    /// (#2143 review). A model file cannot produce a decline that does not also diverge, and
+    /// the stagnation guard's decrement has to be seen refusing one. Per thread, so a test
+    /// sets it inside a one-worker pool and no other test can see it.
+    pub(crate) static FORCE_LINEAR_DECLINE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 thread_local! {
     /// Per-thread collector for [`SolverStatsScope`]. `None` when no scope is active, which
     /// is every production integration outside the post-fit diagnostic pass.
@@ -2309,10 +2337,16 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // individually. A segment it declines is integrated as `Auto` would integrate it.
     if opts.method == OdeMethod::Linear {
         if (t_span.1 - t_span.0).abs() >= 1e-15 {
-            if let Some(out) =
-                super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
-            {
-                return out;
+            #[cfg(test)]
+            let declined_by_test = FORCE_LINEAR_DECLINE.get();
+            #[cfg(not(test))]
+            let declined_by_test = false;
+            if !declined_by_test {
+                if let Some(out) =
+                    super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
+                {
+                    return out;
+                }
             }
             if let Some(s) = stats.as_deref_mut() {
                 s.linear_declined_segments += 1;

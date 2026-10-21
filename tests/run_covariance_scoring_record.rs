@@ -9,7 +9,7 @@
 //! cleared, since with the record present a default field resolves back to the record.
 //! Mutation: delete any one line of `with_scoring_record` → that field's row dies, naming it.
 //!
-//! Two fields have no row, because no affordable fixture moves the covariance with them; their
+//! Three fields have no row, because no affordable fixture moves the covariance with them; their
 //! resolve lines are pinned at the resolver instead (`fit_inputs::tests::scoring_record_*`):
 //! - `ode_stiff_abort_after` only acts on a segment the stiffness probe flags, and no example
 //!   model is stiff.
@@ -18,6 +18,9 @@
 //!   warfarin (default solver; Nelder–Mead at `inner_maxiter = 2`) and on the EVID=4 washout
 //!   model, whose resets make every coordinate scanned (default solver at `inner_maxiter` 200
 //!   and 1; Nelder–Mead at 2).
+//! - `inner_screen` (#2013) runs inside that same multi-start, before its scan. Measured inert
+//!   on warfarin at `inner_maxiter` 200 and 10, the budget at which the fit's own final
+//!   re-solve screens a subject (`tests/final_ebe_solve.rs`).
 //!
 //! #1806 T1–T3 (the `in_fit_sir_*` and `run_sir_without_a_sir_record_*` tests): the in-fit
 //! SIR scores under the stage record, so the two records are equal and `run_sir` repeats it;
@@ -159,6 +162,9 @@ fn failing_inner() -> FitOptions {
     FitOptions {
         inner_optimizer: InnerOptimizer::NelderMead,
         inner_maxiter: 2,
+        // With the #2013 screen on, `ebe_warm_start` no longer moves the covariance on
+        // this base (measured: the premise fails), so the screen is held off on both sides.
+        inner_screen: 0,
         ..quiet(EstimationMethod::FoceI)
     }
 }
@@ -228,13 +234,20 @@ field_row!(
 /// `inner_tol` to 1e-8, so the record must come from that stage's options, not the
 /// top-level ones (1e-5). Mutations: delete the `inner_tol` resolve line, or record from
 /// `options` instead of `stage_opts` → dies.
+///
+/// On `warfarin_iov`, not `warfarin`. The step re-solves the EBEs only at θ̂, warm from the
+/// fit's own, and stops on the gradient norm. On warfarin the covariances at 1e-5 and 1e-8
+/// differ by a worst relative 1.7e-9–2.4e-9 on Linux aarch64 and 2.5e-11–4.2e-10 on native
+/// macOS arm64 across `outer_maxiter` 2–6 — and by nothing at 3 on macOS, where this
+/// premise failed. On `warfarin_iov` the same pair differs by 2.0e-7–2.2e-6 at every budget
+/// from 2 to 6, on both platforms.
 #[test]
 fn inner_tol() {
     let with = FitOptions {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
         ..quiet(EstimationMethod::FoceI)
     };
-    let f = Fitted::new(&WARFARIN, &with, "inner_tol");
+    let f = Fitted::new(&WARFARIN_IOV, &with, "inner_tol");
     assert_eq!(
         f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
         Some(1e-8),
@@ -259,6 +272,11 @@ fn inner_tol() {
 /// from the record site in `fit_inner` → the record is 1e-8 and the row dies.
 /// `imp_eval_only` needs no row: an IMP readout does not tighten `inner_tol`, so its record
 /// equals the estimating stage's and the defect cannot show there.
+///
+/// On `warfarin_iov` for the reason `inner_tol` gives: on warfarin this premise's gap was
+/// 2.8e-10–3.6e-9 on macOS arm64 and 2.5e-10–3.7e-9 on Linux aarch64 across
+/// `outer_maxiter` 2–6, the band in which `inner_tol`'s went to exactly 0. On `warfarin_iov`
+/// it is 6.4e-8–3.1e-7 on both platforms.
 #[test]
 fn inner_tol_ignores_a_trailing_evaluator() {
     let with = FitOptions {
@@ -267,7 +285,7 @@ fn inner_tol_ignores_a_trailing_evaluator() {
         ..quiet(EstimationMethod::FoceI)
     };
     let what = "inner_tol (trailing evaluator)";
-    let f = Fitted::new(&WARFARIN, &with, what);
+    let f = Fitted::new(&WARFARIN_IOV, &with, what);
     assert_eq!(
         f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
         Some(FitOptions::default().inner_tol),

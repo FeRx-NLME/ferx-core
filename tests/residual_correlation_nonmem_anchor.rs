@@ -102,7 +102,11 @@ fn run(src: &str, maxiter: Option<usize>, covariance: bool) -> FitResult {
 fn residual_correlation_matches_nonmem_at_fixed_parameters() {
     let mut worst = 0.0_f64;
     for &(probe, kind, rho, nm) in PROBES {
-        let ofv = run(&twin(kind, rho), Some(0), false).ofv;
+        let r = run(&twin(kind, rho), Some(0), false);
+        // `weight = WPSE` × `correlation`: the inner search runs on the exact dense-`R`
+        // gradient, and the label says so (#2209).
+        assert_eq!(r.gradient_method_inner, "analytic (Dual2)", "{probe}");
+        let ofv = r.ofv;
         // Finite first: `f64::max` would discard a NaN and keep the rows that worked.
         assert!(ofv.is_finite(), "{probe}: OFV {ofv}");
         let err = (ofv - nm).abs();

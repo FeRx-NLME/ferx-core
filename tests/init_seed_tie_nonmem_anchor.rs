@@ -29,7 +29,7 @@
 //! Tier 2: one `predict()`, one dual walk per subject, one no-op adaptive run per subject,
 //! and two `fit()` evaluations at `maxiter = 0`.
 
-use ferx_core::sens::ode_provider::ode_subject_sensitivities;
+use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::sim::adaptive::{ControllerCtx, DoseAction};
 use ferx_core::{
     fit, parse_full_model_file, predict, read_nonmem_csv, simulate_adaptive,
@@ -140,10 +140,11 @@ fn via_dual(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let labels = via_predict(m, pop);
     let mut values = Vec::new();
     for s in &pop.subjects {
-        let sens = ode_subject_sensitivities(m, s, &m.default_params.theta, &eta)
+        // The adjoint's recorder (#2093): the dual walk the gradients differentiate.
+        let obs = subject_eta_grad(m, s, &m.default_params.theta, &eta)
             .unwrap_or_else(|| panic!("ID {}: routed to FD, the dual walk is not exercised", s.id));
-        assert_eq!(sens.obs.len(), s.obs_times.len(), "ID {}: dual rows", s.id);
-        values.extend(sens.obs.iter().map(|o| (s.id.clone(), o.f)));
+        assert_eq!(obs.len(), s.obs_times.len(), "ID {}: dual rows", s.id);
+        values.extend(obs.iter().map(|o| (s.id.clone(), o.f)));
     }
     assert_eq!(values.len(), labels.len(), "dual vs predict row count");
     values
@@ -309,3 +310,73 @@ fn fit_objective_at_an_evid2_obs_tie_matches_nonmem() {
 // (arm b), so 7× headroom. The smallest defect it guards is arm a's OFV moving by 27.3 (the
 // dual seed alone wrong).
 const OFV_BOUND: f64 = 1e-5;
+
+/// The compartment-state pass behind the sdtab state columns and `[derived]`
+/// (`pk::compute_predictions_with_states`): `central / V` at every observation, η = 0, rows
+/// labelled with `predict()`'s times as on the dual leg. `V` is the model's `TVV`, constant
+/// on every subject, so this is the IPRED the states imply. It is read from the **states**,
+/// not from the function's own `ipred` output — that comes from the prediction engine, which
+/// was already right, and is the half that cannot see #2133.
+fn via_states(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
+    let theta = &m.default_params.theta;
+    let eta = vec![0.0; m.n_eta];
+    let v = theta[m.theta_names.iter().position(|n| n == "TVV").expect("TVV")];
+    let labels = via_predict(m, pop);
+    let mut values = Vec::new();
+    for s in &pop.subjects {
+        let (_, states) = ferx_core::pk::compute_predictions_with_states(m, s, theta, &eta);
+        assert_eq!(states.len(), s.obs_times.len(), "ID {}: state rows", s.id);
+        values.extend(states.iter().map(|u| (s.id.clone(), u[0] / v)));
+    }
+    assert_eq!(values.len(), labels.len(), "states vs predict row count");
+    values
+        .into_iter()
+        .zip(labels)
+        .map(|((id, f), (pid, t, _))| {
+            assert_eq!(id, pid, "states and predict rows are in one subject order");
+            (id, t, f)
+        })
+        .collect()
+}
+
+/// Empty since #2139: ID 6 (a trough listed before a co-timed dose) read post-dose at t = 0 in
+/// the state pass, 30 against NONMEM's 28 — the seed was right, but the dense walk read the
+/// reader's ULP-earlier observation after the dose that its first break also matched. Kept as
+/// a list so the leg's shape matches the adaptive one (#2124).
+const STATES_SKIP: &[&str] = &[];
+
+/// #2133: the state pass (sdtab compartment columns, `[derived]`) seeded `init()` from the
+/// first *observation's* `$PK` and re-seeded every EVID=3/4 reset from that same snapshot,
+/// instead of from the first record (`dosing::first_record`) and the reset's own row. On
+/// `be1e9cbd` it read 28 / 30 / 27.145 / 25.335 at the first observation of IDs 3 / 5 / 7 / 8
+/// (NONMEM 14 / 16 / 14.477 / 12.668), 14 for ID 13's post-reset sample (NONMEM 28) and 11.46
+/// at t = 6 on IDs 12 and 13 (NONMEM 22.92). The obs-first subjects (IDs 1, 2, 9–11) are the
+/// control, right under either rule; the cells' EVID=3 ties (IDs 16, 17) and dose/EVID=2
+/// pairs (IDs 19, 20) put each kind first in both file orders. Same `IPRED_BOUND`: the
+/// realized worst error is the predict leg's, since the states and IPRED share one solve
+/// per record order.
+#[test]
+fn state_pass_seeds_init_from_the_first_record_and_each_reset_matches_nonmem() {
+    let m = model("init_seed_tie_fit").0;
+    let mut pop = data("init_seed_tie");
+    pop.subjects
+        .retain(|s| !STATES_SKIP.contains(&s.id.as_str()));
+    assert_matches(
+        "states, init_seed_tie",
+        &via_states(&m, &pop),
+        &nonmem_ipred("init_seed_tie"),
+        STATES_SKIP,
+        IPRED_BOUND,
+    );
+    let mut cells = data("init_seed_tie_cells");
+    cells
+        .subjects
+        .retain(|s| !CELLS_SKIP.contains(&s.id.as_str()));
+    assert_matches(
+        "states, init_seed_tie_cells",
+        &via_states(&m, &cells),
+        &nonmem_ipred("init_seed_tie_cells"),
+        CELLS_SKIP,
+        IPRED_BOUND,
+    );
+}

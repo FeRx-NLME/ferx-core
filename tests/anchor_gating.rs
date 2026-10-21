@@ -48,8 +48,8 @@ fn tests_dir() -> PathBuf {
 /// single-dose A (10.04 s alone, ~35 s in CI — the binary measured 61.2 s with it and
 /// 26.2 s without; reintroducing #1060 also reddens the control D and 17 `sens::` unit
 /// tests), `ss_lagtime_edge`'s two objective anchors (45 s in CI; the `lag >= II`
-/// dual-walk defect they caught is now pinned per-PR by
-/// `ode_provider_ss_lagtime_at_or_past_the_interval_matches_production`), and
+/// derivative they guard is pinned per-PR by the adjoint's
+/// `ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd`), and
 /// `absorption_iov_carryover`'s objective check (~205 s in CI; every mutation that kills it
 /// in the #1569 sweep also kills its IPRED sibling above or 15 `sens::` unit tests, #1573).
 /// Add a test here only with its measured CI time. A NONMEM anchor that runs real fits

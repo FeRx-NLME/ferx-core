@@ -98,10 +98,17 @@ like `tanh(...)`.
 
 `floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
 is **0** away from a step (the integer boundaries are undefined and ignored). A
-parameter that rounds is therefore flat with respect to the value it
-rounds, which is usually what a dose-band or occasion-index lookup wants — but it
-does mean an `η` that only enters through a rounded quantity gets a zero
-gradient.
+parameter that rounds is therefore flat with respect to the value it rounds,
+which is usually what a dose-band or occasion-index lookup wants — but it does
+mean an `η` that only enters through a rounded quantity gets a zero gradient.
+
+`a mod b` is **not** flat: it is `a − b·q` with the integer quotient `q`
+piecewise constant, so between its jumps the derivative is `1` in `a` and `−q`
+in `b`, and an `η` or `θ` inside a `mod` is estimated like any other. Before
+[#2150](https://github.com/FeRx-NLME/ferx-core/issues/2150) its derivative was
+taken as `0`, so `CL = TVCL * exp((ETA_CL + 5) mod 10 - 5)` — equal to
+`TVCL * exp(ETA_CL)` for `ETA_CL` in `[-5, 5)` — fitted with 100 % shrinkage on
+`ETA_CL` and its ω left at the initial estimate, while reporting convergence.
 
 `a mod b` is the remainder after division and is never negative:
 `(0 - 0.5) mod 24` is `23.5`, and `0.5 mod (0 - 24)` is `0.5`. Fortran's `MOD`,

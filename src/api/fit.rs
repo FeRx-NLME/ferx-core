@@ -149,8 +149,10 @@ pub fn fit_from_files(
     let (data_path, data_path_warning) =
         resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
     let data_path = data_path.as_str();
-    let (mut population, covariate_table) =
-        read_population_with_diag(&parsed.model, &reader_settings, data_path)
+    // One read of the dataset (#2140): the population and `data_hash` are the same
+    // bytes, so a CSV edited while the fit runs is not recorded as the fitted data.
+    let (mut population, covariate_table, data_hash) =
+        crate::api::run::read_population_hashed_diag(&parsed.model, &reader_settings, data_path)
             .map_err(EngineError::from_diagnostic)?;
     // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
@@ -176,13 +178,12 @@ pub fn fit_from_files(
         result.warnings.push(w);
         rebuild_warnings_structured(&mut result);
     }
-    // The model's hash and text are the read that was parsed and fitted (#1752).
-    // The CSV is hashed post-fit; a failure there is non-fatal and just disables
-    // the data integrity check in `run_sir`.
+    // The model's hash and text, and the data's hash, are the reads that were
+    // parsed and fitted (#1752, #2140).
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
     result.model_hash = Some(model_hash);
-    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.data_hash = Some(data_hash);
     result.model_text = Some(model_text);
     result.reader_settings = Some(reader_settings);
     Ok(result)
@@ -439,7 +440,7 @@ pub(crate) fn nn_regularization_unapplied_warning(
     .filter(|(_, l)| *l > 0.0)
     .map(|(k, _)| k)
     .collect();
-    if set.is_empty() || !model_has_covariate_nn(model) {
+    if set.is_empty() || !model.has_covariate_nn() {
         return None;
     }
     let last = *chain.last()?;
@@ -455,16 +456,6 @@ pub(crate) fn nn_regularization_unapplied_warning(
         if set.len() == 1 { "is" } else { "are" },
         last.label(),
     ))
-}
-
-#[cfg(feature = "nn")]
-fn model_has_covariate_nn(model: &CompiledModel) -> bool {
-    !model.covariate_nns.is_empty()
-}
-
-#[cfg(not(feature = "nn"))]
-fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
-    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -768,6 +759,9 @@ fn fit_unstamped(
     // different concentration curves (#1853).
     #[cfg(feature = "survival")]
     first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // The same freeze on a drug-driven CTMM generator's `[odes]` solve (#1918).
+    #[cfg(feature = "markov")]
+    first_error(&check_ctmm_time_dependent_pk_diags(model))?;
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
@@ -1522,6 +1516,12 @@ fn fit_inner(
         n_params_pre,
         options,
         !model.priors.is_empty(),
+        crate::estimation::covariance::analytic_r_expected(
+            model,
+            population,
+            options,
+            init_params.mixture.is_some(),
+        ),
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
@@ -1568,7 +1568,7 @@ fn fit_inner(
     );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
-    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // (but not all) subjects fall outside the analytic (adjoint) scope, surface
     // it through warnings (not just the startup banner) per the AGENTS.md rule.
     if chain.iter().any(|m| {
         matches!(
@@ -2660,12 +2660,9 @@ fn fit_inner(
         // ODE models with resets are handled correctly (ode_dense_solve_states applies
         // the reset as a break-point); this warning is analytical-only.
         //
-        // One nuance for a TV-covariate ODE subject, already inside
-        // W_DERIVED_CMT_TV_ODE's scope above: that state pass is frozen at the
-        // first-observation snapshot throughout, so an `[odes] init(...)` re-seeded at a
-        // reset uses that snapshot rather than the reset row's own, while `ipred` uses the
-        // reset row's (#1133). Self-consistent within the pass and covered by the warning,
-        // but it means the two can differ by the covariate ratio at the reset.
+        // An `[odes] init(...)` re-seeded at a reset reads the reset row's own snapshot
+        // in the state pass, as `ipred` does (#1133, #2133); only the disposition stays
+        // at the first-observation snapshot, which W_DERIVED_CMT_TV_ODE above covers.
         if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \

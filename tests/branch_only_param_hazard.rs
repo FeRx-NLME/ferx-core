@@ -90,13 +90,19 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 }
 
 /// The same equivalence on the gradient path. The fixture above has no η on `H0`
-/// and a constant hazard, so it never asks the analytic provider for `∂H/∂η`
+/// and a constant hazard, so it never asks the analytic gradient for `∂H/∂η`
 /// through the promoted slot. Here `H0` carries `ETA_H` on both arms and the
-/// hazard is drug-driven, so the inner EBE search and the outer FOCEI gradient
-/// both differentiate through it. The two spellings must give the same OFV and
-/// θ bit for bit, and both must report the analytic inner gradient with no
-/// subject on the finite-difference fallback: an FD-routed fit would agree with
-/// its twin while never touching the dual path.
+/// hazard is drug-driven, so the inner EBE search differentiates through it.
+/// The two spellings must give the same OFV and θ bit for bit.
+///
+/// Which engine that search runs on: every subject here carries a TTE record,
+/// and a TTE term has no analytic η-channel yet (#2024 phase 3), so each
+/// subject's whole inner gradient is finite-differenced. This test used to
+/// assert "no subject on the FD fallback" — which held only because the
+/// fallback warning asked the Gaussian recorder alone, which serves the PK rows
+/// and never sees the hazard (#1861). The warning now counts the route that
+/// runs, so both twins must report all 8 subjects on FD; the model-level label
+/// still reads analytic, because the recorder serves the PK rows.
 #[test]
 fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin_on_the_analytic_path() {
     use ferx_core::{fit, FitOptions};
@@ -152,10 +158,10 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin_on_the_analytic_
             "{label}: the inner gradient must be the analytic provider"
         );
         assert!(
-            !r.warnings
+            r.warnings
                 .iter()
-                .any(|w| w.contains("finite-difference inner gradients")),
-            "{label}: no subject may fall back to FD: {:?}",
+                .any(|w| w.contains("8 of 8 subjects use finite-difference inner gradients")),
+            "{label}: every TTE subject runs the FD inner gradient: {:?}",
             r.warnings
         );
     }

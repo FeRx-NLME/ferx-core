@@ -52,7 +52,7 @@ const TWO_PI: f64 = std::f64::consts::TAU;
 /// [`crate::stats::special::normal_inv_cdf`]. Because the clamped u is always in
 /// (0,1), that function's `p<=0`/`p>=1` ±inf guards never fire, so the output is
 /// bit-identical to the prior inline copy for every input this wrapper receives.
-fn inv_normal_cdf(u: f64) -> f64 {
+pub(crate) fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
@@ -110,7 +110,7 @@ fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
 /// That is what lets [`sobol_qmc_draws`] append the Student-t and mixture
 /// coordinates without moving the normals. Each value is mapped to the centre
 /// of its 2⁻³² cell, which keeps it strictly inside (0, 1).
-fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+pub(crate) fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
     use sobol::Sobol;
 
     let seeds = owen_coordinate_seeds(dim, seed);
@@ -2089,21 +2089,6 @@ pub(crate) struct Proposal {
     d: usize,
 }
 
-/// Build a proposal view from the regularised anchor retained for the matching
-/// gradient, avoiding a second Cholesky decomposition of the same matrix.
-pub(crate) fn proposal_from_regularised_anchor(
-    anchor: &crate::estimation::agq_cov_hessian::RegularisedAnchor,
-) -> Proposal {
-    let chol_h = anchor.chol.l();
-    let d = chol_h.nrows();
-    let log_det_inv_scale = 2.0 * (0..d).map(|i| chol_h[(i, i)].ln()).sum::<f64>();
-    Proposal {
-        chol_h,
-        log_det_inv_scale,
-        d,
-    }
-}
-
 impl Proposal {
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
@@ -2689,28 +2674,6 @@ mod tests {
         // Σ = H⁻¹ = diag(0.5, 0.25), so log|Σ⁻¹| ≈ log 8.
         // (λ jitter is ~1e-6·trace/d = 3e-6 — negligible at this precision.)
         assert!((p.log_det_inv_scale - 8.0_f64.ln()).abs() < 1e-4);
-    }
-
-    #[test]
-    fn retained_regularised_anchor_builds_identical_proposal() {
-        let h = DMatrix::from_row_slice(3, 3, &[2.0, 0.1, 0.0, 0.1, 4.0, 0.2, 0.0, 0.2, 3.0]);
-        let omega_inv = DMatrix::identity(3, 3);
-        let rebuilt = build_proposal(&h, &omega_inv, 3).expect("proposal");
-        let anchor = crate::estimation::agq_cov_hessian::regularised_anchor(&h).expect("anchor");
-        let retained = proposal_from_regularised_anchor(&anchor);
-        assert_eq!(
-            rebuilt.log_det_inv_scale.to_bits(),
-            retained.log_det_inv_scale.to_bits()
-        );
-        let z = [0.3, -0.2, 0.7];
-        let mut rebuilt_node = [0.0; 3];
-        let mut retained_node = [0.0; 3];
-        rebuilt.apply_l_sigma(&z, &mut rebuilt_node, std::f64::consts::SQRT_2);
-        retained.apply_l_sigma(&z, &mut retained_node, std::f64::consts::SQRT_2);
-        assert_eq!(
-            rebuilt_node.map(f64::to_bits),
-            retained_node.map(f64::to_bits)
-        );
     }
 
     #[test]

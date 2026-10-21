@@ -59,7 +59,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/api/pool.rs",
-        "with_fit_scope",
+        "with_scope",
         2,
         "runtime: the fit-scoped worker pool could not be built; its ODE-option refusal is coded (#2044)",
     ),
@@ -158,7 +158,7 @@ fn enclosing_fn(lines: &[&str], i: usize) -> String {
 /// `mod NAME {`, through its closing `}` in column 0. Blanked, not removed, so line
 /// numbers keep their meaning. A test module may sit mid-file (`dosing.rs`,
 /// `stats/residual_error.rs`), so the scan carries on after it.
-fn production_lines(text: &str) -> Vec<&str> {
+pub(super) fn production_lines(text: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -186,9 +186,12 @@ fn production_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// `(file, fn) → count` of the uncoded sites in the non-test code under `root/src`.
-fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
-    let mut found = BTreeMap::new();
+/// `(path relative to root, contents)` of every non-test source file under
+/// `root/src`: `*_tests.rs` siblings, `src/**/tests/` and this file are skipped. Pair
+/// it with [`production_lines`] to blank the inline test modules too. Shared with the
+/// error-code registry check (#1051), so the two scans agree on what test code is.
+pub(super) fn production_files(root: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
     let mut stack = vec![root.join("src")];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read a src dir") {
@@ -208,19 +211,29 @@ fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read a source file");
-            let lines = production_lines(&text);
             let rel = path
                 .strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            for (i, line) in lines.iter().enumerate() {
-                let n: usize = PATTERNS.iter().map(|p| line.matches(p).count()).sum();
-                if n > 0 {
-                    *found
-                        .entry((rel.clone(), enclosing_fn(&lines, i)))
-                        .or_insert(0) += n;
-                }
+            files.push((rel, text));
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `(file, fn) → count` of the uncoded sites in the non-test code under `root/src`.
+fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
+    let mut found = BTreeMap::new();
+    for (rel, text) in production_files(root) {
+        let lines = production_lines(&text);
+        for (i, line) in lines.iter().enumerate() {
+            let n: usize = PATTERNS.iter().map(|p| line.matches(p).count()).sum();
+            if n > 0 {
+                *found
+                    .entry((rel.clone(), enclosing_fn(&lines, i)))
+                    .or_insert(0) += n;
             }
         }
     }

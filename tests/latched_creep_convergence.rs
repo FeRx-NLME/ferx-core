@@ -44,8 +44,31 @@ const MODEL_Q_001: &str = r"
 const NONMEM_OFV: f64 = -432.166_830_842_677_9;
 const NONMEM_THETA: [f64; 4] = [4.80976, 15.4816, 2.94425, 19.0347];
 
+/// [`MODEL_Q_001`] as an `[odes]` model solved by `ode_method` (#2001). The system is
+/// linear, so `auto` solves it exactly by matrix exponential (#852) and `rk45` integrates it.
+fn ode_model_q_001(ode_method: &str) -> String {
+    MODEL_Q_001.replace(
+        "  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n",
+        &format!(
+            "  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[fit_options]
+  ode_method = {ode_method}
+"
+        ),
+    )
+}
+
 fn fit_from_q_001(optimizer: Optimizer) -> ferx_core::FitResult {
-    let model = parse_model_string(MODEL_Q_001).expect("model parses");
+    fit_source_from_q_001(MODEL_Q_001, optimizer)
+}
+
+fn fit_source_from_q_001(source: &str, optimizer: Optimizer) -> ferx_core::FitResult {
+    let model = parse_model_string(source).expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -92,4 +115,68 @@ fn a_slow_creep_is_not_latched_as_converged() {
             );
         }
     }
+}
+
+/// The warning a stagnation latch adds when it overrode the decrement veto.
+const VETO_OVERRIDE: &str = "Stagnation guard stopped the outer optimizer although";
+
+/// #2001: the same creep on the model's ODE twin. #1999 withheld the decrement from every
+/// ODE model, so both runs below latched silently: SLSQP on the exact (matrix-exponential)
+/// path at eval 66 on −204.4130, and L-BFGS under rk45 at eval 27 on −204.4227, each
+/// reported converged 227.7 OFV short of NONMEM's optimum with no warning.
+///
+/// Measured on Linux x86_64 at the fix. SLSQP on the exact path now reaches −432.166537,
+/// 2.9e-4 above NONMEM, every θ within 5.4e-4 relative; the bounds are those of the
+/// closed-form test above (34× and 3.7× headroom). L-BFGS under
+/// rk45 is vetoed at eval 27 (predicted gain 14.83, the closed form's at the same point)
+/// but does not escape: on the default-tolerance integrated gradient its line search makes
+/// no progress, and with the guard off NLopt stops at the same point itself
+/// (`XtolReached`, −204.42); at `ode_reltol = 1e-9` it reaches −432.1668. So the guard
+/// stops it after the re-armed window and says so, which is all it can do for a fit the
+/// optimizer has itself abandoned. Silence is the regression this pins.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: fit to convergence (#2001); opt in with --features slow-tests"
+)]
+fn a_slow_creep_on_an_exact_ode_model_reaches_the_optimum() {
+    let exact = fit_source_from_q_001(&ode_model_q_001("auto"), Optimizer::Slsqp);
+    eprintln!(
+        "exact SLSQP: converged {} OFV {:.6} theta {:?}",
+        exact.converged, exact.ofv, exact.theta
+    );
+    assert!(exact.converged, "exact SLSQP must converge");
+    assert!(
+        exact.ofv.is_finite() && (exact.ofv - NONMEM_OFV).abs() < 1e-2,
+        "exact SLSQP: OFV {} vs NONMEM {NONMEM_OFV}",
+        exact.ofv
+    );
+    for (k, (&got, &want)) in exact.theta.iter().zip(&NONMEM_THETA).enumerate() {
+        assert!(
+            got.is_finite() && ((got - want) / want).abs() < 2e-3,
+            "exact SLSQP theta[{k}]: {got} vs NONMEM {want}"
+        );
+    }
+}
+
+/// The rk45 L-BFGS half of [`a_slow_creep_on_an_exact_ode_model_reaches_the_optimum`], its
+/// own test so each side's regression names itself.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: fit to convergence (#2001); opt in with --features slow-tests"
+)]
+fn a_slow_creep_on_an_integrated_ode_model_is_not_latched_silently() {
+    let rk45 = fit_source_from_q_001(&ode_model_q_001("rk45"), Optimizer::NloptLbfgs);
+    eprintln!(
+        "rk45 L-BFGS: converged {} OFV {:.6} warnings {:?}",
+        rk45.converged, rk45.ofv, rk45.warnings
+    );
+    assert!(rk45.ofv.is_finite(), "rk45 L-BFGS: OFV {}", rk45.ofv);
+    let short = rk45.ofv - NONMEM_OFV;
+    let warned = rk45.warnings.iter().any(|w| w.contains(VETO_OVERRIDE));
+    assert!(
+        short < 1e-2 || warned || !rk45.converged,
+        "rk45 L-BFGS stopped {short} short of NONMEM, reported converged, with no warning"
+    );
 }

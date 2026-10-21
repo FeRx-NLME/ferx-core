@@ -323,13 +323,35 @@ pub(crate) fn with_fit_scope<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
+    with_scope(FitScope::of(options), options.threads, f)
+}
+
+/// [`with_fit_scope`] with `options`' ODE solver override replaced by `ode`, every other
+/// member of the scope kept. For the stagnation guard's Newton decrement, which re-solves the
+/// incumbent at a tighter integrator tolerance than the fit's own (#2001); `ode` is the whole
+/// override, not a merge onto the fit's.
+pub(crate) fn with_fit_scope_ode<R: Send>(
+    options: &FitOptions,
+    ode: crate::ode::solver::OdeSolverOverride,
+    f: impl FnOnce() -> R + Send,
+) -> Result<R, crate::diagnostics::EngineError> {
+    let scope = FitScope {
+        ode,
+        ..FitScope::of(options)
+    };
+    with_scope(scope, options.threads, f)
+}
+
+fn with_scope<R: Send>(
+    scope: FitScope,
+    threads: Option<usize>,
+    f: impl FnOnce() -> R + Send,
+) -> Result<R, crate::diagnostics::EngineError> {
     use crate::diagnostics::EngineError;
-    let scope = FitScope::of(options);
     scope
         .validate()
         .map_err(super::entry_refusals::ode_solver_options)?;
-    let requested_threads = options
-        .threads
+    let requested_threads = threads
         .filter(|&n| n > 0)
         .unwrap_or_else(effective_default_threads);
     // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
@@ -351,7 +373,7 @@ pub(crate) fn with_fit_scope<R: Send>(
     if carried && rayon::current_num_threads() == requested_threads {
         return Ok(f());
     }
-    match options.threads.filter(|&n| n > 0) {
+    match threads.filter(|&n| n > 0) {
         Some(n) => Ok(fit_scope_pool(scope, n)
             .map_err(EngineError::uncoded)?
             .install(f)),

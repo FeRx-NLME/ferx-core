@@ -247,6 +247,10 @@ pub(crate) enum LevelDataEntry {
     /// `fit()` (and `ferx check`, which binds before it gets here): it estimates θ, so
     /// the model is laid out afresh on the population's own levels.
     Fit,
+    /// `run_covariance` / `run_sir` on a fit with no current fingerprint to compare the
+    /// population against (#1793): they run the fit's θ, so the binder is `Run`'s, but
+    /// a population with levels the fit lacks is not the one it was given.
+    PostHoc,
 }
 
 /// A **bound** `theta NAME[...]` block handed a population that was never bound for
@@ -260,7 +264,7 @@ pub(crate) enum LevelDataEntry {
 ///
 /// | Entry | Binder named |
 /// |---|---|
-/// | `Run` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
+/// | `Run`, `PostHoc` | `bind_from_fit` with the bindings the θ was laid out on (a fit's `data_bindings`, or the model's own) |
 /// | `Fit` | `bind_theta_levels` on a fresh parse |
 ///
 /// A population that carries the column is checked record by record against the
@@ -274,7 +278,7 @@ pub(crate) enum LevelDataEntry {
 /// | no subject carries the index | `E_THETA_LEVELS_DATA_UNBOUND`, "never bound" | the binder above |
 /// | some subjects carry none | `E_THETA_LEVELS_DATA_UNBOUND`, "`k` of `n` subjects" | the binder above |
 /// | an index without its level column | `E_THETA_LEVELS_DATA_MISMATCH` | none: the level is unknown |
-/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder |
+/// | levels the model's table lacks | `E_THETA_LEVELS_DATA_MISMATCH`, every one listed | `Run`: a θ from a fit of a model bound on this population; `Fit`: the `Fit` binder; `PostHoc`: the population the fit was given |
 /// | indexed for another table | `E_THETA_LEVELS_DATA_MISMATCH`, the first record | the binder above |
 ///
 /// A population is refused, never re-indexed: the check reads `&Population`, and
@@ -286,7 +290,7 @@ pub(crate) fn check_level_index_columns(
     entry: LevelDataEntry,
 ) -> Vec<Diagnostic> {
     let binder = match entry {
-        LevelDataEntry::Run => {
+        LevelDataEntry::Run | LevelDataEntry::PostHoc => {
             "Bind the population with `bind_from_fit(&mut parsed, &model_text, &mut \
              population, &fit.data_bindings)`, passing the bindings the θ you run was \
              laid out on: the fit's `data_bindings`, or, for the model's own θ, a clone \
@@ -302,25 +306,19 @@ pub(crate) fn check_level_index_columns(
     let blocks = model.theta_blocks();
     bound_level_columns(model)
         .into_iter()
-        .filter_map(|(name, column)| {
-            // "Never bound" only when no subject carries the index: a population some of
-            // whose subjects do is partly bound, and is told so below (#1762).
-            let carried = population.covariate_names.contains(&column)
-                || population
-                    .subjects
-                    .iter()
-                    .any(|s| s.covariates.contains_key(&column));
-            if !carried {
-                return Some(Diagnostic::error(
+        .filter_map(|(name, _)| {
+            let decl = blocks.level_blocks().iter().find(|d| d.name() == name)?;
+            let (code, message) = match level_index_finding(decl, population)? {
+                // "Never bound" only when no subject carries the index, whatever
+                // `covariate_names` lists (#1795): a population some of whose subjects
+                // do is partly bound, and is told so below (#1762).
+                LevelIndexFinding::NeverBound => (
                     "E_THETA_LEVELS_DATA_UNBOUND",
                     format!(
                         "`theta {name}[...]` is bound, but this population was never bound for \
                          it, so its records carry no index into the block's levels. {binder}"
                     ),
-                ));
-            }
-            let decl = blocks.level_blocks().iter().find(|d| d.name() == name)?;
-            let (code, message) = match level_index_finding(decl, population)? {
+                ),
                 LevelIndexFinding::SomeSubjectsUnbound {
                     unbound,
                     of,
@@ -347,6 +345,10 @@ pub(crate) fn check_level_index_columns(
                             "A θ for them comes from a fit of a model bound on this population."
                         }
                         LevelDataEntry::Fit => binder,
+                        // #1793: the fit's own population has only the fit's levels.
+                        LevelDataEntry::PostHoc => {
+                            "So this is not the population the fit was given: pass that one."
+                        }
                     };
                     (
                         "E_THETA_LEVELS_DATA_MISMATCH",
@@ -1827,6 +1829,7 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(check_dose_compartments(model, population));
     diags.extend(check_dose_attr_finiteness(model, population));
+    diags.extend(check_negative_lagtime(model, population, &params.theta));
     diags.extend(validate_output_columns(model, population));
     // `fit()` refuses both of these inline, ahead of this list, so they change no first
     // error of `fit()`'s; listed here so `ferx check` reports what `fit()` refuses (#1774).
@@ -3450,6 +3453,134 @@ pub(crate) fn check_dose_attr_finiteness(
     Vec::new()
 }
 
+/// The first dose record whose applied lag is negative at typical values (η = κ = 0),
+/// at `theta`. One predicate behind two severities: `E_NEGATIVE_LAGTIME` on `fit()` and
+/// `ferx check` ([`check_negative_lagtime`]), `W_NEGATIVE_LAGTIME` on `predict()` /
+/// `simulate()` ([`negative_lagtime_warning`]), which run no data errors at all.
+///
+/// Two lags reach a dose, and either may be the negative one: the compartment lag
+/// (`lagtime` / `ALAG{n}`, read through the dose-attribute map exactly as the engine reads
+/// it) and, on an `[odes]` model, the per-route `fn(..., lag=L)` of each forcing feeding
+/// the dose's compartment. Read per dose record, from that record's own snapshot — where
+/// the engine reads both (#1235, #1569) — so a covariate or `TIME`-driven lag that goes
+/// negative only at a later dose is caught. `-0.0` is not negative; a `NaN` is
+/// `E_DOSE_ATTR_NONFINITE`'s (or, for a route lag, `E_ABSORPTION_DOMAIN`'s), not this one's.
+struct NegativeLag {
+    subject: String,
+    record: String,
+    what: String,
+    cmt: usize,
+    value: f64,
+}
+
+fn first_negative_lag(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<NegativeLag> {
+    let map = model.active_dose_attr_map();
+    let route_lagged: Vec<&crate::pk::absorption::InputRateForcing> = model
+        .ode_spec
+        .as_ref()
+        .map(|ode| {
+            ode.input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Cost gate: a model with neither lag kind reads the `PkParams` default `0.0`, so no
+    // snapshot is built for it.
+    if !model.has_lagtime() && route_lagged.is_empty() {
+        return None;
+    }
+    let mut scratch = TypicalSnapshotScratch::default();
+    for subject in &population.subjects {
+        for snap in typical_dose_snapshots(model, subject, theta, &mut scratch) {
+            let cmt = subject.doses[snap.index].cmt_1based();
+            let cmt_lag = map.lagtime(cmt, snap.values);
+            let found = if cmt_lag < 0.0 {
+                Some(("lag time (`lagtime` / `ALAG`)".to_string(), cmt_lag))
+            } else {
+                route_lagged
+                    .iter()
+                    .filter(|f| f.cmt + 1 == cmt)
+                    .map(|f| (f, f.route_lag(snap.values)))
+                    .find(|(_, lag)| *lag < 0.0)
+                    .map(|(f, lag)| {
+                        (
+                            format!("per-route absorption lag (a `{:?}` route)", f.kind),
+                            lag,
+                        )
+                    })
+            };
+            if let Some((what, value)) = found {
+                return Some(NegativeLag {
+                    subject: subject.id.clone(),
+                    record: snap.record_label(),
+                    what,
+                    cmt,
+                    value,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// A dose lag must not be negative at the initial estimates (#1189). NONMEM refuses the
+/// run (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`), and
+/// `fit()` / `ferx check` refuse it the same way rather than starting the dose's input
+/// before its record time. Evaluated at `theta` — the fit's own initial estimates, which a
+/// caller may have replaced — per subject and per dose record ([`first_negative_lag`]).
+/// Reported once: a single fatal error already halts the fit.
+///
+/// Typical values only, like every fit-init dose-attribute check: a lag driven negative
+/// mid-fit by an η or θ excursion is still integrated from the earlier onset, identically
+/// on every engine (pinned by `negative_route_lag_engines_agree_from_earlier_onset`).
+pub(crate) fn check_negative_lagtime(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Vec<Diagnostic> {
+    let Some(neg) = first_negative_lag(model, population, theta) else {
+        return Vec::new();
+    };
+    vec![Diagnostic::error(
+        "E_NEGATIVE_LAGTIME",
+        format!(
+            "Dose {} for compartment {} is {:.4} (< 0) at the initial typical-value point \
+             (subject {}, {}). A negative lag would start the dose's input before its \
+             record time; NONMEM rejects it (PK PARAMETER FOR ABSORPTION LAG IS \
+             NEGATIVE) and so does ferx. Use a positive-link parameterisation \
+             (e.g. `ALAG1 = TVLAG * exp(ETA_LAG)`) or a lower bound of 0 on the lag's theta.",
+            neg.what, neg.cmt, neg.value, neg.subject, neg.record,
+        ),
+    )
+    .with_block("individual_parameters")]
+}
+
+/// The `predict()` / `simulate()` counterpart of [`check_negative_lagtime`]: those entry
+/// points run no data errors, so a negative lag is served — the dose's input starts at the
+/// earlier onset — and reported as `W_NEGATIVE_LAGTIME` instead.
+pub(crate) fn negative_lagtime_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<Diagnostic> {
+    let neg = first_negative_lag(model, population, theta)?;
+    Some(Diagnostic::warning(
+        "W_NEGATIVE_LAGTIME",
+        format!(
+            "Dose {} for compartment {} is {:.4} (< 0) at the typical-value point \
+             (subject {}, {}). It is applied as written, so the dose's input starts before \
+             its record time. fit() and `ferx check` reject this as E_NEGATIVE_LAGTIME, as \
+             NONMEM does.",
+            neg.what, neg.cmt, neg.value, neg.subject, neg.record,
+        ),
+    ))
+}
+
 /// A `[covariate_model]` relation stated with a symbolic statistic (#1111) is
 /// only buildable once a dataset has been summarised. Reaching a fit with one
 /// still unresolved means the covariate effect is simply *absent* from the
@@ -4323,6 +4454,116 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
     None
 }
 
+/// Reject a model whose **time-inhomogeneous (drug-driven) CTMM generator** reads a
+/// `TIME`-dependent disposition — the #1853 freeze on the `[markov_model]` endpoint (#1918).
+///
+/// `markov::endpoint`'s inhomogeneous scorer solves the subject's `[odes]` system under one
+/// `$PK` snapshot, `(model.pk_param_fn)(…, 0.0)`, and samples the states the transition
+/// intensities read from that solve. Every dose-record quantity is read at its own dose
+/// record (#1575), exactly as on the hazard pass, so what stays frozen is again the
+/// disposition the RHS integrates and `init()`. The intensity expressions themselves cannot
+/// read `TIME`, directly or through an `[individual_parameters]` value — the parser refuses
+/// that — so the RHS/`init()` route is the only one left open, and the one this closes.
+///
+/// Measured on a 1-cpt IV model, `CL = TVCL·(1 + KT·TIME)`, `V = 10`, a 100 mg bolus and
+/// both intensities scaled by `central/V` (so `P(Δt) = expm(Q₀·∫C)` in closed form): the
+/// CTMM `−log L` is **bit-identical** at `KT = 0` and `KT = 0.05` (3.3747459385), matching
+/// the frozen-`CL` closed form (3.3747459877) to the scorer's sub-grid error, while the
+/// per-record convention the Gaussian walk uses gives 3.3778309; `central(20)` is 13.53
+/// under the freeze against 3.68 per record. The `TIME` coefficient has no influence on the
+/// transition term at all.
+///
+/// The predicate is [`check_survival_time_dependent_pk`]'s, per parameter and per endpoint:
+/// the dependency slice is the union of
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every
+/// state the generator reads, so a `TIME`-dependent parameter that cannot reach any of them
+/// (a state the generator never sees, a dose-record quantity) is not refused. A
+/// time-**homogeneous** CTMM reads no ODE state and returns `None` — it never solves the
+/// `[odes]` system. Fails closed, as the hazard check does, on a model whose compiled
+/// programs were stripped.
+#[cfg(feature = "markov")]
+pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<String> {
+    use crate::types::EndpointLikelihood;
+    // Every inhomogeneous CTMM endpoint with the ODE states its generator reads, in CMT
+    // order so the message is deterministic.
+    let mut ctmms: Vec<(usize, Vec<usize>)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, e)| match e {
+            EndpointLikelihood::Ctmm {
+                generator_states, ..
+            } if !generator_states.is_empty() => {
+                Some((*cmt, generator_states.iter().map(|&(_, idx)| idx).collect()))
+            }
+            _ => None,
+        })
+        .collect();
+    ctmms.sort_unstable();
+    let first_cmt = ctmms.first().map(|(cmt, _)| *cmt)?;
+    let unanalysable = |what: &str, how: &str| -> Option<String> {
+        Some(format!(
+            "[markov_model] on CMT={first_cmt}: this model carries a drug-driven \
+             (time-inhomogeneous) CTMM generator, whose [odes] solve runs under the individual \
+             parameters frozen at their TIME=0 values, but it has no {what}, so whether that \
+             freeze applies cannot be determined (#1918). Every model parsed from a `.ferx` \
+             file carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
+             through `parse_model_string` / `parse_model_file`{how}."
+        ))
+    };
+    let Some(rhs) = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()) else {
+        return unanalysable(
+            "compiled `[odes]` program (`OdeSpec::rhs_program`)",
+            ", or make the transition intensities state-free",
+        );
+    };
+    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+        return unanalysable(
+            "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
+            " rather than replacing that field with `IndivParamPartials::empty()`",
+        );
+    };
+    let reads_time = program.params_reading_time();
+    if !reads_time.iter().any(|&t| t) {
+        return None;
+    }
+    for (cmt, states) in ctmms {
+        // What the generator's states depend on: the union of each one's backward slice.
+        let mut slice: Vec<bool> = Vec::new();
+        for s in states {
+            let one = rhs.chz_dependency_slice(s);
+            if slice.len() < one.len() {
+                slice.resize(one.len(), false);
+            }
+            for (acc, x) in slice.iter_mut().zip(one) {
+                *acc |= x;
+            }
+        }
+        for (i, name) in model.indiv_param_names.iter().enumerate() {
+            if !reads_time.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
+                continue;
+            }
+            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
+            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
+            let site = match (in_rhs, in_init) {
+                (true, true) => "the [odes] RHS and an init(...) seed read",
+                (true, false) => "the [odes] RHS reads",
+                (false, true) => "an [odes] init(...) seed reads",
+                (false, false) => continue,
+            };
+            return Some(format!(
+                "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) CTMM \
+                 generator reads model states solved with the individual parameters frozen at \
+                 their TIME=0 values, but `{name}` reads the `TIME` built-in and {site} it. A \
+                 TIME-dependent disposition on a state-driven transition intensity is not yet \
+                 supported (#1918): the Gaussian predictions evaluate `[individual_parameters]` \
+                 at every record while the CTMM pass keeps the TIME=0 value. Hold `{name}` \
+                 constant in TIME for now."
+            ));
+        }
+    }
+    None
+}
+
 /// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`
 /// report: `E_ENDPOINT_TIME_DEPENDENT_PK`, block `event_model` (#1774). One code for every
 /// text, the two fail-closed arms included: each says the hazard pass would read a
@@ -4333,6 +4574,23 @@ pub(crate) fn check_survival_time_dependent_pk_diags(model: &CompiledModel) -> V
     check_survival_time_dependent_pk(model)
         .map(|m| {
             vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("event_model")]
+        })
+        .unwrap_or_default()
+}
+
+/// [`check_ctmm_time_dependent_pk`] as a diagnostic: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
+/// `markov_model` (#1918). Kept apart from [`check_survival_time_dependent_pk_diags`] because
+/// the two freezes are read by different entry points: the CTMM likelihood is scored by
+/// `fit()` and re-scored by the post-fit `run_covariance()` / `run_sir()`, so those three and
+/// `ferx check` call this. `predict()` drops CTMM rows when
+/// continuous observations exist and its per-record walk never runs the frozen solve, and
+/// `simulate()` refuses every CTMM with `E_CTMM_UNSUPPORTED` — a refusal this must not
+/// pre-empt.
+#[cfg(feature = "markov")]
+pub(crate) fn check_ctmm_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnostic> {
+    check_ctmm_time_dependent_pk(model)
+        .map(|m| {
+            vec![Diagnostic::error("E_ENDPOINT_TIME_DEPENDENT_PK", m).with_block("markov_model")]
         })
         .unwrap_or_default()
 }
@@ -5373,8 +5631,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
-    // The GN anchor's `H̃` comes from the sensitivity provider (`score_core`), so the
-    // refinement is available only where that provider reaches — the same analytic scope
+    // The GN anchor's `H̃` comes from the adjoint (`exact_htilde`), so the
+    // refinement is available only where the adjoint reaches — the same analytic scope
     // FOCEI's own outer gradient needs. Outside it (e.g. an ODE model without sensitivities,
     // or a pure-TTE endpoint), reject up front rather than fail deep in the objective.
     if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI))
@@ -7895,7 +8153,9 @@ pub(crate) fn check_packed_start_in_box(
 mod packed_start_box_tests;
 
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
-/// resets under an SDE model, and a negative typical-value lag time. These are
+/// resets under an SDE model, and the like. A negative typical-value lag time is
+/// not one of them since #1189: it is `E_NEGATIVE_LAGTIME` on the fatal list
+/// (`check_negative_lagtime`). These are
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
 /// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
 /// is identical to the historical inline strings.
@@ -8398,87 +8658,6 @@ pub(crate) fn check_model_data_warnings_rule(
              Use an ODE or analytical model if the lag matters."
                 .to_string(),
         ));
-    }
-
-    // Negative typical-value lag time at the initial point (eta = 0).
-    if model.has_lagtime() {
-        if let Some(first_subj) = population.subjects.first() {
-            let zero_eta = vec![0.0_f64; model.n_eta];
-            // Negative-lag warning at the initial point: typical values at t=0.
-            let pk =
-                (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
-            if pk.lagtime() < 0.0 {
-                diags.push(Diagnostic::warning(
-                    "W_NEGATIVE_LAGTIME",
-                    format!(
-                        "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
-                         point (eta = 0). Negative lagtimes are physically nonsensical \
-                         and are not clamped — consider an exp() or other positive-link \
-                         parameterisation.",
-                        pk.lagtime()
-                    ),
-                ));
-            }
-            // Compartment-indexed `ALAGn` lags (issue #369) live in their own
-            // spare slots, so the bare check above never sees them — flag each one
-            // that is negative at the typical-value point. Ordered by compartment
-            // for deterministic diagnostics.
-            if let Some(ode) = &model.ode_spec {
-                for cmt in 1..=ode.n_states {
-                    let Some(slot) = ode
-                        .dose_attr_map
-                        .indexed_slot(crate::types::DoseAttr::Lag, cmt)
-                    else {
-                        continue;
-                    };
-                    let lag = pk.values.get(slot).copied().unwrap_or(0.0);
-                    if lag < 0.0 {
-                        diags.push(Diagnostic::warning(
-                            "W_NEGATIVE_LAGTIME",
-                            format!(
-                                "ALAG{cmt} (compartment-{cmt} lag) evaluates to {lag:.4} (< 0) \
-                                 at the initial typical-value point (eta = 0). Negative lagtimes \
-                                 are physically nonsensical and are not clamped — consider an \
-                                 exp() or other positive-link parameterisation."
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // Negative per-route absorption lag (`fn(..., lag=L)`) at the initial typical-value
-    // point (η = 0). A per-route lag lives on the forcing (its own `lag_slot`), NOT the
-    // dose-attribute lag machinery, so `model.has_lagtime()` does not cover it and the
-    // block above never sees it — this check stands on its own, gated on a forcing
-    // actually carrying a `lag_slot`. Same convention as `W_NEGATIVE_LAGTIME`: warned,
-    // not clamped (a negative lag shifts the onset earlier rather than crashing).
-    if let Some(ode) = &model.ode_spec {
-        if ode.has_route_lag() {
-            if let Some(first_subj) = population.subjects.first() {
-                let zero_eta = vec![0.0_f64; model.n_eta];
-                let pk =
-                    (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
-                for f in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
-                    let lag = f.route_lag(&pk.values);
-                    if lag < 0.0 {
-                        diags.push(Diagnostic::warning(
-                            "W_NEGATIVE_LAGTIME",
-                            format!(
-                                "Per-route absorption lag (a `{:?}` route on compartment {}) \
-                                 evaluates to {lag:.4} (< 0) at the initial typical-value point \
-                                 (eta = 0). Negative lagtimes are physically nonsensical and are \
-                                 not clamped — consider an exp() or other positive-link \
-                                 parameterisation.",
-                                f.kind,
-                                f.cmt + 1
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
     }
 
     // Analytic absorption flip-flop diagnostic (#634 review finding 3; IG #790). The
@@ -9143,7 +9322,39 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 /// per-CMT / steady-state / lag-time checks run as well. An explicit
 /// `data_path` overrides the model's `[data]` block, with a warning
 /// diagnostic when the two differ (see [`resolve_data_path`]).
+///
+/// The checks run against the model file's own `[fit_options]` and
+/// `[data_selection]`. To check against the settings a fit with call-time
+/// overrides actually uses, call [`validate_model_file_with`].
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
+    validate_model_file_with(model_path, data_path, &[])
+}
+
+/// [`validate_model_file`], against the options a fit with call-time overrides
+/// runs with (#2165).
+///
+/// `overrides` are `(key, value)` fit-option pairs — the keys of `[fit_options]`
+/// and `[data_selection]` (`ignore`, `accept`, `ignore_subjects`) — applied in
+/// order on top of the model file's own options with
+/// [`apply_fit_option`](crate::parser::model_parser::apply_fit_option) (and
+/// `method`, one method or a `[a, b]` chain, as a `[fit_options]` line reads it),
+/// the way ferx-r's `ferx_fit(settings = …)` builds the options it fits with: a later
+/// value of a scalar key wins, a selection clause is added to the file's. Every
+/// check reads the merged options — `check_model_options`, the variance-rail,
+/// box and prior checks, the data read's selection filter and `iov_column`,
+/// and the `iov_occasion` the model–data checks group occasions by — so a
+/// finding the fit would not produce is not reported, and one it would is.
+///
+/// A pair that cannot be applied — an unknown key, or a value the key does not
+/// accept — is an `E_FIT_OPTION` error, one per pair, and like a model file that
+/// does not parse it is terminal: the report carries only those diagnostics,
+/// since the options every other check would read are not ones any fit runs
+/// with. An empty `overrides` is exactly [`validate_model_file`].
+pub fn validate_model_file_with(
+    model_path: &str,
+    data_path: Option<&str>,
+    overrides: &[(String, String)],
+) -> CheckReport {
     use crate::io::model_source::ModelSource;
 
     // 1. Read and parse, once (#1752): the binding step below takes its text from
@@ -9170,6 +9381,18 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     // it (#1395: the check report used the stem unconditionally).
     super::run::set_model_name(&mut parsed.model, model_path);
     let model_name = parsed.model.name.clone();
+
+    // Call-time overrides (#2165), merged before anything reads the options. A
+    // pair that does not apply is terminal, like a parse failure: the checks
+    // below would describe options no fit runs with.
+    let override_errors = apply_fit_option_overrides(&mut parsed, overrides);
+    if !override_errors.is_empty() {
+        return CheckReport::new(
+            model_name,
+            data_path.map(|s| s.to_string()),
+            override_errors,
+        );
+    }
 
     // Resolve which dataset (if any) to check against: an explicit
     // `data_path` wins over the model's `[data]` block; absence of both just
@@ -9244,6 +9467,9 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    predict / simulate entry point refuse it; `ferx check` reports it (#1774).
     #[cfg(feature = "survival")]
     diags.extend(check_survival_time_dependent_pk_diags(&parsed.model));
+    // The same freeze on a drug-driven CTMM generator (#1918); `fit()` refuses it too.
+    #[cfg(feature = "markov")]
+    diags.extend(check_ctmm_time_dependent_pk_diags(&parsed.model));
 
     // 2d. Undeclared random effects, *without* a dataset. With data present this
     //    is an `E_ETA_NOT_DECLARED` error from `check_covariates` below (we know
@@ -9313,9 +9539,9 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    records. A covariate-validation failure surfaces as the matching
     //    diagnostic rather than a generic read error.
     //
-    //    The filter is the model file's own clauses and only those: this function
-    //    takes no `FitOptions`, so clauses a *caller* merges in (`fit_from_files`,
-    //    ferx-r's `ferx_fit(ignore =, accept =, ignore_ids =)`) are invisible here
+    //    The filter is the model file's own clauses plus any the caller passed as
+    //    `overrides` (#2165) — the same merged list a fit with those overrides
+    //    reads with. Clauses a caller merges in some other way are invisible here
     //    and a check cannot speak for them (#1465).
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
@@ -9412,6 +9638,54 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
     report
+}
+
+/// Apply `overrides` onto `parsed.fit_options` in order, with the parser's own
+/// [`apply_fit_option`](crate::parser::model_parser::apply_fit_option) (`method`
+/// through `apply_method_option`, as a `[fit_options]` line). Returns one
+/// `E_FIT_OPTION` error per pair that could not be applied; on any error
+/// `parsed.fit_options` is left partially updated, which the caller does not read
+/// further.
+///
+/// Only the options are updated, not the copies the parser stamped on the model
+/// (`bloq_method`, the ODE solver settings): no check reads those — every M3 gate
+/// a check reaches sits behind `check_model_options`, which arms
+/// `options.bloq_method` itself — and `fit()` resolves both from its options too.
+fn apply_fit_option_overrides(
+    parsed: &mut crate::types::ParsedModel,
+    overrides: &[(String, String)],
+) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for (key, value) in overrides {
+        let key = key.trim();
+        // `method` is parsed beside `apply_fit_option` rather than by it, so it is
+        // routed to the same helper `[fit_options]` uses.
+        let applied = if key == "method" {
+            crate::parser::model_parser::apply_method_option(&mut parsed.fit_options, value)
+                .map(|()| true)
+        } else {
+            crate::parser::model_parser::apply_fit_option(&mut parsed.fit_options, key, value)
+        };
+        match applied {
+            Ok(true) => {}
+            Ok(false) => errors.push(
+                Diagnostic::error(
+                    "E_FIT_OPTION",
+                    format!("fit option override `{key}` is not a known fit option"),
+                )
+                .with_suggestion(
+                    "use a `[fit_options]` or `[data_selection]` key; see the fit options \
+                     reference"
+                        .to_string(),
+                ),
+            ),
+            Err(e) => errors.push(Diagnostic::error(
+                "E_FIT_OPTION",
+                format!("fit option override `{key} = {value}`: {e}"),
+            )),
+        }
+    }
+    errors
 }
 
 /// The binding step of [`validate_model_file`]: bind `parsed` to `population`

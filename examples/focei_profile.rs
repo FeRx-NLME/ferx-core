@@ -9,7 +9,6 @@ use ferx_core::estimation::{
     parameterization::{pack_params, unpack_params},
     sens_outer_gradient as gradient,
 };
-use ferx_core::sens::provider;
 use ferx_core::{fit, parser::model_parser::parse_model_string, read_nonmem_csv, types::*};
 use serde_json::{json, Value};
 use std::{hint::black_box, path::Path, sync::atomic::Ordering::Relaxed, time::Instant};
@@ -22,20 +21,12 @@ mod allocation;
 static ALLOCATOR: allocation::Allocator = allocation::Allocator;
 
 fn counters() -> Value {
-    json!({"full_sens_calls": provider::PROFILE_SENS_CALLS.load(Relaxed),
-        "full_sens_ns": provider::PROFILE_SENS_NANOS.load(Relaxed),
-        "eta_sens_calls": provider::PROFILE_ETA_CALLS.load(Relaxed),
-        "eta_sens_ns": provider::PROFILE_ETA_NANOS.load(Relaxed),
-        "inner_solves": inner::PROFILE_INNER_SOLVES.load(Relaxed),
+    json!({"inner_solves": inner::PROFILE_INNER_SOLVES.load(Relaxed),
         "inner_analytic_steps": inner::PROFILE_INNER_ANALYTIC_GRAD.load(Relaxed),
         "inner_fd_steps": inner::PROFILE_INNER_FD_FALLBACK.load(Relaxed)})
 }
 fn reset_counters() {
     for c in [
-        &provider::PROFILE_SENS_CALLS,
-        &provider::PROFILE_SENS_NANOS,
-        &provider::PROFILE_ETA_CALLS,
-        &provider::PROFILE_ETA_NANOS,
         &inner::PROFILE_INNER_SOLVES,
         &inner::PROFILE_INNER_ANALYTIC_GRAD,
         &inner::PROFILE_INNER_FD_FALLBACK,
