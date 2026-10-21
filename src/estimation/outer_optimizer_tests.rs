@@ -6430,15 +6430,209 @@ mod outer_fd_fallback {
         };
         // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
         let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
-        let unmasked = central_diff_packed(&x, &fixed, &bounds, raw);
+        let floor = [1.0, 1.0];
+        let unmasked = central_diff_packed(&x, &fixed, &floor, &bounds, raw);
         assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
-        let masked = central_diff_packed(&x, &fixed, &bounds, |v| fd_masked_subject_nll(raw(v)));
+        let masked = central_diff_packed(&x, &fixed, &floor, &bounds, |v| {
+            fd_masked_subject_nll(raw(v))
+        });
         assert_eq!(masked[0], 0.0);
         assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
         for nll in [1e20, f64::INFINITY] {
             assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
         }
         assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
+    }
+
+    /// #2187: `central_diff_packed` steps coordinate k by `fd_step(1e-4, xₖ, floor[k])`. An
+    /// identity-packed θ of 7.7e-5 under the legacy floor 1 is stepped by ~1.0e-4, through
+    /// zero, where the objective returns a *finite* penalty (`1e16`, as a negative volume
+    /// does) that the `is_finite()` filter keeps, so the derivative comes out ~1e19. With the
+    /// floor `|θ₀|` the minus point stays positive and the difference is the quadratic's. The
+    /// coordinate at 7.7 has floor 1 and must keep the legacy step bit for bit.
+    #[test]
+    fn central_diff_packed_steps_a_small_identity_theta_relative_to_its_floor() {
+        use std::cell::RefCell;
+        let x = [7.7e-5, 7.7];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-7.7e-3, -770.0],
+            upper: vec![7.7e-3, 770.0],
+        };
+        let quad = |v: &[f64]| 3e6 * v[0] * v[0] + 0.2 * v[0] * v[1] + 0.5 * v[1] * v[1];
+        let points: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
+        let ofv = |v: &[f64]| {
+            points.borrow_mut().push(v.to_vec());
+            if v[0] <= 0.0 {
+                1e16
+            } else {
+                quad(v)
+            }
+        };
+
+        let g = central_diff_packed(&x, &fixed, &[7.7e-5, 1.0], &bounds, &ofv);
+        assert!(
+            points.borrow().iter().all(|p| p[0] > 0.0),
+            "a stencil point crossed zero: {:?}",
+            points.borrow()
+        );
+        // A quadratic's central difference is exact up to the rounding of f ≈ 30 over
+        // 2h₀ = 3.1e-8: measured relative error 1.6e-9 on coordinate 0, 0 on coordinate 1.
+        for (j, want) in [(0, 6e6 * x[0] + 0.2 * x[1]), (1, 0.2 * x[0] + x[1])] {
+            let rel = (g[j] - want).abs() / want;
+            eprintln!("MEASURE #2187 kernel coordinate {j}: rel {rel:.2e}");
+            assert!(rel < 1e-6, "∂{j} = {} vs {want}", g[j]);
+        }
+        // Coordinate 1's points are the legacy ones, bit for bit.
+        let h1 = 1e-4 * (1.0 + x[1].abs());
+        let p = points.borrow();
+        assert_eq!(p[2][1].to_bits(), (x[1] + h1).to_bits());
+        assert_eq!(p[3][1].to_bits(), (x[1] - h1).to_bits());
+        drop(p);
+
+        // The straddle: floor 1 on coordinate 0 (the pre-#2187 step) crosses zero and builds
+        // the difference on the penalty.
+        points.borrow_mut().clear();
+        let legacy = central_diff_packed(&x, &fixed, &[1.0, 1.0], &bounds, &ofv);
+        assert!(points.borrow().iter().any(|p| p[0] <= 0.0));
+        assert!(legacy[0].abs() > 1e18, "∂0 = {}", legacy[0]);
+    }
+
+    /// #2187 at the callers of `central_diff_packed`: warfarin with `V = TVV_S / k` and
+    /// `TVV_S` bounded at `±100·TVV_S`, so identity-packed at every k, started 5 % above the
+    /// FOCEI estimate so the volume gradient is well away from zero. Rescaling a θ by k scales
+    /// its packed derivative by `1/k` and leaves every other one alone, so `k·∂/∂TVV_S` at a
+    /// small k must equal `∂/∂TVV_S` at k = 1 (`TVV_S` = 8.1, floor 1, the pre-#2187 step).
+    fn rescaled_volume(k: f64, iov: bool) -> crate::PreparedRun {
+        let tvv_s = 8.124591 * k;
+        let (kappa, cl, fit_options, data) = if iov {
+            (
+                "  kappa KAPPA_CL ~ 0.01\n",
+                "TVCL * exp(ETA_CL + KAPPA_CL)",
+                "  method = foce\n  iov_column = OCC\n",
+                "data/warfarin_iov.csv",
+            )
+        } else {
+            (
+                "",
+                "TVCL * exp(ETA_CL)",
+                "  method = focei\n",
+                "data/warfarin.csv",
+            )
+        };
+        let src = format!(
+            "[parameters]
+  theta TVCL(0.132695, 0.001, 10.0)
+  theta TVV_S({tvv_s:e}, {lo:e}, {hi:e})
+  theta TVKA(0.810796, 0.01, 50.0)
+  omega ETA_CL ~ 0.028590
+  omega ETA_V  ~ 0.009592
+  omega ETA_KA ~ 0.335871
+{kappa}  sigma PROP_ERR ~ 0.010565 (sd)
+[individual_parameters]
+  CL = {cl}
+  V  = TVV_S / {k:e} * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+{fit_options}",
+            lo = -100.0 * tvv_s,
+            hi = 100.0 * tvv_s,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "ferx_2187_rescaled_volume_{}_{iov}_{k:e}.ferx",
+            std::process::id()
+        ));
+        std::fs::write(&path, src).unwrap();
+        crate::prepare_run(path.to_str().unwrap(), Some(data)).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Max-norm relative gap between the gradient at k (its `TVV_S` entry times k) and k = 1.
+    fn rescaled_gap(route: &str, k: f64, g_k: &[f64], g_1: &[f64]) -> f64 {
+        assert_eq!(g_k.len(), g_1.len());
+        let scale = g_1.iter().fold(0.0_f64, |m, v| {
+            assert!(v.is_finite(), "{route}: k = 1 gradient {g_1:?}");
+            m.max(v.abs())
+        });
+        assert!(scale > 0.0, "{route}: zero gradient");
+        let gap = g_k.iter().zip(g_1).enumerate().fold(0.0_f64, |m, (j, (&a, &b))| {
+            let a = if j == 1 { k * a } else { a };
+            assert!(a.is_finite(), "{route} k = {k}: ∂{j} = {a}");
+            m.max((a - b).abs())
+        }) / scale;
+        eprintln!("MEASURE #2187 {route} k = {k:e}: max-norm rel {gap:.3e}");
+        gap
+    }
+
+    #[test]
+    fn reconverged_fd_gradients_step_a_small_identity_theta_relatively() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let at = |k: f64| {
+            let prep = rescaled_volume(k, false);
+            let (model, pop, p) = (&prep.parsed.model, &prep.population, &prep.init_params);
+            let opts = &prep.parsed.fit_options;
+            let PackedStart {
+                packed: x, bounds, ..
+            } = pack_with_bounds(p);
+            let warm = vec![DVector::zeros(model.n_eta); pop.subjects.len()];
+            let pop_g = reconverged_fd_gradient(&x, p, model, pop, &warm, &bounds, opts);
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts);
+            let priors = build_prior_set(model, p);
+            let report_g =
+                reporting_fd_gradient(&x, p, model, pop, &warm, &bounds, opts, &nn_reg, &priors);
+            let s = &pop.subjects[0];
+            let eta = find_ebe_for_stage(model, s, &unpack_params(&x, p), 500, 1e-12, None, None, 0, opts)
+                .eta;
+            let subj_g = subject_reconverged_fd_gradient(&x, p, model, s, &eta, &bounds, opts);
+            (pop_g, report_g, subj_g)
+        };
+        // Measured (macOS arm64): 2.341e-7 population and reporting, 4.228e-8 subject, the
+        // same at both k. With floor 1 on `TVV_S` (the pre-#2187 step) the population and
+        // reporting gaps are 1.524e-1 at k = 1e-4 — the issue's own number — and the subject
+        // gap 2.370e-2, so 1e-5 sits 43× above the realised gap and over three orders below
+        // the defect.
+        let (pop_1, report_1, subj_1) = at(1.0);
+        for k in [1e-4, 1e-5] {
+            let (pop_k, report_k, subj_k) = at(k);
+            let g = rescaled_gap("population", k, &pop_k, &pop_1);
+            assert!(g < 1e-5, "reconverged_fd_gradient k = {k}: {g:e}");
+            let g = rescaled_gap("reporting", k, &report_k, &report_1);
+            assert!(g < 1e-5, "reporting_fd_gradient k = {k}: {g:e}");
+            let g = rescaled_gap("subject", k, &subj_k, &subj_1);
+            assert!(g < 1e-5, "subject_reconverged_fd_gradient k = {k}: {g:e}");
+        }
+    }
+
+    #[test]
+    fn iov_subject_reconverged_fd_gradient_steps_a_small_identity_theta_relatively() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let at = |k: f64| {
+            let prep = rescaled_volume(k, true);
+            let (model, p) = (&prep.parsed.model, &prep.init_params);
+            let opts = &prep.parsed.fit_options;
+            let s = &prep.population.subjects[0];
+            let PackedStart {
+                packed: x, bounds, ..
+            } = pack_with_bounds(p);
+            let ebe =
+                find_ebe_for_stage(model, s, &unpack_params(&x, p), 500, 1e-12, None, None, 0, opts);
+            let mut stacked = ebe.eta.as_slice().to_vec();
+            for kap in &ebe.kappas {
+                stacked.extend_from_slice(kap.as_slice());
+            }
+            let warm = DVector::from_column_slice(&stacked);
+            subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, opts)
+        };
+        // Measured (macOS arm64): 3.099e-9 at both k; with floor 1 on `TVV_S` (the pre-#2187
+        // step) 1.826e-3 at k = 1e-4, 180× above the bound.
+        let g_1 = at(1.0);
+        for k in [1e-4, 1e-5] {
+            let g = rescaled_gap("iov subject", k, &at(k), &g_1);
+            assert!(g < 1e-5, "subject_reconverged_fd_gradient_iov k = {k}: {g:e}");
+        }
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`

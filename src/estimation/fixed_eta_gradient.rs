@@ -21,6 +21,7 @@
 //! it contributes 0 and skips its finite-difference evaluation.
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
+use crate::estimation::parameterization::{fd_step, fd_theta_step_floor};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{obs_nll_subject_from_preds, obs_nll_subject_into};
 use crate::types::*;
@@ -28,6 +29,18 @@ use crate::types::*;
 #[cfg(test)]
 #[path = "fixed_eta_gradient_tests.rs"]
 mod tests;
+
+/// The forward-difference step of **natural** θ `i`, the one every θ difference in this file
+/// takes: `fd_step(h, θᵢ, sᵢ)` with `sᵢ` the natural-scale floor `fd_theta_step_floor` of the
+/// declared `θ₀` (#2187). `sᵢ = 1` — the pre-#2187 `h·(1 + |θᵢ|)`, bit for bit — unless
+/// `0 < |θ₀| < 1`; there a step absolute in θ's units was ~1.2 % of a θ of 8e-4, a
+/// first-order error in a forward difference, and stepped a θ below `h` through zero. The
+/// packing does not enter: these differences are taken in θ itself, so a log-packed θ is as
+/// exposed as an identity-packed one.
+#[inline]
+fn theta_fd_step(model: &CompiledModel, theta: &[f64], i: usize, h: f64) -> f64 {
+    fd_step(h, theta[i], fd_theta_step_floor(&model.default_params, i))
+}
 
 /// `∂V_j/∂(log σ_k)` for one observation of the fixed-η M-step objective, before
 /// the caller's per-observation `ruv_scale` (which is `1.0` on a FREM row).
@@ -240,7 +253,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
             let mut theta_p = theta.to_vec();
-            let delta = sign * h * (1.0 + theta[i].abs());
+            let delta = sign * theta_fd_step(model, theta, i, h);
             theta_p[i] += delta;
             let nll_p = obs_nll_subject_into_iov(
                 model,
@@ -355,7 +368,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
     let h_fd = 1e-5;
     let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
     let mut signed_theta_deriv = |i: usize, sign: f64| -> f64 {
-        let delta = sign * h_fd * (1.0 + theta[i].abs());
+        let delta = sign * theta_fd_step(model, theta, i, h_fd);
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
         let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
@@ -603,7 +616,7 @@ fn obs_nll_subject_grad_impl(
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
             let mut theta_p = theta.to_vec();
-            let delta = sign * h * (1.0 + theta[i].abs());
+            let delta = sign * theta_fd_step(model, theta, i, h);
             theta_p[i] += delta;
             let nll_p = obs_nll_subject_into(
                 model,
@@ -760,7 +773,7 @@ fn obs_nll_subject_grad_impl(
     // σ), and for the whole subject when the information is out of scope.
     let mut df_packed: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
-        let delta = sign * h_fd * (1.0 + theta[i].abs());
+        let delta = sign * theta_fd_step(model, theta, i, h_fd);
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
         let preds_p =
@@ -806,7 +819,7 @@ fn obs_nll_subject_grad_impl(
             // contracted on the spot: the packed `∂f_j/∂x_i` is what both the
             // gradient and the information are built from, so there is one FD
             // and one prediction call here as before.
-            let delta = h_fd * (1.0 + theta[i].abs());
+            let delta = theta_fd_step(model, theta, i, h_fd);
             let mut theta_p = theta.to_vec();
             theta_p[i] += delta;
             let preds_p = crate::pk::compute_predictions_with_tv_into(

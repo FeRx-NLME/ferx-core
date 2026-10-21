@@ -25,8 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{
-    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
-    unpack_params, PackedBounds,
+    fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
+    theta_packs_log, unpack_params, PackedBounds,
 };
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{
@@ -603,6 +603,10 @@ impl MixtureScoreContext {
 /// Central-FD outer gradient of the mixture OFV in real packed space — the
 /// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
 /// Re-runs `mixture_ofv` at `x ± h` per coordinate (`2·n` cold evals).
+///
+/// `hᵢ = 1e-5·sᵢ`, `sᵢ` the `fd_step_floors` floor (#2187): `1` — the flat pre-#2187 step,
+/// bit for bit — except on a small identity-packed θ, where a flat `1e-5` is ~1.2 % of a θ of
+/// 8e-4 and steps a θ below 1e-5 through zero.
 pub fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
@@ -610,10 +614,11 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let h = 1e-5;
+    let floor = fd_step_floors(init_params, &model.default_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
     for i in 0..n {
+        let h = 1e-5 * floor[i];
         let mut xp = x.to_vec();
         let mut xm = x.to_vec();
         xp[i] += h;
@@ -1166,6 +1171,55 @@ mod tests {
         let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
         assert_eq!(fd.len(), packed_len(&model.default_params));
         assert!(fd.iter().all(|g| g.is_finite()));
+    }
+
+    /// #2187: `mixture_gradient_fd` stepped every packed coordinate by a flat `1e-5`. On a
+    /// volume written as `V = TVV_S / k` with `TVV_S` bounded at `±100·TVV_S` (identity-
+    /// packed) that is 1 % of `TVV_S` at k = 1e-4 and 10 % at k = 1e-5. Rescaling a θ by k
+    /// scales its packed derivative by `1/k` and leaves the others alone, so `k·∂/∂TVV_S`
+    /// must match `∂/∂TVV_S` at k = 1, where `TVV_S` = 10.5 has floor 1 and keeps the flat
+    /// step bit for bit.
+    #[test]
+    fn mixture_gradient_fd_steps_a_small_identity_theta_relatively() {
+        use crate::estimation::parameterization::pack_params;
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let grad = |k: f64| {
+            let tvv_s = 10.5 * k;
+            let src = MIX_FIT_MODEL
+                .replace(
+                    "theta TVV(10.0, 0.1, 1000.0)",
+                    &format!(
+                        "theta TVV_S({tvv_s:e}, {:e}, {:e})",
+                        -100.0 * tvv_s,
+                        100.0 * tvv_s
+                    ),
+                )
+                .replace("V  = TVV\n", &format!("V  = TVV_S / {k:e}\n"));
+            let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+            let p = &model.default_params;
+            assert!(p.theta_lower[2] < 0.0, "fixture: TVV_S must be identity-packed");
+            super::mixture_gradient_fd(&model, &pop, &pack_params(p), p, &opts)
+        };
+        let g_1 = grad(1.0);
+        let scale = g_1.iter().fold(0.0_f64, |m, v| {
+            assert!(v.is_finite(), "k = 1 gradient {g_1:?}");
+            m.max(v.abs())
+        });
+        assert!(g_1[2].abs() > 1e-3 * scale, "fixture: ∂/∂TVV_S is live, {g_1:?}");
+        // Measured (macOS arm64): 2.653e-11 at k = 1e-4, 2.420e-11 at 1e-5; with the flat
+        // 1e-5 step (pre-#2187) 3.194e-5 at k = 1e-4, so 1e-8 leaves 380× headroom below and
+        // three orders above.
+        for k in [1e-4, 1e-5] {
+            let g_k = grad(k);
+            let gap = g_k.iter().zip(&g_1).enumerate().fold(0.0_f64, |m, (j, (&a, &b))| {
+                let a = if j == 2 { k * a } else { a };
+                assert!(a.is_finite(), "k = {k}: ∂{j} = {a}");
+                m.max((a - b).abs())
+            }) / scale;
+            eprintln!("MEASURE #2187 mixture k = {k:e}: max-norm rel {gap:.3e}");
+            assert!(gap < 1e-8, "mixture_gradient_fd k = {k}: {gap:e}");
+        }
     }
 
     #[test]

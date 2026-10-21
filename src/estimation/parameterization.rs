@@ -96,17 +96,19 @@ pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParamet
 /// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
 /// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
 pub(crate) fn fd_theta_step_floors(declared: &ModelParameters) -> Vec<f64> {
-    declared
-        .theta
-        .iter()
-        .map(|&t0| {
-            if t0 != 0.0 && t0.abs() < 1.0 {
-                t0.abs()
-            } else {
-                1.0
-            }
-        })
+    (0..declared.theta.len())
+        .map(|j| fd_theta_step_floor(declared, j))
         .collect()
+}
+
+/// One entry of [`fd_theta_step_floors`], for a site that steps a single θ and should not
+/// allocate the vector per call (the SAEM / VI fixed-η gradients, #2187). A `j` past the θ
+/// vector gets 1.
+pub(crate) fn fd_theta_step_floor(declared: &ModelParameters, j: usize) -> f64 {
+    match declared.theta.get(j) {
+        Some(&t0) if t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
+        _ => 1.0,
+    }
 }
 
 /// The finite-difference step of a packed coordinate at `x` with floor `floor`
@@ -2197,6 +2199,24 @@ mod tests {
         let mut short = declared.clone();
         short.theta.truncate(1);
         assert_eq!(fd_step_floor(&template, &short, 4), 1.0);
+    }
+
+    /// The natural-scale twin does not read the packing: the log-packed θ 3 (`θ₀ = 0.5`)
+    /// takes `|θ₀|` here where `fd_step_floor` gives it 1, since in θ's own units a log-packed
+    /// θ is stepped as absolutely as an identity-packed one (#2187). `θ₀ = 0`, `|θ₀| ≥ 1` and an
+    /// index past the θ vector keep 1; the vector form is the scalar form per index.
+    #[test]
+    fn the_natural_theta_step_floor_ignores_the_packing() {
+        let mut declared = make_template();
+        declared.theta = vec![0.0077, 7.7, 0.0, 0.5, -0.3];
+        declared.theta_lower = vec![-0.77, -770.0, -1.0, 0.0, -1.0];
+        let floors = fd_theta_step_floors(&declared);
+        assert_eq!(floors, vec![0.0077, 1.0, 1.0, 0.5, 0.3]);
+        for (j, &f) in floors.iter().enumerate() {
+            assert_eq!(fd_theta_step_floor(&declared, j).to_bits(), f.to_bits());
+        }
+        assert_eq!(fd_theta_step_floor(&declared, 5), 1.0);
+        assert_eq!(fd_step_floor(&declared, &declared, 3), 1.0, "packed: log θ keeps 1");
     }
 
     /// With floor 1, `fd_step` is the pre-#2147 `eps·(1 + |x|)` bit for bit — the property
