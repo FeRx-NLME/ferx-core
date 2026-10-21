@@ -126,49 +126,26 @@ fn rescaling_an_identity_packed_theta_leaves_every_standard_error_where_it_was()
         CovarianceMethod::Sandwich,
     ] {
         let reference = natural_ses(&fit_scaled(1.0, method), 1.0);
-        // Large units: before #2145, `s` failed and `r` / `rsr` understated SE(TVV) by 4.5×
-        // (r, k = 1e5) up to 2000× (rsr, k = 1e6). Measured worst relative difference over
-        // all seven SEs, Linux x86_64 (glibc 2.28): 1.2e-9 (`rsr`), 6.0e-10 (`r`), 3.4e-10
-        // (`s`), all at k = 1e6. macOS arm64 is looser, 4.3e-7 (`s`, k = 1e6), and the bound
-        // is 23× that.
-        for k in [1e5, 1e6] {
+        // Before #2145 every cell failed: `s` could not invert `S` at any of the three k, and
+        // `r` / `rsr` were regularized. In large units that understated SE(TVV) by 4.5×
+        // (r, k = 1e5) up to 2000× (rsr, k = 1e6); in small units the floor clipped the
+        // *other* coordinates, and SE(TVKA) came out 2.5× (r) and 6.5× (rsr) too small at
+        // k = 3e-6.
+        //
+        // Since #2239 steps an identity-packed θ relative to its θ₀, the FD stencils are
+        // equivariant under the rescaling, so what is left is rounding. Measured worst relative
+        // difference over all seven SEs, macOS arm64: 8.2e-10 (`s`, k = 3e-6), 7.8e-11 (`rsr`,
+        // k = 1e6), 7.8e-16 (`r`, k = 1e6). The bound is 12× the worst.
+        for k in [1e5, 1e6, 3e-6] {
             let label = format!("{method:?}, k = {k:e}");
             let got = natural_ses(&fit_scaled(k, method), k);
             let worst = worst_rel(&got, &reference, &all, &label);
+            eprintln!("WORST {label}: {worst:.3e}");
             assert!(
-                worst < 1e-5,
+                worst < 1e-8,
                 "{label}: worst relative SE difference {worst:e}"
             );
         }
-    }
-    // Small units, where the floor clipped the *other* coordinates: before #2145, SE(TVKA) was
-    // understated 2.3× (r) and 5.4× (rsr) at k = 3e-6, a relative error of 0.57 and 0.81.
-    //
-    // Two defects this fix does not touch are still visible here, so the comparison is
-    // narrower than at large k:
-    // - SE(TVV) is left out: the analytic R's own TVV entry is off at small k, by 9.9 % here
-    //   on this branch and identically before it (the analytic-R defect #2093 replaces).
-    // - `s` is left out, and `rsr` gets a wider bound: the per-subject score takes an
-    //   absolute FD step on an identity-packed θ, which this small a θ does not tolerate
-    //   (#2147).
-    // Measured worst relative difference over the six SEs, Linux x86_64 (glibc 2.28): 2.38e-4
-    // under `r` (TVCL) and 5.06e-3 under `rsr` (TVCL, through `S`); macOS arm64 agrees to two
-    // figures. Each bound is about 4× its worst and two orders of magnitude below the error
-    // before the fix.
-    let others = [0usize, 2, 3, 4, 5, 6];
-    for (method, tol) in [
-        (CovarianceMethod::Hessian, 1e-3),
-        (CovarianceMethod::Sandwich, 2e-2),
-    ] {
-        let k = 3e-6;
-        let label = format!("{method:?}, k = {k:e}");
-        let reference = natural_ses(&fit_scaled(1.0, method), 1.0);
-        let got = natural_ses(&fit_scaled(k, method), k);
-        let worst = worst_rel(&got, &reference, &others, &label);
-        assert!(
-            worst < tol,
-            "{label}: worst relative SE difference {worst:e}"
-        );
     }
 }
 

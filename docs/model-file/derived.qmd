@@ -43,7 +43,7 @@ where `name` becomes a new sdtab column and `expression` is evaluated for every 
 
 ## Operators and functions
 
-Standard arithmetic (`+`, `-`, `*`, `/`), comparison (`<`, `>`, `<=`, `>=`, `==`, `!=`), and logical (`&&`, `||`, `!`) operators are supported. Use the `mod` keyword for modulo (`a mod b`). As well as:
+Standard arithmetic (`+`, `-`, `*`, `/`), comparison (`<`, `>`, `<=`, `>=`, `==`, `!=`), and logical (`&&`, `||`, `!`) operators are supported. Use the `mod` keyword for modulo (`a mod b`); the result is never negative, and a divisor of zero (`|b| < 1e-30`) gives `0`, as `/` does and as `mod` does in `[individual_parameters]`. As well as:
 
 | Function | Description |
 |----------|-------------|

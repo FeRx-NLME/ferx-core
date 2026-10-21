@@ -17077,6 +17077,59 @@ fn bytecode_g_f64_bit_identical() {
     );
 }
 
+/// #2149: `x mod 0` must mean the same thing in all three evaluators. The
+/// bytecode VMs (f64 and `Dual2`) returned `0` under the `|b| < 1e-30` guard
+/// that `/` uses, while the tree evaluator `eval_expr` (which serves
+/// `[derived]`, hazard, Markov and mixture expressions) returned
+/// `rem_euclid(0.0) = NaN`. A divisor just inside the guard and one just
+/// outside it straddle the gate, so a guard dropped from any one evaluator, or
+/// a threshold moved in one, reddens this test.
+#[test]
+fn mod_zero_divisor_agrees_across_all_three_evaluators() {
+    use crate::sens::dual2::Dual2;
+    let nn: Vec<Vec<f64>> = Vec::new();
+    // (divisor, expected `7.25 mod divisor`)
+    let cases = [
+        (0.0, 0.0),
+        (-0.0, 0.0),
+        (1e-31, 0.0),
+        (-1e-31, 0.0),
+        (2.0, 1.25),
+        (-2.0, 1.25),
+    ];
+    for (b, want) in cases {
+        let e = binop(BinOp::Mod, varidx(0), varidx(1));
+        let vars = [7.25, b];
+        let tree = eval_expression_indexed(&e, &[], &[], &[], &vars, &nn);
+        let bc = compile_bytecode(&e);
+        let mut s: Vec<f64> = Vec::new();
+        let vm = eval_bytecode(&bc, &[], &[], &[], &vars, &nn, &mut s);
+        let vd = [Dual2::<2>::var(7.25, 0), Dual2::<2>::var(b, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let dual = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        assert_eq!(tree, want, "eval_expr: 7.25 mod {b:e}");
+        assert_eq!(vm, want, "f64 VM: 7.25 mod {b:e}");
+        assert_eq!(dual.value, want, "Dual2 VM: 7.25 mod {b:e}");
+        // Inside the guard the result is a constant; outside it carries the
+        // `a' − q·b'` jet of #2150.
+        let want_grad = if b.abs() < 1e-30 {
+            [0.0; 2]
+        } else {
+            [1.0, -7.25_f64.div_euclid(b)]
+        };
+        assert_eq!(dual.grad, want_grad, "Dual2 VM grad: 7.25 mod {b:e}");
+    }
+    // The literal-divisor spelling the issue reproduced (`TIME mod 0`) goes
+    // through the same arms; pin it bit-for-bit against the bytecode too.
+    bc_vs_ast(
+        binop(BinOp::Mod, varidx(0), lit(0.0)),
+        &[7.25],
+        &[],
+        &[],
+        &[],
+    );
+}
+
 /// The `Dual2` VM's `Op::Mod` carries the jet `a' − q·b'` (`q = div_euclid(a, b)`)
 /// and keeps the value `rem_euclid` bit for bit. It used to lift the result as a
 /// constant, a zero gradient on both operands (#2150). The points straddle the
