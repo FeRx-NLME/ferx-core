@@ -15,7 +15,12 @@
 //! ## Error-code registry
 //!
 //! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings).
-//! Add new codes here and document them in `docs/file-formats/check-report.qmd`.
+//! The table is exhaustive: every code the engine emits — as a [`Diagnostic`]'s or an
+//! `EngineError`'s code, or as the code opening a `FitResult.warnings` or data-reader
+//! message — has a row here **and** in `docs/file-formats/check-report.qmd`, and
+//! neither lists a code nothing emits. `diagnostics_code_registry_tests.rs` enforces
+//! both (#1051) by scanning the non-test code under `src/` for code-shaped tokens, so
+//! write each code as a literal: one assembled at run time is invisible to it.
 //!
 //! | code | meaning |
 //! |------|---------|
@@ -122,6 +127,97 @@
 //! | `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA` | a `correlation cs(…)` line whose blocks partition the rows exactly as a kappa-carrying level's groups (nested, or the occasions of one level): the kappa is the same covariance (#1082 PR5). Raised by `fit()` and `ferx check --data`. Block `error_model` |
 //! | `W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA` | the same partitions agree in some subjects but not all: identified from the others, so it fits, with the count said (#1082 PR5). Raised by `fit()` and `ferx check --data` |
 //! | `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED` | a nested model reached an adaptive-dosing entry point, whose kappa stream draws one kappa per occasion (#1082); `simulate*` draws per level. Block `parameters`. Never by `ferx check` |
+//! | `W_PARSE` | generic code for a parse-time warning with no narrower code (e.g. mu-referencing notes, `W_NN_WEIGHT_DIRECT_REFERENCE`); the block context is in the message text |
+//! | `W_DATA_PATH_OVERRIDE` | an explicit data path (`--data`, R) and the model's `[data] path = ...` name different files; the explicit one is used (#690) |
+//! | `E_PRIOR_UNRESOLVED` | a `prior(...)` (or `[priors] from_fit`) cannot be resolved against the parameter layout: unknown name, a FIXed parameter, a block element, a duplicate, a bad central value, or an unexpanded `from_fit` (#254) |
+//! | `W_UNUSED_PARAM` | a theta, omega, kappa or sigma declared in `[parameters]` is not referenced by any model expression (sigma: by `[error_model]`), so it cannot affect predictions |
+//! | `E_KAPPA_WEIGHT_NONPOSITIVE` | a kappa's `weight = W` (κ ~ N(0, Ω_IOV / W)) evaluates to zero, negative or non-finite at an observation or dose record, at the model's initial θ (#1031) |
+//! | `W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION` | a kappa's sample-size weight is not constant across the observations of one occasion (or one group of its level under nested levels); reported once per kappa (#1031) |
+//! | `W_ADDITIVE_INIT_SCALE` | a `combined` error model's additive SD initial estimate is below 1% of the median abs(DV) of the observations it covers, which can trap the fit in a collapsed-additive local minimum |
+//! | `W_DATA` | `ferx check` relay code for a data-reader warning whose message states no `W_` code of its own |
+//! | `E_DOSE_NO_AMT` | the dataset has dose records (`EVID=1/4`) but no `AMT` column, so every dose amount would be zero (#753) |
+//! | `E_DOSE_CMT_OUT_OF_RANGE` | a dose record (any `AMT`, bolus or infusion) whose `CMT` exceeds the model's compartment count — the `[odes]` states, or the analytical model's compartments (#899) |
+//! | `E_DOSE_CMT_NOT_INFUSABLE` | an infusion with `AMT ≠ 0` into compartment 0 (`CMT=0`), which is a default bolus compartment with no zero-order target, on an ODE or event-walk analytical model (#899) |
+//! | `W_STEADY_STATE_INIT` | subject(s) have SS=1 doses while the analytical model declares an `[initial_conditions]` baseline; the baseline is superposed on the steady state and double-counts the starting amount (#521) |
+//! | `E_MODELED_DURATION_NO_PARAM` | a `RATE=-2` dose (modeled infusion duration) into compartment n on a model that declares no `D{n}` parameter; one per compartment. Not raised on a compartment-free model |
+//! | `E_MODELED_RATE_NO_PARAM` | a `RATE=-1` dose (modeled infusion rate) into compartment n on a model that declares no `R{n}` parameter; one per compartment. Not raised on a compartment-free model |
+//! | `W_MODELED_DURATION_NONPOSITIVE` | a modeled infusion duration `D{n}` (RATE=-2) is at or below its `1e-8` floor at a dose record at the initial typical values (η = 0); the dose is delivered as a bolus-like spike |
+//! | `W_MODELED_RATE_NONPOSITIVE` | a modeled infusion rate `R{n}` (RATE=-1) is at or below its `1e-8` floor at a dose record at the initial typical values (η = 0); the dose trickles in over a near-infinite duration |
+//! | `W_NN_WEIGHT_DIRECT_REFERENCE` | an expression reads a generated `[covariate_nn]` weight or bias θ directly; the analytic NN θ-gradient shortcut is disabled and every θ falls back to finite differences |
+//! | `E_THETA_LEVELS_UNBOUND` | a `theta NAME[...]` level block reached an entry point without being bound to data, so it has no levels and gathers NaN (#1064) |
+//! | `E_FREM_NON_GAUSSIAN_ENDPOINT` | FREM requested on a model that declares a non-Gaussian endpoint (`[event_model]` / `[binary_model]` / `[markov_model]`); FREM is Gaussian-only (#1199) |
+//! | `E_THETA_GATHER_INDEX_MISSING` | a `theta NAME[COL]` block is indexed by a data column a subject's observation or dose record carries no value for (#1064) |
+//! | `E_THETA_GATHER_INDEX_RANGE` | a `theta NAME[COL]` index column holds a value that is not a whole number in 1..=N for the block's N levels (often a 0-based column) (#1064) |
+//! | `E_RESIDUAL_CORRELATION_RANGE` | a residual `correlation` line's ρ range does not keep R positive definite (`cs` at or below −1/(n−1), `car1` ρ < 0, abs(ρ) ≥ 1) or a free ρ's bound exceeds ±0.995 (#1081) |
+//! | `E_RESIDUAL_CORRELATION_RESET` | an `ar1` / `car1` residual `correlation` block holds rows on both sides of an EVID=3/4 record that restarts TIME, so the time between them is undefined (#1081) |
+//! | `E_RESIDUAL_CORRELATION_TIES` | an `ar1` / `car1` residual `correlation` block has two rows at the same TIME: `ar1` cannot order them and `car1` makes R singular (#1081) |
+//! | `W_RESIDUAL_CORRELATION_INERT` | a residual `correlation … by …` line under which no block holds two observations in any subject, so ρ never enters the likelihood and stays at its initial value (#1081) |
+//! | `W_BLOCK_SIGMA_L2_ORDER` | a `block_sigma` correlated residual whose co-temporal rows can pair more than one way, with no `L2` column — the pairing follows CSV row order (#830) |
+//! | `W_L2_UNUSED` | the dataset has an `L2` column but the model declares no `block_sigma` correlated residual, so `L2` is inert and not available as a covariate (#830) |
+//! | `E_AGQ_NODES_ZERO` | `n_agq = 0` with a `focei` or `laplace` stage in the chain; use `n_agq = 1` for plain FOCEI / one-node Laplace |
+//! | `E_AGQ_NODES_TOO_LARGE` | a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) with `n_agq` above the 21-node per-dimension limit |
+//! | `E_AGQ_GRID_TOO_LARGE` | a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) whose tensor grid `n_agq^n_eta` exceeds 100,000 nodes per subject |
+//! | `E_AGQ_EVAL_ONLY` | `agq_eval_only = true` with no `laplace` stage in the method chain, or with `laplace` not the final stage |
+//! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
+//! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
+//! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
+//! | `E_BINARY_IOV_UNSUPPORTED` | a `[binary_model]` endpoint on a model with IOV (`n_kappa > 0`); the binary term is not in the outer IOV objective (#760) |
+//! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
+//! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
+//! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |
+//! | `E_VI_MODEL_UNSUPPORTED` | `method = vi` anywhere in a chain on a model with a non-Gaussian (TTE / categorical) endpoint or an SDE (`[diffusion]`) block, whose likelihood VI's fixed-η data term does not evaluate |
+//! | `W_VI_OMEGA_UNANCHORED` | `vi_kl = mc` with `vi_omega_update = adam` on a chain that runs VI leaves Ω driven only by a Monte-Carlo gradient; expect a noisy Ω trace and possible non-convergence |
+//! | `E_BLOCK_SIGMA_METHOD_UNSUPPORTED` | a `block_sigma` model with a stage other than `foce`, `focei`, `saem`, `imp`, `laplace` or `vi` in the chain (i.e. `gn`, `gn_hybrid`, `impmap`, `bayes`) |
+//! | `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED` | a `block_sigma` model with a free correlation whose chain runs a stage other than `foce`/`focei`/`laplace` after one of those; it would score the declared rho, not the estimate (#847) |
+//! | `E_BLOCK_SIGMA_M3_UNSUPPORTED` | `block_sigma` correlated residual errors with `bloq_method = m3` (censored-observation likelihood) |
+//! | `E_BLOCK_SIGMA_FREM_UNSUPPORTED` | `block_sigma` correlated residual errors on a FREM model (covariate pseudo-observations) |
+//! | `E_BLOCK_SIGMA_IIV_ON_RUV_UNSUPPORTED` | `block_sigma` correlated residual errors together with `iiv_on_ruv` residual-error scaling |
+//! | `E_BLOCK_SIGMA_IOV_UNSUPPORTED` | `block_sigma` correlated residual errors on a model with IOV (`n_kappa > 0`); the IOV inner objective does not use the full residual covariance |
+//! | `E_BLOCK_SIGMA_SDE_UNSUPPORTED` | a `block_sigma` SDE (`[diffusion]`) model with `saem` in the chain; SAEM's data term carries no EKF process noise (FOCE/FOCEI are fine) |
+//! | `E_BLOCK_SIGMA_TTE_UNSUPPORTED` | `block_sigma` correlated residual errors on a model with any non-Gaussian endpoint (TTE, binary/categorical, Markov), for every method |
+//! | `E_RESIDUAL_CORRELATION_SCOPE` | a residual `correlation` line with a method other than `foce` / `focei`, `n_agq > 1`, `bloq_method = m3`, FREM, a non-Gaussian endpoint, a mixture or an SDE model (#1081) |
+//! | `E_PRIOR_METHOD_UNSUPPORTED` | a parameter prior is in force but the last estimating stage is not `foce` / `focei` / `laplace` / `gn` / `gn_hybrid`, so the prior would be silently dropped (#254) |
+//! | `E_PRIOR_COV_METHOD_UNSUPPORTED` | a parameter prior is in force with the covariance step on and `covariance_method = s` or `rsr`, neither of which can carry a prior's curvature (#254) |
+//! | `E_ABSORPTION_DOMAIN` | a built-in absorption input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, igd `mat`/`cv2 ≤ 0`, a non-finite per-route `lag=`) is out of domain at typical values at some dose record |
+//! | `E_ABSORPTION_FRACTION` | a pathway fraction (`FR*fn(...)`) on a built-in absorption term is outside (0, 1], or the fractions on one compartment do not sum to 1 (±1e-4), at typical values at some dose record (#388) |
+//! | `E_ABSORPTION_RATE_ZERO_ORDER` | an infusion (`RATE>0`) into a compartment fed by a `zero_order()` absorption function; infusing a spanning window is not supported (#719) |
+//! | `E_ABSORPTION_SS_INFUSION` | a steady-state infusion (`SS=1` with `RATE>0`, any `II`) into a compartment fed by a built-in absorption input-rate function (#719) |
+//! | `E_ABSORPTION_SS_LAG` | an `SS=1` dose (`II > 0`) into a built-in absorption compartment that carries a lag (compartment `lagtime`/`ALAG` or a per-route `lag=`) (#719, #856) |
+//! | `E_ABSORPTION_SS_ZERO_ORDER` | an `SS=1` dose (`II > 0`) into a compartment fed by a `zero_order()` absorption function; periodic window equilibration is not implemented (#719) |
+//! | `E_ABSORPTION_DIFFUSION` | an `[odes]` model with a built-in absorption input-rate function (`transit()`, `igd()`, …) also has a `[diffusion]` block; the EKF propagation does not carry the input-rate forcing |
+//! | `E_TRANSIT_UNSUPPORTED` | a transit closed form (`one_cpt_transit` / `two_cpt_transit`) meets a feature it cannot serve: a non-depot (CMT≥2) dose, an EVID=3/4 reset, an SS infusion, or (twin-less) IOV, a TIME-dependent parameter, TV covariates, SS or an infusion (#386) |
+//! | `E_TRANSIT_FLIP_FLOP` | a twin-less transit closed form (`one_cpt_transit` / `two_cpt_transit` with no ODE twin) starts outside its convergence domain at η = 0 — flip-flop or (2-cpt) coincident eigenvalues — so it predicts zero (#776); also every uncertainty draw flip-flopped |
+//! | `W_TRANSIT_FLIP_FLOP` | a twin-carrying transit absorption model is in the flip-flop regime at typical values (η = 0) for some subject; ferx evaluates the equivalent ODE model there (informational) |
+//! | `E_IG_UNSUPPORTED` | an inverse-Gaussian closed form (`one_cpt_ig` / `two_cpt_ig`) meets a feature it cannot serve: a non-depot (CMT≥2) dose, an EVID=3/4 reset, an SS infusion, or (twin-less) IOV, a TIME-dependent parameter, TV covariates, SS or an infusion (#790) |
+//! | `E_IG_FLIP_FLOP` | a twin-less inverse-Gaussian closed form (`one_cpt_ig` / `two_cpt_ig` with no ODE twin) starts outside its convergence domain at η = 0 — flip-flop regime or (2-cpt) coincident disposition eigenvalues — so it predicts zero (#776); also every uncertainty draw flip-flopped |
+//! | `W_IG_FLIP_FLOP` | a twin-carrying inverse-Gaussian absorption model is in the flip-flop regime at typical values (η = 0) for some subject; ferx evaluates the equivalent ODE model there (informational) |
+//! | `W_IOV_NO_OCCASIONS` | an IOV model with an Ω_IOV was handed subjects with no occasion label after the occasion rule was applied, so they were simulated at κ = 0 with no inter-occasion variability (#1955, #1980) |
+//! | `W_SIMULATED_FLIP_FLOP` | some simulated individuals dosed before an observation drew an η in the flip-flop regime of a twin-less transit / IG closed form, so their dose-driven concentration was clamped to zero (#1823) |
+//! | `W_UNCERTAINTY_DRAWS_SKIPPED` | some uncertainty draws put a twin-less transit / IG closed form in the flip-flop regime at typical values and were skipped, so intervals built from the rest are biased (#786, #1485) |
+//! | `W_RTTE_DEGENERATE` | a simulated subject's recurrent-event hazard is degenerate (expected events non-finite or above 1e6, or the stream passed 1e6 events); its stream was skipped or truncated and censored at the horizon (#762) |
+//! | `W_TTE_DEGENERATE_HAZARD` | a simulated subject's analytic hazard draw had a non-positive or non-finite effective rate, so no event was generated and the subject is censored at the observation window (#763) |
+//! | `W_STALLED_AT_INIT` | the fit never left its initial estimates (optimizer escape test, or no free θ, Ω or σ moved by 1%), so the reported objective is that of the initial values; silent when `outer_maxiter = 0` |
+//! | `W_NO_FEASIBLE_EVAL` | not one outer trial was feasible: every evaluation was rejected by the EBE convergence guard or returned a non-finite objective, so the estimates are the starting values and `converged` is false (#1617) |
+//! | `W_NONFINITE_OBJECTIVE` | the objective at the final estimates is NaN, infinite, or at or above the `1e14` divergence sentinel, so the fit is reported `converged: false` (#1303) |
+//! | `W_EBE_START_DEPENDENT` | the EBEs at the final parameters depend on where the inner loop starts: a cold re-solve scores materially worse or non-finite (#833), lower than the minimised objective (#1565), or the Sobol screen moved subjects (#2013) |
+//! | `W_VI_BAD_BASIN` | VI's final ELBO tightness check found the data term more than 25× further above its value at the variational means than expected, so the fit is in a bad basin and reported `converged: false` |
+//! | `W_ODE_SOLVER_DIAGNOSTICS` | the ODE solver did not integrate cleanly on that pass: kept min-step clamps, rejected or failed stiff escalations, unfinished, stiff-aborted or diverged segments, or an abandoned non-finite timeline (#1080, #1304) |
+//! | `W_ODE_SOLVER_ESCALATION_NOTE` | informational: `ode_method = auto` escalated some segments to a stiff stepper and the integration was otherwise clean (no rejected escalation, no min-step clamp) |
+//! | `W_DERIVED_CMT_IOV_UNSUPPORTED` | a `[derived]` expression reads `compartments[i]` on a fit where some subject has IOV (κ); those subjects have no compartment states, so it evaluates to NaN |
+//! | `W_DERIVED_CMT_TV_ANALYTICAL` | analytical model with a `[derived]` expression reading `compartments[i]` and subject(s) with time-varying covariates; compartment states are not built for those subjects, so the expression is NaN |
+//! | `W_DERIVED_CMT_TV_ODE` | `[odes]` model with a `[derived]` expression reading `compartments[i]` and subject(s) with time-varying covariates; their compartment states come from first-observation parameters and are approximate |
+//! | `W_DERIVED_CMT_RESET_ANALYTICAL` | a `[derived]` `compartments[i]` read on an analytical model where some subject has an EVID=3/4 reset; those subjects get NaN states and compartment-based integrals |
+//! | `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` | a `[derived]` `compartments[i]` read on an analytical model with a dose superposition cannot place (infusion outside central, bolus outside CMT 1); those subjects get NaN states (#400, #375) |
+//! | `W_DERIVED_INIT_ANALYTICAL` | analytical model with an `[initial_conditions]` baseline and a `[derived]` expression reading `compartments[i]`; compartment states are not available, so the expression is NaN (#521) |
+//! | `E_RUV_MAGNITUDE_NONPOSITIVE` | a custom residual-error magnitude (e.g. a `weight = ...` modifier) or a `power(SIGMA, P)` exponent evaluates to zero, negative or non-finite at an observation, at the model's initial θ (#484, #1182) |
+//! | `E_DOSE_ATTR_DOUBLE_USE` | a dose attribute the engine applies at the dose event (`F`, `LAGTIME`/`ALAG`, `F{n}`/`ALAG{n}`, or a `D{n}`/`R{n}` a coded `RATE` lands on) is also read by the model, so it is applied twice (#993, #1004) |
+//! | `E_DOSE_ATTR_NONFINITE` | a dose attribute (lag time, bioavailability, or a modeled `D{n}`/`R{n}` behind a coded `RATE`) is `NaN` or infinite at typical values at some dose record's own snapshot (#1189, #1235) |
+//! | `E_ETA_NOT_DECLARED` | an unresolved identifier reads as a random effect (`ETA…` / `KAPPA…`) but no `omega` / `kappa` declaration defines it and the data has no such column |
+//! | `W_ETA_NOT_DECLARED` | as `E_ETA_NOT_DECLARED`, reported without `--data`, where the dataset might still supply the column |
+//! | `E_IOV_MISSING_OCC` | the model declares kappa (IOV) parameters but no occasion labels were found (no `iov_column` read and no `iov_occasion` derivation) |
+//! | `E_NONFINITE_DV` | a subject carries a non-finite (`NaN`/`Inf`) observation, usually a simulation-reader population passed to `fit()` |
+//! | `W_DESIGN_DV` | simulation reader only: `EVID=0` rows with a missing `DV` were kept as design points to simulate at (#957) |
+//! | `W_INIT_NOT_REPRESENTABLE` | a declared initial value the packer itself moved before any box existed — the `1e-10` log floor, or the Fisher-z `±3` rail on a free `block_sigma` correlation (#1307) |
 
 use serde::Serialize;
 
@@ -540,3 +636,7 @@ mod tests {
 #[cfg(test)]
 #[path = "diagnostics_uncoded_sites.rs"]
 mod uncoded_sites;
+
+#[cfg(test)]
+#[path = "diagnostics_code_registry_tests.rs"]
+mod code_registry;
