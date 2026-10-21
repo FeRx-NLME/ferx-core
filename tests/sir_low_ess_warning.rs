@@ -211,8 +211,11 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // aarch64): the first outer evaluation now starts every occasion's κ at the pre-flight's
     // κ̂ instead of 0, so its inner solves stop at a different point inside `inner_tol`, the
     // outer path from there differs, and the fixed-seed SIR proposal is built from the
-    // covariance at a slightly different optimum. The FOCEI literals stayed inside
-    // `ESS_REL_TOL` again.
+    // covariance at a slightly different point of the same optimum. Measured base against
+    // head on one machine (macOS arm64, so for attribution only): the first OFV moves
+    // 332.264851 → 332.264852, the optimizer stops at OFV 205.09032950834 → 205.09032950484
+    // (−3.5e-9), worst θ TVKA 2.7e-6 relative, |g|∞ 1.5e-3 → 1.8e-4. The FOCEI literals
+    // stayed inside `ESS_REL_TOL` again.
     assert_ess(f.sir_ess, 402.382_022_243_937_3, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
