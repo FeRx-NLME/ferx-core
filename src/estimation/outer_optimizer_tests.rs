@@ -5,7 +5,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::covariance::{
     assemble_score_cross_product, build_non_pd_fallback_proposal, combine_covariance,
     cov_progress_eta, cov_progress_should_print, cov_progress_step, extract_eigenvalues,
-    format_non_pd_warning, invert_psd_with_floor, packed_param_label, select_fd_step,
+    format_non_pd_warning, invert_psd_with_floor, packed_param_label, select_fd_step, CoordUnits,
     FALLBACK_PROPOSAL_MAX_COND,
 };
 use crate::estimation::parameterization::{compute_bounds, pack_params};
@@ -318,7 +318,7 @@ fn test_combine_covariance_collapses_when_s_equals_r() {
         CovarianceMethod::CrossProduct,
         CovarianceMethod::Sandwich,
     ] {
-        let cov = combine_covariance(m, r_inv.clone(), &r, &[false; 2])
+        let cov = combine_covariance(m, r_inv.clone(), &r, &[CoordUnits::Dimensionless; 2])
             .unwrap_or_else(|| panic!("{m:?} should produce a covariance"));
         assert_mat_close(&cov, &r_inv, 1e-9, &format!("{m:?} with S=R"));
     }
@@ -331,8 +331,13 @@ fn test_combine_covariance_sandwich_matches_explicit_product() {
     let r = l.transpose() * &l;
     let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
     let s = DMatrix::from_row_slice(2, 2, &[3.0, 0.4, 0.4, 2.0]);
-    let sandwich = combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &[false; 2])
-        .expect("sandwich");
+    let sandwich = combine_covariance(
+        CovarianceMethod::Sandwich,
+        r_inv.clone(),
+        &s,
+        &[CoordUnits::Dimensionless; 2],
+    )
+    .expect("sandwich");
     let expected = &r_inv * &s * &r_inv;
     assert_mat_close(&sandwich, &expected, 1e-12, "sandwich = R⁻¹SR⁻¹");
     // Sandwich must stay symmetric (S and R⁻¹ are symmetric).
@@ -359,13 +364,19 @@ fn test_combine_covariance_singular_s() {
             CovarianceMethod::CrossProduct,
             r_inv.clone(),
             &s_rank1,
-            &[false; 2]
+            &[CoordUnits::Dimensionless; 2]
         )
         .is_none(),
         "S⁻¹ must report singular S"
     );
     assert!(
-        combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1, &[false; 2]).is_some(),
+        combine_covariance(
+            CovarianceMethod::Sandwich,
+            r_inv,
+            &s_rank1,
+            &[CoordUnits::Dimensionless; 2]
+        )
+        .is_some(),
         "sandwich must tolerate rank-deficient S"
     );
 }
