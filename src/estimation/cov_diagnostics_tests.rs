@@ -1470,7 +1470,7 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
     // diag(1, 1e-11) is positive definite, and `invert_psd_with_floor` clips it, so the
     // fallback gate fires for a sampler and not for FOCEI.
     let r = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 1e-11]));
-    let inv = crate::estimation::covariance::invert_psd_with_floor(&r, &[]).expect("inverse");
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&r).expect("inverse");
     assert!(
         inv.min_eigenvalue > 0.0 && inv.n_clipped == 1,
         "{} {}",
@@ -1489,7 +1489,7 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
     ));
     // And the absolute-floor cell: diag(1e-13, 2e-13) is clipped by `1e-12` at condition 2.
     let tiny = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-13, 2e-13]));
-    let inv = crate::estimation::covariance::invert_psd_with_floor(&tiny, &[]).expect("inverse");
+    let inv = crate::estimation::covariance::invert_psd_with_floor(&tiny).expect("inverse");
     assert!(
         inv.min_eigenvalue > 0.0 && inv.n_clipped == 2,
         "{} {}",

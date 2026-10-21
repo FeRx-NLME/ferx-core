@@ -5,7 +5,7 @@
 //! `condition_free_proposal` floored that matrix's eigenvalues at `max(1e-10·λ_max, 1e-12)`, so
 //! at `k = 1e5` the θ's own variance became `λ_max` and every other direction fell under the
 //! floor, and at `k = 3e-6` the θ's variance fell under the absolute `1e-12`. The covariance
-//! step itself is units-free since #2145 (`tests/identity_theta_covariance_floor.rs`), so what is
+//! step itself is units-free since #2145 (`tests/cov_floor_identity_theta_units.rs`), so what is
 //! measured here is SIR's own floor. These fits evaluate once (`outer_maxiter = 0`) and compare
 //! each rescaled file with the same model at `k = 1`.
 
@@ -133,14 +133,13 @@ fn rescaling_an_identity_packed_theta_leaves_every_sir_interval_where_it_was() {
         eprintln!(
             "WORST {label}: CI {worst:.3e}, ESS {ess:.6} vs {ess_ref:.6} (rel {ess_rel:.3e})"
         );
-        // Before #2179, on macOS arm64 at fe136960: k = 1e5 moved a CI by 25 % and the ESS
+        // Before #2179, on macOS arm64 at 594d1e75: k = 1e5 moved a CI by 25 % and the ESS
         // from 411.3 to 66.8, k = 1e6 by 26× with an ESS of 1.0, k = 3e-6 by 16 % with 212.9,
         // and at k = 1e8 every one of the 1000 draws had an invalid weight. Since, the draws
         // are `ŷ + L·z` with `L` exactly `K·L₁`, so what is left is rounding: worst CI
-        // difference 2.3e-15 (k = 1e6) and ESS 1.5e-10 (k = 1e6) on macOS arm64, and
-        // 3.9e-15 (k = 1e6) and 2.8e-10 (k = 1e5) on Linux x86_64 (glibc 2.28). The ESS
+        // difference 2.3e-15 (k = 1e6) and ESS 1.6e-10 (k = 1e8) on macOS arm64. The ESS
         // moves more than the CIs because the weights carry the objective's own rounding at
-        // each draw. The bounds are 256× and 36× the Linux worst.
+        // each draw. The bounds are 430× and 60× the macOS worst.
         if !(worst < 1e-12) {
             failures.push(format!("{label}: worst relative CI difference {worst:e}"));
         }

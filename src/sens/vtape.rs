@@ -700,6 +700,10 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     fn div_taped(&self, o: &Self, ib: f64, r: &Self) -> u32 {
         match (self.i == NONE, o.i == NONE) {
             (true, true) => NONE,
+            // A constant exact zero over anything is the constant zero — no derivative, as
+            // `mul_taped`'s constant-zero factor. Without it `0 / V` with `V` taped pushes a
+            // node, and the zero stops being structural (`linsolve::structural_zero`).
+            (true, false) if self.zero_tan() && self.v == 0.0 => NONE,
             (false, true) if o.zero_tan() => self.scaled(ib, r),
             _ => {
                 let (a, b) = (self.mat(), o.mat());
@@ -1552,6 +1556,24 @@ mod tests {
         let b = T::lincomb(a, 0.3, &[0.5, -0.2], &[p0 * p1, a * e1]);
         let q = (b * b + c(2.0)).sqrt().ln() + b.pow(c(1.7)) / (c(1.5) + p1 * e0);
         q - (c(0.2) * e0 - e1).inv_logit() * c(3.0) + (c(0.3) * p0 * e1).cos()
+    }
+
+    /// A constant exact zero divided by a taped value is the constant zero: no tape node and
+    /// zero tangents, as a constant-zero factor in `mul_taped`. `ode::linear` extracts a
+    /// generator column as `(f(s·e_j) − f(0))/s`, and `KA·x/V1` at `x = 0` reaches it as
+    /// `0/V1`; a node there makes every entry of the row non-structural for the outer gradient.
+    /// Mutation: drop the `(true, false)` zero arm in `div_taped` → `z.i` is a node.
+    #[test]
+    fn a_constant_zero_over_a_taped_value_is_an_untaped_zero() {
+        vtape_reset(2);
+        let v = DualV::<1, 0>::leaf(2.5, [0.0], []);
+        assert_ne!(v.i, NONE, "premise: the divisor is on the tape");
+        let z = DualV::<1, 0>::constant(0.0) / v;
+        assert_eq!(z.i, NONE);
+        assert!(z.v == 0.0 && z.g == [0.0]);
+        assert!(z.is_constant());
+        // A non-zero constant over a taped value still records.
+        assert_ne!((DualV::<1, 0>::constant(1.0) / v).i, NONE);
     }
 
     /// Directions `u₀ = (1, −0.2)`, `u₁ = (0.3, 1)` in η: the η leaves' tangents are their

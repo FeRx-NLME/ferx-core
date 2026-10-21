@@ -1752,10 +1752,20 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 /// fingerprinted population, the bundle still loads: the population is `None` and
 /// the returned note says why (#1685 review r1 #2). The θ, Ω and σ do not depend on
 /// how this version reads a CSV, and `run_sir` / `run_covariance` refuse a wrong
-/// population where it is used. One that does not record both (a bundle saved
-/// before #1685, or a fit made in memory with no settings to replay) is read as
-/// before: the model's `[data]` renames and endpoint routing only, unverified, since
-/// that read never claimed to reproduce the fit's.
+/// population where it is used.
+///
+/// A fit made in memory (`prepare_run` + [`fit`](crate::fit)) records a fingerprint
+/// but no reader settings (#1941). Its `data.csv` is read with the settings the
+/// model file states ([`ReaderSettings::from_parsed`](crate::ReaderSettings::from_parsed):
+/// `[data]` renames, `[covariates]`, `iov_column`, `[data_selection]`) and checked
+/// against the fingerprint the same way, so an IOV fit reloads with its occasions —
+/// read routing-only, it came back with none and its occasion column as a
+/// covariate. A caller that built the population some other way gets `None` and the
+/// note, not a population known to be wrong.
+///
+/// A bundle with no current fingerprint (saved before #1685) is read as before: the
+/// model's `[data]` renames and endpoint routing only, unverified, since that read
+/// never claimed to reproduce the fit's.
 fn read_bundled_population(
     bytes: &[u8],
     model_source: &str,
@@ -1772,12 +1782,20 @@ fn read_bundled_population(
         .as_ref()
         .filter(|f| f.is_current());
     match (parsed, &fit.reader_settings, fingerprint) {
-        (Ok(mut parsed), Some(settings), Some(fingerprint)) => {
+        (Ok(mut parsed), recorded, Some(fingerprint)) => {
+            // A fit made in memory (`prepare_run` + `fit`) records no settings but
+            // does record a fingerprint (#1941): read it the way the model file reads
+            // its data — `[covariates]`, `iov_column`, `[data_selection]` included —
+            // since the routing-only read gave an IOV fit no occasions.
+            let settings = match recorded {
+                Some(settings) => settings.clone(),
+                None => crate::api::ReaderSettings::from_parsed(&parsed),
+            };
             let replayed = (|| -> Result<Population, String> {
                 // Both codes below are dropped on purpose: the text only feeds the
                 // replay warning. Both are listed among the uncoded sites (#1772).
                 let (mut population, _) =
-                    crate::api::read_population_with_diag(&parsed.model, settings, data_path)
+                    crate::api::read_population_with_diag(&parsed.model, &settings, data_path)
                         .map_err(|d| d.message)?;
                 // The fit's population carries the level index columns its binding
                 // wrote; write them the same way, from the fit's own bindings.
@@ -1797,13 +1815,18 @@ fn read_bundled_population(
                     Some(d) => Err(format!("it is not the population the fit was given: {d}")),
                 }
             })();
+            let read_with = if recorded.is_some() {
+                "the fit's recorded reader settings"
+            } else {
+                "the model file's reader settings (the fit recorded none)"
+            };
             Ok(match replayed {
                 Ok(population) => (Some(population), None),
                 Err(why) => (
                     None,
                     Some(format!(
-                        "load_fit: the bundled data.csv was not loaded. Read with the \
-                         fit's recorded reader settings, {why}. The bundled data, or how \
+                        "load_fit: the bundled data.csv was not loaded. Read with \
+                         {read_with}, {why}. The bundled data, or how \
                          this version of ferx reads it, has changed since the fit was \
                          saved. The estimates are loaded; to run `run_sir` or \
                          `run_covariance`, pass the fit's population or refit."
@@ -4705,6 +4728,94 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.starts_with("load_fit:")));
+    }
+
+    /// #1941: a fit made in memory (`prepare_run` + `fit`) records a fingerprint but
+    /// no reader settings. Its bundled `data.csv` is read with the model file's
+    /// settings, so the IOV model's `iov_column` gives the reloaded population its
+    /// occasions and `OCC` is not read as a covariate; the read is checked against
+    /// the fingerprint. Measured on the old routing-only read: 0 occasions for the
+    /// fit's 220 and `covariate_names == ["OCC"]`, which `run_covariance` refused as
+    /// "extra `OCC`". Controls: with no fingerprint (a pre-#1685 bundle) the legacy
+    /// routing-only read is kept — and it is the occasion-less population, so the
+    /// fixture straddles the fix; with a fingerprint of another population the
+    /// bundle loads no population and a note naming the model file's settings.
+    ///
+    /// Mutations — route the settings-less arm back to `read_population_routed_by`:
+    /// the occasion count and the covariate names die; skip the verification: the
+    /// tampered bundle loads its population; drop the `read_with` branch: the note
+    /// equality dies.
+    #[test]
+    fn load_fit_reads_an_in_memory_iov_fit_with_the_model_file_settings() {
+        let prep =
+            crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+                .unwrap();
+        let occasions =
+            |p: &Population| p.subjects.iter().map(|s| s.occasions.len()).sum::<usize>();
+        let want = occasions(&prep.population);
+        assert!(want > 0, "the fixture must carry occasions");
+        assert!(!prep.population.covariate_names.iter().any(|c| c == "OCC"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let save_load = |fit: &FitResult| {
+            let path = dir.path().join("iov.fitrx");
+            save_fit(
+                fit,
+                &prep.population,
+                &prep.model_text,
+                &path,
+                SaveFitOptions {
+                    include_data: Some(PathBuf::from("data/warfarin_iov.csv")),
+                },
+            )
+            .unwrap();
+            load_fit(&path).unwrap()
+        };
+        let mut fit = minimal_fit_result();
+        fit.model_text = Some(prep.model_text.clone());
+        fit.reader_settings = None;
+        fit.population_fingerprint =
+            Some(crate::types::PopulationFingerprint::of(&prep.population));
+
+        let loaded = save_load(&fit);
+        let p = loaded.population.expect("the in-memory fit's data reloads");
+        assert_eq!(occasions(&p), want);
+        assert_eq!(p.covariate_names, prep.population.covariate_names);
+        let fp = fit.population_fingerprint.as_ref().unwrap();
+        assert_eq!(fp.first_difference(&p), None);
+        assert!(!loaded
+            .fit
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("load_fit:")));
+
+        // No fingerprint: the legacy routing-only read, unchanged and occasion-less.
+        let mut legacy = fit.clone();
+        legacy.population_fingerprint = None;
+        let p = save_load(&legacy).population.unwrap();
+        assert_eq!(occasions(&p), 0);
+        assert_eq!(p.covariate_names, vec!["OCC".to_string()]);
+
+        // A fingerprint the model file's settings do not reproduce: no population.
+        let mut other = prep.population.clone();
+        other.subjects.pop();
+        let mut tampered = fit.clone();
+        tampered.population_fingerprint = Some(crate::types::PopulationFingerprint::of(&other));
+        let loaded = save_load(&tampered);
+        assert!(loaded.population.is_none());
+        let note = loaded
+            .fit
+            .warnings
+            .last()
+            .expect("a note says why the data was not loaded");
+        assert!(
+            note.starts_with(
+                "load_fit: the bundled data.csv was not loaded. Read with the model \
+                 file's reader settings (the fit recorded none), it is not the population \
+                 the fit was given: "
+            ),
+            "{note}"
+        );
     }
 
     #[test]

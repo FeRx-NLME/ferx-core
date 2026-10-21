@@ -20,10 +20,9 @@
 //! # Strictness
 //!
 //! `FitResult::converged` is a bool. It is never `true` at an objective that is
-//! not a usable number — `NaN`, infinite, or the clamped divergence sentinel all
-//! demote it, with a `W_NONFINITE_OBJECTIVE` warning saying which (#1303) — but
-//! it does not distinguish a genuine optimum
-//! from an init stall (#751), a boundary estimate, an ill-conditioned
+//! not a usable number — `NaN`, infinite, or at or above the `1e14` divergence
+//! cutoff all demote it, with a `W_NONFINITE_OBJECTIVE` warning saying which
+//! (#1303) — but it does not distinguish a genuine optimum from an init stall (#751), a boundary estimate, an ill-conditioned
 //! covariance step or a near-singular correlation matrix. Under automation all
 //! of those become *model-selection errors*: a candidate that never left its
 //! initial estimates is ranked on an OFV that says nothing about the model.
@@ -253,8 +252,8 @@ pub(crate) fn bic_inputs_for(
 pub struct Strictness {
     /// Fail a fit with `converged == false`. This already covers an internal
     /// runaway-guard hit, which demotes `converged` (#1118), and an objective
-    /// that is `NaN`, infinite or the clamped divergence sentinel, which demotes
-    /// it too (#1303) — so a candidate whose OFV is not a real number is
+    /// that is `NaN`, infinite or at or above the `1e14` divergence cutoff, which
+    /// demotes it too (#1303) — so a candidate whose OFV is not a real number is
     /// excluded by this gate rather than ranked on it.
     pub require_converged: bool,
     /// Fail unless the covariance step ran and produced uncertainty:
@@ -428,8 +427,7 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
     // condition number behind for the thresholds to find: measured on warfarin's one-
     // peripheral candidate, correlation-matrix condition number 2.98 and max |r| 0.35 next to
     // a TVQ RSE of 293519%. The floor fires only on an indefinite Hessian or one with
-    // `λ_min < max(1e-10·λ_max, 1e-12)` (`invert_psd_with_floor`, once an identity-packed θ's
-    // units are equilibrated out, #2145) — the analogue of NONMEM's "R matrix algorithmically singular" —
+    // `λ_min < max(1e-10·λ_max, 1e-12)` (`invert_psd_with_floor`) — the analogue of NONMEM's "R matrix algorithmically singular" —
     // so it fails here whenever either matrix-reading gate is enabled, rather than passing on
     // numbers the floor manufactured.
     //

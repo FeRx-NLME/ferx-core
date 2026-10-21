@@ -274,19 +274,19 @@ pub(crate) const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
 /// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
 ///
 /// Neither the floor nor `|λ|` is invariant to rescaling one coordinate, so
-/// `equilibrate` is [`invert_psd_with_floor`]'s mask (#2179): the eigenvalue
-/// modification runs on `C = D⁻¹ H D⁻¹` and the proposal is `D⁻¹ C̃⁻¹ D⁻¹`,
-/// which is unchanged when an identity-packed θ is written in other units. An
-/// empty mask marks nothing and leaves the result bit-identical.
+/// `unit_coords` is the mask of [`invert_psd_with_floor_unit_free`] (#2179): the
+/// eigenvalue modification runs on its `C = D⁻¹ H D⁻¹` and the proposal is
+/// `D⁻¹ C̃⁻¹ D⁻¹`, which is unchanged when an identity-packed θ is written in other
+/// units. A mask that flags nothing leaves the result bit-identical.
 pub(crate) fn build_non_pd_fallback_proposal(
     hess_free_sym: &DMatrix<f64>,
     free_idx: &[usize],
     n_full: usize,
     inflation: f64,
-    equilibrate: &[bool],
+    unit_coords: &[bool],
 ) -> DMatrix<f64> {
-    let d = equilibration_scales(hess_free_sym, equilibrate);
-    let eig = SymmetricEigen::new(divide_by_scales(hess_free_sym.clone(), &d));
+    let d = unit_coordinate_scales(hess_free_sym, unit_coords);
+    let eig = SymmetricEigen::new(divide_by_scales(hess_free_sym.clone(), d.as_deref()));
     // Largest absolute eigenvalue anchors the relative floor. Guard the
     // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
     // stays positive and we never divide by zero.
@@ -301,7 +301,10 @@ pub(crate) fn build_non_pd_fallback_proposal(
     // any floating-point asymmetry from the matrix products.
     let cov_free_raw =
         &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
-    let cov_free = divide_by_scales((&cov_free_raw + cov_free_raw.transpose()) * 0.5, &d);
+    let cov_free = divide_by_scales(
+        (&cov_free_raw + cov_free_raw.transpose()) * 0.5,
+        d.as_deref(),
+    );
     embed_free(&cov_free, free_idx, n_full)
 }
 
@@ -461,26 +464,29 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
 /// `S`. `Sandwich` never inverts `S`, so it stays defined even when `S` is
 /// rank-deficient.
 ///
-/// `equilibrate` is [`invert_psd_with_floor`]'s mask for the `S` inverse, read only by
-/// `CrossProduct`.
+/// `unit_coords` flags the coordinates whose units the floor on `S` must not see
+/// ([`invert_psd_with_floor_unit_free`], #2145).
 pub(crate) fn combine_covariance(
     method: CovarianceMethod,
     r_inv: DMatrix<f64>,
     s: &DMatrix<f64>,
-    equilibrate: &[bool],
+    unit_coords: &[bool],
 ) -> Option<DMatrix<f64>> {
     match method {
         CovarianceMethod::Hessian => Some(r_inv),
         CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
-        CovarianceMethod::CrossProduct => invert_cross_product(s, equilibrate),
+        CovarianceMethod::CrossProduct => invert_cross_product(s, unit_coords),
     }
 }
 
 /// `S⁻¹`, accepted only when `S` is full-rank (no eigenvalue clipped); a rank-deficient or
 /// indefinite `S` yields `None`. The whole of the `CrossProduct` estimator — it reads no `R` —
 /// which is why `covariance_method = s` can call it without building one (#1803).
-fn invert_cross_product(s: &DMatrix<f64>, equilibrate: &[bool]) -> Option<DMatrix<f64>> {
-    match invert_psd_with_floor(s, equilibrate) {
+///
+/// The rank test is the floor of [`invert_psd_with_floor_unit_free`], so an identity-packed θ
+/// written in large or small units is not refused as rank-deficient (#2145).
+fn invert_cross_product(s: &DMatrix<f64>, unit_coords: &[bool]) -> Option<DMatrix<f64>> {
+    match invert_psd_with_floor_unit_free(s, unit_coords) {
         Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
         _ => None,
     }
@@ -547,11 +553,11 @@ pub(crate) fn combine_covariance_and_reference(
     r_inv: DMatrix<f64>,
     r_inv_ref: Option<DMatrix<f64>>,
     s: &DMatrix<f64>,
-    equilibrate: &[bool],
+    unit_coords: &[bool],
 ) -> Option<(DMatrix<f64>, Option<DMatrix<f64>>)> {
-    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s, equilibrate));
+    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s, unit_coords));
     Some((
-        combine_covariance(method, r_inv, s, equilibrate)?,
+        combine_covariance(method, r_inv, s, unit_coords)?,
         reference,
     ))
 }
@@ -847,26 +853,87 @@ fn analytic_cov_declines(
     out
 }
 
-/// Whether the covariance step is expected to take the analytic R-matrix: no clause of
-/// [`analytic_cov_declines`]'s walk fires. A subject can still bail at run time (a trial point
-/// the recorder cannot form), and then only that subject takes the stencil (the hybrid route).
+/// Which route the covariance step is expected to build `R` on, predicted before the fit from
+/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates, then
+/// `cov_width_declines` per subject, then the salvage cut [`salvages_declined`] the assembly
+/// itself applies. The prediction can still be wrong when a subject bails at run time (a trial
+/// point the recorder cannot form) — then that subject joins the salvaged minority, or, past
+/// the cut, the whole population takes the stencil — which is why every message built from it
+/// is worded as an expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredictedRRoute {
+    /// Every subject on the analytic assembly: no finite-difference objective at all.
+    Analytic,
+    /// A strict minority of subjects declines; the `2·n²`-point stencil runs over those
+    /// `declined` of `n_subjects` alone (#1514).
+    Salvage { declined: usize, n_subjects: usize },
+    /// The whole-population stencil.
+    Stencil,
+}
+
+/// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
+/// stencil, rather than taking the population stencil — the one cut both
+/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
+    (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
+}
+
+/// The covariance step's expected `R` route; see [`PredictedRRoute`].
 ///
 /// What this decides is the *cost* of `R`: one profile-Hessian pass per subject instead of
 /// `fd_r_objective_evals(n)` reconverged population objectives, so the large-problem reroute to
-/// `S` and the pre-fit cost note, both written for the stencil, do not apply.
+/// `S` and the pre-fit cost note, both written for the stencil, do not apply on
+/// [`PredictedRRoute::Analytic`].
+pub(crate) fn predicted_r_route(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> PredictedRRoute {
+    if !analytic_cov_model_declines(model, options, is_mixture).is_empty() {
+        return PredictedRRoute::Stencil;
+    }
+    let n_subjects = population.subjects.len();
+    match width_declined_subjects(model, population, options) {
+        0 => PredictedRRoute::Analytic,
+        declined if salvages_declined(declined, n_subjects) => PredictedRRoute::Salvage {
+            declined,
+            n_subjects,
+        },
+        _ => PredictedRRoute::Stencil,
+    }
+}
+
+/// Whether the covariance step is expected to take the analytic R-matrix for every subject:
+/// [`predicted_r_route`] is [`PredictedRRoute::Analytic`], i.e. no clause of
+/// [`analytic_cov_declines`]'s walk fires.
 pub(crate) fn analytic_r_expected(
     model: &CompiledModel,
     population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> bool {
-    analytic_cov_scope_declines(model, population, options, is_mixture).is_empty()
+    predicted_r_route(model, population, options, is_mixture) == PredictedRRoute::Analytic
 }
 
 /// The clauses of [`analytic_cov_declines`], empty when none fires.
 fn analytic_cov_scope_declines(
     model: &CompiledModel,
     population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> Vec<CovScopeDecline> {
+    let mut out = analytic_cov_model_declines(model, options, is_mixture);
+    if width_declined_subjects(model, population, options) > 0 {
+        out.push(CovScopeDecline::TooManyRandomEffects);
+    }
+    out
+}
+
+/// The model-level clauses of [`analytic_cov_declines`] — every one that sends the whole
+/// population to the stencil, whatever the subjects look like.
+fn analytic_cov_model_declines(
+    model: &CompiledModel,
     options: &FitOptions,
     is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
@@ -889,15 +956,22 @@ fn analytic_cov_scope_declines(
     if model.has_non_gaussian() {
         out.push(CovScopeDecline::NonGaussianEndpoint);
     }
+    out
+}
+
+/// How many subjects are too wide for the profile Hessian's buckets under the fit's
+/// objective — the per-subject clause, through the rule the Hessian dispatch itself runs on.
+fn width_declined_subjects(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> usize {
     let objective = cov_objective(options);
-    if population
+    population
         .subjects
         .iter()
-        .any(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
-    {
-        out.push(CovScopeDecline::TooManyRandomEffects);
-    }
-    out
+        .filter(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
+        .count()
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1104,7 +1178,7 @@ pub(super) fn analytic_cov_assembly(
     if declined.is_empty() {
         return AnalyticCovAssembly::Full(acc);
     }
-    if declined.len() as f64 >= SALVAGE_MAX_DECLINED_FRACTION * population.subjects.len() as f64 {
+    if !salvages_declined(declined.len(), population.subjects.len()) {
         return AnalyticCovAssembly::Unavailable;
     }
     AnalyticCovAssembly::Partial {
@@ -1740,10 +1814,9 @@ pub(crate) fn compute_covariance_for(
     // covariance step (#243). Since #1018 the optimizer holds them through the
     // same mask, so there is one gate, not a second structural filter here.
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
-    // The coordinates whose units the eigenvalue floor must not see (#2145), for both the `S`
-    // and the `R` inverse.
-    let equilibrate = identity_theta_mask(template, &free_idx);
     let n_free = free_idx.len();
+    // The free coordinates whose units the eigenvalue floor on `S` and `R` must not see (#2145).
+    let unit_coords = identity_theta_free_mask(template, &free_idx);
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
@@ -1782,7 +1855,7 @@ pub(crate) fn compute_covariance_for(
             Ok(s) => s,
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        let Some(cov_free) = invert_cross_product(&s_free, &equilibrate) else {
+        let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
             return CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string());
         };
         if options.verbose {
@@ -2055,13 +2128,11 @@ pub(crate) fn compute_covariance_for(
         }
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
-    // The SIR fallback proposal of every `FailedNonPd` arm below. One spelling, so the
-    // equilibration mask (#2179) is passed in one place and the test that pins it on one arm
-    // pins it on all three.
+    // The `|λ|`-rectified proposal of every `FailedNonPd` arm, in the basis the floor above uses.
     let fallback_proposal =
-        || build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0, &equilibrate);
+        || build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0, &unit_coords);
 
-    let inv = match invert_psd_with_floor(&hess_free_sym, &equilibrate) {
+    let inv = match invert_psd_with_floor_unit_free(&hess_free_sym, &unit_coords) {
         Some(inv) => inv,
         None => {
             // `invert_psd_with_floor` returns None in two distinct cases, and we
@@ -2169,7 +2240,7 @@ pub(crate) fn compute_covariance_for(
             }
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free, &equilibrate) {
+        match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free, &unit_coords) {
             Some(pair) => pair,
             None => {
                 debug_assert!(
@@ -2334,15 +2405,12 @@ fn offdiag_nan_warning(
 }
 
 /// Result of [`invert_psd_with_floor`].
-///
-/// The three spectrum fields describe the matrix the floor ran on: the input,
-/// or its equilibrated `D⁻¹ M D⁻¹` when a coordinate was marked (#2145).
 pub(crate) struct RegularizedInverse {
     pub inverse: DMatrix<f64>,
-    /// Smallest eigenvalue of the floored matrix (before clipping). `f64::INFINITY`
+    /// Smallest eigenvalue of the input matrix (before clipping). `f64::INFINITY`
     /// for 0×0 matrices.
     pub min_eigenvalue: f64,
-    /// Largest eigenvalue of the floored matrix. `f64::NEG_INFINITY` for 0×0 matrices.
+    /// Largest eigenvalue of the input matrix. `f64::NEG_INFINITY` for 0×0 matrices.
     /// Paired with `min_eigenvalue` this gives the scale-free `|min λ| / λ_max` the
     /// regularization severity is graded on (#520).
     pub max_eigenvalue: f64,
@@ -2479,50 +2547,22 @@ pub(crate) fn worst_variance_inflation(var: &[f64], var_ref: &[f64]) -> f64 {
 /// floor leaves PD inputs untouched (`n_clipped == 0`, exact inverse) and
 /// recovers a PD inverse on near-singular or marginally-indefinite inputs.
 ///
-/// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` makes the
-/// floor invariant to a common rescaling of the whole matrix; the absolute floor
-/// handles the edge case where the whole spectrum is tiny.
-///
-/// It is **not** invariant to rescaling one coordinate, and one kind of
-/// coordinate carries units: an identity-packed θ (`theta_packs_log` false — a
-/// θ whose lower bound is negative), whose row of `R` or `S` scales as `1/k²`
-/// when the θ is written `k` times larger. The log-θ, the log-packed Cholesky-Ω
-/// diagonals, log-σ and the Fisher-z residual correlations are dimensionless. An
-/// off-diagonal Cholesky-Ω entry is packed as-is and carries its η's units when
-/// that η is additive; it is not marked, so the floor still moves with them. So
-/// `equilibrate[i] == true`
-/// marks the coordinates to rescale before the floor is applied (#2145): each
-/// such row and column is divided by `dᵢ = sqrt(|Mᵢᵢ| / g)`, where `g` is the
-/// geometric mean of `|Mⱼⱼ|` over the unmarked coordinates (`1` when there are
-/// none), the eigendecomposition and the floor run on `C = D⁻¹ M D⁻¹`, and the
-/// result is returned as `D⁻¹ C⁻¹ D⁻¹`. A marked coordinate is moved to the
-/// typical magnitude of the others, so its units can no longer decide what the
-/// floor clips, while every unmarked coordinate keeps the floor it had —
-/// a tiny diagonal there is a flat direction, and equilibrating it away would
-/// silence the alarm. A marked coordinate whose diagonal is zero or non-finite
-/// keeps `dᵢ = 1`, so a θ with no information is still clipped. An empty
-/// `equilibrate` marks nothing.
-///
-/// With a marked coordinate, `min_eigenvalue`, `max_eigenvalue` and `floor`
-/// describe `C`, not `M`. By Sylvester's law of inertia `C` has as many
-/// positive eigenvalues as `M`, so the `None` decision below does not move.
+/// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` keeps the
+/// regularisation equivariant to multiplying the **whole** matrix by a constant; the
+/// absolute floor handles the edge case where the whole spectrum is tiny. It is *not*
+/// invariant to rescaling one coordinate, which is what a change of units does to an
+/// identity-packed θ — the covariance step's callers go through
+/// [`invert_psd_with_floor_unit_free`] for that (#2145).
 ///
 /// Returns `None` only when the eigendecomposition fails or every eigenvalue
 /// is non-finite or non-positive — i.e. the Hessian carries no usable
 /// curvature information at all, in which case regularisation cannot help.
-pub(crate) fn invert_psd_with_floor(
-    sym: &DMatrix<f64>,
-    equilibrate: &[bool],
-) -> Option<RegularizedInverse> {
+pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInverse> {
     let n = sym.nrows();
     debug_assert_eq!(
         n,
         sym.ncols(),
         "invert_psd_with_floor requires square input"
-    );
-    debug_assert!(
-        equilibrate.is_empty() || equilibrate.len() == n,
-        "invert_psd_with_floor: one equilibrate flag per coordinate, or none"
     );
     if n == 0 {
         return Some(RegularizedInverse {
@@ -2537,12 +2577,8 @@ pub(crate) fn invert_psd_with_floor(
 
     // Symmetric eigendecomposition: H = Q Λ Qᵀ ⇒ H⁻¹ = Q Λ⁻¹ Qᵀ. Inverting via
     // the eigendecomposition lets us clip non-positive Λ entries before
-    // forming Λ⁻¹, which is what `try_inverse` cannot do. It runs on the
-    // equilibrated `C = D⁻¹ M D⁻¹` (#2145), which is `M` itself when nothing is
-    // marked.
-    let d = equilibration_scales(sym, equilibrate);
-    let rescale = |m: DMatrix<f64>| divide_by_scales(m, &d);
-    let eig = SymmetricEigen::new(rescale(sym.clone()));
+    // forming Λ⁻¹, which is what `try_inverse` cannot do.
+    let eig = SymmetricEigen::new(sym.clone());
     let q = &eig.eigenvectors;
     let lambdas = &eig.eigenvalues;
 
@@ -2624,76 +2660,141 @@ pub(crate) fn invert_psd_with_floor(
         (&m + &m_t) * 0.5
     };
 
-    // M⁻¹ = D⁻¹ C⁻¹ D⁻¹: the same element-wise division by `dᵢ dⱼ` that formed `C`.
     Some(RegularizedInverse {
-        inverse: rescale(inverse),
+        inverse,
         min_eigenvalue: min_eig,
         max_eigenvalue: max_eig,
         floor,
         n_clipped,
-        unclipped_inverse: rescale(unclipped_inverse),
+        unclipped_inverse,
     })
 }
 
-/// The diagonal scale `D` of [`invert_psd_with_floor`]'s equilibration (#2145):
-/// `sqrt(|Mᵢᵢ| / g)` on each marked coordinate, `1` everywhere else, with `g`
-/// the geometric mean of `|Mⱼⱼ|` over the unmarked coordinates whose diagonal is
-/// finite and non-zero (`1` when there are none). A marked coordinate whose
-/// scale would be zero or non-finite keeps `1`.
+/// [`invert_psd_with_floor`] with the floor made independent of the units of the coordinates
+/// flagged in `unit_coords` (#2145).
 ///
-/// `M` may be an information matrix or a covariance: either way the marked
-/// diagonal lands on `g`. SIR's two proposal floors use it on both (#2179).
-pub(crate) fn equilibration_scales(sym: &DMatrix<f64>, equilibrate: &[bool]) -> Vec<f64> {
+/// An identity-packed θ (a negative lower bound, `theta_packs_log`) is the one packed
+/// coordinate that carries units: writing it in units `k` times larger divides its row and
+/// column of `R` or `S` by `k`. The floor, taken from the raw spectrum, then clips a
+/// well-determined fit purely because of those units — under `covariance_method = s` that is a
+/// rejected `S`, under `r`/`rsr` an understated SE. So each flagged coordinate with a positive,
+/// finite diagonal is rescaled first, `C = D⁻¹ M D⁻¹` with `dᵢ = sqrt(Mᵢᵢ / g)`, `g` the
+/// largest **unflagged** positive diagonal entry, so its diagonal entry in `C` is `g` whatever
+/// its units. With no usable unflagged entry (every free coordinate an identity-packed θ, e.g.
+/// Ω and σ FIX) `g = 1`, i.e. Jacobi scaling of the flagged block: any anchor read off a
+/// flagged diagonal would move with the units, and the absolute `1e-12` floor would clip on
+/// them again. The floor is applied to `C`'s
+/// spectrum and the result mapped back, `M⁻¹ = D⁻¹ C⁻¹ D⁻¹`.
+///
+/// The largest rather than a mean: a mean is dragged down by exactly the flat dimensionless
+/// direction the floor exists to catch, and would then pull a well-determined θ under the floor
+/// with it. At the largest entry the flagged coordinate leaves `λ_max`, and so the floor every
+/// other coordinate is tested against, where the dimensionless block alone puts it (within the
+/// factor the off-diagonals allow).
+///
+/// Every other coordinate keeps `dᵢ = 1`. Log-θ, the log-Cholesky Ω diagonal, log-σ and ρ are
+/// dimensionless, so there a tiny diagonal entry *is* a flat direction and the floor must keep seeing it — which
+/// full Jacobi scaling of every coordinate would hide, since a diagonal matrix equilibrates to
+/// the identity. A flagged coordinate with a non-positive or non-finite diagonal also keeps
+/// `dᵢ = 1`: a parameter with no information is still clipped.
+///
+/// Not covered: an Ω Cholesky **off-diagonal** is identity-packed and carries the units of its
+/// η's (an additive η, say), so a block Ω on such η's can still meet a unit-dependent floor.
+/// Only θ's are flagged by the covariance step (`identity_theta_free_mask`).
+///
+/// The returned `min_eigenvalue`, `max_eigenvalue` and `floor` are those of `C`, so the
+/// regularization warning built from them no longer moves with a θ's units either.
+pub(crate) fn invert_psd_with_floor_unit_free(
+    sym: &DMatrix<f64>,
+    unit_coords: &[bool],
+) -> Option<RegularizedInverse> {
     let n = sym.nrows();
-    let marked = |i: usize| equilibrate.get(i).copied().unwrap_or(false);
-    let usable = |a: f64| a > 0.0 && a.is_finite();
-    let (mut log_sum, mut count) = (0.0, 0usize);
-    for i in (0..n).filter(|&i| !marked(i)) {
-        let a = sym[(i, i)].abs();
-        if usable(a) {
-            log_sum += a.ln();
-            count += 1;
-        }
-    }
-    let g = if count > 0 {
-        (log_sum / count as f64).exp()
-    } else {
-        1.0
+    debug_assert_eq!(unit_coords.len(), n, "one flag per coordinate");
+    let Some(d) = unit_coordinate_scales(sym, unit_coords) else {
+        return invert_psd_with_floor(sym);
     };
-    (0..n)
-        .map(|i| {
-            let s = (sym[(i, i)].abs() / g).sqrt();
-            if marked(i) && usable(s) {
-                s
-            } else {
-                1.0
-            }
-        })
-        .collect()
+    let mut inv = invert_psd_with_floor(&divide_by_scales(sym.clone(), Some(&d)))?;
+    inv.inverse = divide_by_scales(inv.inverse, Some(&d));
+    inv.unclipped_inverse = divide_by_scales(inv.unclipped_inverse, Some(&d));
+    Some(inv)
 }
 
-/// `M` with each entry divided by `dᵢ dⱼ`: `D⁻¹ M D⁻¹` for the scales of
-/// [`equilibration_scales`]. With every `dᵢ = 1` it returns `M` bit for bit.
-pub(crate) fn divide_by_scales(mut m: DMatrix<f64>, d: &[f64]) -> DMatrix<f64> {
-    for i in 0..m.nrows() {
-        for j in 0..m.ncols() {
-            m[(i, j)] /= d[i] * d[j];
+/// `D⁻¹ M D⁻¹` for the scaling `d` of [`unit_coordinate_scales`]; `None` returns `m` unchanged.
+/// The same map takes a matrix into the rescaled basis and takes its inverse back out of it.
+pub(crate) fn divide_by_scales(mut m: DMatrix<f64>, d: Option<&[f64]>) -> DMatrix<f64> {
+    if let Some(d) = d {
+        for i in 0..m.nrows() {
+            for j in 0..m.ncols() {
+                m[(i, j)] /= d[i] * d[j];
+            }
         }
     }
     m
 }
 
-/// Which free coordinates [`invert_psd_with_floor`] equilibrates (#2145): the
-/// identity-packed θ's, the only packed coordinates that carry the θ's units.
-/// `free_idx` indexes the packed vector, whose leading `template.theta.len()`
-/// entries are the θ's. SIR's proposal floors read the same mask (#2179).
-pub(crate) fn identity_theta_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
+/// The diagonal scaling `d` of [`invert_psd_with_floor_unit_free`], or `None` when it is the
+/// identity (no flagged coordinate with a usable diagonal), so the unscaled path is taken
+/// unchanged. The SIR fallback proposal rescales its Hessian by it too (#2179).
+fn unit_coordinate_scales(sym: &DMatrix<f64>, unit_coords: &[bool]) -> Option<Vec<f64>> {
+    unit_coordinate_scales_anchored(sym, unit_coords, f64::max)
+}
+
+/// [`unit_coordinate_scales`] for a matrix that is the *inverse* of the one the covariance
+/// step floors, i.e. SIR's proposal covariance `Σ` (#2179): each flagged diagonal is brought to
+/// the **smallest** unflagged one instead of the largest. In `Σ` the largest diagonal is the
+/// least-determined direction, the one SIR's cap exists for, so the largest anchor would mix
+/// the θ into exactly the direction that gets capped. For a diagonal matrix the two are exact
+/// duals, the scales of `M⁻¹` here being the reciprocals of those of `M` there, so both
+/// floors run in the same basis.
+pub(crate) fn unit_coordinate_scales_of_inverse(
+    sym: &DMatrix<f64>,
+    unit_coords: &[bool],
+) -> Option<Vec<f64>> {
+    unit_coordinate_scales_anchored(sym, unit_coords, f64::min)
+}
+
+/// The one body of both: `anchor` folds the unflagged positive finite diagonals into `g`.
+fn unit_coordinate_scales_anchored(
+    sym: &DMatrix<f64>,
+    unit_coords: &[bool],
+    anchor: fn(f64, f64) -> f64,
+) -> Option<Vec<f64>> {
+    let usable = |i: usize| {
+        let m = sym[(i, i)];
+        m.is_finite() && m > 0.0
+    };
+    let n = sym.nrows();
+    if !(0..n).any(|i| unit_coords[i] && usable(i)) {
+        return None;
+    }
+    let g = (0..n)
+        .filter(|&i| !unit_coords[i] && usable(i))
+        .map(|i| sym[(i, i)])
+        .reduce(anchor)
+        .unwrap_or(1.0);
+    Some(
+        (0..n)
+            .map(|i| {
+                if unit_coords[i] && usable(i) {
+                    (sym[(i, i)] / g).sqrt()
+                } else {
+                    1.0
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Which free coordinates of the covariance step carry units: the identity-packed θ's
+/// (`theta_packs_log` false), the mask [`invert_psd_with_floor_unit_free`] equilibrates (#2145),
+/// and that SIR's proposal conditioning reads (#2179).
+pub(crate) fn identity_theta_free_mask(
+    template: &ModelParameters,
+    free_idx: &[usize],
+) -> Vec<bool> {
     free_idx
         .iter()
-        .map(|&i| {
-            i < template.theta.len()
-                && !crate::estimation::parameterization::theta_packs_log(template.theta_lower[i])
-        })
+        .map(|&i| i < template.theta.len() && !theta_packs_log(template.theta_lower[i]))
         .collect()
 }
 
@@ -2747,6 +2848,11 @@ pub(crate) fn published_covariance_method(
 /// `covariance_method = r` is the user's call and is honoured, but is told what
 /// it is about to cost.
 ///
+/// `rsr` builds the same `R` and is told the same (#2055). It is never the
+/// default, so it is never routed — the routing is gated on `Hessian`, the cost
+/// warning on [`needs_r`]. Its warning does not read `explicitly_set`: a
+/// `Sandwich` request is the user's whether or not the flag was raised.
+///
 /// Split out from [`run_covariance_step_inner`] so the three branches are
 /// reachable from a unit test: exercising them through the real covariance step
 /// would mean converging a fit with several hundred free parameters.
@@ -2756,7 +2862,7 @@ pub(crate) fn scale_routed_covariance_method(
     explicitly_set: bool,
     has_priors: bool,
 ) -> (CovarianceMethod, Option<String>) {
-    if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
+    if n <= crate::types::COV_HESSIAN_MAX_DIM || !needs_r(requested) {
         return (requested, None);
     }
     // #254: `S` is a sum of per-*subject* score cross-products, and a parameter
@@ -2769,6 +2875,29 @@ pub(crate) fn scale_routed_covariance_method(
     // A packed dimension near `usize::MAX.sqrt()` is not a model anyone can write; the
     // saturated count is still a lower bound on the cost.
     let stencil = fd_r_objective_evals(n).unwrap_or(usize::MAX);
+    if requested == CovarianceMethod::Sandwich {
+        // `S` cannot carry a prior (above), so with one declared the cheap way out
+        // is not `s` — it would drop the prior from the sandwich's `S` and its `R`
+        // alike — and only switching the step off is left to name.
+        let warning = if has_priors {
+            format!(
+                "covariance_method = rsr with {n} free parameters and parameter priors \
+                 declared: the sandwich R⁻¹SR⁻¹ needs the R matrix, a finite-difference \
+                 Hessian needing {stencil} re-converged objective evaluations. \
+                 `covariance_method = s` builds no R but cannot represent a prior, so it is \
+                 not a way out here. Set `covariance = false` if this does not finish."
+            )
+        } else {
+            format!(
+                "covariance_method = rsr with {n} free parameters: the sandwich R⁻¹SR⁻¹ \
+                 needs the R matrix, a finite-difference Hessian that re-converges every \
+                 subject's EBEs at each of {stencil} objective evaluations. Set \
+                 `covariance_method = s` (the score cross-product, one pass) if this does \
+                 not finish."
+            )
+        };
+        return (requested, Some(warning));
+    }
     if has_priors {
         return (
             requested,
@@ -2825,17 +2954,20 @@ pub(crate) fn routed_covariance_method(
 }
 
 /// The count for `fit()`'s pre-fit covariance cost note, at `n` free coordinates: `None` when
-/// no note is due — the step is off, `n ≤ 30`, or the estimator the step will actually run
-/// (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
-/// `fd_r_objective_evals`, itself `None` on overflow (#1803). Before #1803 the note fired under
-/// `covariance_method = s` too, and quoted `n²`.
+/// no note is due — the step is off, `n ≤ 30`, `R` is expected on the analytic assembly for
+/// every subject (`route`, see [`predicted_r_route`]; #2054), or the estimator the step will
+/// actually run (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
+/// `fd_r_objective_evals`, itself `None` on overflow (#1803). On
+/// [`PredictedRRoute::Salvage`] the count is the same `2·n²`, but each evaluation covers only
+/// the declined subjects; [`pre_fit_covariance_cost_note`] says so. Before #1803 the note fired
+/// under `covariance_method = s` too, and quoted `n²`; before #2054 it ignored the route.
 pub(crate) fn pre_fit_covariance_cost(
     n: usize,
     options: &FitOptions,
     has_priors: bool,
-    analytic_r: bool,
+    route: PredictedRRoute,
 ) -> Option<Option<usize>> {
-    if !options.run_covariance_step || n <= 30 || analytic_r {
+    if !options.run_covariance_step || n <= 30 || route == PredictedRRoute::Analytic {
         return None;
     }
     let (routed, _) = routed_covariance_method(n, options, has_priors, false);
@@ -2843,23 +2975,37 @@ pub(crate) fn pre_fit_covariance_cost(
 }
 
 /// The pre-fit cost note for a [`pre_fit_covariance_cost`] result at `n` free coordinates, or
-/// `None` when no note is due. On overflow it still warns, without the (wrapped) number.
+/// `None` when no note is due. On overflow it still warns, without the (wrapped) number. On
+/// [`PredictedRRoute::Salvage`] it names the subject subset the stencil is expected to cover.
+/// Worded as an expectation: a subject the walk predicts in scope can still bail at run time.
 pub(crate) fn pre_fit_covariance_cost_note(
     n: usize,
     cost: Option<Option<usize>>,
+    route: PredictedRRoute,
 ) -> Option<String> {
-    match cost? {
-        Some(n_evals) => Some(format!(
-            "Covariance step: {n} parameters → {n_evals} OFV evaluations \
-             (finite-difference Hessian). This may take several minutes \
-             on complex models."
-        )),
-        None => Some(format!(
-            "Covariance step: {n} parameters → 2n² OFV evaluations \
-             (finite-difference Hessian). Estimate exceeds usize range; \
-             expect this to be very slow."
-        )),
-    }
+    let count = match cost? {
+        Some(n_evals) => n_evals.to_string(),
+        None => "2n²".to_string(),
+    };
+    let scope = match route {
+        PredictedRRoute::Salvage {
+            declined,
+            n_subjects,
+        } => format!(
+            " over {declined} of {n_subjects} subjects (finite-difference Hessian for the \
+             subjects outside the analytic R-matrix; the rest are analytic)"
+        ),
+        PredictedRRoute::Analytic | PredictedRRoute::Stencil => {
+            " (finite-difference Hessian)".to_string()
+        }
+    };
+    let tail = match cost? {
+        Some(_) => "This may take several minutes on complex models.",
+        None => "Estimate exceeds usize range; expect this to be very slow.",
+    };
+    Some(format!(
+        "Covariance step: {n} parameters → {count} OFV evaluations expected{scope}. {tail}"
+    ))
 }
 
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
@@ -3231,11 +3377,11 @@ mod tests {
             ..defaulted.clone()
         };
         assert_eq!(
-            super::pre_fit_covariance_cost(n, &explicit, false, true),
+            super::pre_fit_covariance_cost(n, &explicit, false, super::PredictedRRoute::Analytic),
             None
         );
         assert_eq!(
-            super::pre_fit_covariance_cost(n, &explicit, false, false),
+            super::pre_fit_covariance_cost(n, &explicit, false, super::PredictedRRoute::Stencil),
             Some(Some(20_402))
         );
 
@@ -3283,13 +3429,225 @@ mod tests {
         (0..m.nrows()).map(|k| m[(k, k)]).collect()
     }
 
+    /// `M` with coordinate `j` written in units `k` times larger: row and column `j` divided
+    /// by `k`, exactly what a change of units does to an identity-packed θ's block of `R` or `S`.
+    fn rescale_coordinate(m: &DMatrix<f64>, j: usize, k: f64) -> DMatrix<f64> {
+        let mut out = m.clone();
+        for i in 0..m.nrows() {
+            out[(i, j)] /= k;
+            out[(j, i)] /= k;
+        }
+        out
+    }
+
+    /// Worst entrywise relative gap — per entry, since the entries span `k²` in magnitude and a
+    /// gap normalised by the largest would not see the small ones.
+    fn max_rel_gap(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+        let mut worst = 0.0_f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let gap = (x - y).abs() / y.abs();
+            assert!(gap.is_finite(), "{x} vs {y}");
+            if gap > worst {
+                worst = gap;
+            }
+        }
+        worst
+    }
+
+    /// #2145: an identity-packed θ in large or small units is not clipped once its coordinate
+    /// is flagged, and its inverse is the rescaled inverse of the original — while the same
+    /// rescale on an **unflagged** coordinate is still clipped, so an implementation that
+    /// equilibrated every coordinate (full Jacobi) fails the second half.
+    #[test]
+    fn unit_free_floor_ignores_the_units_of_a_flagged_coordinate_only() {
+        // Well conditioned: eigenvalues ≈ 0.6 … 4.6, correlations ≤ 0.5.
+        let m = DMatrix::from_row_slice(3, 3, &[4.0, 0.6, 0.3, 0.6, 1.0, 0.2, 0.3, 0.2, 0.8]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        let flag_1 = [false, true, false];
+        let at_k1 = super::invert_psd_with_floor_unit_free(&m, &flag_1).expect("PD");
+        for k in [1e6, 1e-6] {
+            let mk = rescale_coordinate(&m, 1, k);
+            // The fixture straddles the floor: unscaled, the rescale alone is clipped.
+            let raw = super::invert_psd_with_floor(&mk).expect("PD");
+            assert!(
+                raw.n_clipped > 0,
+                "k = {k}: fixture must be under the raw floor"
+            );
+
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &flag_1).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = {k}: flagged coordinate was clipped");
+            // (Mₖ)⁻¹ = row/column 1 of M⁻¹ multiplied by k.
+            let want = rescale_coordinate(&m_inv, 1, 1.0 / k);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            let gap_ref = max_rel_gap(&inv.unclipped_inverse, &want);
+            eprintln!("k = {k:e}: inverse gap {gap:.2e}, reference gap {gap_ref:.2e}");
+            // Measured ≤ 6.4e-16 (macOS arm64) at both k: a few roundings per entry.
+            assert!(gap < 1e-12 && gap_ref < 1e-12, "k = {k}: {gap} / {gap_ref}");
+            // The spectrum the warning reports does not move with the units either.
+            for (got, want) in [
+                (inv.max_eigenvalue, at_k1.max_eigenvalue),
+                (inv.min_eigenvalue, at_k1.min_eigenvalue),
+                (inv.floor, at_k1.floor),
+            ] {
+                assert!(
+                    ((got - want) / want).abs() < 1e-12,
+                    "k = {k}: {got} vs k = 1 {want}"
+                );
+            }
+
+            // The same rescale on a coordinate that is not flagged: still clipped.
+            let unflagged =
+                super::invert_psd_with_floor_unit_free(&mk, &[true, false, false]).expect("PD");
+            assert!(
+                unflagged.n_clipped > 0,
+                "k = {k}: an unflagged coordinate escaped the floor"
+            );
+        }
+    }
+
+    /// #2145: the equilibration does not switch the floor off. A flagged coordinate that is
+    /// collinear with another (correlation `1 − 1e-14`) is still a flat direction, and so is a
+    /// flagged coordinate with no information at all; an uncorrelated tiny diagonal entry on a
+    /// dimensionless (unflagged) coordinate is still clipped beside a flagged one.
+    #[test]
+    fn unit_free_floor_still_clips_a_genuinely_flat_direction() {
+        let rho = 1.0 - 1e-14;
+        let corr = DMatrix::from_row_slice(2, 2, &[1.0, rho, rho, 1.0]);
+        for k in [1.0, 1e6, 1e-6] {
+            let mk = rescale_coordinate(&corr, 1, k);
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &[false, true]).expect("PSD");
+            assert_eq!(
+                inv.n_clipped, 1,
+                "k = {k}: collinear pair escaped the floor"
+            );
+            let both = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PSD");
+            assert_eq!(
+                both.n_clipped, 1,
+                "k = {k}: all-flagged collinear pair escaped"
+            );
+        }
+
+        let no_info = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![2.0, 0.0]));
+        let inv = super::invert_psd_with_floor_unit_free(&no_info, &[false, true]).expect("PSD");
+        assert_eq!(
+            inv.n_clipped, 1,
+            "a flagged coordinate with no score must stay clipped"
+        );
+
+        // Exactly one clip: the flat entry. The flagged θ's anchor is the largest unflagged
+        // diagonal; a geometric mean (1e-10 here) drags it onto the floor beside the flat one.
+        let flat = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-20, 1.0, 3e8]));
+        let inv = super::invert_psd_with_floor_unit_free(&flat, &[false, false, true]).expect("PD");
+        assert_eq!(
+            inv.n_clipped, 1,
+            "a flat dimensionless direction must stay clipped"
+        );
+    }
+
+    /// Review of #2145: with **every** coordinate flagged (Ω and σ FIX, only identity-packed θ's
+    /// free) there is no dimensionless diagonal to anchor on. An anchor read off the flagged
+    /// diagonals moves with the units, and `[1e-14]` — `[1]` in units 1e7 larger — fell under
+    /// the absolute `1e-12` floor. The straddle: unscaled it is clipped, flagged it is not, and
+    /// the inverse is exact; a two-coordinate block in mixed units likewise.
+    #[test]
+    fn unit_free_floor_is_unit_free_when_every_coordinate_is_flagged() {
+        let one = DMatrix::from_element(1, 1, 1e-14);
+        assert_eq!(super::invert_psd_with_floor(&one).expect("PD").n_clipped, 1);
+        let inv = super::invert_psd_with_floor_unit_free(&one, &[true]).expect("PD");
+        assert_eq!(
+            inv.n_clipped, 0,
+            "an all-flagged θ in large units was clipped"
+        );
+        assert!(
+            ((inv.inverse[(0, 0)] - 1e14) / 1e14).abs() < 1e-14,
+            "{}",
+            inv.inverse[(0, 0)]
+        );
+
+        let m = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        for (k0, k1) in [(1e7, 1e-7), (1e8, 1e8)] {
+            let mk = rescale_coordinate(&rescale_coordinate(&m, 0, k0), 1, k1);
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = ({k0}, {k1}): clipped");
+            let want = rescale_coordinate(&rescale_coordinate(&m_inv, 0, 1.0 / k0), 1, 1.0 / k1);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            // Measured ≤ 4e-16 (macOS arm64).
+            assert!(gap < 1e-12, "k = ({k0}, {k1}): gap {gap}");
+        }
+    }
+
+    /// The mask the covariance step passes: identity-packed θ's (a negative lower bound) only,
+    /// indexed over the free coordinates.
+    #[test]
+    fn identity_theta_free_mask_flags_identity_packed_thetas_only() {
+        let t = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![5.0, 2.0],
+            theta_names: vec!["SLOPE".into(), "TVCL".into()],
+            // Identity-packed (negative lower bound), then log-packed (a lower bound of 0).
+            theta_lower: vec![-100.0, 0.0],
+            theta_upper: vec![100.0, 50.0],
+            theta_fixed: vec![false; 2],
+            omega: crate::types::OmegaMatrix::from_diagonal(&[0.09], vec!["E1".into()]),
+            omega_fixed: vec![false],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        };
+        // Packed: θ₀, θ₁, ω, σ. All free; then with θ₀ FIX the free block starts at θ₁.
+        assert_eq!(
+            super::identity_theta_free_mask(&t, &[0, 1, 2, 3]),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            super::identity_theta_free_mask(&t, &[1, 2, 3]),
+            vec![false, false, false]
+        );
+    }
+
+    /// #2179: SIR rescales its `Σ` with `unit_coordinate_scales_of_inverse`, the covariance step
+    /// its `R` with `unit_coordinate_scales`. On a diagonal `R` the two must be reciprocal, i.e.
+    /// the same basis, and must differ from taking `Σ` at the covariance step's own anchor —
+    /// which brings the θ to `Σ`'s widest direction rather than its narrowest.
+    #[test]
+    fn the_inverse_anchor_rescales_sigma_into_the_covariance_steps_basis() {
+        // Coordinate 0 flagged; the unflagged precisions 4, 100 and 0.25 have their largest
+        // and smallest at different coordinates, so a swapped anchor cannot coincide.
+        let r = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-6, 4.0, 100.0, 0.25]));
+        let sigma = DMatrix::from_diagonal(&r.diagonal().map(|v| 1.0 / v));
+        let mask = [true, false, false, false];
+        let d_r = super::unit_coordinate_scales(&r, &mask).expect("θ flagged");
+        let d_s = super::unit_coordinate_scales_of_inverse(&sigma, &mask).expect("θ flagged");
+        for i in 0..4 {
+            let prod = d_r[i] * d_s[i];
+            assert!(
+                (prod - 1.0).abs() < 1e-14,
+                "coordinate {i}: {} · {} = {prod}",
+                d_r[i],
+                d_s[i]
+            );
+        }
+        // `R` rescaled brings θ to precision 100; `Σ` rescaled must bring it to 1/100.
+        assert!((super::divide_by_scales(sigma.clone(), Some(&d_s))[(0, 0)] - 0.01).abs() < 1e-16);
+        // The straddle: `Σ` at the covariance step's own anchor brings θ to variance 4.
+        let d_wrong = super::unit_coordinate_scales(&sigma, &mask).expect("θ flagged");
+        assert!((super::divide_by_scales(sigma, Some(&d_wrong))[(0, 0)] - 4.0).abs() < 1e-14);
+    }
+
     #[test]
     fn invert_psd_with_floor_reports_the_spectrum_ends_and_no_inflation_when_clean() {
         // A positive-definite input is inverted exactly: nothing is clipped, so the floor
         // manufactured no variance and the reference equals the inverse — an inflation of
         // exactly 1.0, the value that grades `Minor` however many free parameters there are.
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 1.0]));
-        let inv = super::invert_psd_with_floor(&m, &[]).expect("PD input inverts");
+        let inv = super::invert_psd_with_floor(&m).expect("PD input inverts");
         assert_eq!(inv.n_clipped, 0);
         assert!(
             (inv.max_eigenvalue - 4.0).abs() < 1e-12,
@@ -3324,7 +3682,7 @@ mod tests {
         let a = 0.5 * (100.0 + -1e-3);
         let b = 0.5 * (100.0 - -1e-3);
         let m = DMatrix::from_row_slice(2, 2, &[a, b, b, a]);
-        let inv = super::invert_psd_with_floor(&m, &[]).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         assert!(
             (inv.max_eigenvalue - 100.0).abs() < 1e-9,
@@ -3366,195 +3724,11 @@ mod tests {
         // for it at all. The ratio is `+∞`, which `format_regularized_warning` words rather
         // than printing as `inf`.
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
-        let inv = super::invert_psd_with_floor(&m, &[]).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         let got =
             super::worst_variance_inflation(&diag(&inv.inverse), &diag(&inv.unclipped_inverse));
         assert!(got.is_infinite(), "{got}");
-    }
-
-    // ── #2145: the floor does not see an identity-packed θ's units ───────────
-
-    /// A well-conditioned, fully coupled 3×3 information matrix: eigenvalues of order 1, every
-    /// off-diagonal non-zero, so a rescaled coordinate cannot be inverted on its own.
-    fn coupled_information() -> DMatrix<f64> {
-        DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.0])
-    }
-
-    /// `M` with coordinate 0 written `k` times larger: its row and column scale as `1/k`.
-    fn rescale_coordinate_0(m: &DMatrix<f64>, k: f64) -> DMatrix<f64> {
-        let mut out = m.clone();
-        for j in 0..m.ncols() {
-            out[(0, j)] /= k;
-            out[(j, 0)] /= k;
-        }
-        out
-    }
-
-    #[test]
-    fn an_identity_theta_in_large_or_small_units_is_not_clipped_and_inverts_exactly() {
-        // The issue's defect at the smallest scale that shows it. Writing coordinate 0 as
-        // `k·θ` moves its information by `1/k²`; at `k = 1e6` its eigenvalue falls below
-        // `1e-10·λ_max`, and at `k = 1e-6` it pushes `λ_max` up until the other two fall below.
-        // Either way today's floor clips a positive-definite matrix. Equilibrating the marked
-        // coordinate gives back the exact inverse, `K M⁻¹ K` with `K = diag(k, 1, 1)`.
-        let m = coupled_information();
-        let m_inv = m.clone().try_inverse().expect("PD");
-        for k in [1e6, 1e-6] {
-            let mk = rescale_coordinate_0(&m, k);
-            // The straddle: unmarked, the same matrix IS clipped, so the fixture reaches the
-            // floor. This half also fails an implementation that equilibrates every
-            // coordinate regardless of the mask.
-            let unmarked = super::invert_psd_with_floor(&mk, &[]).expect("has curvature");
-            assert!(
-                unmarked.n_clipped > 0,
-                "k = {k}: the fixture must reach the floor"
-            );
-            // Marking a coordinate other than the rescaled one does not help: the mask is
-            // per coordinate, not a switch.
-            let wrong = super::invert_psd_with_floor(&mk, &[false, true, false]).expect("curv");
-            assert!(
-                wrong.n_clipped > 0,
-                "k = {k}: marking coordinate 1 must not help"
-            );
-
-            let inv = super::invert_psd_with_floor(&mk, &[true, false, false]).expect("PD");
-            assert_eq!(
-                inv.n_clipped, 0,
-                "k = {k}: the marked coordinate is clipped"
-            );
-            let kv = [k, 1.0, 1.0];
-            let mut worst: f64 = 0.0;
-            for i in 0..3 {
-                for j in 0..3 {
-                    let want = kv[i] * kv[j] * m_inv[(i, j)];
-                    let got = inv.inverse[(i, j)];
-                    assert!(got.is_finite(), "k = {k}: inverse[{i},{j}] = {got}");
-                    let rel = ((got - want) / want).abs();
-                    if rel > worst {
-                        worst = rel;
-                    }
-                }
-            }
-            // Measured worst relative error 1.06e-15 (k = 1e6) and 1.45e-15 (k = 1e-6) on
-            // macOS arm64; the bound gives about 70× headroom and is still far below the
-            // order-one error of a clipped direction.
-            assert!(worst < 1e-13, "k = {k}: worst relative error {worst:e}");
-            assert_eq!(inv.unclipped_inverse, inv.inverse, "k = {k}");
-        }
-    }
-
-    #[test]
-    fn the_cross_product_estimator_forwards_the_mask_to_the_s_inverse() {
-        // `S⁻¹` rejects any clipped `S`, so in large units it failed outright (#2145). Both
-        // `combine_covariance` and `combine_covariance_and_reference` — the route the
-        // SAEM/IMP `r` → `s` fallback takes — must hand the mask on.
-        let s = rescale_coordinate_0(&coupled_information(), 1e6);
-        let r_inv = DMatrix::<f64>::identity(3, 3);
-        let mask = [true, false, false];
-        let est = CovarianceMethod::CrossProduct;
-        assert!(super::combine_covariance(est, r_inv.clone(), &s, &[]).is_none());
-        assert!(super::combine_covariance(est, r_inv.clone(), &s, &mask).is_some());
-        let (cov, reference) =
-            super::combine_covariance_and_reference(est, r_inv.clone(), None, &s, &mask)
-                .expect("S⁻¹ exists once the units are equilibrated");
-        assert!(reference.is_none());
-        let want = super::invert_psd_with_floor(&s, &mask).expect("PD").inverse;
-        assert_eq!(cov, want);
-        assert!(super::combine_covariance_and_reference(est, r_inv, None, &s, &[]).is_none());
-    }
-
-    #[test]
-    fn a_marked_coordinate_collinear_with_another_is_still_clipped() {
-        // Equilibration fixes the units, not the information: a marked coordinate whose
-        // correlation with another is 1 − 1e-14 is a flat direction in any units, and the
-        // floor must still clip it. Fails an equilibration that bypasses the floor.
-        let (rho, k) = (1.0 - 1e-14, 1e3);
-        let m = rescale_coordinate_0(&DMatrix::from_row_slice(2, 2, &[1.0, rho, rho, 1.0]), k);
-        let inv = super::invert_psd_with_floor(&m, &[true, false]).expect("has curvature");
-        assert_eq!(inv.n_clipped, 1);
-        // The diagnostic's reference is unscaled too. Here `D = diag(1/k, 1)` (g = 1, the
-        // unmarked diagonal), so `C` is the unit-diagonal matrix and its pseudo-inverse over
-        // the kept direction (1, 1)/√2 is `[[1, 1], [1, 1]] / (2(1 + ρ))`; `D⁻¹ C⁺ D⁻¹` puts
-        // `k²` and `k` on the marked row. Measured exact (relative error 0) on macOS arm64;
-        // the bound leaves room for a different eigensolver rounding, and is still far below
-        // the factor of `k` or `k²` an unscaled reference would be off by.
-        let c_plus = 1.0 / (2.0 * (1.0 + rho));
-        for (i, j, want) in [(0, 0, k * k * c_plus), (0, 1, k * c_plus), (1, 1, c_plus)] {
-            let got = inv.unclipped_inverse[(i, j)];
-            assert!(
-                ((got - want) / want).abs() < 1e-9,
-                "unclipped_inverse[{i},{j}] = {got} vs {want}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_marked_coordinate_with_no_information_keeps_unit_scale_and_is_clipped() {
-        // A zero diagonal would give `d = 0` and turn `C` into NaN, which the eigenvalue
-        // check reports as "no usable curvature" — the wrong failure for a matrix with a
-        // perfectly good second coordinate. The scale stays 1 and the floor clips it.
-        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![2.0, 0.0]));
-        let inv = super::invert_psd_with_floor(&m, &[false, true]).expect("has curvature");
-        assert_eq!(inv.n_clipped, 1);
-        assert_eq!(inv.floor, 1e-10 * 2.0);
-        assert_eq!(inv.inverse[(1, 1)], 1.0 / inv.floor);
-    }
-
-    #[test]
-    fn equilibration_scales_move_a_marked_diagonal_to_the_geometric_mean_of_the_others() {
-        // Hand-computed: the unmarked diagonals are 4 and 9, so g = 6, and the marked 1.5e9
-        // gets d = sqrt(1.5e9 / 6) = 15811.38…, putting its equilibrated diagonal at g.
-        // `|Mᵢᵢ|`, not `Mᵢᵢ`: the negative unmarked entry counts by magnitude. The zero
-        // unmarked entry (a coordinate with no information) is left out of the mean rather
-        // than dragging it to 0.
-        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, -9.0, 0.0, 1.5e9]));
-        let d = super::equilibration_scales(&m, &[false, false, false, true]);
-        assert_eq!(&d[..3], &[1.0; 3]);
-        let want = (1.5e9f64 / 6.0).sqrt();
-        assert!((d[3] - want).abs() / want < 1e-15, "{} vs {want}", d[3]);
-        // No unmarked coordinate: g = 1, so the marked diagonal is moved to 1.
-        let one = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![25.0]));
-        assert_eq!(super::equilibration_scales(&one, &[true]), vec![5.0]);
-        // An empty mask marks nothing.
-        assert_eq!(super::equilibration_scales(&m, &[]), vec![1.0; 4]);
-    }
-
-    #[test]
-    fn identity_theta_mask_marks_exactly_the_free_identity_packed_thetas() {
-        // θ lower bounds -1 (identity), 0.1 (log), -5 (identity, FIXED, so not in free_idx),
-        // then Ω and σ coordinates, which are never marked. A θ on a lower bound of exactly 0
-        // log-packs (`theta_packs_log` is `lo >= 0`).
-        let omega = crate::types::OmegaMatrix::from_matrix(
-            DMatrix::from_row_slice(1, 1, &[0.09]),
-            vec!["E1".into()],
-            false,
-        );
-        let template = crate::types::ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            theta: vec![1.0, 5.0, 2.0, 3.0],
-            theta_names: vec!["A".into(), "B".into(), "C".into(), "D".into()],
-            theta_lower: vec![-1.0, 0.1, -5.0, 0.0],
-            theta_upper: vec![10.0, 50.0, 10.0, 10.0],
-            theta_fixed: vec![false, false, true, false],
-            omega,
-            omega_fixed: vec![false],
-            sigma: crate::types::SigmaVector {
-                values: vec![0.05],
-                names: vec!["PROP_ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: vec![],
-            mixture: None,
-        };
-        // Packed: θ(4) | Ω(1) | σ(1); θ index 2 is FIX.
-        let free_idx = [0usize, 1, 3, 4, 5];
-        assert_eq!(
-            super::identity_theta_mask(&template, &free_idx),
-            vec![true, false, false, false, false]
-        );
     }
 
     #[test]
@@ -3606,7 +3780,7 @@ mod tests {
         // `R` is axis-aligned with a floored second direction, so `R⁻¹ = diag(1/100, 1/floor)`
         // and the floored direction is coordinate 1.
         let r = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
-        let inv = super::invert_psd_with_floor(&r, &[]).expect("has positive curvature");
+        let inv = super::invert_psd_with_floor(&r).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
         let r_inv = inv.inverse.clone() * 2.0;
         let r_inv_ref = inv.unclipped_inverse.clone() * 2.0;
@@ -3621,7 +3795,7 @@ mod tests {
                 r_inv.clone(),
                 Some(r_inv_ref.clone()),
                 s,
-                &[],
+                &[false, false],
             )
             .expect("sandwich never inverts S");
             let cov_ref = cov_ref.expect("a reference was supplied");
@@ -3672,7 +3846,7 @@ mod tests {
             r_inv.clone(),
             Some(r_inv_ref.clone()),
             &s_asym,
-            &[],
+            &[false, false],
         )
         .expect("sandwich never inverts S");
         let reference = reference.expect("a reference was supplied");
@@ -3695,7 +3869,7 @@ mod tests {
             r_inv.clone(),
             None,
             &s_loaded,
-            &[],
+            &[false, false],
         )
         .expect("sandwich never inverts S");
         assert!(none_ref.is_none());
@@ -3946,12 +4120,80 @@ mod tests {
     #[test]
     fn a_non_hessian_request_is_never_rerouted() {
         // Only a defaulted `r` is rerouted: `s` builds no `R`, and `rsr` is an explicit
-        // request for the sandwich, which no cheaper estimator computes.
+        // request for the sandwich, which no cheaper estimator computes. `s` is not warned
+        // about either; `rsr` is (#2055), in the test below.
         for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+            for explicit in [false, true] {
+                for priors in [false, true] {
+                    let (routed, _) = scale_routed_covariance_method(
+                        COV_HESSIAN_MAX_DIM * 8,
+                        method,
+                        explicit,
+                        priors,
+                    );
+                    assert_eq!(routed, method, "explicit {explicit}, priors {priors}");
+                }
+            }
+        }
+        let (_, warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM * 8,
+            CovarianceMethod::CrossProduct,
+            false,
+            false,
+        );
+        assert!(warning.is_none(), "`s` builds no R: {warning:?}");
+    }
+
+    /// #2055: `rsr` builds the same `R` as `r`, so above the threshold it gets the
+    /// explicit-`r` cost warning, naming `rsr` — before the fix it returned before any cost
+    /// branch, because the gate read `requested == Hessian`. The straddle is `n`: 100 is
+    /// silent, 101 warns. The warning does not depend on `explicitly_set`, since `rsr` is
+    /// never the default. With priors the `s` advice is replaced, as for `r`: `S` cannot
+    /// carry a prior.
+    ///
+    /// Mutations: gate on `Hessian` again → the 101 cell has no warning; route `rsr` to `s`
+    /// → the `routed` assertion fires; give the priored arm the unpriored text → the
+    /// `covariance = false` assertion fires.
+    #[test]
+    fn an_rsr_request_is_honoured_at_scale_but_warned_about() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        for explicit in [false, true] {
             let (routed, warning) =
-                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false, false);
-            assert_eq!(routed, method);
-            assert!(warning.is_none());
+                scale_routed_covariance_method(n, CovarianceMethod::Sandwich, explicit, false);
+            assert_eq!(routed, CovarianceMethod::Sandwich, "rsr is never rerouted");
+            let warning = warning.expect("rsr builds R, so its cost must be reported");
+            assert!(warning.contains("covariance_method = rsr"), "{warning}");
+            assert!(warning.contains("20402"), "2·101²: {warning}");
+            assert!(
+                warning.contains("Set `covariance_method = s`"),
+                "the way out must be named: {warning}"
+            );
+        }
+
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Sandwich, true, true);
+        assert_eq!(routed, CovarianceMethod::Sandwich);
+        let warning = warning.expect("priored rsr at scale must be reported");
+        assert!(warning.contains("covariance_method = rsr"), "{warning}");
+        assert!(warning.contains("parameter priors"), "{warning}");
+        assert!(warning.contains("cannot represent a prior"), "{warning}");
+        assert!(warning.contains("covariance = false"), "{warning}");
+        assert!(
+            !warning.contains("Set `covariance_method = s`"),
+            "`s` drops the prior, so it must not be advised: {warning}"
+        );
+        assert!(warning.contains("20402"), "{warning}");
+
+        // The straddle: at the threshold nothing is said.
+        for priors in [false, true] {
+            let (small, small_warning) = scale_routed_covariance_method(
+                COV_HESSIAN_MAX_DIM,
+                CovarianceMethod::Sandwich,
+                true,
+                priors,
+            );
+            assert_eq!(small, CovarianceMethod::Sandwich);
+            assert!(small_warning.is_none(), "{small_warning:?}");
         }
     }
 
@@ -3962,8 +4204,9 @@ mod tests {
     /// which is what decides if the step runs `R` or the routed `S⁻¹`.
     #[test]
     fn the_pre_fit_cost_note_counts_r_only_when_the_step_builds_r() {
-        let cost =
-            |n, o: &crate::types::FitOptions, p| super::pre_fit_covariance_cost(n, o, p, false);
+        let cost = |n, o: &crate::types::FitOptions, p| {
+            super::pre_fit_covariance_cost(n, o, p, super::PredictedRRoute::Stencil)
+        };
         let opts = |method: CovarianceMethod, set: bool| crate::types::FitOptions {
             run_covariance_step: true,
             covariance_method: method,
@@ -4019,33 +4262,56 @@ mod tests {
         );
     }
 
-    /// #1803: the note's text, pinned whole on both arms so deleting any sentence reddens it,
-    /// and still classified as the `covariance_step` Info it was before the count changed.
+    /// #1803 / #2054: the note's text, pinned whole on every arm so deleting any sentence
+    /// reddens it, and still classified as the `covariance_step` Info it was before the count
+    /// changed. The salvage arm names the declined subset; the stencil arm does not.
     #[test]
     fn the_pre_fit_cost_note_quotes_the_r_count_or_says_it_overflowed() {
         use super::pre_fit_covariance_cost_note as note;
+        use super::PredictedRRoute;
         use crate::types::{classify_warning, WarningCode, WarningSeverity};
-        let counted = note(31, Some(Some(1922))).expect("a note is due");
+        let salvage = PredictedRRoute::Salvage {
+            declined: 2,
+            n_subjects: 20,
+        };
+        let counted = note(31, Some(Some(1922)), PredictedRRoute::Stencil).expect("a note is due");
         assert_eq!(
             counted,
-            "Covariance step: 31 parameters → 1922 OFV evaluations (finite-difference \
+            "Covariance step: 31 parameters → 1922 OFV evaluations expected (finite-difference \
              Hessian). This may take several minutes on complex models."
         );
-        let overflowed = note(31, Some(None)).expect("a note is due");
+        let overflowed = note(31, Some(None), PredictedRRoute::Stencil).expect("a note is due");
         assert_eq!(
             overflowed,
-            "Covariance step: 31 parameters → 2n² OFV evaluations (finite-difference \
+            "Covariance step: 31 parameters → 2n² OFV evaluations expected (finite-difference \
              Hessian). Estimate exceeds usize range; expect this to be very slow."
         );
-        for msg in [&counted, &overflowed] {
+        let salvaged = note(31, Some(Some(1922)), salvage).expect("a note is due");
+        assert_eq!(
+            salvaged,
+            "Covariance step: 31 parameters → 1922 OFV evaluations expected over 2 of 20 \
+             subjects (finite-difference Hessian for the subjects outside the analytic \
+             R-matrix; the rest are analytic). This may take several minutes on complex models."
+        );
+        let salvaged_overflow = note(31, Some(None), salvage).expect("a note is due");
+        assert_eq!(
+            salvaged_overflow,
+            "Covariance step: 31 parameters → 2n² OFV evaluations expected over 2 of 20 \
+             subjects (finite-difference Hessian for the subjects outside the analytic \
+             R-matrix; the rest are analytic). Estimate exceeds usize range; expect this to be \
+             very slow."
+        );
+        for msg in [&counted, &overflowed, &salvaged, &salvaged_overflow] {
             let entry = classify_warning(msg);
             assert_eq!(
                 (entry.severity, entry.category),
                 (WarningSeverity::Info, WarningCode::CovarianceStep),
                 "{msg}"
             );
+            // ferx-r's `ferx_get_warnings()` advice arm matches this exact token.
+            assert!(msg.contains("OFV evaluations"), "{msg}");
         }
-        assert_eq!(note(31, None), None, "no cost, no note");
+        assert_eq!(note(31, None, salvage), None, "no cost, no note");
     }
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
@@ -4422,7 +4688,7 @@ mod tests {
     }
 
     /// #2179, the wiring: the SIR fallback proposal `compute_covariance` hands back on a
-    /// non-PD `R` is built in the equilibrated basis, so writing an identity-packed λ `k` times
+    /// non-PD `R` is built in the rescaled basis, so writing an identity-packed λ `k` times
     /// larger scales its row and column by `k` and changes nothing else. The fixture is the
     /// one-subject `FailedNonPd` case above, λ written `TVLAMBDA_S = k·λ` with a negative lower
     /// bound. `build_fallback_proposal_is_equivariant_in_an_identity_coordinates_units` pins
@@ -4488,9 +4754,9 @@ mod tests {
             // What is left is the FD Hessian, not the proposal. `fd_step_floor` steps λ by
             // `eps·(|θ₀| + |λ|)` while `|θ₀| < 1` and by `eps·(1 + |λ|)` from there on, so at
             // k = 1 and k = 1e-6 the relative step is the same `2·eps` and the proposals agree
-            // exactly, while at k = 1e6 it is about `eps` and the one-subject Hessian's
-            // truncation error moves by 2.5e-3 (macOS arm64). With this step's mask not
-            // passed to the builder, k = 1e6 is 0.52 off; the bound is 4× the measured worst.
+            // to 4.8e-17, while at k = 1e6 it is about `eps` and the one-subject Hessian's
+            // truncation error moves by 3.0e-3 (macOS arm64). With this step's mask not
+            // passed to the builder, k = 1e6 is 0.52 off; the bound is 3× the measured worst.
             assert!(
                 worst < 1e-2,
                 "k = {k:e}: worst relative difference {worst:e}"
@@ -5139,7 +5405,7 @@ mod tests {
         )
         .expect("S");
         let want = super::embed_free(
-            &super::invert_cross_product(&s, &[]).expect("S⁻¹ exists"),
+            &super::invert_cross_product(&s, &vec![false; s.nrows()]).expect("S⁻¹ exists"),
             &free_idx,
             x.len(),
         );

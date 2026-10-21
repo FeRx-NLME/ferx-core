@@ -535,7 +535,9 @@ this engine is, and switch automatically once a block makes the problem large:
   million population objectives at 800 parameters — so above 100 free
   coordinates a *defaulted* covariance method routes to the score cross-product
   (`covariance_method = s`, one pass) with a warning. Setting
-  `covariance_method = r` explicitly forces it, and says what it costs.
+  `covariance_method = r` explicitly forces it, and says what it costs. An
+  explicit `covariance_method = rsr` builds the same `R`, is never routed, and is
+  told the same.
 
 A block of 20 or more coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console.

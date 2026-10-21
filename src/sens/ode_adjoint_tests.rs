@@ -1765,6 +1765,173 @@ fn iov_linearization_uses_the_exact_kappa_jacobian() {
     assert!(worst < 1e-9, "worst κ-column gap {worst:.2e}");
 }
 
+// ---- IOV past the retired 24-axis program cap (#2031) ---------------------------------
+
+/// `src` with `n` live θ `PAD0…PAD{n-1}` added after the last θ line, each scaling the
+/// `[individual_parameters]` line `target` by `(1 + 0.02·PADi)`. Live, not inert: a pad at
+/// `+ 0.0 * PADi` has an exactly-zero θ column, so the parity below would not see a
+/// θ column the recording dropped or misplaced.
+fn with_live_pads(src: &str, last_theta: &str, target: &str, n: usize) -> String {
+    let thetas: String = (0..n)
+        .map(|i| format!("  theta PAD{i}(0.5, 0.01, 10.0)\n"))
+        .collect();
+    let terms: String = (0..n).map(|i| format!(" + 0.02 * PAD{i}")).collect();
+    assert!(
+        src.contains(last_theta) && src.contains(target),
+        "pad anchors"
+    );
+    src.replacen(last_theta, &format!("{last_theta}{thetas}"), 1)
+        .replacen(target, &format!("{target} * (1.0{terms})"), 1)
+}
+
+/// Compartment-free IOV twin of [`ODE_IOV`]: 3 θ, 2 η, 2 κ (7 axes), the same η/κ layout.
+const ALGEBRAIC_IOV: &str = r#"
+[parameters]
+  theta TVE0(10.0, 0.1, 100.0)
+  theta TVEMAX(6.0, 0.1, 100.0)
+  theta TVET50(2.0, 0.01, 100.0)
+  omega ETA_E0 ~ 0.09
+  omega ETA_EMAX ~ 0.06
+  kappa KAPPA_E0 ~ 0.03
+  kappa KAPPA_EMAX ~ 0.02
+  sigma ADD ~ 1.0 (sd)
+[individual_parameters]
+  E0   = TVE0 * exp(ETA_E0 + KAPPA_E0)
+  EMAX = TVEMAX * exp(ETA_EMAX + KAPPA_EMAX)
+  ET50 = TVET50
+[structural_model]
+  y = E0 - EMAX * TIME / (ET50 + TIME)
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// [`iov_subject`] for a compartment-free model: the same three occasions, no doses.
+fn algebraic_iov_subject(model: &CompiledModel) -> Subject {
+    let times = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
+    let mut s = subject_shell(vec![], &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 3, 3, 3];
+    let kappas = vec![vec![0.1, -0.05], vec![-0.08, 0.04], vec![0.05, 0.06]];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+        &kappas,
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The inner loop's stacked `[η, κ_0, κ_1, κ_2]` Jacobian (`exact_obs_grads`, all the inner
+/// gradient reads) against a Richardson difference of `predict_iov`: the worst relative gap
+/// over every row and stacked column.
+fn iov_jacobian_gap(model: &CompiledModel, s: &Subject, theta: &[f64]) -> f64 {
+    let eta = [0.07, -0.04];
+    let kappas = [vec![0.06, -0.03], vec![-0.05, 0.02], vec![0.04, 0.05]];
+    let stacked: Vec<f64> = eta
+        .iter()
+        .copied()
+        .chain(kappas.iter().flatten().copied())
+        .collect();
+    let exact = exact_obs_grads(model, s, theta, &stacked).expect("inner recording serves it");
+    let predict = |st: &[f64]| {
+        let k: Vec<Vec<f64>> = st[2..].chunks(2).map(<[f64]>::to_vec).collect();
+        crate::pk::predict_iov(model, s, theta, &st[..2], &k)
+    };
+    let mut worst = 0.0f64;
+    for c in 0..stacked.len() {
+        let fd = |h: f64| {
+            let (mut p, mut m) = (stacked.clone(), stacked.clone());
+            p[c] += h;
+            m[c] -= h;
+            let (yp, ym) = (predict(&p), predict(&m));
+            yp.iter()
+                .zip(&ym)
+                .map(|(a, b)| (a - b) / (2.0 * h))
+                .collect::<Vec<f64>>()
+        };
+        let (f1, f2) = (fd(1e-3), fd(2e-3));
+        for (j, row) in exact.iter().enumerate() {
+            let rich = (4.0 * f1[j] - f2[j]) / 3.0;
+            assert!(
+                row.df_deta[c].is_finite() && rich.is_finite(),
+                "row {j} column {c}: exact {} fd {rich}",
+                row.df_deta[c]
+            );
+            worst = worst.max((row.df_deta[c] - rich).abs() / (1.0 + rich.abs()));
+        }
+    }
+    worst
+}
+
+/// #2031: before #2093 the forward provider declined an IOV model on the ODE engine
+/// (`ode_iov_supported`) or the compartment-free readout (`algebraic::supported_iov`) once
+/// `n_theta + n_eta + n_kappa > 24`, FIX θ included, so both loops ran on finite
+/// differences. The adjoint seeds θ on its reverse tape and only `[η, κ]` forward, so a
+/// 25-axis model (18 live pads on a 7-axis fixture) records like a 7-axis one: the outer
+/// FOCEI gradient matches the reconverged FD of the production objective along every packed
+/// coordinate, the pads' included, and the inner stacked Jacobian matches FD of
+/// `predict_iov`. A width clause reinstated anywhere on the subject path panics at the
+/// `expect`s instead.
+fn assert_wide_iov_parity(engine: &str, model: &CompiledModel, s: &Subject, tol: (f64, f64)) {
+    assert!(
+        model.n_theta + model.n_eta + model.n_kappa > 24,
+        "{engine}: the fixture must sit past the old cap"
+    );
+    assert!(recorder_in_scope(model), "{engine}: model-level scope");
+    let jac = iov_jacobian_gap(model, s, &moved_params(model).theta);
+    let outer = iov_parity(model, s, true);
+    eprintln!("#2031 {engine} at 25 axes: inner Jacobian vs FD {jac:.2e}, FOCEI vs reconverged FD {outer:.2e}");
+    assert!(jac < tol.0, "{engine}: inner Jacobian vs FD {jac:.2e}");
+    assert!(
+        outer < tol.1,
+        "{engine}: FOCEI vs reconverged FD {outer:.2e}"
+    );
+}
+
+#[test]
+fn ode_iov_past_24_axes_matches_fd() {
+    let src = with_live_pads(
+        ODE_IOV,
+        "  theta TVKA(1.2, 0.05, 20.0)\n",
+        "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        18,
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = iov_subject(&model);
+    // Measured (macOS arm64): Jacobian 5.0e-13, FOCEI 3.1e-9 (the Richardson floor at EBE
+    // tol 1e-12, as on the 7-axis fixture); 10× headroom each.
+    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 3e-8));
+}
+
+#[test]
+fn compartment_free_iov_past_24_axes_matches_fd() {
+    let src = with_live_pads(
+        ALGEBRAIC_IOV,
+        "  theta TVET50(2.0, 0.01, 100.0)\n",
+        "  E0   = TVE0 * exp(ETA_E0 + KAPPA_E0)",
+        18,
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.is_algebraic());
+    let s = algebraic_iov_subject(&model);
+    // The oracle's EBE at 1e-7, not 1e-12: this exact objective has no stall stop, and its
+    // BFGS cannot certify `|g| < 1e-8` at the moved θ (the inner gradient agrees with a
+    // central difference to 9 figures; it is the L2 floor), so every stencil point fell to
+    // Nelder–Mead and the test took 36 s in debug.
+    ORACLE_EBE_TOL.set(1e-7);
+    // Measured (macOS arm64): Jacobian 1.7e-13, FOCEI 6.4e-7 (6.3e-12 with the oracle at
+    // 1e-12); 10× headroom each. A dropped or misplaced θ column is an O(1) relative gap.
+    assert_wide_iov_parity("compartment-free", &model, &s, (2e-12, 6.4e-6));
+    ORACLE_EBE_TOL.set(1e-12);
+}
+
 // ---- closed-form event walk: time-varying covariates and IOV --------------------------
 
 const CF_TVCOV: &str = r#"

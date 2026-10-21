@@ -239,6 +239,99 @@ pub(crate) fn absorption_flip_flop_at(
     }
 }
 
+/// `subject`'s dose, observation, EVID=2 and EVID=3/4 records whose `CL` or `V`, at
+/// `(theta, eta_bsv, kappas)`, is non-positive or non-finite, as `(time, nan)` in time
+/// order (#2104). `nan` separates the two rules the closed-form engines apply: `false`
+/// where the parameters are degenerate in the sense of
+/// [`crate::sens::propagate::cl_or_v_degenerate`] (non-positive or `+inf`: served 0),
+/// `true` where they are not but one is `NaN` (served `NaN` once a dose has arrived, 0
+/// before — which of the two a given record got depends on the timeline, not on the
+/// parameter alone). Empty for a model the rule does not govern
+/// ([`crate::sens::propagate::cl_v_rule_governs`]).
+///
+/// Each record is evaluated the way the prediction evaluates it: its own covariate
+/// snapshot and `TIME`, and on an IOV model its own occasion's κ (the same occasion map
+/// `predict_iov` uses). `kappas` is ignored when `model.n_kappa == 0`.
+pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[K],
+) -> Vec<(f64, bool)> {
+    if !crate::sens::propagate::cl_v_rule_governs(model.pk_model)
+        || model.ode_spec.is_some()
+        || model.is_algebraic()
+    {
+        return Vec::new();
+    }
+    let params = if model.n_kappa > 0 {
+        let layout =
+            crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), model.n_kappa, subject);
+        let combined_for = iov_occasion_eta(&layout, eta_bsv, kappas);
+        let mut out = EventPkParams::default();
+        fill_iov_record_params(
+            model,
+            subject,
+            theta,
+            &combined_for,
+            &mut out.dose,
+            &mut out.obs,
+            &mut out.pk_only,
+        );
+        // EVID=3/4 rows under their own covariates and occasion — `predict_iov`'s reset
+        // snapshot, with its BSV-only fallback for a row with no resolvable occasion.
+        out.reset = (0..subject.reset_times.len())
+            .map(|r| {
+                let combined = combined_for(reset_row_occasion(subject, r).unwrap_or(u32::MAX));
+                pk_params_at_time(
+                    model,
+                    theta,
+                    &combined,
+                    subject.reset_cov(r),
+                    subject.param_time_at(subject.reset_times[r]),
+                )
+            })
+            .collect();
+        out
+    } else {
+        compute_event_pk_params(model, subject, theta, eta_bsv)
+    };
+    // `!(x > 0 && finite)` is true for a `NaN` too — which `cl_or_v_degenerate`, the
+    // engines' rule, deliberately is not.
+    let valid = |x: f64| x > 0.0 && x.is_finite();
+    // The reader stores an EVID=4 row twice — in `doses`, flagged `evid4`, and in
+    // `reset_times` at the same time — so its reset entry is skipped: counting it again
+    // would report one data record as two. A separate EVID=3 row co-timed with a dose is
+    // a second record and is kept, whatever its CL and V. (A reset co-timed with an
+    // earlier one is shifted past it by the reader's segmentation, so a time names at
+    // most one reset.)
+    let evid4_twin = |t: f64| subject.doses.iter().any(|d| d.evid4 && d.time == t);
+    let mut records: Vec<(f64, bool)> = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .zip(&params.dose)
+        .chain(subject.obs_times.iter().copied().zip(&params.obs))
+        .chain(subject.pk_only_times.iter().copied().zip(&params.pk_only))
+        .chain(
+            subject
+                .reset_times
+                .iter()
+                .copied()
+                .zip(&params.reset)
+                .filter(|&(t, _)| !evid4_twin(t)),
+        )
+        .filter(|(_, p)| !(valid(p.cl()) && valid(p.v())))
+        .map(|(t, p)| {
+            let nan = !crate::sens::propagate::cl_or_v_degenerate(p.cl(), p.v());
+            (t, nan)
+        })
+        .collect();
+    records.sort_by(|a, b| a.0.total_cmp(&b.0));
+    records
+}
+
 /// The model to evaluate this subject with at `(theta, eta)`: the structural
 /// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` / IOV transit or IG
 /// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
@@ -2005,6 +2098,14 @@ fn route_f_scale(pk_model: PkModel, infusion: bool, p: &PkParams) -> f64 {
 fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> f64 {
     let cl = p.cl();
     let v = p.v();
+    // A degenerate `CL` or `V` drops the dose (0), a `NaN` one makes it `NaN` — the rule
+    // the event-driven walk applies too, so the two engines serve the same subject the
+    // same prediction (#2104). Transit / IG keep their own convention.
+    if crate::sens::propagate::cl_v_rule_governs(pk_model) {
+        if let Some(c) = crate::sens::propagate::superposed_dose_override(cl, v) {
+            return c;
+        }
+    }
     let infusion = dose.is_infusion();
     let f_scale = route_f_scale(pk_model, infusion, p);
 
@@ -2199,6 +2300,12 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> Vec<f64> {
     let cl = p.cl();
     let v = p.v();
+    // The state twin of `single_dose_concentration`'s degenerate-parameter rule (#2104).
+    if crate::sens::propagate::cl_v_rule_governs(pk_model) {
+        if let Some(c) = crate::sens::propagate::superposed_dose_override(cl, v) {
+            return vec![c; pk_model.topology().n_states];
+        }
+    }
     let infusion = dose.is_infusion();
 
     // Bioavailability handling mirrors `single_dose_concentration` (#419):
@@ -5989,6 +6096,15 @@ mod tests {
         assert!((states[1] - c).abs() <= 1e-9 * c.abs().max(1.0));
     }
 
+    /// A `PkParams` whose `CL` and `V` pass the degenerate-parameter early return (#2104),
+    /// so a direct call reaches the dispatch below it.
+    fn pk_valid_cl_v() -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 5.0;
+        p.values[crate::types::PK_IDX_V] = 50.0;
+        p
+    }
+
     /// SS doses reroute to the ODE twin before reaching the closed forms (`effective_for`,
     /// #719), so the SS arms of `single_dose_concentration` / `single_dose_states` are
     /// `unreachable!` — calling them directly with an SS dose must hit those guards (covers the
@@ -5996,7 +6112,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "one_cpt_ig SS doses reroute")]
     fn single_dose_concentration_one_cpt_ig_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_concentration(PkModel::OneCptIg, &ss, 2.0, &p);
     }
@@ -6004,7 +6120,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_ig SS doses reroute")]
     fn single_dose_states_two_cpt_ig_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_states(PkModel::TwoCptIg, &ss, 2.0, &p);
     }
@@ -6015,7 +6131,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_concentration_two_cpt_transit_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_concentration(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }
@@ -6024,7 +6140,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_states_two_cpt_transit_ss_unreachable() {
-        let p = PkParams::default();
+        let p = pk_valid_cl_v();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_states(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }

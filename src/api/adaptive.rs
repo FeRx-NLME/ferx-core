@@ -985,35 +985,18 @@ where
             // Tagged trajectory rows (Ipred only). `run.predictions` is indexed
             // by the subject's observation grid, exactly like `emit_subject_rows`.
             // The driver (and the replay that verified it) return the bare readout;
-            // `[scaling]` Form A/B is applied here, as `simulate()` applies it (#2129).
+            // `adaptive_rows_to_model_scale` puts it on the scale `simulate()` reports
+            // (`[scaling]`, #2129; the FREM covariate rows, #2156).
             let mut predictions = run.predictions;
-            match eta_occ.as_deref() {
-                None => crate::pk::apply_scaling(
-                    model,
-                    subject,
-                    &params.theta,
-                    &eta_slice,
-                    &mut predictions,
-                ),
-                // IOV: each row divides under its decision window's `[η | κ]` — the eta
-                // the driver read the row with (`occasion_of`, as `compute_event_pk_params_iov`
-                // resolves it) — as `predict_iov` scales each occasion under its own κ.
-                Some(eo) if has_obs_scale => {
-                    for (j, pred) in predictions.iter_mut().enumerate() {
-                        let eta_j = crate::pk::occasion_of(decision_times, subject.obs_times[j])
-                            .map_or(eta_slice.as_slice(), |g| eo[g].as_slice());
-                        let scale = crate::pk::obs_scale_divisors(
-                            model,
-                            subject,
-                            &params.theta,
-                            eta_j,
-                            &subject.obs_cmts[j..=j],
-                        )[0];
-                        *pred = crate::pk::divide_by_obs_scale(*pred, scale);
-                    }
-                }
-                Some(_) => {}
-            }
+            adaptive_rows_to_model_scale(
+                model,
+                subject,
+                &params.theta,
+                &eta_slice,
+                eta_occ.as_deref(),
+                decision_times,
+                &mut predictions,
+            );
             for (j, &pred) in predictions.iter().enumerate() {
                 trajectories.push(SimulationResult {
                     draw: 1,
@@ -1069,7 +1052,7 @@ where
                     );
                     let realized_decision_times: Vec<f64> =
                         run.decisions.iter().map(|d| d.time).collect();
-                    crate::ode::adaptive_window_signal_aucs(
+                    let aucs = crate::ode::adaptive_window_signal_aucs(
                         ode,
                         &pk.values,
                         &params.theta,
@@ -1079,14 +1062,16 @@ where
                         &run.ledger,
                         mon.observe,
                         mon.spec.cmt,
+                    );
+                    // The pass integrates the bare readout (#2129).
+                    adaptive_window_aucs_to_model_scale(
+                        model,
+                        subject,
+                        mon,
+                        &eta_slice,
+                        eta_occ.as_deref(),
+                        aucs,
                     )
-                    .into_iter()
-                    // The pass integrates the bare readout. Its divisor is one constant
-                    // per subject here — `auc_target` is refused above under IOV and
-                    // time-varying covariates — so dividing the window AUC is dividing
-                    // every grid point (#2129).
-                    .map(|auc| mon.scale_readout(auc, &eta_slice))
-                    .collect()
                 }
                 _ => Vec::new(),
             };
@@ -1147,6 +1132,103 @@ where
         metrics,
         warnings,
     })
+}
+
+/// Divide the `auc_target` window AUCs, integrated on the bare readout, by the
+/// monitor's `[scaling]` divisor (#2129).
+///
+/// The divisor is evaluated once per subject: under `eta_slice` (κ = 0) and, as
+/// `apply_scaling` always does, on the static covariate snapshot at t = 0. Dividing the
+/// window AUC by it is exact while two conditions hold, and each `debug_assert!` below
+/// states one of them:
+///
+/// - **No decision-window κ.** Under IOV each window reads under its own `[η | κ_g]`, so
+///   a κ the divisor reads moves it between windows, and one κ = 0 divisor is wrong.
+/// - **No per-event PK.** This divide is right for such a subject, since the divisor
+///   never follows the covariates. The AUC it divides is not: the window pass integrates
+///   one frozen PK snapshot, so a time-varying covariate or `TIME` in the PK leaves the
+///   integrand itself wrong.
+///
+/// The `auc_target` refusal in `run_adaptive_population` keeps both cases out today, so
+/// neither fires in production. They state the conditions at the place that relies on
+/// them, so a widened refusal fails here in debug builds. The second one calls the same
+/// `subject_needs_per_event_pk` the refusal calls, so it shares that predicate's
+/// definition of per-event PK. Both go when #943 rewrites the window pass per grid point
+/// (#2156). Pinned by `adaptive_frem_tests::window_auc_divide_asserts_no_decision_kappa`
+/// and `adaptive_frem_tests::window_auc_divide_asserts_no_per_event_pk`.
+pub(crate) fn adaptive_window_aucs_to_model_scale(
+    model: &CompiledModel,
+    subject: &Subject,
+    mon: &crate::sim::adaptive::AdaptiveMonitor,
+    eta_slice: &[f64],
+    eta_occ: Option<&[Vec<f64>]>,
+    aucs: Vec<f64>,
+) -> Vec<f64> {
+    debug_assert!(
+        eta_occ.is_none(),
+        "auc_target: subject '{}' has a decision-window κ, so its [scaling] divisor can \
+         change between windows, but the window AUCs are divided by one κ = 0 divisor; \
+         convert per grid point instead (#943)",
+        subject.id
+    );
+    debug_assert!(
+        !crate::pk::subject_needs_per_event_pk(model, subject),
+        "auc_target: subject '{}' needs per-event PK, but the window AUCs integrate one \
+         frozen PK snapshot; integrate per event instead (#943)",
+        subject.id
+    );
+    aucs.into_iter()
+        .map(|auc| mon.scale_readout(auc, eta_slice))
+        .collect()
+}
+
+/// Put the adaptive driver's bare readout rows on the scale `simulate()` reports: the
+/// steps the `pk` sink (`compute_predictions_with_tv` / `predict_iov`) runs after the
+/// engine, in the sink's order.
+///
+/// 1. `[scaling]` Form A/B (#2129): one divisor per subject, or — under IOV — each row
+///    divided under its decision window's `[η | κ]`, the eta the driver read the row with
+///    (`occasion_of`, as `compute_event_pk_params_iov` resolves it), as `predict_iov`
+///    scales each occasion under its own κ.
+/// 2. The LTBS log-wrap. A no-op today, since `reject_unsupported_adaptive` refuses a
+///    log-transformed model; it is here so this function mirrors the sink step for step.
+/// 3. The FREM override (#2156): a `FREMTYPE > 0` covariate pseudo-observation is
+///    `θ_k + η_m`, not the readout. `eta_slice` is `[η_bsv | 0…0]`, so the BSV indices
+///    `frem_predictions` names read it directly, with or without IOV — the sink passes
+///    the BSV η too.
+///
+/// Form C (`y = <expr>`) is applied inside the ODE engine, so it is already in `preds`.
+/// Pinned bit for bit against the full sink by
+/// `adaptive_frem_tests::row_conversion_matches_the_full_pk_sink`.
+pub(crate) fn adaptive_rows_to_model_scale(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_slice: &[f64],
+    eta_occ: Option<&[Vec<f64>]>,
+    decision_times: &[f64],
+    preds: &mut [f64],
+) {
+    match eta_occ {
+        None => crate::pk::apply_scaling(model, subject, theta, eta_slice, preds),
+        Some(eo) if !matches!(model.scaling, crate::types::ScalingSpec::None) => {
+            for (j, pred) in preds.iter_mut().enumerate() {
+                let eta_j = crate::pk::occasion_of(decision_times, subject.obs_times[j])
+                    .map_or(eta_slice, |g| eo[g].as_slice());
+                let scale = crate::pk::obs_scale_divisors(
+                    model,
+                    subject,
+                    theta,
+                    eta_j,
+                    &subject.obs_cmts[j..=j],
+                )[0];
+                *pred = crate::pk::divide_by_obs_scale(*pred, scale);
+            }
+        }
+        Some(_) => {}
+    }
+    crate::pk::apply_log_transform(model, preds);
+    crate::pk::apply_frem_prediction_override(model, subject, theta, eta_slice, preds);
 }
 
 /// Validate that the per-(subject, replicate) PK snapshots the reactive driver was

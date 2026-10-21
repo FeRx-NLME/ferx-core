@@ -163,11 +163,16 @@ covariance step had to floor is a direction the data do not inform.
 Neither note depends on the units a theta is written in. A theta with a negative
 lower bound is sampled as itself, so its variance in the proposal grows as `k²`
 when the theta is written `k` times larger. SIR therefore floors and caps the
-proposal with each such theta's row and column rescaled to the other
-coordinates' scale, as the
-[covariance step does](parameterization.qmd#theta-log-vs-identity), and maps the
-factor back before drawing. The `|eigenvalue|`-rectified fallback proposal of
-`covariance_fallback = sir` is built the same way. Before #2179, writing the
+proposal in the basis the
+[covariance step floors in](parameterization.qmd#identity-theta-covariance-floor),
+and maps the factor back before drawing. The proposal is a covariance, the
+inverse of the matrix the covariance step floors, so each such theta's row and
+column are scaled until its variance equals the *smallest* variance among the
+other coordinates. That keeps the theta from setting the floor, and from being
+mixed into a direction the cap shrinks, since the widest direction is the one a
+cap acts on. The `|eigenvalue|`-rectified fallback proposal of
+`covariance_fallback = sir` is built from the Hessian, so it is rescaled exactly
+as the covariance step rescales it. Before #2179, writing the
 warfarin example's `V` `1e5` times larger floored every other direction and moved
 an SIR interval by 25 %, `1e6` moved one 26-fold, and at `1e8` every draw was
 rejected. A theta drawn on the logit scale is dimensionless and is not rescaled.
