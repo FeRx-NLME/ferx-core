@@ -788,8 +788,8 @@ pub(crate) fn mr_scope<'a>(
 /// Verify-gate memo key (#1150): what the twin comparison actually depends on, by
 /// **content** — never by address.
 ///
-///   - `spec`: [`spec_fingerprint`] — the `OdeSpec`'s structure, its RHS and readout
-///     *behaviour* (probed at a fixed synthetic point), its input-rate forcings, and
+///   - `spec`: [`spec_fingerprint`] — the `OdeSpec`'s structure, its compiled RHS and
+///     readout programs, its input-rate forcings, and
 ///     the raw and effective `solver_opts` the twin and `verify_tol` are derived from.
 ///   - `subject`: [`subject_fingerprint`] — the id **and** the dose and observation
 ///     schedule, so a single-dose verdict is never reused for a multi-dose regimen.
@@ -841,20 +841,23 @@ struct MrVerifyKey {
 
 /// Content fingerprint of everything on the `OdeSpec` side of the twin comparison.
 ///
-/// The RHS and readout are closures, so they are fingerprinted by **behaviour**: each
-/// is evaluated once at a fixed synthetic state/parameter point and the result bits
-/// are hashed. Two specs that differ only in an RHS constant then differ here, while
-/// two parses of the same source agree. The probe point is independent of `(θ, η)` —
-/// the parameter point is [`param_bucket`]'s job — so this stays fixed across a fit
-/// and can key the per-subject budget. The probe is deterministic because `mr_scope`
-/// has already declined any RHS or readout that reads model time.
+/// The RHS and readout are fingerprinted by their **compiled programs**
+/// (`hash_structure`: statements, bytecode, constants and slot plans), not by
+/// evaluating them. A behavioural probe at a finite set of points cannot separate
+/// `y = central/V` from `y = central/V + central·(central−1)·(central−2)`, which
+/// agree wherever `central ∈ {0, 1, 2}` — exactly the probe points the linearity
+/// check uses — and differ on every real trajectory. Two parses of the same source
+/// produce the same programs and so share a key; any edit to the program does not.
+///
+/// `mr_scope` admits only specs with both an `rhs_program` and a `readout_program`
+/// (`identify_disposition` declines otherwise), so every admitted spec is
+/// fingerprinted structurally; the `None` arms only keep the function total. The
+/// closures (`rhs`, `readout`) are compiled from the same statements.
+///
+/// Independent of `(θ, η)` — the parameter point is [`param_bucket`]'s job — so this
+/// stays fixed across a fit and can key the per-subject budget.
 #[cfg(debug_assertions)]
-fn spec_fingerprint(
-    spec: &OdeSpec,
-    subject: &crate::types::Subject,
-    n_theta: usize,
-    n_eta: usize,
-) -> u64 {
+fn spec_fingerprint(spec: &OdeSpec) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     spec.n_states.hash(&mut h);
@@ -868,28 +871,33 @@ fn spec_fingerprint(
     // integrates at the latter, and `verify_tol` is derived from them.
     format!("{:?}", spec.solver_opts).hash(&mut h);
     format!("{:?}", spec.effective_solver_opts()).hash(&mut h);
-    let u: Vec<f64> = (0..spec.n_states).map(|i| 1.0 + 0.37 * i as f64).collect();
-    let p: Vec<f64> = (0..crate::types::MAX_PK_PARAMS)
-        .map(|j| 1.0 + 0.013 * j as f64)
-        .collect();
-    match probe_rhs_f64(spec, &u, &p, 0.5) {
-        Some(du) => du.iter().for_each(|d| d.to_bits().hash(&mut h)),
-        None => u64::MAX.hash(&mut h),
+    match &spec.rhs_program {
+        Some(prog) => {
+            1u8.hash(&mut h);
+            prog.hash_structure(&mut h);
+        }
+        None => 0u8.hash(&mut h),
     }
-    let theta = vec![1.1; n_theta];
-    let eta = vec![0.1; n_eta];
+    match &spec.readout_program {
+        Some(ro) => {
+            1u8.hash(&mut h);
+            ro.hash_structure(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
     match &spec.readout {
         crate::ode::OdeReadout::ObsCmt(idx) => (0u8, *idx).hash(&mut h),
-        crate::ode::OdeReadout::Single(_) | crate::ode::OdeReadout::PerCmt(_) => {
-            1u8.hash(&mut h);
-            let mut cmts = subject.obs_cmts.clone();
-            cmts.sort_unstable();
-            cmts.dedup();
-            for c in cmts {
-                let y = spec
-                    .readout
-                    .eval(&u, &p, &theta, &eta, &subject.covariates, c, 0.5);
-                (c, y.to_bits()).hash(&mut h);
+        crate::ode::OdeReadout::Single(_) => 1u8.hash(&mut h),
+        crate::ode::OdeReadout::PerCmt(map) => {
+            2u8.hash(&mut h);
+            let mut cmts: Vec<_> = map.iter().collect();
+            cmts.sort_unstable_by_key(|(c, _)| **c);
+            for (c, r) in cmts {
+                c.hash(&mut h);
+                match &r.program {
+                    Some(ro) => ro.hash_structure(&mut h),
+                    None => u64::MAX.hash(&mut h),
+                }
             }
         }
     }
@@ -1076,6 +1084,22 @@ fn verify_against_ode_twin(
     eta: &[f64],
     mr: &[f64],
 ) {
+    verify_against_twin(s, subject, mr, || {
+        crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject)
+    });
+}
+
+/// [`verify_against_ode_twin`] with the twin integration injected, so a test can hand
+/// the memo a twin no real integration produces on demand — a finite prefix followed
+/// by `NaN` — and pin that such a partial comparison does not retire the key (#1150).
+/// `twin` runs only once the key is claimed and the budget and tolerance gates pass.
+#[cfg(debug_assertions)]
+fn verify_against_twin(
+    s: &MrScope<'_>,
+    subject: &crate::types::Subject,
+    mr: &[f64],
+    twin: impl FnOnce() -> Vec<f64>,
+) {
     // The bound has to scale with the model's *own* solver accuracy: the twin is
     // integrated at `spec.solver_opts`, so it cannot be a tighter reference than
     // the user asked for. A fixed bound is the wrong shape here, and a fixed
@@ -1114,7 +1138,7 @@ fn verify_against_ode_twin(
     // Once per key — see `MrVerifyKey`. Claimed *before* the integration; the claim
     // releases itself (including on unwind) unless the comparison below settles it.
     let key = MrVerifyKey {
-        spec: spec_fingerprint(s.spec, subject, theta.len(), eta.len()),
+        spec: spec_fingerprint(s.spec),
         subject: subject_fingerprint(subject),
         point: param_bucket(&s.pk.values),
     };
@@ -1169,7 +1193,7 @@ fn verify_against_ode_twin(
     if solver.reltol > MR_TWIN_MAX_RELTOL || solver.abstol > MR_TWIN_MAX_ABSTOL {
         return;
     }
-    let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject);
+    let twin = twin();
     if twin.len() != mr.len() {
         return;
     }
@@ -3479,11 +3503,9 @@ mod tests {
         let eta = [0.0, 0.0];
         let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
         // A length mismatch: nothing is compared, so nothing was verified. This is
-        // the one vacuity path reachable from outside — the other (`compared <
-        // mr.len()`, some twin entries non-finite, #1150) needs the *twin* to be
-        // NaN, and the gate integrates that itself from `s.spec`, so no caller can
-        // arrange it. Both paths release the same key, but only this one has a test:
-        // weakening the partial check to `compared > 0` leaves the suite green.
+        // the vacuity path reachable through the public seam; the partial one (some
+        // twin entries non-finite) is pinned through the injected twin by
+        // `a_partial_verify_gate_call_does_not_retire_its_memo_key`.
         verify_against_ode_twin(&s, &subject, &theta, &eta, &[]);
         // Same key. If the vacuous call had kept the key, this
         // would return early and the test would fail by *not* panicking.
@@ -3675,9 +3697,7 @@ mod tests {
             parse(&src_b).unwrap(),
         );
         let subject = tad_subject();
-        let fp = |m: &crate::types::CompiledModel| {
-            spec_fingerprint(m.ode_spec.as_ref().unwrap(), &subject, 5, 2)
-        };
+        let fp = |m: &crate::types::CompiledModel| spec_fingerprint(m.ode_spec.as_ref().unwrap());
         assert_eq!(
             fp(&a1),
             fp(&a2),
@@ -3695,6 +3715,70 @@ mod tests {
         );
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             verify_clean_then_perturbed(&a1, &subject, &theta, &b, &subject, &theta)
+        }));
+        assert!(
+            caught.is_err(),
+            "the second model's closed form was never checked"
+        );
+    }
+
+    /// A **partial** comparison must not retire the key either (#1150 §5): a twin that
+    /// is finite for the first observations and `NaN` after leaves most of them never
+    /// compared. Retiring the key on `compared > 0` would let that call stand in for a
+    /// full check. The twin is injected (no real integration produces this on demand);
+    /// the closed form agrees with it on every finite entry, so the first call cannot
+    /// panic, and the follow-up perturbed call proves the key is still live.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn a_partial_verify_gate_call_does_not_retire_its_memo_key() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        let real = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        let mut partial = real.clone();
+        partial[3..].iter_mut().for_each(|v| *v = f64::NAN);
+        assert!(
+            partial[..3].iter().all(|v| v.is_finite()),
+            "precondition: finite prefix"
+        );
+        verify_against_twin(&s, &subject, &real, || partial);
+        let mut preds = real.clone();
+        preds[10] *= 1.01;
+        verify_against_twin(&s, &subject, &preds, || real);
+    }
+
+    /// The readout is keyed by its **compiled program**, not by a behavioural probe
+    /// (#1150 review). `central / V` and `central / V + central·(central−1)·(central−2)`
+    /// agree at `central ∈ {0, 1, 2}` — the linearity probe's own points, so both are
+    /// admitted — and differ on every real trajectory. With the same RHS, subject and
+    /// parameters, the first model's verdict must not suppress the second's check.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_verify_gate_keys_the_readout_by_its_program() {
+        let parse = crate::parser::model_parser::parse_model_string;
+        let src_b = REDUCE_1CPT.replace(
+            "  y = central / V\n",
+            "  y = central / V + central*(central - 1)*(central - 2)\n",
+        );
+        assert_ne!(src_b, REDUCE_1CPT, "precondition: the replacement applied");
+        let (a, b) = (parse(REDUCE_1CPT).unwrap(), parse(&src_b).unwrap());
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        assert!(
+            mr_scope(&b, &subject, &theta, &eta).is_some(),
+            "precondition: the polynomial readout must be admitted, else nothing collides"
+        );
+        assert_ne!(
+            spec_fingerprint(a.ode_spec.as_ref().unwrap()),
+            spec_fingerprint(b.ode_spec.as_ref().unwrap()),
+            "a readout change must change the key"
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_clean_then_perturbed(&a, &subject, &theta, &b, &subject, &theta)
         }));
         assert!(
             caught.is_err(),
