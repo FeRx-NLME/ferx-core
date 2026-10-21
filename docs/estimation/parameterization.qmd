@@ -119,6 +119,29 @@ optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_
 the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
 301.58, its plain model's minimum.
 
+#### An identity-packed θ far from 1 {#identity-theta-large}
+
+The NLopt outer optimizers' default magnitude scaling (`parameter_scaling = abs`,
+which `auto` resolves to for the gradient-based optimizers) divides each packed
+coordinate by its initial size. When any θ is identity-packed that is switched off
+for every coordinate, since a near-zero covariate effect beside O(1) log-packed
+coordinates hurts the quasi-Newton Hessian estimate. A θ with a large magnitude
+would then reach the optimizer in raw units: its packed gradient is about $1/|\theta_0|$
+of the unit-magnitude one, so the optimizer barely moves it and the stop test is met
+far from the minimum (#2146).
+
+So under `auto` and `abs` every identity-packed θ with $|\theta_0| > 10$ is divided
+by $|\theta_0|$ in the optimizer's scale vector — `bobyqa` and `mma` included, which
+are otherwise unscaled under `auto`. Every other coordinate is unchanged; `none` and
+`rescale2` keep their own vectors. The bar is 10, not 1: at 1 the rule moves
+`ctmm_pd_2state`'s `LQ01 = -1.2` and every optimizer's end point on it, while BOBYQA
+first stalls at $\theta_0 = 100$.
+
+Measured on warfarin with `V = TVV_S / 1e5` and `TVV_S` started at `1e6`, symmetric
+bounds (macOS arm64): L-BFGS used to stop at OFV −265.42 and BOBYQA at −265.42, each
+reporting convergence with `TVV_S` unmoved; both now reach the minimum, −286.00 at
+`TVV_S = 773770.6`. `parameter_scaling = none` still stops at −265.42.
+
 ## Bounds
 
 `compute_bounds()` returns a box in packed space:

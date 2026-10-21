@@ -10172,3 +10172,150 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
     assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
     assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }
+
+// ── nlopt_scale_vector: large-magnitude identity-packed θ (#2146) ────────
+
+/// θ in order: `TVCL` 0.2 (log-packed), `BIG` 1e6, `NEG_BIG` −1e6, `SMALL` −0.01,
+/// `AT_GATE` 10, `PAST_GATE` 10.5 — every one but `TVCL` identity-packed.
+#[cfg(test)]
+const LARGE_IDENTITY_THETA_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta BIG(1000000.0, -50000000.0, 50000000.0)
+  theta NEG_BIG(-1000000.0, -50000000.0, 50000000.0)
+  theta SMALL(-0.01, -1.0, 1.0)
+  theta AT_GATE(10.0, -100.0, 100.0)
+  theta PAST_GATE(10.5, -100.0, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) + 0 * (BIG + NEG_BIG + SMALL + AT_GATE + PAST_GATE)
+  V  = 10.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The scale vector `optimize_nlopt_once` builds for `params` under `options`.
+#[cfg(test)]
+fn scale_vector_for(
+    params: &ModelParameters,
+    options: &FitOptions,
+    identity_scales: &[(usize, f64)],
+) -> Vec<f64> {
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    clamp_to_bounds(&mut x0, &bounds);
+    nlopt_scale_vector(&x0, params, &bounds, options, false, identity_scales)
+}
+
+/// An identity-packed θ above 10 in magnitude is divided by |θ₀|, both signs, while
+/// one at the gate and the near-zero covariate effect keep 1.0, as does every other
+/// coordinate of a model with an identity θ — under `auto` for both the gradient
+/// optimizers (resolved `abs`) and BOBYQA (resolved unscaled), and under an explicit
+/// `abs` (#2146). Before the fix `BIG`, `NEG_BIG` and `PAST_GATE` read 1.0.
+#[test]
+fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    let params = &model.default_params;
+    let n_theta = params.theta.len();
+    let expected_theta = [1.0, 1e6, 1e6, 1.0, 1.0, 10.5];
+    for (scaling, optimizer) in [
+        (ParameterScaling::Auto, Optimizer::NloptLbfgs),
+        (ParameterScaling::Auto, Optimizer::Slsqp),
+        (ParameterScaling::Auto, Optimizer::Bobyqa),
+        (ParameterScaling::Auto, Optimizer::Mma),
+        (ParameterScaling::Abs, Optimizer::NloptLbfgs),
+        (ParameterScaling::Abs, Optimizer::Bobyqa),
+    ] {
+        let options = FitOptions {
+            parameter_scaling: scaling,
+            optimizer,
+            ..FitOptions::default()
+        };
+        let scale = scale_vector_for(params, &options, &[]);
+        assert_eq!(
+            &scale[..n_theta],
+            &expected_theta,
+            "{scaling:?} / {optimizer:?}"
+        );
+        assert!(
+            scale[n_theta..].iter().all(|&s| s == 1.0),
+            "{scaling:?} / {optimizer:?}: Ω/Σ stay unscaled beside an identity θ: {scale:?}"
+        );
+        // A probed near-zero entry (#2159) still lands on its own coordinate.
+        let probed = scale_vector_for(params, &options, &[(3, 0.01)]);
+        assert_eq!(probed[3], 0.01, "{scaling:?} / {optimizer:?}");
+        assert_eq!(probed[1], 1e6, "{scaling:?} / {optimizer:?}");
+    }
+}
+
+/// An explicit `none` keeps meaning no scaling — `scale_params` included, which an
+/// identity θ switches off — and `rescale2` keeps its box-width vector (#2146).
+#[test]
+fn nlopt_scale_vector_leaves_explicit_none_and_rescale2_alone() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    let params = &model.default_params;
+    for scale_params in [false, true] {
+        let options = FitOptions {
+            parameter_scaling: ParameterScaling::None,
+            optimizer: Optimizer::Bobyqa,
+            scale_params,
+            ..FitOptions::default()
+        };
+        let scale = scale_vector_for(params, &options, &[]);
+        assert!(
+            scale.iter().all(|&s| s == 1.0),
+            "none, scale_params = {scale_params}: {scale:?}"
+        );
+    }
+    let options = FitOptions {
+        parameter_scaling: ParameterScaling::Rescale2,
+        optimizer: Optimizer::NloptLbfgs,
+        ..FitOptions::default()
+    };
+    let bounds = pack_with_bounds(params).bounds;
+    assert_eq!(
+        scale_vector_for(params, &options, &[]),
+        compute_rescale2_scale(&bounds)
+    );
+}
+
+/// A model with no identity θ keeps `compute_scale_packed` under `abs` (#2146 leaves
+/// it alone).
+#[test]
+fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        NEAR_ZERO_V_WARFARIN
+            .replace(
+                "theta TVV_S(1e-05, -0.0005, 0.0005)",
+                "theta TVV_S(1e-05, 1e-07, 0.0005)",
+            )
+            .as_str(),
+    )
+    .expect("model parses");
+    let params = &model.default_params;
+    let options = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        ..FitOptions::default()
+    };
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    clamp_to_bounds(&mut x0, &bounds);
+    let scale = scale_vector_for(params, &options, &[]);
+    assert_eq!(scale, compute_scale_packed(&x0, params));
+    assert!(
+        scale[1] > 1.0,
+        "log-packed TVV_S is magnitude-scaled: {scale:?}"
+    );
+}
