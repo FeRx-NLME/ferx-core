@@ -1571,6 +1571,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 accelerate_exact_outer: false,
                 screen: 0,
                 init_is_mode: false,
+                newton_polish: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1633,6 +1634,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 accelerate_exact_outer: false,
                 screen: 0,
                 init_is_mode: false,
+                newton_polish: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1659,6 +1661,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 accelerate_exact_outer: false,
                 screen: 0,
                 init_is_mode: false,
+                newton_polish: false,
             },
             true,
         )
@@ -1732,6 +1735,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         accelerate_exact_outer: true,
         screen: 0,
         init_is_mode: false,
+        newton_polish: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -5618,5 +5622,202 @@ mod binary_inner {
             &subject()
         ));
         assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+    }
+}
+
+// ---- `inner_newton_polish`: one exact-Hessian Newton step after the inner solve ---------
+
+/// One `find_ebe_impl` solve of the well-identified fixture at `tol`, with the polish on or
+/// off and the stage's conditional or FOCE frozen-variance convention.
+fn polish_solve(
+    model: &CompiledModel,
+    subject: &Subject,
+    tol: f64,
+    newton_polish: bool,
+    ebe_variance: EbeVariance,
+) -> EbeResult {
+    find_ebe_impl(
+        model,
+        subject,
+        &model.default_params,
+        500,
+        tol,
+        None,
+        None,
+        0,
+        None,
+        InnerSolvePolicy {
+            ebe_variance,
+            newton_polish,
+            ..InnerSolvePolicy::default()
+        },
+    )
+}
+
+/// The polish squares the EBE's residual: from a loosely converged solve, the polished mode,
+/// and the adjoint outer gradient evaluated there, sit far closer to a tightly converged
+/// reference than the unpolished ones — the property that makes a looser `inner_tol` safe.
+/// The returned `h_matrix` is the η-Jacobian at the polished mode, not the stale one.
+#[test]
+fn newton_polish_squares_the_ebe_residual() {
+    let (model, subject) = wellidentified_oral_fixture();
+    let p = model.default_params.clone();
+    let x = crate::estimation::parameterization::pack_params(&p);
+    let reference = polish_solve(&model, &subject, 1e-12, false, EbeVariance::Conditional);
+    let loose = polish_solve(&model, &subject, 1e-2, false, EbeVariance::Conditional);
+    let polished = polish_solve(&model, &subject, 1e-2, true, EbeVariance::Conditional);
+    let gap = |e: &DVector<f64>| (e - &reference.eta).amax();
+    let grad = |e: &DVector<f64>| {
+        crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+            &model,
+            &subject,
+            &p,
+            &x,
+            e.as_slice(),
+            true,
+        )
+        .expect("in adjoint scope")
+    };
+    let g_ref = grad(&reference.eta);
+    let grad_gap = |e: &DVector<f64>| {
+        let g = grad(e);
+        assert!(g.iter().all(|v| v.is_finite()));
+        g.iter()
+            .zip(&g_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+            / g_ref.iter().map(|v| v.abs()).fold(0.0, f64::max)
+    };
+    let (e0, e1) = (gap(&loose.eta), gap(&polished.eta));
+    let (d0, d1) = (grad_gap(&loose.eta), grad_gap(&polished.eta));
+    eprintln!("η gap loose {e0:.2e} polished {e1:.2e}; outer-gradient gap loose {d0:.2e} polished {d1:.2e}");
+    assert!(
+        e0 > 0.0 && d0 > 0.0,
+        "the loose solve must leave a residual to polish"
+    );
+    // Measured: η 8.1e-5 -> 4.7e-9 (ratio 5.8e-5), outer gradient 2.8e-6 -> 2.3e-10 (ratio
+    // 8.2e-5). The 1e-3 bound keeps ≥ 12× headroom; an unpolished or half-applied step
+    // leaves the ratio at 1.
+    assert!(e1 < 1e-3 * e0, "η: {e0:.2e} -> {e1:.2e}");
+    assert!(d1 < 1e-3 * d0, "outer gradient: {d0:.2e} -> {d1:.2e}");
+    let jac = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+        &model,
+        &subject,
+        &p.theta,
+        polished.eta.as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        polished.h_matrix, jac,
+        "h_matrix must be the Jacobian at the polished mode"
+    );
+    assert!(
+        polished.terminal_hessian.is_none(),
+        "a stale terminal Hessian must not survive"
+    );
+}
+
+/// FOCE's frozen-variance search minimises a different inner objective, which the polish's
+/// conditional gradient and Hessian do not describe, so it leaves that solve alone — bit for
+/// bit — rather than step it towards the wrong mode.
+#[test]
+fn newton_polish_leaves_a_frozen_variance_solve_alone() {
+    let (model, subject) = wellidentified_oral_fixture();
+    let off = polish_solve(&model, &subject, 1e-2, false, EbeVariance::Population);
+    let on = polish_solve(&model, &subject, 1e-2, true, EbeVariance::Population);
+    assert_eq!(off.eta, on.eta);
+    assert_eq!(off.h_matrix, on.h_matrix);
+}
+
+/// Off by default, and every stage's policy reads it from the options.
+#[test]
+fn newton_polish_is_opt_in_and_reaches_the_stage_policy() {
+    let (model, _) = wellidentified_oral_fixture();
+    let mut o = crate::types::FitOptions::default();
+    assert!(!o.inner_newton_polish);
+    assert!(!InnerSolvePolicy::for_stage(&o, &model).newton_polish);
+    o.inner_newton_polish = true;
+    assert!(InnerSolvePolicy::for_stage(&o, &model).newton_polish);
+}
+
+/// An accepted polish returns the inner loop's own η-Jacobian at the polished mode —
+/// `exact_obs_grads`, bit for bit — FREM rows included: a covariate pseudo-observation
+/// predicts `θ_i + η_e`, so its row is the unit vector `e_e`, a fix-up the bare recording
+/// does not carry. The first form of the polish read `exact_eta_jacobian`, which skips it.
+/// Fixture: warfarin subject 0 under `warfarin_frem.ferx`, with its two covariate
+/// pseudo-observations (`FREMTYPE` 100 → `ETA_WT_FREM`, 200 → `ETA_AGE_FREM`) appended.
+#[test]
+fn an_accepted_polish_returns_the_inner_loops_own_jacobian_frem_rows_included() {
+    use std::path::Path;
+    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(
+        "examples/warfarin_frem.ferx",
+    ))
+    .expect("warfarin_frem parses");
+    let model = parsed.model;
+    let fc = model
+        .frem_config
+        .clone()
+        .expect("premise: the model carries FREM rows");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let mut s = pop.subjects[0].clone();
+    let n = s.obs_times.len();
+    let t = s.obs_times[n - 1];
+    s.fremtype = vec![0; n];
+    for (ft, y) in [(100u16, 80.0), (200u16, 45.0)] {
+        s.fremtype.push(ft);
+        s.obs_times.push(t);
+        s.observations.push(y);
+        s.obs_cmts.push(s.obs_cmts[n - 1]);
+        if !s.cens.is_empty() {
+            s.cens.push(0);
+        }
+        if !s.obs_covariates.is_empty() {
+            s.obs_covariates.push(s.obs_covariates[n - 1].clone());
+        }
+        for v in [&mut s.occasions, &mut s.obs_rgroup] {
+            if !v.is_empty() {
+                v.push(v[n - 1]);
+            }
+        }
+        if !s.obs_raw_times.is_empty() {
+            s.obs_raw_times.push(t);
+        }
+        if !s.obs_l2.is_empty() {
+            s.obs_l2.push(s.obs_l2[n - 1]);
+        }
+    }
+    assert!(s.obs_records.is_empty(), "premise: Gaussian rows only");
+    let raw = polish_solve(&model, &s, 1e-2, false, EbeVariance::Conditional);
+    let r = polish_solve(&model, &s, 1e-2, true, EbeVariance::Conditional);
+    assert_ne!(
+        r.eta, raw.eta,
+        "premise: the polish was accepted on this subject"
+    );
+    let rows = crate::sens::ode_provider::adjoint::exact_obs_grads(
+        &model,
+        &s,
+        &model.default_params.theta,
+        r.eta.as_slice(),
+    )
+    .expect("the recorders serve the subject");
+    assert_eq!(r.h_matrix.nrows(), rows.len());
+    for (j, row) in rows.iter().enumerate() {
+        for k in 0..model.n_eta {
+            assert_eq!(
+                r.h_matrix[(j, k)].to_bits(),
+                row.df_deta[k].to_bits(),
+                "h_matrix[({j}, {k})]"
+            );
+        }
+    }
+    for (j, ft) in [(n, 100u16), (n + 1, 200u16)] {
+        let (_, e) = fc.fremtype_to_indices[&ft];
+        for k in 0..model.n_eta {
+            assert_eq!(
+                r.h_matrix[(j, k)],
+                if k == e { 1.0 } else { 0.0 },
+                "FREM row {j}"
+            );
+        }
     }
 }

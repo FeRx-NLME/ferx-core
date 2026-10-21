@@ -8294,6 +8294,11 @@ pub struct FitOptions {
     pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// Finish every conditional-variance EBE with one exact-Hessian Newton step (accepted
+    /// only if it lowers the inner objective). The step squares the EBE's residual, so the
+    /// outer gradient and the objective are accurate to `O(‖∇_η l‖²)` instead of
+    /// `O(‖∇_η l‖)`, which makes a looser `inner_tol` safe. Default `false`.
+    pub inner_newton_polish: bool,
     /// Guarded multi-start count for the inner EBE search (`[fit_options]
     /// inner_restarts`, default `1`; set `0` to disable). A multimodal individual objective —
     /// e.g. saturable protein binding, which admits a high-V/low-conc and a
@@ -9204,6 +9209,7 @@ impl Default for FitOptions {
             // only held for well-conditioned fits. Override via `inner_tol = ...`
             // in `[fit_options]` (loosen for speed; tighten with care).
             inner_tol: 1e-5,
+            inner_newton_polish: false,
             // On by default (one Ω-scaled restart pass): guards against inner-EBE
             // local minima on multimodal individual objectives at ≈0 cost, since
             // it fires only for reset / TV-cov subjects on a cold start and only
@@ -10597,6 +10603,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_restarts",
             "inner_screen",
             "inner_optimizer",
@@ -10618,6 +10625,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_restarts",
             "inner_screen",
             "inner_optimizer",
@@ -10640,6 +10648,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_restarts",
             "inner_screen",
             "inner_optimizer",
@@ -10658,6 +10667,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_restarts",
             "inner_screen",
             "inner_optimizer",
@@ -10669,6 +10679,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_restarts",
             "inner_screen",
             "inner_optimizer",
@@ -10687,6 +10698,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         EstimationMethod::Saem => &[
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_optimizer",
             "n_exploration",
             "n_convergence",
@@ -10724,6 +10736,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_sobol",
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "iscale_min",
             "iscale_max",
             "frem_rao_blackwell",
@@ -10733,6 +10746,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         EstimationMethod::Impmap => &[
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "inner_optimizer",
             "impmap_iterations",
             "impmap_samples",
@@ -10756,6 +10770,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         EstimationMethod::Bayes => &[
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "n_mh_steps",
             "n_leapfrog",
             "bayes_warmup",
@@ -10769,6 +10784,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             // `vi_final_ofv = laplace` EBE reconvergence — VI itself has no inner loop.
             "inner_maxiter",
             "inner_tol",
+            "inner_newton_polish",
             "vi_iters",
             "vi_mc_samples",
             "vi_lr",

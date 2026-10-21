@@ -10629,6 +10629,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "inner_newton_polish" => opts.inner_newton_polish = parse_bool("inner_newton_polish")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like

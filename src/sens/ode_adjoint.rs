@@ -1714,6 +1714,181 @@ pub(crate) fn exact_inner_hessian(
     )
 }
 
+/// The conditional inner objective at one point, as an exact Newton step on it reads it:
+/// `l`, `∇_η l`, the η-Jacobian `∂f/∂η` (`n_obs × width`, as [`exact_eta_jacobian`]) and,
+/// from [`exact_inner_newton_point`] only, `∇²_η l`.
+pub(crate) struct InnerPoint {
+    pub(crate) l: f64,
+    pub(crate) grad: Vec<f64>,
+    pub(crate) jac: DMatrix<f64>,
+    pub(crate) hess: Option<DMatrix<f64>>,
+}
+
+/// [`InnerPoint`] with the Hessian, from **one** second-order recording: the dual `l`
+/// [`exact_inner_hessian`] evaluates carries the value and the gradient too, so a Newton
+/// step needs no separate gradient or objective pass. The Jacobian is the first-order part
+/// of the same predictions.
+pub(crate) fn exact_inner_newton_point(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Option<InnerPoint> {
+    fn go<const N: usize, const M: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        params: &ModelParameters,
+        eta: &[f64],
+        w: usize,
+    ) -> Option<InnerPoint> {
+        use crate::sens::rtape::DualH;
+        let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
+        let ctx = LikCtx::new(model, subject, params);
+        let mut pv = ParT::of(model, subject, params);
+        pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
+            stacked_omega::<N>(model, subject, params, params, w).chol,
+        )?;
+        let fh: Vec<DualH<N, M, f64>> = p
+            .iter()
+            .map(|q| DualH {
+                v: q.v,
+                g: q.g,
+                h: q.h,
+            })
+            .collect();
+        let unit = unit_dirs::<N>();
+        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
+            v: eta[k],
+            g: unit[k],
+            h: [0.0; M],
+        });
+        let l = inner_l(
+            &ctx,
+            &fh,
+            &eh,
+            &pv.map(|x| DualH {
+                v: x,
+                g: [0.0; N],
+                h: [0.0; M],
+            }),
+            None,
+        )?;
+        let point = InnerPoint {
+            l: l.v,
+            grad: l.g[..w].to_vec(),
+            jac: DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]),
+            hess: Some(DMatrix::from_fn(w, w, |a, b| l.hess(a, b))),
+        };
+        point.finite().then_some(point)
+    }
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
+    if inner_point_declines(model, subject, params) {
+        return None;
+    }
+    let mut point: InnerPoint = by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), params, &eta, w)
+    )?;
+    frem_unit_rows(model, subject, &mut point.jac);
+    Some(point)
+}
+
+/// [`InnerPoint`] without the Hessian, from **one** first-order recording: the Jacobian is
+/// the recording itself, `∇_η l` the kernel's `inner_grad` on it and `l` the kernel's
+/// objective on its values — what [`exact_eta_jacobian`] and [`exact_inner_gradient`] and an
+/// `individual_nll` call would each have recomputed.
+pub(crate) fn exact_inner_point(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Option<InnerPoint> {
+    fn go<const N: usize, const M: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        params: &ModelParameters,
+        eta: &[f64],
+        w: usize,
+    ) -> Option<InnerPoint> {
+        let p = canonical_jets1::<N>(model, subject, lay, &params.theta, eta)?;
+        let ctx = LikCtx::new(model, subject, params);
+        let mut pv = ParT::of(model, subject, params);
+        pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
+            stacked_omega::<N>(model, subject, params, params, w).chol,
+        )?;
+        let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+        let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+        let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+        let gr = inner_grad(&ctx, &f, &g, &e, &pv, None)?;
+        let point = InnerPoint {
+            l: inner_l(&ctx, &f, &e, &pv, None)?,
+            grad: gr[..w].to_vec(),
+            jac: DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]),
+            hess: None,
+        };
+        point.finite().then_some(point)
+    }
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
+    if inner_point_declines(model, subject, params) {
+        return None;
+    }
+    let mut point: InnerPoint = by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), params, &eta, w)
+    )?;
+    frem_unit_rows(model, subject, &mut point.jac);
+    Some(point)
+}
+
+impl InnerPoint {
+    fn finite(&self) -> bool {
+        self.l.is_finite()
+            && self.grad.iter().all(|v| v.is_finite())
+            && self.jac.iter().all(|v| v.is_finite())
+            && self
+                .hess
+                .as_ref()
+                .is_none_or(|h| h.iter().all(|v| v.is_finite()))
+    }
+}
+
+/// A FREM covariate pseudo-observation predicts `θ_i + η_e`, so its Jacobian row is the unit
+/// vector `e_e` — the fix-up [`exact_obs_grads_into`] applies to the inner loop's own
+/// Jacobian, which the recording alone does not carry.
+fn frem_unit_rows(model: &CompiledModel, subject: &Subject, jac: &mut DMatrix<f64>) {
+    let Some(fc) = model.frem_config.as_ref() else {
+        return;
+    };
+    for j in 0..jac.nrows() {
+        let Some(&(_, ei)) = subject
+            .fremtype
+            .get(j)
+            .filter(|&&ft| ft != 0)
+            .and_then(|ft| fc.fremtype_to_indices.get(ft))
+        else {
+            continue;
+        };
+        for k in 0..jac.ncols() {
+            jac[(j, k)] = if k == ei { 1.0 } else { 0.0 };
+        }
+    }
+}
+
+/// The scope both [`InnerPoint`] entries share: the union of what [`exact_inner_hessian`],
+/// [`exact_inner_gradient`] and [`exact_eta_jacobian`] each decline.
+fn inner_point_declines(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+) -> bool {
+    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
+    iov_mismatch || model.is_sde() || !likelihood_supported(model, subject, params)
+}
+
 /// FOCEI's Gauss–Newton `H̃` at `eta` (the stacked `[η, κ]` under IOV), the kernel's on
 /// one tape-free first-order recording: the AGQ grid's `H̃` anchor.
 pub(crate) fn exact_htilde(
