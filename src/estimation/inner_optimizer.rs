@@ -1684,6 +1684,20 @@ thread_local! {
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// One certified IOV start (`InnerSolvePolicy::init_is_mode`) as `find_ebe_iov` built it:
+/// the subject, the BSV block in ψ-space (`η + μ`), the `μ` it was shifted by, and the
+/// per-cell κ vectors (#2217).
+#[cfg(test)]
+pub(crate) type CertifiedIovStart = (String, Vec<f64>, Vec<f64>, Vec<Vec<f64>>);
+
+// Every certified IOV start solved on this thread, so a test can read the vector the first
+// outer evaluation actually started from (#2217).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CERTIFIED_IOV_STARTS: std::cell::RefCell<Vec<CertifiedIovStart>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // Solves on this thread that entered the guarded cold-start multi-start in `find_ebe_solve`,
 // so a test can observe which callers pay for it (#2014 review).
 #[cfg(test)]
@@ -2645,6 +2659,17 @@ fn find_ebe_iov(
         None => eta_init,
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
+    #[cfg(test)]
+    if init_is_mode {
+        CERTIFIED_IOV_STARTS.with(|s| {
+            s.borrow_mut().push((
+                subject.id.clone(),
+                x[..n_eta].to_vec(),
+                mu.clone(),
+                to_kappas(&x),
+            ))
+        });
+    }
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -2845,9 +2870,9 @@ fn find_ebe_iov(
         .unwrap_or(false);
     // A certified start (`InnerSolvePolicy::init_is_mode`, the pre-flight EBEs handed to the
     // first outer evaluation since #2202) is not a stale warm start, whatever its NLL. On an
-    // IOV subject it is the pre-flight's η̂ at these `params` with every κ restarted at 0
-    // (the pre-flight hands over η̂ only), so it is no worse a start than the cold one this
-    // guard already exempts. Rejecting it hard-rejected every subject of an ODE+IOV fit whose
+    // IOV subject it is the pre-flight's whole mode (η̂, κ̂) at these `params` (#2217), so
+    // it is the mode the cold start this guard already exempts converged to. Rejecting it
+    // hard-rejected every subject of an ODE+IOV fit whose
     // initial estimate sits far from the data, so the fit never moved (#2212).
     if has_informative_warm_start
         && !init_is_mode
