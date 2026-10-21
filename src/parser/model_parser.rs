@@ -605,9 +605,11 @@ fn detect_mu_refs(
 
 /// [`detect_mu_refs`], plus which mu-reference each assigned name **ends up
 /// with**: `owners[name]` is `Some((eta_name, theta_name))` when the *last*
-/// write to `name` is a top-level assignment classified as a mu-reference, and
-/// `None` when the last write is anything else — a plain assignment, or an
-/// assignment anywhere inside an `if`, whose value is conditional.
+/// write to `name` is a top-level assignment classified as a mu-reference, or a
+/// self-dependent rewrite of a name that already had one (see
+/// [`carried_owner`]), and `None` when the last write is anything else — an
+/// independent overwrite, or an assignment anywhere inside an `if`, whose value
+/// is conditional.
 ///
 /// `mu_refs` cannot answer this: it is keyed by η, so it says nothing about
 /// which parameter an η's θ belongs to, keeps only the last assignment that
@@ -667,9 +669,12 @@ fn detect_mu_refs_with_owners(
                 let inlined = scope.view(at, raw_expr);
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
-            let owner = found
-                .as_ref()
-                .map(|(eta_idx, mu_ref)| (eta_names[*eta_idx].clone(), mu_ref.theta_name.clone()));
+            let owner = match &found {
+                Some((eta_idx, mu_ref)) => {
+                    Some((eta_names[*eta_idx].clone(), mu_ref.theta_name.clone()))
+                }
+                None => carried_owner(name, raw_expr, &owners),
+            };
             owners.insert(name.clone(), owner);
             if let Some((eta_idx, mu_ref)) = found {
                 result.insert(eta_names[eta_idx].clone(), mu_ref);
@@ -684,6 +689,40 @@ fn detect_mu_refs_with_owners(
         }
     }
     (result, owners)
+}
+
+/// The owner a top-level reassignment `name = expr` that is **not** itself a
+/// mu-reference keeps from `name`'s previous value (#1930 review r3).
+///
+/// `InlineScope` does not inline a multiply-assigned name, so a rewrite such as
+/// `CL = CL` or `CL = CL * (WT/70)^0.75` after `CL = BASE * exp(ETA_CL)` classifies
+/// as nothing — yet its value is the old one, η and anchor θ unchanged, only
+/// rescaled by η-free factors. That is the same shape as
+/// `CL = TVCL * CLWT * exp(ETA_CL)`, which routes to `TVCL`. So the owner carries
+/// when the rewrite reads `name` itself, reads no η, and reads no *other* name that
+/// carries a mu-reference (whose η would then be in the value too). Anything else
+/// is an independent overwrite and retires the owner.
+fn carried_owner(
+    name: &str,
+    expr: &Expression,
+    owners: &HashMap<String, Option<(String, String)>>,
+) -> Option<(String, String)> {
+    let prev = owners.get(name)?.clone()?;
+    if !extract_eta_indices(expr).is_empty() {
+        return None;
+    }
+    let mut reads_self = false;
+    let mut reads_other_owner = false;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Variable(v) = e {
+            if v == name {
+                reads_self = true;
+            } else if matches!(owners.get(v), Some(Some(_))) {
+                reads_other_owner = true;
+            }
+        }
+    });
+    (reads_self && !reads_other_owner).then_some(prev)
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -5044,7 +5083,7 @@ pub fn parse_full_model_with(
         &all_eta_names,
         &nn_specs_for_ctx,
     );
-    indiv_param_partials.mu_ref_owners = mu_ref_owners;
+    indiv_param_partials.mu_ref_owners = Some(mu_ref_owners);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -30931,8 +30970,10 @@ pub struct IndivParamPartials {
     /// `Some((eta_name, theta_name))` when its last write is a top-level
     /// mu-referenced assignment, `None` otherwise — from
     /// `detect_mu_refs_with_owners`. Read through
-    /// [`crate::CompiledModel::mu_ref_owner`]. Empty for hand-built fixtures.
-    pub(crate) mu_ref_owners: HashMap<String, Option<(String, String)>>,
+    /// [`crate::CompiledModel::mu_ref_owner`]. `None` — not empty — for
+    /// hand-built fixtures, which have no statements to analyse; the accessor then
+    /// falls back to a unique η-name match.
+    pub(crate) mu_ref_owners: Option<HashMap<String, Option<(String, String)>>>,
 }
 
 impl IndivParamPartials {
@@ -30952,7 +30993,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
-            mu_ref_owners: HashMap::new(),
+            mu_ref_owners: None,
         }
     }
 
@@ -31062,7 +31103,7 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
-        mu_ref_owners: HashMap::new(),
+        mu_ref_owners: None,
     }
 }
 

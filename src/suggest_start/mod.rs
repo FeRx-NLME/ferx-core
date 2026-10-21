@@ -1617,6 +1617,102 @@ mod tests {
             "if-wrapped reassignment leaves no owner"
         );
         assert_eq!(omega(&m), None, "if-wrapped reassignment");
+
+        // Review r3: a **self-dependent** rewrite keeps the value — and so the
+        // owner — of the assignment it rewrites. `InlineScope` does not inline a
+        // multiply-assigned name, so these classify as no mu-reference; before the
+        // carry they retired `CL`'s owner, and with `TVCL` in the fixture layer 2
+        // answered `TVCL` instead of `TVOLD`, the θ `CL` still reads. Paired with an
+        // η-reading self-rewrite, whose value carries a second η and must retire.
+        for (label, line, want) in [
+            ("identity", "  CL = CL\n", Some(("ETA_OLD", "TVOLD"))),
+            (
+                "eta-free rescale",
+                "  CL = CL * (WT/70)^0.75\n",
+                Some(("ETA_OLD", "TVOLD")),
+            ),
+            ("adds an eta", "  CL = CL * exp(IIV_CL)\n", None),
+            ("reads another owner", "  CL = CL * V\n", None),
+        ] {
+            let src = model(line).replace("  V = TVV * exp(ETA_V)\n", "");
+            // `CL = CL * V` needs V declared above it.
+            let src = src.replace(
+                "  CL = TVOLD * exp(ETA_OLD)\n",
+                "  V = TVV * exp(ETA_V)\n  CL = TVOLD * exp(ETA_OLD)\n",
+            );
+            let m = parse(&src);
+            let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+            assert_eq!(m.mu_ref_owner(cl_pos), want, "{label}");
+            let (want_theta, want_omega) = match want {
+                Some((e, t)) => (t, Some(e.to_string())),
+                // No owner: layer 2 by name.
+                None => ("TVCL", None),
+            };
+            assert_eq!(theta(&m).as_deref(), Some(want_theta), "{label}");
+            assert_eq!(omega(&m), want_omega, "{label}");
+        }
+    }
+
+    /// Review r3 minor: a **hand-built** `CompiledModel` has no parsed statements,
+    /// so its owner record is absent (`IndivParamPartials::empty()`), and the public
+    /// `inits_from_nca` must still route through an unambiguous `mu_refs` entry —
+    /// `VOLUME` with `ETA_VOLUME -> DISTRIB`, which neither name search can reach.
+    /// Simulated by parsing and then dropping the record. The fallback answers only
+    /// for a **unique** qualifying η name: with a second one (`IIV_VOLUME` on an
+    /// unbound intermediate) it declines rather than pick in hash order — parsed 20
+    /// times, each a fresh `RandomState`.
+    #[test]
+    fn nca_hand_built_model_routes_through_a_unique_eta_name_match() {
+        let src = |extra_theta: &str, extra_omega: &str, extra_line: &str| {
+            format!(
+                "[parameters]\n  theta CLEARANCE(0.2, 0.001, 10.0)\n  \
+                 theta DISTRIB(10.0, 0.1, 500.0)\n  theta THKA(1.5, 0.01, 50.0)\n\
+                 {extra_theta}  omega ETA_CLEARANCE ~ 0.09\n  \
+                 omega ETA_VOLUME ~ 0.04\n{extra_omega}  sigma PROP_ERR ~ 0.02 (sd)\n\
+                 [individual_parameters]\n  CLEARANCE_I = CLEARANCE * exp(ETA_CLEARANCE)\n  \
+                 VOLUME = DISTRIB * exp(ETA_VOLUME)\n  KA = THKA\n{extra_line}\
+                 [structural_model]\n  pk one_cpt_oral(cl=CLEARANCE_I, v=VOLUME, ka=KA)\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            )
+        };
+        let hand_built = |src: &str| {
+            let mut m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            assert!(
+                m.indiv_param_partials.mu_ref_owners.is_some(),
+                "parsed has a record"
+            );
+            m.indiv_param_partials.mu_ref_owners = None;
+            m
+        };
+        let v_theta = |m: &CompiledModel| {
+            find_theta_for_slot(m, PK_IDX_V).map(|i| m.default_params.theta_names[i].clone())
+        };
+
+        let m = hand_built(&src("", "", ""));
+        // Premise: neither name search reaches DISTRIB from `VOLUME`.
+        assert!(
+            !m.default_params.theta_names.iter().any(|n| n.contains('V')),
+            "no theta may contain `V` (so neither `VOLUME` nor the canonical name): {:?}",
+            m.default_params.theta_names
+        );
+        assert_eq!(
+            v_theta(&m).as_deref(),
+            Some("DISTRIB"),
+            "unique match routes"
+        );
+
+        for run in 0..20 {
+            let m = hand_built(&src(
+                "  theta THS(3.0, 0.01, 100.0)\n",
+                "  omega IIV_VOLUME ~ 0.25\n",
+                "  S = THS * exp(IIV_VOLUME)\n",
+            ));
+            assert_eq!(
+                v_theta(&m),
+                None,
+                "run {run}: two qualifying eta names must decline, not pick one"
+            );
+        }
     }
 
     /// The two halves of [`unmapped_role_warning`], in one test so a gate stuck on
