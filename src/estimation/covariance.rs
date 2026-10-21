@@ -316,12 +316,13 @@ enum FdPert {
 
 /// The diagonal stencil's specs at step `eps`, in the order both [`select_fd_step`] and
 /// [`fd_ofv_stencil`] lay them out: `+hₐ, −hₐ` for each free coordinate `a`, with
-/// `hₐ = eps·(1 + |x̂ᵢ|)`. One builder for both, so the probe's accepted pass is the stencil's
-/// diagonal by construction rather than by two loops happening to agree (#1935).
-fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64) -> Vec<FdPert> {
+/// `hₐ = eps·(sᵢ + |x̂ᵢ|)` ([`fd_step`], `sᵢ = floor[i]`, #2147). One builder for both, so the
+/// probe's accepted pass is the stencil's diagonal by construction rather than by two loops
+/// happening to agree (#1935).
+fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64, floor: &[f64]) -> Vec<FdPert> {
     let mut specs = Vec::with_capacity(2 * free_idx.len());
     for &i in free_idx {
-        let hi = eps * (1.0 + x_hat[i].abs());
+        let hi = fd_step(eps, x_hat[i], floor[i]);
         specs.push(FdPert::Single { i, di: hi });
         specs.push(FdPert::Single { i, di: -hi });
     }
@@ -381,6 +382,7 @@ pub(crate) struct FdStep {
 pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     x_hat: &[f64],
     free_idx: &[usize],
+    floor: &[f64],
     initial_eps: f64,
     f0: f64,
     ofv: &F,
@@ -389,7 +391,7 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     const MAX_HALVINGS: usize = 8;
     let mut eps = initial_eps;
     for halvings in 0..MAX_HALVINGS {
-        let specs = fd_diag_specs(x_hat, free_idx, eps);
+        let specs = fd_diag_specs(x_hat, free_idx, eps, floor);
         let report = cov_progress("step probe", specs.len(), options.verbose);
         let vals: Vec<f64> = specs
             .par_iter()
@@ -415,7 +417,7 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
         // hi², and the FD loop rejects on the quotient, so accepting the step here on the
         // numerator alone would hand back an eps the loop then rejects.
         let all_ok = free_idx.iter().enumerate().all(|(a, &i)| {
-            let hi = eps * (1.0 + x_hat[i].abs());
+            let hi = fd_step(eps, x_hat[i], floor[i]);
             let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
             h_ii.is_finite()
         });
@@ -1175,6 +1177,7 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,
     x_hat: &[f64],
     free_idx: &[usize],
+    floor: &[f64],
     eps: f64,
     f0: f64,
     diag: Option<&[f64]>,
@@ -1184,14 +1187,14 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     let nf = free_idx.len();
     let hsteps: Vec<f64> = free_idx
         .iter()
-        .map(|&i| eps * (1.0 + x_hat[i].abs()))
+        .map(|&i| fd_step(eps, x_hat[i], floor[i]))
         .collect();
     // Flat list of perturbation SPECS (not materialised x-vectors): 2 per diagonal (±hᵢ), then
     // 4 per (a<b) off-diagonal pair. Each par_iter task clones `x_hat` once and applies its
     // spec, so only ~n_threads vectors are live at a time instead of all ~2·nf² perturbed
     // points held resident for the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
     let mut specs: Vec<FdPert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
-    specs.extend(fd_diag_specs(x_hat, free_idx, eps));
+    specs.extend(fd_diag_specs(x_hat, free_idx, eps, floor));
     let n_diag = specs.len();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for a in 0..nf {
@@ -1295,6 +1298,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,
     x_hat: &[f64],
     free_idx: &[usize],
+    floor: &[f64],
     initial_eps: f64,
     f0: f64,
     ofv: &F,
@@ -1305,7 +1309,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
     // are finite. Most models use the initial step; halving only kicks in when the OFV
     // overflows at the default perturbation size.
-    let step = select_fd_step(x_hat, free_idx, initial_eps, f0, ofv, options);
+    let step = select_fd_step(x_hat, free_idx, floor, initial_eps, f0, ofv, options);
     if crate::cancel::is_cancelled(&options.cancel) {
         return None;
     }
@@ -1322,6 +1326,7 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
         n,
         x_hat,
         free_idx,
+        floor,
         step.eps,
         f0,
         step.diag.as_deref(),
@@ -1924,7 +1929,17 @@ pub(crate) fn compute_covariance_for(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
-        let stencil = fd_ofv_hessian(n, x_hat, &free_idx, initial_eps, f0_fd, &fd_ofv, options);
+        let fd_floor = fd_step_floors(template, &model.default_params);
+        let stencil = fd_ofv_hessian(
+            n,
+            x_hat,
+            &free_idx,
+            &fd_floor,
+            initial_eps,
+            f0_fd,
+            &fd_ofv,
+            options,
+        );
         #[cfg(test)]
         FD_OBJECTIVE_EVALS
             .with(|c| c.set(c.get() + fd_evals.load(std::sync::atomic::Ordering::Relaxed)));
@@ -4880,6 +4895,7 @@ mod tests {
         let free_idx = [0usize, 1, 3];
         let n = x_hat.len();
         let nf = free_idx.len();
+        let ones = [1.0; 4];
         let smooth = |x: &[f64]| -> f64 {
             0.1 * (x[0] * x[1]).exp() + x[0] * x[0] + 3.0 * x[1] * x[3] + x[3].powi(4) + x[2]
         };
@@ -4925,7 +4941,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::Relaxed);
                 ofv(x)
             };
-            let got = fd_ofv_hessian(n, &x_hat, &free_idx, eps0, f0, &counted, &opts)
+            let got = fd_ofv_hessian(n, &x_hat, &free_idx, &ones, eps0, f0, &counted, &opts)
                 .expect("nothing cancels in a test");
             assert_eq!(
                 calls.load(Ordering::Relaxed),
@@ -4933,15 +4949,16 @@ mod tests {
                 "{label}: objective evaluations on the FD Hessian route"
             );
 
-            let step = select_fd_step(&x_hat, &free_idx, eps0, f0, &ofv, &opts);
+            let step = select_fd_step(&x_hat, &free_idx, &ones, eps0, f0, &ofv, &opts);
             assert_eq!(step.n_halvings, halvings, "{label}: halvings");
             assert_eq!(
                 step.diag.is_some(),
                 halvings < 8,
                 "{label}: a reusable pass exists exactly when one was accepted"
             );
-            let alone = fd_ofv_stencil(n, &x_hat, &free_idx, step.eps, f0, None, &ofv, &opts)
-                .expect("nothing cancels in a test");
+            let alone =
+                fd_ofv_stencil(n, &x_hat, &free_idx, &ones, step.eps, f0, None, &ofv, &opts)
+                    .expect("nothing cancels in a test");
             assert_eq!(got.hess, alone.hess, "{label}: reuse changed the matrix");
             assert_eq!(got.diag_nan, alone.diag_nan, "{label}: diag_nan");
             assert_eq!(got.offdiag_nan, alone.offdiag_nan, "{label}: offdiag_nan");
@@ -5038,12 +5055,80 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| select_fd_step(&x_hat, &[0, 1, 2], 1e-2, quad(&x_hat), &ofv, &opts));
+            .install(|| {
+                select_fd_step(
+                    &x_hat,
+                    &[0, 1, 2],
+                    &[1.0; 3],
+                    1e-2,
+                    quad(&x_hat),
+                    &ofv,
+                    &opts,
+                )
+            });
         assert_eq!(step.n_halvings, 0);
         assert!(
             witness.overlapped(),
             "no two probe points were ever in flight together: the pass ran serially"
         );
+    }
+
+    /// #2147: an identity-packed θ̂ = 0.0077 under `eps = 1e-2`. Its legacy step
+    /// `eps·(1 + |x̂|) ≈ 0.0101` crosses zero, where the objective returns a *finite* penalty
+    /// (`1e16`, as a negative volume does) — so the probe's non-finite guard accepts it and
+    /// the diagonal comes out ~1e20. With the floor `|θ₀|` the step is `eps·2|x̂|`, the minus
+    /// point stays positive and the stencil is the quadratic's. Coordinate 1 at 7.7 keeps
+    /// floor 1 and must keep today's step exactly, so the change straddles the gate.
+    #[test]
+    fn a_small_identity_theta_is_stepped_relative_to_its_floor() {
+        use super::{fd_ofv_hessian, fd_step, select_fd_step};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.0077f64, 7.7];
+        let quad = |x: &[f64]| 3.0 * x[0] * x[0] + 0.2 * x[0] * x[1] + 0.5 * x[1] * x[1];
+        let crossed = AtomicBool::new(false);
+        let ofv = |x: &[f64]| {
+            if x[0] <= 0.0 {
+                crossed.store(true, Ordering::Relaxed);
+                1e16
+            } else {
+                quad(x)
+            }
+        };
+        let f0 = ofv(&x_hat);
+        let eps = 1e-2;
+
+        let floor = [0.0077, 1.0];
+        let step = select_fd_step(&x_hat, &[0, 1], &floor, eps, f0, &ofv, &opts);
+        assert_eq!((step.eps, step.n_halvings), (eps, 0));
+        let got = fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &ofv, &opts).unwrap();
+        assert!(
+            !crossed.load(Ordering::Relaxed),
+            "a stencil point crossed zero"
+        );
+        // A quadratic's central second differences are exact up to rounding of f ≈ 30 at
+        // h₀ = 1.54e-4: measured worst relative error 1.8e-8 (the (0,0) entry; 1.2e-10 and
+        // 2e-14 on the others). The legacy step misses it by ~1e20.
+        for (ij, want) in [((0, 0), 6.0), ((0, 1), 0.2), ((1, 1), 1.0)] {
+            let rel = (got.hess[ij] - want).abs() / want;
+            assert!(rel < 1e-6, "H{ij:?} = {} vs {want}", got.hess[ij]);
+        }
+        // Coordinate 1's step is the legacy one, bit for bit.
+        assert_eq!(
+            fd_step(eps, x_hat[1], floor[1]).to_bits(),
+            (eps * (1.0 + x_hat[1].abs())).to_bits()
+        );
+
+        // The straddle: floor 1 on coordinate 0 (the pre-#2147 step) crosses zero, is
+        // accepted anyway, and builds the stencil on the penalty.
+        let legacy = fd_ofv_hessian(2, &x_hat, &[0, 1], &[1.0, 1.0], eps, f0, &ofv, &opts).unwrap();
+        assert!(crossed.load(Ordering::Relaxed));
+        assert!(
+            legacy.diag_nan.is_empty(),
+            "the penalty is finite, so nothing is flagged"
+        );
+        assert!(legacy.hess[(0, 0)] > 1e19, "H00 = {}", legacy.hess[(0, 0)]);
     }
 
     /// #1935: `map_subjects` with `parallel = true` really re-solves subjects concurrently,
@@ -5139,7 +5224,9 @@ mod tests {
             .num_threads(THREADS)
             .build()
             .unwrap()
-            .install(|| fd_ofv_hessian(4, &x_hat, &[0, 1, 2, 3], 1e-2, 1.0, &ofv, &opts));
+            .install(|| {
+                fd_ofv_hessian(4, &x_hat, &[0, 1, 2, 3], &[1.0; 4], 1e-2, 1.0, &ofv, &opts)
+            });
         assert!(got.is_none(), "a cancelled step must not return a Hessian");
         let n = calls.load(Ordering::SeqCst);
         assert!(
