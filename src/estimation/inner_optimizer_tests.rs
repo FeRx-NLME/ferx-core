@@ -4794,6 +4794,155 @@ fn lbfgs_scales_its_identity_first_step_like_dense_bfgs() {
     assert!((t[0] + g0[0] / gn).abs() < 1e-12 && (t[1] + g0[1] / gn).abs() < 1e-12);
 }
 
+/// The two #2080 outcome fixtures above, under `inner_optimizer = lbfgs` (#2099). Three
+/// random effects take dense BFGS under `auto`, so those tests never reach `lbfgs_core`;
+/// on the #2091 branch, before L-BFGS's empty-history direction was bounded, this seed
+/// went through the Nelder–Mead fallback and the multi-start kept the twin at −21.073865.
+/// Mutation: deleting the `s_hist.is_empty()` bound in `lbfgs_core` reddens both.
+fn armed_lbfgs() -> InnerSettingsGuard {
+    arm_inner_settings(InnerSettings {
+        mode: crate::types::InnerOptimizer::Lbfgs,
+        warm: false,
+    })
+}
+
+#[test]
+fn lbfgs_far_seed_reaches_the_deeper_mode_from_a_bounded_first_step() {
+    let _lbfgs = armed_lbfgs();
+    let (trapped, r) = flip_flop_eta_v_minus_2sd(5.0, [0.04, 0.04, 2.0]);
+    eprintln!(
+        "config 2, lbfgs: trapped {:.6}, from seed {:.6}, fallback {}",
+        trapped.nll, r.nll, r.used_fallback
+    );
+    assert!(trapped.nll.is_finite() && r.nll.is_finite());
+    assert!(
+        !r.used_fallback,
+        "L-BFGS must converge from the seed itself, not through the Nelder–Mead fallback"
+    );
+    assert!(
+        r.nll < trapped.nll - 1.0,
+        "the seed must reach the deeper mode: {} vs trapped {}",
+        r.nll,
+        trapped.nll
+    );
+}
+
+#[test]
+fn lbfgs_cold_multi_start_keeps_the_far_seed() {
+    let _lbfgs = armed_lbfgs();
+    let (model, mut subject) = flip_flop_oral_fixture(5.0, [0.04, 0.04, 2.0]);
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|i| HashMap::from([("WT".to_string(), 70.0 + i as f64)]))
+        .collect();
+    assert!(
+        subject.has_tv_covariates() && !subject.has_resets(),
+        "test premise: the subject is on the scan-all arm through its covariates"
+    );
+    let params = &model.default_params;
+    let single = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 0);
+    let multi = find_ebe(&model, &subject, params, 200, 1e-5, None, None, 1);
+    eprintln!(
+        "config 2 multi-start, lbfgs: r=0 {:.6}, r=1 {:.6}",
+        single.nll, multi.nll
+    );
+    assert!(single.nll.is_finite() && multi.nll.is_finite());
+    assert!(
+        multi.nll < single.nll - 1.0,
+        "inner_restarts = 1 must keep the deeper mode: {} vs r = 0 {}",
+        multi.nll,
+        single.nll
+    );
+}
+
+/// Dense BFGS's steepest-descent reset is bounded like its first step (#2099). The reset
+/// needs `dᵀg ≥ 0` from a BFGS-updated `h_inv`, which in exact arithmetic is PD and never
+/// produces one; this fixture gets it from rounding. A fake gradient returns
+/// `g₀ = (2⁻⁵, 2⁻⁵)` at the start and `g₁ ≈ (2.1e7, −4.8e7)` everywhere else, so the
+/// accepted unit first step `s = −diag(p)·g₀` and `y = g₁ − g₀` are nearly orthogonal
+/// (`sᵀy ≈ 5.7e-3` against `‖s‖‖y‖ ≈ 2e5`) and `g₁` lies almost along `y`, where the true
+/// quadratic form `g₁ᵀH₁g₁` is tiny; the computed one comes out negative. Found by a
+/// float-for-float search of the update; the premise is asserted below rather than assumed.
+/// The reset direction `−diag(p)·g₁` is ~2e8 prior SDs long, so its first trial must sit on
+/// the runaway radius. Mutation: deleting the reset's `cap_curvature_free_step` call
+/// reddens the bound. (L-BFGS's non-descent fallback is bounded the same way; the same
+/// search over its two-loop recursion found no such fixture.)
+#[test]
+fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
+    use std::cell::RefCell;
+    let p = [0.09, 0.04];
+    let g0 = [0.03125, 0.03125];
+    let g1 = [21474834.48, -48318382.064375];
+    let r2 = RUNAWAY_EBE_MAHA_PER_ETA * 2.0;
+    let never = |_: &[f64]| false;
+    let trials: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
+    // Any move off the start is an accepted decrease; after that nothing is.
+    let obj = |x: &[f64]| {
+        trials.borrow_mut().push(x.to_vec());
+        if x == [0.0, 0.0] {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let grad = |x: &[f64]| {
+        if x == [0.0, 0.0] {
+            g0.to_vec()
+        } else {
+            g1.to_vec()
+        }
+    };
+    let mut x = vec![0.0, 0.0];
+    dense_bfgs_core(
+        &obj,
+        &grad,
+        &mut x,
+        2,
+        2,
+        1e-8,
+        Some(&p),
+        None,
+        None,
+        &never,
+        false,
+    );
+    let t = trials.borrow();
+    // trials[0] is the start; [1] the first iteration's accepted unit step.
+    let x1 = [-p[0] * g0[0], -p[1] * g0[1]];
+    assert_eq!(
+        t[1], x1,
+        "fixture premise: the first step is −diag(p)·g₀ at α = 1"
+    );
+    // Premise: the BFGS direction at x₁ is not a descent direction, so the solve resets.
+    // The same update `dense_bfgs_core` applies, in the same operation order.
+    let s = DVector::from_column_slice(&x1);
+    let y = DVector::from_column_slice(&[g1[0] - g0[0], g1[1] - g0[1]]);
+    let rho = 1.0 / s.dot(&y);
+    let eye = DMatrix::<f64>::identity(2, 2);
+    let h0 = DMatrix::from_diagonal(&DVector::from_column_slice(&p));
+    let h1 = (&eye - rho * &s * y.transpose()) * &h0 * (&eye - rho * &y * s.transpose())
+        + rho * &s * s.transpose();
+    let g1v = DVector::from_column_slice(&g1);
+    let d_bfgs = -(&h1 * &g1v);
+    assert!(
+        d_bfgs.dot(&g1v) >= 0.0,
+        "fixture premise: the BFGS direction must be non-descent, dᵀg = {}",
+        d_bfgs.dot(&g1v)
+    );
+    let reset = &t[2];
+    let step = [reset[0] - x1[0], reset[1] - x1[1]];
+    let m: f64 = step.iter().zip(&p).map(|(si, pi)| si * si / pi).sum();
+    assert!(
+        m.is_finite() && m <= r2 * (1.0 + 1e-9),
+        "the reset's first trial {reset:?} is {m:.3e} from x₁ in the prior metric, radius² {r2}"
+    );
+    // The direction is still steepest descent in the preconditioned metric.
+    let sd = [-p[0] * g1[0], -p[1] * g1[1]];
+    assert!(
+        (step[0] / step[1] - sd[0] / sd[1]).abs() < 1e-9 * (sd[0] / sd[1]).abs(),
+        "the reset step {step:?} must keep −diag(p)·g₁'s direction {sd:?}"
+    );
+}
+
 /// #2209: a residual magnitude (`weight =`, or a θ in the magnitude) combined with a dense
 /// `R` (`correlation`, `block_sigma`) is served exactly by the dense-`R` inner kernel,
 /// which has threaded the per-observation multiplier since #627. The model-level label,
