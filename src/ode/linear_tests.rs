@@ -860,4 +860,111 @@ fn matmul_keeps_a_taped_zero_in_the_outer_gradient_type() {
         dp, 0.0,
         "premise: the taped zero carries a θ-derivative into S"
     );
+
+    // And against the function itself: central differences of the same S in plain `f64`.
+    // S is quadratic in (p, q), so a central difference is exact up to rounding.
+    fn s_f64(p: f64, q: f64) -> f64 {
+        let n = 4;
+        let mut a = vec![0.0; n * n];
+        for i in 0..n {
+            a[i * n + i] = q * (-1.0 - 0.1 * i as f64);
+            if i + 1 < n {
+                a[(i + 1) * n + i] = q * 0.5;
+            }
+        }
+        a[3] = p;
+        matmul_reference(&a, &a, n)
+            .iter()
+            .enumerate()
+            .map(|(k, v)| v * (1.0 + 0.25 * k as f64))
+            .sum()
+    }
+    let h = 1e-4;
+    let fd_p = (s_f64(h, 0.8) - s_f64(-h, 0.8)) / (2.0 * h);
+    let fd_q = (s_f64(0.0, 0.8 + h) - s_f64(0.0, 0.8 - h)) / (2.0 * h);
+    // Measured: ∂S/∂p −1.52 vs FD −1.5199999999993, ∂S/∂q 11.424 vs 11.4240000000043 — about
+    // 5e-13 relative, rounding only (S is quadratic); bound 1e-9.
+    assert!(
+        (dp - fd_p).abs() <= 1e-9 * (1.0 + fd_p.abs()),
+        "∂S/∂p {dp} vs FD {fd_p}"
+    );
+    assert!(
+        (dq - fd_q).abs() <= 1e-9 * (1.0 + fd_q.abs()),
+        "∂S/∂q {dq} vs FD {fd_q}"
+    );
+}
+
+/// Copilot's second dependency on the outer gradient's own type: an untaped `DualV` that is
+/// zero in value and η-gradient but carries a second-order η-payload (`h`). It is not
+/// constant, so it must be multiplied. Mutation: `DualV::is_constant` checking `g` but not
+/// `h` → it is skipped and the product's `h` differs from the dense reference.
+#[test]
+fn matmul_keeps_an_outer_type_zero_whose_only_derivative_is_its_hessian() {
+    use crate::sens::vtape::{DualV, NONE};
+    let n = 3;
+    let c = DualV::<1, 1>::constant;
+    let mut a = vec![c(0.0); n * n];
+    for i in 0..n {
+        a[i * n + i] = DualV {
+            v: -0.4 - 0.3 * i as f64,
+            g: [1.0],
+            h: [0.2],
+            i: NONE,
+        };
+    }
+    a[2] = DualV {
+        v: 0.0,
+        g: [0.0],
+        h: [1.5],
+        i: NONE,
+    };
+    assert!(
+        !a[2].is_constant(),
+        "premise: the payload makes it non-constant"
+    );
+    let got = matmul(&a, &a, n);
+    let want = matmul_reference(&a, &a, n);
+    let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(
+            (norm(g.v), norm(g.g[0]), norm(g.h[0])),
+            (norm(w.v), norm(w.g[0]), norm(w.h[0]))
+        );
+    }
+    assert_ne!(got[2].h[0], 0.0, "the Hessian-only zero was dropped");
+}
+
+/// A structural zero is skipped in the per-step self-check only against a finite state.
+/// State 1 has no self-term (a structural-zero diagonal) and accumulates from a huge
+/// state 0 until it overflows: the dense check computes `0·inf = NaN`, fails, and the
+/// segment declines, as its contract says for a state the extracted system cannot
+/// reproduce. Skipping the zero regardless would pass the check and hand back `inf` as a
+/// valid state. Mutation: drop `all_finite(xj)` from the self-check's skip → `Some`.
+#[test]
+fn a_segment_whose_state_overflows_declines() {
+    let rhs = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
+        du[0] = -p[0] * u[0];
+        du[1] = p[1] * u[0];
+    };
+    let (k, kin, t1) = (1e-9, 10.0, 1e8);
+    let out = linear_segment_g(&rhs, &[1e300, 0.0], (0.0, t1), &[k, kin], &[t1], &[]);
+    assert!(
+        out.is_none(),
+        "an overflowed state was returned as valid: {:?}",
+        out.map(|(h, _)| h[0].u.clone())
+    );
+}
+
+/// `matmul` keeps dense semantics against a non-finite factor: a structural zero times an
+/// `inf` row is `NaN` in the dense product, so it is not skipped there. Mutation: drop the
+/// `row_finite` guard → the zero is skipped and the entry comes out finite.
+#[test]
+fn matmul_does_not_skip_a_zero_against_a_non_finite_row() {
+    let n = 2;
+    let x = [0.0, 1.0, 2.0, 3.0];
+    let y = [f64::INFINITY, 1.0, 1.0, 1.0];
+    let got = matmul(&x, &y, n);
+    let want = matmul_reference(&x, &y, n);
+    assert!(want[0].is_nan(), "premise: the dense product is NaN");
+    assert!(got[0].is_nan(), "the skip hid a NaN: {got:?}");
 }

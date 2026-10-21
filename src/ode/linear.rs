@@ -371,17 +371,13 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             };
             let e = &cache[idx].1;
             let mut next = vec![zero; n];
-            let x_finite: Vec<bool> = x
-                .iter()
-                .map(|&v| crate::sens::linsolve::all_finite(v))
-                .collect();
+            // `x` is finite here: `u0` passed the magnitude check, and every propagated state
+            // passed `reproduces`, which declines a non-finite one
+            // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
             for i in 0..n {
-                // From `+0`, as `matmul`'s accumulators: a sum that starts at `+0` cannot end
-                // at `-0` in round-to-nearest, so skipping a `±0` term below cannot flip the
-                // sign of an exactly-zero state.
-                let mut acc = zero + e[i * m + n] * c;
+                let mut acc = e[i * m + n] * c;
                 for j in 0..n {
-                    if x_finite[j] && crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
                         continue;
                     }
                     acc = acc + e[i * m + j] * x[j];

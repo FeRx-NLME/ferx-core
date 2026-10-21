@@ -284,6 +284,24 @@ mod tests {
         }
     }
 
+    /// A skipped row still stores its multiplier, so the factorization keeps the dense
+    /// code's sign: `+0` under a negative pivot is stored as `0 / −2 = −0`, exactly as the
+    /// row update would have written it. Mutation: skip without storing → `+0` stays.
+    #[test]
+    fn a_skipped_lu_row_keeps_the_dense_multiplier_sign() {
+        let n = 2;
+        let mut m = vec![-2.0, 1.0, 0.0, 3.0];
+        let mut piv = vec![0usize; n];
+        assert!(lu_factor_in_place_g(&mut m, &mut piv, n));
+        assert_eq!(piv[0], 0, "premise: no swap");
+        let want = 0.0_f64 / -2.0;
+        assert!(
+            want.is_sign_negative(),
+            "premise: the dense multiplier is −0"
+        );
+        assert_eq!(m[2].to_bits(), want.to_bits(), "multiplier {}", m[2]);
+    }
+
     /// A structural zero is skipped only against a finite factor. With an infinite multiplier
     /// column and a structurally-zero right-hand side entry, the dense solve propagates
     /// `0·inf = NaN`; skipping the zero would hand back a finite answer to a diverged system.
@@ -307,6 +325,64 @@ mod tests {
             "premise: the dense solve is NaN"
         );
         assert!(b.iter().any(|v| v.is_nan()), "the skip hid a NaN: {b:?}");
+    }
+
+    /// The factor's skip is guarded by the pivot row. An `inf` there can only arise mid-
+    /// elimination (any `inf` input makes the singularity tolerance infinite and the factor
+    /// rejects up front), so: finite entries near `f64::MAX` whose column-0 update overflows
+    /// row 1's `U` entry to `inf`, with a structural zero below it in column 1. The dense
+    /// update writes `1e300 − 0·inf = NaN` there. Mutation: drop `pivot_row_finite` → the
+    /// row is skipped and stays `1e300`.
+    #[test]
+    fn lu_factor_does_not_skip_a_zero_against_an_overflowed_pivot_row() {
+        let n = 3;
+        let mut m = vec![
+            1e300, 0.0, 1.5e308, //
+            -1e300, 1e300, 1.5e308, //
+            0.0, 0.0, 1e300,
+        ];
+        let mut piv = vec![0usize; n];
+        // Column 2's pivot is then NaN, so the factor rejects; what it wrote must match dense.
+        let _ = lu_factor_in_place_g(&mut m, &mut piv, n);
+        assert_eq!(piv[..2], [0, 1], "premise: no swaps");
+        assert!(
+            m[5].is_infinite(),
+            "premise: row 1's U entry overflowed: {m:?}"
+        );
+        assert!(m[8].is_nan(), "the skip hid 1e300 − 0·inf: {m:?}");
+    }
+
+    /// The forward substitution's per-entry skip is guarded by the solved entry: a
+    /// structural-zero multiplier below an `inf` right-hand side is `0·inf = NaN` in the
+    /// dense update. Mutation: drop `b_finite` → the update is skipped and `b[1]` stays 1.
+    #[test]
+    fn lu_forward_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
+        let n = 2;
+        let m = vec![1.0, 0.0, 0.0, 1.0];
+        let piv = vec![0usize, 1];
+        let mut b = vec![f64::INFINITY, 1.0];
+        lu_solve_in_place_g(&m, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&m, &piv, n, &[f64::INFINITY, 1.0]);
+        assert!(want[1].is_nan(), "premise: dense {want:?}");
+        assert!(b[1].is_nan(), "the skip hid 0·inf: {b:?}");
+    }
+
+    /// The back substitution's skip is guarded by the solved entry: a structural zero in
+    /// `U` against an `inf` component of the solution is `NaN` in the dense sum. Mutation:
+    /// drop `all_finite(b[c])` → the term is skipped and `x[0]` comes out finite.
+    #[test]
+    fn lu_back_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
+        let n = 2;
+        let m = vec![1.0, 0.0, 0.0, 1e-300];
+        let piv = vec![0usize, 1];
+        let mut b = vec![1.0, 1e10];
+        lu_solve_in_place_g(&m, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&m, &piv, n, &[1.0, 1e10]);
+        assert!(
+            want[1].is_infinite() && want[0].is_nan(),
+            "premise: dense {want:?}"
+        );
+        assert!(b[0].is_nan(), "the skip hid 0·inf: {b:?}");
     }
 
     /// The pre-skip substitutions alone, on a given factorization.
