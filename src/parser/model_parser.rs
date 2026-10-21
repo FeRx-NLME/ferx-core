@@ -25406,7 +25406,15 @@ fn eval_expr<E: EvalEnv>(
                         l / r
                     }
                 }
-                BinOp::Mod => l.rem_euclid(r),
+                // Same `|b| < 1e-30 → 0` guard as `/` and as both bytecode VMs'
+                // `Op::Mod`; without it `x mod 0` was `NaN` here and `0` there (#2149).
+                BinOp::Mod => {
+                    if r.abs() < 1e-30 {
+                        0.0
+                    } else {
+                        l.rem_euclid(r)
+                    }
+                }
             }
         }
         Expression::UnaryFn(name, arg) => {
