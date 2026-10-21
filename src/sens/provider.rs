@@ -179,8 +179,13 @@ impl<T: PkNum> SeededPkDuals<T> {
         }
     }
 
-    /// Build the disposition the `flags` class superposes over, once.
+    /// Build the disposition the `flags` class superposes over, once. Not for a degenerate
+    /// `CL` or `V` (#2104): [`superpose_doses`] drops every dose then and never reads it,
+    /// and its macro rates would be `NaN` (`CL = +inf` gives `inf − inf` in the roots).
     fn with_disposition(mut self, flags: PkClassFlags) -> Self {
+        if self.cl_or_v_degenerate() {
+            return self;
+        }
         if flags.three_cpt {
             self.three = Some(super::three_cpt::ThreeCpt::new(
                 self.cl_d, self.v1_d, self.q_d, self.v2_d, self.q3_d, self.v3_d,
@@ -191,6 +196,24 @@ impl<T: PkNum> SeededPkDuals<T> {
             ));
         }
         self
+    }
+
+    /// The degenerate-parameter rule both closed-form engines apply
+    /// ([`crate::sens::propagate::cl_or_v_degenerate`], #2104), on the seeded values.
+    #[inline]
+    fn cl_or_v_degenerate(&self) -> bool {
+        crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
+    }
+
+    /// `crate::sens::propagate::dose_override_g` on the seeded values, for the
+    /// six IV / oral classes only — `None` for transit / IG, as the value path's
+    /// `cl_v_rule_governs` gate gives (#2104).
+    #[inline]
+    fn dose_override(&self, flags: PkClassFlags) -> Option<T> {
+        if flags.transit || flags.two_cpt_transit || flags.ig || flags.two_cpt_ig {
+            return None;
+        }
+        crate::sens::propagate::dose_override_g(self.cl_d, self.v1_d)
     }
 }
 
@@ -236,7 +259,14 @@ fn superpose_doses<T: PkNum>(
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
             continue;
         };
-        let c = if flags.transit {
+        // A degenerate `CL` or `V` drops the dose and a `NaN` one makes it `NaN`: the value
+        // path's own override in `pk::single_dose_concentration`, from the same helper, so
+        // this recording and the prediction it differentiates serve the same constant
+        // (#2104). First in the ladder, so a disposition `with_disposition` declined to
+        // build is never asked for.
+        let c = if let Some(v) = d.dose_override(flags) {
+            v
+        } else if flags.transit {
             one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
         } else if flags.two_cpt_transit {
             two_cpt_transit_conc_g(
@@ -1696,3 +1726,7 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
         // let the dual walk mirror production, instead of falling to FD.
         || (subject.has_resets() && subject.doses.iter().any(|d| d.ss))
 }
+
+#[cfg(test)]
+#[path = "provider_degenerate_tests.rs"]
+mod degenerate_tests;
