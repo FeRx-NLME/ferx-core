@@ -1191,7 +1191,7 @@ fn run_sir_in_box(
         // The prior half, at this draw. `x_k` is already the packed vector the penalty
         // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
         // bit-identical.
-        sir_draw_ofv(model, population, params_k, eta_hats, options) + priors.penalty(x_k)
+        sir_draw_ofv(model, population, params_k, params, eta_hats, options) + priors.penalty(x_k)
     };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
@@ -1391,7 +1391,7 @@ fn run_sir_in_box(
 ///
 /// At the estimates this equals the fit's data OFV bit for bit on FOCE, FOCEI, Laplace
 /// and mixture fits (pinned by `sir_draw_ofv_at_the_estimate_is_the_fits_objective`):
-/// the fit's η̂ is a fixed point of [`sir_draw_ebes`] (#2279) — when the last stage
+/// the fit's η̂ is a fixed point of [`sir_draw_ebes`] at `eta_params` (#2279) — when the last stage
 /// estimates. After an evaluation-only last stage (`agq_eval_only`, `imp_eval_only`)
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
@@ -1401,6 +1401,7 @@ pub(crate) fn sir_draw_ofv(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
+    eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
 ) -> f64 {
@@ -1408,7 +1409,8 @@ pub(crate) fn sir_draw_ofv(
         return crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
             .ofv;
     }
-    let (ehs, hms, kappas) = sir_draw_ebes(model, population, params, eta_hats, options);
+    let (ehs, hms, kappas) =
+        sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
     // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
     // marginal it was actually optimised against, not the FOCE one.
     2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
@@ -1416,10 +1418,18 @@ pub(crate) fn sir_draw_ofv(
 
 /// The EBEs [`sir_draw_ofv`] scores a non-mixture draw at: re-solved warm from the fit's
 /// `eta_hats` under the fit's own stage `options` — its inner Hessian seed and EBE variance
-/// convention — keeping any start the inner certificate already accepts
-/// (`InnerSolvePolicy::keep_certified_start`). The fit's reported η̂ passed that certificate,
-/// so at the fit's estimates it is a fixed point of this solve and the scorer reproduces the
-/// fit's objective bit for bit (#2279).
+/// convention. `eta_params` are the parameters `eta_hats` were solved at (the fit's
+/// estimates); when `params` is bit-identical to them, a start the inner certificate already
+/// accepts is kept as it stands (`InnerSolvePolicy::keep_certified_start`). The fit's
+/// reported η̂ passed that certificate at those parameters, so there it is a fixed point of
+/// this solve and the scorer reproduces the fit's objective bit for bit (#2279).
+///
+/// A draw anywhere else re-solves as before, with no precheck: at moved parameters the fit's
+/// η̂ is a stale start, and the certificate's resolution arm (`½gᵀH⁻¹g` below the objective's
+/// resolution) could return it unmoved with a Newton step above `tol` — scoring the draw at
+/// stale EBEs — while its `pd_newton_step` costs `2·n_eta` gradients per subject before the
+/// search it would usually not skip. Neither applies at the fit's own parameters, where the
+/// point *is* the one the fit certified, and the check runs once per subject.
 ///
 /// Both halves were measured on warfarin. Unseeded (`InnerHessianSeed::None`, before #2279),
 /// BFGS failed its line search at η̂ and the Nelder–Mead fallback moved FOCE subjects 0 and 7
@@ -1431,6 +1441,7 @@ pub(crate) fn sir_draw_ebes(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
+    eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
@@ -1448,13 +1459,38 @@ pub(crate) fn sir_draw_ebes(
         // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
         // mode its marginal linearises around (#1722).
         InnerSolvePolicy {
-            keep_certified_start: true,
+            keep_certified_start: same_point(params, eta_params),
             ..InnerSolvePolicy::for_stage(options, model)
         },
         None,
         |_, _| (),
     );
     (ehs, hms, kappas)
+}
+
+/// Whether `a` and `b` are the same point bit for bit in every value the draw scorer reads:
+/// θ, Ω, Σ, the live `block_sigma` correlations and Ω_IOV. Gates
+/// `InnerSolvePolicy::keep_certified_start` in [`sir_draw_ebes`].
+fn same_point(a: &ModelParameters, b: &ModelParameters) -> bool {
+    fn bits(x: &[f64], y: &[f64]) -> bool {
+        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+    }
+    let omega = |x: &crate::types::OmegaMatrix, y: &crate::types::OmegaMatrix| {
+        x.matrix.shape() == y.matrix.shape() && bits(x.matrix.as_slice(), y.matrix.as_slice())
+    };
+    bits(&a.theta, &b.theta)
+        && omega(&a.omega, &b.omega)
+        && bits(&a.sigma.values, &b.sigma.values)
+        && a.residual_correlations.len() == b.residual_correlations.len()
+        && a.residual_correlations
+            .iter()
+            .zip(&b.residual_correlations)
+            .all(|(x, y)| x.rho.to_bits() == y.rho.to_bits())
+        && match (&a.omega_iov, &b.omega_iov) {
+            (None, None) => true,
+            (Some(x), Some(y)) => omega(x, y),
+            _ => false,
+        }
 }
 
 /// The IOV kappa variances of one unpacked draw — the `omega_iov` diagonal, in

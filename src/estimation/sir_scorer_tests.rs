@@ -72,7 +72,7 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 /// caller defaults, minus the fit's data OFV. Bitwise 0 is the claim.
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let got = sir_draw_ofv(model, pop, &params, &etas, &options);
+    let got = sir_draw_ofv(model, pop, &params, &params, &etas, &options);
     (got, fit.ofv - fit.ofv_prior)
 }
 
@@ -90,7 +90,7 @@ fn scorer_inputs(
 /// `(index, max |Δη|)`. Empty is the claim: the fit's η̂ is a fixed point (#2279).
 fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(usize, f64)> {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &etas, &options);
+    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &params, &etas, &options);
     ehs.iter()
         .zip(&etas)
         .enumerate()
@@ -317,6 +317,11 @@ fn mixture_override_refusals_carry_their_codes() {
 /// Newton arm). Both sides of the gate on one start: with the flag the start comes back
 /// bitwise; without it the search moves it. Dies if `sir_draw_ebes` drops the flag (the
 /// second assertion's twin becomes the first), or if `find_ebe_solve` stops honouring it.
+///
+/// And the scorer raises the flag only at the parameters the start was certified at: a
+/// draw one θ step away re-solves the same start and moves it, so a draw is never scored at
+/// a stale η̂ nor pays the certificate's FD Hessian (review of #2279). Dies if
+/// `same_point` always holds (the draw keeps the start) or never does (the estimate moves it).
 #[test]
 fn scorer_keeps_a_start_its_certificate_accepts() {
     use crate::estimation::inner_optimizer::{find_ebe_cached, InnerSolvePolicy};
@@ -369,10 +374,71 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
     let mut shifted = etas.clone();
     shifted[0] = DVector::from_vec(start.clone());
-    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &params, &shifted, &options);
+    let (ehs, _, _) = sir_draw_ebes(
+        model,
+        &prep.population,
+        &params,
+        &params,
+        &shifted,
+        &options,
+    );
     assert_eq!(
         bits(ehs[0].as_slice()),
         bits(&start),
-        "sir_draw_ebes moved a certified start"
+        "sir_draw_ebes moved a certified start at the estimates"
     );
+
+    // A draw away from the estimates does not keep it: the gate is off, the start is searched.
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.0 + 1e-9;
+    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options);
+    assert_ne!(
+        bits(ehs[0].as_slice()),
+        bits(&start),
+        "sir_draw_ebes kept a start at a draw away from the parameters it was certified at"
+    );
+}
+
+/// `same_point` is bitwise in every value the scorer reads: one ULP on any of θ, Ω, Σ, a
+/// `block_sigma` ρ or Ω_IOV breaks it, and a clone keeps it. Each field gets its own case so
+/// dropping one comparison names it.
+#[test]
+fn same_point_sees_every_scored_value() {
+    use crate::types::{OmegaMatrix, ResidualCorrelation};
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    let mut base = prep.init_params.clone();
+    base.residual_correlations = vec![ResidualCorrelation {
+        sigma_i: 0,
+        sigma_j: 0,
+        rho: 0.25,
+    }];
+    base.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04], vec!["K1".into()]));
+    assert!(
+        same_point(&base, &base.clone()),
+        "a clone is the same point"
+    );
+    let up = |x: &mut f64| *x = f64::from_bits(x.to_bits() + 1);
+    let cases: Vec<(&str, Box<dyn Fn(&mut ModelParameters)>)> = vec![
+        ("theta", Box::new(|p| up(&mut p.theta[0]))),
+        ("omega", Box::new(|p| up(&mut p.omega.matrix[(0, 0)]))),
+        ("sigma", Box::new(|p| up(&mut p.sigma.values[0]))),
+        ("rho", Box::new(|p| up(&mut p.residual_correlations[0].rho))),
+        (
+            "omega_iov",
+            Box::new(|p| up(&mut p.omega_iov.as_mut().unwrap().matrix[(0, 0)])),
+        ),
+        ("omega_iov presence", Box::new(|p| p.omega_iov = None)),
+    ];
+    for (what, bump) in cases {
+        let mut moved = base.clone();
+        bump(&mut moved);
+        assert!(
+            !same_point(&base, &moved),
+            "{what}: one ULP still reads as the same point"
+        );
+    }
 }

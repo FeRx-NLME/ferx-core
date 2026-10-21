@@ -841,8 +841,11 @@ pub(crate) struct InnerSolvePolicy {
     /// flag on every platform; without it, a fallback-certified η̂ (gradient norm just above
     /// `tol`, the mode resolved by the Newton or resolution arm) re-enters BFGS, stalls, and
     /// the Nelder–Mead fallback moves it by a rounding-level amount whose size is libm-
-    /// dependent. Set only by the SIR draw scorer, which re-solves from the fit's reported
-    /// η̂; `false`, the `Default`, otherwise. The IOV inner solve does not read it.
+    /// dependent. Set only by the SIR draw scorer, and only when it scores at the very
+    /// parameters the warm start was certified at (the fit's estimates): elsewhere the start
+    /// is stale, the certificate's resolution arm could keep it with a Newton step above `tol`,
+    /// and its FD Hessian would cost every draw `2·n_eta` gradients per subject. `false`, the
+    /// `Default`, otherwise. The IOV inner solve does not read it.
     pub(crate) keep_certified_start: bool,
 }
 
@@ -1008,7 +1011,9 @@ impl FallbackCertifier<'_> {
     /// below `tol`, or (off the objective-stall regime, as in `certify`) the Newton step at `x`
     /// is below `tol` or its predicted gain is below the objective's resolution. The test a
     /// converged inner solve's own end point passes, so a re-solve that checks it first
-    /// returns that point unchanged (`InnerSolvePolicy::keep_certified_start`, #2279).
+    /// returns that point unchanged (`InnerSolvePolicy::keep_certified_start`, #2279). Unlike
+    /// [`Self::newton_certifies`] it takes no Newton step before the resolution arm, so it is
+    /// sound only at the parameters `x` was certified at — not as a shortcut for a moved one.
     fn certifies_in_place(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64]) -> bool {
         if !x.iter().all(|v| v.is_finite()) {
             return false;
