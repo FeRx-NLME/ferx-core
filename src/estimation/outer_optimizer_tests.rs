@@ -264,25 +264,26 @@ fn resolve_scaling_routes_auto_by_optimizer() {
 }
 
 /// A template for `nlopt_scale_vector` (#2146): θ in packed order
-/// `[TVCL 5 (log), TVBIG 1e6 (log), B_BIG 1e6, B_SMALL -0.01, B_10 10, B_10P5 10.5,
+/// `[TVCL 5 (log), TVBIG 1e6 (log), B_BIG 1e6, B_SMALL -0.01, B_1E3 1000, B_1E3P 1050,
 /// B_NEG -1e6]`, the last five identity-packed, then one Ω diagonal and one Σ.
 ///
-/// `TVBIG` packs to ln(1e6) ≈ 13.8, above the threshold, so a rule that forgot to
-/// ask about the packing would scale it. `B_10` and `B_10P5` sit on the two sides of
-/// the `> 10` gate.
+/// `B_1E3` and `B_1E3P` sit on the two sides of the `> 1e3` gate. `TVBIG` packs to
+/// ln(1e6) ≈ 13.8, below that gate (no log-packed value reaches it), so
+/// `scale_large_identity_thetas_skips_a_log_packed_theta` pins the packing check at a
+/// lower threshold.
 fn identity_scale_template() -> ModelParameters {
     use crate::types::{OmegaMatrix, SigmaVector};
     ModelParameters {
         residual_correlations: Vec::new(),
         residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 1e6, 1e6, -0.01, 10.0, 10.5, -1e6],
+        theta: vec![5.0, 1e6, 1e6, -0.01, 1e3, 1050.0, -1e6],
         theta_names: [
-            "TVCL", "TVBIG", "B_BIG", "B_SMALL", "B_10", "B_10P5", "B_NEG",
+            "TVCL", "TVBIG", "B_BIG", "B_SMALL", "B_1E3", "B_1E3P", "B_NEG",
         ]
         .map(String::from)
         .to_vec(),
-        theta_lower: vec![0.1, 1.0, -5e7, -1.0, -500.0, -500.0, -5e7],
-        theta_upper: vec![50.0, 1e8, 5e7, 1.0, 500.0, 500.0, 5e7],
+        theta_lower: vec![0.1, 1.0, -5e7, -1.0, -5e4, -5e4, -5e7],
+        theta_upper: vec![50.0, 1e8, 5e7, 1.0, 5e4, 5e4, 5e7],
         theta_fixed: vec![false; 7],
         omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
         omega_fixed: vec![false],
@@ -325,7 +326,7 @@ fn nlopt_scale_vector_applies_the_probed_small_identity_scales_beside_the_large_
     let PackedStart {
         packed: x0, bounds, ..
     } = pack_with_bounds(&template);
-    let want = [1.0, 1.0, 1e6, 0.01, 1.0, 10.5, 1e6, 1.0, 1.0];
+    let want = [1.0, 1.0, 1e6, 0.01, 1.0, 1050.0, 1e6, 1.0, 1.0];
     for opt in [Optimizer::NloptLbfgs, Optimizer::Bobyqa] {
         let options = FitOptions {
             optimizer: opt,
@@ -337,24 +338,24 @@ fn nlopt_scale_vector_applies_the_probed_small_identity_scales_beside_the_large_
 }
 
 /// Every strategy that magnitude-scales or leaves the coordinates unscaled divides an
-/// identity-packed θ with |θ₀| > 10 by |θ₀|, and changes nothing else (#2146).
+/// identity-packed θ with |θ₀| > 1e3 by |θ₀|, and changes nothing else (#2146).
 ///
 /// The expected vector is main's (all ones, because an identity-packed θ is present)
-/// with exactly `B_BIG`, `B_10P5` and `B_NEG` replaced. Without the rule `B_BIG` stays
+/// with exactly `B_BIG`, `B_1E3P` and `B_NEG` replaced. Without the rule `B_BIG` stays
 /// at 1 and L-BFGS stops at the initial 1e6 on the issue's warfarin model (OFV
-/// −265.4195 against −286.0042). `B_10` → 1 against `B_10P5` → 10.5 pins the strict
-/// `>`. `B_NEG` → 1e6 pins the `abs`. `TVBIG` → 1 pins the packing test. `B_SMALL` →
-/// 1 is the near-zero covariate case `7e7a3a4a` turned the scaling off for.
+/// −265.4195 against −286.0042). `B_1E3` → 1 against `B_1E3P` → 1050 pins both the
+/// threshold and the strict `>`. `B_NEG` → 1e6 pins the `abs`. `B_SMALL` → 1 is the
+/// near-zero covariate case `7e7a3a4a` turned the scaling off for.
 #[test]
 fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
     use crate::types::ParameterScaling::{Abs, Auto};
     let template = identity_scale_template();
-    let want = [1.0, 1.0, 1e6, 1.0, 1.0, 10.5, 1e6, 1.0, 1.0];
+    let want = [1.0, 1.0, 1e6, 1.0, 1.0, 1050.0, 1e6, 1.0, 1.0];
     for (ps, opt, scale_params) in [
         // `auto` → `abs`: the default for the gradient-based optimizers.
         (Auto, Optimizer::NloptLbfgs, false),
         (Auto, Optimizer::Slsqp, false),
-        // `auto` → unscaled: BOBYQA stalls from θ₀ = 100 without the rule.
+        // `auto` → unscaled: BOBYQA stops short from θ₀ = 1e4 without the rule.
         (Auto, Optimizer::Bobyqa, false),
         (Auto, Optimizer::Mma, false),
         // Written by the user, and the legacy `scale_params` alias.
@@ -368,6 +369,27 @@ fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
             "{ps:?} / {opt:?} / scale_params = {scale_params}"
         );
     }
+}
+
+/// The rule asks about the packing, not only the packed magnitude: at a threshold of
+/// 10, `TVBIG`'s packed ln(1e6) ≈ 13.8 is above it and stays at 1, while `B_1E3` (an
+/// identity θ) is scaled. At the production 1e3 no log-packed value can reach the gate,
+/// so only this lower threshold can see the check.
+#[test]
+fn scale_large_identity_thetas_skips_a_log_packed_theta() {
+    let template = identity_scale_template();
+    let PackedStart { packed: x0, .. } = pack_with_bounds(&template);
+    assert!(
+        x0[1] > 13.0,
+        "TVBIG packs to ln(1e6), above the test threshold"
+    );
+    let mut scale = vec![1.0; x0.len()];
+    scale_large_identity_thetas(&mut scale, &x0, &template.theta_lower, 10.0);
+    assert_eq!(
+        scale,
+        [1.0, 1.0, 1e6, 1.0, 1e3, 1050.0, 1e6, 1.0, 1.0],
+        "TVBIG must stay at 1"
+    );
 }
 
 /// An explicit `parameter_scaling = none` is the legacy unscaled path and stays so,
@@ -400,8 +422,9 @@ fn nlopt_scale_vector_leaves_rescale2_to_the_bound_half_range() {
 }
 
 /// With no identity-packed θ, `abs` is `compute_scale_packed` on every coordinate, as
-/// before #2146; and with only small identity θ the switch-off of `7e7a3a4a` still
-/// gives all ones.
+/// before #2146; and with only identity θ of |θ₀| ≤ 1e3 the switch-off of `7e7a3a4a`
+/// still gives all ones. That includes the ordinary baseline `500`, which the rule
+/// leaves to the optimizer.
 #[test]
 fn nlopt_scale_vector_keeps_the_existing_vector_without_a_large_identity_theta() {
     let mut log_only = identity_scale_template();
@@ -424,7 +447,7 @@ fn nlopt_scale_vector_keeps_the_existing_vector_without_a_large_identity_theta()
     );
 
     let mut small = identity_scale_template();
-    small.theta = vec![5.0, 1e6, 0.5, -0.01, 10.0, -3.0, 0.001];
+    small.theta = vec![5.0, 1e6, 0.5, -0.01, 500.0, -3.0, 0.001];
     let got = identity_scale_vector(ParameterScaling::Auto, Optimizer::NloptLbfgs, false, &small);
     assert_eq!(got, vec![1.0; 9]);
 }

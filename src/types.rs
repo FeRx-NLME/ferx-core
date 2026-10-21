@@ -9058,9 +9058,10 @@ pub struct FitOptions {
     /// (`cap_scaled_gradient`, on every SLSQP eval and the first L-BFGS eval), the
     /// quasi-Newton Hessian estimate, and the xtol/ftol termination — all of
     /// which act in the scaled coordinate system, so the *trajectory* and stop
-    /// point differ. Because the scaling-enabled path only ever runs on
-    /// log/Cholesky-packed coordinates (it auto-disables when any
-    /// identity-packed theta is present), dividing by `|log value|` is
+    /// point differ. The `|packed value|` layer runs only on log/Cholesky-packed
+    /// coordinates (it switches off when any identity-packed theta is present;
+    /// an identity-packed θ with initial magnitude above 1e3 is then divided by
+    /// that magnitude on its own, #2146), and there dividing by `|log value|` is
     /// counterproductive: a coordinate like `ln(V) = ln(20) ≈ 3` gets scale 3,
     /// so the optimizer's unit step becomes a 3-unit move in log space — an
     /// e³ ≈ 20× multiplicative jump in V. That large step both overshoots and,
@@ -9072,14 +9073,13 @@ pub struct FitOptions {
     /// opt-in for experimentation.
     pub scale_params: bool,
     /// Parameter-scaling strategy for the outer optimizer. When non-`None` this
-    /// supersedes [`FitOptions::scale_params`]: `Rescale2` (nlmixr2-style bound-half-width
-    /// normalisation) is the recommended setting for gradient-based optimizers
-    /// and substantially improves cold-start convergence (see
-    /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the
-    /// gradient-based optimizers that benefit (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`)
-    /// and leaves the derivative-free `Bobyqa` unscaled (where `Rescale2`
-    /// distorts its trust-region model). Set via `[fit_options]` key
-    /// `parameter_scaling = none|abs|rescale2` to override.
+    /// supersedes [`FitOptions::scale_params`] (see [`ParameterScaling`]).
+    /// **Default: `Auto`** — applies `Abs` to the gradient-based optimizers
+    /// (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`) and leaves `Bobyqa`, `Mma` and
+    /// `TrustRegion` unscaled; it applies `Rescale2` to none of them. Under `Auto`
+    /// and `Abs` the NLopt optimizers also divide an identity-packed θ whose initial
+    /// magnitude exceeds 1e3 by that magnitude (#2146). Set via `[fit_options]` key
+    /// `parameter_scaling = auto|none|abs|rescale2` to override.
     pub parameter_scaling: ParameterScaling,
     /// Fraction of subjects allowed to have unconverged EBEs before the outer
     /// optimizer rejects the current parameter step (returns OFV = ∞).  Set to
@@ -9689,7 +9689,7 @@ pub enum ParameterScaling {
     /// derivative-free `Bobyqa` and `Mma`/`TrustRegion` are left unscaled, with
     /// the legacy `scale_params` / IOV-auto-enable still applying in that
     /// unscaled branch. Under both, the NLopt optimizers also divide an
-    /// identity-packed θ (lower bound < 0) whose initial magnitude exceeds 10 by
+    /// identity-packed θ (lower bound < 0) whose initial magnitude exceeds 1e3 by
     /// that magnitude (#2146).
     #[default]
     Auto,
@@ -9697,11 +9697,16 @@ pub enum ParameterScaling {
     /// auto-enable). Preserves the pre-`Auto` unscaled behaviour for any optimizer.
     None,
     /// Normalise each coordinate by `|packed value|` (the legacy `compute_scale`
-    /// strategy). O(1) for log-packed thetas; 1.0 fallback near zero.
+    /// strategy). O(1) for log-packed thetas; 1.0 fallback near zero. When any θ is
+    /// identity-packed this layer switches off for every coordinate, and only an
+    /// identity-packed θ with initial magnitude above 1e3 is divided by that
+    /// magnitude (#2146).
     Abs,
     /// nlmixr2-style: normalise each coordinate by the half-width of its bound
-    /// range, mapping it toward `(−1, 1)`. The recommended scaling for
-    /// gradient-based optimizers (`bfgs`/`lbfgs`); harmful to `Bobyqa`.
+    /// range, mapping it toward `(−1, 1)`. Bound width is unrelated to curvature, so
+    /// it can drive L-BFGS into a bound and freeze SLSQP's first step, and it
+    /// distorts `Bobyqa`'s trust region; [`Auto`](Self::Auto) uses it for no
+    /// optimizer.
     Rescale2,
 }
 

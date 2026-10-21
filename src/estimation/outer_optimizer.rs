@@ -2266,8 +2266,8 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
 }
 
 /// An identity-packed θ whose initial magnitude exceeds this is divided by that
-/// magnitude in the NLopt scale vector, whatever the strategy does with the other
-/// coordinates (#2146).
+/// magnitude in the NLopt scale vector (#2146). The rule applies under `auto` and an
+/// explicit `abs`; `rescale2` and an explicit `none` skip it.
 ///
 /// Unscaled, such a θ reaches the optimizer in raw units: its packed gradient is
 /// about `1/|θ|` of a unit-magnitude one, so the stop test passes with the θ at its
@@ -2277,17 +2277,21 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
 /// θ₀ = 1e5; BOBYQA stops short from θ₀ = 1e4 (−285.3322, unconverged) and stalls
 /// from 1e5.
 ///
-/// The threshold is 10, not 1. At 1 the rule reaches `ctmm_pd_2state`'s
-/// `LQ01 = -1.2` and moves all three optimizers to a worse objective (L-BFGS
-/// 712.6479 → 712.9186, SLSQP 711.6420 → 712.5712, BOBYQA 711.4581 → 712.2777).
-/// At 10 no committed fixture has such a θ, and the rule still reaches every θ₀
-/// at which an optimizer fails.
+/// The threshold is 1e3: above every θ₀ at which all three optimizers reached the
+/// minimum without the rule (10, 100 and 1000), and below every one at which one
+/// failed. An identity baseline
+/// of 10 to 1000 is ordinary (a PD `E0 = 50`, a score), and scaling one changes the
+/// trajectory for no gain in the objective. At a threshold of 10, SLSQP from
+/// θ₀ = 100 stopped 0.0086 above the minimum (−285.9956) while reporting
+/// convergence. At 1 the rule also reached `ctmm_pd_2state`'s `LQ01 = -1.2` and
+/// moved all three optimizers to a worse objective (L-BFGS 712.6479 → 712.9186,
+/// SLSQP 711.6420 → 712.5712, BOBYQA 711.4581 → 712.2777).
 ///
 /// A small identity θ is not scaled by its value alone, since a covariate exponent
 /// started at 0.001 is usually an O(1) slope: [`identity_theta_scales`] (#2159)
 /// scales one with `0 < |θ₀| <` [`NEAR_ZERO_IDENTITY_THETA`] only when probing the
 /// objective shows that the moves that matter are of the θ's own size.
-const IDENTITY_THETA_SCALE_ABOVE: f64 = 10.0;
+const IDENTITY_THETA_SCALE_ABOVE: f64 = 1e3;
 
 /// The per-coordinate scale vector of the NLopt outer loop: the optimizer sees
 /// `x / scale`.
@@ -2295,8 +2299,12 @@ const IDENTITY_THETA_SCALE_ABOVE: f64 = 10.0;
 /// `auto_scale_iov` is the IOV + SLSQP auto-enable, computed by the caller.
 /// `identity_scales` is [`identity_theta_scales`]' result, `(θ index, |θ₀|)`; the
 /// caller probes only under `auto` / `abs`, so it is empty under `none` and
-/// `rescale2`. Its θ are all below [`NEAR_ZERO_IDENTITY_THETA`] in magnitude, so it
-/// never meets the large-θ rule's.
+/// `rescale2`. It is probed once, at the user's initial values, where its θ are all
+/// below [`NEAR_ZERO_IDENTITY_THETA`] in magnitude, so on the first leg it never meets
+/// the large-θ rule's. A restart leg passes the same `identity_scales` with the stalled
+/// estimates as `x0`: there both rules read the stalled point, and a probed θ that has
+/// grown past [`IDENTITY_THETA_SCALE_ABOVE`] takes `|x|` and is then overwritten with
+/// its probed scale.
 fn nlopt_scale_vector(
     options: &FitOptions,
     auto_scale_iov: bool,
@@ -2345,16 +2353,30 @@ fn nlopt_scale_vector(
     if matches!(options.parameter_scaling, ParameterScaling::None) {
         return scale;
     }
-    // θ occupy the first `theta_lower.len()` packed slots (`pack_params`).
-    for ((s, &x), &lo) in scale.iter_mut().zip(x0).zip(&init_params.theta_lower) {
-        if !theta_packs_log(lo) && x.abs() > IDENTITY_THETA_SCALE_ABOVE {
-            *s = x.abs();
-        }
-    }
+    scale_large_identity_thetas(
+        &mut scale,
+        x0,
+        &init_params.theta_lower,
+        IDENTITY_THETA_SCALE_ABOVE,
+    );
     for &(i, s) in identity_scales {
         scale[i] = s;
     }
     scale
+}
+
+/// Set the scale of each identity-packed θ with `|x| > above` to `|x|`.
+///
+/// The threshold is a parameter so a test can pin the packing check: at
+/// [`IDENTITY_THETA_SCALE_ABOVE`] no log-packed value can reach the gate, since
+/// `ln(f64::MAX)` is about 709.8, so the check only matters if the threshold is lowered.
+fn scale_large_identity_thetas(scale: &mut [f64], x0: &[f64], theta_lower: &[f64], above: f64) {
+    // θ occupy the first `theta_lower.len()` packed slots (`pack_params`).
+    for ((s, &x), &lo) in scale.iter_mut().zip(x0).zip(theta_lower) {
+        if !theta_packs_log(lo) && x.abs() > above {
+            *s = x.abs();
+        }
+    }
 }
 
 /// Resolve the derivative-free `bobyqa` outer optimizer's `ftol_rel` stop tolerance.

@@ -70,7 +70,7 @@ the parameterization.
 #### An identity-packed θ started near zero {#identity-theta-near-zero}
 
 An identity-packed θ reaches the NLopt outer optimizers on its natural scale
-unless its initial magnitude exceeds 10, when it is divided by that magnitude
+unless its initial magnitude exceeds 1e3, when it is divided by that magnitude
 ([`parameter_scaling`](../model-file/fit-options.qmd#parameter-scaling-and-ebe-convergence),
 #2146). So one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of
 magnitude below the optimizer's unit step and its stopping tolerances (#2159).

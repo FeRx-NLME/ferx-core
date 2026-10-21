@@ -95,7 +95,7 @@ fn a_large_identity_theta_reaches_the_minimum_under_auto() {
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
     // Linux x86_64 (glibc 2.28), at b164d98: OFV −286.0042195051 in 33
     // iterations, 2.0e-5 from OFV_MIN, so the 1e-3 band has 50× headroom; TVV_S
-    // 773770.591, 0.009 from the bound's centre, against 100.
+    // 773770.591, 0.009 from the band's centre (773770.6), against 100.
     assert!(
         (r.ofv - OFV_MIN).abs() < 1e-3,
         "auto: OFV {} is not the minimum {OFV_MIN} (stalled fits end at {OFV_STALLED})",
@@ -118,7 +118,7 @@ fn a_large_identity_theta_reaches_the_minimum_under_bobyqa() {
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
     // Linux x86_64 (glibc 2.28), at b164d98: OFV −286.0042137931 in 385
     // iterations, 1.4e-5 from OFV_MIN, so the 1e-3 band has 72× headroom; TVV_S
-    // 773755.606, 15.0 from the bound's centre, against 100. Since #2170 polishes a
+    // 773755.606, 15.0 from the band's centre (773770.6), against 100. Since #2170 polishes a
     // BOBYQA tolerance stop, BOBYQA reaches the minimum as closely as L-BFGS does.
     assert!(
         (r.ofv - OFV_MIN).abs() < 1e-3,
