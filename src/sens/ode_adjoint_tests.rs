@@ -2529,6 +2529,82 @@ fn laplace_adjoint_matches_reconverged_fd() {
     assert!(worst < 5e-7, "ODE: {worst:.2e}");
 }
 
+/// A subject with 30 random effects under Laplace's exact anchor, two doses and the shared
+/// sampling times. Before the 48 bucket it found no exact-anchor bucket (`[2, 4, 8, 24]`)
+/// and fell back to finite differences.
+fn thirty_effect_laplace_fixture() -> (CompiledModel, Subject) {
+    let n = 30;
+    let model = parse_model_string(&one_cpt_oral_n_eta(n)).unwrap();
+    assert_eq!(model.n_eta, n);
+    let eta_ref: Vec<f64> = (0..n).map(|k| 0.02 * (k as f64 * 1.3).sin()).collect();
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &eta_ref,
+    );
+    (model, s)
+}
+
+/// On a fit pool worker's stack, as production runs it: a 48-wide exact-anchor value is
+/// ~1.5 kB and the recording keeps several per state.
+fn on_fit_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(scope, f)
+            .expect("spawn")
+            .join()
+            .expect("join")
+    })
+}
+
+/// Laplace's exact anchor past 24 random effects pads to the 48 bucket: a 30-effect
+/// subject gets the exact gradient, finite in every packed coordinate.
+#[test]
+fn laplace_exact_anchor_serves_a_thirty_effect_subject() {
+    let (model, s) = thirty_effect_laplace_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    let g = on_fit_stack(|| {
+        subject_adjoint_gradient(
+            &model,
+            &s,
+            &params,
+            &x,
+            eta.as_slice(),
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+        )
+    })
+    .expect("a 30-effect subject must be served by the 48 bucket");
+    assert_eq!(g.len(), x.len());
+    assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+}
+
+/// The 48 bucket's exact-anchor gradient against the reconverged FD of production's
+/// objective, on the 30-effect subject. ~25 s in a debug build (34 coordinates, four
+/// 30-dimensional EBE solves each), so nightly; the per-PR twin is
+/// `laplace_exact_anchor_serves_a_thirty_effect_subject`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn laplace_exact_anchor_matches_reconverged_fd_at_thirty_effects() {
+    let (model, s) = thirty_effect_laplace_fixture();
+    let worst = on_fit_stack(|| fd_oracle_laplace(&model, &s));
+    eprintln!("30 η, exact anchor (bucket 48) vs reconverged FD {worst:.2e}");
+    // Measured worst 1.7e-9 on Linux; ~10× headroom.
+    assert!(worst < 2e-8, "30 η exact anchor: {worst:.2e}");
+}
+
 // ---- the exact η-Jacobian and inner Hessian that replace production FD ---------------
 
 #[test]
