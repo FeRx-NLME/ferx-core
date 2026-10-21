@@ -667,6 +667,64 @@ fn test_find_ebe_iov_two_occasions_returns_two_kappas() {
     assert!(result.converged || result.nll.is_finite());
 }
 
+/// #2261: the two warm-start widths `find_ebe_iov` reads — `η̂` alone and `η̂` then every
+/// cell's κ̂ — solve; the debug assertion that refuses every other width
+/// ([`iov_warm_start_of_another_width_panics_in_debug`]) leaves both alone.
+#[test]
+fn iov_warm_start_of_eta_or_joint_width_solves() {
+    let model = make_iov_model();
+    let subject = make_iov_subject();
+    let params = model.default_params.clone();
+    let joint = stacked_width(model.n_eta, model.n_kappa, 2);
+    for width in [model.n_eta, joint] {
+        let warm = vec![0.01; width];
+        let r = find_ebe(&model, &subject, &params, 200, 1e-5, Some(&warm), None, 0);
+        assert!(r.nll.is_finite(), "width {width}: NLL {}", r.nll);
+    }
+}
+
+/// #2261: a warm start of any other width is a caller that lost the joint layout; before
+/// it was cut to `η̂` with κ silently restarted at 0.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "IOV warm start of width 2 is neither")]
+fn iov_warm_start_of_another_width_panics_in_debug() {
+    let model = make_iov_model();
+    let subject = make_iov_subject();
+    assert_eq!(model.n_eta, 1, "fixture: width 2 must be off-width");
+    assert_eq!(stacked_width(model.n_eta, model.n_kappa, 2), 3, "fixture");
+    let params = model.default_params.clone();
+    find_ebe(
+        &model,
+        &subject,
+        &params,
+        200,
+        1e-5,
+        Some(&[0.01, 0.02]),
+        None,
+        0,
+    );
+}
+
+/// #2261: a cancelled subject's placeholder keeps the warm `η̂` from a joint warm start
+/// (`η̂` then every cell's κ̂) as it does from an `η̂`-only one; shorter than `η̂` is no
+/// start at all and reports η = 0.
+#[test]
+fn cancelled_placeholder_keeps_eta_hat_of_a_joint_warm_start() {
+    let model = make_iov_model();
+    let subject = make_iov_subject();
+    let eta_of = |init: Option<&[f64]>| {
+        cancelled_ebe_placeholder(&model, &subject, init)
+            .eta
+            .as_slice()
+            .to_vec()
+    };
+    assert_eq!(eta_of(Some(&[0.3])), vec![0.3], "η̂ only");
+    assert_eq!(eta_of(Some(&[0.3, -0.4, 0.5])), vec![0.3], "η̂ then κ̂");
+    assert_eq!(eta_of(Some(&[])), vec![0.0], "shorter than η̂");
+    assert_eq!(eta_of(None), vec![0.0], "no warm start");
+}
+
 #[test]
 fn test_find_ebe_iov_h_matrix_dimensions() {
     let model = make_iov_model();

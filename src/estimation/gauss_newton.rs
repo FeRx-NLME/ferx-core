@@ -289,13 +289,15 @@ pub fn run_foce_gn(
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
+        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261).
+        let warm = crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &kappas);
         let (eta_try, h_try, _, kap_try) = run_inner_loop_warm_seeded(
             model,
             population,
             &params_try,
             options.inner_maxiter,
             options.inner_tol,
-            Some(&eta_hats),
+            Some(&warm),
             Some(&try_mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,

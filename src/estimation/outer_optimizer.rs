@@ -3255,7 +3255,10 @@ fn decrement_ode_override(
 /// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
 /// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
 /// (#2001 review). A subject with no κ cells is its `η̂` alone.
-fn joint_warm_starts(ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> Vec<DVector<f64>> {
+pub(super) fn joint_warm_starts(
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
     ehs.iter()
         .enumerate()
         .map(|(i, eta)| {
@@ -4752,18 +4755,20 @@ fn optimize_nlopt_once(
         // mixture cache the branch above has already overwritten (#1290).
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
+            // The next evaluation starts every subject at this one's whole mode, κ̂ with
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
+            state.cached_etas = joint_warm_starts(&ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
             // twice.
             *best_solve_cl.lock().unwrap() = Some(IncumbentSolve {
                 xs: xs.to_vec(),
-                etas: ehs.clone(),
+                etas: ehs,
                 h_mats: hms.clone(),
                 kappas: kappas.clone(),
             });
             state.cached_h_mats = hms;
-            state.cached_etas = ehs;
         } else {
             state.cached_h_mats = hms;
             if let Some(prev) = warm_start_by_class {
@@ -5531,7 +5536,7 @@ fn optimize_nlopt_once(
                     // it does not (the tracker can rank a guard-penalised eval best,
                     // whose EBEs are never adopted), it still seeds the re-solve.
                     let held_is_at_this_point = inc.xs == restored_xs;
-                    let seed = inc.etas.clone();
+                    let seed = joint_warm_starts(&inc.etas, &inc.kappas);
                     let warm = solve_at(Some(&seed));
                     // Cold first: `reported_candidate` breaks ties by index, so a fit
                     // whose candidates agree keeps reporting the cold number.
@@ -6072,7 +6077,8 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        (f, g, ehs, hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
+        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
     };
 
     // Per-element scale factors for the BFGS outer loop.
