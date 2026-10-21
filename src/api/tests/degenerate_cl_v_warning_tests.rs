@@ -421,3 +421,52 @@ fn a_reset_record_is_scanned_under_its_own_snapshot() {
         "{msg}"
     );
 }
+
+/// An EVID=4 row is stored twice by the reader — in `doses` and in `reset_times` — but is
+/// one data record, so it is counted once (#2104 review). A separate EVID=3 row co-timed
+/// with a dose, under covariates of its own, is a second record and still counts.
+///
+/// Mutation (run): drop the `evid4_twin` filter → the first half dies (5 records reported).
+#[test]
+fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
+    let model = parse(LINEAR_AGE_SRC);
+    // EVID=4 at TIME 0: the dose and its reset twin, same row, AGE 200 everywhere.
+    let mut s1 = subject("S1", [200.0; 4]);
+    s1.reset_times = vec![0.0];
+    s1.reset_covariates = vec![age(200.0)];
+    let (msg, entry) = degenerate_cl_v_warning(
+        &model,
+        &population(vec![s1]),
+        &model.default_params.theta,
+        &etas(1, 0.0),
+        &[],
+        None,
+    )
+    .expect("must warn");
+    assert!(
+        msg.contains("on 4 record(s)"),
+        "the EVID=4 twin counts once: {msg}"
+    );
+    assert_eq!(
+        entry.details.unwrap()["subjects"][0]["times"],
+        serde_json::json!([0.0, 1.0, 2.0, 3.0])
+    );
+
+    // A distinct EVID=3 row at TIME 0 with AGE 200, beside a valid dose at AGE 40.
+    let mut s2 = subject("S2", [40.0; 4]);
+    s2.reset_times = vec![0.0];
+    s2.reset_covariates = vec![age(200.0)];
+    let (msg, _) = degenerate_cl_v_warning(
+        &model,
+        &population(vec![s2]),
+        &model.default_params.theta,
+        &etas(1, 0.0),
+        &[],
+        None,
+    )
+    .expect("the co-timed reset row's own negative CL must warn");
+    assert!(
+        msg.contains("on 1 record(s)") && msg.contains("first at TIME 0"),
+        "{msg}"
+    );
+}

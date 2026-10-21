@@ -210,13 +210,15 @@ pub(crate) fn three_cpt_iv_peripherals(
     q3: f64,
     v3: f64,
 ) -> [f64; 2] {
-    if tau < 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || crate::sens::propagate::cl_or_v_degenerate(cl, v1)
-        || q2 < 0.0
-        || q3 < 0.0
-    {
+    if tau < 0.0 {
+        return [0.0; 2];
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl, v1) {
+        return [c; 2];
+    }
+    if v2 <= 0.0 || v3 <= 0.0 || q2 < 0.0 || q3 < 0.0 {
         return [0.0; 2];
     }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
@@ -344,14 +346,15 @@ pub(crate) fn three_cpt_oral_peripherals(
         !dose.is_infusion(),
         "three_cpt_oral_peripherals called with an infusion dose — route infusions through three_cpt_iv_peripherals"
     );
-    if tau < 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || crate::sens::propagate::cl_or_v_degenerate(cl, v1)
-        || q2 < 0.0
-        || q3 < 0.0
-        || ka <= 0.0
-    {
+    if tau < 0.0 {
+        return [0.0; 2];
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl, v1) {
+        return [c; 2];
+    }
+    if v2 <= 0.0 || v3 <= 0.0 || q2 < 0.0 || q3 < 0.0 || ka <= 0.0 {
         return [0.0; 2];
     }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);

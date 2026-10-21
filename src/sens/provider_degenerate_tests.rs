@@ -286,6 +286,75 @@ fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
     );
 }
 
+/// The `NaN` half of the rule in the exported kernels: a `NaN` `CL` or `V` on an arrived
+/// dose is `NaN` on every 1-/2-/3-cpt dispatcher × dose kind, as `predict_concentration`
+/// and the event walk serve it — and 0 before the dose arrives. Before, the 2-cpt infusion
+/// forms read the `NaN` disposition (`TwoCpt::new` maps it to `β = 0`) through their
+/// numerical-degeneracy guard and returned 0, so `two_cpt_infusion`, `two_cpt_infusion_ss`
+/// and `two_cpt_predict` disagreed with the bolus forms and the engines (#2104 review).
+///
+/// Mutation (run): delete the `superposed_dose_override` check in `two_cpt_infusion_d` →
+/// the 2-cpt infusion `NaN` rows die (0 returned).
+#[test]
+fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
+    use crate::sens::{
+        one_cpt::one_cpt_conc_g, three_cpt::three_cpt_conc_g, two_cpt::two_cpt_conc_g,
+    };
+    let mk = |rate: f64, ss: bool, ii: f64| DoseEvent::new(0.0, 500.0, 1, rate, ss, ii);
+    let doses: [(DoseEvent, bool); 6] = [
+        (mk(0.0, false, 0.0), false),
+        (mk(100.0, false, 0.0), false),
+        (mk(0.0, false, 0.0), true),
+        (mk(0.0, true, 12.0), false),
+        (mk(100.0, true, 12.0), false),
+        (mk(0.0, true, 12.0), true),
+    ];
+    let (q, v2, q3, v3, ka, f) = (3.0, 40.0, 2.0, 60.0, 1.2, 1.0);
+    let nan = f64::NAN;
+    for (dose, oral) in &doses {
+        for (label, cl, v) in [("CL=NaN", nan, 80.0), ("V=NaN", 5.0, nan)] {
+            for t in [0.0, 1.0, 10.0] {
+                let at = format!(
+                    "{label} rate={} ss={} oral={oral} t={t}",
+                    dose.rate, dose.ss
+                );
+                let c1 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, f, *oral);
+                let c2 = two_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, ka, f, *oral);
+                let c3 = three_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, q3, v3, ka, f, *oral);
+                assert!(
+                    c1.is_nan() && c2.is_nan() && c3.is_nan(),
+                    "{at}: 1/2/3-cpt kernels gave {c1}, {c2}, {c3}"
+                );
+            }
+            // Before the arrival nothing has been given: 0, not `NaN`.
+            let before = one_cpt_conc_g::<f64>(dose, -1.0, cl, v, ka, f, *oral)
+                + two_cpt_conc_g::<f64>(dose, -1.0, cl, v, q, v2, ka, f, *oral)
+                + three_cpt_conc_g::<f64>(dose, -1.0, cl, v, q, v2, q3, v3, ka, f, *oral);
+            assert_eq!(before, 0.0, "{label}: before the arrival");
+        }
+    }
+    // The public f64 entry points the review named, and the state helpers.
+    let infusion = mk(100.0, false, 0.0);
+    let infusion_ss = mk(100.0, true, 12.0);
+    let bolus = mk(0.0, false, 0.0);
+    for (cl, v) in [(nan, 80.0), (5.0, nan)] {
+        for t in [0.0, 1.0, 10.0] {
+            assert!(crate::pk::two_cpt_infusion(&infusion, t, cl, v, q, v2).is_nan());
+            assert!(crate::pk::two_cpt_infusion_ss(&infusion_ss, t, cl, v, q, v2).is_nan());
+            assert!(crate::pk::two_cpt_predict(&infusion, t, cl, v, q, v2, None, None).is_nan());
+            assert!(crate::pk::one_cpt_predict(&bolus, t, cl, v, None, None).is_nan());
+        }
+        assert!(
+            crate::pk::two_compartment::two_cpt_iv_peripheral(&bolus, 1.0, cl, v, q, v2).is_nan()
+        );
+        assert!(crate::pk::three_compartment::three_cpt_iv_peripherals(
+            &bolus, 1.0, cl, v, q, v2, q3, v3
+        )
+        .iter()
+        .all(|x| x.is_nan()));
+    }
+}
+
 /// The transit / inverse-Gaussian closed forms keep their own convention: a `NaN` `CL` or
 /// `V` on a static subject is still served 0 there, as their kernels and their IOV /
 /// time-varying absorption walk (`WalkDomain::Invalid`) both do — #2104's `NaN` override is

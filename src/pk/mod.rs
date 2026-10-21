@@ -299,6 +299,19 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
     // `!(x > 0 && finite)` is true for a `NaN` too — which `cl_or_v_degenerate`, the
     // engines' rule, deliberately is not.
     let valid = |x: f64| x > 0.0 && x.is_finite();
+    // The reader stores an EVID=4 row twice — in `doses` and in `reset_times` — under one
+    // row's covariates and occasion, so its reset snapshot is a dose snapshot at the same
+    // time with the same CL and V. Counting it again would report one data record as two.
+    // Matching on the values too (bitwise, so a `NaN` matches itself) keeps a *separate*
+    // EVID=3 row co-timed with a dose whose own covariates differ.
+    let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
+    let evid4_twin = |t: f64, r: &PkParams| {
+        subject
+            .doses
+            .iter()
+            .zip(&params.dose)
+            .any(|(d, p)| d.time == t && same(p.cl(), r.cl()) && same(p.v(), r.v()))
+    };
     let mut records: Vec<(f64, bool)> = subject
         .doses
         .iter()
@@ -306,7 +319,14 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
         .zip(&params.dose)
         .chain(subject.obs_times.iter().copied().zip(&params.obs))
         .chain(subject.pk_only_times.iter().copied().zip(&params.pk_only))
-        .chain(subject.reset_times.iter().copied().zip(&params.reset))
+        .chain(
+            subject
+                .reset_times
+                .iter()
+                .copied()
+                .zip(&params.reset)
+                .filter(|&(t, p)| !evid4_twin(t, p)),
+        )
         .filter(|(_, p)| !(valid(p.cl()) && valid(p.v())))
         .map(|(t, p)| {
             let nan = !crate::sens::propagate::cl_or_v_degenerate(p.cl(), p.v());

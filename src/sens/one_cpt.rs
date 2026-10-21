@@ -24,8 +24,13 @@ pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v: T) -> T {
 /// its parameter sensitivity through the impulse. The single-dose path passes a
 /// constant `amt` via [`one_cpt_iv_bolus_g`]; the only formula lives here.
 pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val()) {
+    if t.val() < 0.0 {
         return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
     }
     let k = cl / v;
     (amt / v) * (-(k * t)).exp()
@@ -39,10 +44,15 @@ pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) ->
 /// As [`one_cpt_oral_g`] but with a generic amount `amt` (issue #524). The
 /// initial-condition path passes `A₀` as a dual with `F = 1`.
 pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0
-        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val())
-        || ka.val() <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
+    }
+    if ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
@@ -130,8 +140,13 @@ pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_b
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
 pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val()) {
+    if t.val() < 0.0 {
         return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
     }
     if dur <= 0.0 {
         return one_cpt_iv_bolus_g(amt, t, cl, v);
@@ -160,10 +175,15 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
 /// `∂/∂dur` jet is exact on whichever side is selected; real observation times
 /// essentially never land exactly on `dur`.
 pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T {
-    if t.val() < 0.0
-        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val())
-        || dur.val() <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
+    }
+    if dur.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
@@ -179,7 +199,15 @@ pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio
 
 /// 1-cpt IV bolus at steady state (interval `ii`).
 pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> T {
-    if t.val() < 0.0 || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val()) || ii <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
+    }
+    if ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
@@ -192,11 +220,15 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
 
 /// 1-cpt oral at steady state (interval `ii`), with the `KA ≈ k` L'Hôpital limit.
 pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0
-        || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val())
-        || ka.val() <= 0.0
-        || ii <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
+    }
+    if ka.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
@@ -233,7 +265,15 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     cl: T,
     v: T,
 ) -> T {
-    if t.val() < 0.0 || crate::sens::propagate::cl_or_v_degenerate(cl.val(), v.val()) || ii <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+        return T::from_f64(c);
+    }
+    if ii <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
