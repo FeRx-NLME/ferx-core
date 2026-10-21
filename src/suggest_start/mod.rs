@@ -1624,6 +1624,13 @@ mod tests {
         // carry they retired `CL`'s owner, and with `TVCL` in the fixture layer 2
         // answered `TVCL` instead of `TVOLD`, the θ `CL` still reads. Paired with an
         // η-reading self-rewrite, whose value carries a second η and must retire.
+        //
+        // Review r4: the carry is decided by substituting the previous value and
+        // re-running the mu-reference classifier, not by a "reads itself, no η" rule
+        // — so a rewrite that changes the algebra retires the owner exactly as its
+        // one-line equivalent is rejected. `CL = 1.0 / CL` would otherwise route a
+        // clearance `c` onto `TVOLD` and give a typical clearance `1/c`; and
+        // `CL = CL * FACTOR` has two θ anchors.
         for (label, line, want) in [
             ("identity", "  CL = CL\n", Some(("ETA_OLD", "TVOLD"))),
             (
@@ -1631,10 +1638,25 @@ mod tests {
                 "  CL = CL * (WT/70)^0.75\n",
                 Some(("ETA_OLD", "TVOLD")),
             ),
+            (
+                "chained rescales",
+                "  CL = CL * 2.0\n  CL = CL * (WT/70)^0.75\n",
+                Some(("ETA_OLD", "TVOLD")),
+            ),
             ("adds an eta", "  CL = CL * exp(IIV_CL)\n", None),
             ("reads another owner", "  CL = CL * V\n", None),
+            ("reciprocal", "  CL = 1.0 / CL\n", None),
+            ("second theta anchor", "  CL = CL * FACTOR\n", None),
         ] {
             let src = model(line).replace("  V = TVV * exp(ETA_V)\n", "");
+            let src = if line.contains("FACTOR") {
+                src.replace(
+                    "  theta TVV(",
+                    "  theta FACTOR(1.0, 0.1, 10.0)\n  theta TVV(",
+                )
+            } else {
+                src
+            };
             // `CL = CL * V` needs V declared above it.
             let src = src.replace(
                 "  CL = TVOLD * exp(ETA_OLD)\n",

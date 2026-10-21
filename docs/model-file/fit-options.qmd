@@ -347,9 +347,11 @@ matched the mu-reference by η **name** (`<PARAM>` or `…_<PARAM>`), which miss
 `IIV_CL` on another parameter — picked one in hash order, so start values could
 differ between runs of the same model on the same data (#1930). A reassigned
 parameter is read from its **last** assignment, as the model itself reads it. A
-rewrite of the parameter's own value that adds no η — `CL = CL` or
-`CL = CL * (WT/70)^0.75` — keeps the earlier assignment's θ; any other
-reassignment, or one inside an `if`, falls back to the name search below. An
+rewrite of the parameter's own value keeps the earlier assignment's θ when,
+with that value substituted in, it is still a mu-reference with one θ and one η —
+`CL = CL` or `CL = CL * (WT/70)^0.75` does, `CL = 1.0 / CL`, `CL = CL * FACTOR`
+(a second θ) and `CL = CL * exp(IIV_CL)` (a second η) do not. Those, any other
+reassignment, and one inside an `if` fall back to the name search below. An
 η read by two parameters still routes each to its own θ, but the CL η's variance is
 then left at the model default, since it is not clearance's alone.
 
