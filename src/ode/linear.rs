@@ -61,11 +61,27 @@ const THETA13: f64 = 5.371_920_351_148_152;
 const MAX_SQUARINGS: u32 = 64;
 
 /// Row-major `n×n` product `x·y`.
+///
+/// A factor that is a **structural** zero — value 0 and no derivative at all, no jet and no
+/// tape node (`structural_zero`) — is skipped: its products add exactly 0 to every
+/// component, so the result is bit-identical (up to the sign of a zero). A PK generator is
+/// mostly such zeros (a transit chain is bidiagonal, its powers stay near-triangular), and in
+/// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
+/// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+    use crate::sens::linsolve::{all_finite, structural_zero};
+    // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
+    // products to be exactly `±0` (`all_finite`).
+    let row_finite: Vec<bool> = (0..n)
+        .map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v)))
+        .collect();
     let mut out = vec![T::from_f64(0.0); n * n];
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
+            if row_finite[k] && structural_zero(xik) {
+                continue;
+            }
             for j in 0..n {
                 out[i * n + j] = out[i * n + j] + xik * y[k * n + j];
             }
@@ -277,6 +293,13 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             let mut jet_scale = b[i].jet_max_abs();
             for j in 0..n {
                 let (aij, xj) = (a[i * n + j], x[j]);
+                // A structural zero against a finite state adds exactly 0 to the sum and to
+                // both scales (the same skip, and the same guard, as the propagation).
+                if crate::sens::linsolve::structural_zero(aij)
+                    && crate::sens::linsolve::all_finite(xj)
+                {
+                    continue;
+                }
                 assembled = assembled + aij * xj;
                 scale += (aij.val() * xj.val()).abs();
                 jet_scale += aij.jet_max_abs() * xj.val().abs()
@@ -348,9 +371,15 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             };
             let e = &cache[idx].1;
             let mut next = vec![zero; n];
+            // `x` is finite here: `u0` passed the magnitude check, and every propagated state
+            // passed `reproduces`, which declines a non-finite one
+            // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
             for i in 0..n {
                 let mut acc = e[i * m + n] * c;
                 for j in 0..n {
+                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                        continue;
+                    }
                     acc = acc + e[i * m + j] * x[j];
                 }
                 next[i] = acc;

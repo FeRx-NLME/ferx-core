@@ -281,7 +281,7 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 - **converged**: whether the run reached a solution of the problem posed. It is
   never `true` at an objective that is not a usable number — `NaN`, infinite, or
-  the clamped divergence sentinel all report `converged: false` with a
+  past the `1e14` divergence cutoff all report `converged: false` with a
   `W_NONFINITE_OBJECTIVE` warning saying which. See [A non-finite
   objective](warnings.qmd#non-finite-objective).
 - **final_gradient_max_abs** / **final_gradient_source**: |g|∞, the largest

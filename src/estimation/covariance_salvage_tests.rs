@@ -11,6 +11,9 @@
 //! Also here (#2048): an ODE model past the forward provider's old 24-axis `θ + η` cap keeps
 //! the analytic outer route and assembles the analytic R-matrix for every subject, measured
 //! by the FD objectives the step evaluates.
+//!
+//! And (#1933): no `[scaling]` form declines the R-matrix on either engine, and every
+//! remediable decline clause is checked by applying its remedy.
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
@@ -1385,4 +1388,158 @@ fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
         AnalyticCovAssembly::Full(_) => panic!("expected Partial, got Full"),
         AnalyticCovAssembly::Unavailable => panic!("expected Partial, got Unavailable"),
     }
+}
+
+/// #1933: the warning once told a closed-form `obs_scale` user that rewriting it as
+/// `[scaling] y = central / V` "moves the fit onto the analytic route", and on a `pk`
+/// model the rewrite only traded the scaling clause for an analytic-readout one. Since
+/// #2093 no `[scaling]` form declines the R-matrix on either engine, so the regression to
+/// catch is a scaling- or readout-keyed clause coming back on one engine only. Every form
+/// the issue tabulated, on both engines in one test, and each fixture checked to carry the
+/// representation it is named for, so a parse that dropped `[scaling]` cannot pass as the
+/// unscaled control.
+#[test]
+fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
+    use crate::types::{FitOptions, Population, ScalingSpec, Subject};
+    let population = Population {
+        subjects: vec![Subject::default()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options = FitOptions::default();
+    // `examples/warfarin_iov.ferx`, the issue's closed-form fixture (κ on CL).
+    let closed = |scaling: &str| {
+        crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n\
+             omega ETA_KA ~ 0.3\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n\
+             V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n{scaling}"
+        ))
+        .unwrap()
+    };
+    // `examples/one_cpt_iv_ode.ferx`, the issue's `[odes]` control.
+    let ode = |obs_cmt: &str, scaling: &str| {
+        crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+             [structural_model]\n  ode({obs_cmt}states=[central])\n\
+             [odes]\n  d/dt(central) = -(CL/V) * central\n\
+             [scaling]\n{scaling}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        ))
+        .unwrap()
+    };
+
+    let none = closed("");
+    assert!(matches!(none.scaling, ScalingSpec::None) && none.analytic_readout.is_none());
+    let mut cases = vec![("pk, no [scaling]", none)];
+    for (label, body) in [
+        ("pk, obs_scale = 1.0", "  obs_scale = 1.0"),
+        ("pk, obs_scale = 0.5", "  obs_scale = 0.5"),
+        ("pk, obs_scale = V", "  obs_scale = V"),
+        ("pk, obs_scale = 1000 / V", "  obs_scale = 1000 / V"),
+    ] {
+        let m = closed(&format!("[scaling]\n{body}\n"));
+        assert!(!matches!(m.scaling, ScalingSpec::None), "{label}");
+        cases.push((label, m));
+    }
+    for (label, body) in [
+        ("pk, y = central / V", "  y = central / V"),
+        ("pk, y = central / V * 2", "  y = central / V * 2"),
+    ] {
+        let m = closed(&format!("[scaling]\n{body}\n"));
+        assert!(
+            m.analytic_readout.is_some(),
+            "{label}: Form-C on a pk model"
+        );
+        cases.push((label, m));
+    }
+    let ode_y = ode("", "  y = central / V");
+    assert!(matches!(
+        ode_y.ode_spec.as_ref().unwrap().readout,
+        crate::ode::predictions::OdeReadout::Single(_)
+    ));
+    assert!(ode_y.analytic_readout.is_none());
+    cases.push(("odes, y = central / V", ode_y));
+    let ode_os = ode("obs_cmt=central, ", "  obs_scale = V");
+    assert!(!matches!(ode_os.scaling, ScalingSpec::None));
+    cases.push(("odes, obs_scale = V", ode_os));
+
+    for (label, model) in &cases {
+        assert_eq!(
+            super::analytic_cov_scope_declines(model, &population, &options, false),
+            Vec::new(),
+            "{label}"
+        );
+        assert!(
+            super::analytic_r_expected(model, &population, &options, false),
+            "{label}"
+        );
+    }
+}
+
+/// #1933 proposed fix (2), in its general form: a remedy is checked by **applying** it,
+/// not by reading it. For every clause whose `remedy()` is `Some`, a model that hits only
+/// that clause declines with exactly it, and performing the action leaves the walk empty —
+/// so a remedy whose action introduces a clause of its own (the closed-form `obs_scale` →
+/// `y = …` rewrite trading one decline for another) reddens here. A new remediable clause
+/// without an arm below fails the `unreachable!`.
+#[test]
+fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    use crate::types::{FitOptions, GradientMethod, Population, Subject};
+    let population = Population {
+        subjects: vec![Subject::default()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let base = || {
+        crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
+             pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .unwrap()
+    };
+    let mut remediable = 0;
+    for decline in CovScopeDecline::ALL {
+        if decline.remedy().is_none() {
+            continue;
+        }
+        remediable += 1;
+        let mut model = base();
+        let mut options = FitOptions::default();
+        match decline {
+            CovScopeDecline::Disabled => options.analytic_cov_hessian = false,
+            CovScopeDecline::GradientFd => model.gradient_method = GradientMethod::Fd,
+            other => unreachable!("{other:?} has a remedy but no fixture applying it"),
+        }
+        assert_eq!(
+            super::analytic_cov_scope_declines(&model, &population, &options, false),
+            vec![decline],
+            "{decline:?}: the fixture hits only its own clause"
+        );
+        match decline {
+            CovScopeDecline::Disabled => options.analytic_cov_hessian = true,
+            CovScopeDecline::GradientFd => model.gradient_method = GradientMethod::Auto,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            super::analytic_cov_scope_declines(&model, &population, &options, false),
+            Vec::new(),
+            "{decline:?}: {} must clear the walk",
+            decline.remedy().unwrap()
+        );
+    }
+    assert_eq!(remediable, 2, "a remediable clause was added or lost");
 }
