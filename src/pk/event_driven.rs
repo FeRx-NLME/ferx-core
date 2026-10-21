@@ -901,6 +901,8 @@ fn event_driven_predictions_with_schedule_impl(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
+    // Whether a dose has arrived since the last reset — `observe_central_g`'s `dosed`.
+    let mut dosed = false;
     // Most-recent system-reset time. Infusions recorded before this are no
     // longer active, even a lagged one whose window opens after it (#1587): a
     // reset turns off ongoing and pending infusions, the same way it zeros the
@@ -949,6 +951,7 @@ fn event_driven_predictions_with_schedule_impl(
             state.iter_mut().for_each(|s| *s = 0.0);
             cur_t = ev.time;
             reset_floor = ev.time;
+            dosed = false;
             continue;
         }
 
@@ -1034,6 +1037,7 @@ fn event_driven_predictions_with_schedule_impl(
                 {
                     continue;
                 }
+                dosed = true;
                 // Dose *attributes* belong to the dose row, so they read that
                 // row's own snapshot and never `pk_now`, which after #1073 is the
                 // next record's. Before the split the two were the same object.
@@ -1102,6 +1106,7 @@ fn event_driven_predictions_with_schedule_impl(
                     central_slot,
                     pk_now.cl(),
                     pk_now.v(),
+                    dosed,
                 );
             }
             EventKind::PkOnly => {
@@ -2586,20 +2591,26 @@ mod tests {
     /// with no elimination (`AMT / V` = 6.25 on every IV row, where superposition served 0),
     /// and neither engine caught `+inf`, where the walk formed `0 / 0`.
     ///
-    /// Two dosing histories: one dose (an observation sits on its arrival, where no time has
-    /// elapsed and the walk reads the dose itself), and two doses, so the second lands on
-    /// residual drug. A `NaN` `CL` / `V` is in the table too: both engines must keep it (#2039).
+    /// Three dosing histories: one bolus (an observation sits on its arrival, where no time
+    /// has elapsed and the walk reads the dose itself), two boluses, so the second lands on
+    /// residual drug, and two infusions (an observation on an infusion's start, where the
+    /// state is still empty but superposition already sums the dose). A `NaN` `CL` / `V` is in the table too: both engines must keep it (#2039).
     ///
     /// Mutations (run): drop the degenerate check in `observe_central_g` → the `CL = 0` row
     /// at `t = 0` dies (6.25 served); drop its `NaN`-`CL` check → the `NaN` `CL` row at
-    /// `t = 0` dies; drop the `+inf` half of `cl_or_v_degenerate` → the `CL = +inf` rows die;
+    /// `t = 0` dies; drop its `dosed ||` → the infusion history's `NaN` `CL` row at `t = 1`
+    /// dies (0 served: the state is still empty); drop its `v.is_nan()` half → the
+    /// infusion history's `V = NaN` row at `t = 0`, before any dose, dies (`NaN` served
+    /// where superposition has nothing to sum); drop the `NaN` early return in
+    /// `single_dose_concentration` → the 2-cpt infusion `CL = NaN` row at `t = 1` dies (its
+    /// closed form returns 0 there); drop the `+inf` half of `cl_or_v_degenerate` → the `CL = +inf` rows die;
     /// drop the early return in `single_dose_concentration` → the `CL = +inf` rows die (`NaN`
     /// against 0). The propagation step's emptying is *not* observable here — with constant
     /// parameters every later observation's own degenerate `CL` reads 0 anyway — so it is
     /// pinned by the time-varying test below.
     #[test]
     fn the_walk_and_superposition_agree_on_a_degenerate_clearance_or_volume() {
-        let histories: [(&str, Vec<DoseEvent>, Vec<f64>); 2] = [
+        let histories: [(&str, Vec<DoseEvent>, Vec<f64>); 3] = [
             (
                 "one dose",
                 vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)],
@@ -2612,6 +2623,21 @@ mod tests {
                     DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
                 ],
                 vec![0.0, 1.0, 10.0, 12.0, 13.0, 24.0],
+            ),
+            (
+                // Zero-order infusions (5 h): an observation before the first one (no
+                // dose to sum: 0 even under a `NaN`), one on an infusion's start (an
+                // arrived dose with nothing yet in the state), mid-window ones, and a
+                // second infusion landing on residual drug. Into central:
+                // compartment 1 here, remapped to 2 on the oral models below, where a
+                // compartment-1 infusion would feed the walk's depot but superposition's
+                // central (it routes every infusion to central).
+                "two infusions",
+                vec![
+                    DoseEvent::new(1.0, 500.0, 1, 100.0, false, 0.0),
+                    DoseEvent::new(13.0, 500.0, 1, 100.0, false, 0.0),
+                ],
+                vec![0.0, 1.0, 3.0, 11.0, 13.0, 15.0, 25.0],
             ),
         ];
         let cases: [(&str, usize, f64); 10] = [
@@ -2627,7 +2653,6 @@ mod tests {
             ("V=NaN", crate::types::PK_IDX_V, f64::NAN),
         ];
         for (history, doses, obs_times) in &histories {
-            let subj = make_subject(doses.clone(), obs_times.clone());
             for model in [
                 PkModel::OneCptIv,
                 PkModel::OneCptOral,
@@ -2636,6 +2661,18 @@ mod tests {
                 PkModel::ThreeCptIv,
                 PkModel::ThreeCptOral,
             ] {
+                let oral = matches!(
+                    model,
+                    PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+                );
+                let doses: Vec<DoseEvent> = doses
+                    .iter()
+                    .map(|d| {
+                        let cmt = if oral && d.rate > 0.0 { 2 } else { 1 };
+                        DoseEvent::new(d.time, d.amt, cmt, d.rate, d.ss, d.ii)
+                    })
+                    .collect();
+                let subj = make_subject(doses, obs_times.clone());
                 for (label, idx, val) in cases {
                     let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
                     pk.values[crate::types::PK_IDX_KA] = 1.2;
@@ -2679,7 +2716,7 @@ mod tests {
                     // drug after the first dose, or "both 0" would pass vacuously.
                     if label == "control" {
                         assert!(
-                            sup[1] > 0.1 && walk[1] > 0.1,
+                            sup[2] > 0.1 && walk[2] > 0.1,
                             "{history} {model:?}: control is inert ({walk:?})"
                         );
                     }

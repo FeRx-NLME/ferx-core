@@ -2251,14 +2251,20 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 }
 
 /// Build the human message + native structured entry for a closed-form fit whose final
-/// estimates put a non-positive or infinite `CL` or `V` on any record, or `None` (#2104).
+/// estimates put a non-positive or non-finite `CL` or `V` on any record, or `None` (#2104).
 ///
-/// Both closed-form engines serve such a record a concentration of 0 — superposition drops
-/// the dose, the event-driven walk empties every compartment over the interval the record
-/// governs — so the fit completes and scores those subjects against a confident, finite
-/// prediction. NONMEM would not have made it: PREDPP reports a non-positive PK parameter as
-/// a PRED error. Nothing else surfaces this, which is why it is a warning at fit end rather
-/// than silence. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
+/// The closed-form engines give such a record one of two outcomes, and the message states
+/// whichever occurred — the two sentences are gated on their own record counts:
+///
+/// - **non-positive or infinite** — served a concentration of 0 (superposition drops the
+///   dose, the event-driven walk empties every compartment over the interval the record
+///   governs), so the fit completes and scores the subject against a confident, finite
+///   prediction;
+/// - **`NaN`** (an invalid covariate expression, say) — served `NaN`, so the subject's
+///   likelihood is repelled through the sentinel rather than scored.
+///
+/// NONMEM would not have made either prediction: PREDPP reports a non-positive PK parameter
+/// as a PRED error. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
 /// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
 /// own fitted class.
 pub(crate) fn degenerate_cl_v_warning(
@@ -2270,7 +2276,7 @@ pub(crate) fn degenerate_cl_v_warning(
     mixest: Option<&[usize]>,
 ) -> Option<(String, WarningEntry)> {
     let no_kappas: Vec<DVector<f64>> = Vec::new();
-    let hits: Vec<(String, Vec<f64>)> = population
+    let hits: Vec<(String, Vec<(f64, bool)>)> = population
         .subjects
         .iter()
         .zip(eta_hats)
@@ -2280,7 +2286,7 @@ pub(crate) fn degenerate_cl_v_warning(
             let class = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
             let _mix = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
             let ks = kappas.get(si).unwrap_or(&no_kappas);
-            let times = crate::pk::degenerate_cl_v_record_times(
+            let records = crate::pk::invalid_cl_v_records(
                 model,
                 subject,
                 theta,
@@ -2290,26 +2296,43 @@ pub(crate) fn degenerate_cl_v_warning(
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
-            (!times.is_empty()).then(|| (subject.id.clone(), times))
+            (!records.is_empty()).then(|| (subject.id.clone(), records))
         })
         .collect();
-    let (first_id, first_times) = hits.first()?;
-    let n_records: usize = hits.iter().map(|(_, t)| t.len()).sum();
+    let (first_id, first_records) = hits.first()?;
+    let all = || hits.iter().flat_map(|(_, r)| r.iter());
+    let n_records = all().count();
+    let n_nan = all().filter(|&&(_, nan)| nan).count();
+    let n_zero = n_records - n_nan;
     let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
-    let msg = format!(
-        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or infinite CL or V on {} \
-         record(s) at the final estimates (first at TIME {} in subject {}). The closed-form PK \
-         engines serve a concentration of 0 there and drop any drug in the body over an \
-         interval such a record governs, so these subjects were scored against predictions \
-         NONMEM would not make: PREDPP rejects a non-positive PK parameter as an error. Check \
-         the individual-parameter model — a linear covariate term such as \
-         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record — and prefer a \
-         form that keeps CL and V positive, such as an exponential or power model.",
+    let mut msg = format!(
+        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or non-finite CL or V on {} \
+         record(s) at the final estimates (first at TIME {} in subject {}).",
         hits.len(),
         ids.join(", "),
         n_records,
-        first_times[0],
+        first_records[0].0,
         first_id,
+    );
+    if n_zero > 0 {
+        msg.push_str(&format!(
+            " On {n_zero} of them CL or V is non-positive or infinite: the closed-form PK \
+             engines serve a concentration of 0 there and drop any drug in the body over an \
+             interval such a record governs, so the fit scored a confident, finite prediction."
+        ));
+    }
+    if n_nan > 0 {
+        msg.push_str(&format!(
+            " On {n_nan} of them CL or V is NaN: the prediction there is NaN, so that \
+             subject's likelihood was repelled rather than scored."
+        ));
+    }
+    msg.push_str(
+        " NONMEM would refuse these records: PREDPP rejects a non-positive PK parameter as an \
+         error. Check the individual-parameter model — a linear covariate term such as \
+         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record, and a covariate \
+         value the expression cannot use gives NaN — and prefer a form that keeps CL and V \
+         positive, such as an exponential or power model.",
     );
     let entry = warning_entry(
         WarningCode::DegenerateClearanceOrVolume,
@@ -2317,9 +2340,15 @@ pub(crate) fn degenerate_cl_v_warning(
         Some(serde_json::json!({
             "model": model.pk_model.canonical_name(),
             "n_records": n_records,
+            "n_zero_records": n_zero,
+            "n_nan_records": n_nan,
             "subjects": hits
                 .iter()
-                .map(|(id, times)| serde_json::json!({ "id": id, "times": times }))
+                .map(|(id, records)| serde_json::json!({
+                    "id": id,
+                    "times": records.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    "nan_times": records.iter().filter(|r| r.1).map(|r| r.0).collect::<Vec<_>>(),
+                }))
                 .collect::<Vec<_>>(),
         })),
     );

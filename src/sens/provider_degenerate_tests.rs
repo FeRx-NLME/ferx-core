@@ -51,14 +51,19 @@ fn model_for(pk_model: PkModel) -> CompiledModel {
     model
 }
 
-fn subject() -> Subject {
+fn subject(first_rate: f64) -> Subject {
     let obs_times = vec![0.0, 1.0, 10.0, 12.0, 13.0, 24.0];
     let n = obs_times.len();
     Subject {
         obs_rgroup: Vec::new(),
         id: "1".into(),
+        // First (IV models) a 5 h infusion observed at its start, `t = 0`, with nothing
+        // else arrived — the 2-cpt closed form's own arithmetic returns 0 there under a
+        // `NaN` CL while the value path's explicit rule says `NaN` — then a bolus on the
+        // residual. An oral model takes a bolus first instead: a central infusion on it is
+        // outside this recording's scope.
         doses: vec![
-            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 500.0, 1, first_rate, false, 0.0),
             DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
         ],
         obs_times,
@@ -93,10 +98,10 @@ fn subject() -> Subject {
 /// `CL = +inf` rows die (first at `OneCptIv`, `t = 0`: the kernels' `≤ 0` guards let it
 /// through and the recording is `NaN` where the prediction is 0). The matching skip in
 /// `with_disposition` is not observable — with the arm in place the disposition is never
-/// read — and only keeps `NaN` macro rates from being built.
+/// read — and only keeps `NaN` macro rates from being built. Drop the `NaN` arm after it →
+/// the `TwoCptIv` `CL = NaN` row at the infusion's start (`t = 0`) dies.
 #[test]
 fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume() {
-    let subj = subject();
     let cases: [(&str, usize, f64); 8] = [
         ("control", PK_IDX_CL, 5.0),
         ("CL=0", PK_IDX_CL, 0.0),
@@ -116,6 +121,11 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
         PkModel::ThreeCptOral,
     ] {
         let model = model_for(pk_model);
+        let oral = matches!(
+            pk_model,
+            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+        );
+        let subj = subject(if oral { 0.0 } else { 100.0 });
         for (label, idx, val) in cases {
             let mut pk = crate::types::PkParams::default();
             pk.values[PK_IDX_CL] = 5.0;

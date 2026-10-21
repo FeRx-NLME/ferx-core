@@ -238,22 +238,25 @@ pub(crate) fn absorption_flip_flop_at(
     }
 }
 
-/// The times of `subject`'s dose, observation and EVID=2 records whose `CL` or `V`, at
-/// `(theta, eta_bsv, kappas)`, is degenerate in the sense of
-/// [`crate::sens::propagate::cl_or_v_degenerate`] — non-positive or `+inf` — in record
-/// order (#2104). Empty for a model that is not one of the six 1-/2-/3-cpt IV / oral
-/// closed forms, the only models whose engines that rule governs.
+/// `subject`'s dose, observation and EVID=2 records whose `CL` or `V`, at
+/// `(theta, eta_bsv, kappas)`, is non-positive or non-finite, as `(time, served_nan)` in
+/// time order (#2104). `served_nan` tells the two outcomes the closed-form engines give
+/// such a record apart: `false` where the parameters are degenerate in the sense of
+/// [`crate::sens::propagate::cl_or_v_degenerate`] (non-positive or `+inf`; the record is
+/// served 0), `true` where they are not but one is `NaN` (served `NaN`). Empty for a model
+/// that is not one of the six 1-/2-/3-cpt IV / oral closed forms, the only models whose
+/// engines that rule governs.
 ///
 /// Each record is evaluated the way the prediction evaluates it: its own covariate
 /// snapshot and `TIME`, and on an IOV model its own occasion's κ (the same occasion map
 /// `predict_iov` uses). `kappas` is ignored when `model.n_kappa == 0`.
-pub(crate) fn degenerate_cl_v_record_times<K: AsRef<[f64]>>(
+pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta_bsv: &[f64],
     kappas: &[K],
-) -> Vec<f64> {
+) -> Vec<(f64, bool)> {
     let closed_form = matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -284,19 +287,24 @@ pub(crate) fn degenerate_cl_v_record_times<K: AsRef<[f64]>>(
     } else {
         compute_event_pk_params(model, subject, theta, eta_bsv)
     };
-    let bad = |p: &PkParams| crate::sens::propagate::cl_or_v_degenerate(p.cl(), p.v());
-    let mut times: Vec<f64> = subject
+    // `!(x > 0 && finite)` is true for a `NaN` too — which `cl_or_v_degenerate`, the
+    // engines' rule, deliberately is not.
+    let valid = |x: f64| x > 0.0 && x.is_finite();
+    let mut records: Vec<(f64, bool)> = subject
         .doses
         .iter()
         .map(|d| d.time)
         .zip(&params.dose)
         .chain(subject.obs_times.iter().copied().zip(&params.obs))
         .chain(subject.pk_only_times.iter().copied().zip(&params.pk_only))
-        .filter(|(_, p)| bad(p))
-        .map(|(t, _)| t)
+        .filter(|(_, p)| !(valid(p.cl()) && valid(p.v())))
+        .map(|(t, p)| {
+            let served_nan = !crate::sens::propagate::cl_or_v_degenerate(p.cl(), p.v());
+            (t, served_nan)
+        })
         .collect();
-    times.sort_by(f64::total_cmp);
-    times
+    records.sort_by(|a, b| a.0.total_cmp(&b.0));
+    records
 }
 
 /// The model to evaluate this subject with at `(theta, eta)`: the structural
@@ -2070,6 +2078,13 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     if crate::sens::propagate::cl_or_v_degenerate(cl, v) {
         return 0.0;
     }
+    // A `NaN` `CL` or `V` makes an arrived dose `NaN`, stated here rather than left to each
+    // closed form's arithmetic: at the start of an infusion (`τ = 0`) the 1-cpt form came
+    // out `NaN` and the 2-cpt one 0. The event-driven walk's readout applies the same rule
+    // (`observe_central_g`'s `dosed`), so the engines agree there too (#2104).
+    if cl.is_nan() || v.is_nan() {
+        return f64::NAN;
+    }
     let infusion = dose.is_infusion();
     let f_scale = route_f_scale(pk_model, infusion, p);
 
@@ -2267,6 +2282,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     // The state twin of `single_dose_concentration`'s degenerate-parameter rule (#2104).
     if crate::sens::propagate::cl_or_v_degenerate(cl, v) {
         return vec![0.0; pk_model.topology().n_states];
+    }
+    if cl.is_nan() || v.is_nan() {
+        return vec![f64::NAN; pk_model.topology().n_states];
     }
     let infusion = dose.is_infusion();
 

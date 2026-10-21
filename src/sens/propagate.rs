@@ -1441,27 +1441,42 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
 ///
 /// - A degenerate `CL` or `V` ([`cl_or_v_degenerate`]: non-positive or `+inf`) reads
 ///   0, as the superposition closed forms drop a dose with such parameters (#2104).
-/// - A `NaN` `V` or amount is kept. The walk used to test `v > 0.0`, which is false
-///   for a `NaN`, and floor with `f64::max`, which discards one, so a subject whose
-///   `CL` or `V` was `NaN` from some record on was served a prediction of 0 there and
-///   scored against it with a finite objective. Superposition keeps the `NaN` since
-///   #1399, and so does the ODE engine.
-/// - A `NaN` `CL` reads `NaN` once any compartment holds drug (#2104). Usually the
-///   propagation step has already turned the state `NaN`, but an observation that
-///   sits on a dose's arrival has no elapsed time behind it, so the state is the dose
-///   itself, finite. Superposition serves `NaN` there, since its closed form reads
-///   `exp(−ke·0)` with a `NaN` `ke`. Before any dose the state is all zeros and
-///   superposition has no dose to sum, so both serve 0.
+/// - A `NaN` amount is kept. The walk used to test `v > 0.0`, which is false for a
+///   `NaN`, and floor with `f64::max`, which discards one, so a subject whose `CL` or
+///   `V` was `NaN` from some record on was served a prediction of 0 there and scored
+///   against it with a finite objective. Superposition keeps the `NaN` since #1399, and
+///   so does the ODE engine.
+/// - A `NaN` `CL` or `V` reads `NaN` once a dose has arrived in the current reset segment
+///   (`dosed`) or any compartment holds drug (#2104). Usually the propagation step has
+///   already turned the state `NaN`, but an observation that sits on a dose's arrival
+///   has no elapsed time behind it: after a bolus the state is the dose itself, finite,
+///   and at the start of a zero-order infusion it is still all zeros, since an infusion
+///   makes no instantaneous jump. Superposition serves `NaN` at both, since every
+///   arrived dose contributes `NaN` (`pk::single_dose_concentration` says so explicitly,
+///   rather than leaving it to each closed form's arithmetic at `τ = 0`) — hence `dosed`,
+///   not the state alone. The state half covers an `SS=1` record seeded ahead of its
+///   lagged arrival, which superposition also sums. Before any dose, superposition has
+///   nothing to sum and both serve 0.
 /// - A negative concentration clamps to 0 and its derivatives vanish there, so the
 ///   dual path is consistent with the objective.
 #[inline]
-pub(crate) fn observe_central_g<T: PkNum>(read: &[T], central_slot: usize, cl: T, v: T) -> T {
+pub(crate) fn observe_central_g<T: PkNum>(
+    read: &[T],
+    central_slot: usize,
+    cl: T,
+    v: T,
+    dosed: bool,
+) -> T {
     if cl_or_v_degenerate(cl.val(), v.val()) {
         return T::from_f64(0.0);
     }
-    // `!= 0.0` is true for a `NaN` amount, which is then kept either way.
-    if cl.val().is_nan() && read.iter().any(|a| a.val() != 0.0) {
-        return T::from_f64(f64::NAN);
+    if cl.val().is_nan() || v.val().is_nan() {
+        // `!= 0.0` is true for a `NaN` amount, which is then kept either way.
+        return if dosed || read.iter().any(|a| a.val() != 0.0) {
+            T::from_f64(f64::NAN)
+        } else {
+            T::from_f64(0.0)
+        };
     }
     let conc = read[central_slot] / v;
     // `<` is false for a `NaN`, which therefore passes through.
@@ -1546,6 +1561,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let mut state = vec![T::from_f64(0.0); n_states];
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
+    // Whether a dose has arrived since the last reset — `observe_central_g`'s `dosed`.
+    let mut dosed = false;
 
     // Same resolution as the value walk, from the same shared helper: a record
     // governs itself, a non-record takes the next record ahead, and the trailing
@@ -1562,6 +1579,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
             state.iter_mut().for_each(|s| *s = T::from_f64(0.0));
             cur_t = ev.time;
             reset_floor = ev.time;
+            dosed = false;
             continue;
         }
         // The record terminating this interval — itself for a record, the next one
@@ -1616,6 +1634,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 {
                     continue;
                 }
+                dosed = true;
                 // Dose attributes belong to the dose row, so `F` and the SS
                 // equilibration read that row's snapshot — never `pk_now`, which
                 // after #1073 is the next record's (#1073).
@@ -1709,7 +1728,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     }
                     None => &state[..],
                 };
-                preds[ev.orig_idx] = observe_central_g(read, central_slot, pk_now.cl, pk_now.v);
+                preds[ev.orig_idx] =
+                    observe_central_g(read, central_slot, pk_now.cl, pk_now.v, dosed);
             }
             EventKind::PkOnly => {}
             EventKind::Reset => unreachable!("Reset handled before pk_for_g above"),
@@ -1912,7 +1932,7 @@ mod tests {
     /// clamped negative carries no derivative.
     #[test]
     fn observe_central_keeps_a_nan_and_floors_the_rest() {
-        let f = |amount: f64, v: f64| observe_central_g::<f64>(&[amount], 0, 5.0, v);
+        let f = |amount: f64, v: f64| observe_central_g::<f64>(&[amount], 0, 5.0, v, true);
         assert_eq!(f(50.0, 10.0), 5.0);
         assert!(f(50.0, f64::NAN).is_nan(), "a NaN volume is kept");
         assert!(f(f64::NAN, 10.0).is_nan(), "a NaN amount is kept");
@@ -1922,7 +1942,7 @@ mod tests {
         assert_eq!(f(-1.0, 10.0), 0.0, "a negative concentration clamps");
 
         // The clearance half (#2104). Slot 1 is central, slot 0 a depot.
-        let g = |read: &[f64], cl: f64| observe_central_g::<f64>(read, 1, cl, 10.0);
+        let g = |read: &[f64], cl: f64| observe_central_g::<f64>(read, 1, cl, 10.0, false);
         assert_eq!(g(&[0.0, 50.0], 0.0), 0.0, "a zero clearance reads 0");
         assert_eq!(g(&[0.0, 50.0], -1.0), 0.0, "a negative clearance reads 0");
         assert_eq!(
@@ -1940,14 +1960,18 @@ mod tests {
             0.0,
             "NaN CL before any dose reads 0"
         );
+        assert!(
+            observe_central_g::<f64>(&[0.0, 0.0], 1, f64::NAN, 10.0, true).is_nan(),
+            "NaN CL at an infusion's start: arrived, but nothing in the state yet"
+        );
         assert_eq!(
-            observe_central_g::<f64>(&[0.0, 50.0], 1, f64::NAN, -10.0),
+            observe_central_g::<f64>(&[0.0, 50.0], 1, f64::NAN, -10.0, true),
             0.0,
             "a degenerate V wins over a NaN CL, as superposition's early return does"
         );
 
         let d = |amount: Dual2<1>, v: Dual2<1>| {
-            observe_central_g::<Dual2<1>>(&[amount], 0, Dual2::constant(5.0), v)
+            observe_central_g::<Dual2<1>>(&[amount], 0, Dual2::constant(5.0), v, true)
         };
         assert!(d(Dual2::constant(50.0), Dual2::constant(f64::NAN))
             .value

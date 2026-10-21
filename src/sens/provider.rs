@@ -256,6 +256,9 @@ fn superpose_doses<T: PkNum>(
         // `with_disposition` declined to build is never asked for.
         let c = if d.cl_or_v_degenerate() {
             T::from_f64(0.0)
+        } else if d.cl_d.val().is_nan() || d.v1_d.val().is_nan() {
+            // The value path's explicit `NaN` for an arrived dose, on the same test.
+            T::from_f64(f64::NAN)
         } else if flags.transit {
             one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
         } else if flags.two_cpt_transit {

@@ -166,13 +166,23 @@ fn a_negative_clearance_names_the_subject_and_counts_its_records() {
     );
     assert!(msg.contains("on 4 record(s)"), "{msg}");
     assert!(msg.contains("first at TIME 0 in subject S2"), "{msg}");
-    // Sentence 2: what the engines served, and why NONMEM differs.
+    // Sentence 2, gated on non-positive / infinite records: what the engines served.
+    assert!(
+        msg.contains("On 4 of them CL or V is non-positive or infinite"),
+        "{msg}"
+    );
     assert!(msg.contains("serve a concentration of 0"), "{msg}");
+    // Its NaN twin is gated on NaN records, of which there are none here.
+    assert!(
+        !msg.contains("is NaN"),
+        "no NaN record, no NaN sentence: {msg}"
+    );
+    // Sentence 3: why NONMEM differs.
     assert!(
         msg.contains("PREDPP rejects a non-positive PK parameter"),
         "{msg}"
     );
-    // Sentence 3: the advice.
+    // Sentence 4: the advice.
     assert!(msg.contains("exponential or power model"), "{msg}");
     // The emitted text classifies to its own code, not the generic "degenerate" →
     // optimizer-health arm its wording would otherwise fall into.
@@ -182,6 +192,8 @@ fn a_negative_clearance_names_the_subject_and_counts_its_records() {
     );
     let details = entry.details.expect("native entry carries details");
     assert_eq!(details["n_records"], 4);
+    assert_eq!(details["n_zero_records"], 4);
+    assert_eq!(details["n_nan_records"], 0);
     assert_eq!(details["subjects"][0]["id"], "S2");
     assert_eq!(
         details["subjects"][0]["times"],
@@ -283,4 +295,70 @@ fn silent_when_in_range_or_not_a_closed_form() {
         None
     )
     .is_none());
+}
+
+/// A `NaN` CL — here from a covariate value the expression cannot use — is reported too,
+/// though the engines' degenerate rule deliberately excludes `NaN`: such a record is served
+/// `NaN`, not 0, and the message says so. Both sentence gates are asserted in one test with
+/// a mixed population, so forcing either branch reddens it: S1 is `NaN` on its TIME 1
+/// record only, S2 negative on every record.
+#[test]
+fn a_nan_clearance_warns_with_its_own_outcome() {
+    let model = parse(LINEAR_AGE_SRC);
+    let nan_only = population(vec![subject("S1", [40.0, f64::NAN, 40.0, 40.0])]);
+    let (msg, entry) = degenerate_cl_v_warning(
+        &model,
+        &nan_only,
+        &model.default_params.theta,
+        &etas(1, 0.0),
+        &[],
+        None,
+    )
+    .expect("a NaN CL must warn");
+    assert!(
+        msg.contains("non-positive or non-finite CL or V on 1 record(s)"),
+        "{msg}"
+    );
+    assert!(msg.contains("first at TIME 1 in subject S1"), "{msg}");
+    assert!(msg.contains("On 1 of them CL or V is NaN"), "{msg}");
+    assert!(msg.contains("repelled rather than scored"), "{msg}");
+    assert!(
+        !msg.contains("serve a concentration of 0"),
+        "a NaN record is not served 0: {msg}"
+    );
+    let details = entry.details.unwrap();
+    assert_eq!(details["n_nan_records"], 1);
+    assert_eq!(
+        details["subjects"][0]["nan_times"],
+        serde_json::json!([1.0])
+    );
+
+    let mixed = population(vec![
+        subject("S1", [40.0, f64::NAN, 40.0, 40.0]),
+        subject("S2", [200.0; 4]),
+    ]);
+    let (msg, entry) = degenerate_cl_v_warning(
+        &model,
+        &mixed,
+        &model.default_params.theta,
+        &etas(2, 0.0),
+        &[],
+        None,
+    )
+    .expect("a mixed population must warn");
+    assert!(msg.contains("2 subject(s) [S1, S2]"), "{msg}");
+    assert!(msg.contains("on 5 record(s)"), "{msg}");
+    assert!(
+        msg.contains("On 4 of them CL or V is non-positive or infinite"),
+        "{msg}"
+    );
+    assert!(msg.contains("On 1 of them CL or V is NaN"), "{msg}");
+    let details = entry.details.unwrap();
+    assert_eq!(
+        (
+            details["n_zero_records"].as_u64(),
+            details["n_nan_records"].as_u64()
+        ),
+        (Some(4), Some(1))
+    );
 }

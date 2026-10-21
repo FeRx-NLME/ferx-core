@@ -6892,11 +6892,11 @@ pub enum WarningCode {
     /// [`WarningCode::FlipFlop`]: the rows returned are a sample of a truncated parameter
     /// distribution, so intervals built from them are biased, not merely fewer.
     UncertaintyDrawsSkipped,
-    /// The final estimates put a non-positive or infinite `CL` or `V` on at least one record
-    /// of a closed-form (1-/2-/3-cpt IV / oral) model (`W_DEGENERATE_CL_V`, #2104). Both
-    /// closed-form engines serve such a record a concentration of 0 — the dose is dropped —
-    /// a prediction NONMEM would not make: PREDPP treats a non-positive PK parameter as an
-    /// error.
+    /// The final estimates put a non-positive or non-finite `CL` or `V` on at least one
+    /// record of a closed-form (1-/2-/3-cpt IV / oral) model (`W_DEGENERATE_CL_V`, #2104).
+    /// Both closed-form engines serve a non-positive or infinite value a concentration of 0
+    /// — the dose is dropped — and a `NaN` a `NaN`; NONMEM would refuse either record:
+    /// PREDPP treats a non-positive PK parameter as an error.
     DegenerateClearanceOrVolume,
     /// Unrecognised message — fallback bucket.
     General,
@@ -7042,7 +7042,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningCode::AbsorptionTwinDeclined,
         )
     } else if lower.contains("w_degenerate_cl_v") {
-        // #2104: a non-positive or infinite CL / V at the final estimates. A token arm ahead
+        // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
         // otherwise match.
         (
