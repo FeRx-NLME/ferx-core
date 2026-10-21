@@ -124,7 +124,7 @@ the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
 The covariance step inverts $S$ and $R$ in packed coordinates through an
 eigenvalue floor, `max(1e-10·λmax, 1e-12)`: under `covariance_method = s` a
 clipped eigenvalue refuses $S$ as rank-deficient, under `r` and `rsr` it is
-reported as a regularization. Log-θ, the Omega Cholesky entries, log-σ and the
+reported as a regularization. Log-θ, the log-Cholesky Omega diagonal, log-σ and the
 `block_sigma` correlations are dimensionless, but an identity-packed θ's row
 and column carry the θ's own units, so writing it in units $k$ times larger
 divides its diagonal entry by $k^2$. Before #2145 that alone could clip a
@@ -137,7 +137,15 @@ coordinate is left as it is, so a tiny diagonal there is still caught as a flat
 direction, and so is a θ with no information (a zero diagonal) or one collinear
 with another. The eigenvalues and the floor printed in a "Covariance step
 regularized" warning are those of the rescaled matrix, and they no longer move
-with a θ's units.
+with a θ's units. When every free coordinate is an identity-packed θ (Omega and
+Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a
+unit diagonal instead.
+
+One packed coordinate with units is **not** rescaled: an Omega Cholesky
+off-diagonal (`chol_<i>_<j>`) is identity-packed and carries the units of its
+η's. For η's on a log scale (`CL = TVCL·exp(ETA_CL)`) those are dimensionless,
+but a block Omega on additive η's in large or small units can still meet a
+floor that depends on those units.
 
 Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its
 FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at

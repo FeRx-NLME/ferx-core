@@ -2677,8 +2677,11 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 /// well-determined fit purely because of those units — under `covariance_method = s` that is a
 /// rejected `S`, under `r`/`rsr` an understated SE. So each flagged coordinate with a positive,
 /// finite diagonal is rescaled first, `C = D⁻¹ M D⁻¹` with `dᵢ = sqrt(Mᵢᵢ / g)`, `g` the
-/// largest **unflagged** positive diagonal entry (the largest flagged one when there is none),
-/// so its diagonal entry in `C` is `g` whatever its units. The floor is applied to `C`'s
+/// largest **unflagged** positive diagonal entry, so its diagonal entry in `C` is `g` whatever
+/// its units. With no usable unflagged entry (every free coordinate an identity-packed θ, e.g.
+/// Ω and σ FIX) `g = 1`, i.e. Jacobi scaling of the flagged block: any anchor read off a
+/// flagged diagonal would move with the units, and the absolute `1e-12` floor would clip on
+/// them again. The floor is applied to `C`'s
 /// spectrum and the result mapped back, `M⁻¹ = D⁻¹ C⁻¹ D⁻¹`.
 ///
 /// The largest rather than a mean: a mean is dragged down by exactly the flat dimensionless
@@ -2687,11 +2690,15 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 /// other coordinate is tested against, where the dimensionless block alone puts it (within the
 /// factor the off-diagonals allow).
 ///
-/// Every other coordinate keeps `dᵢ = 1`. Log-θ, Cholesky-Ω, log-σ and ρ are dimensionless, so
-/// there a tiny diagonal entry *is* a flat direction and the floor must keep seeing it — which
+/// Every other coordinate keeps `dᵢ = 1`. Log-θ, the log-Cholesky Ω diagonal, log-σ and ρ are
+/// dimensionless, so there a tiny diagonal entry *is* a flat direction and the floor must keep seeing it — which
 /// full Jacobi scaling of every coordinate would hide, since a diagonal matrix equilibrates to
 /// the identity. A flagged coordinate with a non-positive or non-finite diagonal also keeps
 /// `dᵢ = 1`: a parameter with no information is still clipped.
+///
+/// Not covered: an Ω Cholesky **off-diagonal** is identity-packed and carries the units of its
+/// η's (an additive η, say), so a block Ω on such η's can still meet a unit-dependent floor.
+/// Only θ's are flagged by the covariance step (`identity_theta_free_mask`).
 ///
 /// The returned `min_eigenvalue`, `max_eigenvalue` and `floor` are those of `C`, so the
 /// regularization warning built from them no longer moves with a θ's units either.
@@ -2733,13 +2740,11 @@ fn unit_coordinate_scales(sym: &DMatrix<f64>, unit_coords: &[bool]) -> Option<Ve
     if !(0..n).any(|i| unit_coords[i] && usable(i)) {
         return None;
     }
-    let largest = |flagged: bool| {
-        (0..n)
-            .filter(|&i| unit_coords[i] == flagged && usable(i))
-            .map(|i| sym[(i, i)])
-            .reduce(f64::max)
-    };
-    let g = largest(false).or_else(|| largest(true))?;
+    let g = (0..n)
+        .filter(|&i| !unit_coords[i] && usable(i))
+        .map(|i| sym[(i, i)])
+        .reduce(f64::max)
+        .unwrap_or(1.0);
     Some(
         (0..n)
             .map(|i| {
@@ -3506,6 +3511,39 @@ mod tests {
             inv.n_clipped, 1,
             "a flat dimensionless direction must stay clipped"
         );
+    }
+
+    /// Review of #2145: with **every** coordinate flagged (Ω and σ FIX, only identity-packed θ's
+    /// free) there is no dimensionless diagonal to anchor on. An anchor read off the flagged
+    /// diagonals moves with the units, and `[1e-14]` — `[1]` in units 1e7 larger — fell under
+    /// the absolute `1e-12` floor. The straddle: unscaled it is clipped, flagged it is not, and
+    /// the inverse is exact; a two-coordinate block in mixed units likewise.
+    #[test]
+    fn unit_free_floor_is_unit_free_when_every_coordinate_is_flagged() {
+        let one = DMatrix::from_element(1, 1, 1e-14);
+        assert_eq!(super::invert_psd_with_floor(&one).expect("PD").n_clipped, 1);
+        let inv = super::invert_psd_with_floor_unit_free(&one, &[true]).expect("PD");
+        assert_eq!(
+            inv.n_clipped, 0,
+            "an all-flagged θ in large units was clipped"
+        );
+        assert!(
+            ((inv.inverse[(0, 0)] - 1e14) / 1e14).abs() < 1e-14,
+            "{}",
+            inv.inverse[(0, 0)]
+        );
+
+        let m = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        for (k0, k1) in [(1e7, 1e-7), (1e8, 1e8)] {
+            let mk = rescale_coordinate(&rescale_coordinate(&m, 0, k0), 1, k1);
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = ({k0}, {k1}): clipped");
+            let want = rescale_coordinate(&rescale_coordinate(&m_inv, 0, 1.0 / k0), 1, 1.0 / k1);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            // Measured ≤ 4e-16 (macOS arm64).
+            assert!(gap < 1e-12, "k = ({k0}, {k1}): gap {gap}");
+        }
     }
 
     /// The mask the covariance step passes: identity-packed θ's (a negative lower bound) only,
