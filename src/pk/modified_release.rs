@@ -790,7 +790,7 @@ pub(crate) fn mr_scope<'a>(
 ///
 ///   - `spec`: [`spec_fingerprint`] — the `OdeSpec`'s structure, its compiled RHS and
 ///     readout programs, its input-rate forcings, and
-///     the raw and effective `solver_opts` the twin and `verify_tol` are derived from.
+///     the effective `solver_opts` the twin and `verify_tol` are derived from.
 ///   - `subject`: [`subject_fingerprint`] — the id **and** the dose and observation
 ///     schedule, so a single-dose verdict is never reused for a multi-dose regimen.
 ///   - `point`: [`param_bucket`] — a coarse bucket over the **whole** `pk.values`
@@ -867,9 +867,10 @@ fn spec_fingerprint(spec: &OdeSpec) -> u64 {
         v.to_bits().hash(&mut h);
     }
     format!("{:?}", spec.input_rate).hash(&mut h);
-    // Both the baked options and the fit-scoped effective ones (#1212): the twin
-    // integrates at the latter, and `verify_tol` is derived from them.
-    format!("{:?}", spec.solver_opts).hash(&mut h);
+    // The effective options (#1212) — what the twin integrates at and `verify_tol`
+    // is derived from. They are the baked field merged under any fit-scoped override,
+    // so an in-place `sync_ode_solver_opts` change still reaches the key, while a
+    // baked value the override replaces correctly does not.
     format!("{:?}", spec.effective_solver_opts()).hash(&mut h);
     match &spec.rhs_program {
         Some(prog) => {
