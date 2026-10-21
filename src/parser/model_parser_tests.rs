@@ -20716,6 +20716,103 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
     assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
 }
 
+/// #1927: an `else if` arm is governed by **every** condition up to and including
+/// its own — it fires only when the earlier ones were false. Here the earlier
+/// condition reads η, so `FAC` takes `WT / 70` only when `ETA_SW ≤ 0`, and must
+/// not fold to a cov-static constant even though its own condition (`WT > 70`)
+/// and body are covariate-only.
+const ELSE_IF_DYNAMIC_PRIOR_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_SW ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  FAC = 1.0
+  if (ETA_SW > 0) {
+    AUX = 1
+  } else if (WT > 70) {
+    FAC = WT / 70
+  }
+  CL = TVCL * FAC * exp(ETA_CL)
+  V1 = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// #1927: `Dual2` value and (θ, η) gradient of the `else if` fixture above must
+/// match the plain-`f64` evaluator and its central finite differences, on **both**
+/// sides of the η-governed first arm. Under the old per-arm rule `FAC` was
+/// classified cov-static and folded from a pass that runs at η = 0, so with
+/// `ETA_SW = 0.3` (first arm taken, `FAC = 1`) the dual walk carried the `else if`
+/// value `80/70` instead: `CL` and `∂CL/∂TVCL` were both off by that factor. With
+/// `ETA_SW = −0.3` both rules agree (the `else if` arm is the right one), which is
+/// the straddle: the negative side passes either way, so it pins that the fixture
+/// still exercises the arm rather than that the fix holds.
+#[test]
+fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
+    use crate::sens::dual2::Dual2;
+    let model = parse_model_string(ELSE_IF_DYNAMIC_PRIOR_MODEL).expect("model compiles");
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present");
+    let names = &model.indiv_param_names;
+    let fac = names.iter().position(|n| n == "FAC").expect("FAC slot");
+    let cl = names.iter().position(|n| n == "CL").expect("CL slot");
+    // `FAC` must not fold: which value it takes depends on `ETA_SW`.
+    assert!(
+        !prog.cov_static_mask.get(fac).copied().unwrap_or(false),
+        "FAC is governed by the η condition of the earlier arm; it must not be cov-static \
+         (mask = {:?}, names = {names:?})",
+        prog.cov_static_mask
+    );
+    // `CL` is read through the pk slot list.
+    let cl_row = prog
+        .pk_var_slots()
+        .iter()
+        .position(|&(_, vs)| vs == cl)
+        .expect("CL is a pk slot");
+
+    let cov: HashMap<String, f64> = [("WT".to_string(), 80.0)].into_iter().collect();
+    let theta = [5.0_f64];
+    let f64_cl = |th: &[f64], et: &[f64]| prog.eval_param_values(th, et, &cov, 0.0, &[])[cl];
+    for eta_sw in [0.3_f64, -0.3] {
+        let eta = [0.2_f64, eta_sw];
+        let th_d = [Dual2::<3>::var(theta[0], 0)];
+        let et_d = [Dual2::<3>::var(eta[0], 1), Dual2::<3>::var(eta[1], 2)];
+        let got = prog.eval_params_g::<Dual2<3>>(&th_d, &et_d, &cov)[cl_row];
+        let want = f64_cl(&theta, &eta);
+        assert!(want.is_finite() && got.value.is_finite());
+        assert_eq!(
+            got.value.to_bits(),
+            want.to_bits(),
+            "ETA_SW = {eta_sw}: dual CL value {} != f64 CL {want}",
+            got.value
+        );
+        // Central FD on each axis; `ETA_SW` is ±0.3 away from its jump, so a step
+        // of 1e-6 never crosses it and the FD derivative there is exactly 0.
+        let h = 1e-6;
+        let fd = [
+            (f64_cl(&[theta[0] + h], &eta) - f64_cl(&[theta[0] - h], &eta)) / (2.0 * h),
+            (f64_cl(&theta, &[eta[0] + h, eta[1]]) - f64_cl(&theta, &[eta[0] - h, eta[1]]))
+                / (2.0 * h),
+            (f64_cl(&theta, &[eta[0], eta[1] + h]) - f64_cl(&theta, &[eta[0], eta[1] - h]))
+                / (2.0 * h),
+        ];
+        for (k, (&g, &f)) in got.grad.iter().zip(fd.iter()).enumerate() {
+            assert!(g.is_finite() && f.is_finite());
+            assert!(
+                (g - f).abs() <= 1e-7 * (1.0 + f.abs()),
+                "ETA_SW = {eta_sw}: axis {k}: dual {g} vs FD {f}"
+            );
+        }
+    }
+}
+
 // ── [simulation] block key handling ──────────────────────────────────────
 fn sim_lines(body: &[&str]) -> Vec<String> {
     body.iter().map(|s| s.to_string()).collect()
