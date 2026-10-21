@@ -185,7 +185,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.38567292526295 since #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820222439373 since #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -207,7 +207,13 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // aarch64 and the x86_64 CI dispatch agree to every printed digit): the first outer
     // evaluation now warm-starts from the pre-flight EBEs, so the inner solves stop at a
     // slightly different point. The FOCEI literals above stayed inside `ESS_REL_TOL`.
-    assert_ess(f.sir_ess, 402.385_672_925_262_95, "FOCE packed");
+    // #2217 moved it by −9.1e-6 relative (402.38567292526295 → 402.3820222439373, Linux
+    // aarch64): the first outer evaluation now starts every occasion's κ at the pre-flight's
+    // κ̂ instead of 0, so its inner solves stop at a different point inside `inner_tol`, the
+    // outer path from there differs, and the fixed-seed SIR proposal is built from the
+    // covariance at a slightly different optimum. The FOCEI literals stayed inside
+    // `ESS_REL_TOL` again.
+    assert_ess(f.sir_ess, 402.382_022_243_937_3, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
