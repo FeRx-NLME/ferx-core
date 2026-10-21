@@ -1389,9 +1389,10 @@ fn run_sir_in_box(
 ///   the fit's own through `fit_inputs::scoring_options` — so a Laplace fit is scored
 ///   with its Laplace marginal, not the FOCEI one.
 ///
-/// At the estimates this equals the fit's data OFV (bit for bit on FOCEI, Laplace and
-/// mixture fits, to 4e-10 on FOCE's frozen-variance re-solve; pinned by
-/// `sir_draw_ofv_at_the_estimate_is_the_fits_objective`) — when the last stage
+/// At the estimates this equals the fit's data OFV bit for bit on FOCE, FOCEI, Laplace
+/// and mixture fits (pinned by `sir_draw_ofv_at_the_estimate_is_the_fits_objective`):
+/// the warm re-solve runs under the fit's own inner Hessian seed, so the fit's η̂ is its
+/// fixed point (#2279) — when the last stage
 /// estimates. After an evaluation-only last stage (`agq_eval_only`, `imp_eval_only`)
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
@@ -1408,6 +1409,22 @@ pub(crate) fn sir_draw_ofv(
         return crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
             .ofv;
     }
+    let (ehs, hms, kappas) = sir_draw_ebes(model, population, params, eta_hats, options);
+    // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
+    // marginal it was actually optimised against, not the FOCE one.
+    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+}
+
+/// The EBEs [`sir_draw_ofv`] scores a non-mixture draw at: re-solved warm from the fit's
+/// `eta_hats` under the fit's own stage `options` and inner Hessian seed. At the fit's
+/// estimates the fit's η̂ is a fixed point of this solve (#2279).
+pub(crate) fn sir_draw_ebes(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
         model,
@@ -1419,14 +1436,17 @@ pub(crate) fn sir_draw_ofv(
         Some(&mu_k),
         0, // SIR: no EBE convergence tracking
         0, // SIR: warm-started; no inner multi-start
-        InnerHessianSeed::None,
+        // The fit's own seed (#2279), as its final inner pass and every warm outer
+        // evaluation use. Unseeded, BFGS standing on the fit's η̂ failed its line search on
+        // warfarin and the Nelder–Mead fallback moved η̂ (3.9e-14 on FOCE, 6.9e-18 on
+        // Laplace, macOS arm64) — the gap a 12-ULP Laplace objective on glibc 2.28 and
+        // FOCE's 5.7e-13 everywhere came from.
+        InnerHessianSeed::for_options(options),
         // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are the
         // frozen-variance mode that marginal linearises around (#1722).
         options,
     );
-    // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
-    // marginal it was actually optimised against, not the FOCE one.
-    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+    (ehs, hms, kappas)
 }
 
 /// The IOV kappa variances of one unpacked draw — the `omega_iov` diagonal, in

@@ -71,19 +71,52 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 /// The scorer at the fit's estimates, with `run_sir`'s scoring options built from
 /// caller defaults, minus the fit's data OFV. Bitwise 0 is the claim.
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
-    let options = fitted_marginal_options(fit, &FitOptions::default());
-    let params = fitted_params_from_result(fit, model).expect("params rebuild");
-    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    let (options, params, etas) = scorer_inputs(model, fit);
     let got = sir_draw_ofv(model, pop, &params, &etas, &options);
     (got, fit.ofv - fit.ofv_prior)
 }
 
+fn scorer_inputs(
+    model: &CompiledModel,
+    fit: &FitResult,
+) -> (FitOptions, ModelParameters, Vec<DVector<f64>>) {
+    let options = fitted_marginal_options(fit, &FitOptions::default());
+    let params = fitted_params_from_result(fit, model).expect("params rebuild");
+    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    (options, params, etas)
+}
+
+/// The subjects whose η̂ the scorer's warm re-solve moves off the fit's, as
+/// `(index, max |Δη|)`. Empty is the claim: the fit's η̂ is a fixed point (#2279).
+fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(usize, f64)> {
+    let (options, params, etas) = scorer_inputs(model, fit);
+    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &etas, &options);
+    ehs.iter()
+        .zip(&etas)
+        .enumerate()
+        .filter(|(_, (a, b))| {
+            a.iter()
+                .zip(b.iter())
+                .any(|(x, y)| x.to_bits() != y.to_bits())
+        })
+        .map(|(i, (a, b))| (i, (a - b).amax()))
+        .collect()
+}
+
 /// T3. `sir_draw_ofv` at the estimates **is** the fit's objective — bit for bit on
-/// FOCEI, Laplace and a `[mixture]` override fit, to 1e-8 on FOCE — scored through `run_sir`'s option
+/// FOCE, FOCEI, Laplace and a `[mixture]` override fit — scored through `run_sir`'s option
 /// builder with caller defaults (`method = FoceI`). The FOCE / FOCEI arms are the
 /// no-move control; the Laplace arm dies when the builder stops taking the fit's
 /// method (−3.40e-2 on the #1755 probe), the mixture arm when the scorer loses its
 /// mixture branch (+639.6).
+///
+/// #2279: bitwise is a property of the code, not of rounding — the fit's η̂ is a fixed
+/// point of the scorer's warm re-solve, asserted directly on every warfarin arm. With the
+/// re-solve unseeded (`InnerHessianSeed::None`, as before #2279) BFGS failed its line
+/// search at η̂ and the Nelder–Mead fallback moved subjects 0 and 7 on FOCE (3.9e-14) and
+/// subject 6 on Laplace (6.9e-18) on macOS arm64. The objective then read 5.7e-13 off on
+/// FOCE on every platform, and 6.8e-13 off on Laplace on Linux x86_64 / glibc 2.28 while
+/// macOS rounded it back to the same bits; the η̂ assertion sees the move on any platform.
 #[test]
 fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     let prep = crate::api::prepare_run(
@@ -107,6 +140,12 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
         };
         let fit = crate::api::fit(&prep.parsed.model, &prep.population, &init, &opts)
             .expect("warfarin fit must run");
+        let moved = moved_etas(&prep.parsed.model, &prep.population, &fit);
+        assert!(
+            moved.is_empty(),
+            "{method:?}: the scorer's warm re-solve moved the fit's η̂ (subject, max |Δη|): \
+             {moved:?}"
+        );
         let (got, want) = scorer_gap(&prep.parsed.model, &prep.population, &fit);
         gaps.push((format!("{method:?}"), got, want));
     }
@@ -131,25 +170,12 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     }
     for (arm, got, want) in &gaps {
         assert!(got.is_finite() && want.is_finite(), "{arm}: non-finite");
-        if arm == "Foce" {
-            // The one arm that is not bitwise: FOCE's frozen-variance EBEs (#1722),
-            // re-solved warm from the reported η̂, land 4.24e-10 away (Linux aarch64 and
-            // macOS arm64 alike) —
-            // the FOCE scorer is not what this PR changes, and it is the no-move
-            // control. 1e-8 is 24× that and 3.4e6× below the Laplace mutation.
-            assert!(
-                (got - want).abs() <= 1e-8,
-                "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
-                got - want
-            );
-        } else {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
-                got - want
-            );
-        }
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
+            got - want
+        );
     }
 }
 
