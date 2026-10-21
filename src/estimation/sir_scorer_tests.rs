@@ -111,12 +111,15 @@ fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(
 /// mixture branch (+639.6).
 ///
 /// #2279: bitwise is a property of the code, not of rounding — the fit's η̂ is a fixed
-/// point of the scorer's warm re-solve, asserted directly on every warfarin arm. With the
-/// re-solve unseeded (`InnerHessianSeed::None`, as before #2279) BFGS failed its line
-/// search at η̂ and the Nelder–Mead fallback moved subjects 0 and 7 on FOCE (3.9e-14) and
-/// subject 6 on Laplace (6.9e-18) on macOS arm64. The objective then read 5.7e-13 off on
-/// FOCE on every platform, and 6.8e-13 off on Laplace on Linux x86_64 / glibc 2.28 while
-/// macOS rounded it back to the same bits; the η̂ assertion sees the move on any platform.
+/// point of the scorer's warm re-solve ([`sir_draw_ebes`]), asserted directly on every
+/// warfarin arm. Before #2279 it was not, twice over. The re-solve was unseeded, so BFGS
+/// failed its line search at η̂ and the Nelder–Mead fallback moved FOCE subjects 0 and 7 by
+/// 3.9e-14 (macOS arm64): FOCE's 5.7e-13 objective gap on every platform. And the fit's cold
+/// final pass leaves some subjects fallback-certified (gradient norm above `tol`, Newton step
+/// below it), which a re-search stalls on and the fallback nudges: Laplace subject 8 by
+/// 1.7e-14 under Linux x86_64 / glibc 2.28, a 6.8e-13 objective gap that macOS rounded back
+/// to the same bits. The seed reverting reddens the η̂ assertion on macOS; the second half is
+/// pinned platform-independently by `scorer_keeps_a_start_its_certificate_accepts`.
 #[test]
 fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     let prep = crate::api::prepare_run(
@@ -306,4 +309,70 @@ fn mixture_override_refusals_carry_their_codes() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// #2279: `keep_certified_start` returns a warm start the inner certificate accepts as it
+/// stands — here the Laplace fit's η̂ moved 1e-6 per coordinate, so its gradient norm is far
+/// above `tol` (BFGS would step) while its Newton step is below it (`certifies_in_place`'s
+/// Newton arm). Both sides of the gate on one start: with the flag the start comes back
+/// bitwise; without it the search moves it. Dies if `sir_draw_ebes` drops the flag (the
+/// second assertion's twin becomes the first), or if `find_ebe_solve` stops honouring it.
+#[test]
+fn scorer_keeps_a_start_its_certificate_accepts() {
+    use crate::estimation::inner_optimizer::{find_ebe_cached, InnerSolvePolicy};
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    let model = &prep.parsed.model;
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = unpack_params(&WARF_LAPLACE_PACKED, &prep.init_params);
+    let fit = crate::api::fit(model, &prep.population, &init, &opts).expect("fit must run");
+    let (options, params, etas) = scorer_inputs(model, &fit);
+    let start: Vec<f64> = etas[0].iter().map(|e| e + 1e-6).collect();
+    let solve = |keep: bool| {
+        let policy = InnerSolvePolicy {
+            keep_certified_start: keep,
+            ..InnerSolvePolicy::for_stage(&options, model)
+        };
+        let r = find_ebe_cached(
+            model,
+            &prep.population.subjects[0],
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&start),
+            None,
+            0,
+            None,
+            policy,
+        );
+        assert!(r.converged, "keep = {keep}: not converged");
+        r.eta.as_slice().to_vec()
+    };
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&solve(true)), bits(&start), "kept start moved");
+    let searched = solve(false);
+    assert_ne!(
+        bits(&searched),
+        bits(&start),
+        "fixture premise: a search from this start moves it (gradient norm above tol)"
+    );
+
+    // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
+    let mut shifted = etas.clone();
+    shifted[0] = DVector::from_vec(start.clone());
+    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &params, &shifted, &options);
+    assert_eq!(
+        bits(ehs[0].as_slice()),
+        bits(&start),
+        "sir_draw_ebes moved a certified start"
+    );
 }

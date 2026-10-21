@@ -8,7 +8,7 @@
 //! more robust than the asymptotic covariance matrix.
 
 use crate::diagnostics::EngineError;
-use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_map, InnerSolvePolicy};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_mu_k, coordinate_names, coordinate_values, pack_with_bounds, packed_segments,
@@ -1391,8 +1391,7 @@ fn run_sir_in_box(
 ///
 /// At the estimates this equals the fit's data OFV bit for bit on FOCE, FOCEI, Laplace
 /// and mixture fits (pinned by `sir_draw_ofv_at_the_estimate_is_the_fits_objective`):
-/// the warm re-solve runs under the fit's own inner Hessian seed, so the fit's η̂ is its
-/// fixed point (#2279) — when the last stage
+/// the fit's η̂ is a fixed point of [`sir_draw_ebes`] (#2279) — when the last stage
 /// estimates. After an evaluation-only last stage (`agq_eval_only`, `imp_eval_only`)
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
@@ -1416,8 +1415,18 @@ pub(crate) fn sir_draw_ofv(
 }
 
 /// The EBEs [`sir_draw_ofv`] scores a non-mixture draw at: re-solved warm from the fit's
-/// `eta_hats` under the fit's own stage `options` and inner Hessian seed. At the fit's
-/// estimates the fit's η̂ is a fixed point of this solve (#2279).
+/// `eta_hats` under the fit's own stage `options` — its inner Hessian seed and EBE variance
+/// convention — keeping any start the inner certificate already accepts
+/// (`InnerSolvePolicy::keep_certified_start`). The fit's reported η̂ passed that certificate,
+/// so at the fit's estimates it is a fixed point of this solve and the scorer reproduces the
+/// fit's objective bit for bit (#2279).
+///
+/// Both halves were measured on warfarin. Unseeded (`InnerHessianSeed::None`, before #2279),
+/// BFGS failed its line search at η̂ and the Nelder–Mead fallback moved FOCE subjects 0 and 7
+/// by 3.9e-14 on macOS arm64 — FOCE's 5.7e-13 objective gap. Seeded but re-searched, a subject
+/// the fit's cold final pass left fallback-certified (gradient norm 1.6e-5 against `tol` 1e-5,
+/// Newton step below `tol`) stalled in BFGS and the fallback moved it 1.7e-14 under Linux
+/// x86_64 / glibc 2.28, while macOS rounded it back to the same bits.
 pub(crate) fn sir_draw_ebes(
     model: &CompiledModel,
     population: &Population,
@@ -1426,7 +1435,7 @@ pub(crate) fn sir_draw_ebes(
     options: &FitOptions,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
+    let (ehs, hms, _, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
         params,
@@ -1436,15 +1445,14 @@ pub(crate) fn sir_draw_ebes(
         Some(&mu_k),
         0, // SIR: no EBE convergence tracking
         0, // SIR: warm-started; no inner multi-start
-        // The fit's own seed (#2279), as its final inner pass and every warm outer
-        // evaluation use. Unseeded, BFGS standing on the fit's η̂ failed its line search on
-        // warfarin and the Nelder–Mead fallback moved η̂ (3.9e-14 on FOCE, 6.9e-18 on
-        // Laplace, macOS arm64) — the gap a 12-ULP Laplace objective on glibc 2.28 and
-        // FOCE's 5.7e-13 everywhere came from.
-        InnerHessianSeed::for_options(options),
-        // A FOCE fit's weights are FOCE marginals, so each draw's EBEs are the
-        // frozen-variance mode that marginal linearises around (#1722).
-        options,
+        // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
+        // mode its marginal linearises around (#1722).
+        InnerSolvePolicy {
+            keep_certified_start: true,
+            ..InnerSolvePolicy::for_stage(options, model)
+        },
+        None,
+        |_, _| (),
     );
     (ehs, hms, kappas)
 }
