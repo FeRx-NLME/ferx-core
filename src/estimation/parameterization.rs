@@ -2216,7 +2216,11 @@ mod tests {
             assert_eq!(fd_theta_step_floor(&declared, j).to_bits(), f.to_bits());
         }
         assert_eq!(fd_theta_step_floor(&declared, 5), 1.0);
-        assert_eq!(fd_step_floor(&declared, &declared, 3), 1.0, "packed: log θ keeps 1");
+        assert_eq!(
+            fd_step_floor(&declared, &declared, 3),
+            1.0,
+            "packed: log θ keeps 1"
+        );
     }
 
     /// With floor 1, `fd_step` is the pre-#2147 `eps·(1 + |x|)` bit for bit — the property

@@ -1198,7 +1198,10 @@ mod tests {
                 .replace("V  = TVV\n", &format!("V  = TVV_S / {k:e}\n"));
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let p = &model.default_params;
-            assert!(p.theta_lower[2] < 0.0, "fixture: TVV_S must be identity-packed");
+            assert!(
+                p.theta_lower[2] < 0.0,
+                "fixture: TVV_S must be identity-packed"
+            );
             super::mixture_gradient_fd(&model, &pop, &pack_params(p), p, &opts)
         };
         let g_1 = grad(1.0);
@@ -1206,17 +1209,25 @@ mod tests {
             assert!(v.is_finite(), "k = 1 gradient {g_1:?}");
             m.max(v.abs())
         });
-        assert!(g_1[2].abs() > 1e-3 * scale, "fixture: ∂/∂TVV_S is live, {g_1:?}");
+        assert!(
+            g_1[2].abs() > 1e-3 * scale,
+            "fixture: ∂/∂TVV_S is live, {g_1:?}"
+        );
         // Measured (macOS arm64): 2.653e-11 at k = 1e-4, 2.420e-11 at 1e-5; with the flat
         // 1e-5 step (pre-#2187) 3.194e-5 at k = 1e-4, so 1e-8 leaves 380× headroom below and
         // three orders above.
         for k in [1e-4, 1e-5] {
             let g_k = grad(k);
-            let gap = g_k.iter().zip(&g_1).enumerate().fold(0.0_f64, |m, (j, (&a, &b))| {
-                let a = if j == 2 { k * a } else { a };
-                assert!(a.is_finite(), "k = {k}: ∂{j} = {a}");
-                m.max((a - b).abs())
-            }) / scale;
+            let gap = g_k
+                .iter()
+                .zip(&g_1)
+                .enumerate()
+                .fold(0.0_f64, |m, (j, (&a, &b))| {
+                    let a = if j == 2 { k * a } else { a };
+                    assert!(a.is_finite(), "k = {k}: ∂{j} = {a}");
+                    m.max((a - b).abs())
+                })
+                / scale;
             eprintln!("MEASURE #2187 mixture k = {k:e}: max-norm rel {gap:.3e}");
             assert!(gap < 1e-8, "mixture_gradient_fd k = {k}: {gap:e}");
         }

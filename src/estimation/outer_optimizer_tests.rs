@@ -6558,11 +6558,16 @@ mod outer_fd_fallback {
             m.max(v.abs())
         });
         assert!(scale > 0.0, "{route}: zero gradient");
-        let gap = g_k.iter().zip(g_1).enumerate().fold(0.0_f64, |m, (j, (&a, &b))| {
-            let a = if j == 1 { k * a } else { a };
-            assert!(a.is_finite(), "{route} k = {k}: ∂{j} = {a}");
-            m.max((a - b).abs())
-        }) / scale;
+        let gap = g_k
+            .iter()
+            .zip(g_1)
+            .enumerate()
+            .fold(0.0_f64, |m, (j, (&a, &b))| {
+                let a = if j == 1 { k * a } else { a };
+                assert!(a.is_finite(), "{route} k = {k}: ∂{j} = {a}");
+                m.max((a - b).abs())
+            })
+            / scale;
         eprintln!("MEASURE #2187 {route} k = {k:e}: max-norm rel {gap:.3e}");
         gap
     }
@@ -6584,8 +6589,18 @@ mod outer_fd_fallback {
             let report_g =
                 reporting_fd_gradient(&x, p, model, pop, &warm, &bounds, opts, &nn_reg, &priors);
             let s = &pop.subjects[0];
-            let eta = find_ebe_for_stage(model, s, &unpack_params(&x, p), 500, 1e-12, None, None, 0, opts)
-                .eta;
+            let eta = find_ebe_for_stage(
+                model,
+                s,
+                &unpack_params(&x, p),
+                500,
+                1e-12,
+                None,
+                None,
+                0,
+                opts,
+            )
+            .eta;
             let subj_g = subject_reconverged_fd_gradient(&x, p, model, s, &eta, &bounds, opts);
             (pop_g, report_g, subj_g)
         };
@@ -6617,8 +6632,17 @@ mod outer_fd_fallback {
             let PackedStart {
                 packed: x, bounds, ..
             } = pack_with_bounds(p);
-            let ebe =
-                find_ebe_for_stage(model, s, &unpack_params(&x, p), 500, 1e-12, None, None, 0, opts);
+            let ebe = find_ebe_for_stage(
+                model,
+                s,
+                &unpack_params(&x, p),
+                500,
+                1e-12,
+                None,
+                None,
+                0,
+                opts,
+            );
             let mut stacked = ebe.eta.as_slice().to_vec();
             for kap in &ebe.kappas {
                 stacked.extend_from_slice(kap.as_slice());
@@ -6631,7 +6655,10 @@ mod outer_fd_fallback {
         let g_1 = at(1.0);
         for k in [1e-4, 1e-5] {
             let g = rescaled_gap("iov subject", k, &at(k), &g_1);
-            assert!(g < 1e-5, "subject_reconverged_fd_gradient_iov k = {k}: {g:e}");
+            assert!(
+                g < 1e-5,
+                "subject_reconverged_fd_gradient_iov k = {k}: {g:e}"
+            );
         }
     }
 

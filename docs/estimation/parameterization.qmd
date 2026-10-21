@@ -119,6 +119,31 @@ optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_
 the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
 301.58, its plain model's minimum.
 
+#### Finite-difference steps on a small θ {#fd-steps-small-theta}
+
+A finite difference steps a packed coordinate $x$ by $\varepsilon\,(s + |x|)$.
+With $s = 1$ that is a relative step on a log-packed coordinate but an absolute
+one, about $\varepsilon$ in the θ's own units, on an identity-packed θ: too
+coarse for a θ near $\varepsilon$, and through zero for one below it. So an
+identity-packed θ whose declared $\theta_0$ satisfies $0 < |\theta_0| < 1$ takes
+$s = |\theta_0|$, and every other coordinate keeps $s = 1$ and its step bit for
+bit. This holds for the covariance step (see
+[`fd_hessian_step`](../model-file/fit-options.qmd), #2147), for the reconverged
+FD outer gradient ($\varepsilon = 10^{-4}$: `reconverge_gradient_interval`, an IOV
+model under `gradient = fd` or outside the analytic IOV scope, the per-subject
+salvage of the analytic gradient, and a derivative-free fit's `final_gradient`),
+and for a mixture model's FD outer gradient ($\varepsilon = 10^{-5}$) (#2187).
+
+The SAEM M-step gradient and Fisher information and the VI ELBO gradient take
+forward differences in θ itself, where a log-packed θ is stepped as absolutely as
+an identity-packed one. There every θ with $0 < |\theta_0| < 1$ takes
+$s = |\theta_0|$. On warfarin with `V = TVV_S / 1e-4`, the reconverged FD gradient
+in `TVV_S` was 15 % off before #2187 (macOS arm64), and agrees with the
+`V = TVV_S` model to $2\times10^{-7}$ relative after it.
+
+A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative
+to θ₀, so declare θ₀ at the parameter's scale.
+
 ## Bounds
 
 `compute_bounds()` returns a box in packed space:

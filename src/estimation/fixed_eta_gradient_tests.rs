@@ -1975,14 +1975,33 @@ fn rescaled_volume_theta_error(k: f64, iov: bool, route: FixedEtaRoute) -> (f64,
         (true, FixedEtaRoute::Fisher) => unreachable!("the IOV gradient has no Fisher body"),
         (true, _) => {
             obs_nll_subject_grad_iov(
-                &model, &subject, &theta, &sigma, &eta, &kappas, &mask, &lo, &hi, n_theta,
-                n_sigma, &mut scratch,
+                &model,
+                &subject,
+                &theta,
+                &sigma,
+                &eta,
+                &kappas,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
             )
             .1
         }
         (false, FixedEtaRoute::Fisher) => {
             let (_, g, info) = obs_nll_subject_grad_fisher(
-                &model, &subject, &theta, &sigma, &eta, &mask, &lo, &hi, n_theta, n_sigma,
+                &model,
+                &subject,
+                &theta,
+                &sigma,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
                 &mut scratch,
             );
             assert!(info.is_some(), "fixture: the Fisher body must run");
@@ -1990,7 +2009,16 @@ fn rescaled_volume_theta_error(k: f64, iov: bool, route: FixedEtaRoute) -> (f64,
         }
         (false, _) => {
             obs_nll_subject_grad(
-                &model, &subject, &theta, &sigma, &eta, &mask, &lo, &hi, n_theta, n_sigma,
+                &model,
+                &subject,
+                &theta,
+                &sigma,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
                 &mut scratch,
             )
             .1
@@ -2009,7 +2037,10 @@ fn rescaled_volume_theta_error(k: f64, iov: bool, route: FixedEtaRoute) -> (f64,
         assert!(w.is_finite(), "reference {want:?}");
         m.max(w.abs())
     });
-    assert!(want[1].abs() > 1e-2 * scale, "fixture: ∂/∂TVV_S is live, {want:?}");
+    assert!(
+        want[1].abs() > 1e-2 * scale,
+        "fixture: ∂/∂TVV_S is live, {want:?}"
+    );
     let err = grad[..n_theta]
         .iter()
         .zip(&want)
@@ -2026,6 +2057,21 @@ fn rescaled_volume_theta_error(k: f64, iov: bool, route: FixedEtaRoute) -> (f64,
     (err_v, err)
 }
 
+/// Measured (macOS arm64), worst of `∂/∂TVV_S` and the θ block, over k ∈ {1, 1e-4}:
+///
+/// | route | fixed | pre-#2187 step at k = 1e-4 |
+/// |---|---|---|
+/// | Gaussian / Fisher, no IOV | 2.324e-5 | 1.108e-2 (block 2.142e-3) |
+/// | Gaussian, IOV | 2.115e-5 | 7.476e-3 (block 1.980e-3) |
+/// | M3, no IOV | 2.175e-4 | 1.040e-1 (block 5.543e-2) |
+/// | M3, IOV | 1.998e-4 | 9.498e-2 (block 6.649e-2) |
+///
+/// M3's floor is the forward difference's own `O(h)` truncation through the censored row's
+/// normal CDF: 1.191e-4 already at k = 1, where the step is unchanged. So the bound is `1e-4` on the
+/// Gaussian routes and `1e-3` on M3: 4.3× and 4.6× above the fixed error, 20× and 55× below
+/// the smallest pre-#2187 one. Reverting any one of the five `theta_fd_step` call sites in
+/// `fixed_eta_gradient.rs` to `h·(1 + |θ|)` fails exactly its own route below (the IOV and
+/// no-IOV M3 bodies, the IOV and no-IOV Gaussian chains, and the Fisher body).
 #[test]
 fn fixed_eta_theta_steps_are_relative_on_a_small_theta() {
     for (iov, route) in [
@@ -2035,10 +2081,17 @@ fn fixed_eta_theta_steps_are_relative_on_a_small_theta() {
         (true, FixedEtaRoute::Gaussian),
         (true, FixedEtaRoute::M3),
     ] {
+        let tol = match route {
+            FixedEtaRoute::M3 => 1e-3,
+            FixedEtaRoute::Gaussian | FixedEtaRoute::Fisher => 1e-4,
+        };
         for k in [1.0, 1e-4] {
             let (err_v, err) = rescaled_volume_theta_error(k, iov, route);
-            assert!(err_v < 1e-3, "{route:?} iov {iov} k = {k}: ∂/∂TVV_S {err_v:e}");
-            assert!(err < 1e-3, "{route:?} iov {iov} k = {k}: θ block {err:e}");
+            assert!(
+                err_v < tol,
+                "{route:?} iov {iov} k = {k}: ∂/∂TVV_S {err_v:e}"
+            );
+            assert!(err < tol, "{route:?} iov {iov} k = {k}: θ block {err:e}");
         }
     }
 }
