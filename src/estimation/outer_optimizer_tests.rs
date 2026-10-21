@@ -9181,7 +9181,7 @@ fn warfarin_iov_fixture() -> (CompiledModel, Population, FitOptions) {
     let (model, mut pop, opts) = load_iov_fixture(
         include_str!("../../examples/warfarin_iov.ferx"),
         "data/warfarin_iov.csv",
-        3,
+        2,
     );
     let mut no_occ = pop.subjects[0].clone();
     no_occ.id = "NO_OCC".into();
@@ -9222,16 +9222,48 @@ fn kappa_correlation_fixture() -> (CompiledModel, Population, FitOptions) {
         model.residual_serial.is_some(),
         "fixture: the correlation line must reach the model"
     );
+    // ...and the data: with every `obs_rgroup` 0 the correlation is inert and this is
+    // plain `warfarin_iov` again (measured: 11 rows in group 1, 11 in group 2).
+    for s in &pop.subjects {
+        let groups: std::collections::BTreeSet<u32> =
+            s.obs_rgroup.iter().copied().filter(|&g| g > 0).collect();
+        assert!(
+            groups.len() >= 2,
+            "fixture: subject {} has residual groups {:?}; the correlation is inert",
+            s.id,
+            s.obs_rgroup
+        );
+    }
     (model, pop, opts)
 }
 
-/// The pre-flight's cold solve, repeated outside it at the same packed, clamped start:
-/// each subject's `η̂` and per-cell `κ̂`.
+/// `f` on a private one-thread rayon pool. Both sides of every #2217 bit-identity twin run
+/// through here, so neither shares the global pool with concurrently running tests (the
+/// in-process IOV nondeterminism of #1197 needs such a co-runner).
+fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap()
+        .install(f)
+}
+
+/// The pre-flight's cold solve, repeated outside it at the same packed, clamped start.
+struct PreflightStart {
+    params: ModelParameters,
+    mu_k: Vec<f64>,
+    /// Each subject's `η̂`.
+    ehs: Vec<DVector<f64>>,
+    /// Each subject's per-cell `κ̂` (empty for a subject with no κ).
+    kappas: Vec<Vec<DVector<f64>>>,
+}
+
 fn preflight_start_modes(
     model: &CompiledModel,
     pop: &Population,
     opts: &FitOptions,
-) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+) -> PreflightStart {
     let PackedStart {
         packed: mut x,
         bounds,
@@ -9241,20 +9273,27 @@ fn preflight_start_modes(
     let params = unpack_params(&x, &model.default_params);
     let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
     let cold = vec![DVector::zeros(model.n_eta); pop.subjects.len()];
-    let (ehs, _, _, kappas) = run_inner_loop_warm_seeded(
-        model,
-        pop,
-        &params,
-        opts.inner_maxiter,
-        opts.inner_tol,
-        Some(&cold),
-        Some(&mu_k),
-        opts.min_obs_for_convergence_check as usize,
-        opts.inner_restarts,
-        InnerHessianSeed::for_options(opts),
-        opts,
-    );
-    (ehs, kappas)
+    let (ehs, _, _, kappas) = on_one_thread(|| {
+        run_inner_loop_warm_seeded(
+            model,
+            pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            Some(&cold),
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            InnerHessianSeed::for_options(opts),
+            opts,
+        )
+    });
+    PreflightStart {
+        params,
+        mu_k,
+        ehs,
+        kappas,
+    }
 }
 
 /// How [`assert_first_eval_starts_at_preflight_mode`] reaches the first evaluation.
@@ -9274,18 +9313,18 @@ fn assert_first_eval_starts_at_preflight_mode(
     first_eval: FirstEval,
 ) {
     use crate::estimation::inner_optimizer::CERTIFIED_IOV_STARTS;
-    let (ehs, kappas) = preflight_start_modes(&model, &pop, &opts);
+    let PreflightStart {
+        params,
+        mu_k,
+        ehs,
+        kappas,
+    } = preflight_start_modes(&model, &pop, &opts);
     // The fixture must make a dropped κ̂ visible: κ = 0 has to differ from the mode.
     assert!(
         kappas.iter().flatten().flatten().any(|&v| v != 0.0),
         "{label}: fixture: every κ̂ is 0, so a dropped κ block cannot show"
     );
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .stack_size(crate::FIT_RAYON_STACK_SIZE)
-        .build()
-        .unwrap();
-    let starts = pool.install(|| {
+    let starts = on_one_thread(|| {
         CERTIFIED_IOV_STARTS.with(|s| s.borrow_mut().clear());
         match first_eval {
             FirstEval::ThroughOptimizer => {
@@ -9304,14 +9343,6 @@ fn assert_first_eval_starts_at_preflight_mode(
                 )
                 .etas
                 .unwrap_or_else(|| panic!("{label}: every subject converged"));
-                let PackedStart {
-                    packed: mut x,
-                    bounds,
-                    ..
-                } = pack_with_bounds(&model.default_params);
-                clamp_to_bounds(&mut x, &bounds);
-                let params = unpack_params(&x, &model.default_params);
-                let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
                 let nll = run_inner_loop_and_nll_prepared(
                     &model,
                     &pop,
@@ -9408,21 +9439,21 @@ fn first_eval_starts_at_preflight_iov_mode_kappa_correlation() {
 /// alone, bit for bit as before.
 #[test]
 fn preflight_etas_stack_kappa_only_for_subjects_with_kappa_cells() {
-    let declines = |pop: &Population| OuterFdDeclineLog::new(pop.subjects.len());
+    let preflight = |model: &CompiledModel, pop: &Population, opts: &FitOptions| {
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        on_one_thread(|| {
+            freeze_flat_thetas(model, pop, &model.default_params, opts, &declines, false).etas
+        })
+    };
     let bits = |v: &DVector<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // The expected side re-runs the pre-flight's solve with a copy of its inner policy, so
+    // a legitimate change to that policy also reddens this test.
+    const POLICY_NOTE: &str = "(or the pre-flight's inner policy no longer matches \
+                               `preflight_start_modes`)";
 
     let (model, pop, opts) = warfarin_iov_fixture();
-    let (ehs, kappas) = preflight_start_modes(&model, &pop, &opts);
-    let got = freeze_flat_thetas(
-        &model,
-        &pop,
-        &model.default_params,
-        &opts,
-        &declines(&pop),
-        false,
-    )
-    .etas
-    .expect("warfarin_iov: every subject converged");
+    let PreflightStart { ehs, kappas, .. } = preflight_start_modes(&model, &pop, &opts);
+    let got = preflight(&model, &pop, &opts).expect("warfarin_iov: every subject converged");
     let (mut with_kappa, mut without) = (0, 0);
     for (i, s) in pop.subjects.iter().enumerate() {
         let want: Vec<u64> = ehs[i]
@@ -9438,7 +9469,8 @@ fn preflight_etas_stack_kappa_only_for_subjects_with_kappa_cells() {
         assert_eq!(
             bits(&got[i]),
             want,
-            "warfarin_iov: subject {} ({} κ cells): pre-flight entry is not (η̂, κ̂)",
+            "warfarin_iov: subject {} ({} κ cells): pre-flight entry is not (η̂, κ̂) \
+             {POLICY_NOTE}",
             s.id,
             kappas[i].len()
         );
@@ -9454,22 +9486,13 @@ fn preflight_etas_stack_kappa_only_for_subjects_with_kappa_cells() {
         3,
     );
     assert_eq!(model.n_kappa, 0, "fixture: warfarin has no kappa");
-    let (ehs, _) = preflight_start_modes(&model, &pop, &opts);
-    let got = freeze_flat_thetas(
-        &model,
-        &pop,
-        &model.default_params,
-        &opts,
-        &declines(&pop),
-        false,
-    )
-    .etas
-    .expect("warfarin: every subject converged");
+    let PreflightStart { ehs, .. } = preflight_start_modes(&model, &pop, &opts);
+    let got = preflight(&model, &pop, &opts).expect("warfarin: every subject converged");
     for (i, s) in pop.subjects.iter().enumerate() {
         assert_eq!(
             bits(&got[i]),
             bits(&ehs[i]),
-            "warfarin (no kappa): subject {}: pre-flight entry is not η̂ alone",
+            "warfarin (no kappa): subject {}: pre-flight entry is not η̂ alone {POLICY_NOTE}",
             s.id
         );
     }
