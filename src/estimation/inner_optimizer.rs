@@ -4790,9 +4790,17 @@ fn dense_bfgs_core(
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
-            // A curvature-free step like the first one: bounded the same way (#2099).
+            // A curvature-free step like the first one: bounded the same way (#2099) — the
+            // runaway cap under a preconditioner, the 1/‖g‖ scaling on the identity (the IOV
+            // inner solve passes `precond = None`).
             if seed_inv.is_none() {
-                cap_curvature_free_step(&mut d, precond);
+                match precond {
+                    Some(_) => cap_curvature_free_step(&mut d, precond),
+                    None => {
+                        let k = h0_step_scale(gnorm);
+                        d.iter_mut().for_each(|di| *di *= k);
+                    }
+                }
             }
             let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
             let (alpha, f_new) = backtracking_line_search(

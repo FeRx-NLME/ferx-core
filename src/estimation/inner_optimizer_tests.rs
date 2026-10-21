@@ -4943,6 +4943,66 @@ fn dense_bfgs_steepest_descent_reset_takes_a_bounded_first_trial() {
     );
 }
 
+/// The identity-metric twin of the test above: the IOV inner solve passes `precond = None`,
+/// where `cap_curvature_free_step` is a no-op and the reset must take `h0_step_scale`
+/// instead (#2099 review). Fixture, from the same float-for-float search with `H₀ = I`:
+/// `g₀ = (−2⁻¹⁰, 2⁻¹⁰)` (‖g₀‖ < 1, so the first step is the unscaled `−g₀`) and
+/// `g₁ = (2²³, 2²³)` everywhere else, for which the computed `H₁·g₁` gives `dᵀg = 0`. The
+/// reset's first trial must then be exactly one unit along `−g₁/‖g₁‖`, not the
+/// 1.2e7-long `−g₁`. Mutation: dropping the `None` arm's scaling reddens it.
+#[test]
+fn dense_bfgs_identity_steepest_descent_reset_takes_a_scaled_first_trial() {
+    use std::cell::RefCell;
+    let g0 = [-0.0009765625, 0.0009765625];
+    let g1 = [8388608.0, 8388608.0];
+    let never = |_: &[f64]| false;
+    let trials: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
+    // Any move off the start is an accepted decrease; after that nothing is.
+    let obj = |x: &[f64]| {
+        trials.borrow_mut().push(x.to_vec());
+        if x == [0.0, 0.0] {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let grad = |x: &[f64]| {
+        if x == [0.0, 0.0] {
+            g0.to_vec()
+        } else {
+            g1.to_vec()
+        }
+    };
+    let mut x = vec![0.0, 0.0];
+    dense_bfgs_core(
+        &obj, &grad, &mut x, 2, 2, 1e-8, None, None, None, &never, false,
+    );
+    let t = trials.borrow();
+    let x1 = [-g0[0], -g0[1]];
+    assert_eq!(t[1], x1, "fixture premise: the first step is −g₀ at α = 1");
+    // Premise: the BFGS direction at x₁ is not a descent direction, so the solve resets.
+    let s = DVector::from_column_slice(&x1);
+    let y = DVector::from_column_slice(&[g1[0] - g0[0], g1[1] - g0[1]]);
+    let rho = 1.0 / s.dot(&y);
+    let eye = DMatrix::<f64>::identity(2, 2);
+    let h1 = (&eye - rho * &s * y.transpose()) * &eye * (&eye - rho * &y * s.transpose())
+        + rho * &s * s.transpose();
+    let g1v = DVector::from_column_slice(&g1);
+    let d_bfgs = -(&h1 * &g1v);
+    assert!(
+        d_bfgs.dot(&g1v) >= 0.0,
+        "fixture premise: the BFGS direction must be non-descent, dᵀg = {}",
+        d_bfgs.dot(&g1v)
+    );
+    let gn = (g1[0] * g1[0] + g1[1] * g1[1]).sqrt();
+    let want = [x1[0] - g1[0] / gn, x1[1] - g1[1] / gn];
+    let reset = &t[2];
+    assert!(
+        (reset[0] - want[0]).abs() < 1e-12 && (reset[1] - want[1]).abs() < 1e-12,
+        "the reset's first trial {reset:?} must be x₁ − g₁/‖g₁‖ = {want:?}"
+    );
+}
+
 /// #2209: a residual magnitude (`weight =`, or a θ in the magnitude) combined with a dense
 /// `R` (`correlation`, `block_sigma`) is served exactly by the dense-`R` inner kernel,
 /// which has threaded the per-observation multiplier since #627. The model-level label,
