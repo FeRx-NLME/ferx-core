@@ -32,7 +32,7 @@ use crate::types::{DoseEvent, PkModel, Subject};
 /// - the **superposition** closed forms drop such a dose — its contribution is 0
 ///   (`pk::single_dose_concentration` / `single_dose_states` return early);
 /// - the **event-driven walk** empties every compartment over an interval whose
-///   parameters fail it ([`zero_state_if_cl_v_degenerate`]), and reads 0 at an
+///   parameters fail it ([`skip_step_on_cl_v`]), and reads 0 at an
 ///   observation whose own parameters fail it ([`observe_central_g`]).
 ///
 /// Before #2104 the walk instead *skipped* the propagation step, so the dose stayed
@@ -87,27 +87,37 @@ pub(crate) fn superposed_dose_override(cl: f64, v: f64) -> Option<f64> {
     }
 }
 
-/// The walk's half of [`cl_or_v_degenerate`]: when the interval's `CL` or `V` is
-/// degenerate, empty every compartment and return `true`, so the caller skips the
-/// closed-form step. Matches superposition, which drops a dose with such parameters
-/// outright. Every propagator — the inline `*_g` wrappers and the production walk's
+/// The walk's half of [`cl_or_v_degenerate`], applied ahead of every propagation step:
+/// returns `true` when the caller must skip the closed-form step.
+///
+/// - A degenerate `CL` or `V` empties every compartment, matching superposition, which
+///   drops a dose with such parameters outright.
+/// - A `NaN` `CL` or `V` over an interval that starts **empty and unforced** (every
+///   compartment and every `rates` input exactly 0 — before the first dose, or after a
+///   reset) leaves the state empty. The closed-form step would form `exp(NaN)·0` and
+///   `0 / NaN` there and turn the empty state `NaN`, so a pre-dose observation after it
+///   would read `NaN` where superposition, with no arrived dose to sum, serves 0 — and a
+///   later dose with valid parameters would inherit the `NaN` too. With drug present or
+///   an input running, the `NaN` propagates as before.
+///
+/// Every propagator — the inline `*_g` wrappers and the production walk's
 /// cached-eigendata arms — goes through this one function.
 #[inline]
-pub(crate) fn zero_state_if_cl_v_degenerate<T: PkNum>(state: &mut [T], cl: T, v: T) -> bool {
-    if !cl_or_v_degenerate(cl.val(), v.val()) {
-        return false;
+pub(crate) fn skip_step_on_cl_v<T: PkNum>(state: &mut [T], cl: T, v: T, rates: &[T]) -> bool {
+    if cl_or_v_degenerate(cl.val(), v.val()) {
+        for a in state.iter_mut() {
+            *a = T::from_f64(0.0);
+        }
+        return true;
     }
-    for a in state.iter_mut() {
-        *a = T::from_f64(0.0);
-    }
-    true
+    (cl.val().is_nan() || v.val().is_nan()) && state.iter().chain(rates).all(|a| a.val() == 0.0)
 }
 
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
 /// a constant input `rate` into the central compartment. Mirror of
 /// `crate::pk::event_driven::propagate_one_cpt`.
 pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: T) {
-    if zero_state_if_cl_v_degenerate(state, cl, v) {
+    if skip_step_on_cl_v(state, cl, v, &[rate]) {
         return;
     }
     let ke = cl / v;
@@ -131,7 +141,7 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
     rate_central: T,
     rate_depot: T,
 ) {
-    if zero_state_if_cl_v_degenerate(state, cl, v) || ka.val() <= 0.0 {
+    if skip_step_on_cl_v(state, cl, v, &[rate_central, rate_depot]) || ka.val() <= 0.0 {
         return;
     }
     let ke = cl / v;
@@ -283,7 +293,7 @@ pub fn propagate_two_cpt_g<T: PkNum>(
     rate_central: T,
     rate_periph: T,
 ) {
-    if zero_state_if_cl_v_degenerate(state, cl, v1) {
+    if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph]) {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
@@ -420,7 +430,9 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     rate_periph1: T,
     rate_depot: T,
 ) {
-    if zero_state_if_cl_v_degenerate(state, cl, v1) || ka.val() <= 0.0 {
+    if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_depot])
+        || ka.val() <= 0.0
+    {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
@@ -582,7 +594,7 @@ pub fn propagate_three_cpt_g<T: PkNum>(
     rate_periph1: T,
     rate_periph2: T,
 ) {
-    if zero_state_if_cl_v_degenerate(state, cl, v1) {
+    if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_periph2]) {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
@@ -707,7 +719,13 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     rate_periph2: T,
     rate_depot: T,
 ) {
-    if zero_state_if_cl_v_degenerate(state, cl, v1) || ka.val() <= 0.0 {
+    if skip_step_on_cl_v(
+        state,
+        cl,
+        v1,
+        &[rate_central, rate_periph1, rate_periph2, rate_depot],
+    ) || ka.val() <= 0.0
+    {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {

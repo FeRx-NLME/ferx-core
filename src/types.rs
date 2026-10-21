@@ -126,6 +126,12 @@ pub struct DoseEvent {
     /// reshapes it (see [`InfusionDef`] and `Self::bioavailable_infusion`, #419).
     /// Persistent across `Self::resolve_rate`. Only read for infusions.
     pub infusion_def: InfusionDef,
+    /// Whether this dose came from an `EVID=4` row (reset + dose). The reader stores such
+    /// a row twice — here and as a `Subject::reset_times` entry at the same time — and this
+    /// is what tells it apart from a separate `EVID=3` row co-timed with a dose, which the
+    /// engines treat identically but which is a second data record (#2104's warning counts
+    /// records). Crate-private, like `cmt`, so it widens no public API.
+    pub(crate) evid4: bool,
 }
 
 impl DoseEvent {
@@ -143,6 +149,7 @@ impl DoseEvent {
             // A data-driven dose is rate-specified (`RATE>0`); a bolus never reads
             // this. Either way `RateDefined` is the correct default (#419).
             infusion_def: InfusionDef::RateDefined,
+            evid4: false,
         }
     }
 
@@ -169,6 +176,7 @@ impl DoseEvent {
             ii,
             rate_mode: mode,
             infusion_def,
+            evid4: false,
         }
     }
 

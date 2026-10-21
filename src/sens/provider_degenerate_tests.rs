@@ -204,8 +204,10 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
 /// passed the kernels' `≤ 0` guards and came back `NaN` (`exp(−inf · 0)`). The f64 public
 /// entry points and the superposition state helpers (the peripheral forms) are checked too.
 ///
-/// Mutation (run): restore any one kernel's `cl.val() <= 0.0` term in place of
-/// `cl_or_v_degenerate` → the `CL=+inf` rows reaching that kernel die.
+/// Mutations (run): restore any one kernel's `cl.val() <= 0.0` term in place of
+/// `cl_or_v_degenerate` → the `CL=+inf` rows reaching that kernel die; delete the
+/// override ahead of the `F` post-multiply in one dispatcher (`one_cpt_conc_g`,
+/// `two_cpt_conc_d`, `three_cpt_conc_d`) → its `F=NaN` / `F=inf` IV and infusion rows die.
 #[test]
 fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
     use crate::sens::{
@@ -229,30 +231,50 @@ fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
         ("V=-80", 5.0, -80.0),
     ];
     let (q, v2, q3, v3, ka, f) = (3.0, 40.0, 2.0, 60.0, 1.2, 1.0);
-    for (dose, oral) in &doses {
-        for (label, cl, v) in cases {
-            for t in [0.0, 1.0, 10.0] {
-                let at = format!(
-                    "{label} rate={} ss={} oral={oral} t={t}",
-                    dose.rate, dose.ss
-                );
-                let c1 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, f, *oral);
-                let c2 = two_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, ka, f, *oral);
-                let c3 = three_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, q3, v3, ka, f, *oral);
-                assert_eq!((c1, c2, c3), (0.0, 0.0, 0.0), "{at}: 1/2/3-cpt kernels");
-                let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
-                let j2 = two_cpt_conc_g::<Dual1<2>>(
-                    dose,
-                    Dual1::constant(t),
-                    d(cl, 0),
-                    d(v, 1),
-                    Dual1::constant(q),
-                    Dual1::constant(v2),
-                    Dual1::constant(ka),
-                    Dual1::constant(f),
-                    *oral,
-                );
-                assert_eq!((j2.value, j2.grad), (0.0, [0.0; 2]), "{at}: 2-cpt jet");
+    // `F` too: a dropped dose stays 0 under a `NaN` or infinite `F`, which the dispatchers'
+    // post-multiply of the IV and infusion forms would otherwise turn `NaN` — as
+    // `predict_concentration` serves 0 there.
+    for f_bio in [f, f64::NAN, f64::INFINITY] {
+        for (dose, oral) in &doses {
+            for (label, cl, v) in cases {
+                for t in [0.0, 1.0, 10.0] {
+                    let at = format!(
+                        "{label} F={f_bio} rate={} ss={} oral={oral} t={t}",
+                        dose.rate, dose.ss
+                    );
+                    let c1 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, f_bio, *oral);
+                    let c2 = two_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, ka, f_bio, *oral);
+                    let c3 =
+                        three_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, q3, v3, ka, f_bio, *oral);
+                    assert_eq!((c1, c2, c3), (0.0, 0.0, 0.0), "{at}: 1/2/3-cpt kernels");
+                    // The production predictor is the reference the dispatchers follow.
+                    let mut p = crate::types::PkParams::default();
+                    p.values[crate::types::PK_IDX_CL] = cl;
+                    p.values[crate::types::PK_IDX_V] = v;
+                    p.values[crate::types::PK_IDX_KA] = ka;
+                    p.values[crate::types::PK_IDX_F] = f_bio;
+                    let model = if *oral {
+                        crate::types::PkModel::OneCptOral
+                    } else {
+                        crate::types::PkModel::OneCptIv
+                    };
+                    let want =
+                        crate::pk::predict_concentration(model, std::slice::from_ref(dose), t, &p);
+                    assert_eq!(want, 0.0, "{at}: predict_concentration");
+                    let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
+                    let j2 = two_cpt_conc_g::<Dual1<2>>(
+                        dose,
+                        Dual1::constant(t),
+                        d(cl, 0),
+                        d(v, 1),
+                        Dual1::constant(q),
+                        Dual1::constant(v2),
+                        Dual1::constant(ka),
+                        Dual1::constant(f_bio),
+                        *oral,
+                    );
+                    assert_eq!((j2.value, j2.grad), (0.0, [0.0; 2]), "{at}: 2-cpt jet");
+                }
             }
         }
     }

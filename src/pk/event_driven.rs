@@ -1279,10 +1279,11 @@ fn propagate_with_bounds(
         // intervals (the Schnider speedup), with the formula living once in `sens`.
         use crate::sens::propagate::{
             propagate_three_cpt_core_g, propagate_three_cpt_oral_core_g, propagate_two_cpt_core_g,
-            propagate_two_cpt_oral_core_g, zero_state_if_cl_v_degenerate,
+            propagate_two_cpt_oral_core_g, skip_step_on_cl_v,
         };
         // A degenerate `CL` or `V` empties the system, as superposition drops such a
-        // dose (#2104). The 1-cpt arms apply `zero_state_if_cl_v_degenerate` inside their
+        // dose, and a `NaN` one leaves an empty, unforced system empty (#2104). The 1-cpt
+        // arms apply `skip_step_on_cl_v` inside their
         // `*_g` propagator; the 2-/3-cpt arms bypass the inline `*_g` wrappers for the
         // eigendata memo, so each applies it itself before the memo lookup.
         match pk_model {
@@ -1305,7 +1306,7 @@ fn propagate_with_bounds(
                 propagate_one_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::TwoCptIv => {
-                if zero_state_if_cl_v_degenerate(state, pk.cl(), pk.v()) {
+                if skip_step_on_cl_v(state, pk.cl(), pk.v(), &[rate_central, rate_periph1]) {
                     continue;
                 }
                 if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
@@ -1313,7 +1314,12 @@ fn propagate_with_bounds(
                 }
             }
             PkModel::TwoCptOral => {
-                if zero_state_if_cl_v_degenerate(state, pk.cl(), pk.v()) {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_depot],
+                ) {
                     continue;
                 }
                 if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
@@ -1329,7 +1335,12 @@ fn propagate_with_bounds(
                 }
             }
             PkModel::ThreeCptIv => {
-                if zero_state_if_cl_v_degenerate(state, pk.cl(), pk.v()) {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_periph2],
+                ) {
                     continue;
                 }
                 if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
@@ -1345,7 +1356,12 @@ fn propagate_with_bounds(
                 }
             }
             PkModel::ThreeCptOral => {
-                if zero_state_if_cl_v_degenerate(state, pk.cl(), pk.v()) {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_periph2, rate_depot],
+                ) {
                     continue;
                 }
                 if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
@@ -2605,7 +2621,10 @@ mod tests {
     /// `single_dose_concentration` → the 2-cpt infusion `CL = NaN` row at `t = 1` dies (its
     /// closed form returns 0 there); drop the `+inf` half of `cl_or_v_degenerate` → the `CL = +inf` rows die;
     /// drop the early return in `single_dose_concentration` → the `CL = +inf` rows die (`NaN`
-    /// against 0). The propagation step's emptying is *not* observable here — with constant
+    /// against 0); drop the empty-and-unforced clause of `skip_step_on_cl_v` → the
+    /// infusion history's `NaN` rows at `t = 0.5` die (the walk steps its empty state to
+    /// `NaN` where superposition, with no dose yet, serves 0). The propagation step's
+    /// emptying is *not* observable here — with constant
     /// parameters every later observation's own degenerate `CL` reads 0 anyway — so it is
     /// pinned by the time-varying test below.
     #[test]
@@ -2625,8 +2644,9 @@ mod tests {
                 vec![0.0, 1.0, 10.0, 12.0, 13.0, 24.0],
             ),
             (
-                // Zero-order infusions (5 h): an observation before the first one (no
-                // dose to sum: 0 even under a `NaN`), one on an infusion's start (an
+                // Zero-order infusions (5 h): two observations before the first one (no
+                // dose to sum: 0 even under a `NaN`; the second makes the walk step its
+                // empty state through the `NaN` parameters), one on an infusion's start (an
                 // arrived dose with nothing yet in the state), mid-window ones, and a
                 // second infusion landing on residual drug. Into central:
                 // compartment 1 here, remapped to 2 on the oral models below, where a
@@ -2637,7 +2657,7 @@ mod tests {
                     DoseEvent::new(1.0, 500.0, 1, 100.0, false, 0.0),
                     DoseEvent::new(13.0, 500.0, 1, 100.0, false, 0.0),
                 ],
-                vec![0.0, 1.0, 3.0, 11.0, 13.0, 15.0, 25.0],
+                vec![0.0, 0.5, 1.0, 3.0, 11.0, 13.0, 15.0, 25.0],
             ),
         ];
         let cases: [(&str, usize, f64); 10] = [
@@ -2716,7 +2736,7 @@ mod tests {
                     // drug after the first dose, or "both 0" would pass vacuously.
                     if label == "control" {
                         assert!(
-                            sup[2] > 0.1 && walk[2] > 0.1,
+                            sup.iter().any(|&c| c > 0.1) && walk.iter().any(|&w| w > 0.1),
                             "{history} {model:?}: control is inert ({walk:?})"
                         );
                     }

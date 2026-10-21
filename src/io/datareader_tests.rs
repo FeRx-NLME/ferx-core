@@ -799,6 +799,31 @@ fn test_evid4_reset_plus_dose_recorded_as_both() {
     assert_eq!(subj.obs_times, vec![1.0, 11.0]);
 }
 
+/// #2104: only an `EVID=4` row's dose is flagged `evid4`, so the degenerate-CL/V
+/// warning can count that row once while still counting an `EVID=3` row co-timed with an
+/// `EVID=1` dose as two records — the two layouts build the same reset and dose times.
+///
+/// Mutation (run): set `evid4 = true` on every dose → the `EVID=1` doses' flags die;
+/// drop the assignment → the `EVID=4` dose's flag dies.
+#[test]
+fn only_an_evid4_rows_dose_is_flagged_evid4() {
+    let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n\
+                   1,10,.,4,200\n\
+                   1,11,3.0,0,.\n\
+                   1,20,.,3,.\n\
+                   1,20,.,1,300\n\
+                   1,21,3.0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+    // The straddle: both layouts put a reset and a dose at one time.
+    assert_eq!(subj.reset_times, vec![10.0, 20.0]);
+    let flags: Vec<(f64, bool)> = subj.doses.iter().map(|d| (d.time, d.evid4)).collect();
+    assert_eq!(flags, vec![(0.0, false), (10.0, true), (20.0, false)]);
+}
+
 #[test]
 fn test_obs_before_same_time_dose_is_pre_dose_trough() {
     // NONMEM record order: an observation listed BEFORE a dose at the same

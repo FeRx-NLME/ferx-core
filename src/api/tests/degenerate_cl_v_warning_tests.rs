@@ -422,16 +422,23 @@ fn a_reset_record_is_scanned_under_its_own_snapshot() {
     );
 }
 
-/// An EVID=4 row is stored twice by the reader — in `doses` and in `reset_times` — but is
-/// one data record, so it is counted once (#2104 review). A separate EVID=3 row co-timed
-/// with a dose, under covariates of its own, is a second record and still counts.
+/// An EVID=4 row is stored twice by the reader — in `doses` (flagged `evid4`) and in
+/// `reset_times` — but is one data record, so it is counted once (#2104 review). A
+/// separate EVID=3 row co-timed with an EVID=1 dose is a second record and still counts,
+/// both under covariates of its own and under the dose's own covariates — where its CL and
+/// V match the dose's bit for bit, so no value-based match could tell it from an EVID=4
+/// twin.
 ///
-/// Mutation (run): drop the `evid4_twin` filter → the first half dies (5 records reported).
+/// Mutations (run): drop the `evid4_twin` filter → the first case dies (5 records
+/// reported); match on time alone, ignoring `evid4` → the second case dies first (its
+/// reset row is dropped, so nothing warns) and the third with it; the earlier match on
+/// time and CL/V values → the third case dies (4 reported).
 #[test]
 fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
     let model = parse(LINEAR_AGE_SRC);
     // EVID=4 at TIME 0: the dose and its reset twin, same row, AGE 200 everywhere.
     let mut s1 = subject("S1", [200.0; 4]);
+    s1.doses[0].evid4 = true;
     s1.reset_times = vec![0.0];
     s1.reset_covariates = vec![age(200.0)];
     let (msg, entry) = degenerate_cl_v_warning(
@@ -468,5 +475,28 @@ fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
     assert!(
         msg.contains("on 1 record(s)") && msg.contains("first at TIME 0"),
         "{msg}"
+    );
+
+    // A distinct EVID=3 row at TIME 0 under the dose's own AGE 200: same time, same CL
+    // and V as the dose, but not flagged — two records, so five in all.
+    let mut s3 = subject("S3", [200.0; 4]);
+    s3.reset_times = vec![0.0];
+    s3.reset_covariates = vec![age(200.0)];
+    let (msg, entry) = degenerate_cl_v_warning(
+        &model,
+        &population(vec![s3]),
+        &model.default_params.theta,
+        &etas(1, 0.0),
+        &[],
+        None,
+    )
+    .expect("must warn");
+    assert!(
+        msg.contains("on 5 record(s)"),
+        "the EVID=3 row is its own record: {msg}"
+    );
+    assert_eq!(
+        entry.details.unwrap()["subjects"][0]["times"],
+        serde_json::json!([0.0, 0.0, 1.0, 2.0, 3.0])
     );
 }

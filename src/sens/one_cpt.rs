@@ -329,6 +329,15 @@ pub fn one_cpt_conc_g<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
+    // The shared #2104 rule decides an arrived dose before `F` scales it, as
+    // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
+    // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
+    // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
+    if t.val() >= 0.0 {
+        if let Some(c) = crate::sens::propagate::superposed_dose_override(cl.val(), v.val()) {
+            return T::from_f64(c);
+        }
+    }
     let oral_bolus = oral && !dose.is_infusion();
     let raw = if dose.ss && dose.ii > 0.0 {
         if dose.is_infusion() {

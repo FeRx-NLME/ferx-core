@@ -299,19 +299,13 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
     // `!(x > 0 && finite)` is true for a `NaN` too — which `cl_or_v_degenerate`, the
     // engines' rule, deliberately is not.
     let valid = |x: f64| x > 0.0 && x.is_finite();
-    // The reader stores an EVID=4 row twice — in `doses` and in `reset_times` — under one
-    // row's covariates and occasion, so its reset snapshot is a dose snapshot at the same
-    // time with the same CL and V. Counting it again would report one data record as two.
-    // Matching on the values too (bitwise, so a `NaN` matches itself) keeps a *separate*
-    // EVID=3 row co-timed with a dose whose own covariates differ.
-    let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
-    let evid4_twin = |t: f64, r: &PkParams| {
-        subject
-            .doses
-            .iter()
-            .zip(&params.dose)
-            .any(|(d, p)| d.time == t && same(p.cl(), r.cl()) && same(p.v(), r.v()))
-    };
+    // The reader stores an EVID=4 row twice — in `doses`, flagged `evid4`, and in
+    // `reset_times` at the same time — so its reset entry is skipped: counting it again
+    // would report one data record as two. A separate EVID=3 row co-timed with a dose is
+    // a second record and is kept, whatever its CL and V. (A reset co-timed with an
+    // earlier one is shifted past it by the reader's segmentation, so a time names at
+    // most one reset.)
+    let evid4_twin = |t: f64| subject.doses.iter().any(|d| d.evid4 && d.time == t);
     let mut records: Vec<(f64, bool)> = subject
         .doses
         .iter()
@@ -325,7 +319,7 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
                 .iter()
                 .copied()
                 .zip(&params.reset)
-                .filter(|&(t, p)| !evid4_twin(t, p)),
+                .filter(|&(t, _)| !evid4_twin(t)),
         )
         .filter(|(_, p)| !(valid(p.cl()) && valid(p.v())))
         .map(|(t, p)| {
