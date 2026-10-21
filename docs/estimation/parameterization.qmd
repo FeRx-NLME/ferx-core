@@ -87,7 +87,8 @@ the eigenvalues and the floor in the
 [`covariance_regularized`](../warnings.qmd#codes-covariance) warning, including
 its `W_COV_NON_STATIONARY_ESTIMATE` form, describe the rescaled matrix. The
 non-positive-definite message still reports the eigenvalues of the unscaled
-matrix.
+matrix. SIR floors and caps its proposal in the same rescaled basis (#2179, see
+[SIR](sir.qmd)).
 
 #### An identity-packed θ started near zero {#identity-theta-near-zero}
 

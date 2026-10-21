@@ -158,7 +158,23 @@ those directions.
 They are a signal about the *model*, not only about SIR: a direction the
 covariance step had to floor is a direction the data do not inform.
 
-**When every sample is still rejected**, the error names the failing check
+#### A theta's units do not move the floor or the cap
+
+Neither note depends on the units a theta is written in. A theta with a negative
+lower bound is sampled as itself, so its variance in the proposal grows as `k²`
+when the theta is written `k` times larger. SIR therefore floors and caps the
+proposal with each such theta's row and column rescaled to the other
+coordinates' scale, as the
+[covariance step does](parameterization.qmd#theta-log-vs-identity), and maps the
+factor back before drawing. The `|eigenvalue|`-rectified fallback proposal of
+`covariance_fallback = sir` is built the same way. Before #2179, writing the
+warfarin example's `V` `1e5` times larger floored every other direction and moved
+an SIR interval by 25 %, `1e6` moved one 26-fold, and at `1e8` every draw was
+rejected. A theta drawn on the logit scale is dimensionless and is not rescaled.
+
+#### When every sample is still rejected
+
+The error names the failing check
 rather than just saying the weights were invalid — how many samples fell out of
 bounds, which coordinates' bounds they hit, and what the proposal's rank
 deficiency looks like:

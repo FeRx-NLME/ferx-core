@@ -272,13 +272,21 @@ pub(crate) const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
 /// The result is embedded into the full packed-parameter covariance (zeros for
 /// FIX parameters) and explicitly symmetrised, since the eigen-reconstruction
 /// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
+///
+/// Neither the floor nor `|λ|` is invariant to rescaling one coordinate, so
+/// `equilibrate` is [`invert_psd_with_floor`]'s mask (#2179): the eigenvalue
+/// modification runs on `C = D⁻¹ H D⁻¹` and the proposal is `D⁻¹ C̃⁻¹ D⁻¹`,
+/// which is unchanged when an identity-packed θ is written in other units. An
+/// empty mask marks nothing and leaves the result bit-identical.
 pub(crate) fn build_non_pd_fallback_proposal(
     hess_free_sym: &DMatrix<f64>,
     free_idx: &[usize],
     n_full: usize,
     inflation: f64,
+    equilibrate: &[bool],
 ) -> DMatrix<f64> {
-    let eig = SymmetricEigen::new(hess_free_sym.clone());
+    let d = equilibration_scales(hess_free_sym, equilibrate);
+    let eig = SymmetricEigen::new(divide_by_scales(hess_free_sym.clone(), &d));
     // Largest absolute eigenvalue anchors the relative floor. Guard the
     // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
     // stays positive and we never divide by zero.
@@ -293,7 +301,7 @@ pub(crate) fn build_non_pd_fallback_proposal(
     // any floating-point asymmetry from the matrix products.
     let cov_free_raw =
         &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
-    let cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    let cov_free = divide_by_scales((&cov_free_raw + cov_free_raw.transpose()) * 0.5, &d);
     embed_free(&cov_free, free_idx, n_full)
 }
 
@@ -2065,8 +2073,13 @@ pub(crate) fn compute_covariance_for(
             // So only build the proposal when the eigenvalues are finite.
             match extract_eigenvalues(&hess_free_sym) {
                 Some(eigvals) => {
-                    let fallback_proposal =
-                        build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+                    let fallback_proposal = build_non_pd_fallback_proposal(
+                        &hess_free_sym,
+                        &free_idx,
+                        n,
+                        4.0,
+                        &equilibrate,
+                    );
                     return CovarianceStepResult::FailedNonPd {
                         reason: format_non_pd_warning(&eigvals),
                         fallback_proposal,
@@ -2158,6 +2171,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &equilibrate,
                     ),
                 }
             }
@@ -2180,6 +2194,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &equilibrate,
                     ),
                 };
             }
@@ -2540,14 +2555,7 @@ pub(crate) fn invert_psd_with_floor(
     // equilibrated `C = D⁻¹ M D⁻¹` (#2145), which is `M` itself when nothing is
     // marked.
     let d = equilibration_scales(sym, equilibrate);
-    let rescale = |mut m: DMatrix<f64>| {
-        for i in 0..n {
-            for j in 0..n {
-                m[(i, j)] /= d[i] * d[j];
-            }
-        }
-        m
-    };
+    let rescale = |m: DMatrix<f64>| divide_by_scales(m, &d);
     let eig = SymmetricEigen::new(rescale(sym.clone()));
     let q = &eig.eigenvectors;
     let lambdas = &eig.eigenvalues;
@@ -2646,7 +2654,10 @@ pub(crate) fn invert_psd_with_floor(
 /// the geometric mean of `|Mⱼⱼ|` over the unmarked coordinates whose diagonal is
 /// finite and non-zero (`1` when there are none). A marked coordinate whose
 /// scale would be zero or non-finite keeps `1`.
-fn equilibration_scales(sym: &DMatrix<f64>, equilibrate: &[bool]) -> Vec<f64> {
+///
+/// `M` may be an information matrix or a covariance: either way the marked
+/// diagonal lands on `g`. SIR's two proposal floors use it on both (#2179).
+pub(crate) fn equilibration_scales(sym: &DMatrix<f64>, equilibrate: &[bool]) -> Vec<f64> {
     let n = sym.nrows();
     let marked = |i: usize| equilibrate.get(i).copied().unwrap_or(false);
     let usable = |a: f64| a > 0.0 && a.is_finite();
@@ -2675,11 +2686,22 @@ fn equilibration_scales(sym: &DMatrix<f64>, equilibrate: &[bool]) -> Vec<f64> {
         .collect()
 }
 
+/// `M` with each entry divided by `dᵢ dⱼ`: `D⁻¹ M D⁻¹` for the scales of
+/// [`equilibration_scales`]. With every `dᵢ = 1` it returns `M` bit for bit.
+pub(crate) fn divide_by_scales(mut m: DMatrix<f64>, d: &[f64]) -> DMatrix<f64> {
+    for i in 0..m.nrows() {
+        for j in 0..m.ncols() {
+            m[(i, j)] /= d[i] * d[j];
+        }
+    }
+    m
+}
+
 /// Which free coordinates [`invert_psd_with_floor`] equilibrates (#2145): the
 /// identity-packed θ's, the only packed coordinates that carry the θ's units.
 /// `free_idx` indexes the packed vector, whose leading `template.theta.len()`
-/// entries are the θ's.
-fn identity_theta_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
+/// entries are the θ's. SIR's proposal floors read the same mask (#2179).
+pub(crate) fn identity_theta_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
     free_idx
         .iter()
         .map(|&i| {
@@ -4410,6 +4432,83 @@ mod tests {
         match cov_at_init(&model, &one(3), &saem_r) {
             R::Success(o) => assert_eq!(o.method, CovarianceMethod::Hessian),
             _ => panic!("subject 4: R is positive definite, so R⁻¹ is returned"),
+        }
+    }
+
+    /// #2179, the wiring: the SIR fallback proposal `compute_covariance` hands back on a
+    /// non-PD `R` is built in the equilibrated basis, so writing an identity-packed λ `k` times
+    /// larger scales its row and column by `k` and changes nothing else. The fixture is the
+    /// one-subject `FailedNonPd` case above, λ written `TVLAMBDA_S = k·λ` with a negative lower
+    /// bound. `build_fallback_proposal_is_equivariant_in_an_identity_coordinates_units` pins
+    /// the builder; this pins that the step passes it the identity θ's mask.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_non_pd_fallback_proposal_does_not_see_an_identity_thetas_units() {
+        use super::CovarianceStepResult as R;
+        use crate::types::EstimationMethod as M;
+        let proposal_at = |k: f64| {
+            let (model, full) = tte_exponential_at(SAEM_POINT.0, SAEM_POINT.1);
+            let tv = SAEM_POINT.0 * k;
+            let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+                .expect("model file")
+                .replace(
+                    "theta TVLAMBDA(0.05, 0.001, 10.0)",
+                    &format!(
+                        "theta TVLAMBDA_S({tv:e}, {:e}, {:e})",
+                        -100.0 * tv,
+                        100.0 * tv
+                    ),
+                )
+                .replace(
+                    "omega ETA_LAMBDA ~ 0.09",
+                    &format!("omega ETA_LAMBDA ~ {:?}", SAEM_POINT.1),
+                )
+                .replace("TVLAMBDA * exp", &format!("TVLAMBDA_S / {k:e} * exp"));
+            let scaled = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+            assert_eq!(
+                scaled.default_params.theta.len(),
+                model.default_params.theta.len()
+            );
+            let one = crate::types::Population {
+                subjects: vec![full.subjects[0].clone()],
+                ..full
+            };
+            match cov_at_init(&scaled, &one, &opts_for(M::Saem, CovarianceMethod::Hessian)) {
+                R::FailedNonPd {
+                    fallback_proposal, ..
+                } => fallback_proposal,
+                R::Success(o) => panic!("k = {k:e}: expected FailedNonPd, got {:?}", o.method),
+                R::Unusable(m) => panic!("k = {k:e}: expected FailedNonPd, got Unusable: {m}"),
+            }
+        };
+        let p1 = proposal_at(1.0);
+        assert!(p1[(0, 0)] > 0.0, "λ must carry proposal variance: {p1}");
+        for k in [1e6, 1e-6] {
+            let pk = proposal_at(k);
+            // λ is packed slot 0; every other slot is in units that do not move.
+            let s = |i: usize| if i == 0 { k } else { 1.0 };
+            let mut worst: f64 = 0.0;
+            for i in 0..p1.nrows() {
+                for j in 0..p1.ncols() {
+                    let got = pk[(i, j)] / (s(i) * s(j));
+                    assert!(got.is_finite(), "k = {k:e}: ({i},{j}) = {}", pk[(i, j)]);
+                    let scale = (p1[(i, i)] * p1[(j, j)]).sqrt();
+                    if scale > 0.0 {
+                        worst = worst.max((got - p1[(i, j)]).abs() / scale);
+                    }
+                }
+            }
+            eprintln!("k = {k:e}: worst relative proposal difference {worst:.3e}");
+            // What is left is the FD Hessian, not the proposal. `fd_step_floor` steps λ by
+            // `eps·(|θ₀| + |λ|)` while `|θ₀| < 1` and by `eps·(1 + |λ|)` from there on, so at
+            // k = 1 and k = 1e-6 the relative step is the same `2·eps` and the proposals agree
+            // exactly, while at k = 1e6 it is about `eps` and the one-subject Hessian's
+            // truncation error moves by 2.5e-3 (macOS arm64). With this step's mask not
+            // passed to the builder, k = 1e6 is 0.52 off; the bound is 4× the measured worst.
+            assert!(
+                worst < 1e-2,
+                "k = {k:e}: worst relative difference {worst:e}"
+            );
         }
     }
 

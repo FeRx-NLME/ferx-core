@@ -599,6 +599,25 @@ fn proposal_sd_caps(
         .collect()
 }
 
+/// Which free coordinates [`condition_free_proposal`] equilibrates (#2179): the
+/// covariance step's identity-packed θ's, less any θ drawn on the logit scale. A
+/// `LogitProbability` θ may be identity-packed, but `to_draw_scale` has already
+/// replaced it by `logit(θ)`, which carries no units, and a flat direction there
+/// must still be floored and reported.
+fn proposal_equilibrate_mask(
+    params: &ModelParameters,
+    free_idx: &[usize],
+    logit_coords: &[LogitThetaCoord],
+) -> Vec<bool> {
+    let mut mask = crate::estimation::covariance::identity_theta_mask(params, free_idx);
+    for (m, &i) in mask.iter_mut().zip(free_idx) {
+        if logit_coords.iter().any(|c| c.index == i) {
+            *m = false;
+        }
+    }
+    mask
+}
+
 /// Turn the free-block covariance into a proposal SIR can sample from.
 ///
 /// Each eigen-direction's variance is
@@ -617,10 +636,22 @@ fn proposal_sd_caps(
 /// directions were eigenvalue-floored during inversion: those come back with
 /// variances around `1/floor` (1e7 and up in packed log-space), which without a
 /// cap puts every single draw outside the bounds (#1021).
+///
+/// Neither the floor, the cap's loading cut nor the eigenvectors are invariant
+/// to rescaling one coordinate, and an identity-packed θ carries its units into
+/// this matrix: its variance scales as `k²` when it is written `k` times larger.
+/// So `equilibrate` is the covariance step's mask
+/// ([`crate::estimation::covariance::identity_theta_mask`]), and the
+/// conditioning runs on `C = D⁻¹ Σ D⁻¹` with the scales of
+/// [`crate::estimation::covariance::equilibration_scales`] and the caps
+/// `sd_caps[k] / d_k`; the factor is mapped back as `D · chol(C)` (#2179). The
+/// reported directions and the capped sd's are those of `C`. An empty mask
+/// marks nothing and leaves every result bit-identical.
 pub(crate) fn condition_free_proposal(
     sub_cov: &DMatrix<f64>,
     sd_caps: &[f64],
     names: &[String],
+    equilibrate: &[bool],
 ) -> Result<ConditionedProposal, String> {
     let n = sub_cov.nrows();
     debug_assert_eq!(
@@ -631,7 +662,10 @@ pub(crate) fn condition_free_proposal(
     debug_assert_eq!(n, sd_caps.len(), "one sd cap per free coordinate");
 
     let sym = (sub_cov + sub_cov.transpose()) * 0.5;
-    let eig = sym.clone().symmetric_eigen();
+    let d = crate::estimation::covariance::equilibration_scales(&sym, equilibrate);
+    let sym_c = crate::estimation::covariance::divide_by_scales(sym.clone(), &d);
+    let sd_caps: Vec<f64> = sd_caps.iter().zip(&d).map(|(s, di)| s / di).collect();
+    let eig = sym_c.symmetric_eigen();
     if eig.eigenvalues.iter().any(|v| !v.is_finite()) {
         return Err(
             "SIR proposal covariance has non-finite eigenvalues — the covariance step \
@@ -715,7 +749,9 @@ pub(crate) fn condition_free_proposal(
     // A healthy block must not be perturbed. Round-tripping it through `V Λ Vᵀ`
     // changes it at ~1e-16 relative, which changes every drawn sample and
     // therefore the SIR CIs — so when no eigenvalue was capped or floored,
-    // factor the input directly and leave the draws bit-identical (#1037).
+    // factor the input directly and leave the draws bit-identical (#1037). That
+    // input is the unscaled `Σ`, so an untouched equilibrated block (#2179)
+    // draws exactly what it did before.
     let untouched = (0..n).all(|i| lambdas[i] == eig.eigenvalues[i]);
     let chol = untouched
         .then(|| sym.cholesky().map(|c| c.l()))
@@ -733,7 +769,14 @@ pub(crate) fn condition_free_proposal(
                     let jitter = DMatrix::identity(n, n) * (max_eig * 1e-12).max(1e-14);
                     (&cov + jitter).cholesky()
                 })
-                .map(|c| c.l())
+                .map(|c| {
+                    // `D · chol(C)` is lower-triangular and factors `D C D`.
+                    let mut l = c.l();
+                    for (i, &di) in d.iter().enumerate() {
+                        l.row_mut(i).scale_mut(di);
+                    }
+                    l
+                })
                 .ok_or_else(|| {
                     "SIR proposal covariance could not be made positive definite after \
                      eigenvalue conditioning."
@@ -743,7 +786,9 @@ pub(crate) fn condition_free_proposal(
 
     Ok(ConditionedProposal {
         chol,
-        log_det: lambdas.iter().map(|l| l.ln()).sum::<f64>(),
+        // `log|D C D| = log|C| + 2 Σ log dᵢ`; the second term is 0 when nothing is marked.
+        log_det: lambdas.iter().map(|l| l.ln()).sum::<f64>()
+            + 2.0 * d.iter().map(|di| di.ln()).sum::<f64>(),
         null_dirs,
         capped_dirs: capped.into_iter().map(|(_, d)| d).collect(),
     })
@@ -1099,8 +1144,10 @@ fn run_sir_in_box(
         })
         .collect();
     let sd_caps = proposal_sd_caps(&y_hat, &draw_bounds, &free_idx, options.sir_df);
-    let conditioned =
-        condition_free_proposal(&sub_cov, &sd_caps, &free_names).map_err(EngineError::uncoded)?;
+    // An identity-packed θ's units must not decide what the floor and the cap see (#2179).
+    let equilibrate = proposal_equilibrate_mask(params, &free_idx, &logit_coords);
+    let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names, &equilibrate)
+        .map_err(EngineError::uncoded)?;
     if options.verbose {
         for w in conditioned.warnings() {
             eprintln!("  SIR: {w}");
@@ -1672,7 +1719,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_is_identity_on_a_healthy_block() {
         let cov = DMatrix::from_row_slice(2, 2, &[0.01, 0.002, 0.002, 0.04]);
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap();
         assert!(c.null_dirs.is_empty(), "{:?}", c.null_dirs);
         assert!(c.capped_dirs.is_empty(), "{:?}", c.capped_dirs);
         assert!(c.warnings().is_empty());
@@ -1703,7 +1750,7 @@ mod tests {
         // Coordinate 0 carries variance 1e7 (sd ≈ 3162 in packed log-space);
         // its bound allows a proposal sd of at most 1.0.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.01]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         assert!(
             c.capped_dirs[0].contains("P0"),
@@ -1732,7 +1779,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_does_not_let_an_explosive_direction_swamp_the_floor() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e8, 1e-4]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         assert!(
             c.null_dirs.is_empty(),
@@ -1757,7 +1804,7 @@ mod tests {
         let v = DMatrix::from_row_slice(2, 2, &[h, h, h, -h]);
         let cov =
             &v * DMatrix::from_diagonal(&DVector::from_column_slice(&[0.02, 0.0])) * v.transpose();
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap();
         assert_eq!(c.null_dirs.len(), 1, "{:?}", c.null_dirs);
         assert!(
             c.null_dirs[0].contains("P0") && c.null_dirs[0].contains("P1"),
@@ -1776,7 +1823,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_survives_two_null_directions() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.0, 0.0]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3), &[]).unwrap();
         assert_eq!(c.null_dirs.len(), 2, "{:?}", c.null_dirs);
         assert!(c.chol.iter().all(|v| v.is_finite()));
     }
@@ -1784,14 +1831,14 @@ mod tests {
     #[test]
     fn condition_free_proposal_rejects_a_covariance_with_no_positive_direction() {
         let cov = DMatrix::zeros(2, 2);
-        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap_err();
         assert!(err.contains("no positive eigenvalue"), "{err}");
     }
 
     #[test]
     fn condition_free_proposal_rejects_a_non_finite_covariance() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[f64::NAN, 0.01]));
-        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap_err();
         assert!(err.contains("non-finite"), "{err}");
     }
 
@@ -1809,7 +1856,7 @@ mod tests {
         ];
         let coord_names = vec!["TVCL".to_string(), "PROP_ERR".to_string()];
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.0]));
-        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &coord_names).unwrap();
+        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &coord_names, &[]).unwrap();
 
         let msg = all_invalid_weights_message(&outcomes, &coord_names, &conditioned);
         assert!(msg.contains("All 5 SIR samples"), "{msg}");
@@ -1893,7 +1940,7 @@ mod tests {
 
         let names = coordinate_names(&params);
         let cov = DMatrix::identity(1, 1);
-        let conditioned = condition_free_proposal(&cov, &[1.0], &names[..1]).unwrap();
+        let conditioned = condition_free_proposal(&cov, &[1.0], &names[..1], &[]).unwrap();
         let msg = all_invalid_weights_message(&outcomes, &names, &conditioned);
         assert!(msg.contains("1 out of bounds"), "{msg}");
         assert!(
@@ -1908,7 +1955,7 @@ mod tests {
     #[test]
     fn all_invalid_weights_message_stays_bare_for_a_healthy_proposal() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.04]));
-        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &[]).unwrap();
         let msg =
             all_invalid_weights_message(&[SampleOutcome::NonFiniteOfv], &names(2), &conditioned);
         assert!(msg.contains("1 non-finite OFV"), "{msg}");
@@ -2002,7 +2049,7 @@ mod tests {
         assert!((caps[0] - expected).abs() < 1e-12, "{}", caps[0]);
         // A proposal built on it is still PD, not an error.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7]));
-        let c = condition_free_proposal(&cov, &caps, &names(1)).unwrap();
+        let c = condition_free_proposal(&cov, &caps, &names(1), &[]).unwrap();
         assert!(c.chol[(0, 0)] > 0.0);
     }
 
@@ -2029,7 +2076,7 @@ mod tests {
         // sd 3.0 against a cap of 1.5: over the cap, but nowhere near the
         // 1e3–1e4 overshoot the cap exists for.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[9.0, 0.01]));
-        let c = condition_free_proposal(&cov, &[1.5, 1.5], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.5, 1.5], &names(2), &[]).unwrap();
         assert!(
             c.capped_dirs.is_empty(),
             "a merely imprecise direction must not be shrunk: {:?}",
@@ -2046,7 +2093,7 @@ mod tests {
         let cap_sd = 1.5_f64;
         let over = (CAP_TRIGGER_FACTOR + 1.0) * cap_sd;
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[over * over, 0.01]));
-        let c = condition_free_proposal(&cov, &[cap_sd, cap_sd], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[cap_sd, cap_sd], &names(2), &[]).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         let round = &c.chol * c.chol.transpose();
         assert!(
@@ -2068,7 +2115,7 @@ mod tests {
                 0.013, 0.0021, -0.0007, 0.0021, 0.041, 0.0033, -0.0007, 0.0033, 0.0089,
             ],
         );
-        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3), &[]).unwrap();
         let expected = cov.clone().cholesky().expect("input is PD").l();
         for i in 0..3 {
             for j in 0..3 {
@@ -2081,6 +2128,194 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── #2179: the floor and the cap do not see an identity-packed θ's units ──
+
+    /// `Σ` with coordinate 0 written `k` times larger: its row and column scale as `k`.
+    fn scale_coordinate_0(cov: &DMatrix<f64>, k: f64) -> DMatrix<f64> {
+        let mut out = cov.clone();
+        for j in 0..cov.ncols() {
+            out[(0, j)] *= k;
+            out[(j, 0)] *= k;
+        }
+        out
+    }
+
+    #[test]
+    fn an_identity_coordinate_in_large_or_small_units_is_not_floored() {
+        // A healthy, fully coupled block. Written in units k = 1e6, coordinate 0's variance
+        // becomes `λ_max` and puts the relative floor above the other two; at k = 1e-6 its own
+        // eigenvalue (≈ 4.7e-13) falls under the absolute 1e-12. The caps scale with k, as a
+        // θ's bounds do, and are wide enough never to fire.
+        let cov = DMatrix::from_row_slice(3, 3, &[0.5, 0.1, 0.05, 0.1, 0.4, 0.08, 0.05, 0.08, 0.3]);
+        for k in [1e6, 1e-6] {
+            let ck = scale_coordinate_0(&cov, k);
+            let caps = [1e3 * k, 1e3, 1e3];
+            // The straddle: unmarked, the same block IS floored, so the fixture reaches the
+            // floor; and marking another coordinate does not help.
+            let unmarked = condition_free_proposal(&ck, &caps, &names(3), &[]).unwrap();
+            assert!(
+                !unmarked.null_dirs.is_empty(),
+                "k = {k}: fixture must reach the floor"
+            );
+            let wrong =
+                condition_free_proposal(&ck, &caps, &names(3), &[false, true, false]).unwrap();
+            assert!(
+                !wrong.null_dirs.is_empty(),
+                "k = {k}: marking P1 must not help"
+            );
+
+            let c = condition_free_proposal(&ck, &caps, &names(3), &[true, false, false]).unwrap();
+            assert!(c.null_dirs.is_empty(), "k = {k}: {:?}", c.null_dirs);
+            assert!(c.capped_dirs.is_empty(), "k = {k}: {:?}", c.capped_dirs);
+            // Nothing was floored or capped, so the factor is the unscaled input's own
+            // Cholesky, bit for bit: the draws are those of `Σ_k` itself.
+            let expected = ck.clone().cholesky().expect("input is PD").l();
+            assert_eq!(c.chol, expected, "k = {k}");
+            // `log|Σ_k| = log|Σ| + 2 log k`. Measured relative error 1.4e-16 (k = 1e6) and
+            // 0 (k = 1e-6) on macOS arm64.
+            let want = cov.determinant().ln() + 2.0 * k.ln();
+            let rel = ((c.log_det - want) / want).abs();
+            eprintln!("k = {k:e}: log_det rel {rel:.3e}");
+            assert!(
+                rel < 1e-13,
+                "k = {k}: log_det {} vs {want}, rel {rel:e}",
+                c.log_det
+            );
+        }
+    }
+
+    #[test]
+    fn a_capped_proposal_maps_back_through_the_identity_coordinates_scale() {
+        // Coordinate 1 (unmarked) is explosive — variance 1e7 against an sd cap of 1 — and
+        // correlated 0.9 with the marked coordinate 0, so the capped direction loads on both
+        // and is rebuilt through `V Λ Vᵀ`, the path that has to map the factor back by `D`.
+        // Coordinate 0's cap scales with k, as its bounds would. In every unit the result must
+        // be the k = 1 result, `K·L₁` and `log|Σ₁| + 2 log k`, with the same reported
+        // direction: its loadings and sd's are those of the equilibrated block.
+        let rho = 0.9;
+        let cov1 = DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                1.0,
+                rho * 1e7f64.sqrt(),
+                0.0,
+                rho * 1e7f64.sqrt(),
+                1e7,
+                0.0,
+                0.0,
+                0.0,
+                0.01,
+            ],
+        );
+        let mask = [true, false, false];
+        let at = |k: f64| {
+            condition_free_proposal(
+                &scale_coordinate_0(&cov1, k),
+                &[k, 1.0, 1.0],
+                &names(3),
+                &mask,
+            )
+            .unwrap()
+        };
+        let c1 = at(1.0);
+        assert_eq!(
+            c1.capped_dirs.len(),
+            1,
+            "fixture must cap: {:?}",
+            c1.capped_dirs
+        );
+        assert!(c1.null_dirs.is_empty(), "{:?}", c1.null_dirs);
+        let want_ld = |k: f64| c1.log_det + 2.0 * k.ln();
+        // Worst entry of `K⁻¹·L` against `L₁`, relative to the row's diagonal.
+        let worst_vs_c1 = |l: &DMatrix<f64>, k: f64| {
+            let kv = [k, 1.0, 1.0];
+            let mut worst: f64 = 0.0;
+            for i in 0..3 {
+                for j in 0..=i {
+                    let (got, want) = (l[(i, j)] / kv[i], c1.chol[(i, j)]);
+                    assert!(got.is_finite(), "k = {k}: chol[{i},{j}] = {got}");
+                    worst = worst.max((got - want).abs() / c1.chol[(i, i)].abs());
+                }
+            }
+            worst
+        };
+        for k in [1e6, 1e-6] {
+            // The straddle: unmarked, the same rescaled block is capped in its raw units and
+            // the factor moves.
+            let unmarked = condition_free_proposal(
+                &scale_coordinate_0(&cov1, k),
+                &[k, 1.0, 1.0],
+                &names(3),
+                &[],
+            )
+            .unwrap();
+            let off = worst_vs_c1(&unmarked.chol, k);
+            assert!(
+                off > 1e-2,
+                "k = {k}: fixture must move unmarked, worst {off:e}"
+            );
+            let ck = at(k);
+            assert_eq!(ck.capped_dirs, c1.capped_dirs, "k = {k}");
+            assert!(ck.null_dirs.is_empty(), "k = {k}: {:?}", ck.null_dirs);
+            let worst = worst_vs_c1(&ck.chol, k);
+            let ld_rel = ((ck.log_det - want_ld(k)) / want_ld(k)).abs();
+            eprintln!(
+                "k = {k:e}: chol worst {worst:.3e} (unmarked {off:.3e}), log_det rel {ld_rel:.3e}"
+            );
+            // Measured on macOS arm64: chol 1.3e-16 relative to the row's diagonal and log_det
+            // 0, at both k.
+            assert!(worst < 1e-12, "k = {k}: worst chol difference {worst:e}");
+            let want = want_ld(k);
+            assert!(ld_rel < 1e-12, "k = {k}: log_det {} vs {want}", ck.log_det);
+        }
+    }
+
+    #[test]
+    fn the_proposal_mask_leaves_a_logit_drawn_theta_unmarked() {
+        // θ lower bounds -1 (identity), -0.5 (identity, but a LogitProbability θ drawn on the
+        // logit scale), 0.1 (log); then Ω and σ, never marked.
+        let omega = OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(1, 1, &[0.09]),
+            vec!["E1".into()],
+            false,
+        );
+        let params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![1.0, 0.4, 5.0],
+            theta_names: vec!["A".into(), "P".into(), "B".into()],
+            theta_lower: vec![-1.0, -0.5, 0.1],
+            theta_upper: vec![10.0, 0.999, 50.0],
+            theta_fixed: vec![false; 3],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        };
+        let free_idx = [0usize, 1, 2, 3, 4];
+        let logit = [LogitThetaCoord {
+            index: 1,
+            log_packed: false,
+        }];
+        // Without the logit coordinate the covariance step's mask marks both identity θ's;
+        // with it, only the one that carries units.
+        assert_eq!(
+            proposal_equilibrate_mask(&params, &free_idx, &[]),
+            vec![true, true, false, false, false]
+        );
+        assert_eq!(
+            proposal_equilibrate_mask(&params, &free_idx, &logit),
+            vec![true, false, false, false, false]
+        );
     }
 
     /// #1037: a degenerate direction spread thinly over many coordinates has no

@@ -423,7 +423,7 @@ fn test_invert_psd_with_floor_rejects_negative_definite() {
     // extract_eigenvalues succeeds and the proposal is all-finite and PD.
     let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
     assert!(eigs.iter().all(|e| e.is_finite()));
-    let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0);
+    let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0, &[]);
     assert!(
         proposal.iter().all(|v| v.is_finite()),
         "fallback proposal must be finite for a finite non-PD Hessian"
@@ -4176,7 +4176,7 @@ fn bench_cov_hessian_throughput() {
 fn build_fallback_proposal_is_pd_and_inflated() {
     let hess = DMatrix::from_row_slice(2, 2, &[-2.0_f64, 0.0, 0.0, 4.0]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[]);
     // Result must be symmetric PD.
     assert!(proposal[(0, 0)] > 0.0, "diagonal must be positive");
     assert!(proposal[(1, 1)] > 0.0, "diagonal must be positive");
@@ -4206,7 +4206,7 @@ fn build_fallback_proposal_is_pd_and_inflated() {
 fn build_fallback_proposal_zeros_fixed_params() {
     let hess = DMatrix::from_row_slice(1, 1, &[2.0_f64]);
     let free_idx = [0usize];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0);
+    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0, &[]);
     assert_eq!(proposal.nrows(), 3);
     assert_eq!(proposal.ncols(), 3);
     assert!(
@@ -4227,7 +4227,7 @@ fn build_fallback_proposal_caps_condition_number() {
     // diag(1000, 1e-9): one well-determined direction, one near-flat.
     let hess = DMatrix::from_row_slice(2, 2, &[1000.0_f64, 0.0, 0.0, 1e-9]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[]);
     let eig = SymmetricEigen::new(proposal.clone());
     let max_var = eig.eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
     let min_var = eig.eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
@@ -4245,6 +4245,63 @@ fn build_fallback_proposal_caps_condition_number() {
         max_var / min_var,
         FALLBACK_PROPOSAL_MAX_COND
     );
+}
+
+/// #2179: the fallback's `|λ|max / 1e8` floor does not see an identity-packed θ's units.
+/// Writing coordinate 0 `k` times larger scales its row and column of the Hessian by `1/k`;
+/// with the coordinate marked, the proposal must be the k = 1 proposal with coordinate 0's row
+/// and column scaled by `k`, while unmarked the same Hessian is floored differently.
+#[test]
+fn build_fallback_proposal_is_equivariant_in_an_identity_coordinates_units() {
+    // Indefinite (eigenvalues ≈ -1.1, 1.4, 2.2), fully coupled.
+    let hess = DMatrix::from_row_slice(3, 3, &[2.0_f64, 0.5, 0.3, 0.5, -1.0, 0.2, 0.3, 0.2, 1.5]);
+    let free_idx = [0usize, 1, 2];
+    let mask = [true, false, false];
+    let scaled = |m: &DMatrix<f64>, k: f64| {
+        let mut out = m.clone();
+        for j in 0..3 {
+            out[(0, j)] *= k;
+            out[(j, 0)] *= k;
+        }
+        out
+    };
+    // Unlike an inverse, `V |Λ|⁻¹ Vᵀ` depends on the basis it is taken in, so the marked
+    // proposal differs from the unmarked one even at k = 1, by 2.7 % on its (0,0) entry here: the mask picks
+    // the equilibrated basis, which is the one that does not move with the units.
+    let p1 = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0, &mask);
+    for k in [1e6, 1e-6] {
+        let hk = scaled(&hess, 1.0 / k);
+        let want = scaled(&p1, k);
+        let worst_rel = |p: &DMatrix<f64>| {
+            let mut worst: f64 = 0.0;
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert!(p[(i, j)].is_finite(), "k = {k}: ({i},{j}) = {}", p[(i, j)]);
+                    // Relative to the geometric mean of the two diagonals, so an entry in the
+                    // coordinate's units is judged on the scale it carries.
+                    let scale = (want[(i, i)] * want[(j, j)]).sqrt();
+                    worst = worst.max((p[(i, j)] - want[(i, j)]).abs() / scale);
+                }
+            }
+            worst
+        };
+        // The straddle: unmarked, the rescaled Hessian is floored and the proposal moves.
+        let unmarked = build_non_pd_fallback_proposal(&hk, &free_idx, 3, 4.0, &[]);
+        let off = worst_rel(&unmarked);
+        assert!(
+            off > 1e-2,
+            "k = {k}: fixture must reach the floor, worst {off:e}"
+        );
+        let marked = build_non_pd_fallback_proposal(&hk, &free_idx, 3, 4.0, &mask);
+        let worst = worst_rel(&marked);
+        eprintln!("k = {k:e}: marked worst {worst:.3e}, unmarked {off:.3e}");
+        // Measured worst 1.5e-16 (k = 1e6) and 2.9e-16 (k = 1e-6) on macOS arm64; unmarked,
+        // 1.0 at both.
+        assert!(
+            worst < 1e-12,
+            "k = {k}: worst relative difference {worst:e}"
+        );
+    }
 }
 
 // ── select_fd_step ───────────────────────────────────────────────────────
