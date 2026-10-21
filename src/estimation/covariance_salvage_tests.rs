@@ -7,6 +7,10 @@
 //! A subject is declined through [`super::forced_cov_decline`] by id, so the salvage is reached
 //! without changing any prediction: the forward provider's tests routed a subject onto the
 //! event walk with an unused time-varying covariate, a shape the adjoint now serves.
+//!
+//! Also here (#2048): an ODE model past the forward provider's old 24-axis `θ + η` cap keeps
+//! the analytic outer route and assembles the analytic R-matrix for every subject, measured
+//! by the FD objectives the step evaluates.
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
@@ -455,6 +459,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
                 n,
                 &x_hat,
                 &free_idx,
+                &crate::estimation::parameterization::fd_step_floors(params, &model.default_params),
                 opts.fd_hessian_step,
                 f0,
                 None,
@@ -1051,7 +1056,7 @@ fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
     };
     let x = [0.0, 0.0];
     let opts = FitOptions::default();
-    let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, None, &ofv, &opts)
+    let stencil = fd_ofv_stencil(2, &x, &[0, 1], &[1.0, 1.0], 1e-2, 0.0, None, &ofv, &opts)
         .expect("nothing cancels in a test");
 
     // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
@@ -1078,4 +1083,185 @@ fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
     assert_eq!(stencil.offdiag_nan, named);
     assert_eq!(stencil.hess[(0, 1)], 0.0);
     assert_eq!(stencil.hess[(1, 0)], 0.0);
+}
+
+// ── #2048: an ODE model past the retired forward provider's 24-axis `θ + η` cap ──────────
+
+/// Runs `f` with [`super::FD_OBJECTIVE_EVALS`] reset, returning its result and the objectives
+/// the covariance step's FD probe and stencil evaluated meanwhile.
+fn fd_objective_evals_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    super::FD_OBJECTIVE_EVALS.with(|c| c.set(0));
+    let out = f();
+    (out, super::FD_OBJECTIVE_EVALS.with(|c| c.get()))
+}
+
+/// #2048's fixture: a one-state ODE model with 2 θ + 2 η plus `n_fix` FIX θ, each a
+/// factor of exactly 1 on CL, so the likelihood does not depend on `n_fix` while the
+/// `θ + η` count the retired forward provider capped at 24 does.
+fn padded_ode_model(n_fix: usize) -> crate::types::CompiledModel {
+    let thetas: String = (0..n_fix)
+        .map(|k| format!("  theta TH_{k}(0.0, -3.0, 3.0) FIX\n"))
+        .collect();
+    let factors: String = (0..n_fix).map(|k| format!(" * (1 + TH_{k})")).collect();
+    crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
+         {thetas}  omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.15\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL{factors} * exp(ETA_CL)\n\
+         V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = -(CL/V) * central\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    ))
+    .unwrap()
+}
+
+/// #2048: an ODE model past the retired forward provider's 24-axis `θ + η` cap keeps every
+/// analytic route the fit reports. Before #2093 the 25th axis (here a FIX θ, which counts)
+/// dropped the outer gradient to FD, sent `auto` to BOBYQA and the covariance step to the
+/// stencil, with nothing in the fit saying why. The adjoint has no θ cap, so the three
+/// predicates the fit routes on must read the same at 24 and past it — asserted on both
+/// sides of the old cap so a reinstated cap reddens the far side by name, and on a
+/// `gradient = fd` control so the predicates are shown able to decline at all.
+#[test]
+fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    use crate::sens::provider::{
+        analytic_outer_gradient_for_interaction, analytic_outer_gradient_in_scope,
+    };
+    use crate::types::{FitOptions, GradientMethod, Optimizer, Population, Subject};
+    let model = padded_ode_model;
+    let population = Population {
+        subjects: vec![Subject::default()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options = FitOptions::default();
+    for n_fix in [20, 21, 40] {
+        let m = model(n_fix);
+        let axes = m.n_theta + m.n_eta;
+        assert_eq!(axes, 4 + n_fix, "the FIX θ are counted as θ");
+        assert!(m.ode_spec.is_some(), "{axes} axes: an ODE model");
+        assert!(
+            analytic_outer_gradient_in_scope(&m),
+            "{axes} axes: the outer gradient must stay analytic"
+        );
+        for interaction in [true, false] {
+            assert_eq!(
+                Optimizer::Auto.resolve_auto(&m, interaction),
+                Optimizer::NloptLbfgs,
+                "{axes} axes, interaction = {interaction}: `auto` must take L-BFGS"
+            );
+        }
+        assert_eq!(
+            super::analytic_cov_declines(&m, &population, &options, false),
+            vec![CovScopeDecline::PerSubjectBail],
+            "{axes} axes: no model-level clause may decline the analytic R-matrix"
+        );
+        assert!(super::analytic_r_expected(&m, &population, &options, false));
+
+        let mut fd = model(n_fix);
+        fd.gradient_method = GradientMethod::Fd;
+        assert!(
+            !analytic_outer_gradient_for_interaction(&fd, true),
+            "{axes} axes, FD"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&fd, true),
+            Optimizer::Bobyqa,
+            "{axes} axes, FD"
+        );
+        assert!(!super::analytic_r_expected(
+            &fd,
+            &population,
+            &options,
+            false
+        ));
+    }
+}
+
+/// #2048, the covariance step as it **runs**, not as it is predicted. `analytic_r_expected`
+/// above is a model-level walk; a cap reinstated inside the profile-Hessian recorder
+/// (`subject_adjoint_cov_hessian` returning `None` per subject) would leave it green while
+/// every subject fell to the stencil — the issue's 50× covariance step. So on real
+/// subjects at 24 and 25 axes: the assembly returns `Full` (no subject declined), and the
+/// whole step evaluates **zero** FD objectives. The controls run the same step with the
+/// analytic R-matrix switched off and with `gradient = fd`, and must pay the full `2·n²`
+/// stencil, so the zero is a count that can move.
+#[test]
+fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject() {
+    use crate::types::{FitOptions, GradientMethod};
+    let mut population = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/two_cpt_oral_cov.csv"),
+        None,
+        None,
+    )
+    .expect("two_cpt_oral_cov.csv loads");
+    population.subjects.truncate(6);
+    let options = FitOptions::default();
+    let off = FitOptions {
+        analytic_cov_hessian: false,
+        ..FitOptions::default()
+    };
+    for n_fix in [20, 21] {
+        let model = padded_ode_model(n_fix);
+        let axes = model.n_theta + model.n_eta;
+        let p = model.default_params.clone();
+        let x = crate::estimation::parameterization::pack_params(&p);
+        let (etas, hs): (Vec<_>, Vec<_>) = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let e = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                    &model, s, &p, 200, 1e-8, None, None, 0, &options,
+                );
+                (e.eta, e.h_matrix)
+            })
+            .unzip();
+        let kappas = vec![Vec::new(); population.subjects.len()];
+        let n_free = model.free_packed_dim();
+
+        let assembly =
+            super::analytic_cov_assembly(&model, &population, &p, &x, &etas, &kappas, &options);
+        assert!(
+            matches!(assembly, super::AnalyticCovAssembly::Full(_)),
+            "{axes} axes: every subject must take the analytic R-matrix"
+        );
+        let step = |m: &crate::types::CompiledModel, o: &FitOptions| {
+            fd_objective_evals_during(|| {
+                super::compute_covariance(&x, &p, m, &population, &etas, &hs, &kappas, o)
+            })
+        };
+        let (out, evals) = step(&model, &options);
+        assert!(
+            matches!(out, super::CovarianceStepResult::Success(_)),
+            "{axes} axes: analytic step"
+        );
+        assert_eq!(
+            evals, 0,
+            "{axes} axes: the analytic step differences no objective"
+        );
+
+        let (out, evals) = step(&model, &off);
+        assert!(matches!(out, super::CovarianceStepResult::Success(_)));
+        assert_eq!(
+            evals,
+            super::fd_r_objective_evals(n_free).unwrap(),
+            "{axes} axes, analytic_cov_hessian = false: the stencil"
+        );
+        let mut fd = padded_ode_model(n_fix);
+        fd.gradient_method = GradientMethod::Fd;
+        assert!(matches!(
+            super::analytic_cov_assembly(&fd, &population, &p, &x, &etas, &kappas, &options),
+            super::AnalyticCovAssembly::Unavailable
+        ));
+        let (_, evals) = step(&fd, &options);
+        assert_eq!(
+            evals,
+            super::fd_r_objective_evals(n_free).unwrap(),
+            "{axes} axes, gradient = fd: the stencil"
+        );
+    }
 }

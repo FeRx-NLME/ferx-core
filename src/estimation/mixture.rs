@@ -25,7 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{
-    pack_params, pack_with_bounds, packed_segments, theta_packs_log, unpack_params, PackedBounds,
+    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
+    unpack_params, PackedBounds,
 };
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{
@@ -367,8 +368,9 @@ pub fn mixture_gradient(
     }
 
     // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
+    let theta_floor = fd_theta_step_floors(&model.default_params);
     for (i, subject) in population.subjects.iter().enumerate() {
-        let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates)?;
+        let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates, &theta_floor)?;
         for (cls, dlnp_c) in dlnp.iter().enumerate() {
             let w = eval.pmix[i][cls];
             if w == 0.0 {
@@ -565,8 +567,9 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates)
-            .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates));
+        let floor = fd_theta_step_floors(&model.default_params);
+        let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
+            .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
         for (cls, view) in self.classes.iter().enumerate() {
             let w = self.eval.pmix[i][cls];
@@ -677,6 +680,89 @@ mod tests {
         assert!((contrib - (-2.0 * l.ln())).abs() < 1e-10);
         let p0 = 0.3 * (-2.0_f64).exp() / l;
         assert!((pmix[0] - p0).abs() < 1e-10);
+    }
+
+    /// #2147: the mixing-map derivative steps θ in its own units. With `TINY = 7.7e-8` in
+    /// `sqrt(TINY)`, the legacy step `1e-6·max(|θ|, 1) = 1e-6` puts the minus point at
+    /// `−9.2e-7`; the floor `|θ₀|` steps by `1e-6·TINY` instead. `dlnp/dTINY` against the
+    /// closed form `(1 − pⱼ)·g′` with `g′ = 1/(2·sqrt(TINY))` (class 1) and `−p₁·g′`
+    /// (class 2), for both mixing forms — `p(1) = sqrt(TINY)` routes to the FD map. Each
+    /// side asserts the floored step and the straddle that floor 1 is wrong.
+    #[test]
+    fn mixing_derivative_steps_a_small_theta_relative_to_its_floor() {
+        use crate::estimation::parameterization::fd_theta_step_floors;
+        use crate::parser::model_parser::{mixing_logp_grad, mixing_logp_grad_fd};
+        use std::collections::HashMap;
+
+        let tiny = 7.7e-8_f64;
+        let g = tiny.sqrt();
+        let dg = 0.5 / g;
+        let none = HashMap::new();
+        for logit in [true, false] {
+            let mixing = if logit {
+                "logit(1) = sqrt(TINY)"
+            } else {
+                "p(1) = sqrt(TINY)"
+            };
+            let src = format!(
+                "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TINY({tiny:e}, -1.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.1
+[mixture]
+  nsub = 2
+  {mixing}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=10.0)
+[error_model]
+  DV ~ proportional(EPS)
+"
+            );
+            let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+            let spec = model.mixture.as_ref().unwrap();
+            let theta = &model.default_params.theta;
+            let floor = fd_theta_step_floors(&model.default_params);
+            assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
+            // The closed form: softmax with logit g, or the p form p₁ = g (both unclamped
+            // here, p₁ = 2.8e-4).
+            let p1 = if logit { 1.0 / (1.0 + (-g).exp()) } else { g };
+            let want = if logit {
+                [(1.0 - p1) * dg, -p1 * dg]
+            } else {
+                [dg / p1, -dg / (1.0 - p1)]
+            };
+            let grad = |f: &[f64]| {
+                if logit {
+                    mixing_logp_grad(spec, theta, &none, f).unwrap()
+                } else {
+                    assert!(mixing_logp_grad(spec, theta, &none, f).is_none());
+                    mixing_logp_grad_fd(spec, theta, &none, f)
+                }
+            };
+            let got = grad(&floor);
+            for c in 0..2 {
+                let rel = (got[c][1] - want[c]).abs() / want[c].abs();
+                // Central difference of sqrt at h/x = 1e-6: truncation ~1e-13, so what is
+                // left is rounding. Measured: 7.1e-11 (logit); p form 1.0e-9 (class 1) and 1.4e-7
+                // (class 2, whose ln(1 − p₁) moves by only ~3e-10 across the step). The legacy step is 71 % off.
+                assert!(
+                    rel < 1e-6,
+                    "{mixing} class {}: {} vs {}",
+                    c + 1,
+                    got[c][1],
+                    want[c]
+                );
+            }
+            let legacy = grad(&[1.0, 1.0]);
+            let rel = (legacy[0][1] - want[0]).abs() / want[0].abs();
+            assert!(
+                !(rel < 0.1),
+                "{mixing}: the legacy step must be wrong ({rel})"
+            );
+        }
     }
 
     // ── End-to-end fit() smoke / convergence tests ──

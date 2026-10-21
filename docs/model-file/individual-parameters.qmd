@@ -118,12 +118,13 @@ in `TIME mod 24`.
 
 ### Values outside an operation's domain
 
-Four operations return a finite value outside their domain instead of an error
+Five operations return a finite value outside their domain instead of an error
 or a `NaN`. They do it silently: nothing is warned or reported.
 
 | Operation | Outside the domain | Returns |
 |-----------|--------------------|---------|
 | `a / b` | `abs(b) < 1e-30` | `0` |
+| `a mod b` | `abs(b) < 1e-30` | `0` |
 | `log(x)`, `ln(x)` | `x < 1e-30`, or `x` is `NaN` | `log(1e-30)`, about `-69.08` |
 | `sqrt(x)` | `x < 0`, or `x` is `NaN` | `0` |
 | `logit(x)` | `x` below `1e-15` or above `1 - 1e-15` | the value at that bound, about `-34.54` or `34.54` |
@@ -150,7 +151,7 @@ wrong parameter and no error:
 **Coming from NONMEM.** NONMEM protects these operations only when asked:
 `$ABBR PROTECT` makes NM-TRAN replace `LOG`, `SQRT` and `EXP` with `PLOG`,
 `PSQRT` and `PEXP`, guard `/` with `PDZ`, and rewrite `B**E` as
-`PEXP(E*PLOG(B))`. ferx always guards `/`, `log`, `sqrt` and `logit`, with the
+`PEXP(E*PLOG(B))`. ferx always guards `/`, `mod`, `log`, `sqrt` and `logit`, with the
 thresholds in the table above, and never guards `exp` or `^`. A translated
 model can therefore behave differently on a value outside the domain. Without
 `$ABBR PROTECT`, NONMEM guards neither `LOG` nor `SQRT`, while ferx returns
