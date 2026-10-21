@@ -706,31 +706,32 @@ fn detect_mu_refs_with_owners(
             let carries_eta = expr_contains_eta(raw_expr)
                 || reads_eta_name
                 || (self_rewrite && eta_carrying.contains(name.as_str()));
-            let owner = match &found {
-                Some((eta_idx, mu_ref)) => {
-                    Some((eta_names[*eta_idx].clone(), mu_ref.theta_name.clone()))
-                }
-                // A self-dependent rewrite (#1930 review r3/r4): `InlineScope`
-                // does not inline a multiply-assigned name, so `CL = CL` or
-                // `CL = CL * (WT/70)^0.75` classifies as nothing on its own. With
-                // the previous value substituted the same classifier decides, so
-                // the owner carries exactly when the rewritten value is still a
-                // single-anchor mu-reference: `CL = 1.0 / CL` and `CL = CL * FACTOR`
-                // are rejected as their one-line equivalents are. A value that also
-                // reads another η-carrying name, or a second η of its own
-                // (`CL = CL * exp(IIV_CL)`, which the classifier would accept on its
-                // first `exp(η)`), is declined: the variance NCA would write is no
-                // longer one η's.
-                None => match &value {
-                    Some(v)
-                        if self_rewrite && !reads_eta_name && extract_eta_indices(v).len() == 1 =>
-                    {
+            // A self-dependent rewrite (#1930 review r3–r5) is classified on its
+            // **effective** value — the previous value substituted in — and never
+            // on the raw line. `InlineScope` does not inline a multiply-assigned
+            // name, so the raw `CL` reference is opaque in both directions: `CL = CL`
+            // or `CL = CL * (WT/70)^0.75` classifies as nothing on its own, and
+            // `CL = CL * TVNEW * exp(IIV_CL)` as a clean `(IIV_CL, TVNEW)` although
+            // its value carries two θ anchors and two η. With the previous value
+            // substituted the classifier decides as for a one-line model, so
+            // `CL = 1.0 / CL` and `CL = CL * FACTOR` retire the owner. A value that
+            // reads another η-carrying name, or a second η of its own
+            // (`CL = CL * exp(IIV_CL)`, which the classifier would accept on its
+            // first `exp(η)`), is declined: the variance NCA would write is no
+            // longer one η's.
+            let owner = if self_rewrite {
+                match &value {
+                    Some(v) if !reads_eta_name && extract_eta_indices(v).len() == 1 => {
                         classify_mu_ref(v, theta_names, eta_names, nn_specs).map(
                             |(eta_idx, mu_ref)| (eta_names[eta_idx].clone(), mu_ref.theta_name),
                         )
                     }
                     _ => None,
-                },
+                }
+            } else {
+                found.as_ref().map(|(eta_idx, mu_ref)| {
+                    (eta_names[*eta_idx].clone(), mu_ref.theta_name.clone())
+                })
             };
             owners.insert(name.clone(), owner);
             if carries_eta {

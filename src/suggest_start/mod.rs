@@ -1647,15 +1647,24 @@ mod tests {
             ("reads another owner", "  CL = CL * V\n", None),
             ("reciprocal", "  CL = 1.0 / CL\n", None),
             ("second theta anchor", "  CL = CL * FACTOR\n", None),
+            // Review r5: the raw line alone is a clean `TVNEW * exp(IIV_CL)`
+            // mu-reference — `CL` is opaque to the classifier — but the value is
+            // `TVOLD * exp(ETA_OLD) * TVNEW * exp(IIV_CL)`: two θ, two η, no owner.
+            // `TVNEW` contains no `CL`, so the θ assertion straddles too: the raw
+            // match answers `TVNEW`, the fixed lookup falls to layer 2's `TVCL`.
+            (
+                "raw line is itself a mu-ref",
+                "  CL = CL * TVNEW * exp(IIV_CL)\n",
+                None,
+            ),
         ] {
             let src = model(line).replace("  V = TVV * exp(ETA_V)\n", "");
-            let src = if line.contains("FACTOR") {
-                src.replace(
+            let src = match ["FACTOR", "TVNEW"].into_iter().find(|t| line.contains(t)) {
+                Some(extra) => src.replace(
                     "  theta TVV(",
-                    "  theta FACTOR(1.0, 0.1, 10.0)\n  theta TVV(",
-                )
-            } else {
-                src
+                    &format!("  theta {extra}(1.0, 0.1, 10.0)\n  theta TVV("),
+                ),
+                None => src,
             };
             // `CL = CL * V` needs V declared above it.
             let src = src.replace(
