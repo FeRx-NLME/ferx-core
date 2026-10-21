@@ -93,9 +93,9 @@ fn tvv_s(result: &FitResult) -> f64 {
 fn a_large_identity_theta_reaches_the_minimum_under_auto() {
     let r = fit_with(Optimizer::Auto, ParameterScaling::Auto);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // Linux x86_64 (glibc 2.28), at 6d85dd16: OFV −286.0042195068 in 33
+    // Linux x86_64 (glibc 2.28), at b164d98: OFV −286.0042195051 in 33
     // iterations, 2.0e-5 from OFV_MIN, so the 1e-3 band has 50× headroom; TVV_S
-    // 773770.613, 0.013 from the bound's centre, against 100.
+    // 773770.591, 0.009 from the bound's centre, against 100.
     assert!(
         (r.ofv - OFV_MIN).abs() < 1e-3,
         "auto: OFV {} is not the minimum {OFV_MIN} (stalled fits end at {OFV_STALLED})",
@@ -116,9 +116,9 @@ fn a_large_identity_theta_reaches_the_minimum_under_auto() {
 fn a_large_identity_theta_reaches_the_minimum_under_bobyqa() {
     let r = fit_with(Optimizer::Bobyqa, ParameterScaling::Auto);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // Linux x86_64 (glibc 2.28), at 6d85dd16: OFV −286.0040852286 in 338
-    // iterations, 1.1e-4 from OFV_MIN, so the 1e-3 band has 8.7× headroom; TVV_S
-    // 773780.479, 9.9 from the bound's centre, against 100. Since #2170 polishes a
+    // Linux x86_64 (glibc 2.28), at b164d98: OFV −286.0042137931 in 385
+    // iterations, 1.4e-5 from OFV_MIN, so the 1e-3 band has 72× headroom; TVV_S
+    // 773755.606, 15.0 from the bound's centre, against 100. Since #2170 polishes a
     // BOBYQA tolerance stop, BOBYQA reaches the minimum as closely as L-BFGS does.
     assert!(
         (r.ofv - OFV_MIN).abs() < 1e-3,
@@ -140,8 +140,8 @@ fn a_large_identity_theta_reaches_the_minimum_under_bobyqa() {
 fn an_explicit_none_still_leaves_the_large_identity_theta_stalled() {
     let r = fit_with(Optimizer::Auto, ParameterScaling::None);
     assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
-    // Linux x86_64 (glibc 2.28), at 6d85dd16: OFV −265.4195452100 in 25
-    // iterations, 4.5e-4 from OFV_STALLED against 0.05; TVV_S 999999.999987.
+    // Linux x86_64 (glibc 2.28), at b164d98: OFV −265.4195452098 in 25
+    // iterations, 4.5e-4 from OFV_STALLED against 0.05; TVV_S 999999.999986.
     assert!(
         (r.ofv - OFV_STALLED).abs() < 0.05,
         "none: OFV {} should stay at the stall {OFV_STALLED}; if it reaches the \
