@@ -143,7 +143,7 @@ impl CovScopeDecline {
             }
             CovScopeDecline::TooManyRandomEffects => {
                 "a subject has more random effects than the analytic R-matrix serves \
-                 (8 under Laplace's exact anchor, 24 otherwise)"
+                 (8 under Laplace's exact anchor, 48 otherwise)"
             }
             CovScopeDecline::PerSubjectBail => {
                 "at least one subject fell outside the analytic assembly"

@@ -2357,7 +2357,7 @@ where
 /// that every width instantiates in full — so it pads to these rather than to every
 /// [`WIDTH_BUCKETS`] entry (#2093 review), at the cost of a few inert directions on the
 /// widths between.
-const EXACT_ANCHOR_BUCKETS: [usize; 4] = [2, 4, 8, 24];
+const EXACT_ANCHOR_BUCKETS: [usize; 5] = [2, 4, 8, 24, 48];
 
 /// A [`WIDTH_BUCKETS`] width as a type, so whether the exact anchor's taped recording is
 /// instantiated at it is decided at compile time ([`ExactAnchor`]).
@@ -2439,8 +2439,8 @@ macro_rules! exact_anchor_buckets {
 }
 
 exact_anchor_buckets!(
-    taped: (2, 3), (4, 10), (8, 36), (24, 300);
-    declined: (1, 1), (3, 6), (6, 21), (12, 78), (16, 136), (32, 528), (48, 1176)
+    taped: (2, 3), (4, 10), (8, 36), (24, 300), (48, 1176);
+    declined: (1, 1), (3, 6), (6, 21), (12, 78), (16, 136), (32, 528)
 );
 
 /// The taped half of [`run_agq`]: the node recordings, the scalar-tape objective, the

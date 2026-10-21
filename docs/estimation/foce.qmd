@@ -258,7 +258,7 @@ above.
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
 | SS + an RHS reading `TIME`/`T`/`TAFD`, or `TAD` with a lagged SS dose | ODE | both | an absolute clock has no periodic steady state; the lagged pre-arrival window's `TAD` convention is open (#1126). A `TAD`-only RHS under unlagged SS is analytic |
 | a reset or covariate change exactly on a moving boundary (a lagged arrival, a moving window end), or two moving boundaries coinciding | closed-form | both | the walk resolves one dual position per break time. An *observation* on a moving boundary is analytic ([below](#sampling-on-a-moving-boundary)) |
-| more than 48 random effects (stacked `[η, κ]` under IOV; 24 for Laplace's exact anchor, 8 for its exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
+| more than 48 random effects (stacked `[η, κ]` under IOV; 8 for Laplace's exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
 
 Since the adjoint gradient (#486), LTBS × IOV on ODE models, a rate-defined infusion under
 `F ≠ 1`, the M3 × IOV × `iiv_on_ruv` triple's inner gradient, and models past the forward
@@ -295,8 +295,8 @@ The practical consequence is that at *exactly* such a coincidence an analytic gr
 Since the adjoint (#2093) model size is not a limit on the analytic route. Its cost does not grow
 with the number of θ, so neither the θ count nor the number of individual parameters is capped,
 and a Form-C `[scaling] y = <expr>` readout is recorded like any other. What does limit it is the
-number of random effects of one subject: 48, counting the stacked `[η, κ₁…κ_K]` under IOV (24 for
-Laplace's exact anchor, 8 for its exact R-matrix). A subject past that takes finite differences, named in
+number of random effects of one subject: 48, counting the stacked `[η, κ₁…κ_K]` under IOV (8 for
+the exact R-matrix of Laplace's exact anchor). A subject past that takes finite differences, named in
 `FitResult.warnings`.
 
 Before #2093 the forward sensitivity provider had model-size caps instead: `θ + η` at 24 on the
