@@ -48,6 +48,15 @@ pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
     x.val() == 0.0 && x.is_constant()
 }
 
+/// Value and every derivative component finite. A structural zero is skipped only against a
+/// finite factor: `0·inf` and `0·NaN` are `NaN` in IEEE arithmetic, and dropping them would
+/// turn a diverged solve that used to propagate `NaN` (and be rejected) into a finite one.
+/// Against a finite factor the skipped product is exactly `±0`.
+#[inline]
+pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
+    x.val().is_finite() && x.jets_finite()
+}
+
 /// Partial-pivoted LU factorization of the row-major `n×n` matrix `m`, **in place**: the
 /// unit-lower multipliers land in the strict lower triangle and `U` in the upper, with
 /// `piv[col]` recording the row swapped into `col`. Returns `false` (leaving `m` partially
@@ -99,11 +108,15 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
             }
         }
         let pivot = m[col * n + col];
+        // The pivot row to the right of the pivot, which every update below multiplies.
+        let pivot_row_finite = ((col + 1)..n).all(|c| all_finite(m[col * n + c]));
         for r in (col + 1)..n {
             // A structural zero below the pivot (value 0, no jet, no tape) has multiplier
-            // exactly 0 in every component, so its row update is a no-op; skipping it is
-            // bit-identical and saves the row of jet multiplies (see `structural_zero`).
-            if structural_zero(m[r * n + col]) {
+            // exactly 0 in every component, so its row update adds `±0`: skipped, against a
+            // finite pivot row (see `all_finite`). The multiplier itself is still stored, so
+            // its sign is the one the update would have written.
+            if pivot_row_finite && structural_zero(m[r * n + col]) {
+                m[r * n + col] = m[r * n + col] / pivot;
                 continue;
             }
             let factor = m[r * n + col] / pivot;
@@ -143,11 +156,13 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
         }
     }
     for col in 0..n {
-        if structural_zero(b[col]) {
+        // `b[col]` a structural zero multiplies the whole multiplier column below it.
+        if structural_zero(b[col]) && ((col + 1)..n).all(|r| all_finite(m[r * n + col])) {
             continue;
         }
+        let b_finite = all_finite(b[col]);
         for r in (col + 1)..n {
-            if structural_zero(m[r * n + col]) {
+            if b_finite && structural_zero(m[r * n + col]) {
                 continue;
             }
             let sub = m[r * n + col] * b[col];
@@ -157,7 +172,7 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
     for i in (0..n).rev() {
         let mut s = b[i];
         for c in (i + 1)..n {
-            if structural_zero(m[i * n + c]) {
+            if structural_zero(m[i * n + c]) && all_finite(b[c]) {
                 continue;
             }
             s = s - m[i * n + c] * b[c];
@@ -226,8 +241,11 @@ mod tests {
 
     /// The structural-zero skips in the factor and both substitutions are exact on a sparse
     /// system — bit-identical to taking every update (`±0` identified) — and a zero that
-    /// carries a derivative is still used. Mutation: drop `is_constant` from
-    /// `structural_zero` → the jet on `m[1][0]` is lost and the `DualF` solve differs.
+    /// carries a derivative is still used, in `L` and in `U`. The system forces a row swap
+    /// (column 0's largest entry is below the diagonal) and has non-zero upper entries, so the
+    /// back substitution sees both kinds of zero. Mutations: drop `is_constant` from
+    /// `structural_zero` → the jet-carrying zeros are skipped and the `DualF` solve differs;
+    /// skip every back-substitution term → the non-zero `U` entries are lost.
     #[test]
     fn lu_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
         use crate::sens::vfree::DualF;
@@ -239,17 +257,22 @@ mod tests {
             h: [],
         };
         let mut m = vec![c(0.0); n * n];
-        for i in 0..n {
-            m[i * n + i] = d(2.0 + i as f64, 1.0, 0.2);
-        }
-        m[2 * n + 1] = d(0.5, 0.0, 1.0);
-        m[3 * n + 2] = c(0.25);
-        m[n] = d(0.0, 3.0, 0.0); // numerically zero, derivative live
+        m[0] = d(1.0, 1.0, 0.2); // pivot-swap: row 1 has the larger column-0 entry
+        m[n] = d(3.0, 0.0, 0.5);
+        m[n + 1] = d(2.5, 0.3, 0.0);
+        m[1] = d(0.7, 0.0, 1.0); // non-zero U entry
+        m[2] = d(0.0, 2.0, 0.0); // jet-carrying zero in U
+        m[2 * n + 2] = d(4.0, 1.0, 0.0);
+        m[2 * n + 1] = d(0.0, 0.0, 3.0); // jet-carrying zero in L
+        m[n + 3] = c(0.25); // non-zero U entry, constant
+        m[3 * n + 3] = d(5.0, 0.0, 0.4);
+        m[3 * n + 2] = c(0.5);
         let b = vec![d(1.0, 0.0, 0.0), c(0.0), d(0.0, 0.5, 0.0), c(2.0)];
         let mut got = b.clone();
         let mut mm = m.clone();
         let mut piv = vec![0usize; n];
         assert!(lu_factor_in_place_g(&mut mm, &mut piv, n));
+        assert_eq!(piv[0], 1, "premise: column 0 pivots on row 1");
         lu_solve_in_place_g(&mm, &piv, n, &mut got);
         let want = lu_reference(&m, n, &b).unwrap();
         let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
@@ -259,7 +282,52 @@ mod tests {
                 assert_eq!(norm(g.g[k]), norm(w.g[k]));
             }
         }
-        assert_ne!(got[1].g[0], 0.0, "the jet-carrying zero was dropped");
+    }
+
+    /// A structural zero is skipped only against a finite factor. With an infinite multiplier
+    /// column and a structurally-zero right-hand side entry, the dense solve propagates
+    /// `0·inf = NaN`; skipping the zero would hand back a finite answer to a diverged system.
+    /// Mutation: drop the `all_finite` guards → the solution is finite and this fails.
+    #[test]
+    fn lu_does_not_skip_a_zero_against_an_infinite_factor() {
+        let n = 2;
+        let m = vec![1.0, 0.0, f64::INFINITY, 1.0];
+        let mut piv = vec![0usize; n];
+        let mut mm = m.clone();
+        // Pivoting would move the inf row up; bypass the factor and solve the unit-lower
+        // system directly, as a Rosenbrock stage solve with an overflowed entry does.
+        piv[0] = 0;
+        piv[1] = 1;
+        mm[2] = f64::INFINITY;
+        let mut b = vec![0.0, 1.0];
+        lu_solve_in_place_g(&mm, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&mm, &piv, n, &[0.0, 1.0]);
+        assert!(
+            want.iter().any(|v| v.is_nan()),
+            "premise: the dense solve is NaN"
+        );
+        assert!(b.iter().any(|v| v.is_nan()), "the skip hid a NaN: {b:?}");
+    }
+
+    /// The pre-skip substitutions alone, on a given factorization.
+    fn lu_reference_solve_only(m: &[f64], piv: &[usize], n: usize, b: &[f64]) -> Vec<f64> {
+        let mut x = b.to_vec();
+        for col in 0..n {
+            x.swap(col, piv[col]);
+        }
+        for col in 0..n {
+            for r in (col + 1)..n {
+                x[r] -= m[r * n + col] * x[col];
+            }
+        }
+        for i in (0..n).rev() {
+            let mut s = x[i];
+            for c in (i + 1)..n {
+                s -= m[i * n + c] * x[c];
+            }
+            x[i] = s / m[i * n + i];
+        }
+        x
     }
 
     /// A 2×2 system whose entries mix both parameters (so `x(p)` is genuinely nonlinear in

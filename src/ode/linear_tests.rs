@@ -766,11 +766,98 @@ fn matmul_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
         component_bits(&a2),
         component_bits(&matmul_reference(&a, &a, n))
     );
-    // The jet on the numerically-zero a[0][3] reaches the product: row 0 × column 3 of A·A
-    // picks it up through a[3][3].
-    assert_ne!(a2[3].g[1], 0.0, "the jet-carrying zero was dropped");
+    // (A·A)[0][3] = a00·a03 + a03·a33, so ∂/∂p₁ = −0.7·2.5 + (−1.0)·2.5 = −4.25 exactly.
+    // Skipping the jet-carrying a03 as x (k = 3) leaves −1.75; the bitwise comparison
+    // above catches it too, this names the number.
+    assert_eq!(a2[3].g[1], -4.25, "the jet-carrying zero was dropped");
     let af: Vec<f64> = a.iter().map(|d| d.v).collect();
     let got = matmul(&af, &af, n);
     let want = matmul_reference(&af, &af, n);
     assert!(got.iter().zip(&want).all(|(g, w)| g == w));
+}
+
+/// A zero whose only derivative is second-order — value 0, gradient 0, Hessian live — is not
+/// structural and is multiplied. Mutation: a predicate that reads value and gradient but not
+/// the Hessian payload → the product's Hessian component differs from the dense reference.
+#[test]
+fn matmul_keeps_a_zero_whose_only_derivative_is_its_hessian() {
+    use crate::sens::vfree::DualF;
+    let n = 3;
+    let c = |v: f64| DualF::<1, 1>::from_f64(v);
+    let mut a = vec![c(0.0); n * n];
+    for i in 0..n {
+        a[i * n + i] = DualF {
+            v: -0.5 - 0.2 * i as f64,
+            g: [1.0],
+            h: [0.3],
+        };
+    }
+    a[2] = DualF {
+        v: 0.0,
+        g: [0.0],
+        h: [1.5],
+    };
+    let got = matmul(&a, &a, n);
+    let want = matmul_reference(&a, &a, n);
+    let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(
+            (norm(g.v), norm(g.g[0]), norm(g.h[0])),
+            (norm(w.v), norm(w.g[0]), norm(w.h[0]))
+        );
+    }
+    // (A·A)[0][2] = a00·a02 + a02·a22: the Hessian-only zero carries h = 1.5 into it.
+    assert_ne!(got[2].h[0], 0.0, "the Hessian-only zero was dropped");
+}
+
+/// The outer gradient's type: a `DualV` on the θ-tape that is exactly zero with zero
+/// η-jets (`θ − θ₀` at `θ = θ₀`) is not structural — its derivative lives on the tape,
+/// not in the jets. The skipping `matmul` must give the same θ-gradient through a reverse
+/// sweep as the dense reference. Mutation: `structural_zero` testing value and jets only
+/// (`jet_max_abs() == 0`, dropping the tape check in `is_constant`) → the taped zero is
+/// skipped and `∂S/∂p` loses the term.
+#[test]
+fn matmul_keeps_a_taped_zero_in_the_outer_gradient_type() {
+    use crate::sens::vtape::{vadj_index, vadj_init, vsweep, vtape_reset, DualV};
+    // S(p, q) = Σ_ij w_ij (A·A)_ij, with A's (0,3) entry the taped leaf p (value 0).
+    fn sweep_ds(
+        mul: fn(&[DualV<1, 0>], &[DualV<1, 0>], usize) -> Vec<DualV<1, 0>>,
+    ) -> (f64, f64, f64) {
+        let n = 4;
+        vtape_reset(2);
+        let p = DualV::<1, 0>::leaf(0.0, [0.0], []);
+        let q = DualV::<1, 0>::leaf(0.8, [0.0], []);
+        assert!(p.i != crate::sens::vtape::NONE, "premise: p is on the tape");
+        let c = DualV::<1, 0>::constant;
+        let mut a = vec![c(0.0); n * n];
+        for i in 0..n {
+            a[i * n + i] = q * c(-1.0 - 0.1 * i as f64);
+            if i + 1 < n {
+                a[(i + 1) * n + i] = q * c(0.5);
+            }
+        }
+        a[3] = p;
+        let a2 = mul(&a, &a, n);
+        let mut s = c(0.0);
+        for (k, v) in a2.iter().enumerate() {
+            s = s + *v * c(1.0 + 0.25 * k as f64);
+        }
+        let adj = vadj_init::<1>();
+        adj[vadj_index::<1, 1>(s.i, 0, 0)] = 1.0;
+        let out = vsweep::<1, 1>(s.i as usize + 1);
+        (
+            s.v,
+            out[vadj_index::<1, 1>(p.i, 0, 0)],
+            out[vadj_index::<1, 1>(q.i, 0, 0)],
+        )
+    }
+    let (sv, dp, dq) = sweep_ds(matmul::<DualV<1, 0>>);
+    let (rv, rp, rq) = sweep_ds(matmul_reference::<DualV<1, 0>>);
+    assert_eq!(sv.to_bits(), rv.to_bits());
+    assert_eq!(dq.to_bits(), rq.to_bits());
+    assert_eq!(dp.to_bits(), rp.to_bits(), "∂S/∂p: skip {dp} vs dense {rp}");
+    assert_ne!(
+        dp, 0.0,
+        "premise: the taped zero carries a θ-derivative into S"
+    );
 }

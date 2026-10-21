@@ -69,11 +69,17 @@ const MAX_SQUARINGS: u32 = 64;
 /// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
 /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+    use crate::sens::linsolve::{all_finite, structural_zero};
+    // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
+    // products to be exactly `±0` (`all_finite`).
+    let row_finite: Vec<bool> = (0..n)
+        .map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v)))
+        .collect();
     let mut out = vec![T::from_f64(0.0); n * n];
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
-            if crate::sens::linsolve::structural_zero(xik) {
+            if row_finite[k] && structural_zero(xik) {
                 continue;
             }
             for j in 0..n {
@@ -287,6 +293,13 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             let mut jet_scale = b[i].jet_max_abs();
             for j in 0..n {
                 let (aij, xj) = (a[i * n + j], x[j]);
+                // A structural zero against a finite state adds exactly 0 to the sum and to
+                // both scales (the same skip, and the same guard, as the propagation).
+                if crate::sens::linsolve::structural_zero(aij)
+                    && crate::sens::linsolve::all_finite(xj)
+                {
+                    continue;
+                }
                 assembled = assembled + aij * xj;
                 scale += (aij.val() * xj.val()).abs();
                 jet_scale += aij.jet_max_abs() * xj.val().abs()
@@ -358,10 +371,17 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             };
             let e = &cache[idx].1;
             let mut next = vec![zero; n];
+            let x_finite: Vec<bool> = x
+                .iter()
+                .map(|&v| crate::sens::linsolve::all_finite(v))
+                .collect();
             for i in 0..n {
-                let mut acc = e[i * m + n] * c;
+                // From `+0`, as `matmul`'s accumulators: a sum that starts at `+0` cannot end
+                // at `-0` in round-to-nearest, so skipping a `±0` term below cannot flip the
+                // sign of an exactly-zero state.
+                let mut acc = zero + e[i * m + n] * c;
                 for j in 0..n {
-                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                    if x_finite[j] && crate::sens::linsolve::structural_zero(e[i * m + j]) {
                         continue;
                     }
                     acc = acc + e[i * m + j] * x[j];
