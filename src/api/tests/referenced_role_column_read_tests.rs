@@ -255,6 +255,77 @@ fn routed_by_reads_what_read_population_for_reads() {
     assert_eq!(reload.covariate_names, fit_read.covariate_names);
 }
 
+// ── #1946: one case rule on every read path ──
+//
+// A model extra binds only the header it spells exactly — on the auto path (T5
+// above), the explicit-list path and the declared path alike. Only a name the
+// caller or a `[data_selection]` filter supplied keeps the case-insensitive
+// fallback. Each path below is its own mutation target in `exact_case_extras` /
+// `cov_indices`.
+
+/// T8 — explicit list: a model reading `wt` against a `WT` header, with a list
+/// that leaves `WT` out, does not bind it. **Straddle:** the same read with the
+/// caller listing `wt` itself does bind `WT` (the caller's own names keep the
+/// fallback), so forcing either branch of the rule reddens one half. Mutation:
+/// drop the `exact_only` gate in `cov_indices` (the extra binds `WT` again), or
+/// drop the `listed` exemption in `exact_case_extras` (the control stays unread).
+#[test]
+fn explicit_list_does_not_bind_a_case_differing_reference() {
+    let csv = iov_wt_csv();
+    let path = csv.path().to_str().unwrap();
+    let parsed = model("wt", "");
+    let pop = read(&parsed, path, Some(&["X"]));
+    assert_eq!(pop.covariate_names, Vec::<String>::new());
+    assert_eq!(check_covariates(&parsed.model, &pop).len(), 1);
+
+    let named = read(&parsed, path, Some(&["wt"]));
+    assert_eq!(named.covariate_names, vec!["WT".to_string()], "control");
+}
+
+/// T9 — declared path: a model declaring `WT` and reading `occ` against an `OCC`
+/// header leaves `OCC` unread (before #1946 it bound as `["WT", "OCC"]`). The
+/// declared `WT` still binds. Mutation: drop the `exact_only` gate in
+/// `cov_indices`, or skip `exact_case_extras` when `decls` is `Some`.
+#[test]
+fn declared_path_does_not_bind_a_case_differing_reference() {
+    let csv = iov_wt_csv();
+    let parsed = model("occ", "[covariates]\n  WT continuous\n");
+    assert!(parsed.covariate_decls.is_some());
+    let pop = read(&parsed, csv.path().to_str().unwrap(), None);
+    assert_eq!(pop.covariate_names, vec!["WT".to_string()]);
+    assert_eq!(check_covariates(&parsed.model, &pop).len(), 1);
+}
+
+/// T10 — the fallback the rule keeps: a model extra a `[data_selection]` filter
+/// also references still binds case-insensitively, so the filter fires. Here the
+/// model reads `wt`, the filter `WT == 61` (subject 1's weight) and the header is
+/// `WT`. Mutation: drop the `filtered` exemption in `exact_case_extras` — `wt`
+/// goes unread, the filter can never fire and subject 1 is kept.
+#[test]
+fn filter_referenced_extra_keeps_the_case_insensitive_fallback() {
+    let csv = iov_wt_csv();
+    let parsed = model("wt", "");
+    let filter =
+        crate::io::datareader::SelectionFilter::from_opts(&["WT == 61".to_string()], &[], &[])
+            .unwrap();
+    let (pop, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        csv.path().to_str().unwrap(),
+        Some(&["X"]),
+        Some("OCC"),
+        Some(&filter),
+        &[],
+    )
+    .expect("read succeeds");
+    assert_eq!(pop.covariate_names, vec!["WT".to_string()]);
+    assert!(
+        pop.subjects.iter().all(|s| s.id != "1"),
+        "subject 1 (WT = 61) must be filtered out"
+    );
+    assert!(pop.subjects.iter().any(|s| s.id == "2"), "non-degenerate");
+}
+
 // ── `check_covariates` tells an unread header from an absent one ──
 //
 // After the reader fix the only way to reach `E_MISSING_COVARIATE` on a name the
