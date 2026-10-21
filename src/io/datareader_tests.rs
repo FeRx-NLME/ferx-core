@@ -146,13 +146,41 @@ fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
         pop.subjects[1].covariates["WT"].is_nan(),
         "a subject with no finite value must not read as 0.0"
     );
-    assert!(
-        pop.warnings
-            .iter()
-            .any(|w| w.contains("covariate WT has no value for 1 of 2 subjects")),
-        "the gap must be reported: {:?}",
+    // The whole message, so its spacing is pinned: the format string once kept
+    // its continuation lines' indentation, two runs of 14 spaces (#2041).
+    let want = "W_COVARIATE_MISSING: covariate WT has no value for 1 of 2 subjects (2), so it \
+                is NaN for them. A relation that reads it is then NaN, which makes the \
+                objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a \
+                comparison, a finite value with no further warning. Impute the column, \
+                exclude the subjects, or guard the relation with `present(WT)`.";
+    let got: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.contains("covariate WT"))
+        .collect();
+    assert_eq!(
+        got,
+        [want],
+        "the gap must be reported once: {:?}",
         pop.warnings
     );
+    assert!(!want.contains("  "), "no run of two spaces: {want:?}");
+}
+
+/// Five missing subjects are listed in full; a sixth elides the list with `...`.
+#[test]
+fn covariate_missing_warning_lists_five_ids_then_elides() {
+    let five = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5"], 10);
+    assert!(
+        five.contains("has no value for 5 of 10 subjects (1, 2, 3, 4, 5), so"),
+        "{five}"
+    );
+    let six = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5", "6"], 10);
+    assert!(
+        six.contains("has no value for 6 of 10 subjects (1, 2, 3, 4, 5, ...), so"),
+        "{six}"
+    );
+    assert!(!six.contains("5, 6"), "the sixth ID must be elided: {six}");
 }
 
 #[test]

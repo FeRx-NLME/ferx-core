@@ -50,8 +50,8 @@ use crate::estimation::outer_optimizer::{
     OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, pack_with_bounds, packed_fixed_mask, theta_packs_log,
-    unpack_params, PackedBounds, PackedStart,
+    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
+    packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
 use crate::types::{
@@ -1203,9 +1203,17 @@ impl ProfileCtx<'_> {
                     .to_string(),
             );
         }
-        let Some(stencil) =
-            fd_ofv_hessian(n, x_hat, free, options.fd_hessian_step, f0, &f, options)
-        else {
+        let floor = fd_step_floors(hold, &self.model.default_params);
+        let Some(stencil) = fd_ofv_hessian(
+            n,
+            x_hat,
+            free,
+            &floor,
+            options.fd_hessian_step,
+            f0,
+            &f,
+            options,
+        ) else {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
         };
         if !stencil.diag_nan.is_empty() || !stencil.offdiag_nan.is_empty() {
@@ -1308,7 +1316,10 @@ impl ProfileCtx<'_> {
         let l = layout.coords.len();
         let theta_steps: Vec<f64> = free
             .iter()
-            .map(|&i| self.options.fd_hessian_step * (1.0 + x_hat[i].abs()))
+            .map(|&i| {
+                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                fd_step(self.options.fd_hessian_step, x_hat[i], floor)
+            })
             .collect();
         let level_steps: Vec<f64> = solve.se_scale.iter().map(|s| COV_STEP_SE * s).collect();
         if !level_steps.iter().all(|s| s.is_finite() && *s > 0.0) {

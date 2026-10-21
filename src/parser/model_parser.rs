@@ -16816,10 +16816,16 @@ pub(crate) fn eval_mixing_log_probs(
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
 /// `g ≡ 0 ⇒ ∂ = 0`) and `∂g/∂θ_j` comes from the symbolic differentiator.
+///
+/// `floor` is the per-θ step floor of [`crate::estimation::parameterization::fd_theta_step_floors`]
+/// (#2147): θⱼ is stepped by `1e-6·max(|θⱼ|, floorⱼ)`, so a θ declared below 1 in magnitude is
+/// stepped relative to its θ₀ rather than by `1e-6` in its own units, which crosses zero on a
+/// θ near `1e-6`.
 pub(crate) fn mixing_logp_grad(
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
+    floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
@@ -16845,7 +16851,7 @@ pub(crate) fn mixing_logp_grad(
         let c = m.class - 1;
         logit[c] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
         for j in 0..nt {
-            let h = 1e-6 * theta[j].abs().max(1.0);
+            let h = 1e-6 * theta[j].abs().max(floor[j]);
             tperturb[j] = theta[j] + h;
             let fp = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
             tperturb[j] = theta[j] - h;
@@ -16877,17 +16883,18 @@ pub(crate) fn mixing_logp_grad(
 /// of the whole mixture objective there; a per-subject score has no such fallback.
 /// Differences `eval_mixing_log_probs` itself, so the clamp and renormalisation the
 /// objective applies are exactly what is differentiated; same step as the logit form's
-/// expression FD.
+/// expression FD, `floor` included.
 pub(crate) fn mixing_logp_grad_fd(
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
+    floor: &[f64],
 ) -> Vec<Vec<f64>> {
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
     for j in 0..nt {
-        let h = 1e-6 * theta[j].abs().max(1.0);
+        let h = 1e-6 * theta[j].abs().max(floor[j]);
         tperturb[j] = theta[j] + h;
         let fp = eval_mixing_log_probs(spec, &tperturb, covariates);
         tperturb[j] = theta[j] - h;
@@ -25406,7 +25413,15 @@ fn eval_expr<E: EvalEnv>(
                         l / r
                     }
                 }
-                BinOp::Mod => l.rem_euclid(r),
+                // Same `|b| < 1e-30 → 0` guard as `/` and as both bytecode VMs'
+                // `Op::Mod`; without it `x mod 0` was `NaN` here and `0` there (#2149).
+                BinOp::Mod => {
+                    if r.abs() < 1e-30 {
+                        0.0
+                    } else {
+                        l.rem_euclid(r)
+                    }
+                }
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -29152,16 +29167,24 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
                     branches,
                     else_body,
                 } => {
-                    // The `else` arm fires only when *every* branch condition was
-                    // false, so it is governed by all of them: dynamic if any is.
-                    let mut any_cond_dynamic = ctx_dynamic;
+                    // Branch `k` fires only when conditions `0..k` were all false and
+                    // its own is true, so it is governed by **every condition up to and
+                    // including its own**, and the `else` arm by all of them — the
+                    // running `governed` after the loop. A per-arm `ctx || cond_k`
+                    // misses an earlier dynamic condition:
+                    //
+                    //   if (ETA_SW > 0) { AUX = 1 } else if (WT > 70) { FAC = WT / 70 }
+                    //
+                    // `FAC` would fold, and `eval_cov_static_f64` decides the branches
+                    // at η = 0, so the dual walk carried `WT / 70` even where
+                    // `ETA_SW > 0` takes the first arm (#1927).
+                    let mut governed = ctx_dynamic;
                     for (cond, body) in branches {
-                        let branch_dynamic = ctx_dynamic || cond_is_dynamic(cond, dyn_vars);
-                        any_cond_dynamic |= branch_dynamic;
-                        walk(body, branch_dynamic, dyn_vars, changed);
+                        governed = governed || cond_is_dynamic(cond, dyn_vars);
+                        walk(body, governed, dyn_vars, changed);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, any_cond_dynamic, dyn_vars, changed);
+                        walk(eb, governed, dyn_vars, changed);
                     }
                 }
                 _ => {}
@@ -29248,12 +29271,8 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     // cond_k` does not, and the resulting false accept is exactly what
                     // this gate exists to prevent (round-1 review of PR #1924). The
                     // `else` arm is governed by all of them, which is the same variable
-                    // after the loop.
-                    //
-                    // `compute_cov_static_mask` has the per-arm shape and the same hole
-                    // for its own question (an `else if` body folded to a constant
-                    // although which value it takes depends on θ/η) — filed as #1927,
-                    // deliberately not changed here.
+                    // after the loop. `compute_cov_static_mask` uses the same
+                    // accumulation for its own question (#1927).
                     let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);

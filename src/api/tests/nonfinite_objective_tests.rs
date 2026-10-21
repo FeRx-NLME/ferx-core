@@ -323,8 +323,18 @@ fn the_demotion_carries_its_documented_details_payload() {
 /// #1303 says the `NaN` half alone would have been an accident of which sentinel
 /// the objective happened to use.
 ///
-/// Mutation (run): weaken `ofv_is_valid` to `ofv.is_finite()` → the `2e20` and
-/// `DIVERGENCE_OFV` cases fire.
+/// The reason distinguishes the sentinel from an objective that is merely past the
+/// cutoff (#2038). A proportional error on a prediction of 0 at the `1e-12` variance
+/// floor scores `DV² × 1e12` per observation, finite: the `4.6e14` here was measured
+/// on N6's fixture before #2039. That is not the clamp, and calling it "at the
+/// divergence sentinel" sent the reader looking for a clamped subject that did not
+/// exist. Both sides of `SUBJECT_SENTINEL_NLL` are listed, so moving the boundary
+/// either way fires.
+///
+/// Mutation (run): weaken `ofv_is_valid` to `ofv.is_finite()` → the `2e20`,
+/// `DIVERGENCE_OFV` and `4.6e14` cases fire. Compare against `DIVERGENCE_OFV`
+/// instead of `SUBJECT_SENTINEL_NLL` in `nonfinite_objective_reason` → the two "too
+/// large" cases fire; drop the arm → they fire too.
 #[test]
 fn the_gate_rejects_the_finite_sentinel_not_only_nan() {
     // The trap, stated: the sentinel is finite.
@@ -339,7 +349,8 @@ fn the_gate_rejects_the_finite_sentinel_not_only_nan() {
         (f64::NEG_INFINITY, "infinite"),
         (2e20, "at the divergence sentinel"),
         (1e20, "at the divergence sentinel"),
-        (DIVERGENCE_OFV, "at the divergence sentinel"),
+        (4.619_219_710_896_776e14, "too large to be a fit"),
+        (DIVERGENCE_OFV, "too large to be a fit"),
     ] {
         let mut converged = true;
         let msg = gate_converged_on_objective(&mut converged, ofv)
@@ -353,6 +364,17 @@ fn the_gate_rejects_the_finite_sentinel_not_only_nan() {
             msg.contains(what),
             "the message must name which way it failed; ofv = {ofv:?} is `{what}`: {msg}"
         );
+        for other in [
+            "NaN",
+            "infinite",
+            "at the divergence sentinel",
+            "too large to be a fit",
+        ] {
+            assert!(
+                other == what || !msg.contains(other),
+                "ofv = {ofv:?} is `{what}`, and the message also says `{other}`: {msg}"
+            );
+        }
         assert_eq!(nonfinite_objective_reason(ofv), what, "ofv = {ofv:?}");
     }
 }
@@ -1014,4 +1036,422 @@ fn every_published_convergence_verdict_is_gated_on_its_objective() {
          under `vi_final_ofv = none` is the only one today, and `publishes_no_objective` \
          owns that), route it through the same gate and add it here with the reason."
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  N — the warning names the subjects behind it (#2038)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `W_NONFINITE_OBJECTIVE` pair `fit()` builds for a sentinel objective, so the
+/// helper is handed the message and entry it is handed in production.
+fn sentinel_warning() -> (String, crate::types::WarningEntry) {
+    let mut converged = true;
+    crate::api::nonfinite_objective_warning(
+        &mut converged,
+        2e20,
+        EstimationMethod::FoceI,
+        &FitOptions::default(),
+    )
+    .expect("a sentinel objective is demoted")
+}
+
+/// A subject whose engine clock runs 50 ahead of its written `TIME`, as after a reset,
+/// so a `TIME` read off the engine clock instead of the written one is visible.
+fn shifted_subject(id: &str) -> Subject {
+    let mut s = subject_with_dose_time(id, 0.0, 1.0);
+    s.obs_raw_times = s.obs_times.clone();
+    s.obs_times = s.obs_times.iter().map(|t| t + 50.0).collect();
+    s
+}
+
+fn population_of(subjects: Vec<Subject>) -> Population {
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// **N1 — every cell of the sentence, in one message.**
+///
+/// The input space is the subject's contribution (valid, at the sentinel, `NaN`, or
+/// finite but past the cutoff) × its predictions (finite, or not on some records).
+/// Four subjects cover the cells that change the text:
+///
+/// | subject | contribution | predictions | named as |
+/// |---|---|---|---|
+/// | `A` | `2e20` | `IPRED` `NaN` at obs 2, `PRED` `NaN` at obs 3 | 2 of 4, first at `TIME` 8 |
+/// | `B` | `12.34` | every `IPRED` and `PRED` `NaN` | not named |
+/// | `C` | `4.6e14` | finite | "every IPRED and PRED finite" |
+/// | `D` | `NaN` | finite | "every IPRED and PRED finite" |
+///
+/// `B` is the straddle: its predictions are worse than `A`'s, and it is the subject
+/// with no Gaussian observation whose `NaN` predictions are the "no prediction
+/// available" convention. Its contribution is valid, so it is not named. The whole
+/// appended sentence is compared exactly, so deleting any clause of it fires.
+///
+/// Mutation (run):
+/// * select on non-finite predictions instead of the contribution → `B` is named and
+///   `C` and `D` are not;
+/// * select on `ofv_contribution >= DIVERGENCE_OFV` → `D`'s `NaN` drops out;
+/// * count only `IPRED` → `A` reads "1 of 4";
+/// * take the `TIME` from `obs_times` → `A` reads `TIME 58`;
+/// * drop the "{n} of {N} subjects" lead, the contribution, the records clause or
+///   the `TIME` clause → the sentence comparison fires.
+#[test]
+fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
+    let pop = population_of(vec![
+        shifted_subject("A"),
+        shifted_subject("B"),
+        shifted_subject("C"),
+        shifted_subject("D"),
+    ]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    a.ofv_contribution = 2e20;
+    a.ipred[2] = f64::NAN;
+    a.pred[3] = f64::NAN;
+    let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
+    b.ipred = vec![f64::NAN; 4];
+    b.pred = vec![f64::NAN; 4];
+    let mut c = crate::types::test_helpers::dummy_subject("C", 1, 4);
+    c.ofv_contribution = 4.6e14;
+    let mut d = crate::types::test_helpers::dummy_subject("D", 1, 4);
+    d.ofv_contribution = f64::NAN;
+
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[a, b, c, d], &pop);
+
+    let added = full
+        .strip_prefix(&msg)
+        .unwrap_or_else(|| panic!("the gate's message is kept whole and extended: {full}"));
+    assert_eq!(
+        added,
+        " 3 of 4 subjects have an objective contribution that is itself unusable: \
+         A (contribution 2e20, a non-finite IPRED or PRED on 2 of 4 observations, the first \
+         at TIME 8); C (contribution 460000000000000.0, every IPRED and PRED finite); \
+         D (contribution NaN, every IPRED and PRED finite)."
+    );
+    assert_eq!(
+        entry.message, full,
+        "the structured message and the string one say the same thing"
+    );
+
+    let details = entry.details.as_ref().expect("the gate's payload");
+    assert_eq!(
+        details["reason"], "at the divergence sentinel",
+        "the gate's own keys are kept: {details}"
+    );
+    let subjects = details["unusable_subjects"]
+        .as_array()
+        .expect("an unusable_subjects array");
+    assert_eq!(
+        subjects,
+        &vec![
+            serde_json::json!({"id": "A", "ofv_contribution": 2e20,
+                "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0}),
+            serde_json::json!({"id": "C", "ofv_contribution": 4.6e14,
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+            serde_json::json!({"id": "D", "ofv_contribution": "NaN",
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+        ],
+        "JSON has no NaN, so a non-finite contribution is carried as a string"
+    );
+}
+
+/// **N2 — nothing to name, nothing added.** A sentinel objective whose every subject
+/// has a valid post-fit contribution (the objective was clamped at a trial point,
+/// not at the estimates the subjects are scored at) keeps the gate's message and
+/// payload exactly, rather than appending "0 of 2 subjects".
+///
+/// Mutation (run): drop the `named.is_empty()` return → the message grows a
+/// "0 of 2 subjects" sentence and `details` an `unusable_subjects` key, and this fires.
+#[test]
+fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
+    let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
+    let subjects = [
+        crate::types::test_helpers::dummy_subject("A", 1, 4),
+        crate::types::test_helpers::dummy_subject("B", 1, 4),
+    ];
+    let (msg, mut entry) = sentinel_warning();
+    let before = entry.clone();
+    let out = name_nonfinite_subjects(msg.clone(), &mut entry, &subjects, &pop);
+    assert_eq!(out, msg);
+    assert_eq!(entry.message, before.message);
+    assert_eq!(entry.details, before.details);
+}
+
+/// **N3 — a result that does not line up with the population gets no `TIME`.**
+/// `subjects` is in population order, and the `TIME` is read from the population's
+/// subject at the same position only when its `ID` matches. Here the results are in
+/// the reverse order, so `B`'s position holds `A`'s data: printing a `TIME` would
+/// print `A`'s.
+///
+/// Mutation (run): drop the `d.id == s.id` filter → the message names a `TIME` for
+/// `B` and `first_time` is `8.0`, and this fires.
+#[test]
+fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
+    let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
+    let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
+    b.ofv_contribution = 2e20;
+    b.ipred[2] = f64::NAN;
+    let a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[b, a], &pop);
+    assert!(
+        full.ends_with("B (contribution 2e20, a non-finite IPRED or PRED on 1 of 4 observations)."),
+        "{full}"
+    );
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
+    assert_eq!(
+        subjects[0]["first_time"],
+        serde_json::Value::Null,
+        "{subjects}"
+    );
+    assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
+}
+
+/// **N3b — the third way `first_time` is `null`** (#2148 review): the subject is
+/// matched and has a non-finite prediction, but the written `TIME` of that record is
+/// itself not finite. JSON has no `NaN`, so serde writes `null`, while the message
+/// still prints the value. Pins the docs' list of the three `null` cases: with a
+/// finite `TIME` at that record the field would be a number.
+#[test]
+fn a_non_finite_written_time_is_carried_as_null() {
+    let mut data = shifted_subject("A");
+    data.obs_raw_times[2] = f64::NAN;
+    let pop = population_of(vec![data]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    a.ofv_contribution = 2e20;
+    a.ipred[2] = f64::NAN;
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop);
+    assert!(full.ends_with("the first at TIME NaN)."), "{full}");
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
+    assert_eq!(
+        subjects[0]["first_time"],
+        serde_json::Value::Null,
+        "{subjects}"
+    );
+    assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
+}
+
+/// **N4 — the message names ten; the details list them all.** A population where
+/// every subject is unusable (one bad covariate model) would otherwise put a
+/// paragraph per subject into one warning.
+///
+/// Mutation (run): drop the `take` → the message names `s11` and `s12`; drop the
+/// "and N more" clause → its assertion fires; cap the payload too → the length
+/// assertion fires.
+#[test]
+fn the_message_caps_the_named_subjects_and_the_details_do_not() {
+    let ids: Vec<String> = (1..=12).map(|k| format!("s{k:02}")).collect();
+    let pop = population_of(ids.iter().map(|id| shifted_subject(id)).collect());
+    let subjects: Vec<SubjectResult> = ids
+        .iter()
+        .map(|id| {
+            let mut s = crate::types::test_helpers::dummy_subject(id, 1, 4);
+            s.ofv_contribution = 2e20;
+            s
+        })
+        .collect();
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop);
+
+    assert!(full.contains(" 12 of 12 subjects "), "{full}");
+    assert!(full.contains("s10 (contribution 2e20"), "{full}");
+    assert!(
+        !full.contains("s11 (") && !full.contains("s12 ("),
+        "only {} are named in the message: {full}",
+        crate::api::postfit::NONFINITE_SUBJECTS_NAMED
+    );
+    assert!(
+        full.ends_with("; and 2 more, listed only in the Rust API's structured warning."),
+        "{full}"
+    );
+    let listed = entry.details.as_ref().expect("payload")["unusable_subjects"]
+        .as_array()
+        .expect("subjects")
+        .len();
+    assert_eq!(listed, 12, "the details list every subject");
+}
+
+/// The #2038 models: warfarin with `CL ∝ (WT / 70)^0.75`, which is `NaN` at a negative
+/// `WT`, on the closed form and on the equivalent ODE.
+fn wt_power_model(ode: bool) -> CompiledModel {
+    let structural = if ode {
+        "[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  \
+         d/dt(depot)   = -KA * depot\n  d/dt(central) = KA * depot / V - (CL / V) * central\n"
+    } else {
+        "[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n"
+    };
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT / 70)^0.75
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+{structural}[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    ))
+    .expect("parse")
+}
+
+/// Which records of warfarin subject 3 get a negative `WT` (every other record has 70).
+#[derive(Clone, Copy)]
+enum NegativeWt {
+    Nowhere,
+    EveryRecord,
+    FourthObservation,
+}
+
+/// `data/warfarin.csv` with a `WT` column.
+fn warfarin_with_wt(neg: NegativeWt) -> Population {
+    use std::io::Write;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/warfarin.csv");
+    let text = std::fs::read_to_string(path).expect("data/warfarin.csv");
+    let mut lines = text.lines();
+    let mut csv = format!("{},WT\n", lines.next().expect("header"));
+    let mut s3_obs = 0;
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').collect();
+        let s3 = cols[0] == "3";
+        let obs = cols[3] == "0";
+        if s3 && obs {
+            s3_obs += 1;
+        }
+        let negative = s3
+            && match neg {
+                NegativeWt::Nowhere => false,
+                NegativeWt::EveryRecord => true,
+                NegativeWt::FourthObservation => obs && s3_obs == 4,
+            };
+        csv.push_str(&format!("{line},{}\n", if negative { "-5" } else { "70" }));
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::read_nonmem_csv(f.path(), Some(&["WT"]), None).expect("read the #2038 fixture")
+}
+
+fn evaluate(model: &CompiledModel, pop: &Population) -> FitResult {
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    fit(model, pop, &model.default_params, &opts).expect("fit")
+}
+
+/// The one `W_NONFINITE_OBJECTIVE` entry and its `unusable_subjects` payload.
+fn named_subjects(result: &FitResult) -> (String, Vec<serde_json::Value>) {
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN))
+        .unwrap_or_else(|| panic!("no {NONFINITE_OBJECTIVE_TOKEN}: {:?}", result.warnings));
+    let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    (entry.message.clone(), subjects)
+}
+
+/// **N5 — end to end, the issue's reproduction.**
+///
+/// One subject in ten with a negative `WT` on every record makes `CL` `NaN` there
+/// and repels the fit. Before #2038 the warning listed every possible cause and named
+/// no subject; the sdtab did not say which either, since its `NaN` rows look like the
+/// "no prediction available" convention. The control (`WT = 70` everywhere) is part
+/// of the test: it pins that the naming is caused by the negative weight and not by
+/// the fixture, and that a healthy fit stays silent.
+///
+/// Mutation (run): delete the `name_nonfinite_subjects` call in `fit_inner` → the
+/// message names nobody and the `unusable_subjects` payload is absent. Moving it before the
+/// `warnings.retain(...)` de-duplication is caught by G1 and G10 instead, not here:
+/// the estimator's copy no longer ends with the extended message, so both copies
+/// survive, but at `outer_maxiter = 0` this fit has no estimator copy to keep.
+#[test]
+fn a_negative_covariate_on_every_record_names_its_subject() {
+    let model = wt_power_model(false);
+
+    let control = evaluate(&model, &warfarin_with_wt(NegativeWt::Nowhere));
+    assert!(
+        crate::estimation::outer_optimizer::ofv_is_valid(control.ofv),
+        "premise: WT = 70 everywhere is a healthy fit; ofv = {}",
+        control.ofv
+    );
+    assert!(
+        !control
+            .warnings
+            .iter()
+            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        "{:?}",
+        control.warnings
+    );
+
+    let result = evaluate(&model, &warfarin_with_wt(NegativeWt::EveryRecord));
+    assert_eq!(result.ofv, 2e20, "premise: one clamped subject");
+    let (message, subjects) = named_subjects(&result);
+    assert!(
+        message.ends_with(
+            " 1 of 10 subjects have an objective contribution that is itself unusable: \
+             3 (contribution 2e20, a non-finite IPRED or PRED on 11 of 11 observations, the \
+             first at TIME 0.5)."
+        ),
+        "{message}"
+    );
+    assert_eq!(subjects.len(), 1, "only subject 3 is named: {subjects:?}");
+    assert_eq!(
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN))
+            .collect::<Vec<_>>(),
+        vec![&message],
+        "the plain-text warning is the named one, once"
+    );
+}
+
+/// **N6 — end to end, one bad record, on both engines.** A negative `WT` on subject
+/// 3's fourth observation only: each engine carries the `NaN` into that record and
+/// every later one, and the sentence names the first of them.
+///
+/// Before #2039 the closed form served a finite prediction of 0 at that record, which
+/// a proportional error scored at about `4.6e14`, so it named the subject "every IPRED
+/// and PRED finite". Since #2039 it serves the `NaN`, and both engines must give the
+/// same sentence. Each failure names its engine.
+#[test]
+fn a_negative_covariate_on_one_record_names_the_record() {
+    let pop = warfarin_with_wt(NegativeWt::FourthObservation);
+
+    for (engine, ode) in [("ODE", true), ("closed form", false)] {
+        let result = evaluate(&wt_power_model(ode), &pop);
+        let (message, subjects) = named_subjects(&result);
+        assert!(
+            message.ends_with(
+                " 1 of 10 subjects have an objective contribution that is itself unusable: \
+                 3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, \
+                 the first at TIME 4)."
+            ),
+            "{engine}: {message}"
+        );
+        assert_eq!(
+            subjects.len(),
+            1,
+            "{engine}: only subject 3 is named: {subjects:?}"
+        );
+    }
 }

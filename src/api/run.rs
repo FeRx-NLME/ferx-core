@@ -745,6 +745,17 @@ pub fn run_model_simulate_with_overrides(
     ) {
         return Err(EngineError::from_diagnostic(d));
     }
+    // #2052: with a derived rule, `fit()` refuses a population whose every subject has
+    // at most one occasion, again after simulating and with dataset advice. The
+    // template already carries the `times` grid and the one dose, so the count derived
+    // on it is the one `fit()` would see.
+    if let Some(msg) = check_simulation_iov_single_occasion(
+        &parsed.model,
+        &template,
+        &parsed.fit_options.iov_occasion,
+    ) {
+        return Err(EngineError::uncoded(msg));
+    }
 
     // Simulate
     eprintln!(

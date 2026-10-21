@@ -816,6 +816,20 @@ fn classify_warning_dw_is_warning() {
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
 }
 
+/// #2041: the reader's missing-covariate warning is `data_quality` on its token,
+/// whatever the covariate is called. `DURBIN` is the name a prose arm would claim
+/// (the Durbin-Watson arm) without the token arm ahead of it.
+#[test]
+fn classify_warning_covariate_missing_is_data_quality() {
+    use crate::io::datareader::covariate_missing_warning;
+    for name in ["WT", "DURBIN"] {
+        let msg = covariate_missing_warning(name, &["3"], 10);
+        let w = classify_warning(&msg);
+        assert_eq!(w.severity, WarningSeverity::Warning, "{name}");
+        assert_eq!(w.category.as_str(), "data_quality", "{name}: {msg}");
+    }
+}
+
 #[test]
 fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
     // #1021: the proposal-conditioning notes are prefixed `SIR:` / `SIR fallback:`

@@ -1815,6 +1815,120 @@ pub(crate) fn nonfinite_objective_warning(
     Some((msg, entry))
 }
 
+/// How many subjects `W_NONFINITE_OBJECTIVE`'s message names before it says "and N
+/// more"; the `details` payload lists every one (#2038).
+pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
+
+/// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
+/// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
+/// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
+/// Returns `msg` unchanged when no subject qualifies. The `details` reach only the
+/// Rust API: the YAML writes the messages, a `.fitrx` reload rebuilds the entries
+/// without them, and the R package drops them, so the message says where the
+/// subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are.
+///
+/// A subject qualifies when its own post-fit objective contribution fails
+/// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
+/// selector, and the predictions only describe it. Selecting on a non-finite
+/// `IPRED`/`PRED` instead would name every subject with no Gaussian observation,
+/// whose predictions are `NaN` by convention ("no prediction available") and which
+/// contribute nothing wrong. A `NaN` prediction on a scored record cannot hide the
+/// other way: the likelihood maps the subject's objective to the sentinel.
+///
+/// For each subject named, the sentence gives the contribution and the observations
+/// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
+/// none is, it says so, since the cause is then not in the predictions: usually a
+/// proportional error on a prediction of 0, which scores `DV² × 1e12` per
+/// observation at the variance floor, but also a non-Gaussian term, a non-PD
+/// covariance, or a refused subject.
+///
+/// `subjects` is `compute_subject_results`' output, in population order; a subject
+/// whose position does not match `population` gets no `TIME`.
+pub(crate) fn name_nonfinite_subjects(
+    msg: String,
+    entry: &mut WarningEntry,
+    subjects: &[SubjectResult],
+    population: &Population,
+) -> String {
+    let named: Vec<(&SubjectResult, Vec<usize>, Option<&Subject>)> = subjects
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !crate::estimation::outer_optimizer::ofv_is_valid(s.ofv_contribution))
+        .map(|(i, s)| {
+            let bad: Vec<usize> = (0..s.n_obs)
+                .filter(|&j| {
+                    !(s.ipred.get(j).is_some_and(|v| v.is_finite())
+                        && s.pred.get(j).is_some_and(|v| v.is_finite()))
+                })
+                .collect();
+            let data = population.subjects.get(i).filter(|d| d.id == s.id);
+            (s, bad, data)
+        })
+        .collect();
+    if named.is_empty() {
+        return msg;
+    }
+    let describe = |(s, bad, data): &(&SubjectResult, Vec<usize>, Option<&Subject>)| {
+        let records = match (bad.first(), data) {
+            (None, _) => "every IPRED and PRED finite".to_string(),
+            (Some(&j), Some(d)) => format!(
+                "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
+                bad.len(),
+                s.n_obs,
+                d.readout_time(j)
+            ),
+            (Some(_), None) => format!(
+                "a non-finite IPRED or PRED on {} of {} observations",
+                bad.len(),
+                s.n_obs
+            ),
+        };
+        format!(
+            "{} (contribution {:?}, {records})",
+            s.id, s.ofv_contribution
+        )
+    };
+    let mut list = named
+        .iter()
+        .take(NONFINITE_SUBJECTS_NAMED)
+        .map(describe)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if named.len() > NONFINITE_SUBJECTS_NAMED {
+        list.push_str(&format!(
+            "; and {} more, listed only in the Rust API's structured warning",
+            named.len() - NONFINITE_SUBJECTS_NAMED
+        ));
+    }
+    let full = format!(
+        "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
+         {list}.",
+        named.len(),
+        subjects.len()
+    );
+    let payload: Vec<serde_json::Value> = named
+        .iter()
+        .map(|(s, bad, data)| {
+            let c = s.ofv_contribution;
+            serde_json::json!({
+                "id": s.id,
+                "ofv_contribution": if c.is_finite() { serde_json::json!(c) } else { serde_json::json!(c.to_string()) },
+                "nonfinite_predictions": bad.len(),
+                "n_obs": s.n_obs,
+                "first_time": bad.first().zip(*data).map(|(&j, d)| d.readout_time(j)),
+            })
+        })
+        .collect();
+    if let Some(serde_json::Value::Object(map)) = entry.details.as_mut() {
+        map.insert(
+            "unusable_subjects".into(),
+            serde_json::Value::Array(payload),
+        );
+    }
+    entry.message = full.clone();
+    full
+}
+
 /// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
 ///

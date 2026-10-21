@@ -374,8 +374,10 @@ struct FlatThetaPreflight {
     /// initial estimate — the point an optimizer's first evaluation solves at
     /// again when nothing is frozen (#2076). Each is a converged mode, so the
     /// first evaluation takes them as warm starts whatever their values
-    /// ([`InnerSolvePolicy::init_is_mode`]). `None` when the pre-flight solved
-    /// nothing (every theta already fixed) or any subject did not converge.
+    /// ([`InnerSolvePolicy::init_is_mode`]). An IOV subject's entry is its whole
+    /// mode, `η̂` then each occasion cell's `κ̂` ([`joint_warm_starts`]), so the
+    /// first evaluation does not restart κ at 0 (#2217). `None` when the pre-flight
+    /// solved nothing (every theta already fixed) or any subject did not converge.
     etas: Option<Vec<DVector<f64>>>,
     /// `(θ index, scale)` for each near-zero identity-packed θ the NLopt outer loop
     /// divides by its initial magnitude — see [`identity_theta_scales`] (#2159).
@@ -638,7 +640,10 @@ fn freeze_flat_thetas(
     };
     FlatThetaPreflight {
         frozen,
-        etas: converged.iter().all(|&c| c).then_some(ehs),
+        etas: converged
+            .iter()
+            .all(|&c| c)
+            .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
     }
 }
@@ -2335,18 +2340,41 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 /// * `±inf` — an overflow rather than an indeterminate form.
 /// * the **sentinel** — finite, and the reason `is_finite()` alone is not the
 ///   gate. The inner objective clamps a blown-up individual contribution to a
-///   `~1e20` rail, the outer objective doubles it, and an optimizer can report
-///   `Success` sitting on that plateau because every direction looks flat. The
-///   fit was *repelled*, not solved. See [`DIVERGENCE_OFV`].
+///   [`SUBJECT_SENTINEL_NLL`] rail, the outer objective doubles it, and an
+///   optimizer can report `Success` sitting on that plateau because every
+///   direction looks flat. The fit was *repelled*, not solved. See
+///   [`DIVERGENCE_OFV`].
+/// * **too large to be a fit** — finite, at or above [`DIVERGENCE_OFV`] but below
+///   the sentinel, so no subject sits on the `1e20` rail (#2038). Usually a
+///   subject's own objective is that large on its own terms: measured, a
+///   proportional error on a prediction of 0 bottoms out at the residual-SD floor
+///   and scores `4.6e14`. Calling that the sentinel sent the user looking for a
+///   clamp that never happened.
+///
+/// The line is drawn on the population total, so it is a reading, not a proof,
+/// in both directions: an unclamped subject can reach `1e20` on its own (the same
+/// zero prediction against a DV of 12000 scores `1.44e20`), and the IOV + FREM
+/// refusal in `crate::stats::likelihood` returns `1e18`, so a subject refused
+/// there reads as too large rather than as clamped.
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
     } else if ofv.is_infinite() {
         "infinite"
-    } else {
+    } else if ofv >= SUBJECT_SENTINEL_NLL {
         "at the divergence sentinel"
+    } else {
+        "too large to be a fit"
     }
 }
+
+/// The value the per-subject objective is clamped to when it is not finite — the
+/// `1e20` written as a literal at each guard in `crate::stats::likelihood`. A
+/// population objective at or above it holds a clamped subject (one subject's
+/// `2 · 1e20` already exceeds it) or a subject whose own objective is that large;
+/// one below it holds no subject on this rail. That is the line
+/// [`nonfinite_objective_reason`] draws (#2038), and its caveats are listed there.
+pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is

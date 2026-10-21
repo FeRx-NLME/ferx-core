@@ -444,9 +444,11 @@ indistinguishable from a genuine zero. The reader also warns, naming the
 covariate and the subjects:
 
 ```
-covariate CRCL has no value for 3 of 32 subjects (12, 17, 25); it evaluates to
-NaN for them. Impute the column, exclude the subjects, or guard the relation
-with `present(CRCL)`.
+W_COVARIATE_MISSING: covariate CRCL has no value for 3 of 32 subjects (12, 17,
+25), so it is NaN for them. A relation that reads it is then NaN, which makes the
+objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, a
+finite value with no further warning. Impute the column, exclude the subjects, or
+guard the relation with `present(CRCL)`.
 ```
 
 `present(...)` is an ordinary condition available anywhere in
