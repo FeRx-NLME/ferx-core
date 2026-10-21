@@ -196,8 +196,10 @@ fn ode_inner_stays_analytic_past_the_cap_at_loose_ode_tolerances() {
 /// finite-difference warning, and compute the covariance step; since the FIX θ is not
 /// in the optimizer's vector, the two runs take the same steps and land on the same OFV.
 /// Before #2093 the 25-axis twin read `N/A` / `auto (bobyqa)` here. Which R-matrix the
-/// step assembles is not visible on `FitResult`; that half is pinned by the Tier-1
-/// `an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes`.
+/// step assembles is not visible on `FitResult` — a `Computed` status is reached by the
+/// FD stencil too — so that half is pinned by the Tier-1
+/// `an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject`, which
+/// counts the FD objectives the step evaluates.
 #[test]
 fn outer_route_is_the_same_past_the_cap() {
     let run = |n_fix: usize| {
