@@ -1829,31 +1829,45 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// A subject qualifies when its own post-fit objective contribution fails
 /// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
-/// selector, and the predictions only describe it. Selecting on a non-finite
+/// selector, and the per-record clauses only describe it. Selecting on a non-finite
 /// `IPRED`/`PRED` instead would name every subject with no Gaussian observation,
 /// whose predictions are `NaN` by convention ("no prediction available") and which
 /// contribute nothing wrong. A `NaN` prediction on a scored record cannot hide the
 /// other way: the likelihood maps the subject's objective to the sentinel.
 ///
-/// For each subject named, the sentence gives the contribution and the observations
-/// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
-/// none is, it says so, since the cause is then not in the predictions: usually a
-/// proportional error on a prediction of 0, which scores `DV² × 1e12` per
-/// observation at the variance floor, but also a non-Gaussian term, a non-PD
-/// covariance, or a refused subject.
+/// For each subject named, the sentence gives the contribution, then two clauses:
+///
+/// 1. **The records whose own residual term is unusable (#2266)**, with the written
+///    `TIME`, `DV` and `IPRED` of the first. A record's term is `IWRES²`, the weighted
+///    residual it adds to the individual objective at η̂, and it is unusable when it
+///    fails the same `ofv_is_valid` test as the objective: a non-finite `IWRES`, or
+///    one past `√DIVERGENCE_OFV = 1e7`. This is the record to look at first. A
+///    runaway η̂ can leave an early record with a finite `IPRED` of 0 that a
+///    proportional error scores at `DV² × 1e12` (the variance floor), and the first
+///    non-finite *prediction* then names a later record, or none: on the same
+///    subject the closed form and the ODE disagree on the predictions but agree on
+///    this record. A row the fit scored as censored has no residual term (its `IWRES`
+///    is blanked), so it is skipped.
+/// 2. The observations whose `IPRED` or `PRED` is not finite, with the written
+///    `TIME` of the first, as #2038 wrote it. When none is, it says so: the cause is
+///    then a finite prediction the residual model cannot score (clause 1 names it),
+///    a non-Gaussian term, a non-PD covariance, or a refused subject.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
-/// whose position does not match `population` gets no `TIME`.
+/// whose position does not match `population` gets no `TIME`, and its first unusable
+/// residual is named by its 1-based observation number instead.
 pub(crate) fn name_nonfinite_subjects(
     msg: String,
     entry: &mut WarningEntry,
     subjects: &[SubjectResult],
     population: &Population,
+    bloq: crate::types::BloqMethod,
 ) -> String {
-    let named: Vec<(&SubjectResult, Vec<usize>, Option<&Subject>)> = subjects
+    let ofv_is_valid = crate::estimation::outer_optimizer::ofv_is_valid;
+    let named: Vec<NamedSubject> = subjects
         .iter()
         .enumerate()
-        .filter(|(_, s)| !crate::estimation::outer_optimizer::ofv_is_valid(s.ofv_contribution))
+        .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
         .map(|(i, s)| {
             let bad: Vec<usize> = (0..s.n_obs)
                 .filter(|&j| {
@@ -1861,14 +1875,50 @@ pub(crate) fn name_nonfinite_subjects(
                         && s.pred.get(j).is_some_and(|v| v.is_finite()))
                 })
                 .collect();
+            let unusable: Vec<usize> = (0..s.n_obs)
+                .filter(|&j| !bloq.is_censored_row(s.cens.get(j).copied().unwrap_or(0)))
+                .filter(|&j| !s.iwres.get(j).is_some_and(|w| ofv_is_valid(w * w)))
+                .collect();
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
-            (s, bad, data)
+            NamedSubject {
+                s,
+                bad,
+                unusable,
+                data,
+            }
         })
         .collect();
     if named.is_empty() {
         return msg;
     }
-    let describe = |(s, bad, data): &(&SubjectResult, Vec<usize>, Option<&Subject>)| {
+    let describe = |n: &NamedSubject| {
+        let NamedSubject {
+            s,
+            bad,
+            unusable,
+            data,
+        } = n;
+        let ipred_at = |j: usize| s.ipred.get(j).copied().unwrap_or(f64::NAN);
+        let residuals = match (unusable.first(), data) {
+            (None, _) => "every residual term usable on its own".to_string(),
+            (Some(&j), Some(d)) => format!(
+                "an unusable residual term on {} of {} observations, the first at TIME {} \
+                 (DV {}, IPRED {})",
+                unusable.len(),
+                s.n_obs,
+                d.readout_time(j),
+                d.observations.get(j).copied().unwrap_or(f64::NAN),
+                ipred_at(j)
+            ),
+            (Some(&j), None) => format!(
+                "an unusable residual term on {} of {} observations, the first being \
+                 observation {} (IPRED {})",
+                unusable.len(),
+                s.n_obs,
+                j + 1,
+                ipred_at(j)
+            ),
+        };
         let records = match (bad.first(), data) {
             (None, _) => "every IPRED and PRED finite".to_string(),
             (Some(&j), Some(d)) => format!(
@@ -1884,7 +1934,7 @@ pub(crate) fn name_nonfinite_subjects(
             ),
         };
         format!(
-            "{} (contribution {:?}, {records})",
+            "{} (contribution {:?}, {residuals}; {records})",
             s.id, s.ofv_contribution
         )
     };
@@ -1908,14 +1958,16 @@ pub(crate) fn name_nonfinite_subjects(
     );
     let payload: Vec<serde_json::Value> = named
         .iter()
-        .map(|(s, bad, data)| {
-            let c = s.ofv_contribution;
+        .map(|n| {
+            let c = n.s.ofv_contribution;
             serde_json::json!({
-                "id": s.id,
+                "id": n.s.id,
                 "ofv_contribution": if c.is_finite() { serde_json::json!(c) } else { serde_json::json!(c.to_string()) },
-                "nonfinite_predictions": bad.len(),
-                "n_obs": s.n_obs,
-                "first_time": bad.first().zip(*data).map(|(&j, d)| d.readout_time(j)),
+                "nonfinite_predictions": n.bad.len(),
+                "n_obs": n.s.n_obs,
+                "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "unusable_residuals": n.unusable.len(),
+                "first_unusable_residual_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
             })
         })
         .collect();
@@ -1927,6 +1979,16 @@ pub(crate) fn name_nonfinite_subjects(
     }
     entry.message = full.clone();
     full
+}
+
+/// One subject [`name_nonfinite_subjects`] names: its result, the observations with a
+/// non-finite `IPRED` or `PRED`, those with an unusable residual term, and its data
+/// when the result lines up with it.
+struct NamedSubject<'a> {
+    s: &'a SubjectResult,
+    bad: Vec<usize>,
+    unusable: Vec<usize>,
+    data: Option<&'a Subject>,
 }
 
 /// Build the warning for parameter estimates pinned to an internal

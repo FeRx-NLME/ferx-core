@@ -532,33 +532,52 @@ When the subjects' own contributions at the final estimates show where the
 objective went wrong, the warning ends with one more sentence naming them
 (#2038). A subject is named when its objective contribution is itself unusable
 (`NaN`, infinite, or past the cutoff). For each one it gives the contribution and
-the observations whose `IPRED` or `PRED` is not finite, with the `TIME` of the
-first as written in the data:
+two clauses, each with a `TIME` as written in the data:
 
 ```text
 1 of 10 subjects have an objective contribution that is itself unusable:
-3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, the
-first at TIME 4).
+3 (contribution 2e20, an unusable residual term on 1 of 12 observations, the
+first at TIME 0 (DV 200, IPRED 0); every IPRED and PRED finite).
+```
+
+The first clause names the observations whose **own residual term** is unusable
+(#2266), and the `DV` and `IPRED` of the first. That term is the record's squared
+`IWRES` at the subject's EBE, and it is unusable when it fails the same test as the
+objective: a non-finite `IWRES`, or one past `1e7` (so its square is past `1e14`).
+Start with this record. Above, the prediction at `TIME 0` is a finite `0`, which a
+proportional error scores at the variance floor, `DV² × 1e12`. No prediction is
+non-finite, so the prediction clause has no record to name. A row the fit scored
+as censored (`bloq_method = m3`) has no residual term and is never counted.
+
+The second clause names the observations whose `IPRED` or `PRED` is not finite:
+
+```text
+3 (contribution 2e20, an unusable residual term on 8 of 11 observations, the
+first at TIME 4 (DV 11.0602, IPRED NaN); a non-finite IPRED or PRED on 8 of 11
+observations, the first at TIME 4).
 ```
 
 Here the model's `CL` went non-finite at `TIME 4`, and every later prediction
-of the subject inherited it. The first record is then a better place to start
-than the count: on it the parameter model (a power of a negative covariate, a
-`log` of zero) or the structural model produced a value the likelihood could not
-score. It is a starting point, not always the cause. A runaway random effect can
-leave an earlier record with a finite prediction of `0` that the residual model
-already cannot score, and the first non-finite prediction then comes after it.
-The two engines can also disagree on the same subject: the closed form may
-report every prediction finite where the ODE solver reports most of them
-non-finite. So also read the records before the named `TIME`.
+of the subject inherited it. On that record the parameter model (a power of a
+negative covariate, a `log` of zero) or the structural model produced a value the
+likelihood could not score.
 
-When a named subject's predictions are all finite, the sentence says so
-(`every IPRED and PRED finite`), and the cause is not in the predictions. A
-proportional error on a prediction of `0` is the usual case. A non-Gaussian
-term can do it as well (a time-to-event, binary or Markov likelihood), as can a
-covariance matrix that is not positive definite, or a subject the likelihood
-refuses outright, such as IOV combined with FREM. A subject with no Gaussian
-observation meets the condition trivially.
+The two clauses can name different records. A runaway random effect can leave an
+early record with a finite prediction of `0` that the residual model already
+cannot score, and the first non-finite prediction then comes after it. The two
+engines can also disagree on the predictions for the same subject: on such a
+subject the closed form may report a non-finite prediction at one record and
+finite ones elsewhere, where the ODE solver reports the opposite. The residual
+clause names the same record on both, so read that one first.
+
+When neither clause names a record (`every residual term usable on its own;
+every IPRED and PRED finite`), the cause is not in a single Gaussian record. Many
+records whose terms are each large but below the cutoff can add up past it. A
+non-Gaussian term can do it as well (a time-to-event, binary or Markov
+likelihood), as can a covariance matrix that is not positive definite, or a
+subject the likelihood refuses outright, such as IOV combined with FREM. On a
+subject with no Gaussian observation, every record's `IWRES` is `NaN`, so the
+residual clause counts all of them.
 
 A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian
@@ -614,7 +633,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite) ([Which subjects](#which-subjects)) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite), and `unusable_residuals` / `first_unusable_residual_time`, the same pair for unusable residual terms ([Which subjects](#which-subjects)) |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 
