@@ -4957,3 +4957,63 @@ fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engin
         assert!(worst > 0.0, "{label}: no FD comparison ran");
     }
 }
+
+/// #1861 on the IOV loop: an all-TTE population under the FD label still warns, and names
+/// the survival cause. `examples/tte_exponential.ferx` with a `FIX`ed κ on its dummy
+/// clearance, one occasion per subject (the `tte_iov_at_saem_point` shape in
+/// `covariance.rs`), so every subject is an IOV subject carrying an event record. The label
+/// reads FD (a TTE model), so without the survival exception the all-FD guard returns
+/// `None`. The silent half of that guard — all-FD for a non-survival reason under an FD
+/// label — is `iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label`'s
+/// `gradient = fd` arm.
+#[cfg(feature = "survival")]
+#[test]
+fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
+    use std::io::Write;
+    let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+        .expect("model file")
+        .replace(
+            "omega ETA_LAMBDA ~ 0.09",
+            "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX",
+        )
+        .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+    assert_eq!(model.n_kappa, 1, "fixture must carry a κ");
+    let csv = std::fs::read_to_string("data/tte_exponential.csv").expect("data");
+    let mut lines = csv.lines();
+    let mut out = format!("{},OCC\n", lines.next().expect("header"));
+    for l in lines.filter(|l| !l.trim().is_empty()) {
+        out.push_str(&format!("{l},1\n"));
+    }
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    f.write_all(out.as_bytes()).expect("write");
+    let (pop, _) = crate::api::read_population_for(
+        &model,
+        &None,
+        f.path().to_str().expect("path"),
+        None,
+        Some("OCC"),
+        None,
+        &[],
+    )
+    .expect("data");
+    let n = pop.subjects.len();
+    assert!(
+        pop.subjects.iter().all(subject_has_survival_records),
+        "fixture: every subject carries a TTE record"
+    );
+    assert!(
+        !inner_reports_analytic_model(&model),
+        "a TTE model reports FD"
+    );
+
+    let w = fd_fallback_warning(&model, &pop, &model.default_params.theta)
+        .expect("an all-TTE IOV population warns although the label reads FD");
+    assert!(
+        w.starts_with(&format!(
+            "{n} of {n} subjects use finite-difference inner gradients in the IOV loop \
+             (survival/TTE observations: {n})"
+        )),
+        "{w}"
+    );
+}

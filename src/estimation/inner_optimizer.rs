@@ -217,6 +217,10 @@ pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Su
         )
 }
 
+/// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
+/// all-FD guard on it (#1861).
+const IOV_SURVIVAL_REASON: &str = "survival/TTE observations";
+
 fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
@@ -231,7 +235,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         return "missing omega_iov";
     }
     if subject_has_survival_records(subject) {
-        return "survival/TTE observations";
+        return IOV_SURVIVAL_REASON;
     }
     if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
@@ -408,9 +412,12 @@ fn iov_fd_fallback_warning(
     // (`gradient_method_inner` reads the same `inner_reports_analytic_model`), since
     // nothing else would correct that label. An all-analytic (`n_fd == 0`) population
     // needs no warning, and an all-FD one that also *reports* FD (e.g. `gradient = fd`)
-    // is already obvious from the banner and the label (#590 review, #1907).
+    // is already obvious from the banner and the label (#590 review, #1907) — unless a
+    // survival record is a cause, which the FD label on a TTE model does not explain
+    // (#1861, the same exception as the non-IOV twin).
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic) {
+    let survival_cause = reasons.contains_key(IOV_SURVIVAL_REASON);
+    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic && !survival_cause) {
         return None;
     }
     let reason_text = reasons
