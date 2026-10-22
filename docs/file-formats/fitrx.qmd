@@ -246,6 +246,8 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
 `sir` is non-null only when `[fit_options].sir = true`; `iov` is non-null only
 when the model uses kappa (block IOV).
 
+#### Recorded SIR and scoring settings
+
 `sir.settings` records every setting the SIR draws were scored under
 (`FitResult::sir_settings`, [#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)):
 `samples`, `resamples`, the resolved `seed`, `df`, `scale`, `keep_samples`,
@@ -253,7 +255,11 @@ and, flat beside them, the scoring settings below. The enums are written as thei
 `[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token,
 a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance,
 `n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed`
-fails the load as corrupt. The key is additive, so `format_version` stays `"1"`:
+fails the load as corrupt. `df` is a JSON number, except for the
+multivariate-normal proposal (`sir_df = normal`, `df = ∞`), which JSON has no number
+for: it is written as the token `"normal"`, and `"normal"` or `"mvn"` reads back as
+`∞`; a `null` `df` is corrupt ([#1819](https://github.com/FeRx-NLME/ferx-core/issues/1819)).
+The key is additive, so `format_version` stays `"1"`:
 a bundle saved before #1758 has no `settings` and loads `sir_settings = None`.
 `run_sir` on a fit without it takes its scoring settings from `scoring_settings`
 (below) when the bundle has one, and uses the caller's options as given when it

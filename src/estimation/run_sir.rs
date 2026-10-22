@@ -1247,10 +1247,50 @@ mod tests {
     /// decimals again (the ESS bit assertion dies).
     #[test]
     fn run_sir_after_a_fitrx_round_trip_repeats_the_in_fit_sir() {
+        let (prep, fit) = fitrx_round_trip_repeats_the_in_fit_sir(3.0);
+        let (model, pop) = (&prep.parsed.model, &prep.population);
+        let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
+        let quiet = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
+        // stores them, does not repeat it — so the bit identity above is the exact write's.
+        let mut rounded = sir_outputs_cleared(&fit);
+        for s in &mut rounded.subjects {
+            for e in s.eta.iter_mut() {
+                *e = format!("{e:.6}").parse().unwrap();
+            }
+        }
+        let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
+        assert_ne!(
+            control.sir_ess.map(f64::to_bits),
+            Some(ess_fit.to_bits()),
+            "premise: six-decimal EBEs must move the ESS"
+        );
+    }
+
+    /// #1819: the same round trip for the multivariate-normal proposal
+    /// (`sir_df = normal`, `df = ∞`), which `.fitrx` writes as the token `"normal"`.
+    /// Before, JSON had no spelling for it: the record could not reload, and a loaded
+    /// fit's `run_sir` scored at df 5. Mutations: write `df` as a plain number again
+    /// (the reload is `Corrupt` on the `null`); decode `"normal"` to anything but `∞`
+    /// (the record assertion dies).
+    #[test]
+    fn run_sir_after_a_fitrx_round_trip_repeats_a_normal_proposal_sir() {
+        let (_, fit) = fitrx_round_trip_repeats_the_in_fit_sir(f64::INFINITY);
+        assert_eq!(fit.sir_settings.as_ref().map(|s| s.df), Some(f64::INFINITY));
+    }
+
+    /// Fit warfarin with SIR at `sir_df`, save and reload it, and assert `run_sir` on the
+    /// reloaded fit repeats the in-fit SIR bit for bit. Returns the run and the fit.
+    fn fitrx_round_trip_repeats_the_in_fit_sir(
+        sir_df: f64,
+    ) -> (crate::api::PreparedRun, FitResult) {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
             .expect("prepare warfarin");
         let opts = FitOptions {
-            sir_df: 3.0,
+            sir_df,
             ..warfarin_sir_opts(&prep)
         };
         let model = &prep.parsed.model;
@@ -1259,7 +1299,7 @@ mod tests {
         let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
         assert!(ess_fit.is_finite());
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("df3.fitrx");
+        let path = dir.path().join("sir.fitrx");
         crate::io::fitrx::save_fit(
             &fit,
             pop,
@@ -1269,7 +1309,10 @@ mod tests {
         )
         .expect("save");
         let loaded = crate::io::fitrx::load_fit(&path).expect("load").fit;
-        assert_eq!(loaded.sir_settings, fit.sir_settings, "record round-trips");
+        assert_eq!(
+            loaded.sir_settings, fit.sir_settings,
+            "df {sir_df}: record round-trips"
+        );
 
         let quiet = FitOptions {
             verbose: false,
@@ -1288,24 +1331,15 @@ mod tests {
         assert_eq!(
             ess.to_bits(),
             ess_fit.to_bits(),
-            "the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
+            "df {sir_df}: the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
         );
-        assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "θ");
+        assert_eq!(
+            ci_bits(&out.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "df {sir_df}: θ"
+        );
 
-        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
-        // stores them, does not repeat it — so the bit identity above is the exact write's.
-        let mut rounded = sir_outputs_cleared(&fit);
-        for s in &mut rounded.subjects {
-            for e in s.eta.iter_mut() {
-                *e = format!("{e:.6}").parse().unwrap();
-            }
-        }
-        let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
-        assert_ne!(
-            control.sir_ess.map(f64::to_bits),
-            Some(ess_fit.to_bits()),
-            "premise: six-decimal EBEs must move the ESS"
-        );
+        (prep, fit)
     }
 }
 
