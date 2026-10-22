@@ -8463,8 +8463,10 @@ pub struct FitOptions {
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
     /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
-    /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
-    /// smoother OFV surfaces where FD noise is the main concern.
+    /// manual tuning is rarely needed for overflow. Decrease it (e.g. `1e-3`) on a smooth,
+    /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
+    /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
+    /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
     /// When `true` (the default) and the model is in analytic-covariance scope, the
     /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
     /// (#436), assembled from third-order sensitivities instead of second-differencing the

@@ -76,6 +76,16 @@ fn twin(kind: &str, rho: f64) -> String {
 }
 
 fn run(src: &str, maxiter: Option<usize>, covariance: bool) -> FitResult {
+    run_with(src, maxiter, covariance, |_| {})
+}
+
+/// [`run`] with a last edit to the fit options (the covariance-route switches).
+fn run_with(
+    src: &str,
+    maxiter: Option<usize>,
+    covariance: bool,
+    edit: impl FnOnce(&mut FitOptions),
+) -> FitResult {
     let parsed = parse_full_model(src).expect("twin parses");
     let model = parsed.model;
     let (pop, _) = read_population_for(
@@ -95,6 +105,7 @@ fn run(src: &str, maxiter: Option<usize>, covariance: bool) -> FitResult {
     if let Some(m) = maxiter {
         opts.outer_maxiter = m;
     }
+    edit(&mut opts);
     fit(&model, &pop, &model.default_params, &opts).expect("fit runs")
 }
 
@@ -201,18 +212,18 @@ fn free_twin(kind: &str) -> String {
 }
 
 /// Bands from the realised error. Linux aarch64 (the reference platform):
-/// `cs` |ΔOFV| 1.2e-5, |Δρ̂| 6.1e-5, SE 0.05%; `ar1` |ΔOFV| 1e-6, |Δρ̂| 6e-6,
-/// SE 0.1%; `car1` |ΔOFV| 1e-6, |Δρ̂| 3e-6, SE 0.30%. macOS arm64: `cs` 1e-6 /
-/// 4.2e-5 / 0.05%, `ar1` 6.3e-5 / 2.3e-5 / 0.1%.
-/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% (`car1` 2.5%) — ≥ 8× the worst realised error.
-/// `car1`'s SE sits 0.30% from NONMEM's, and a shared 1% bound would leave it 3.3×
-/// headroom. The gap is ferx's covariance step, not the likelihood and not ρ's log
-/// packing (#1974 review r1 #2, macOS arm64): the same −0.30% at NONMEM's own optimum
-/// (`covariance_at_the_nonmem_optimum_gives_its_se_of_rho`); log-packing `cs`/`ar1`'s ρ
-/// moves their SE by < 0.04%; and a central-FD Hessian of ferx's own OFV over all 10
-/// (θ, ω²) at NONMEM's optimum gives NONMEM's SE to ~1e-4 for all three kinds. The
-/// covariance step runs low on all three (`cs` −0.06%, `ar1` −0.11%, `car1` −0.30%);
-/// that is #1975.
+/// `cs` |ΔOFV| 1.2e-5, |Δρ̂| 6.1e-5; `ar1` |ΔOFV| 1e-6, |Δρ̂| 6e-6; `car1` |ΔOFV|
+/// 1e-6, |Δρ̂| 3e-6. macOS arm64: `cs` 1e-6 / 4.2e-5, `ar1` 6.3e-5 / 2.3e-5.
+/// Bounds: OFV 1e-3, ρ̂ 5e-4, SE 1% — ≥ 8× the worst realised error.
+///
+/// SE(ρ̂) is the analytic R-matrix's since #2093 took `correlation` models into its
+/// scope. Linux aarch64 SE(ρ̂) gaps: `cs` +0.004%, `ar1` −0.010%, `car1` +0.004%. Under
+/// the FD stencil they were 0.05% / 0.1% / 0.30%: its O(h²) truncation error at the
+/// default `fd_hessian_step` ran SE(ρ̂) low, and `car1` needed a 2.5% band of its own
+/// (#1975). The shared 1% here is the issue's band; the tight one, which that bias
+/// fails on every kind, is `covariance_at_the_nonmem_optimum_gives_its_se_of_rho`'s
+/// 1e-4, and the bias itself is pinned by
+/// `fd_stencil_se_of_rho_runs_low_by_its_truncation_error`.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -231,8 +242,7 @@ fn residual_correlation_fit_reaches_nonmem_estimates() {
         assert!(r.ofv.is_finite() && rho.is_finite() && se.is_finite());
         assert!((r.ofv - nm_ofv).abs() < 1e-3, "{kind}: OFV {}", r.ofv);
         assert!((rho - nm_rho).abs() < 5e-4, "{kind}: ρ̂ {rho}");
-        let se_tol = if kind == "car1" { 0.025 } else { 0.01 };
-        assert!((se - nm_se).abs() / nm_se < se_tol, "{kind}: SE(ρ̂) {se}");
+        assert!((se - nm_se).abs() / nm_se < 0.01, "{kind}: SE(ρ̂) {se}");
     }
 }
 
@@ -298,18 +308,23 @@ fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
 }
 
 /// T13: the covariance step at NONMEM's own optimum (one evaluation, every θ and ω
-/// free, `outer_maxiter = 0`). Covariance under a `correlation` line takes the FD
-/// Hessian route (`CovScopeDecline::ResidualCorrelations`), and SE(ρ̂) must be
-/// NONMEM's `$COV MATRIX=R` value. The objective is exact there too, so this is
-/// Tier 2. Realised (macOS arm64): `cs` SE 0.077541 against 0.077592, −0.07% (bound
-/// 0.5%); `car1` 0.0371379 against 0.0372486, −0.30% (bound 2.5%, the full-fit band) —
-/// the same gap the full fit shows, so the optimum is not where it comes from (#1974
-/// review r1 #2; the covariance step's bias is #1975).
+/// free, `outer_maxiter = 0`), and SE(ρ̂) must be NONMEM's `$COV MATRIX=R` value. The
+/// objective is exact there, and since #2093 so is the R-matrix: a `correlation` line
+/// is in the analytic route's scope, so no stencil step enters (the step invariance is
+/// pinned in [`fd_stencil_se_of_rho_runs_low_by_its_truncation_error`]). Tier 2.
+///
+/// Realised (macOS arm64 and Linux aarch64, every printed digit the same): `cs`
+/// 0.0775914 against 0.0775917 (−4e-6), `ar1` 0.0633394
+/// against 0.0633394 (< 1e-6), `car1` 0.0372485 against 0.0372486 (−3e-6) — NONMEM
+/// prints six significant figures, so the floor of this comparison is ~1e-6. Bound
+/// 1e-4, 25× the worst. Under the FD stencil the same evaluation gave −0.03% / −0.06% /
+/// −0.30% (#1975), which this bound rejects on every kind.
 #[test]
 fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
-    for (kind, est, nm, tol) in [
-        ("cs", &CS_EST, ESTIMATES[0], 5e-3),
-        ("car1", &CAR_EST, ESTIMATES[2], 0.025),
+    for (kind, est, nm) in [
+        ("cs", &CS_EST, ESTIMATES[0]),
+        ("ar1", &AR1_EST, ESTIMATES[1]),
+        ("car1", &CAR_EST, ESTIMATES[2]),
     ] {
         assert_eq!(nm.0, kind);
         let r = run(&at_optimum(kind, est), Some(0), true);
@@ -319,19 +334,81 @@ fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
             r.ofv
         );
         let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
+        let gap = se / nm.3 - 1.0;
         eprintln!(
-            "{kind}: OFV {:.9} SE(ρ̂) ferx {se:.7} NONMEM {:.7} ({:+.3}%)",
-            r.ofv,
-            nm.3,
-            100.0 * (se / nm.3 - 1.0)
+            "{kind}: OFV {:.9} SE(ρ̂) ferx {se:.7} NONMEM {:.7} ({gap:+.3e})",
+            r.ofv, nm.3
         );
         assert!(se.is_finite(), "{kind}: SE(ρ̂) {se}");
         assert!(
-            (se - nm.3).abs() / nm.3 < tol,
-            "{kind}: SE(ρ̂) ferx {se} vs NONMEM {}",
+            gap.abs() < 1e-4,
+            "{kind}: SE(ρ̂) ferx {se} vs NONMEM {} ({gap:+.3e})",
             nm.3
         );
     }
+}
+
+/// #1975: why the FD covariance step ran SE(ρ̂) low on these anchors, measured as a
+/// one-variable experiment — `car1` at NONMEM's optimum, the stencil forced
+/// (`analytic_cov_hessian = false`), nothing varied but `fd_hessian_step` (macOS arm64;
+/// the pinned `car1` pair reproduces on Linux aarch64 to every printed digit; gap
+/// against the analytic R-matrix's SE):
+///
+/// | step | `cs` | `ar1` | `car1` |
+/// |---|---|---|---|
+/// | 2e-2 | −0.119% | −0.241% | −1.177% |
+/// | 1e-2 (default) | −0.030% | −0.060% | −0.295% |
+/// | 5e-3 | −0.008% | −0.015% | −0.074% |
+/// | 1e-3 | −0.0007% | −0.0006% | −0.0033% |
+/// | 1e-4 | −0.0004% | −0.0001% | −0.0004% |
+///
+/// Each halving divides the gap by 4: it is the stencil's O(h²) truncation error, large
+/// on ρ because `ρ^Δt` makes the objective's higher derivatives in ρ grow with the
+/// visit gaps. Not inner-reconvergence noise (that grows as the step shrinks, ∝ 1/h²),
+/// and not the packed-space back-transform (step-independent, so it would survive
+/// h → 0; the stencil instead converges onto the analytic value). The other θ SEs move
+/// by < 0.04% over the same range.
+///
+/// Pinned here on `car1`, the largest: the gap ratio between h = 1e-2 and 5e-3 is the
+/// h² law (realised 3.99; band [3.6, 4.4]); the Richardson combination
+/// `(4·SE(h/2) − SE(h))/3`, which cancels exactly that term, lands on the analytic SE
+/// (realised −4.9e-7; bound 1e-5); and the default route does not difference at
+/// all — its SE is bit-identical at two steps — which is why it carries no bias.
+#[test]
+fn fd_stencil_se_of_rho_runs_low_by_its_truncation_error() {
+    let src = at_optimum("car1", &CAR_EST);
+    let se_rho = |analytic: bool, step: f64| {
+        let r = run_with(&src, Some(0), true, |o| {
+            o.analytic_cov_hessian = analytic;
+            o.fd_hessian_step = step;
+        });
+        let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
+        assert!(
+            se.is_finite(),
+            "analytic {analytic} step {step}: SE(ρ̂) {se}"
+        );
+        se
+    };
+    let exact = se_rho(true, 1e-2);
+    assert_eq!(
+        exact.to_bits(),
+        se_rho(true, 2e-2).to_bits(),
+        "the analytic route reads no fd_hessian_step"
+    );
+    let (se_h, se_h2) = (se_rho(false, 1e-2), se_rho(false, 5e-3));
+    let (gap_h, gap_h2) = (se_h / exact - 1.0, se_h2 / exact - 1.0);
+    let rich = ((4.0 * se_h2 - se_h) / 3.0) / exact - 1.0;
+    eprintln!(
+        "car1 SE(ρ̂): analytic {exact:.9}, FD h=1e-2 {se_h:.9} ({gap_h:+.3e}), \
+         h=5e-3 {se_h2:.9} ({gap_h2:+.3e}), ratio {:.3}, Richardson {rich:+.3e}",
+        gap_h / gap_h2
+    );
+    // The straddle: at the default step the stencil is outside the T13 bound above,
+    // and low — the bias #1975 reported.
+    assert!(gap_h < -1e-3, "default-step FD gap {gap_h:+.3e}");
+    let ratio = gap_h / gap_h2;
+    assert!((3.6..4.4).contains(&ratio), "gap ratio {ratio} (h² law: 4)");
+    assert!(rich.abs() < 1e-5, "Richardson gap {rich:+.3e}");
 }
 
 /// #1081 follow-up: under a `correlation` line the Durbin–Watson statistic is taken
