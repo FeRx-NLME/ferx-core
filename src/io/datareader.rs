@@ -3104,7 +3104,10 @@ fn parse_subject(
                 raw_time,
             )?;
 
-            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
+            let mut dose = dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode);
+            // The reset half of an `EVID=4` row was pushed to `reset_times` above.
+            dose.evid4 = evid == 4;
+            doses.push(dose);
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }

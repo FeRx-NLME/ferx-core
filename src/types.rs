@@ -102,7 +102,7 @@ pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
 }
 
 /// A single dose event (bolus, infusion, or oral)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DoseEvent {
     pub time: f64,
     pub amt: f64,
@@ -126,6 +126,31 @@ pub struct DoseEvent {
     /// reshapes it (see [`InfusionDef`] and `Self::bioavailable_infusion`, #419).
     /// Persistent across `Self::resolve_rate`. Only read for infusions.
     pub infusion_def: InfusionDef,
+    /// Whether this dose came from an `EVID=4` row (reset + dose). The reader stores such
+    /// a row twice — here and as a `Subject::reset_times` entry at the same time — and this
+    /// is what tells it apart from a separate `EVID=3` row co-timed with a dose, which the
+    /// engines treat identically but which is a second data record (#2104's warning counts
+    /// records). Crate-private, like `cmt`, so it widens no public API.
+    pub(crate) evid4: bool,
+}
+
+/// The derived rendering minus `evid4`: ferx-tools' search journal hashes `{doses:?}` into
+/// its data fingerprint, and the flag labels a record for a warning without changing what
+/// any fit sees, so printing it would move every journal's digest and refuse every resume.
+impl std::fmt::Debug for DoseEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoseEvent")
+            .field("time", &self.time)
+            .field("amt", &self.amt)
+            .field("cmt", &self.cmt)
+            .field("rate", &self.rate)
+            .field("duration", &self.duration)
+            .field("ss", &self.ss)
+            .field("ii", &self.ii)
+            .field("rate_mode", &self.rate_mode)
+            .field("infusion_def", &self.infusion_def)
+            .finish()
+    }
 }
 
 impl DoseEvent {
@@ -143,6 +168,7 @@ impl DoseEvent {
             // A data-driven dose is rate-specified (`RATE>0`); a bolus never reads
             // this. Either way `RateDefined` is the correct default (#419).
             infusion_def: InfusionDef::RateDefined,
+            evid4: false,
         }
     }
 
@@ -169,6 +195,7 @@ impl DoseEvent {
             ii,
             rate_mode: mode,
             infusion_def,
+            evid4: false,
         }
     }
 
@@ -6892,6 +6919,12 @@ pub enum WarningCode {
     /// [`WarningCode::FlipFlop`]: the rows returned are a sample of a truncated parameter
     /// distribution, so intervals built from them are biased, not merely fewer.
     UncertaintyDrawsSkipped,
+    /// The final estimates put a non-positive or non-finite `CL` or `V` on at least one
+    /// record of a closed-form (1-/2-/3-cpt IV / oral) model (`W_DEGENERATE_CL_V`, #2104).
+    /// Both closed-form engines serve a non-positive or infinite value a concentration of 0
+    /// — the dose is dropped — and a `NaN` a `NaN`; NONMEM would refuse either record:
+    /// PREDPP treats a non-positive PK parameter as an error.
+    DegenerateClearanceOrVolume,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -6938,6 +6971,7 @@ impl WarningCode {
             WarningCode::FlatParameter => "flat_parameter",
             WarningCode::OdeSolver => "ode_solver",
             WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
+            WarningCode::DegenerateClearanceOrVolume => "degenerate_clearance_or_volume",
             WarningCode::General => "general",
         }
     }
@@ -7033,6 +7067,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
+        )
+    } else if lower.contains("w_degenerate_cl_v") {
+        // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
+        // of the generic "degenerate" → optimizer-health prose arm, which its wording would
+        // otherwise match.
+        (
+            WarningSeverity::Warning,
+            WarningCode::DegenerateClearanceOrVolume,
         )
     } else if lower.contains("w_uncertainty_draws_skipped") {
         // #1485: skipped uncertainty draws, one warning per run. A token arm ahead of the

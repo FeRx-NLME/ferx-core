@@ -482,6 +482,10 @@ fn dose(e: &mut Encoder, d: &DoseEvent) {
         ii,
         rate_mode,
         infusion_def,
+        // Not hashed: an `EVID=4` row and an `EVID=3` row followed by a co-timed dose
+        // build the same engine input, so the objective cannot tell them apart. It only
+        // labels records for the #2104 warning's count.
+        evid4: _,
     } = d;
     e.f64(*time);
     e.f64(*amt);

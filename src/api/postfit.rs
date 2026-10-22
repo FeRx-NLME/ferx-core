@@ -2364,6 +2364,113 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     Some((msg, entry))
 }
 
+/// Build the human message + native structured entry for a closed-form fit whose final
+/// estimates put a non-positive or non-finite `CL` or `V` on any record, or `None` (#2104).
+///
+/// The closed-form engines give such a record one of two outcomes, and the message states
+/// whichever occurred — the two sentences are gated on their own record counts:
+///
+/// - **non-positive or infinite** — served a concentration of 0 (superposition drops the
+///   dose, the event-driven walk empties every compartment over the interval the record
+///   governs), so the fit completes and scores the subject against a confident, finite
+///   prediction;
+/// - **`NaN`** (an invalid covariate expression, say) — served `NaN` once a dose has
+///   arrived, so the subject's likelihood is repelled through the sentinel, and 0 before
+///   any dose. Which of the two a record got depends on the timeline, so the message states
+///   the rule rather than claiming an outcome per record.
+///
+/// NONMEM would not have made either prediction: PREDPP reports a non-positive PK parameter
+/// as a PRED error. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
+/// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
+/// own fitted class.
+pub(crate) fn degenerate_cl_v_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    mixest: Option<&[usize]>,
+) -> Option<(String, WarningEntry)> {
+    let no_kappas: Vec<DVector<f64>> = Vec::new();
+    let hits: Vec<(String, Vec<(f64, bool)>)> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .enumerate()
+        .filter_map(|(si, (subject, eta))| {
+            // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
+            let class = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
+            let _mix = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let ks = kappas.get(si).unwrap_or(&no_kappas);
+            let records = crate::pk::invalid_cl_v_records(
+                model,
+                subject,
+                theta,
+                eta.as_slice(),
+                ks.iter()
+                    .map(|k| k.as_slice())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            );
+            (!records.is_empty()).then(|| (subject.id.clone(), records))
+        })
+        .collect();
+    let (first_id, first_records) = hits.first()?;
+    let all = || hits.iter().flat_map(|(_, r)| r.iter());
+    let n_records = all().count();
+    let n_nan = all().filter(|&&(_, nan)| nan).count();
+    let n_zero = n_records - n_nan;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    let mut msg = format!(
+        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or non-finite CL or V on {} \
+         record(s) at the final estimates (first at TIME {} in subject {}).",
+        hits.len(),
+        ids.join(", "),
+        n_records,
+        first_records[0].0,
+        first_id,
+    );
+    if n_zero > 0 {
+        msg.push_str(&format!(
+            " On {n_zero} of them CL or V is non-positive or infinite: the closed-form PK \
+             engines serve a concentration of 0 there and drop any drug in the body over an \
+             interval such a record governs, so the fit scored a confident, finite prediction."
+        ));
+    }
+    if n_nan > 0 {
+        msg.push_str(&format!(
+            " On {n_nan} of them CL or V is NaN: an observation there is predicted NaN once a \
+             dose has arrived, which repels that subject's likelihood, and 0 before any dose."
+        ));
+    }
+    msg.push_str(
+        " NONMEM would refuse these records: PREDPP rejects a non-positive PK parameter as an \
+         error. Check the individual-parameter model — a linear covariate term such as \
+         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record, and a covariate \
+         value the expression cannot use gives NaN — and prefer a form that keeps CL and V \
+         positive, such as an exponential or power model.",
+    );
+    let entry = warning_entry(
+        WarningCode::DegenerateClearanceOrVolume,
+        msg.clone(),
+        Some(serde_json::json!({
+            "model": model.pk_model.canonical_name(),
+            "n_records": n_records,
+            "n_zero_records": n_zero,
+            "n_nan_records": n_nan,
+            "subjects": hits
+                .iter()
+                .map(|(id, records)| serde_json::json!({
+                    "id": id,
+                    "times": records.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    "nan_times": records.iter().filter(|r| r.1).map(|r| r.0).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Some((msg, entry))
+}
+
 /// The `W_` token that opens the post-fit ODE-solver diagnostics message, and the string
 /// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
 const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";

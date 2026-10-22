@@ -2270,6 +2270,86 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
     }
 }
 
+/// An identity-packed θ (negative lower bound) whose initial magnitude exceeds this is
+/// divided by `|θ₀|` in the NLopt scale vector under `auto` / `abs` (#2146).
+///
+/// Without it such a θ reaches the optimizer in raw units: warfarin's volume written in
+/// units of 1e-5 L (`TVV_S` = 1e6, symmetric bounds) has a packed gradient ~1/|θ₀| of
+/// the unit-magnitude one, so L-BFGS reports convergence at OFV −265.42 with `TVV_S`
+/// unmoved, against −286.00 at 773770.6, and BOBYQA stalls the same way from θ₀ = 100.
+/// The bar is 10, not 1: at 1 the rule catches `ctmm_pd_2state`'s `LQ01 = -1.2` and
+/// moves every optimizer's end point on it (L-BFGS 712.65 → 712.92), while at 10 no
+/// committed fixture changes and BOBYQA is still fixed at θ₀ = 100, where it first
+/// fails (macOS arm64, #2146 plan).
+const LARGE_IDENTITY_THETA: f64 = 10.0;
+
+/// The NLopt outer loop's per-coordinate scale vector: the optimizer sees
+/// `x[i] / scale[i]`.
+///
+/// The strategy ([`resolve_scaling`]) picks the base vector. Under magnitude scaling
+/// (`abs`, or the legacy `scale_params` / IOV-SLSQP auto-enable under `none`) it is
+/// [`compute_scale_packed`], **unless any θ is identity-packed**, in which case every
+/// coordinate keeps 1.0: `compute_scale` leaves a near-zero covariate effect
+/// (THETA_AGE_CL = −0.01) at its raw value while log-packed θ become O(1), and the
+/// mixed scaled magnitudes hurt the quasi-Newton/SQP Hessian estimate (SAD_SCEN1 FOCEI
+/// 510+ evals vs ~90 unscaled). Re-enabling the log-packed coordinates of such a model
+/// was re-measured on #2146 and is mixed (SLSQP 104 → 178 iterations on a
+/// linear-covariate `two_cpt_oral_cov`), so they stay unscaled.
+///
+/// Two per-θ adjustments follow, both only under `auto` / `abs` — an explicit
+/// `rescale2` already normalises every coordinate by its box, and an explicit `none`
+/// means no scaling — and both on identity-packed θ (packed in place, at the front of
+/// the vector, so `x0[i]` is θᵢ itself):
+///
+/// - |θ₀| > [`LARGE_IDENTITY_THETA`] is divided by |θ₀| (#2146), under the resolved
+///   unscaled strategy (BOBYQA / MMA) as well as under `abs`;
+/// - the near-zero θ in `identity_scales` take their probed scale (#2159,
+///   [`identity_theta_scales`]).
+fn nlopt_scale_vector(
+    x0: &[f64],
+    init_params: &ModelParameters,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    auto_scale_iov: bool,
+    identity_scales: &[(usize, f64)],
+) -> Vec<f64> {
+    let n = x0.len();
+    let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
+    let mut scale = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(bounds),
+        ParameterScaling::Abs => {
+            if has_identity_theta {
+                vec![1.0; n]
+            } else {
+                compute_scale_packed(x0, init_params)
+            }
+        }
+        // `Auto` is resolved away by `resolve_scaling`; group with `None`.
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if (options.scale_params || auto_scale_iov) && !has_identity_theta {
+                compute_scale_packed(x0, init_params)
+            } else {
+                vec![1.0; n]
+            }
+        }
+    };
+    if !matches!(
+        options.parameter_scaling,
+        ParameterScaling::Auto | ParameterScaling::Abs
+    ) {
+        return scale;
+    }
+    for (i, &lo) in init_params.theta_lower.iter().enumerate() {
+        if lo < 0.0 && x0[i].abs() > LARGE_IDENTITY_THETA {
+            scale[i] = x0[i].abs();
+        }
+    }
+    for &(i, s) in identity_scales {
+        scale[i] = s;
+    }
+    scale
+}
+
 /// Resolve the derivative-free `bobyqa` outer optimizer's `ftol_rel` stop tolerance.
 ///
 /// `override_ftol` (`[fit_options] outer_ftol`) wins when set. Otherwise auto-select:
@@ -4207,21 +4287,9 @@ fn optimize_nlopt_once(
     let schedule_cache =
         crate::estimation::inner_optimizer::build_schedule_cache(model, population);
 
-    // Per-element scale factors: present O(1) coordinates to NLopt.
+    // Per-element scale factors: present O(1) coordinates to NLopt — see
+    // `nlopt_scale_vector` for which coordinates stay unscaled and why.
     //
-    // `compute_scale` normalises by |packed value|, which gives O(1)
-    // scaled coords for log-packed thetas (CL, V, KA — log-magnitude
-    // is typically > 0.1) and a 1.0 fallback for everything near zero.
-    // For identity-packed thetas (those with `theta_lower < 0`,
-    // typically small covariate effects like THETA_AGE_CL = -0.01)
-    // this places the scaled value near zero, and SLSQP's BFGS-flavored
-    // Hessian estimate handles wildly different scaled magnitudes
-    // poorly — observed regression: SAD_SCEN1 FOCEI took 510+ evals
-    // (40+ min) vs ~90 evals (~5 min) with scaling off. Auto-disable
-    // scaling whenever any identity-packed theta is present, so the
-    // optimizer runs in the natural (mixed) packed space where
-    // BFGS's own scale-adaptation works correctly.
-    let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
     // IOV + SLSQP: auto-enable per-coordinate scaling (issue #101 rec #2). IOV
     // models pack disparate-magnitude parameters (block-diagonal omega plus the
     // kappa block), and SLSQP's uniform gradient cap (`cap_scaled_gradient`,
@@ -4242,37 +4310,14 @@ fn optimize_nlopt_once(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let mut scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
-        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
-        // Magnitude scaling, but disabled when an identity-packed theta is present
-        // (covariate effects with `theta_lower < 0`): `compute_scale` leaves those
-        // small coordinates near their raw value while log-packed θ become O(1), and
-        // the resulting wildly-mixed scaled magnitudes hurt the quasi-Newton/SQP
-        // Hessian estimate (observed: SAD_SCEN1 FOCEI 510+ evals vs ~90 unscaled).
-        // Falling back to the natural mixed space keeps that protection.
-        ParameterScaling::Abs => {
-            if has_identity_theta {
-                vec![1.0; n]
-            } else {
-                compute_scale_packed(&x0, init_params)
-            }
-        }
-        // `Auto` is resolved away by `resolve_scaling`; group with `None`.
-        ParameterScaling::None | ParameterScaling::Auto => {
-            if (options.scale_params || auto_scale_iov) && !has_identity_theta {
-                compute_scale_packed(&x0, init_params)
-            } else {
-                vec![1.0; n]
-            }
-        }
-    };
-    // #2159: a near-zero identity θ whose objective moves with its relative size is
-    // divided by its initial magnitude, whatever the strategy chose above (all ones
-    // whenever an identity θ is present). θ occupy the first packed slots
-    // (`pack_params`). The caller probes only under `auto` / `abs`.
-    for &(i, s) in identity_scales {
-        scale[i] = s;
-    }
+    let scale = nlopt_scale_vector(
+        &x0,
+        init_params,
+        &bounds,
+        options,
+        auto_scale_iov,
+        identity_scales,
+    );
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].

@@ -132,6 +132,7 @@ pub(crate) enum Objective {
 /// Exact per-subject FOCE/FOCEI packed gradient `dFᵢ/dx` (`pack_params` order, the same
 /// quantity as `subject_packed_gradient` / `_foce`) by the adjoint method, or `None`
 /// outside its scope.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_packed_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -164,7 +165,7 @@ pub(super) struct Scoped<'m> {
     /// model resolved at `η = 0`, which a closed-form absorption model near its flip-flop switch
     /// may route differently from `model` (resolved at `η̂`).
     pub pop_model: &'m CompiledModel,
-    pub params: ModelParameters,
+    pub params: &'m ModelParameters,
     pub width: usize,
     pub bucket: usize,
     pub eta: Vec<f64>,
@@ -172,16 +173,66 @@ pub(super) struct Scoped<'m> {
     pub layout: Option<crate::stats::stacked_layout::StackedLayout>,
 }
 
+/// A packed point unpacked once: `template`, the packed `x` and `unpack_params(x, template)`.
+///
+/// Every subject of a population gradient, covariance matrix or AGQ score sweep is
+/// differentiated at the same packed point, so the population loops build one of these
+/// before `par_iter` and hand it to the `*_at` entry points ([`subject_adjoint_gradient_at`],
+/// [`subject_adjoint_cov_hessian_at`], …). Unpacking per subject rebuilt the whole
+/// `ModelParameters` each time, every θ name a fresh `String`: on a 1,317-θ covariate network
+/// that was a third of the gradient. The per-subject entry points without `_at` build their
+/// own.
+pub(crate) struct PackedPoint<'a> {
+    pub(crate) template: &'a ModelParameters,
+    pub(crate) x: &'a [f64],
+    params: ModelParameters,
+}
+
+impl<'a> PackedPoint<'a> {
+    /// `None` when `x` is not `template`'s packed length, the one shape `unpack_params`
+    /// cannot read (it indexes `x` unchecked).
+    pub(crate) fn new(template: &'a ModelParameters, x: &'a [f64]) -> Option<Self> {
+        #[cfg(test)]
+        if let Ok(mut watch) = PACKED_POINT_WATCH.lock() {
+            if let Some((addr, n)) = watch.as_mut() {
+                if *addr == template as *const ModelParameters as usize {
+                    *n += 1;
+                }
+            }
+        }
+        let seg = crate::estimation::parameterization::packed_segments(template);
+        let len = seg.theta
+            + seg.omega
+            + seg.sigma
+            + seg.rho
+            + seg.iov
+            + seg.mixture_omega
+            + seg.mixture_sigma;
+        (x.len() == len).then(|| PackedPoint {
+            template,
+            x,
+            params: unpack_params(x, template),
+        })
+    }
+}
+
+/// Test watch: `(template address, count)` — the [`PackedPoint`]s built for that one
+/// template, on **any** thread (a per-subject unpack would run on the rayon workers, where a
+/// thread-local counter on the caller cannot see it). Keyed by address so concurrent tests
+/// with their own templates do not count.
+#[cfg(test)]
+pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
+    std::sync::Mutex::new(None);
+
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
 /// the gradient and the covariance Hessian.
 pub(super) fn scope<'m>(
     model: &'m CompiledModel,
     subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+    pt: &'m PackedPoint<'_>,
     eta_hat: &[f64],
 ) -> Option<Scoped<'m>> {
-    let params = unpack_params(x, template);
+    let (template, x, params) = (pt.template, pt.x, &pt.params);
     let pop_model = if model.n_kappa > 0 {
         crate::pk::effective_model_for_eval_iov(
             model,
@@ -257,7 +308,8 @@ macro_rules! by_bucket {
     };
 }
 
-/// [`subject_adjoint_packed_gradient`] for any [`Objective`].
+/// `subject_adjoint_packed_gradient` for any [`Objective`].
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -266,19 +318,33 @@ pub(crate) fn subject_adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
-    adjoint_gradient(model, subject, template, x, eta_hat, objective, false)
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_gradient_at(model, subject, &pt, eta_hat, objective)
+}
+
+/// `subject_adjoint_gradient` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`] the caller unpacked once for its
+/// population.
+pub(crate) fn subject_adjoint_gradient_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<Vec<f64>> {
+    adjoint_gradient(model, subject, pt, eta_hat, objective, false)
 }
 
 /// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
-/// identity [`subject_adjoint_gradient`] declines — an indefinite exact `H` at an `η̂` the
+/// identity [`subject_adjoint_gradient_at`] declines — an indefinite exact `H` at an `η̂` the
 /// inner search's fallback left short of stationary ([`mode_solve`]). Without the identity
 /// the EBE response is not available exactly, and the alternative is the reconverged
 /// finite-difference score, `2·n_x` EBE re-solves per subject: on a 147-weight covariate
 /// network under Laplace that turned a 7.5 s fit into a 90 s one. This is the AGQ twin of
 /// FOCE/FOCEI's held-EBE salvage, omits the same EBE-response term, and is reported by the
-/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient`] declines for
+/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient_at`] declines for
 /// any other reason (scope, a non-finite recording) and for the FOCE/FOCEI objectives,
 /// whose salvage lives in the outer optimizer.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_held_ebe_score(
     model: &CompiledModel,
     subject: &Subject,
@@ -287,20 +353,32 @@ pub(crate) fn subject_adjoint_held_ebe_score(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_held_ebe_score_at(model, subject, &pt, eta_hat, objective)
+}
+
+/// `subject_adjoint_held_ebe_score` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
+pub(crate) fn subject_adjoint_held_ebe_score_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, template, x, eta_hat, objective, true))?
+        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true))?
 }
 
 fn adjoint_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+    pt: &PackedPoint<'_>,
     eta_hat: &[f64],
     objective: Objective,
     held: bool,
 ) -> Option<Vec<f64>> {
-    let mut sc = scope(model, subject, template, x, eta_hat)?;
+    let (template, x) = (pt.template, pt.x);
+    let mut sc = scope(model, subject, pt, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
         Objective::Agq { n_agq, exact: true } if sc.width == 0 => Objective::Agq {
@@ -332,7 +410,7 @@ fn adjoint_gradient(
                 subject,
                 sc.layout.as_ref(),
                 template,
-                &sc.params,
+                sc.params,
                 x,
                 &sc.eta,
                 n_agq,
@@ -346,7 +424,7 @@ fn adjoint_gradient(
                 subject,
                 sc.layout.as_ref(),
                 template,
-                &sc.params,
+                sc.params,
                 x,
                 &sc.eta,
                 objective != Objective::Foce,
@@ -369,7 +447,7 @@ fn adjoint_gradient(
 /// from the inner search's fallback, which can stop short (Nelder–Mead, max-iter), and the
 /// gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
 /// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
-/// score ([`subject_adjoint_held_ebe_score`]), not the reconverged one.
+/// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
 ///
 /// The SPD branch takes no such gate, deliberately. Near a strict mode `η̂ = η* + ε` and
 /// `∂Ψ/∂x` misses the converged objective's total derivative by `O(|∇_η l|)` only, while
@@ -2365,7 +2443,7 @@ struct Bucket<const N: usize, const M: usize>;
 
 /// The exact anchor's taped half ([`agq_taped`] in its directional second-order mode) at
 /// one bucket: the recording at an [`EXACT_ANCHOR_BUCKETS`] width, `None` at any other —
-/// which [`subject_adjoint_gradient`] never reaches, since it pads an exact-anchor subject
+/// which [`subject_adjoint_gradient_at`] never reaches, since it pads an exact-anchor subject
 /// to an exact-anchor bucket first.
 trait ExactAnchor<const N: usize, const M: usize> {
     #[allow(clippy::too_many_arguments)]
@@ -2704,7 +2782,11 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
 
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
-pub(crate) use hessian::{cov_width_declines, subject_adjoint_cov_hessian, subject_adjoint_eta_dx};
+pub(crate) use hessian::{
+    cov_width_declines, subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
+};
+#[cfg(test)]
+pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};
 
 #[cfg(test)]
 #[path = "ode_adjoint_tests.rs"]
