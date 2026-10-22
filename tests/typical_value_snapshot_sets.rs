@@ -1753,11 +1753,15 @@ fn states_read_each_dose_attribute_at_its_own_record_not_the_first() {
 ///   fit's own θ, bit-for-bit, per arm. Dies if `fit()` stops pruning, or prunes a subject
 ///   whose covariate does vary.
 /// - **the arms agree to integrator tolerance, and the gap closes with it**: two
-///   engines integrating the same system. Bounds measured on macOS arm64 (worst
-///   relative gap over the four observations): 3.37e-7 at the default 1e-4/1e-6, 4.78e-11
-///   at 1e-8/1e-10 and 3.99e-15 at 1e-12/1e-14; each bound is ~10× that. A dose
-///   quantity read at observation 1 (`MTT = −9` clamps the transit kernel) loses the drug
-///   and misses every bound by orders of magnitude.
+///   engines integrating the same system. Bounds come from the Linux reference platform
+///   (`tools/linux-test.sh`, Linux/aarch64, glibc 2.41), as the worst relative gap over the
+///   four observations: 3.37e-7 at the default 1e-4/1e-6 and 4.78e-11 at 1e-8/1e-10, each
+///   bounded at ~10×. At 1e-12/1e-14 Linux measures 4.03e-16. The gap there is roundoff,
+///   not truncation, and the libm decides it, so macOS arm64 measures 3.99e-15 (its first
+///   two gaps match Linux to every printed digit). The 1e-14 bound is 25× the Linux value
+///   and still nine orders below a lost dose. A dose quantity read at observation 1
+///   (`MTT = −9` clamps the transit kernel) loses the drug and misses every bound by
+///   orders of magnitude.
 #[test]
 fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
     use ferx_core::{fit, EstimationMethod, FitOptions};
@@ -1769,7 +1773,7 @@ fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
     for (reltol, abstol, bound) in [
         (1e-4, 1e-6, 3e-6),
         (1e-8, 1e-10, 5e-10),
-        (1e-12, 1e-14, 4e-14),
+        (1e-12, 1e-14, 1e-14),
     ] {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
