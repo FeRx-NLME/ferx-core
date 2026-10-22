@@ -542,17 +542,21 @@ first at TIME 0 (DV 200, IPRED 0); every IPRED and PRED finite).
 
 The first clause names the observations whose **own likelihood term** is
 unusable (#2266), and the `DV` and `IPRED` of the first. That term is the
-record's `−2 log L` at the subject's EBE, as the likelihood scores it: residual
-variance, `log` variance, an `iiv_on_ruv` scale and an M3 censored term included.
-It is unusable when it fails the same test as the objective (`NaN`, infinite, or
-at least `1e14`). Start with this record. Above, the prediction at `TIME 0` is a
-finite `0`, which a proportional error scores at the variance floor,
-`DV² × 1e12`. No prediction is non-finite, so the prediction clause has no record
-to name. A runaway `iiv_on_ruv` random effect is caught the same way: its
-variance overflows to infinity, so the term is infinite even though `IWRES`
-reads `0`. A record of a non-Gaussian endpoint has no such term and is never
-counted. When the subject cannot be matched to its data, the clause reads
-`likelihood terms not checked`.
+record's `−2 log L` in the FOCEI conditional data term at the subject's EBE, read
+off the scorer's own computation, with the raw `IPRED` and the fitted residual
+variance. It includes the fitted residual correlations, an SDE's process noise,
+an `iiv_on_ruv` scale and an M3 censored term. A mixture subject is scored under
+its fitted class. The term is unusable when it fails the same test as the
+objective (`NaN`, infinite, or at least `1e14`), or when the scorer cannot use
+its variance at all. Start with this record. Above, the prediction at `TIME 0`
+is a finite `0`, which a proportional error scores at the variance floor,
+`DV² × 1e12`. No prediction is non-finite, so the prediction clause has no
+record to name. A runaway `iiv_on_ruv` random effect is caught the same way:
+its variance overflows to infinity, so the record is named even though `IWRES`
+reads `0`. Under FOCE, or residuals correlated across records, the objective
+does not split by record, and the term is what the record contributes at the
+EBE on its own. When the subject cannot be matched to its data, the clause
+reads `likelihood terms not checked`.
 
 The second clause names the observations whose `IPRED` or `PRED` is not finite:
 

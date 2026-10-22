@@ -1839,18 +1839,18 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// 1. **The records whose own likelihood term is unusable (#2266)**, with the
 ///    written `TIME`, `DV` and `IPRED` of the first. The term is the record's own
-///    `−2 log L` at η̂ and the fitted parameters, from
-///    [`crate::stats::likelihood`]'s per-record term (`obs_neg2ll_terms`) — the one
-///    the likelihood sums, so the residual variance, `ln V`, an `iiv_on_ruv` scale
-///    and an M3 censored term are all in it. It is unusable when it fails the same
-///    `ofv_is_valid` test as the objective. This is the record to look at first. A
-///    runaway η̂ can leave an early record with a finite `IPRED` of 0 that a
-///    proportional error scores at `DV² × 1e12` (the variance floor), and the first
-///    non-finite *prediction* then names a later record, or none: on the same
-///    subject the closed form and the ODE disagree on the predictions but agree on
-///    this record. A runaway residual-error η makes `V` infinite, which `IWRES`
-///    (divided by `√V`) reports as `0`; the term reports it as `inf`. A record no
-///    Gaussian term scores (a non-Gaussian endpoint's row) is skipped.
+///    `−2 log L` in the FOCEI conditional data term at η̂, recorded off the scorer's
+///    own sweep (`conditional_obs_neg2ll_terms`): raw `IPRED`, unclamped `V`, the
+///    fitted correlations, an SDE's process-noise variance, an `iiv_on_ruv` scale
+///    and an M3 censored term are all in it. A mixture subject is evaluated under
+///    its fitted class (`mixest`, 0-based), with that class's Σ. The term is
+///    unusable when it fails the same `ofv_is_valid` test as the objective. This is
+///    the record to look at first. A runaway η̂ can leave an early record with a
+///    finite `IPRED` of 0 that a proportional error scores at `DV² × 1e12` (the
+///    variance floor), and the first non-finite *prediction* then names a later record, or none: on
+///    the same subject the closed form and the ODE disagree on the predictions but
+///    agree on this record. A runaway residual-error η makes `V` infinite, which
+///    `IWRES` (divided by `√V`) reports as `0` and the scorer rejects.
 /// 2. The observations whose `IPRED` or `PRED` is not finite, with the written
 ///    `TIME` of the first, as #2038 wrote it. When none is, it says so: the cause is
 ///    then a finite prediction the residual model cannot score (clause 1 names it),
@@ -1866,6 +1866,7 @@ pub(crate) fn name_nonfinite_subjects(
     population: &Population,
     model: &CompiledModel,
     params: &ModelParameters,
+    mixest: Option<&[usize]>,
 ) -> String {
     let ofv_is_valid = crate::estimation::outer_optimizer::ofv_is_valid;
     let named: Vec<NamedSubject> = subjects
@@ -1882,19 +1883,30 @@ pub(crate) fn name_nonfinite_subjects(
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
             let unusable: Vec<usize> = data
                 .map(|d| {
-                    crate::stats::likelihood::obs_neg2ll_terms(
+                    // The subject's fitted class (#985): held for the evaluation, so
+                    // a `MIXNUM`-keyed residual selector or magnitude reads it, and
+                    // that class's Σ, as `compute_subject_results` holds the guard.
+                    let class = mixest.and_then(|m| m.get(i)).copied();
+                    let _mix_guard =
+                        class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let class_params = class
+                        .filter(|_| params.mixture.is_some())
+                        .map(|c| crate::estimation::mixture::class_params(params, c));
+                    let p = class_params.as_ref().unwrap_or(params);
+                    crate::stats::likelihood::conditional_obs_neg2ll_terms(
                         model,
                         d,
+                        &p.theta,
                         &s.ipred,
-                        &params.theta,
-                        &params.sigma.values,
                         s.eta.as_slice(),
+                        &p.sigma.values,
+                        model.residual_cov_at(p),
                     )
                 })
                 .unwrap_or_default()
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.is_some_and(|t| !ofv_is_valid(t)))
+                .filter(|(_, &t)| !ofv_is_valid(t))
                 .map(|(j, _)| j)
                 .collect();
             NamedSubject {

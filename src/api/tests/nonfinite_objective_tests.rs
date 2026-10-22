@@ -1145,6 +1145,7 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
         &pop,
         &m,
         &m.default_params,
+        None,
     );
 
     let added = full
@@ -1215,6 +1216,7 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
         &pop,
         &m,
         &m.default_params,
+        None,
     );
     assert_eq!(out, msg);
     assert_eq!(entry.message, before.message);
@@ -1245,6 +1247,7 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
         &pop,
         &m,
         &m.default_params,
+        None,
     );
     assert!(
         full.ends_with(
@@ -1287,7 +1290,7 @@ fn a_non_finite_written_time_is_carried_as_null() {
     a.ofv_contribution = 2e20;
     a.ipred[2] = f64::NAN;
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params);
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params, None);
     assert!(full.ends_with("the first at TIME NaN)."), "{full}");
     assert!(
         full.contains("the first at TIME NaN (DV 5.555555555555555, IPRED NaN);"),
@@ -1323,7 +1326,15 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         })
         .collect();
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop, &m, &m.default_params);
+    let full = name_nonfinite_subjects(
+        msg,
+        &mut entry,
+        &subjects,
+        &pop,
+        &m,
+        &m.default_params,
+        None,
+    );
 
     assert!(full.contains(" 12 of 12 subjects "), "{full}");
     assert!(full.contains("s10 (contribution 2e20"), "{full}");
@@ -1571,7 +1582,8 @@ fn a_runaway_residual_error_eta_names_every_record() {
         a.eta[1] = eta_ruv;
         a.iwres = vec![0.0; 4];
         let (msg, mut entry) = sentinel_warning();
-        let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params);
+        let full =
+            name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params, None);
         assert!(full.contains(want), "η_RUV = {eta_ruv}: {full}");
     }
 }
@@ -1605,8 +1617,15 @@ fn a_censored_record_is_scored_by_its_m3_term() {
         let mut m = one_cpt_model();
         m.bloq_method = bloq;
         let (msg, mut entry) = sentinel_warning();
-        let full =
-            name_nonfinite_subjects(msg, &mut entry, &[a.clone()], &pop, &m, &m.default_params);
+        let full = name_nonfinite_subjects(
+            msg,
+            &mut entry,
+            &[a.clone()],
+            &pop,
+            &m,
+            &m.default_params,
+            None,
+        );
         assert!(full.contains(want), "{}: {full}", bloq.label());
     }
 }
@@ -1693,4 +1712,154 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
             );
         }
     }
+}
+
+/// One subject `A` (`shifted_subject`) whose first record reads `dv`, named by a
+/// sentinel warning with `ipred0` as that record's `IPRED`; returns the sentence.
+fn name_first_record(
+    model: &CompiledModel,
+    params: &crate::types::ModelParameters,
+    mixest: Option<&[usize]>,
+    dv: f64,
+    ipred0: f64,
+) -> String {
+    let mut data = shifted_subject("A");
+    data.observations[0] = dv;
+    let pop = population_of(vec![data]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", model.n_eta, 4);
+    a.eta = nalgebra::DVector::zeros(model.n_eta);
+    a.ofv_contribution = 2e20;
+    a.ipred = vec![ipred0, 2.5, 3.0, 2.0];
+    let (msg, mut entry) = sentinel_warning();
+    name_nonfinite_subjects(msg, &mut entry, &[a], &pop, model, params, mixest)
+}
+
+const NAMES_FIRST: &str =
+    "an unusable likelihood term on 1 of 4 observations, the first at TIME 0.5";
+const NAMES_NONE: &str = "every observation's likelihood term usable on its own;";
+
+/// **N1d — the term is the scorer's, not a floored copy** (#2266 review 2). FOCEI
+/// scores a record at its raw `IPRED`: a proportional error (σ = 0.2) on `DV = 20`
+/// at `IPRED = −1` has `V = 0.04` and a term of `21²/0.04 + ln 0.04 ≈ 1.1e4`. Flooring
+/// the prediction to `1e-12` first, as the SAEM/IS objective does, scores it at
+/// `20² × 1e12 = 4e14` and names it. The straddle is `IPRED = 0`, where `V` itself is
+/// at its floor and the record is unusable either way.
+///
+/// Mutation (run): floor the prediction before the variance → the `−1` half fires.
+#[test]
+fn a_negative_prediction_is_scored_as_the_scorer_scores_it() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse");
+    let p = &m.default_params;
+    let got = name_first_record(&m, p, None, 20.0, -1.0);
+    assert!(got.contains(NAMES_NONE), "IPRED −1: {got}");
+    let got = name_first_record(&m, p, None, 20.0, 0.0);
+    assert!(
+        got.contains(&format!("{NAMES_FIRST} (DV 20, IPRED 0);")),
+        "IPRED 0: {got}"
+    );
+}
+
+/// **N1e — a mixture subject is scored under its fitted class's Σ** (#2266 review 2).
+/// Class 1's proportional σ is `1e-7` (sd), class 2's is `0.5`. At `DV = 33`,
+/// `IPRED = 1` the term is `32²/1e-14 ≈ 1e17` under class 1 and `≈ 4e3` under class 2:
+/// a subject assigned to class 2 must not be named, and the same subject in class 1
+/// must be. The base Σ is class 1's, so reading `params.sigma` instead of the class's
+/// names the class-2 subject.
+///
+/// Mutation (run): pass the base `params` instead of `class_params` → the class-2
+/// half fires.
+#[test]
+fn a_mixture_subject_is_scored_under_its_fitted_class() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.04
+  sigma EPS ~ 1e-7 (sd)
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  sigma(2) EPS ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+"#,
+    )
+    .expect("parse");
+    let p = &m.default_params;
+    let got = name_first_record(&m, p, Some(&[1]), 33.0, 1.0);
+    assert!(got.contains(NAMES_NONE), "class 2: {got}");
+    // Class 1 names the other records too (their residuals are as large).
+    let got = name_first_record(&m, p, Some(&[0]), 33.0, 1.0);
+    assert!(
+        got.contains("observations, the first at TIME 0.5 (DV 33, IPRED 1);"),
+        "class 1: {got}"
+    );
+}
+
+/// **N1f — the fitted residual correlation, not the declared one** (#2266 review 2).
+/// A combined error `V = (fσ_p)² + σ_a² + 2ρ·fσ_p·σ_a` with `fσ_p = σ_a = 1` (at
+/// `IPRED = 10`) is `2` at the declared `ρ = 0` and `0` at a fitted `ρ = −1`, floored
+/// to `1e-12`, so `DV = 30` scores `20² × 1e12 = 4e14` there and `≈ 200` at `ρ = 0`. Setting only the parameters' `ρ` must name the record; the
+/// declared model alone must not.
+///
+/// Mutation (run): build the covariance from the model's declaration
+/// (`residual_cov_theta`) → the fitted half fires.
+#[test]
+fn the_fitted_residual_correlation_is_the_one_scored() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP, ADD) = [0.01, 0.0, 1.0]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP, ADD)
+"#,
+    )
+    .expect("parse");
+    let declared = &m.default_params;
+    assert_eq!(
+        declared.residual_correlations.len(),
+        1,
+        "premise: one declared correlation, at ρ = 0: {:?}",
+        declared.residual_correlations
+    );
+    let got = name_first_record(&m, declared, None, 30.0, 10.0);
+    assert!(got.contains(NAMES_NONE), "declared ρ = 0: {got}");
+    let mut fitted = declared.clone();
+    fitted.residual_correlations[0].rho = -1.0;
+    let got = name_first_record(&m, &fitted, None, 30.0, 10.0);
+    assert!(
+        got.contains(&format!("{NAMES_FIRST} (DV 30, IPRED 10);")),
+        "fitted ρ = −1: {got}"
+    );
 }

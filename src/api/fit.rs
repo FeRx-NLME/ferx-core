@@ -2935,6 +2935,7 @@ fn fit_inner(
             population,
             model,
             &result.params,
+            mixest_classes.as_deref(),
         );
         warnings.push(msg);
         native_warnings.push(entry);
