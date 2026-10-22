@@ -19,9 +19,9 @@ mod validation;
 pub(crate) use validation::check_ctmm_time_dependent_pk_diags;
 pub(crate) use validation::{
     all_uncertainty_draws_skipped_diags, check_simulation_iov_occasions,
-    check_simulation_iov_single_occasion, max_obs_dose_occasions, no_occasion_warning,
-    twinless_absorption_closed_form, uncertainty_draws_skipped_warning, with_derived_occasions,
-    SimulatedFlipFlopTally,
+    check_simulation_iov_single_occasion, frem_drawn_eta_warning, max_obs_dose_occasions,
+    no_occasion_warning, twinless_absorption_closed_form, uncertainty_draws_skipped_warning,
+    with_derived_occasions, SimulatedFlipFlopTally,
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{
