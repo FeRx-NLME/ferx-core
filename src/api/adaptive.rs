@@ -1192,6 +1192,8 @@ pub(crate) fn adaptive_window_aucs_to_model_scale(
 ///    scales each occasion under its own κ.
 /// 2. The LTBS log-wrap. A no-op today, since `reject_unsupported_adaptive` refuses a
 ///    log-transformed model; it is here so this function mirrors the sink step for step.
+///    Steps 2 and 3 are the sink's own `pk::finish_on_observation_scale`, so a step the
+///    sink's tail gains reaches this conversion too (#2259).
 /// 3. The FREM override (#2156): a `FREMTYPE > 0` covariate pseudo-observation is
 ///    `θ_k + η_m`, not the readout. `eta_slice` is `[η_bsv | 0…0]`, so the BSV indices
 ///    `frem_predictions` names read it directly, with or without IOV — the sink passes
@@ -1227,8 +1229,7 @@ pub(crate) fn adaptive_rows_to_model_scale(
         }
         Some(_) => {}
     }
-    crate::pk::apply_log_transform(model, preds);
-    crate::pk::apply_frem_prediction_override(model, subject, theta, eta_slice, preds);
+    crate::pk::finish_on_observation_scale(model, subject, theta, eta_slice, preds);
 }
 
 /// Validate that the per-(subject, replicate) PK snapshots the reactive driver was

@@ -97,6 +97,32 @@ EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
 or a hard-rejected start) — scales the θ, since a move of its own size already
 leaves the feasible region. A start the guard rejects is not probed.
 
+When every subject is inside the exact R-matrix's scope (a Gaussian endpoint, no
+`gradient = fd`, the subject's random effects within the
+[analytic widths](foce.qmd#known-fd-fallbacks)), the same quadratic is read off exact
+derivatives at θ₀ instead of the two probes. The EBEs are re-solved once, warm, at the
+covariance step's tolerance (`cov_inner_tol`), and at those modes the pre-flight takes
+the adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate, both
+of the same objective, penalties included. The second difference is then
+$f''\delta^2$ and the minimizer's distance the Newton step $|f'/f''|$, with the same
+two cuts. A θ those derivatives would leave on the unit scale is still checked at the
+two probe points with the EBEs held, without re-solving: a non-finite or walled
+objective there means the optimizer could not take a move of the θ's own size, and the
+θ is scaled, as on the probe route.
+
+That costs one warm inner solve and one R-matrix pass along the candidates, where the
+probes cost two cold population inner solves per candidate, which grew with the number
+of θ: on a 1,317-θ covariate network the probes took 68 of an 87 s fit.
+
+The probes are used instead when any of these holds:
+
+- a subject does not converge at that tolerance;
+- `analytic_cov_hessian = false`;
+- the model is a `[mixture]`;
+- a subject is outside that scope;
+- `nn_smooth_lambda > 0`, since the smoothness penalty's Hessian is its Gauss–Newton
+  part only, not the exact curvature.
+
 The statistic is a ratio of objective differences, so the decision does not change
 when every likelihood contribution is repeated — more subjects, or more
 observations per subject — which multiplies the objective without moving its

@@ -494,6 +494,11 @@ mod adaptive_obs_scale_tests;
 #[path = "tests/adaptive_frem_tests.rs"]
 mod adaptive_frem_tests;
 
+// #2259: sdtab IPRED / IWRES of an ODE FREM fit on the covariate rows.
+#[cfg(test)]
+#[path = "tests/frem_ode_sdtab_tests.rs"]
+mod frem_ode_sdtab_tests;
+
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]

@@ -1786,6 +1786,13 @@ impl NnRegularizer {
         !self.specs.is_empty()
     }
 
+    /// Whether [`Self::add_packed_hessian`] is the penalty's exact Hessian. The L2 term's is;
+    /// the smoothness term's is its Gauss–Newton part only (`2λ Σ ∇C ∇Cᵀ`, without
+    /// `2λ Σ C·∇²C`), so a caller that needs the exact curvature must not use it then.
+    pub(crate) fn hessian_is_exact(&self) -> bool {
+        self.smooth_lambda == 0.0 || self.specs.is_empty()
+    }
+
     /// Additive penalty on the population objective: `Σ_nn (L2 + smoothness)`.
     /// Returns `0.0` when inactive.
     pub(crate) fn penalty_value(&self, theta: &[f64]) -> f64 {

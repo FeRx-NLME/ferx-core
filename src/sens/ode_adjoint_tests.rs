@@ -3374,6 +3374,139 @@ fn the_covariance_width_rule_is_the_dispatchs() {
     assert_eq!(super::hessian::EXACT_ANCHOR_HESSIAN_WIDTH, 8);
 }
 
+/// `f` on a fit pool worker's stack (`FIT_RAYON_STACK_SIZE`), as production runs the
+/// covariance recorders.
+fn with_fit_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(scope, f)
+            .expect("spawn")
+            .join()
+            .expect("join")
+    })
+}
+
+/// `subject_adjoint_cov_diag_at` is the full Hessian's diagonal along `axes`, in `axes`
+/// order: on a five-effect subject (bucket 6) under FOCEI, FOCE and Laplace's exact anchor
+/// (bucket 8), with the axes out of order and spanning θ, Ω and σ. Each entry is the same
+/// lane of the same sweep on either route, read along its own direction only, so the
+/// diagonal is the full Hessian's to the bit: measured worst 0 on Linux. An axis past `x`
+/// is refused.
+#[test]
+fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    let params = moved_params(&five);
+    let x = pack_params(&params);
+    let pt = PackedPoint::new(&params, &x).expect("packed point");
+    let axes = [x.len() - 1, 0, 4, 2];
+    let mut worst = 0.0f64;
+    for objective in [
+        Objective::Focei,
+        Objective::Foce,
+        Objective::Agq {
+            n_agq: 1,
+            exact: true,
+        },
+    ] {
+        let interaction = !matches!(objective, Objective::Foce);
+        let eta = ebe_for(&five, &s, &params, 1e-10, interaction);
+        let (full, diag) = with_fit_stack(|| {
+            (
+                subject_adjoint_cov_hessian(&five, &s, &params, &x, eta.as_slice(), objective)
+                    .expect("full Hessian served"),
+                subject_adjoint_cov_diag_at(&five, &s, &pt, eta.as_slice(), objective, &axes)
+                    .expect("diagonal served"),
+            )
+        });
+        assert_eq!(diag.len(), axes.len());
+        for (&a, &got) in axes.iter().zip(&diag) {
+            let want = full[(a, a)];
+            assert!(got.is_finite(), "{objective:?} [{a}] {got}");
+            worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+        }
+    }
+    eprintln!("axes diagonal vs full Hessian: worst rel {worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
+    let eta = ebe_for(&five, &s, &params, 1e-10, true);
+    let past = [x.len()];
+    assert!(
+        subject_adjoint_cov_diag_at(&five, &s, &pt, eta.as_slice(), Objective::Focei, &past)
+            .is_none(),
+        "an axis past x is refused"
+    );
+}
+
+/// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
+/// (`NnReduction`, as the full covariance Hessian does) and equals the diagonal of the
+/// Hessian assembled along every packed axis, under FOCEI, FOCE and Laplace, on axes
+/// covering a network weight from each layer, a θ and a σ. The counter shows the reduced
+/// basis ran. Without it a candidate set of network weights (the #2159 pre-flight's
+/// motivating case) would sweep one direction per weight.
+#[cfg(feature = "nn")]
+#[test]
+fn cov_diag_on_a_covariate_nn_subject_runs_in_the_reduced_basis() {
+    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    let (model, s) = covariate_nn_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let pt = PackedPoint::new(&params, &x).expect("packed point");
+    let w = model.covariate_nns[0].weights_offset;
+    let n_w = model.covariate_nns[0].mapper.mlp().n_weights();
+    let axes = [w, w + n_w - 1, w + n_w / 2, 0, x.len() - 1];
+    let mut worst = 0.0f64;
+    for (objective, interaction) in [
+        (Objective::Focei, true),
+        (Objective::Foce, false),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            true,
+        ),
+    ] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let (full, diag, hits) = with_fit_stack(|| {
+            NN_REDUCE_OFF.with(|c| c.set(true));
+            let full =
+                subject_adjoint_cov_hessian(&model, &s, &params, &x, eta.as_slice(), objective);
+            NN_REDUCE_OFF.with(|c| c.set(false));
+            NN_REDUCED_HITS.with(|c| c.set(0));
+            let diag =
+                subject_adjoint_cov_diag_at(&model, &s, &pt, eta.as_slice(), objective, &axes);
+            (full, diag, NN_REDUCED_HITS.with(|c| c.get()))
+        });
+        let (full, diag) = (full.expect("full Hessian"), diag.expect("diagonal"));
+        assert_eq!(hits, 1, "{objective:?}: the reduced basis did not run");
+        assert!(
+            diag[..3].iter().any(|v| v.abs() > 1e-3),
+            "{objective:?}: a vanishing weight curvature tests nothing"
+        );
+        for (&a, &got) in axes.iter().zip(&diag) {
+            let want = full[(a, a)];
+            assert!(got.is_finite(), "{objective:?} [{a}] {got}");
+            worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+        }
+    }
+    eprintln!("covariate NN: reduced diagonal vs full Hessian {worst:.2e}");
+    // Measured worst 4.4e-15 on Linux (the reduced basis sums in a different order); the
+    // bound leaves ~20× for a platform's summation.
+    assert!(
+        worst < 1e-13,
+        "reduced diagonal vs full Hessian {worst:.2e}"
+    );
+}
+
 /// The Hessian buckets past the first: a five-effect subject runs FOCEI / FOCE on the
 /// 6-wide bucket and Laplace's exact anchor on its 8-wide one (padded), each against the
 /// reconverged FD of the adjoint gradient.

@@ -135,6 +135,15 @@ Matrices use a row-major dense representation:
 { "rows": 2, "cols": 2, "data": [0.1, 0.0, 0.0, 0.2] }
 ```
 
+`warnings` holds the message strings. `warning_details` (absent when empty, and
+on bundles saved before #2268) holds the structured warnings that carry a
+`details` payload, each a `WarningEntry` object (`severity`, `category`,
+`message`, `source_method`, `details`). On load these are matched to their
+message in `warnings`, and every other structured entry is rebuilt from its
+message. An entry whose `category` the loader does not know is ignored and its
+message is re-classified, so a newer bundle still loads. See [Where `details`
+is written](../warnings.qmd#where-details-is-written).
+
 `Option<T>` fields use JSON `null` when absent (e.g. `covariance_matrix` is
 `null` when the covariance step did not run).
 
