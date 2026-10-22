@@ -2944,6 +2944,7 @@ fn fit_inner(
                 &result.params,
                 &s.eta,
                 result.h_matrices.get(i),
+                options.interaction,
                 result.kappas.get(i).is_some_and(|k| !k.is_empty()),
                 mixest_classes.as_ref().and_then(|m| m.get(i).copied()),
             )

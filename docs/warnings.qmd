@@ -565,32 +565,39 @@ time-to-event-only subject, for example), and the named term is where to look:
 CMT 2 = 1e20).
 ```
 
-The parts scored separately:
+The parts are recorded by the marginal that scored the contribution, on the branch
+it took, so a healthy subject's parts sum to its contribution under FOCE and FOCEI
+alike. A failed factorization stops the marginal: the part that failed is listed as
+`NaN` under a name saying why, and the parts after it are absent.
 
-| Term | What it is | Typical cause |
-|---|---|---|
-| `Gaussian residual term` | the Gaussian observations' `½Σ[r²/V + ln V]` at the subject's EBE | a proportional error on a prediction of `0`, which scores about `DV² × 1e12` per observation at the variance floor; or a `NaN` prediction |
-| `Gaussian residual variance (non-finite or non-positive)` | in place of the residual term when a row's variance cannot be used | a residual model returning `NaN` or `≤ 0` |
-| `censored (M3) term` | the censored rows' `−log Φ` tail, under `bloq_method = m3` | an LLOQ far from the prediction |
-| `random-effect prior` | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` | a runaway EBE |
-| `curvature log-determinant` | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it cannot be factored | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
-| `time-to-event on CMT n`, `categorical`, `CTMM` | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
-| `IOV + FREM refusal` | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
+| Term | Branch | What it is | Typical cause |
+|---|---|---|---|
+| `Gaussian residual term` | FOCEI | `½(rᵀR⁻¹r + ln\|R\|)` at the subject's EBE | a proportional error on a prediction of `0`, about `DV² × 1e12` per observation at the variance floor; a `NaN` prediction |
+| `Gaussian residual variance (non-finite or non-positive)` | FOCEI | in place of the residual term when a row's variance cannot be used | a residual model returning `NaN` or `≤ 0` |
+| `Gaussian residual covariance R (not positive definite)` | FOCEI, correlated `R` | in place of the residual term when `R` does not factor | a residual correlation outside its admissible range |
+| `linearized residual term` | FOCE | `½ rᵀR̃⁻¹r`, `r = y − f₀`, over the quantified rows | as for the Gaussian residual term, at `PRED` |
+| `linearized covariance log-determinant` | FOCE | `½ ln\|R̃\|`, `R̃ = HΩHᵀ + R` | a variance or `∂f/∂η` past the cutoff |
+| `linearized covariance R̃ (not positive definite)` | FOCE | in place of the two above when `R̃` does not factor | a non-finite `∂f/∂η` or variance |
+| `censored (M3) term` | both | the censored rows' `−log Φ` tail, under `bloq_method = m3` | an LLOQ far from the prediction |
+| `random-effect prior` | FOCEI | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` (FOCE carries it inside `R̃`) | a runaway EBE |
+| `curvature log-determinant` | FOCEI | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it does not factor | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
+| `time-to-event on CMT n`, `categorical`, `CTMM` | both | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
+| `non-Gaussian curvature (FD Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
+| `curvature (H̃ not positive definite once the non-Gaussian Hessian is added)` | both | in place of the curvature, when the Gaussian side alone factors | a non-Gaussian term strongly non-convex at the EBE |
+| `IOV + FREM refusal` | IOV | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
 
-The Gaussian parts are the FOCEI marginal's own: under FOCEI they sum exactly to
-the contribution. Under FOCE the contribution is the Sheiner–Beal marginal, which
-linearizes the same parts around the population prediction, so a named part says
-where the subject's likelihood fails at its EBE rather than quoting a term of the
-FOCE number. They are not split for an IOV subject, whose marginal is over the
-stacked `[η, κ]` system.
+A subject with time-to-event, categorical or CTMM records is scored by the joint
+conditional form under FOCE as well, so its parts are the FOCEI names, and its
+curvature carries those terms' finite-difference Hessian. The parts are not split
+for an IOV subject, whose marginal is over the stacked `[η, κ]` system; only its
+non-Gaussian data terms are listed.
 
 A term is listed when its value is `NaN`, infinite, or past the cutoff once put on
 the contribution's `2·` scale. The message shows the raw negative
 log-likelihood, so a term printed as `6e13` is listed. When every scored term is
 usable the sentence says `every separately scored term usable`. The failure is then
 in how the parts combine, not in any one of them: only their sum is past the
-cutoff, FOCE's linearization differs, or it is the non-Gaussian terms' share of
-the curvature.
+cutoff.
 
 A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian

@@ -1899,18 +1899,22 @@ impl ContributionSource {
 ///
 /// * the IOV marginal's FREM refusal, alone, when it refuses the subject (`iov` — the
 ///   subject was scored with κ);
-/// * the Gaussian side's parts — residual term, censored (M3) term, random-effect prior,
-///   curvature log-determinant (`stats::likelihood::gaussian_marginal_parts`) — when the
-///   subject is scored without κ and `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given
-///   and shaped for it. An IOV subject's marginal is over the stacked `[η, κ]` system,
-///   which this split does not rebuild;
-/// * each non-Gaussian data term.
+/// * otherwise, when `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given and shaped for
+///   it, the parts the marginal `compute_subject_results` scored records on the way
+///   (`stats::likelihood::foce_subject_contribution_parts`), under the same `interaction`
+///   flag: the FOCE, row-wise FOCEI or dense-`R` FOCEI branch, or the joint form of a
+///   subject with time-to-event, categorical or CTMM records, whose curvature carries
+///   their Hessian;
+/// * else (an IOV subject, whose marginal is over the stacked `[η, κ]` system this split
+///   does not rebuild) each non-Gaussian data term alone.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn contribution_terms(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     eta: &DVector<f64>,
     h_matrix: Option<&DMatrix<f64>>,
+    interaction: bool,
     iov: bool,
     mix_class: Option<usize>,
 ) -> Vec<ContributionTerm> {
@@ -1922,31 +1926,37 @@ pub(crate) fn contribution_terms(
     }
     let _mix_guard =
         mix_class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
-    let mut terms: Vec<(String, f64)> = Vec::new();
     let shaped = h_matrix.filter(|h| {
         h.nrows() == subject.observations.len()
             && h.ncols() == eta.len()
             && params.omega.matrix.nrows() == eta.len()
     });
-    if let (false, Some(h)) = (iov, shaped) {
-        terms.extend(crate::stats::likelihood::gaussian_marginal_parts(
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut terms: Vec<(String, f64)> = Vec::new();
+    match (iov, shaped) {
+        (false, Some(h)) => {
+            terms = crate::stats::likelihood::foce_subject_contribution_parts(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                interaction,
+            )
+        }
+        #[cfg(feature = "survival")]
+        _ => terms.extend(crate::stats::likelihood::non_gaussian_terms(
             model,
             subject,
             &params.theta,
-            eta,
-            h,
-            &params.omega,
-            &params.sigma.values,
-            model.residual_cov_at(params),
-        ));
+            eta.as_slice(),
+        )),
+        #[cfg(not(feature = "survival"))]
+        _ => {}
     }
-    #[cfg(feature = "survival")]
-    terms.extend(crate::stats::likelihood::non_gaussian_terms(
-        model,
-        subject,
-        &params.theta,
-        eta.as_slice(),
-    ));
     terms
         .into_iter()
         .map(|(name, nll)| ContributionTerm { name, nll })

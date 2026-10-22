@@ -2048,8 +2048,9 @@ fn proportional_iv(m3: bool) -> CompiledModel {
 /// past the cutoff with nothing non-finite anywhere. Before the Gaussian split the
 /// sentence ended at "every IPRED and PRED finite" and named no term. Now it names the
 /// residual term, and only it: the prior and curvature are usable, which is what makes
-/// the attribution mean something. FOCE and FOCEI both name it — under FOCE the
-/// residual is at `PRED`, also `0`. The control (dose at 0 for everyone) stays silent.
+/// the attribution mean something. FOCE names its own Sheiner–Beal part, the
+/// `linearized residual term` (#2267 review r4), its residual at `PRED`, also `0`. The
+/// control (dose at 0 for everyone) stays silent.
 ///
 /// Mutation (run): drop the Gaussian parts from `contribution_terms` → `failed_terms` is
 /// empty and the sentence ends at "every IPRED and PRED finite", the review's report.
@@ -2063,7 +2064,10 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
             subject_with_dose_time("3", if late { 30.0 } else { 0.0 }, 0.9),
         ])
     };
-    for method in [EstimationMethod::FoceI, EstimationMethod::Foce] {
+    for (method, residual) in [
+        (EstimationMethod::FoceI, "Gaussian residual term"),
+        (EstimationMethod::Foce, "linearized residual term"),
+    ] {
         let opts = FitOptions {
             method,
             outer_maxiter: 0,
@@ -2093,7 +2097,7 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
                 .iter()
                 .map(|t| t["term"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["Gaussian residual term"],
+            vec![residual],
             "{method:?}: only the residual term fails: {message}"
         );
         let nll = failed[0]["nll"].as_f64().expect("a finite residual term");
@@ -2103,8 +2107,8 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
         );
         assert!(
             message.contains(&format!(
-                "3 (contribution {:?}, every IPRED and PRED finite, failed term: Gaussian \
-                 residual term = {nll:?})",
+                "3 (contribution {:?}, every IPRED and PRED finite, failed term: {residual} = \
+                 {nll:?})",
                 result.subjects[2].ofv_contribution
             )),
             "{method:?}: {message}"
@@ -2112,99 +2116,190 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
     }
 }
 
-/// **T8 — the Gaussian parts are the marginal's own, censored row included.** On a
-/// healthy FOCEI subject at its EBE, `2·Σ parts` reproduces `foce_subject_nll_cov`'s
-/// contribution, with an M3-censored row so the censored term is live. This is what
-/// makes a named part a part of the contribution rather than a separate diagnostic.
-/// Then each failure the parts exist to name is fed in one at a time: a runaway `η̂`
-/// fails the prior alone, and a non-finite `∂f/∂η` the curvature alone.
+/// **T8 — each branch records the parts of its own contribution** (#2267 review r3,
+/// r4). The parts come from the marginal `compute_subject_results` scores, recorded on
+/// the way, so on a healthy subject `2·Σ parts` reproduces `foce_subject_nll_cov`'s
+/// contribution on every branch it takes:
 ///
-/// Measured: the contribution is `0.0065`, the realised gap `6.3e-16` (one reassociated
-/// sum of four finite numbers), against a bound of `1e-12·max(|c|, 1) = 1e-12` — about
-/// 1600× headroom. The censored term is `0.0017`, so dropping it moves the sum by
-/// `3.5e-3`, far past the bound.
+/// * FOCEI, row-wise, with an M3-censored row so the censored term is live;
+/// * FOCE, the Sheiner–Beal marginal: linearized residual and covariance parts;
+/// * FOCEI with a compound-symmetry serial correlation, the dense-`R` marginal.
 ///
-/// Mutation (run): drop the `0.5·` on any part → the sum is off by that part; leave
-/// `cens_hess` out of `H̃` → the curvature and the sum move; drop the censored arm → the
-/// sum is short by the censored term and its presence assertion fires.
+/// Each branch is straddled against the form a single splitter would have used: the
+/// FOCEI row-wise parts miss the FOCE contribution by `0.90`, and the independent-row
+/// FOCEI contribution misses the dense one by `0.030` — both far past the bound — so a
+/// split of the wrong branch fails the sum. Then each failure a branch can name is fed
+/// in one at a time: a runaway `η̂` fails the prior, a non-finite `∂f/∂η` fails FOCEI's
+/// curvature and FOCE's `R̃`, and a correlation of `1.5` fails the dense `R` alone.
+///
+/// Measured: realised gaps `6.3e-16` (row-wise), `1.1e-16` (FOCE), `1.8e-15` (dense),
+/// against a bound of `1e-12·max(|c|, 1)`, at least 500× headroom. The censored term is `0.0017`, so dropping it moves
+/// the sum by `3.5e-3`.
+///
+/// Mutation (run): drop the `0.5·` on the dense residual part → the dense sum is off;
+/// drop FOCE's censored part → its name list fires; name the dense `R` failure as the
+/// curvature → the last assertion fires. The r3 splitter (row-wise FOCEI parts for
+/// every branch) is what the two straddles measure.
 #[test]
-fn the_gaussian_parts_sum_to_the_focei_contribution_and_each_can_fail_alone() {
+fn each_branch_records_the_parts_of_its_own_contribution() {
+    use crate::stats::residual_error::{ResidualCov, SerialCov};
+    use crate::types::ResidualSerialKind;
     let model = proportional_iv(true);
     // Data the model fits (`C = 10·exp(−0.1·t)` at the initial estimates: 9.5, 8.2, 4.5,
     // 0.9), the last row censored at an LLOQ of 1.0, close enough above its prediction that
     // its `−log Φ` is not rounded to 0 (at 1.5 it was, and the sum could not see the
-    // censored term). A fixture the
-    // model cannot fit makes `H̃` itself non-PD through the censored row, and the
-    // contribution is then the sentinel this test needs to be absent.
-    let mut subject = subject_with_dose_time("1", 0.0, 1.0);
-    subject.observations = vec![9.0, 8.5, 4.2, 1.0];
-    subject.cens = vec![0, 0, 0, 1];
+    // censored term). A fixture the model cannot fit makes `H̃` itself non-PD through the
+    // censored row, and the contribution is then the sentinel this test needs to be absent.
+    let mut censored = subject_with_dose_time("1", 0.0, 1.0);
+    censored.observations = vec![9.0, 8.5, 4.2, 1.0];
+    censored.cens = vec![0, 0, 0, 1];
+    // The dense branch takes uncensored subjects only (a censored row is scored row-wise),
+    // in one residual block.
+    let mut quantified = censored.clone();
+    quantified.observations[3] = 0.95;
+    quantified.cens = vec![0; 4];
+    quantified.obs_rgroup = vec![1; 4];
     let params = model.default_params.clone();
-    let opts = FitOptions {
-        method: EstimationMethod::FoceI,
-        ..Default::default()
+    let independent = model.residual_cov_at(&params);
+    let serial = |rho: f64| ResidualCov {
+        pairs: &[],
+        serial: Some(SerialCov {
+            kind: ResidualSerialKind::Cs,
+            rho,
+        }),
     };
-    let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
-        &model, &subject, &params, 200, 1e-8, None, None, 0, &opts,
-    );
-    let parts = |eta: &DVector<f64>, h: &DMatrix<f64>| {
-        crate::stats::likelihood::gaussian_marginal_parts(
+    let ebe = |subject: &Subject| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            ..Default::default()
+        };
+        crate::estimation::inner_optimizer::find_ebe_for_stage(
+            &model, subject, &params, 200, 1e-8, None, None, 0, &opts,
+        )
+    };
+    let parts = |subject: &Subject,
+                 eta: &DVector<f64>,
+                 h: &DMatrix<f64>,
+                 cov: ResidualCov<'_>,
+                 interaction: bool| {
+        crate::stats::likelihood::foce_subject_contribution_parts(
             &model,
-            &subject,
+            subject,
             &params.theta,
             eta,
             h,
             &params.omega,
             &params.sigma.values,
-            model.residual_cov_at(&params),
+            cov,
+            interaction,
         )
     };
-    let healthy = parts(&ebe.eta, &ebe.h_matrix);
-    let names: Vec<&str> = healthy.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(
-        names,
-        vec![
-            "Gaussian residual term",
-            "censored (M3) term",
-            "random-effect prior",
-            "curvature log-determinant"
-        ]
-    );
-    let contribution = 2.0
-        * crate::stats::likelihood::foce_subject_nll_cov(
+    let contribution = |subject: &Subject,
+                        eta: &DVector<f64>,
+                        h: &DMatrix<f64>,
+                        cov: ResidualCov<'_>,
+                        interaction: bool| {
+        2.0 * crate::stats::likelihood::foce_subject_nll_cov(
             &model,
-            &subject,
+            subject,
             &params.theta,
-            &ebe.eta,
-            &ebe.h_matrix,
+            eta,
+            h,
             &params.omega,
             &params.sigma.values,
-            model.residual_cov_at(&params),
-            true,
-        );
-    let summed: f64 = healthy.iter().map(|(_, v)| 2.0 * v).sum();
-    assert!(
-        healthy.iter().all(|(_, v)| v.is_finite()) && contribution.is_finite(),
-        "{healthy:?} vs {contribution}"
-    );
-    assert!(
-        (summed - contribution).abs() <= 1e-12 * contribution.abs().max(1.0),
-        "2·Σ parts = {summed}, contribution = {contribution}: {healthy:?}"
-    );
-
+            cov,
+            interaction,
+        )
+    };
+    let twice_sum = |list: &[(String, f64)]| list.iter().map(|(_, v)| 2.0 * v).sum::<f64>();
     let failing = |list: &[(String, f64)]| -> Vec<String> {
         list.iter()
             .filter(|(_, v)| !crate::estimation::outer_optimizer::ofv_is_valid(2.0 * v))
             .map(|(n, _)| n.clone())
             .collect()
     };
-    assert_eq!(failing(&healthy), Vec::<String>::new());
+
+    let c_ebe = ebe(&censored);
+    let q_ebe = ebe(&quantified);
+    let branches = [
+        (
+            "FOCEI row-wise",
+            &censored,
+            &c_ebe,
+            independent,
+            true,
+            vec![
+                "Gaussian residual term",
+                "censored (M3) term",
+                "random-effect prior",
+                "curvature log-determinant",
+            ],
+        ),
+        (
+            "FOCE",
+            &censored,
+            &c_ebe,
+            independent,
+            false,
+            vec![
+                "linearized residual term",
+                "censored (M3) term",
+                "linearized covariance log-determinant",
+            ],
+        ),
+        (
+            "FOCEI dense",
+            &quantified,
+            &q_ebe,
+            serial(0.5),
+            true,
+            vec![
+                "Gaussian residual term",
+                "random-effect prior",
+                "curvature log-determinant",
+            ],
+        ),
+    ];
+    for (label, subject, e, cov, interaction, want) in branches {
+        let list = parts(subject, &e.eta, &e.h_matrix, cov, interaction);
+        let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, want, "{label}");
+        let c = contribution(subject, &e.eta, &e.h_matrix, cov, interaction);
+        assert!(
+            list.iter().all(|(_, v)| v.is_finite()) && c.is_finite() && failing(&list).is_empty(),
+            "{label}: {list:?} vs {c}"
+        );
+        let gap = (twice_sum(&list) - c).abs();
+        eprintln!("{label}: contribution {c}, gap {gap:e}");
+        assert!(
+            gap <= 1e-12 * c.abs().max(1.0),
+            "{label}: 2·Σ parts = {}, contribution = {c}: {list:?}",
+            twice_sum(&list)
+        );
+    }
+
+    // The straddles: the r3 splitter's row-wise FOCEI parts are not the FOCE contribution,
+    // and the independent-row FOCEI marginal is not the dense one.
+    let foce = contribution(&censored, &c_ebe.eta, &c_ebe.h_matrix, independent, false);
+    let rowwise = twice_sum(&parts(
+        &censored,
+        &c_ebe.eta,
+        &c_ebe.h_matrix,
+        independent,
+        true,
+    ));
+    let dense = contribution(&quantified, &q_ebe.eta, &q_ebe.h_matrix, serial(0.5), true);
+    let undense = contribution(&quantified, &q_ebe.eta, &q_ebe.h_matrix, independent, true);
+    eprintln!(
+        "FOCE {foce} vs row-wise FOCEI parts {rowwise}; dense {dense} vs independent {undense}"
+    );
+    assert!((foce - rowwise).abs() > 1e-3, "{foce} vs {rowwise}");
+    assert!((dense - undense).abs() > 1e-3, "{dense} vs {undense}");
 
     // η̂ = 1e8 against ω² = 0.04: ½η²/ω² ≈ 1.25e17. The prediction is `0` there (CL is
-    // `inf`), so the residual fails too; the curvature with the EBE's own `H` stays
-    // usable. The prior alone is asserted to be named, and its value checked.
+    // `inf`), so the residual fails too. The prior is asserted to be named, and its value.
     let runaway = DVector::from_vec(vec![1e8]);
-    let prior = parts(&runaway, &ebe.h_matrix);
+    let prior = parts(&censored, &runaway, &c_ebe.h_matrix, independent, true);
     let (_, prior_nll) = prior
         .iter()
         .find(|(n, _)| n == "random-effect prior")
@@ -2214,11 +2309,28 @@ fn the_gaussian_parts_sum_to_the_focei_contribution_and_each_can_fail_alone() {
         "{prior:?}"
     );
 
-    let mut bad_h = ebe.h_matrix.clone();
+    let mut bad_h = c_ebe.h_matrix.clone();
     bad_h[(0, 0)] = f64::NAN;
     assert_eq!(
-        failing(&parts(&ebe.eta, &bad_h)),
+        failing(&parts(&censored, &c_ebe.eta, &bad_h, independent, true)),
         vec!["curvature (H̃ not positive definite)".to_string()],
-        "a non-finite ∂f/∂η fails the curvature and nothing else"
+        "a non-finite ∂f/∂η fails FOCEI's curvature and nothing else"
+    );
+    assert_eq!(
+        failing(&parts(&censored, &c_ebe.eta, &bad_h, independent, false)),
+        vec!["linearized covariance R̃ (not positive definite)".to_string()],
+        "and FOCE's R̃ and nothing else"
+    );
+    // Compound symmetry at ρ = 1.5 over four rows has eigenvalue 1 − ρ < 0: the dense `R`
+    // does not factor, while every row's own variance is usable.
+    assert_eq!(
+        failing(&parts(
+            &quantified,
+            &q_ebe.eta,
+            &q_ebe.h_matrix,
+            serial(1.5),
+            true
+        )),
+        vec!["Gaussian residual covariance R (not positive definite)".to_string()],
     );
 }

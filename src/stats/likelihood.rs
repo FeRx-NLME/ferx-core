@@ -1487,6 +1487,97 @@ pub(crate) fn foce_subject_nll_cov(
     residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
+    foce_subject_nll_cov_split(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        None,
+    )
+}
+
+/// Where a marginal records its parts for `W_NONFINITE_OBJECTIVE` (#2267): `None` on
+/// every scoring path, so the value a caller gets back is computed the same way either
+/// way. Each part is `(name, nll)` on the raw NLL scale — half its share of the `2·nll`
+/// contribution.
+type PartSink<'a> = Option<&'a mut Vec<(String, f64)>>;
+
+/// Record one part when a sink is attached.
+fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
+    if let Some(p) = parts.as_deref_mut() {
+        p.push((name.to_string(), nll));
+    }
+}
+
+/// The parts of `subject`'s [`foce_subject_nll_cov`] contribution, recorded by the branch
+/// that computes it (#2267): the Sheiner–Beal marginal under FOCE, the row-wise or
+/// dense-`R` Almquist marginal under FOCEI, and the joint form with the time-to-event,
+/// categorical and CTMM terms and their curvature. When the marginal returns its
+/// sentinel, the part that made it is recorded as `NaN` under a name saying why, and the
+/// parts it never reached are absent. Healthy, `2·Σ nll` is the contribution, to
+/// rounding. The names:
+///
+/// * FOCE — `linearized residual term` (`½ rᵀR̃⁻¹r` over the quantified rows),
+///   `linearized covariance log-determinant` (`½ ln|R̃|`, `R̃ = HΩHᵀ + R`), or
+///   `linearized covariance R̃ (not positive definite)` in their place;
+/// * FOCEI — `Gaussian residual term` (`½(rᵀR⁻¹r + ln|R|)` at the predictions at
+///   `eta_hat`), or `Gaussian residual variance (non-finite or non-positive)` on the
+///   row-wise path and `Gaussian residual covariance R (not positive definite)` on the
+///   dense one in its place; `random-effect prior` (`½(η̂ᵀΩ⁻¹η̂ + ln|Ω|)`);
+///   `curvature log-determinant` (`½ ln|H̃|`), or `curvature (H̃ not positive definite)`;
+/// * both — `censored (M3) term`, when the fit censors one of the subject's rows;
+/// * a subject with time-to-event, categorical or CTMM records — every one of those data
+///   terms (as [`non_gaussian_terms`] names them), the Gaussian residual term, prior and
+///   curvature under FOCE as well, since that branch is the joint conditional form; and
+///   a failed curvature names the non-Gaussian FD Hessian when it is not finite, or says
+///   `once the non-Gaussian Hessian is added` when the Gaussian `H̃` alone factors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_contribution_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+) -> Vec<(String, f64)> {
+    let mut parts = Vec::new();
+    foce_subject_nll_cov_split(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        Some(&mut parts),
+    );
+    parts
+}
+
+/// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_cov_split(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))] mut parts: PartSink<'_>,
+) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
     // #570: at the EBE mode the Gaussian `ipreds` solve and the at-mode TTE-term solve
     // are both at `eta_hat`; when the subject qualifies, share one augmented integration
@@ -1534,6 +1625,8 @@ pub(crate) fn foce_subject_nll_cov(
         let n_eta = eta_hat.len();
         let mut tte_nll_at_mode = 0.0_f64;
         let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
+        // Per-CMT terms for the part sink, in CMT order (`endpoints` is a hash map).
+        let mut tte_parts: Vec<(usize, f64)> = Vec::new();
 
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte {
@@ -1566,7 +1659,7 @@ pub(crate) fn foce_subject_nll_cov(
                 };
                 // #570: at the mode, read H/h off the shared solve when available; the
                 // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
-                tte_nll_at_mode += match (joint_share.as_ref(), hazard) {
+                let endpoint_nll = match (joint_share.as_ref(), hazard) {
                     (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
                         model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
                         s,
@@ -1575,11 +1668,20 @@ pub(crate) fn foce_subject_nll_cov(
                     ),
                     _ => tte_fn(eta_hat.as_slice()),
                 };
+                tte_nll_at_mode += endpoint_nll;
+                if parts.is_some() {
+                    tte_parts.push((*cmt, endpoint_nll));
+                }
                 if n_eta > 0 {
                     let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
                 }
             }
+        }
+
+        tte_parts.sort_by_key(|&(cmt, _)| cmt);
+        for (cmt, nll) in tte_parts {
+            note(&mut parts, &format!("time-to-event on CMT {cmt}"), nll);
         }
 
         // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
@@ -1590,7 +1692,9 @@ pub(crate) fn foce_subject_nll_cov(
             let discrete_fn = |eta_eval: &[f64]| {
                 crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
             };
-            tte_nll_at_mode += discrete_fn(eta_hat.as_slice());
+            let mode = discrete_fn(eta_hat.as_slice());
+            note(&mut parts, "categorical", mode);
+            tte_nll_at_mode += mode;
             if n_eta > 0 {
                 let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
                 tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
@@ -1605,6 +1709,7 @@ pub(crate) fn foce_subject_nll_cov(
                 crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
             };
             let mode = ctmm_fn(eta_hat.as_slice());
+            note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
             // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
             // observed transition underflowing, or a negative off-diagonal, under the
@@ -1651,6 +1756,7 @@ pub(crate) fn foce_subject_nll_cov(
             interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
+            parts,
         );
     }
 
@@ -1673,7 +1779,7 @@ pub(crate) fn foce_subject_nll_cov(
         || subject.fremtype.iter().any(|&ft| ft > 0);
     if interaction {
         if !residual_cov.is_dense() || rowwise {
-            foce_subject_nll_interaction_corr(
+            foce_subject_nll_interaction_split(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1687,9 +1793,10 @@ pub(crate) fn foce_subject_nll_cov(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 residual_cov.pairs,
+                parts,
             )
         } else {
-            foce_subject_nll_interaction_dense_cov(
+            foce_subject_nll_interaction_dense_split(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1701,6 +1808,7 @@ pub(crate) fn foce_subject_nll_cov(
                 &p_obs,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                parts,
             )
         }
     } else {
@@ -1713,7 +1821,7 @@ pub(crate) fn foce_subject_nll_cov(
         // (always ≥0). Skipped for additive error (variance is f-independent,
         // so f0 and f(η=0) give the same R) to keep that path bit-identical.
         let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
-        foce_subject_nll_standard_cov(
+        foce_subject_nll_standard_split(
             subject,
             &ipreds,
             eta_hat,
@@ -1727,6 +1835,7 @@ pub(crate) fn foce_subject_nll_cov(
             frem_r_override.as_deref(),
             pop_preds.as_deref(),
             ruv_mult.as_deref(),
+            parts,
         )
     }
 }
@@ -1856,6 +1965,43 @@ pub(crate) fn foce_subject_nll_standard_cov(
     // path. Scales each observation's sigma loadings in R.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_standard_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        residual_cov,
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        r_pred_override,
+        ruv_mult,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_standard_cov`], recording its parts into `parts` when one is
+/// attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_standard_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    r_pred_override: Option<&[f64]>,
+    ruv_mult: Option<&[Vec<f64>]>,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
@@ -1947,7 +2093,17 @@ pub(crate) fn foce_subject_nll_standard_cov(
 
     let chol = match r_tilde.clone().cholesky() {
         Some(c) => c,
-        None => return 1e20,
+        None => {
+            if m3 {
+                note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
+            }
+            note(
+                &mut parts,
+                "linearized covariance R̃ (not positive definite)",
+                f64::NAN,
+            );
+            return 1e20;
+        }
     };
 
     // Residuals: y - f0 over the quantified rows.
@@ -1957,6 +2113,20 @@ pub(crate) fn foce_subject_nll_standard_cov(
     let solved = chol.solve(&residuals);
     let quad_form = residuals.dot(&solved);
     let log_det_r = chol_log_det(&chol.l());
+
+    if nq > 0 {
+        note(&mut parts, "linearized residual term", 0.5 * quad_form);
+    }
+    if m3 {
+        note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
+    }
+    if nq > 0 {
+        note(
+            &mut parts,
+            "linearized covariance log-determinant",
+            0.5 * log_det_r,
+        );
+    }
 
     0.5 * (quad_form + log_det_r + bloq_term)
 }
@@ -2067,6 +2237,43 @@ pub(crate) fn foce_subject_nll_interaction_corr(
     ruv_mult: Option<&[Vec<f64>]>,
     correlations: &[ResidualCorrelation],
 ) -> f64 {
+    foce_subject_nll_interaction_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        residual_error_eta,
+        ruv_mult,
+        correlations,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_interaction_corr`], recording its parts into `parts` when one is
+/// attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_interaction_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    residual_error_eta: Option<usize>,
+    ruv_mult: Option<&[Vec<f64>]>,
+    correlations: &[ResidualCorrelation],
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
@@ -2084,110 +2291,57 @@ pub(crate) fn foce_subject_nll_interaction_corr(
         ruv_mult,
         Some(correlations),
     ) else {
+        note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
         return 1e20;
     };
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
     // (`cens_hess` = 0 unless the subject has M3-censored rows.)
     let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            note(&mut parts, CURVATURE_FAILED, f64::NAN);
+            return 1e20;
+        }
     };
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
 
-/// The Gaussian side of one subject's marginal at `eta_hat`, split into the parts
-/// [`foce_subject_nll_interaction_corr`] sums, for `W_NONFINITE_OBJECTIVE` to name the
-/// one that failed (#2267). Each is `(name, nll)` on the raw NLL scale — half its
-/// share of the `2·nll` contribution, like [`non_gaussian_terms`]:
-///
-/// * `Gaussian residual term` — `½Σ[r²/V + ln V]` over the quantified rows, at the
-///   predictions at `eta_hat` (absent for a subject with no Gaussian observation);
-/// * `Gaussian residual variance` — `NaN` in its place when a row's variance is not
-///   finite and positive, where the marginal returns its sentinel;
-/// * `censored (M3) term` — the censored rows' `−log Φ` tail, when the fit censors any;
-/// * `random-effect prior` — `½(η̂ᵀΩ⁻¹η̂ + ln|Ω|)`;
-/// * `curvature log-determinant` — `½ ln|H̃|`, or `NaN` named `curvature (H̃ not
-///   positive definite)` when its Cholesky fails, where the marginal returns its sentinel.
-///
-/// This is the FOCEI (interaction) form for every caller. Under FOCE the contribution is
-/// the Sheiner–Beal marginal instead, which linearizes these same parts around the
-/// population prediction, so a part named here is where the subject's likelihood fails
-/// at its EBE rather than a term the FOCE number literally contains. `H̃` holds no TTE,
-/// categorical or CTMM curvature; those terms are reported by [`non_gaussian_terms`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gaussian_marginal_parts(
-    model: &CompiledModel,
+/// The part named when a row-wise residual variance is not finite and positive.
+const RESIDUAL_VARIANCE_FAILED: &str = "Gaussian residual variance (non-finite or non-positive)";
+/// The part named when `H̃` does not factor.
+const CURVATURE_FAILED: &str = "curvature (H̃ not positive definite)";
+
+/// Record the conditional Gaussian data parts: the residual term when the subject has a
+/// Gaussian observation, and the censored term when the fit censors one of its rows.
+fn note_gaussian_data(
+    parts: &mut PartSink<'_>,
     subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-) -> Vec<(String, f64)> {
-    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
-    let p_obs = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
-    } else {
-        Vec::new()
-    };
-    let frem_r_override =
-        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
-    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), model.residual_error_eta);
-    let n_eta = eta_hat.len();
-    let bloq = model.bloq_in_force();
-    let mut parts = Vec::new();
-    let g = gaussian_foce_accum(
-        subject,
-        &ipreds,
-        h_matrix,
-        &model.error_spec,
-        sigma_values,
-        bloq,
-        &p_obs,
-        n_eta,
-        frem_r_override.as_deref(),
-        model.residual_error_eta,
-        ruv_scale,
-        ruv_mult.as_deref(),
-        Some(residual_cov.pairs),
-    );
-    match &g {
-        Some(g) => {
-            if !subject.observations.is_empty() {
-                parts.push(("Gaussian residual term".to_string(), 0.5 * g.data_ll));
-            }
-            if bloq.has_censored_row(&subject.cens) {
-                parts.push(("censored (M3) term".to_string(), 0.5 * g.bloq_term));
-            }
-        }
-        None => parts.push((
-            "Gaussian residual variance (non-finite or non-positive)".to_string(),
-            f64::NAN,
-        )),
+    bloq_method: BloqMethod,
+    data_ll: f64,
+    bloq_term: f64,
+) {
+    if !subject.observations.is_empty() {
+        note(parts, "Gaussian residual term", 0.5 * data_ll);
     }
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    parts.push((
-        "random-effect prior".to_string(),
-        0.5 * (eta_prior + omega.log_det),
-    ));
-    if let Some(g) = g {
-        let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
-        parts.push(match htilde.cholesky() {
-            Some(c) => (
-                "curvature log-determinant".to_string(),
-                0.5 * chol_log_det(&c.l()),
-            ),
-            None => ("curvature (H̃ not positive definite)".to_string(), f64::NAN),
-        });
+    if bloq_method.has_censored_row(&subject.cens) {
+        note(parts, "censored (M3) term", 0.5 * bloq_term);
     }
-    parts
 }
 
 /// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
@@ -2269,6 +2423,39 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
     // dense data term), so `∂R/∂η_r = 2R` joins `B`.
     residual_error_eta: Option<usize>,
 ) -> f64 {
+    foce_subject_nll_interaction_dense_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        residual_cov,
+        p_obs,
+        ruv_mult,
+        residual_error_eta,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_interaction_dense_cov`], recording its parts into `parts` when one
+/// is attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_interaction_dense_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    p_obs: &[f64],
+    ruv_mult: Option<&[Vec<f64>]>,
+    residual_error_eta: Option<usize>,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2297,7 +2484,14 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
 
     let chol = match r.clone().cholesky() {
         Some(c) => c,
-        None => return 1e20,
+        None => {
+            note(
+                &mut parts,
+                "Gaussian residual covariance R (not positive definite)",
+                f64::NAN,
+            );
+            return 1e20;
+        }
     };
     let r_inv = chol.inverse();
 
@@ -2371,11 +2565,25 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
     }
 
     let htilde = term1 + 0.5 * b + &omega.inv;
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(&mut parts, "Gaussian residual term", 0.5 * data_ll);
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            note(&mut parts, CURVATURE_FAILED, f64::NAN);
+            return 1e20;
+        }
     };
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
@@ -2413,6 +2621,8 @@ fn foce_subject_nll_interaction_with_tte(
     // path. Scales the Gaussian (PK) rows' variance and f-derivative; the TTE
     // rows carry no residual variance so the multiplier never touches them.
     ruv_mult: Option<&[Vec<f64>]>,
+    // The part sink (#2267); the caller has recorded the non-Gaussian data terms.
+    mut parts: PartSink<'_>,
 ) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
@@ -2431,17 +2641,33 @@ fn foce_subject_nll_interaction_with_tte(
         ruv_mult, // custom residual magnitude (#484) — scales the Gaussian PK rows
         None,
     ) else {
+        note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
         return 1e20;
     };
+    note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
 
     // Combine Gaussian and TTE data terms.
     // TTE NLL is scaled by 2 here to match the Gaussian data_ll convention
     // (both are halved at the end via the 0.5 factor).
     let data_ll = g.data_ll + 2.0 * tte_data_nll;
+    // The part sink classifies a failed `H̃` by whether the non-Gaussian Hessian is what
+    // broke it, so it keeps the Gaussian side and that Hessian's finiteness before the sum.
+    let gaussian_htilde = parts.is_some().then(|| {
+        let mut h = g.hrh.clone() + &omega.inv;
+        if interaction {
+            h += 0.5 * &g.ctc + &g.cens_hess;
+        }
+        (h, tte_hessian.iter().all(|x| x.is_finite()))
+    });
     // Accumulate TTE Hessian into the Gaussian Jacobian outer-product matrix.
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. The censored
     // `cens_hess` (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`) is FOCEI-order
     // curvature — its `g2` folds in `∂v/∂f`/`∂²v/∂f²`, and the `C·z`/`C·m` terms are
@@ -2455,8 +2681,26 @@ fn foce_subject_nll_interaction_with_tte(
     };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            let name = match gaussian_htilde {
+                Some((_, false)) => {
+                    "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                     CTMM terms not finite)"
+                }
+                Some((h, true)) if h.clone().cholesky().is_some() => {
+                    "curvature (H̃ not positive definite once the non-Gaussian Hessian is added)"
+                }
+                _ => CURVATURE_FAILED,
+            };
+            note(&mut parts, name, f64::NAN);
+            return 1e20;
+        }
     };
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
@@ -7089,6 +7333,93 @@ DV ~ proportional(PROP_ERR)
             (nll - want).abs() < 1e-12,
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
+    }
+    /// #2267 review r4: the joint (time-to-event, categorical, CTMM) marginal records the
+    /// curvature it actually factors, which carries the non-Gaussian FD Hessian, and says
+    /// when that Hessian is what broke it. Healthy, `2·(Σ parts + non-Gaussian data)`
+    /// is the contribution — under FOCEI and FOCE, whose `H̃` differ.
+    ///
+    /// Measured: the healthy gap is `0` under both flags, against a bound of `1e-12·nll`.
+    ///
+    /// Mutation (run): invert the Gaussian-`H̃` test → the `−1e6` case reads the plain
+    /// name; drop the finiteness arm → the `NaN` case reads another name.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_joint_marginal_names_a_curvature_the_non_gaussian_hessian_broke() {
+        let subject = make_simple_subject();
+        let ipreds: Vec<f64> = subject.observations.iter().map(|y| 1.05 * y).collect();
+        let h = DMatrix::from_fn(6, 1, |j, _| -0.1 * ipreds[j] * subject.obs_times[j]);
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let eta = DVector::from_vec(vec![0.1]);
+        let tte_nll = 2.0;
+        let run = |h: &DMatrix<f64>, tte_h: f64, interaction: bool| {
+            let mut parts = Vec::new();
+            let nll = foce_subject_nll_interaction_with_tte(
+                &subject,
+                &ipreds,
+                &eta,
+                h,
+                &omega,
+                &[0.1],
+                &ErrorSpec::Single(ErrorModel::Proportional),
+                BloqMethod::Drop,
+                &[],
+                tte_nll,
+                DMatrix::from_element(1, 1, tte_h),
+                interaction,
+                None,
+                None,
+                Some(&mut parts),
+            );
+            (nll, parts)
+        };
+        let names = |parts: &[(String, f64)]| -> Vec<String> {
+            parts.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for interaction in [true, false] {
+            let (nll, parts) = run(&h, 3.0, interaction);
+            assert_eq!(
+                names(&parts),
+                [
+                    "Gaussian residual term",
+                    "random-effect prior",
+                    "curvature log-determinant"
+                ],
+                "interaction = {interaction}"
+            );
+            let summed = parts.iter().map(|(_, v)| v).sum::<f64>() + tte_nll;
+            eprintln!(
+                "interaction = {interaction}: gap {:e}",
+                (summed - nll).abs()
+            );
+            assert!(
+                nll.is_finite() && nll < 1e3 && (summed - nll).abs() <= 1e-12 * nll.abs(),
+                "interaction = {interaction}: Σ parts + tte = {summed}, marginal = {nll}"
+            );
+        }
+
+        // The straddle: each case is a sentinel of the same marginal, named for its cause.
+        let broken = [
+            (
+                h.clone(),
+                -1e6,
+                "curvature (H̃ not positive definite once the non-Gaussian Hessian is added)",
+            ),
+            (
+                h.clone(),
+                f64::NAN,
+                "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                 CTMM terms not finite)",
+            ),
+            (DMatrix::from_element(6, 1, f64::NAN), 3.0, CURVATURE_FAILED),
+        ];
+        for (h, tte_h, want) in broken {
+            let (nll, parts) = run(&h, tte_h, true);
+            assert_eq!(nll, 1e20, "{want}");
+            let last = parts.last().expect("a curvature part");
+            assert!(last.0 == want && last.1.is_nan(), "{parts:?}");
+        }
     }
 }
 
