@@ -10272,6 +10272,52 @@ fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
     }
 }
 
+/// A restart leg (#2272) is handed the identity scales probed at the first leg's start
+/// but builds its scale vector at the stalled estimates. A probed θ's scale is then a
+/// floor under its current magnitude: probed at 0.001 and grown to ±2000 it takes 2000
+/// — the large-θ rule's scale — where before the fix the probe overwrote it back to
+/// 0.001, a coordinate of 2e6 in scaled units; grown to 5, under the large-θ gate, it
+/// takes 5 (was 0.001, a coordinate of 5000). At its first-leg value, or shrunk toward
+/// zero, it keeps the probed scale. A θ the probe did not scale keeps the large-θ rule
+/// alone: 1 at 5, |θ| at 5000. Every case under each optimizer `auto` resolves to.
+#[test]
+fn nlopt_scale_vector_restart_floors_a_probed_theta_scale_at_its_magnitude() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    // Widen `SMALL`'s box so the stalled values below are not clamped back into it.
+    let mut base = model.default_params.clone();
+    base.theta_lower[3] = -1e4;
+    base.theta_upper[3] = 1e4;
+    let probed = [(3usize, 0.001)];
+    for optimizer in [Optimizer::NloptLbfgs, Optimizer::Slsqp, Optimizer::Bobyqa] {
+        let options = FitOptions {
+            parameter_scaling: ParameterScaling::Auto,
+            optimizer,
+            ..FitOptions::default()
+        };
+        for (stalled, with_probe, without_probe) in [
+            (2000.0, 2000.0, 2000.0),
+            (-2000.0, 2000.0, 2000.0),
+            (5.0, 5.0, 1.0),
+            (0.001, 0.001, 1.0),
+            (1e-5, 0.001, 1.0),
+        ] {
+            let mut params = base.clone();
+            params.theta[3] = stalled;
+            let scale = scale_vector_for(&params, &options, &probed);
+            assert_eq!(
+                scale[3], with_probe,
+                "{optimizer:?}: probed θ restarted at {stalled}: {scale:?}"
+            );
+            let scale = scale_vector_for(&params, &options, &[]);
+            assert_eq!(
+                scale[3], without_probe,
+                "{optimizer:?}: unprobed θ restarted at {stalled}: {scale:?}"
+            );
+        }
+    }
+}
+
 /// An explicit `none` keeps meaning no scaling — `scale_params` included, which an
 /// identity θ switches off — and `rescale2` keeps its box-width vector (#2146).
 #[test]
