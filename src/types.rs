@@ -5031,6 +5031,22 @@ impl CompiledModel {
         return false;
     }
 
+    /// The θ index range of each `[covariate_nn]` block's weights,
+    /// `weights_offset..weights_offset + n_weights` (empty without the `nn` feature).
+    pub(crate) fn nn_weight_theta_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        #[cfg(feature = "nn")]
+        return self
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                use crate::nn::CovariateMapper;
+                nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()
+            })
+            .collect();
+        #[cfg(not(feature = "nn"))]
+        return Vec::new();
+    }
+
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
     /// This metadata lives behind the existing opaque `indiv_param_partials`

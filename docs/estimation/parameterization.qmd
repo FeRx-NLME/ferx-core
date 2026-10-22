@@ -164,6 +164,13 @@ with a θ's units. When every free coordinate is an identity-packed θ (Omega an
 Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a
 unit diagonal instead.
 
+The weights of a `[covariate_nn]` block are identity-packed too (their bounds
+are $\pm\infty$), but they are not parameters in user units, so they are not
+rescaled (#2273). A weight the data does not identify — one feeding a
+saturated unit, say — keeps a tiny diagonal entry, is clipped, and is reported
+in the regularization warning, which is what lets `max_condition_number` and
+`max_correlation` in a model-selection run reject the fit.
+
 Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its
 FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at
 $k = 10^5$ and $10^6$, `s` used to fail and `r`/`rsr` reported
