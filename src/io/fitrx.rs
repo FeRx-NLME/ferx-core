@@ -3270,11 +3270,12 @@ mod tests {
         let native = WarningEntry {
             severity: WarningSeverity::Critical,
             category: WarningCode::Convergence,
-            message: "W_NONFINITE_OBJECTIVE: the objective is \"NaN\"; and 2 more".into(),
+            message: "W_NONFINITE_OBJECTIVE: the objective is \"NaN\"; subject `a\\b`\nand 2 more"
+                .into(),
             source_method: Some("FOCEI".into()),
             details: Some(details.clone()),
         };
-        const PLAIN: &str = "a plain note";
+        const PLAIN: &str = "a plain note: \"quoted\"";
         let mut r = minimal_fit_result();
         r.warnings = vec![format!("[FOCEI] {}", native.message), PLAIN.into()];
         r.warnings_structured = vec![native.clone()];
@@ -3297,25 +3298,26 @@ mod tests {
         let plain = &l.warnings_structured[1];
         assert_eq!((plain.message.as_str(), &plain.details), (PLAIN, &None));
 
-        // The YAML of the reloaded fit lists the payload, and only that warning.
+        // The YAML of the reloaded fit is one valid document — the messages hold
+        // `"`, `\` and a newline — and lists the payload, and only that warning.
         let yaml_path = dir.path().join("run1-fit.yaml");
         crate::io::output::write_estimates_yaml(&l, yaml_path.to_str().unwrap()).unwrap();
-        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
-        let block = yaml
-            .split("\nwarning_details:\n")
-            .nth(1)
-            .expect("block written");
-        let field = |key: &str| -> serde_json::Value {
-            let prefix = format!("    {key}: ");
-            let line = block.lines().find_map(|l| l.strip_prefix(prefix.as_str()));
-            serde_json::from_str(line.unwrap_or_else(|| panic!("no {key}:\n{yaml}"))).unwrap()
-        };
-        assert!(block.starts_with("  - code: convergence\n"), "{yaml}");
-        assert_eq!(field("details"), details);
-        assert_eq!(field("message"), serde_json::json!(native.message));
-        assert_eq!(field("source_method"), serde_json::json!("FOCEI"));
-        assert_eq!(field("severity"), serde_json::json!("Critical"));
-        assert_eq!(block.matches("  - code: ").count(), 1, "{yaml}");
+        let text = std::fs::read_to_string(&yaml_path).unwrap();
+        let yaml: serde_json::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("the fit YAML does not parse: {e}\n{text}"));
+        assert_eq!(yaml["warnings"], serde_json::json!(r.warnings), "{text}");
+        let block = yaml["warning_details"].as_array().expect("block written");
+        assert_eq!(block.len(), 1, "{text}");
+        assert_eq!(
+            block[0],
+            serde_json::json!({
+                "code": "convergence",
+                "severity": "Critical",
+                "source_method": "FOCEI",
+                "message": native.message,
+                "details": details,
+            })
+        );
 
         // A bundle saved before #2268 has no `warning_details`, and one naming a
         // code this version does not know still loads: both re-classify the message.

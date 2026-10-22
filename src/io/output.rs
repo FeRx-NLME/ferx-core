@@ -3541,8 +3541,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
+        // JSON-quoted, as in `warning_details:` below: a message interpolates
+        // subject IDs and parser text, so it can hold `"` or `\` (#2268).
         for w in &result.warnings {
-            writeln!(f, "  - \"{}\"", w).map_err(|e| e.to_string())?;
+            let quoted = serde_json::to_string(w).map_err(|e| e.to_string())?;
+            writeln!(f, "  - {quoted}").map_err(|e| e.to_string())?;
         }
     }
     write_yaml_warning_details(&mut f, &result.warnings_structured)?;
