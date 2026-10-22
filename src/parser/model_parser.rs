@@ -23869,19 +23869,84 @@ const NON_READING_BLOCKS: &[&str] = &[
     "priors",
 ];
 
-/// Keys of the endpoint blocks whose value is a word or a list of words (a
-/// family, link, recurrence or clock name, the state labels), never an
-/// expression, so the line reads no name (#1902). `cmt` is absent: its integer
-/// value holds no identifier to drop.
-const LITERAL_VALUED_ENDPOINT_KEYS: &[&str] = &["family", "type", "clock", "states", "link"];
+/// What a [`WORD_VALUED_KEYS`] value may hold besides numbers and punctuation.
+#[derive(Clone, Copy)]
+enum WordValue {
+    /// Only these words, which the scan drops (case-insensitively) from the value.
+    /// Any other identifier on the line still counts as a read, so a parser that
+    /// later accepts an expression there (`at = every DT from …`) keeps `DT` in the
+    /// scan rather than silently dropping it (#1905).
+    Words(&'static [&'static str]),
+    /// Labels the line declares (`states = [awake=0, asleep=1]`): every identifier
+    /// in it is a new name, none a read.
+    Labels,
+}
+
+/// Per block, the keys whose value its parser accepts only as fixed words (and
+/// numbers) or as declared labels, so the line reads no name (#1902, #1905).
+/// Each word list is what that parser matches; a word it does not accept is
+/// harmless here (it was refused anyway), and a word it accepts but this table
+/// omits only over-refuses. `observe` and every key whose value is parsed as an
+/// expression stay scanned whole. The parsers' refusal of an identifier value is
+/// pinned key by key in `word_valued_keys_reject_an_identifier_value`.
+const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
+    (
+        "event_model",
+        "family",
+        WordValue::Words(&["exponential", "weibull", "gompertz"]),
+    ),
+    (
+        "event_model",
+        "type",
+        WordValue::Words(&["tte", "single", "rtte"]),
+    ),
+    (
+        "event_model",
+        "clock",
+        WordValue::Words(&["forward", "reset"]),
+    ),
+    ("binary_model", "link", WordValue::Words(&["logit"])),
+    ("markov_model", "type", WordValue::Words(&["ctmm"])),
+    ("markov_model", "states", WordValue::Labels),
+    // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
+    (
+        "adaptive_dosing",
+        "at",
+        WordValue::Words(&["every", "from", "to"]),
+    ),
+    // `parse_adaptive_route`: `bolus(cmt = N)` or `infuse(cmt = N, over = T)`.
+    (
+        "adaptive_dosing",
+        "route",
+        WordValue::Words(&["bolus", "infuse", "cmt", "over"]),
+    ),
+    (
+        "adaptive_dosing",
+        "with_assay_error",
+        WordValue::Words(&["true", "false"]),
+    ),
+    // `parse_covariate_nn_block`'s `parse_activation`, for both layers.
+    (
+        "covariate_nn",
+        "activation",
+        WordValue::Words(ACTIVATION_WORDS),
+    ),
+    ("covariate_nn", "output", WordValue::Words(ACTIVATION_WORDS)),
+];
+
+/// The activation names `parse_covariate_nn_block` accepts (case-insensitively).
+const ACTIVATION_WORDS: &[&str] = &[
+    "identity", "linear", "relu", "softplus", "tanh", "sigmoid", "exp",
+];
 
 /// The identifiers a reading block's `lines` can read, for the #1857 refusal:
 /// [`collect_referenced_identifiers`] over each line minus its assignment target
 /// (#1902). On a `key = expr` line the target — `key`, `init(x)`, `d/dt(x)`,
 /// `transition A -> B` — is a key, a state or a slot being written, never a read,
 /// and counting it refused a valid model whose helper was named `RATE` or `SHAPE`
-/// because `[event_model]` has keys of those names. In an endpoint block a
-/// [`LITERAL_VALUED_ENDPOINT_KEYS`] line reads nothing at all.
+/// because `[event_model]` has keys of those names. On a [`WORD_VALUED_KEYS`]
+/// line the block's fixed words are dropped from the value too (#1905), and a
+/// label-valued line reads nothing at all.
 ///
 /// A line of any other shape — `pk f(cl=CL)`, `DV ~ …`, `if (A == B) {`, or a
 /// target of another form — is tokenized whole, so
@@ -23891,16 +23956,25 @@ fn collect_read_identifiers(
     lines: &[String],
     out: &mut std::collections::HashSet<String>,
 ) {
-    let endpoint = matches!(block, "event_model" | "markov_model" | "binary_model");
     for line in lines {
-        let rhs = match split_assignment_target(line) {
-            Some((target, _)) if endpoint && LITERAL_VALUED_ENDPOINT_KEYS.contains(&target) => {
-                continue
-            }
-            Some((_, rhs)) => rhs,
-            None => line.as_str(),
+        let Some((target, rhs)) = split_assignment_target(line) else {
+            collect_referenced_identifiers(std::slice::from_ref(line), out);
+            continue;
         };
-        collect_referenced_identifiers(&[rhs.to_string()], out);
+        let value = WORD_VALUED_KEYS
+            .iter()
+            .find(|(b, k, _)| *b == block && *k == target)
+            .map(|(_, _, v)| *v);
+        let mut ids = std::collections::HashSet::new();
+        collect_referenced_identifiers(&[rhs.to_string()], &mut ids);
+        match value {
+            Some(WordValue::Labels) => {}
+            Some(WordValue::Words(words)) => out.extend(
+                ids.into_iter()
+                    .filter(|id| !words.iter().any(|w| w.eq_ignore_ascii_case(id))),
+            ),
+            None => out.extend(ids),
+        }
     }
 }
 

@@ -30320,6 +30320,8 @@ fn assert_conditional_read(err: &str, name: &str, reader: &str) {
     for want in &wants {
         assert!(err.contains(want.as_str()), "missing {want:?} in: {err}");
     }
+    // The reader's own label may hold one of these words (`[covariate_nn …]`).
+    let rest = err.replace(&format!("`{name}` ({reader})"), "");
     for never in [
         "covariate",
         "not found in data",
@@ -30327,7 +30329,7 @@ fn assert_conditional_read(err: &str, name: &str, reader: &str) {
         "undefined",
     ] {
         assert!(
-            !err.to_lowercase().contains(never),
+            !rest.to_lowercase().contains(never),
             "must not say {never:?}: {err}"
         );
     }
@@ -30607,20 +30609,257 @@ fn binary_model_key_and_link_word_are_not_reads_of_a_helper() {
 }
 
 /// `[markov_model]`: the state labels, in `states = [...]` and on a
-/// `transition` target.
+/// `transition` target, and the `type = ctmm` word.
 #[cfg(feature = "markov")]
 #[test]
 fn markov_model_state_labels_are_not_reads_of_a_helper() {
     let body = "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
                 states = [awake=0, asleep=1]\n  transition awake  -> asleep = 0.5\n  \
                 transition asleep -> awake  = 0.3\n";
-    let cases = [(
-        "AWAKE",
-        body.to_string(),
-        body.replace("asleep = 0.5", "asleep = 0.5 * AWAKE"),
-        "[markov_model]".to_string(),
-    )];
+    let cases: Vec<_> = ["AWAKE", "CTMM"]
+        .into_iter()
+        .map(|h| {
+            (
+                h,
+                body.to_string(),
+                body.replace("asleep = 0.5", &format!("asleep = 0.5 * {h}")),
+                "[markov_model]".to_string(),
+            )
+        })
+        .collect();
     assert_target_is_not_a_read(&cases, true);
+}
+
+/// `[adaptive_dosing]` (#1905): the words of `at = every … from … to …`, of the
+/// `route` and of `with_assay_error`. The reading twin reads the helper in
+/// `observe`, which stays scanned.
+#[test]
+fn adaptive_dosing_words_are_not_reads_of_a_helper() {
+    let body = "[adaptive_dosing]\n  observe = central / V\n  at = every 12 from 0 to 96\n  \
+                start_dose = 100\n  route = infuse(cmt = 1, over = 2)\n  \
+                dose_bounds = [0, 400]\n  with_assay_error = false\n  \
+                when signal < 10 : increase 25%\n";
+    let cases: Vec<_> = ["EVERY", "FROM", "TO", "INFUSE", "OVER", "FALSE"]
+        .into_iter()
+        .map(|h| {
+            (
+                h,
+                body.to_string(),
+                body.replace("central / V", &format!("central / V * {h}")),
+                "[adaptive_dosing]".to_string(),
+            )
+        })
+        .collect();
+    assert_target_is_not_a_read(&cases, true);
+}
+
+/// `[covariate_nn NAME]` (#1905): the `activation` and `output` words. The
+/// reading twin lists the helper among the block's `inputs`, which stay scanned.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_activation_words_are_not_reads_of_a_helper() {
+    let body = "[covariate_nn TYPICAL]\n  inputs = [WT]\n  outputs = [V]\n  layers = [3]\n  \
+                activation = tanh\n  output = softplus\n";
+    let cases: Vec<_> = ["TANH", "SOFTPLUS"]
+        .into_iter()
+        .map(|h| {
+            (
+                h,
+                body.to_string(),
+                body.replace("[WT]", &format!("[WT, {h}]")),
+                "[covariate_nn TYPICAL]".to_string(),
+            )
+        })
+        .collect();
+    assert_target_is_not_a_read(&cases, true);
+}
+
+/// Each [`WORD_VALUED_KEYS`] entry drops words from the #1857 scan on the
+/// strength of its parser accepting nothing else there. Pin that per entry: the
+/// key's parser refuses a value naming `V`, an individual parameter, so if one
+/// ever accepts an expression this fails and names the key (#1905). Under every
+/// feature, each table entry must have its case here.
+#[test]
+fn word_valued_keys_reject_an_identifier_value() {
+    let ip = "  CL = TVCL * exp(ETA_CL)";
+    let rhs = "-(CL/V) * central";
+    #[allow(unused_mut)]
+    let mut cases: Vec<(&str, &str, String, &str)> = Vec::new();
+    #[cfg(feature = "survival")]
+    {
+        let event = |lines: &str| {
+            cond_pk_model(
+                ip,
+                "",
+                &format!("[event_model]\n  cmt = 3\n  scale = 20\n{lines}"),
+            )
+        };
+        cases.push((
+            "event_model",
+            "family",
+            event("  family = V\n"),
+            "unknown family `V`",
+        ));
+        cases.push((
+            "event_model",
+            "type",
+            event("  family = exponential\n  type = V\n"),
+            "unknown type `V`",
+        ));
+        cases.push((
+            "event_model",
+            "clock",
+            event("  family = exponential\n  type = rtte\n  clock = V\n"),
+            "unknown clock `V`",
+        ));
+        cases.push((
+            "binary_model",
+            "link",
+            cond_ode_model(
+                ip,
+                rhs,
+                "[binary_model]\n  cmt = 3\n  logit = 0.5\n  link = V\n",
+            ),
+            "link `V` is not yet supported",
+        ));
+    }
+    #[cfg(feature = "markov")]
+    {
+        let markov = |ty: &str, states: &str| {
+            cond_ode_model(
+                ip,
+                rhs,
+                &format!(
+                    "[markov_model]\n  type   = {ty}\n  cmt    = 5\n  states = {states}\n  \
+                     transition awake  -> asleep = 0.5\n  transition asleep -> awake  = 0.3\n"
+                ),
+            )
+        };
+        cases.push((
+            "markov_model",
+            "type",
+            markov("V", "[awake=0, asleep=1]"),
+            "unknown type `V`",
+        ));
+        cases.push((
+            "markov_model",
+            "states",
+            markov("ctmm", "[awake=V, asleep=1]"),
+            "state code `V` must be a non-negative integer",
+        ));
+    }
+    let adaptive = |at: &str, route: &str, assay: &str| {
+        cond_ode_model(
+            ip,
+            rhs,
+            &format!(
+                "[adaptive_dosing]\n  observe = central / V\n  at = {at}\n  \
+                 start_dose = 100\n  route = {route}\n  dose_bounds = [0, 400]\n  \
+                 with_assay_error = {assay}\n  when signal < 10 : increase 25%\n"
+            ),
+        )
+    };
+    let route = "infuse(cmt = 1, over = 2)";
+    cases.push((
+        "adaptive_dosing",
+        "at",
+        adaptive("every V from 0 to 96", route, "false"),
+        "bad `at` interval: V",
+    ));
+    cases.push((
+        "adaptive_dosing",
+        "route",
+        adaptive("[24, 48]", "infuse(cmt = 1, over = V)", "false"),
+        "bad route over: V",
+    ));
+    cases.push((
+        "adaptive_dosing",
+        "with_assay_error",
+        adaptive("[24, 48]", route, "V"),
+        "with_assay_error must be `true` or `false`, got `V`",
+    ));
+    #[cfg(feature = "nn")]
+    {
+        let nn = |act: &str, out: &str| {
+            cond_ode_model(
+                ip,
+                rhs,
+                &format!(
+                    "[covariate_nn TYPICAL]\n  inputs = [WT]\n  outputs = [V]\n  \
+                     layers = [3]\n  activation = {act}\n  output = {out}\n"
+                ),
+            )
+        };
+        cases.push((
+            "covariate_nn",
+            "activation",
+            nn("V", "softplus"),
+            "unknown hidden activation `v`",
+        ));
+        cases.push((
+            "covariate_nn",
+            "output",
+            nn("tanh", "V"),
+            "unknown output activation `v`",
+        ));
+    }
+    for (block, key, src, want) in &cases {
+        let err = parse_err(src);
+        assert!(
+            err.contains(want),
+            "`[{block}] {key} = V` must be refused by its parser with {want:?}, got: {err}"
+        );
+    }
+    #[cfg(all(feature = "markov", feature = "nn"))]
+    for (block, key, _) in WORD_VALUED_KEYS {
+        assert!(
+            cases.iter().any(|(b, k, _, _)| b == block && k == key),
+            "`[{block}] {key}` has no case here"
+        );
+    }
+}
+
+/// A [`WORD_VALUED_KEYS`] line drops only its block's words for that key, not
+/// the whole value: an identifier no parser accepts there today (`DT`, `DUR`)
+/// still counts, so a parser that starts accepting one keeps the read in the
+/// scan (#1905). The same words under another key or block still count.
+#[test]
+fn a_word_valued_line_drops_only_its_words() {
+    let read = |block: &str, line: &str| {
+        let mut ids = std::collections::HashSet::new();
+        collect_read_identifiers(block, &[line.to_string()], &mut ids);
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids
+    };
+    for (block, line, want) in [
+        ("adaptive_dosing", "at = every 12 from 0 to 96", vec![]),
+        ("adaptive_dosing", "at = every DT from 0 to 96", vec!["DT"]),
+        (
+            "adaptive_dosing",
+            "route = infuse(cmt = 1, over = DUR)",
+            vec!["DUR"],
+        ),
+        ("adaptive_dosing", "with_assay_error = FALSE", vec![]),
+        (
+            "adaptive_dosing",
+            "observe = central / EVERY",
+            vec!["CENTRAL", "EVERY"],
+        ),
+        ("covariate_nn", "activation = TANH", vec![]),
+        ("covariate_nn", "activation = tanh(X)", vec!["X"]),
+        ("covariate_nn", "inputs = [WT, TANH]", vec!["TANH", "WT"]),
+        ("markov_model", "states = [awake=0, asleep=1]", vec![]),
+        ("event_model", "family = weibull", vec![]),
+        ("event_model", "link = logit", vec!["LOGIT"]),
+        (
+            "scaling",
+            "at = every 12 from 0 to 96",
+            vec!["EVERY", "FROM", "TO"],
+        ),
+    ] {
+        assert_eq!(read(block, line), want, "[{block}] {line}");
+    }
 }
 
 /// `[odes]`' `d/dt(...)` (`D`, `DT`) and `[initial_conditions]`' `init(...)`
