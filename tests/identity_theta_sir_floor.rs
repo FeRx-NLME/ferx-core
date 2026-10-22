@@ -141,7 +141,8 @@ fn rescaling_an_identity_packed_theta_leaves_every_sir_interval_where_it_was() {
         // are `ŷ + L·z` with `L` exactly `K·L₁`, so what is left is rounding: worst CI
         // difference 2.3e-15 (k = 1e6) and ESS 1.6e-10 (k = 1e8) on macOS arm64. The ESS
         // moves more than the CIs because the weights carry the objective's own rounding at
-        // each draw. The bounds are 430× and 60× the macOS worst.
+        // each draw. On Linux x86_64 (glibc 2.28) the worst are 3.4e-15 (k = 1e6) and 7.7e-11
+        // (k = 3e-6). The bounds are 430× and 60× the macOS worst, 300× and 130× the Linux.
         if !(worst < 1e-12) {
             failures.push(format!("{label}: worst relative CI difference {worst:e}"));
         }
@@ -278,9 +279,10 @@ fn rescaling_an_additive_eta_leaves_every_sir_interval_where_it_was() {
         // and the ESS by 2.6e-4 to 3.4e-4. With it `Scaled(L̂₂₂)` the worst CI difference is
         // 4.7e-10 (k = 0.1) and the ESS 4.0e-7 (k = 0.01). k = 0.5, a power of two that
         // rescales every float exactly, agrees to 1.1e-14; at the other k the covariance step's
-        // finite-difference Hessian rounds differently, so `Σ` itself moves at that level. The
-        // bounds are 21× and 25× the macOS worst, and 20,000× and 26× under the unscaled
-        // proposal.
+        // finite-difference Hessian rounds differently, so `Σ` itself moves at that level.
+        // Linux x86_64 (glibc 2.28) gives the same worst values to every printed digit (k = 0.5:
+        // 3.7e-14). The bounds are 21× and 25× that worst, and 20,000× and 26× under the
+        // unscaled proposal.
         if !(worst < 1e-8) {
             failures.push(format!("{label}: worst relative CI difference {worst:e}"));
         }
