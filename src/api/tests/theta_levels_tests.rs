@@ -9215,6 +9215,184 @@ mod absorption {
         }
     }
 
+    /// B4c (#1962). Under sum-to-zero the grouped block basis projects on the
+    /// coded span — each level's difference against its group's last — what a
+    /// basis of those differences projects on, built on the raw columns: per
+    /// probe the residual equals the difference basis's to 1e-12, and the rank
+    /// count (#1977) is the same. Five fixtures on 40 subjects, one level per
+    /// subject, so every difference crosses two subjects:
+    ///
+    /// - no θ carries the levels' mean: one direction removed, and a level
+    ///   alone is outside the span while a difference of two is inside it;
+    /// - an intercept carries it: nothing removed, the level inside;
+    /// - a θ that is one level: its equation pins the group's functional at
+    ///   zero, nothing removed, and the block keeps its rank;
+    /// - a second block whose levels each sum two of this one's: the groups'
+    ///   functionals are tied 2 : 1 and are removed together, while neither
+    ///   group's alone is consistent;
+    /// - a zero level: the constraint has nothing to act on.
+    ///
+    /// The one population-wide vector is the slope θ — the intercept and the
+    /// second block's levels lie in the per-subject span — where the
+    /// differences make one per level.
+    ///
+    /// Mutations — every unit `λ` taken as removed, the misfit ignored (the
+    /// intercept and one-level fixtures' residuals differ); a group whose `t`
+    /// is zero skipped before the joint SVD (the 2 : 1 fixture removes
+    /// nothing, the shape `an_aliased_second_block_stays_refused` reached);
+    /// the zero-column check dropped (the zero fixture keeps a removed
+    /// direction); the last column's direction not added back in `aliased`, or
+    /// the coded-minus-raw count dropped (the counts differ).
+    #[test]
+    fn the_grouped_basis_spans_the_coded_differences() {
+        let n = 40usize;
+        let rows = 4usize;
+        let lens = vec![rows; n];
+        let offsets: Vec<usize> = (0..n).map(|s| s * rows).collect();
+        let wave = |s: usize, k: usize| -> Vec<f64> {
+            (0..rows)
+                .map(|j| (0.37 * (s * rows + j) as f64 + 1.3 * k as f64).sin() + 0.2 * j as f64)
+                .collect()
+        };
+        let level = |s: usize| -> Pieces { vec![(s, wave(s, 0))] };
+        let slope: Pieces = (0..n).map(|s| (s, wave(s, 1))).collect();
+        let levels: Vec<Pieces> = (0..n).map(level).collect();
+        let scaled = |p: &Pieces, a: f64| -> Pieces {
+            p.iter()
+                .map(|(s, v)| (*s, v.iter().map(|x| a * x).collect()))
+                .collect()
+        };
+        let intercept: Pieces = levels.iter().map(|l| scaled(l, 0.7)[0].clone()).collect();
+
+        struct Case {
+            tag: &'static str,
+            cols: Vec<Pieces>,
+            groups: Vec<Option<usize>>,
+            removed: usize,
+            dense: usize,
+        }
+        let own = |extra: Vec<Pieces>| -> (Vec<Pieces>, Vec<Option<usize>>) {
+            let mut groups = vec![None; extra.len()];
+            let mut cols = extra;
+            cols.extend(levels.iter().cloned());
+            groups.extend(std::iter::repeat_n(Some(0), n));
+            (cols, groups)
+        };
+        let mut cases = Vec::new();
+        let (cols, groups) = own(vec![slope.clone()]);
+        cases.push(Case {
+            tag: "no intercept",
+            cols,
+            groups,
+            removed: 1,
+            dense: 1,
+        });
+        let (cols, groups) = own(vec![slope.clone(), intercept.clone()]);
+        cases.push(Case {
+            tag: "intercept",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+        let (cols, groups) = own(vec![slope.clone(), scaled(&levels[5], 1.0)]);
+        cases.push(Case {
+            tag: "one level",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+        let pairs: Vec<Pieces> = (0..n / 2)
+            .map(|k| vec![levels[2 * k][0].clone(), levels[2 * k + 1][0].clone()])
+            .collect();
+        let (mut cols, mut groups) = own(vec![slope.clone()]);
+        cols.extend(pairs.iter().cloned());
+        groups.extend(std::iter::repeat_n(Some(1), n / 2));
+        cases.push(Case {
+            tag: "2 : 1",
+            cols,
+            groups,
+            removed: 1,
+            dense: 1,
+        });
+        let (mut cols, groups) = own(vec![slope.clone()]);
+        cols[1 + 7] = Pieces::new();
+        cases.push(Case {
+            tag: "zero level",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+
+        let probes: Vec<Pieces> = vec![
+            level(3),
+            pieces_minus(&level(3), &level(9)),
+            vec![(4, wave(4, 2))],
+            vec![(0, wave(0, 3)), (n - 1, wave(n - 1, 4))],
+            slope.clone(),
+            intercept.clone(),
+        ];
+        let mut wrong = Vec::new();
+        for case in &cases {
+            let grouped = BlockBasis::grouped(&case.cols, &case.groups, &lens, &offsets);
+            let differences = BlockBasis::new(
+                &coded_differences(&case.cols, &case.groups),
+                &lens,
+                &offsets,
+            );
+            if grouped.removed.len() != case.removed {
+                wrong.push(format!(
+                    "{}: {} directions removed, want {}",
+                    case.tag,
+                    grouped.removed.len(),
+                    case.removed
+                ));
+            }
+            if grouped.dense.len() != case.dense || differences.dense.len() < n - 2 {
+                wrong.push(format!(
+                    "{}: {} population-wide vectors, want {} (differences: {})",
+                    case.tag,
+                    grouped.dense.len(),
+                    case.dense,
+                    differences.dense.len()
+                ));
+            }
+            if grouped.aliased() != differences.aliased() {
+                wrong.push(format!(
+                    "{}: aliased {} vs {}",
+                    case.tag,
+                    grouped.aliased(),
+                    differences.aliased()
+                ));
+            }
+            for (k, z) in probes.iter().enumerate() {
+                let (got, want) = (grouped.residual(z), differences.residual(z));
+                match (got, want) {
+                    (Some(g), Some(w)) if g.is_finite() && (g - w).abs() < 1e-12 => {}
+                    _ => wrong.push(format!("{} probe {k}: {got:?} vs {want:?}", case.tag)),
+                }
+            }
+        }
+        // The straddle: with no intercept a level alone leaves the coded
+        // span, a difference of two does not; the intercept brings it back.
+        let r = |case: usize, probe: usize| {
+            BlockBasis::grouped(&cases[case].cols, &cases[case].groups, &lens, &offsets)
+                .residual(&probes[probe])
+                .unwrap()
+        };
+        if !(r(0, 0) > 1e-3 && r(0, 1) < 1e-12 && r(1, 0) < 1e-12) {
+            wrong.push(format!(
+                "straddle: level {:e}, difference {:e}, level with intercept {:e}",
+                r(0, 0),
+                r(0, 1),
+                r(1, 0)
+            ));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// B4. The span residual on synthetic columns: a multiple of a column is in
     /// its span, to rounding; an orthogonal part shows as its relative size; a
     /// zero column measures nothing; a repeated column adds no direction; and a
@@ -11705,3 +11883,77 @@ mod level_uncertainty {
 /// A level `TIME` key reads the time as written (#1959, #1796).
 #[path = "theta_levels_written_time_tests.rs"]
 mod written_time_keys;
+
+mod carried_scale {
+    use super::*;
+
+    /// The #1962 fixture: a 5-η `two_cpt_oral` intercept model with a
+    /// placebo level per study, one study per subject.
+    pub(super) fn scale_model() -> String {
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta PLACEBO[STUDY](0.0, -5.0, 5.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * exp(PLACEBO)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        .to_string()
+    }
+
+    /// #1962: the certificate's cost is in its population-wide vectors, and
+    /// under sum-to-zero they stay the other θ — here the five typical values
+    /// — however many subjects carry a level. Coded as differences against
+    /// the last level, each of the 30 one-subject levels made one (29 more),
+    /// which is what made the refusal cubic in the subjects: 19 s at 1000
+    /// subjects on this fixture (release, macOS arm64), where the
+    /// [`BlockBasis`] the grouped columns build refuses in under a second. The
+    /// refusal reaches the certificate (bases are built) and its text is the
+    /// one the binder gave before.
+    ///
+    /// Mutation — the sum-to-zero coding back to differences in `carried`
+    /// (34 population-wide vectors).
+    #[test]
+    fn the_certificate_keeps_one_population_wide_vector_per_other_theta() {
+        let pop = population(30, 10);
+        let text = scale_model();
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(&text).unwrap();
+        super::super::DENSE_COUNTS.with(|d| d.borrow_mut().clear());
+        let err = crate::api::bind_theta_levels(&mut parsed, &text, &mut p)
+            .expect_err("the intercept carries the levels' mean: refused")
+            .to_string();
+        let counts = super::super::DENSE_COUNTS.with(|d| d.borrow().clone());
+        assert!(
+            !counts.is_empty(),
+            "the refusal never reached the certificate: {err}"
+        );
+        assert!(
+            counts.iter().all(|&c| c <= 5),
+            "population-wide vectors per basis: {counts:?}"
+        );
+        assert!(err.starts_with("theta PLACEBO[STUDY]: "), "{err}");
+    }
+}
