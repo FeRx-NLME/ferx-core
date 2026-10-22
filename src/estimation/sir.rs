@@ -368,6 +368,56 @@ pub(crate) fn floor_probe_point(
     x
 }
 
+/// The low-ESS floor probe (#1723): `ofv_at` at the estimate, then at each
+/// [`floor_probe_point`], as ΔOFV from the former. Each point costs a full
+/// inner loop, so the cancel token is polled before the baseline and before
+/// every point, and a cancelled probe returns nothing (#1754) — not the
+/// points scored so far, which would flag some variances and silently omit
+/// the rest. An empty probe drops the warning's shelf sentence; the ESS and
+/// draw sentences stay.
+pub(crate) fn floor_probe(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    params: &ModelParameters,
+    fixed: &[bool],
+    coord_names: &[String],
+    cancel: &Option<crate::cancel::CancelFlag>,
+    ofv_at: impl Fn(&ModelParameters, &[f64]) -> f64,
+) -> Vec<FloorProbe> {
+    // The baseline is `ofv_at` at the estimate, not the caller's `ofv_hat`:
+    // an offset between the two cancels in the normalised weights, but here
+    // it would shift an absolute ΔOFV compared against 3.84 (e.g. a Laplace
+    // `fit.ofv` against FOCEI-scored draws).
+    if crate::cancel::is_cancelled(cancel) {
+        return Vec::new();
+    }
+    let base = match screen_draw(x_hat, bounds, params) {
+        Ok(p) => ofv_at(&p, x_hat),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for c in floor_probe_coords(params, fixed) {
+        if crate::cancel::is_cancelled(cancel) {
+            return Vec::new();
+        }
+        let x = floor_probe_point(x_hat, bounds, &c);
+        let Ok(p) = screen_draw(&x, bounds, params) else {
+            continue;
+        };
+        let i = c.diag;
+        let dofv = ofv_at(&p, &x) - base;
+        if dofv.is_finite() {
+            out.push(FloorProbe {
+                name: coord_names[i].clone(),
+                dofv,
+                variance: coordinate_values(&p)[i],
+                covariances_zeroed: c.zeroes_a_covariance(x_hat),
+            });
+        }
+    }
+    out
+}
+
 /// The proposal centre under [`SirScale::Natural`], on the draw scale: the
 /// estimate moved to the Laplace mode of the tilted target, `ŷ + C ∇ log|J|`,
 /// with `C` the free-block proposal covariance and `∇ log|J|` the gradient of
@@ -1343,29 +1393,15 @@ fn run_sir_in_box(
             params,
         );
         let probe = || {
-            // The baseline is `ofv_at` at the estimate, not the caller's
-            // `ofv_hat`: an offset between the two cancels in the normalised
-            // weights, but here it would shift an absolute ΔOFV compared against
-            // 3.84 (e.g. a Laplace `fit.ofv` against FOCEI-scored draws).
-            let base = match screen_draw(&x_hat, &bounds, params) {
-                Ok(p) => ofv_at(&p, &x_hat),
-                Err(_) => return Vec::new(),
-            };
-            floor_probe_coords(params, &fixed_mask)
-                .into_iter()
-                .filter_map(|c| {
-                    let x = floor_probe_point(&x_hat, &bounds, &c);
-                    let p = screen_draw(&x, &bounds, params).ok()?;
-                    let i = c.diag;
-                    let dofv = ofv_at(&p, &x) - base;
-                    dofv.is_finite().then(|| FloorProbe {
-                        name: coord_names[i].clone(),
-                        dofv,
-                        variance: coordinate_values(&p)[i],
-                        covariances_zeroed: c.zeroes_a_covariance(&x_hat),
-                    })
-                })
-                .collect()
+            floor_probe(
+                &x_hat,
+                &bounds,
+                params,
+                &fixed_mask,
+                &coord_names,
+                &options.cancel,
+                &ofv_at,
+            )
         };
         if let Some(w) = low_ess_warning(ess, n_samples, options.sir_scale, &heaviest, probe) {
             if options.verbose {
