@@ -1803,6 +1803,10 @@ pub(crate) fn subject_eta_response_correction(
 ///   records live in `subject.obs_records`, which both closed forms ignore: a TTE-only
 ///   subject scored `(0, [0, …])` — the empty Gaussian marginal — and a joint PK + TTE
 ///   subject dropped the hazard term from the NLL and its θ-gradient.
+/// - FREM covariate pseudo-observations (#2023). The objective scores each one against
+///   `max(σ_cov², 1e-12)`; both closed forms took its variance and `∂R/∂log σ` from the
+///   PK error model, so the covariate σ had no score, the PK σ got a spurious one, and
+///   the returned NLL was not the objective's.
 pub(crate) fn closed_form_fixed_ebe_grad_ok(
     model: &CompiledModel,
     template: &ModelParameters,
@@ -1814,6 +1818,7 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && !model.has_theta_dependent_ruv_magnitude()
         && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
+        && model.frem_config.is_none()
 }
 
 /// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
@@ -4382,6 +4387,153 @@ mod tests {
         assert!(model.has_theta_dependent_ruv_magnitude());
         check_gn_grad_matches_fd(&model, true);
         check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A FREM model with a free PK σ (`ADD`) and a free covariate σ (`EPSCOV`), and
+    /// one subject whose first row is a covariate pseudo-observation (`FREMTYPE = 100`).
+    fn frem_gn_fixture() -> (CompiledModel, Population) {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.5, 0.1, 10.0)\n  theta TVV(20.0, 1.0, 100.0)\n  \
+             theta TV_WT(70.0, 1.0, 200.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_WT_FREM ~ 100.0\n  \
+             sigma ADD ~ 0.5 (sd)\n  sigma EPSCOV ~ 2.0 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ additive(ADD)\n[fit_options]\n  frem_predictions = TV_WT/ETA_WT_FREM:100\n  \
+             frem_sigma = EPSCOV\n",
+        )
+        .expect("FREM model parses");
+        let population = Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![0.0, 1.0, 4.0, 8.0],
+                observations: vec![75.0, 4.6, 3.5, 2.6],
+                obs_cmts: vec![1; 4],
+                cens: vec![0; 4],
+                fremtype: vec![100, 0, 0, 0],
+                ..Default::default()
+            }],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        (model, population)
+    }
+
+    /// #2023: neither closed form knows `FREMTYPE`. Both build the covariate row's
+    /// variance and `∂R/∂log σ` from the PK error model (`ADD`), where the objective,
+    /// `foce_subject_nll_cov`, scores that row against `max(σ_cov², 1e-12)` (`EPSCOV`).
+    /// So `closed_form_fixed_ebe_grad_ok` must send a FREM model to the FD fallback,
+    /// on both legs and both closed forms.
+    ///
+    /// The fixture keeps the defect observable: both σ are free, the covariate row's
+    /// residual at η̂ is `75 − (70 + 1) = 4`, not `±σ_cov = ±2` (where the `ADD` score
+    /// such a row contributes, `1/V − r²/V²`, vanishes), and the η-Jacobian's
+    /// `ETA_WT_FREM` column is live on that row, so `log|H̃|` sees it as well.
+    ///
+    /// Without the FREM clause both legs fail at the NLL check. Measured with that check
+    /// disabled: the Laplace NLL is 32.34 against the objective's 2.360; `EPSCOV`
+    /// (`grad[6]`) scores 0 against FD −3.96 under INTER and 0 against 2.92e-2 without;
+    /// `ADD` (`grad[5]`) −61.2 against 2.81 under INTER; `TV_WT` (`grad[2]`) −1120
+    /// against −70 under INTER and rel 3.7e-2 without, past the helper's 2e-3 bound.
+    #[test]
+    fn frem_gn_grad_matches_fd_via_fallback() {
+        let (model, population) = frem_gn_fixture();
+        let fc = model.frem_config.as_ref().expect("fixture is FREM");
+        assert_eq!(fc.covariate_sigma_index, 1, "EPSCOV is sigma slot 1");
+        assert!(
+            model.default_params.sigma_fixed.iter().all(|f| !f),
+            "fixture precondition: both σ are free"
+        );
+        let eta_hat = DVector::from_vec(vec![0.05, 1.0]);
+        // Rows: the covariate row, then three PK rows. ∂(TV_WT + η_WT)/∂η_WT = 1.
+        let h_matrix =
+            DMatrix::from_column_slice(4, 2, &[0.0, -0.4, -0.3, -0.15, 1.0, 0.0, 0.0, 0.0]);
+        check_gn_grad_matches_fd_at(&model, &population, 0, &eta_hat, &h_matrix, true);
+        check_gn_grad_matches_fd_at(&model, &population, 0, &eta_hat, &h_matrix, false);
+    }
+
+    /// #2023's routing, as a straddle: the FREM fixture shuts the fixed-EBE gate, and the
+    /// same model with `frem_config` cleared opens it, so the FREM clause is what decides.
+    /// The gate also governs the FOCEI `log|H̃|` EBE-response term and, through it, the
+    /// covariance step's `s` / `rsr` subject score, which must come back as exactly
+    /// the FD-fallback gradient with no closed-form term added.
+    #[test]
+    fn frem_routes_every_fixed_ebe_consumer_to_the_fd_fallback() {
+        let (model, population) = frem_gn_fixture();
+        let template = model.default_params.clone();
+        let (mut non_frem, _) = frem_gn_fixture();
+        non_frem.frem_config = None;
+        assert!(
+            closed_form_fixed_ebe_grad_ok(&non_frem, &template, &[]),
+            "fixture precondition: without FREM the gate is open"
+        );
+        assert!(
+            !closed_form_fixed_ebe_grad_ok(&model, &template, &[]),
+            "a FREM model must shut the fixed-EBE gate"
+        );
+
+        let eta_hat = DVector::from_vec(vec![0.05, 1.0]);
+        let h_matrix =
+            DMatrix::from_column_slice(4, 2, &[0.0, -0.4, -0.3, -0.15, 1.0, 0.0, 0.0, 0.0]);
+        let x = pack_params(&template);
+        let bounds = compute_bounds(&template);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+        let correction = |m: &CompiledModel| {
+            subject_eta_response_correction(
+                None,
+                &x,
+                &template,
+                m,
+                &population,
+                0,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &bounds,
+                &options,
+            )
+        };
+        assert!(
+            correction(&non_frem).is_some(),
+            "fixture precondition: without FREM the EBE-response term is computed"
+        );
+        assert!(
+            correction(&model).is_none(),
+            "a FREM model must decline the closed-form EBE-response term"
+        );
+
+        let (_, grad) = subject_nll_pop_grad(
+            &x,
+            &template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+        let score = crate::estimation::covariance::fixed_ebe_subject_score(
+            &x,
+            &template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+        assert_eq!(
+            score, grad,
+            "the covariance score of a FREM subject is the FD-fallback gradient"
+        );
     }
 
     /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
