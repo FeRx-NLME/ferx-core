@@ -1765,6 +1765,173 @@ fn iov_linearization_uses_the_exact_kappa_jacobian() {
     assert!(worst < 1e-9, "worst κ-column gap {worst:.2e}");
 }
 
+// ---- IOV past the retired 24-axis program cap (#2031) ---------------------------------
+
+/// `src` with `n` live θ `PAD0…PAD{n-1}` added after the last θ line, each scaling the
+/// `[individual_parameters]` line `target` by `(1 + 0.02·PADi)`. Live, not inert: a pad at
+/// `+ 0.0 * PADi` has an exactly-zero θ column, so the parity below would not see a
+/// θ column the recording dropped or misplaced.
+fn with_live_pads(src: &str, last_theta: &str, target: &str, n: usize) -> String {
+    let thetas: String = (0..n)
+        .map(|i| format!("  theta PAD{i}(0.5, 0.01, 10.0)\n"))
+        .collect();
+    let terms: String = (0..n).map(|i| format!(" + 0.02 * PAD{i}")).collect();
+    assert!(
+        src.contains(last_theta) && src.contains(target),
+        "pad anchors"
+    );
+    src.replacen(last_theta, &format!("{last_theta}{thetas}"), 1)
+        .replacen(target, &format!("{target} * (1.0{terms})"), 1)
+}
+
+/// Compartment-free IOV twin of [`ODE_IOV`]: 3 θ, 2 η, 2 κ (7 axes), the same η/κ layout.
+const ALGEBRAIC_IOV: &str = r#"
+[parameters]
+  theta TVE0(10.0, 0.1, 100.0)
+  theta TVEMAX(6.0, 0.1, 100.0)
+  theta TVET50(2.0, 0.01, 100.0)
+  omega ETA_E0 ~ 0.09
+  omega ETA_EMAX ~ 0.06
+  kappa KAPPA_E0 ~ 0.03
+  kappa KAPPA_EMAX ~ 0.02
+  sigma ADD ~ 1.0 (sd)
+[individual_parameters]
+  E0   = TVE0 * exp(ETA_E0 + KAPPA_E0)
+  EMAX = TVEMAX * exp(ETA_EMAX + KAPPA_EMAX)
+  ET50 = TVET50
+[structural_model]
+  y = E0 - EMAX * TIME / (ET50 + TIME)
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// [`iov_subject`] for a compartment-free model: the same three occasions, no doses.
+fn algebraic_iov_subject(model: &CompiledModel) -> Subject {
+    let times = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
+    let mut s = subject_shell(vec![], &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 3, 3, 3];
+    let kappas = vec![vec![0.1, -0.05], vec![-0.08, 0.04], vec![0.05, 0.06]];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+        &kappas,
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The inner loop's stacked `[η, κ_0, κ_1, κ_2]` Jacobian (`exact_obs_grads`, all the inner
+/// gradient reads) against a Richardson difference of `predict_iov`: the worst relative gap
+/// over every row and stacked column.
+fn iov_jacobian_gap(model: &CompiledModel, s: &Subject, theta: &[f64]) -> f64 {
+    let eta = [0.07, -0.04];
+    let kappas = [vec![0.06, -0.03], vec![-0.05, 0.02], vec![0.04, 0.05]];
+    let stacked: Vec<f64> = eta
+        .iter()
+        .copied()
+        .chain(kappas.iter().flatten().copied())
+        .collect();
+    let exact = exact_obs_grads(model, s, theta, &stacked).expect("inner recording serves it");
+    let predict = |st: &[f64]| {
+        let k: Vec<Vec<f64>> = st[2..].chunks(2).map(<[f64]>::to_vec).collect();
+        crate::pk::predict_iov(model, s, theta, &st[..2], &k)
+    };
+    let mut worst = 0.0f64;
+    for c in 0..stacked.len() {
+        let fd = |h: f64| {
+            let (mut p, mut m) = (stacked.clone(), stacked.clone());
+            p[c] += h;
+            m[c] -= h;
+            let (yp, ym) = (predict(&p), predict(&m));
+            yp.iter()
+                .zip(&ym)
+                .map(|(a, b)| (a - b) / (2.0 * h))
+                .collect::<Vec<f64>>()
+        };
+        let (f1, f2) = (fd(1e-3), fd(2e-3));
+        for (j, row) in exact.iter().enumerate() {
+            let rich = (4.0 * f1[j] - f2[j]) / 3.0;
+            assert!(
+                row.df_deta[c].is_finite() && rich.is_finite(),
+                "row {j} column {c}: exact {} fd {rich}",
+                row.df_deta[c]
+            );
+            worst = worst.max((row.df_deta[c] - rich).abs() / (1.0 + rich.abs()));
+        }
+    }
+    worst
+}
+
+/// #2031: before #2093 the forward provider declined an IOV model on the ODE engine
+/// (`ode_iov_supported`) or the compartment-free readout (`algebraic::supported_iov`) once
+/// `n_theta + n_eta + n_kappa > 24`, FIX θ included, so both loops ran on finite
+/// differences. The adjoint seeds θ on its reverse tape and only `[η, κ]` forward, so a
+/// 25-axis model (18 live pads on a 7-axis fixture) records like a 7-axis one: the outer
+/// FOCEI gradient matches the reconverged FD of the production objective along every packed
+/// coordinate, the pads' included, and the inner stacked Jacobian matches FD of
+/// `predict_iov`. A width clause reinstated anywhere on the subject path panics at the
+/// `expect`s instead.
+fn assert_wide_iov_parity(engine: &str, model: &CompiledModel, s: &Subject, tol: (f64, f64)) {
+    assert!(
+        model.n_theta + model.n_eta + model.n_kappa > 24,
+        "{engine}: the fixture must sit past the old cap"
+    );
+    assert!(recorder_in_scope(model), "{engine}: model-level scope");
+    let jac = iov_jacobian_gap(model, s, &moved_params(model).theta);
+    let outer = iov_parity(model, s, true);
+    eprintln!("#2031 {engine} at 25 axes: inner Jacobian vs FD {jac:.2e}, FOCEI vs reconverged FD {outer:.2e}");
+    assert!(jac < tol.0, "{engine}: inner Jacobian vs FD {jac:.2e}");
+    assert!(
+        outer < tol.1,
+        "{engine}: FOCEI vs reconverged FD {outer:.2e}"
+    );
+}
+
+#[test]
+fn ode_iov_past_24_axes_matches_fd() {
+    let src = with_live_pads(
+        ODE_IOV,
+        "  theta TVKA(1.2, 0.05, 20.0)\n",
+        "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        18,
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    let s = iov_subject(&model);
+    // Measured (macOS arm64): Jacobian 5.0e-13, FOCEI 3.1e-9 (the Richardson floor at EBE
+    // tol 1e-12, as on the 7-axis fixture); 10× headroom each.
+    assert_wide_iov_parity("ODE", &model, &s, (5e-12, 3e-8));
+}
+
+#[test]
+fn compartment_free_iov_past_24_axes_matches_fd() {
+    let src = with_live_pads(
+        ALGEBRAIC_IOV,
+        "  theta TVET50(2.0, 0.01, 100.0)\n",
+        "  E0   = TVE0 * exp(ETA_E0 + KAPPA_E0)",
+        18,
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.is_algebraic());
+    let s = algebraic_iov_subject(&model);
+    // The oracle's EBE at 1e-7, not 1e-12: this exact objective has no stall stop, and its
+    // BFGS cannot certify `|g| < 1e-8` at the moved θ (the inner gradient agrees with a
+    // central difference to 9 figures; it is the L2 floor), so every stencil point fell to
+    // Nelder–Mead and the test took 36 s in debug.
+    ORACLE_EBE_TOL.set(1e-7);
+    // Measured (macOS arm64): Jacobian 1.7e-13, FOCEI 6.4e-7 (6.3e-12 with the oracle at
+    // 1e-12); 10× headroom each. A dropped or misplaced θ column is an O(1) relative gap.
+    assert_wide_iov_parity("compartment-free", &model, &s, (2e-12, 6.4e-6));
+    ORACLE_EBE_TOL.set(1e-12);
+}
+
 // ---- closed-form event walk: time-varying covariates and IOV --------------------------
 
 const CF_TVCOV: &str = r#"
@@ -2326,6 +2493,138 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
             "n_agq = {n_agq}, exact = {exact}: {worst:.2e}"
         );
     }
+}
+
+/// A packed vector of the wrong length is declined (`None`), not read past its end:
+/// `unpack_params` indexes it unchecked, and `scope` used to unpack before its own length
+/// check, so a short `x` panicked with an index out of bounds (#2294 review). Every entry
+/// point goes through `PackedPoint::new`, which checks first.
+#[test]
+fn a_packed_vector_of_the_wrong_length_declines() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    let eta = ebe_for(&one, &s, &params, 1e-10, true);
+    assert!(
+        subject_adjoint_gradient(&one, &s, &params, &x, eta.as_slice(), Objective::Focei).is_some()
+    );
+    let longer: Vec<f64> = x.iter().copied().chain([0.0]).collect();
+    for (label, bad) in [("short", &x[..x.len() - 1]), ("long", &longer[..])] {
+        for objective in [
+            Objective::Focei,
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+        ] {
+            assert!(
+                subject_adjoint_gradient(&one, &s, &params, bad, eta.as_slice(), objective)
+                    .is_none(),
+                "{label} x, {objective:?}"
+            );
+        }
+        assert!(
+            subject_adjoint_cov_hessian(&one, &s, &params, bad, eta.as_slice(), Objective::Focei)
+                .is_none(),
+            "{label} x, covariance Hessian"
+        );
+        assert!(
+            subject_adjoint_eta_dx(&one, &s, &params, bad, eta.as_slice(), true).is_none(),
+            "{label} x, mode response"
+        );
+    }
+}
+
+/// A population sweep unpacks the packed point once (`PackedPoint`), not once per subject:
+/// the FOCEI population gradient (each subject checked bit for bit against the per-subject
+/// entry point), the mode responses, the AGQ population gradient, and an AGQ score context
+/// scoring every subject, whose scores must take the exact route. On warfarin's ten
+/// subjects. The count is the regression guard: unpacking per subject cloned every θ name
+/// per subject, a third of the gradient at 1,317 θ.
+#[test]
+fn a_population_sweep_unpacks_the_packed_point_once() {
+    use super::PACKED_POINT_WATCH;
+    use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
+    use crate::estimation::sens_outer_gradient::{
+        per_subject_packed_gradients, population_eta_dx, subject_packed_gradient,
+    };
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+        "examples/warfarin.ferx",
+    ))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let etas: Vec<nalgebra::DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| ebe_for(&model, s, &params, 1e-10, true))
+        .collect();
+    let count = |f: &dyn Fn()| {
+        let key = &params as *const ModelParameters as usize;
+        *PACKED_POINT_WATCH.lock().unwrap() = Some((key, 0));
+        f();
+        PACKED_POINT_WATCH
+            .lock()
+            .unwrap()
+            .take()
+            .map_or(0, |(_, n)| n)
+    };
+    let grads = std::cell::RefCell::new(Vec::new());
+    let n = count(&|| {
+        *grads.borrow_mut() =
+            per_subject_packed_gradients(&model, &pop, &params, &x, &etas, true, None)
+    });
+    assert_eq!(n, 1, "FOCEI population gradient");
+    for (i, (g, s)) in grads.borrow().iter().zip(&pop.subjects).enumerate() {
+        let want = subject_packed_gradient(&model, s, &params, &x, etas[i].as_slice());
+        assert_eq!(
+            g.as_ref().expect("served"),
+            &want.expect("served"),
+            "subject {i}"
+        );
+    }
+    let n = count(&|| {
+        population_eta_dx(&model, &pop, &params, &x, &etas, true).expect("served");
+    });
+    assert_eq!(n, 1, "mode responses");
+    let n = count(&|| {
+        crate::estimation::agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            &params,
+            &x,
+            &etas,
+            &[],
+            1,
+            crate::types::HessianAnchor::Exact,
+        )
+        .expect("served");
+    });
+    assert_eq!(n, 1, "AGQ population gradient");
+    let options = crate::types::FitOptions {
+        method: crate::types::EstimationMethod::Laplace,
+        ..Default::default()
+    };
+    let bounds = crate::estimation::parameterization::pack_with_bounds(&params).bounds;
+    let n = count(&|| {
+        let ctx = SubjectScoreContext::new(&model, &params, &x, &options, &bounds, false);
+        for (s, eta) in pop.subjects.iter().zip(&etas) {
+            let (_, route) = ctx
+                .score_routed(s, eta.as_slice(), &[], true)
+                .expect("scored");
+            assert_eq!(route, ScoreRoute::Exact, "subject {}", s.id);
+        }
+    });
+    assert_eq!(n, 1, "AGQ score context");
 }
 
 #[test]

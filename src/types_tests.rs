@@ -1135,6 +1135,10 @@ fn warning_code_tokens_are_stable() {
         // it and the diff stops being reviewable.
         (InitNotRepresentable, "init_not_representable"),
         (UncertaintyDrawsSkipped, "uncertainty_draws_skipped"),
+        (
+            DegenerateClearanceOrVolume,
+            "degenerate_clearance_or_volume",
+        ),
     ];
     // The list is hand-maintained, and had silently fallen four variants behind
     // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
@@ -1184,11 +1188,12 @@ fn warning_code_tokens_are_stable() {
             General => 35,
             InitNotRepresentable => 36,
             UncertaintyDrawsSkipped => 37,
+            DegenerateClearanceOrVolume => 38,
         }
     }
     assert_eq!(
         expected.len(),
-        38,
+        39,
         "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
     );
     for (i, (code, _)) in expected.iter().enumerate() {

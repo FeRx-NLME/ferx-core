@@ -71,19 +71,55 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 /// The scorer at the fit's estimates, with `run_sir`'s scoring options built from
 /// caller defaults, minus the fit's data OFV. Bitwise 0 is the claim.
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
-    let options = fitted_marginal_options(fit, &FitOptions::default());
-    let params = fitted_params_from_result(fit, model).expect("params rebuild");
-    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
-    let got = sir_draw_ofv(model, pop, &params, &etas, &options);
+    let (options, params, etas) = scorer_inputs(model, fit);
+    let got = sir_draw_ofv(model, pop, &params, &params, &etas, &options);
     (got, fit.ofv - fit.ofv_prior)
 }
 
+fn scorer_inputs(
+    model: &CompiledModel,
+    fit: &FitResult,
+) -> (FitOptions, ModelParameters, Vec<DVector<f64>>) {
+    let options = fitted_marginal_options(fit, &FitOptions::default());
+    let params = fitted_params_from_result(fit, model).expect("params rebuild");
+    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    (options, params, etas)
+}
+
+/// The subjects whose η̂ the scorer's warm re-solve moves off the fit's, as
+/// `(index, max |Δη|)`. Empty is the claim: the fit's η̂ is a fixed point (#2279).
+fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(usize, f64)> {
+    let (options, params, etas) = scorer_inputs(model, fit);
+    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &params, &etas, &options);
+    ehs.iter()
+        .zip(&etas)
+        .enumerate()
+        .filter(|(_, (a, b))| {
+            a.iter()
+                .zip(b.iter())
+                .any(|(x, y)| x.to_bits() != y.to_bits())
+        })
+        .map(|(i, (a, b))| (i, (a - b).amax()))
+        .collect()
+}
+
 /// T3. `sir_draw_ofv` at the estimates **is** the fit's objective — bit for bit on
-/// FOCEI, Laplace and a `[mixture]` override fit, to 1e-8 on FOCE — scored through `run_sir`'s option
+/// FOCE, FOCEI, Laplace and a `[mixture]` override fit — scored through `run_sir`'s option
 /// builder with caller defaults (`method = FoceI`). The FOCE / FOCEI arms are the
 /// no-move control; the Laplace arm dies when the builder stops taking the fit's
 /// method (−3.40e-2 on the #1755 probe), the mixture arm when the scorer loses its
 /// mixture branch (+639.6).
+///
+/// #2279: bitwise is a property of the code, not of rounding — the fit's η̂ is a fixed
+/// point of the scorer's warm re-solve ([`sir_draw_ebes`]), asserted directly on every
+/// warfarin arm. Before #2279 it was not, twice over. The re-solve was unseeded, so BFGS
+/// failed its line search at η̂ and the Nelder–Mead fallback moved FOCE subjects 0 and 7 by
+/// 3.9e-14 (macOS arm64): FOCE's 5.7e-13 objective gap on every platform. And the fit's cold
+/// final pass leaves some subjects fallback-certified (gradient norm above `tol`, Newton step
+/// below it), which a re-search stalls on and the fallback nudges: Laplace subject 8 by
+/// 1.7e-14 under Linux x86_64 / glibc 2.28, a 6.8e-13 objective gap that macOS rounded back
+/// to the same bits. The seed reverting reddens the η̂ assertion on macOS; the second half is
+/// pinned platform-independently by `scorer_keeps_a_start_its_certificate_accepts`.
 #[test]
 fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     let prep = crate::api::prepare_run(
@@ -107,6 +143,12 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
         };
         let fit = crate::api::fit(&prep.parsed.model, &prep.population, &init, &opts)
             .expect("warfarin fit must run");
+        let moved = moved_etas(&prep.parsed.model, &prep.population, &fit);
+        assert!(
+            moved.is_empty(),
+            "{method:?}: the scorer's warm re-solve moved the fit's η̂ (subject, max |Δη|): \
+             {moved:?}"
+        );
         let (got, want) = scorer_gap(&prep.parsed.model, &prep.population, &fit);
         gaps.push((format!("{method:?}"), got, want));
     }
@@ -131,25 +173,12 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     }
     for (arm, got, want) in &gaps {
         assert!(got.is_finite() && want.is_finite(), "{arm}: non-finite");
-        if arm == "Foce" {
-            // The one arm that is not bitwise: FOCE's frozen-variance EBEs (#1722),
-            // re-solved warm from the reported η̂, land 4.24e-10 away (Linux aarch64 and
-            // macOS arm64 alike) —
-            // the FOCE scorer is not what this PR changes, and it is the no-move
-            // control. 1e-8 is 24× that and 3.4e6× below the Laplace mutation.
-            assert!(
-                (got - want).abs() <= 1e-8,
-                "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
-                got - want
-            );
-        } else {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
-                got - want
-            );
-        }
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{arm}: SIR scorer {got} vs the fit's objective {want} (gap {:e})",
+            got - want
+        );
     }
 }
 
@@ -280,4 +309,136 @@ fn mixture_override_refusals_carry_their_codes() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// #2279: `keep_certified_start` returns a warm start the inner certificate accepts as it
+/// stands — here the Laplace fit's η̂ moved 1e-6 per coordinate, so its gradient norm is far
+/// above `tol` (BFGS would step) while its Newton step is below it (`certifies_in_place`'s
+/// Newton arm). Both sides of the gate on one start: with the flag the start comes back
+/// bitwise; without it the search moves it. Dies if `sir_draw_ebes` drops the flag (the
+/// second assertion's twin becomes the first), or if `find_ebe_solve` stops honouring it.
+///
+/// And the scorer raises the flag only at the parameters the start was certified at: a
+/// draw one θ step away re-solves the same start and moves it, so a draw is never scored at
+/// a stale η̂ nor pays the certificate's FD Hessian (review of #2279). Dies if
+/// `same_point` always holds (the draw keeps the start) or never does (the estimate moves it).
+#[test]
+fn scorer_keeps_a_start_its_certificate_accepts() {
+    use crate::estimation::inner_optimizer::{find_ebe_cached, InnerSolvePolicy};
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    let model = &prep.parsed.model;
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = unpack_params(&WARF_LAPLACE_PACKED, &prep.init_params);
+    let fit = crate::api::fit(model, &prep.population, &init, &opts).expect("fit must run");
+    let (options, params, etas) = scorer_inputs(model, &fit);
+    let start: Vec<f64> = etas[0].iter().map(|e| e + 1e-6).collect();
+    let solve = |keep: bool| {
+        let policy = InnerSolvePolicy {
+            keep_certified_start: keep,
+            ..InnerSolvePolicy::for_stage(&options, model)
+        };
+        let r = find_ebe_cached(
+            model,
+            &prep.population.subjects[0],
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&start),
+            None,
+            0,
+            None,
+            policy,
+        );
+        assert!(r.converged, "keep = {keep}: not converged");
+        r.eta.as_slice().to_vec()
+    };
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&solve(true)), bits(&start), "kept start moved");
+    let searched = solve(false);
+    assert_ne!(
+        bits(&searched),
+        bits(&start),
+        "fixture premise: a search from this start moves it (gradient norm above tol)"
+    );
+
+    // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
+    let mut shifted = etas.clone();
+    shifted[0] = DVector::from_vec(start.clone());
+    let (ehs, _, _) = sir_draw_ebes(
+        model,
+        &prep.population,
+        &params,
+        &params,
+        &shifted,
+        &options,
+    );
+    assert_eq!(
+        bits(ehs[0].as_slice()),
+        bits(&start),
+        "sir_draw_ebes moved a certified start at the estimates"
+    );
+
+    // A draw away from the estimates does not keep it: the gate is off, the start is searched.
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.0 + 1e-9;
+    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options);
+    assert_ne!(
+        bits(ehs[0].as_slice()),
+        bits(&start),
+        "sir_draw_ebes kept a start at a draw away from the parameters it was certified at"
+    );
+}
+
+/// `same_point` is bitwise in every value the scorer reads: one ULP on any of θ, Ω, Σ, a
+/// `block_sigma` ρ or Ω_IOV breaks it, and a clone keeps it. Each field gets its own case so
+/// dropping one comparison names it.
+#[test]
+fn same_point_sees_every_scored_value() {
+    use crate::types::{OmegaMatrix, ResidualCorrelation};
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    let mut base = prep.init_params.clone();
+    base.residual_correlations = vec![ResidualCorrelation {
+        sigma_i: 0,
+        sigma_j: 0,
+        rho: 0.25,
+    }];
+    base.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04], vec!["K1".into()]));
+    assert!(
+        same_point(&base, &base.clone()),
+        "a clone is the same point"
+    );
+    let up = |x: &mut f64| *x = f64::from_bits(x.to_bits() + 1);
+    let cases: Vec<(&str, Box<dyn Fn(&mut ModelParameters)>)> = vec![
+        ("theta", Box::new(|p| up(&mut p.theta[0]))),
+        ("omega", Box::new(|p| up(&mut p.omega.matrix[(0, 0)]))),
+        ("sigma", Box::new(|p| up(&mut p.sigma.values[0]))),
+        ("rho", Box::new(|p| up(&mut p.residual_correlations[0].rho))),
+        (
+            "omega_iov",
+            Box::new(|p| up(&mut p.omega_iov.as_mut().unwrap().matrix[(0, 0)])),
+        ),
+        ("omega_iov presence", Box::new(|p| p.omega_iov = None)),
+    ];
+    for (what, bump) in cases {
+        let mut moved = base.clone();
+        bump(&mut moved);
+        assert!(
+            !same_point(&base, &moved),
+            "{what}: one ULP still reads as the same point"
+        );
+    }
 }

@@ -513,11 +513,18 @@ const IOV_OCCASIONS: [u32; 6] = [1, 1, 1, 2, 2, 2];
 /// Number of occasions, i.e. the number of `κ` blocks in the stacked vector.
 const K_OCC: usize = 2;
 
+/// `TVCL = 2`, not the non-IOV fixture's 1. `CL` is Gaussian here (`TVCL + η + κ`, prior SD
+/// `√(0.09 + 0.04) = 0.36`), and since #2104 a draw with `CL ≤ 0` is served a concentration
+/// of 0 — the floor of the log transform — where the affine closed form this oracle needs
+/// would keep going. At `TVCL = 1` that tail is 2.8 SD away and ~0.3% of the 64k draws land
+/// in it, which measured a `−2·ELBO` 87 units off the exact marginal. At 2 it is 5.5 SD
+/// away, while `log f(6) = ln 10 − 0.6·CL` stays positive (the quadratic regime, see
+/// [`TIMES`]) out to `CL = 3.84`, 5.1 SD the other side.
 fn linear_gaussian_iov_model() -> CompiledModel {
     crate::parser::model_parser::parse_model_string(
         r"
 [parameters]
-  theta TVCL(1.0, 0.01, 10.0)
+  theta TVCL(2.0, 0.01, 10.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
   sigma ADD_LOG ~ 0.2 (sd)

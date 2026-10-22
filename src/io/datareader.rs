@@ -751,6 +751,7 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
         CsvInput::Path(path),
         None,
         &[],
+        &[],
         None,
         None,
         None,
@@ -838,16 +839,57 @@ pub(crate) fn read_nonmem_csv_routed_from(
     let cols_ref: Option<Vec<&str>> = cols
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
+    let exact = exact_case_extras(
+        // The declared branch ignores the caller's list, so it exempts nothing there.
+        covariate_columns.filter(|_| decls.is_none()),
+        extra_columns,
+        filter,
+    );
     read_nonmem_csv_impl(
         input,
         cols_ref.as_deref(),
         extra_columns,
+        &exact,
         iov_column,
         decls,
         filter,
         routing,
         column_map,
     )
+}
+
+/// The model extras that must bind a header by exact case (#1946): every
+/// `extra_columns` entry the caller did not name in its explicit list (exact
+/// spelling) and no `[data_selection]` filter references (case-insensitively; a
+/// filter lowercases its column names). On the `[covariates]` path the extras are
+/// the referenced-but-*undeclared* columns, so no declared name is ever among
+/// them and a declaration needs no exemption here; the caller passes `None` for
+/// `covariate_columns` on that path, since declarations take precedence over a
+/// fallback list and that list is never read there.
+///
+/// The one rule across all three read paths: a column the *model* references
+/// binds only the header it spells exactly, so a case-differing reference stays
+/// unread (and `check_covariates` reports it) instead of binding a header the
+/// caller left out. The case-insensitive fallback in `cov_indices` is kept for the
+/// names a caller or filter supplied. On the auto-detect path the extras are
+/// already matched against headers exactly, so the list is inert there.
+fn exact_case_extras(
+    covariate_columns: Option<&[&str]>,
+    extra_columns: &[String],
+    filter: Option<&SelectionFilter>,
+) -> Vec<String> {
+    let filter_cols = filter
+        .map(|f| f.referenced_covariate_columns())
+        .unwrap_or_default();
+    extra_columns
+        .iter()
+        .filter(|e| {
+            let listed = covariate_columns.is_some_and(|l| l.iter().any(|c| c == *e));
+            let filtered = filter_cols.iter().any(|c| c.eq_ignore_ascii_case(e));
+            !listed && !filtered
+        })
+        .cloned()
+        .collect()
 }
 
 /// Shared CSV reader. `table_decls`, when `Some`, requests building a
@@ -862,6 +904,11 @@ pub(crate) fn read_nonmem_csv_routed_from(
 /// the `iov_column` (#1936). Matched to headers exactly (case-sensitive), so a
 /// case-differing spelling stays unread rather than silently binding.
 ///
+/// `exact_extras`: on an explicit-list or declared read, the listed names that
+/// must resolve to a header by exact case — the model extras the caller did not
+/// name (see [`exact_case_extras`]). Every other listed name keeps the
+/// case-insensitive fallback, so the auto-detect rule above holds on every path.
+///
 /// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
 /// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
 /// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
@@ -869,6 +916,7 @@ fn read_nonmem_csv_impl(
     input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
     auto_extras: &[String],
+    exact_extras: &[String],
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
@@ -1016,9 +1064,11 @@ fn read_nonmem_csv_impl(
             // Prefer an exact header match; fall back to case-insensitive so a
             // filter-injected lowercase name (e.g. "study" from
             // `referenced_covariate_columns`) still resolves to a "STUDY" header.
+            // A model extra the caller did not name gets no fallback (#1946).
             // Store the actual header name so covariate keys match the dataset.
+            let exact_only = exact_extras.iter().any(|e| e == name);
             col_idx_cs(name)
-                .or_else(|| col_idx_ci(name))
+                .or_else(|| (!exact_only).then(|| col_idx_ci(name)).flatten())
                 .map(|idx| (headers[idx].clone(), idx))
         })
         .collect();
@@ -3054,7 +3104,10 @@ fn parse_subject(
                 raw_time,
             )?;
 
-            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
+            let mut dose = dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode);
+            // The reset half of an `EVID=4` row was pushed to `reset_times` above.
+            dose.evid4 = evid == 4;
+            doses.push(dose);
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }

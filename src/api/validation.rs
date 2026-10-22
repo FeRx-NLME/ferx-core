@@ -2228,6 +2228,79 @@ pub(crate) fn check_simulation_iov_occasions(
     Some(Diagnostic::error("E_IOV_MISSING_OCC", message).with_block("fit_options"))
 }
 
+/// The most distinct occasion labels any one subject carries over its observations and
+/// doses: the count `fit()`'s single-occasion refusal reads after a derived
+/// `iov_occasion` rule has labelled the population, and the `--simulate` pre-check
+/// ([`check_simulation_iov_single_occasion`]) reads on the template (#2052).
+///
+/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
+/// (#1876): a derived rule is monotone in time, so on a subject whose observations
+/// and doses share one occasion such a row lies before or after all of them. Its κ is
+/// then at most weakly informed: only when a second such row lies between it and the
+/// first dose or observation, and the model has an `init(...)` baseline, does it
+/// govern a non-empty interval on nonzero state. Counting it would let the
+/// unidentifiable case through, so the count errs on the conservative side.
+pub(crate) fn max_obs_dose_occasions(population: &Population) -> usize {
+    let distinct_occ = |s: &Subject| -> usize {
+        let mut occs: Vec<u32> = s.occasions.clone();
+        occs.extend_from_slice(&s.dose_occasions);
+        occs.sort_unstable();
+        occs.dedup();
+        occs.len()
+    };
+    population
+        .subjects
+        .iter()
+        .map(distinct_occ)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `fit()`'s single-occasion refusal, checked on the template population
+/// `run_model_simulate` builds from the `[simulation]` block before anything is
+/// simulated (#2052). `fit()` refuses a derived `iov_occasion` rule that leaves every
+/// subject with at most one occasion, but only after the simulation, and with advice
+/// written for a dataset: an `iov_column` (no dataset column exists here) or
+/// `iov_occasion = dose` on a multiple-dose design (every template subject gets the
+/// block's one dose). The template carries the `times` grid and that dose, so the
+/// occasions derived on it are the ones `fit()` would count; the message names only
+/// `iov_occasion = time(...)` with a breakpoint inside `times`.
+///
+/// The gate is `fit()`'s: kappa declared and a derived rule active. A model with
+/// nested levels is left to `fit()`, which labels its records from the level columns
+/// rather than from the rule.
+pub(crate) fn check_simulation_iov_single_occasion(
+    model: &CompiledModel,
+    template: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Option<String> {
+    if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
+        return None;
+    }
+    let mut derived = template.clone();
+    apply_iov_occasion_rule(&mut derived, iov_rule, false, &mut Vec::new());
+    if max_obs_dose_occasions(&derived) > 1 {
+        return None;
+    }
+    let why = match iov_rule {
+        IovOccasionRule::PerDose => {
+            "`iov_occasion = dose` derives one occasion here: each simulated subject receives \
+             the [simulation] block's single dose."
+        }
+        _ => {
+            "No `time(...)` breakpoint lies after the simulated dose at time 0 and at or \
+             before the last of the [simulation] `times`, so every record falls in one window."
+        }
+    };
+    Some(format!(
+        "The `iov_occasion` rule derives only a single occasion for every subject simulated \
+         from the [simulation] block, so the per-occasion kappa (IOV) cannot be separated \
+         from between-subject variability (it is unidentifiable). {why} Set \
+         `iov_occasion = time(...)` in [fit_options], with a breakpoint between the first \
+         and last of the [simulation] `times`, to derive more than one occasion."
+    ))
+}
+
 /// Derive each subject's IOV occasion labels from a model-side rule
 /// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
 /// `Subject::occasions` (parallel to `obs_times`), `Subject::dose_occasions`
@@ -3290,26 +3363,18 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt model has
 /// nothing to do with absorption.
 ///
-/// **Two failure modes, not one, and the second is worse.** A non-finite lag or `F`
-/// makes the timeline unorderable and every prediction `NaN` — loud. A non-finite
-/// modeled `D{n}`/`R{n}` never becomes a `NaN` at all:
-/// [`DoseEvent::resolve_rate`](crate::types::DoseEvent) derives the missing half of the
-/// pair by division, and clamps to `DURATION_FLOOR` / `RATE_FLOOR` (`x > floor` is false
-/// for `NaN`), so the fit returns finite, silently wrong numbers. Measured on a 1-cpt
-/// ODE, `CL/V = 0.1`, `V = 10`, one 100-unit coded-`RATE` dose, observations at
-/// `t = 1, 4, 8`:
-///
-/// | | served | vs the correct infusion |
-/// |---|---|---|
-/// | `D1 = +inf` | `rate = amt/inf = 0` ⇒ not an infusion ⇒ instantaneous bolus | **1.90× high** at `t = 1` |
-/// | `R1 = +inf` | `duration = amt/inf = 0` ⇒ the same bolus | the same |
-/// | `D1 = NaN` | clamped to `DURATION_FLOOR = 1e-8` ⇒ a bolus again | the same |
-/// | `R1 = NaN` | clamped to `RATE_FLOOR = 1e-8` ⇒ `duration = amt/1e-8` | essentially nothing delivered |
-///
-/// The three bolus rows land within **8.2e-7** (1.8e-7 relative — the ODE tolerance) of
-/// the exact bolus solution `10·e^(−0.1t)`. That is why the value check for
-/// `D{n}`/`R{n}` lives here and not only in [`check_modeled_dose_rates`], which
-/// validates that the *slot exists* and never what it holds.
+/// **One consequence for all four attributes.** A non-finite lag or `F` makes
+/// `dose.time + lag`, and every break derived from it, non-finite, so the subject's
+/// timeline cannot be ordered and every prediction is `NaN`. A non-finite modeled
+/// `D{n}`/`R{n}` used to be the quiet exception — `resolve_rate` derived the missing half
+/// of the pair by division and clamped to a floor, serving the dose as an instantaneous
+/// bolus and returning finite, silently wrong numbers. Since #1284
+/// [`DoseEvent::resolve_rate`](crate::types::DoseEvent) maps it to a non-finite dose
+/// instead, whose `NaN` time reaches the same timeline guard, so the subject is repelled
+/// like a lag or `F` (#2151). The value check for `D{n}`/`R{n}` still lives here and not
+/// only in [`check_modeled_dose_rates`], which validates that the *slot exists* and never
+/// what it holds: this is the fit-init front door that names the subject, where the
+/// engine guard alone would only produce an all-`NaN` subject.
 ///
 /// Only compartments the data actually doses into are examined; a model with neither `F`
 /// nor a lag reads the `PkParams` defaults (1.0 / 0.0), finite by construction, so this
@@ -3328,13 +3393,14 @@ pub(crate) fn typical_dose_snapshots<'a>(
 ///
 /// **What can actually make one non-finite, measured.** The DSL's arithmetic is
 /// domain-guarded where you would expect: `/` returns `0.0` when the denominator is below
-/// `1e-30`, and `ln`/`sqrt` floor their argument. `exp` and `^` are not guarded, so the
-/// reachable routes at typical values are an exponential covariate model on an unscaled
-/// covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the hundreds), which overflows to
-/// `+inf`, and a power of a covariate that is negative for some subject
-/// (`ALAG1 = TVLAG*(WT/70)^0.75` with `WT < 0`), which is `NaN` (#2040). The regression
-/// tests use one of each. Mid-fit, any θ/η excursion into the same overflow does it,
-/// which is what the engine-side guard covers.
+/// `1e-30`, and `ln`/`sqrt` floor their argument. `exp` is not clamped, so an exponential
+/// covariate model on an unscaled covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the
+/// hundreds) overflows to `+inf` — that is the reachable route at typical values, and it
+/// is what the regression test uses. Mid-fit, any θ/η excursion into the same overflow
+/// does it, which is what the engine-side guard covers. Two more routes need no overflow
+/// at all: a covariate missing at the record is `NaN`, which passes through arithmetic,
+/// `^` and `exp` unchanged, and `^` is a bare `powf`, so a fractional power of a negative
+/// value (`(WT/70)^0.75` with `WT < 0`) is `NaN` too. The message names all three.
 pub(crate) fn check_dose_attr_finiteness(
     model: &CompiledModel,
     population: &Population,
@@ -3346,26 +3412,12 @@ pub(crate) fn check_dose_attr_finiteness(
     // `PK_IDX_F` with an empty indexed map. Gating there would skip exactly the
     // everyday case this exists for.
     let map = model.active_dose_attr_map();
-    // What a non-finite value *does*, per attribute. The two differ and the difference is
-    // the point: lag / `F` make the timeline unorderable (loud), while a modeled
-    // duration / rate is clamped to a floor and returns a silently wrong number.
+    // What a non-finite value *does* — the same for every attribute. A lag / `F` puts it
+    // in `dose.time + lag` directly; a modeled duration / rate reaches the same place
+    // through `DoseEvent::resolve_rate`, which returns a dose with a `NaN` time (#1284).
     const TIMELINE: &str = "The engine applies this at the dose event, so a non-finite \
          value makes the subject's whole integration timeline non-finite and every \
-         prediction NaN.";
-    const CLAMPED_DURATION: &str = "This never reaches you as a NaN: \
-         `DoseEvent::resolve_rate` derives `rate = amt / duration`, so an infinite \
-         duration gives rate 0 — not an infusion at all — and a NaN is pulled to \
-         DURATION_FLOOR = 1e-8 (`x > floor` is false for NaN). Either way the engine \
-         serves this dose as an instantaneous bolus instead of the infusion the data \
-         asks for, and returns finite, silently wrong numbers (measured 1.90x high at \
-         one elimination half-time on a 1-cpt model).";
-    const CLAMPED_RATE: &str = "This never reaches you as a NaN: \
-         `DoseEvent::resolve_rate` derives `duration = amt / rate`, so an infinite rate \
-         gives duration 0 — an instantaneous bolus — and a NaN is pulled to \
-         RATE_FLOOR = 1e-8 (`x > floor` is false for NaN), spreading the dose over \
-         `amt / 1e-8` time units so that essentially nothing is delivered. Either way \
-         the engine returns finite, silently wrong numbers instead of the infusion the \
-         data asks for.";
+         prediction NaN: the subject is repelled as a diverged solve.";
     // One scratch for the population: `typical_dose_snapshots` resizes and refills it per
     // subject, reusing the allocation.
     let mut scratch = TypicalSnapshotScratch::default();
@@ -3394,34 +3446,21 @@ pub(crate) fn check_dose_attr_finiteness(
             // here rather than reported twice.
             let modeled = match dose.rate_mode {
                 RateMode::Fixed => None,
-                RateMode::ModeledDuration => Some((
-                    DoseAttr::Duration,
-                    "modeled infusion duration (`D`)",
-                    CLAMPED_DURATION,
-                )),
-                RateMode::ModeledRate => {
-                    Some((DoseAttr::Rate, "modeled infusion rate (`R`)", CLAMPED_RATE))
+                RateMode::ModeledDuration => {
+                    Some((DoseAttr::Duration, "modeled infusion duration (`D`)"))
                 }
+                RateMode::ModeledRate => Some((DoseAttr::Rate, "modeled infusion rate (`R`)")),
             }
-            .and_then(|(attr, what, consequence)| {
+            .and_then(|(attr, what)| {
                 let slot = map.indexed_slot(attr, dose.cmt_raw())?;
-                Some((
-                    what,
-                    snap.values.get(slot).copied().unwrap_or(0.0),
-                    consequence,
-                ))
+                Some((what, snap.values.get(slot).copied().unwrap_or(0.0)))
             });
-            for (what, value, consequence) in [
+            for (what, value) in [
                 Some((
                     "lag time (`lagtime` / `ALAG`)",
                     map.lagtime(cmt, snap.values),
-                    TIMELINE,
                 )),
-                Some((
-                    "bioavailability (`F`)",
-                    map.f_bio(cmt, snap.values),
-                    TIMELINE,
-                )),
+                Some(("bioavailability (`F`)", map.f_bio(cmt, snap.values))),
                 modeled,
             ]
             .into_iter()
@@ -3432,15 +3471,16 @@ pub(crate) fn check_dose_attr_finiteness(
                         "E_DOSE_ATTR_NONFINITE",
                         format!(
                             "Dose {what} for compartment {cmt} is {value} at typical values \
-                             (subject {}, {}). {consequence} The usual cause is a covariate \
-                             relation that is undefined at this record. `exp` and `^` are the \
-                             two operations here with no domain guard (`/` by ~0 returns 0, and \
-                             `ln`/`sqrt` floor their argument), so look for an overflowing \
-                             `exp(...)`, such as an exponential covariate model on an unscaled \
-                             covariate, or a power of a negative value, such as \
-                             `(WT / 70)^0.75` with a negative `WT`. Check this subject's \
-                             covariate values at that record, and any `TIME` the expression \
-                             reads.",
+                             (subject {}, {}). {TIMELINE} The usual cause is a covariate \
+                             relationship that is undefined for this subject: a covariate \
+                             missing at that record (a missing value is NaN, and NaN passes \
+                             through arithmetic, `^` and `exp`), a fractional power of a \
+                             negative value (`(WT/70)^0.75` with a negative `WT`), or an \
+                             overflowing `exp(...)` — an exponential covariate model on an \
+                             unscaled covariate, since `exp` has no domain guard (`/` by ~0 \
+                             returns 0, and `ln`/`sqrt` floor their argument). Check this \
+                             subject's covariate values at that record, and any `TIME` the \
+                             expression reads.",
                             subject.id,
                             snap.record_label(),
                         ),
@@ -4984,24 +5024,54 @@ impl SimulatedFlipFlopTally {
         }
     }
 
+    /// Fold another tally into this one — the per-subject tallies of a parallel walk
+    /// (the NPDE reference, #1928), which cannot share one `&mut` accumulator.
+    pub(crate) fn absorb(&mut self, other: SimulatedFlipFlopTally) {
+        self.crossed += other.crossed;
+        self.total += other.total;
+    }
+
     /// The one `W_SIMULATED_FLIP_FLOP` warning this run owes its caller, or `None` when no
     /// simulated individual crossed (the common case, and every non-absorption model).
     pub(crate) fn warning(&self, model: &CompiledModel) -> Option<String> {
+        self.message(
+            model,
+            "simulated individuals",
+            "Those rows are still returned and still summarised, so every VPC band, \
+             prediction interval or mean computed over them describes an undosed subject.",
+        )
+    }
+
+    /// The `W_SIMULATED_FLIP_FLOP` warning for the NPDE / NPD reference distribution
+    /// (#1928), or `None` when no reference replicate crossed. Same finding and code as
+    /// [`warning`](Self::warning) — the replicates are simulated individuals drawn from
+    /// N(0, Ω) — but what the clamped rows corrupt is the empirical CDF every observation
+    /// is scored against, not a returned row set, so the consequence sentence says that.
+    pub(crate) fn npde_reference_warning(&self, model: &CompiledModel) -> Option<String> {
+        self.message(
+            model,
+            "NPDE/NPD reference replicates",
+            "Those replicates are still part of the reference distribution every observation \
+             is scored against, so the NPDE and NPD of every subject they belong to are \
+             computed against a reference mixed with undosed profiles.",
+        )
+    }
+
+    fn message(&self, model: &CompiledModel, who: &str, consequence: &str) -> Option<String> {
         if self.crossed == 0 {
             return None;
         }
         let (domain, ode_fn) = absorption_flip_flop_wording(model);
         let confluent = absorption_confluent_clause(model);
         Some(format!(
-            "W_SIMULATED_FLIP_FLOP: {k} of {n} simulated individuals dosed before one of \
+            "W_SIMULATED_FLIP_FLOP: {k} of {n} {who} dosed before one of \
              their observations were evaluated at an η inside the flip-flop regime \
              (disposition rate ≥ {domain}){confluent}, where the twin-less {model_name} \
              closed form has no solution and clamps its dose-driven concentration to zero. \
              None of their rows carries any contribution from the doses the subject was \
              given — by that clamp, or, for an individual whose absorption never reaches an \
              observation (a `lagtime` past it, or `f = 0`), because the dose never arrived. \
-             Those rows are still returned and still summarised, so every VPC band, \
-             prediction interval or mean computed over them describes an undosed subject. \
+             {consequence} \
              Whether they read as a literal `ipred = 0` depends on what this model layers \
              on the closed form's output afterwards, so searching the output for a zero row \
              will not reliably find them. \

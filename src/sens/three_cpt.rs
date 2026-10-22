@@ -177,7 +177,15 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
         ..
     } = *d;
 
-    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 {
         return T::from_f64(0.0);
     }
 
@@ -239,7 +247,15 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -337,13 +353,15 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
         ..
     } = *d;
 
-    if t.val() < 0.0
-        || v1.val() <= 0.0
-        || v2.val() <= 0.0
-        || v3.val() <= 0.0
-        || cl.val() <= 0.0
-        || ka.val() <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
 
@@ -418,13 +436,15 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
         ..
     } = *d;
 
-    if t.val() < 0.0
-        || v1.val() <= 0.0
-        || v2.val() <= 0.0
-        || v3.val() <= 0.0
-        || cl.val() <= 0.0
-        || ii <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
 
@@ -497,14 +517,15 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0
-        || v1.val() <= 0.0
-        || v2.val() <= 0.0
-        || v3.val() <= 0.0
-        || cl.val() <= 0.0
-        || ka.val() <= 0.0
-        || ii <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 || ka.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
 
@@ -594,13 +615,15 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0
-        || v1.val() <= 0.0
-        || v2.val() <= 0.0
-        || v3.val() <= 0.0
-        || cl.val() <= 0.0
-        || ii <= 0.0
-    {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
+    // numerical guards (which would otherwise read a `NaN` disposition as 0).
+    if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
+        return c;
+    }
+    if v2.val() <= 0.0 || v3.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -708,6 +731,15 @@ pub(crate) fn three_cpt_conc_d<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
+    // The shared #2104 rule decides an arrived dose before `F` scales it, as
+    // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
+    // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
+    // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
+    if t.val() >= 0.0 {
+        if let Some(c) = crate::sens::propagate::dose_override_g(d.cl, d.v1) {
+            return c;
+        }
+    }
     // `F` rule mirrors production `route_f_scale` (#327): oral-depot bolus bakes
     // `F` in; IV bolus and every infusion are linear in dose → post-multiply.
     let oral_bolus = oral && !dose.is_infusion();

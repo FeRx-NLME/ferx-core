@@ -742,7 +742,17 @@ status (`OmegaRowsInput::from_result` does this for a `FitResult`), then calls
 `format_omega_rows_from`. With `OmegaRowsOptions::default()` the rows are the
 console's: a fixed ETA reads `[FIX]` with `SE = ---`, and a covariance step that
 failed or fell back to SIR prints no `CV%` or `SD` on any row. Block-Ω
-correlations are not part of the rows.
+correlations are not part of the rows; a wrapper reads them from
+`ferx_core::io::output::offdiag_corrs` (#2231), the walk the console's
+`--- Correlations ---` block and `format_summary()` use. Given the matrix, its
+optional parameter-correlation matrix (`omega_param_corr`) and the names, it
+returns one `OffDiagCorr` per reported pair, in row-major lower-triangle order:
+every `(i, j)`, `j < i`, with `|cov| > 1e-15`, its names, covariance and
+correlation. `corr_source` says whether the correlation is the
+parameter-correlation entry (`ParamCorr`) or `cov / (√var_i · √var_j)`
+(`Fallback`, 0 when a variance is not positive), so the wrapper can label it.
+The same call over `omega_iov` and `omega_iov_param_corr` gives a
+`block_kappa`'s pairs.
 
 Three options add what a wrapper's print may want. They are off by default, so
 the CLI and `format_summary()` never print them:

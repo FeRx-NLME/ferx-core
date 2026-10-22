@@ -5,7 +5,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::covariance::{
     assemble_score_cross_product, build_non_pd_fallback_proposal, combine_covariance,
     cov_progress_eta, cov_progress_should_print, cov_progress_step, extract_eigenvalues,
-    format_non_pd_warning, invert_psd_with_floor, packed_param_label, select_fd_step,
+    format_non_pd_warning, invert_psd_with_floor, packed_param_label, select_fd_step, CoordUnits,
     FALLBACK_PROPOSAL_MAX_COND,
 };
 use crate::estimation::parameterization::{compute_bounds, pack_params};
@@ -318,7 +318,7 @@ fn test_combine_covariance_collapses_when_s_equals_r() {
         CovarianceMethod::CrossProduct,
         CovarianceMethod::Sandwich,
     ] {
-        let cov = combine_covariance(m, r_inv.clone(), &r)
+        let cov = combine_covariance(m, r_inv.clone(), &r, &[CoordUnits::Dimensionless; 2])
             .unwrap_or_else(|| panic!("{m:?} should produce a covariance"));
         assert_mat_close(&cov, &r_inv, 1e-9, &format!("{m:?} with S=R"));
     }
@@ -331,8 +331,13 @@ fn test_combine_covariance_sandwich_matches_explicit_product() {
     let r = l.transpose() * &l;
     let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
     let s = DMatrix::from_row_slice(2, 2, &[3.0, 0.4, 0.4, 2.0]);
-    let sandwich =
-        combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s).expect("sandwich");
+    let sandwich = combine_covariance(
+        CovarianceMethod::Sandwich,
+        r_inv.clone(),
+        &s,
+        &[CoordUnits::Dimensionless; 2],
+    )
+    .expect("sandwich");
     let expected = &r_inv * &s * &r_inv;
     assert_mat_close(&sandwich, &expected, 1e-12, "sandwich = R⁻¹SR⁻¹");
     // Sandwich must stay symmetric (S and R⁻¹ are symmetric).
@@ -355,11 +360,23 @@ fn test_combine_covariance_singular_s() {
     let g = DVector::from_column_slice(&[1.0, 2.0]);
     let s_rank1 = &g * g.transpose(); // rank-1, singular 2×2
     assert!(
-        combine_covariance(CovarianceMethod::CrossProduct, r_inv.clone(), &s_rank1).is_none(),
+        combine_covariance(
+            CovarianceMethod::CrossProduct,
+            r_inv.clone(),
+            &s_rank1,
+            &[CoordUnits::Dimensionless; 2]
+        )
+        .is_none(),
         "S⁻¹ must report singular S"
     );
     assert!(
-        combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1).is_some(),
+        combine_covariance(
+            CovarianceMethod::Sandwich,
+            r_inv,
+            &s_rank1,
+            &[CoordUnits::Dimensionless; 2]
+        )
+        .is_some(),
         "sandwich must tolerate rank-deficient S"
     );
 }
@@ -9158,6 +9175,363 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
     }
 }
 
+// ── #2217: the pre-flight hands an IOV subject's whole mode (η̂, κ̂) ──────
+
+/// A model file and its data, loaded as `fit` would, cut to the first `n_subj` subjects.
+fn load_iov_fixture(
+    src: &str,
+    data: &str,
+    n_subj: usize,
+) -> (CompiledModel, Population, FitOptions) {
+    let parsed = crate::parser::model_parser::parse_full_model(src).expect("model parses");
+    let (mut pop, _) = crate::api::read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data,
+        None,
+        parsed.fit_options.iov_column.as_deref(),
+        None,
+        &parsed.column_map,
+    )
+    .expect("data loads");
+    pop.subjects.truncate(n_subj);
+    // `fit`'s preparation of a nested-level or serially-correlated population (each a
+    // no-op otherwise); `optimize_population` is called below it.
+    crate::stats::nested_levels::assign_level_cells(&parsed.model, &mut pop);
+    crate::stats::residual_error::assign_residual_groups(&parsed.model, &mut pop);
+    let opts = FitOptions {
+        optimizer: Optimizer::Bfgs,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..parsed.fit_options
+    };
+    (parsed.model, pop, opts)
+}
+
+/// `warfarin_iov` (one-level `iov_column`), plus a copy of its first subject with no
+/// occasion labels, which an IOV model solves for η alone.
+fn warfarin_iov_fixture() -> (CompiledModel, Population, FitOptions) {
+    let (model, mut pop, opts) = load_iov_fixture(
+        include_str!("../../examples/warfarin_iov.ferx"),
+        "data/warfarin_iov.csv",
+        2,
+    );
+    let mut no_occ = pop.subjects[0].clone();
+    no_occ.id = "NO_OCC".into();
+    no_occ.occasions.clear();
+    no_occ.dose_occasions.clear();
+    no_occ.reset_occasions.clear();
+    no_occ.pk_only_occasions.clear();
+    pop.subjects.push(no_occ);
+    (model, pop, opts)
+}
+
+/// `nested_levels_3` (exact3): study → arm nested below the subject.
+fn nested_levels_fixture() -> (CompiledModel, Population, FitOptions) {
+    load_iov_fixture(
+        include_str!("../../nonmem_anchor/nested_levels_3.ferx"),
+        "nonmem_anchor/nested_levels_3.csv",
+        3,
+    )
+}
+
+/// `warfarin_iov` with a residual `correlation ar1(RHO) by OCC` line: kappa and a serial
+/// residual correlation on one model. Its optimizer leg takes 8 s for one subject in a
+/// debug build, so its test drives the first evaluation directly ([`FirstEval::Direct`]).
+fn kappa_correlation_fixture() -> (CompiledModel, Population, FitOptions) {
+    let src = include_str!("../../examples/warfarin_iov.ferx");
+    let (sigma, error) = (
+        "  sigma PROP_ERR ~ 0.2 (sd)\n",
+        "  DV ~ proportional(PROP_ERR)\n",
+    );
+    for anchor in [sigma, error] {
+        assert_eq!(src.matches(anchor).count(), 1, "anchor {anchor:?} moved");
+    }
+    let src = src
+        .replacen(sigma, &format!("{sigma}  theta RHO(0.3, -0.99, 0.99)\n"), 1)
+        .replacen(error, &format!("{error}  correlation ar1(RHO) by OCC\n"), 1);
+    let (model, pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 3);
+    assert!(
+        model.residual_serial.is_some(),
+        "fixture: the correlation line must reach the model"
+    );
+    // ...and the data: with every `obs_rgroup` 0 the correlation is inert and this is
+    // plain `warfarin_iov` again (measured: 11 rows in group 1, 11 in group 2).
+    for s in &pop.subjects {
+        let groups: std::collections::BTreeSet<u32> =
+            s.obs_rgroup.iter().copied().filter(|&g| g > 0).collect();
+        assert!(
+            groups.len() >= 2,
+            "fixture: subject {} has residual groups {:?}; the correlation is inert",
+            s.id,
+            s.obs_rgroup
+        );
+    }
+    (model, pop, opts)
+}
+
+/// `f` on a private one-thread rayon pool. Both sides of every #2217 bit-identity twin run
+/// through here, so neither shares the global pool with concurrently running tests (the
+/// in-process IOV nondeterminism of #1197 needs such a co-runner).
+fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap()
+        .install(f)
+}
+
+/// The pre-flight's cold solve, repeated outside it at the same packed, clamped start.
+struct PreflightStart {
+    params: ModelParameters,
+    mu_k: Vec<f64>,
+    /// Each subject's `η̂`.
+    ehs: Vec<DVector<f64>>,
+    /// Each subject's per-cell `κ̂` (empty for a subject with no κ).
+    kappas: Vec<Vec<DVector<f64>>>,
+}
+
+fn preflight_start_modes(
+    model: &CompiledModel,
+    pop: &Population,
+    opts: &FitOptions,
+) -> PreflightStart {
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(&model.default_params);
+    clamp_to_bounds(&mut x, &bounds);
+    let params = unpack_params(&x, &model.default_params);
+    let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+    let cold = vec![DVector::zeros(model.n_eta); pop.subjects.len()];
+    let (ehs, _, _, kappas) = on_one_thread(|| {
+        run_inner_loop_warm_seeded(
+            model,
+            pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            Some(&cold),
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            InnerHessianSeed::for_options(opts),
+            opts,
+        )
+    });
+    PreflightStart {
+        params,
+        mu_k,
+        ehs,
+        kappas,
+    }
+}
+
+/// How [`assert_first_eval_starts_at_preflight_mode`] reaches the first evaluation.
+enum FirstEval {
+    /// `optimize_population` end to end: the pre-flight, the hand-over, the optimizer.
+    ThroughOptimizer,
+    /// The pre-flight, then the first evaluation's own call with its EBEs certified — for
+    /// a fixture whose objective is too slow in debug for a whole optimizer leg.
+    Direct,
+}
+
+/// #2217: the first outer evaluation's start for every IOV subject is the pre-flight's
+/// (η̂, κ̂), bit for bit. Before the fix the κ block was 0.
+fn assert_first_eval_starts_at_preflight_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    first_eval: FirstEval,
+) {
+    use crate::estimation::inner_optimizer::CERTIFIED_IOV_STARTS;
+    let PreflightStart {
+        params,
+        mu_k,
+        ehs,
+        kappas,
+    } = preflight_start_modes(&model, &pop, &opts);
+    // The fixture must make a dropped κ̂ visible: κ = 0 has to differ from the mode.
+    assert!(
+        kappas.iter().flatten().flatten().any(|&v| v != 0.0),
+        "{label}: fixture: every κ̂ is 0, so a dropped κ block cannot show"
+    );
+    let starts = on_one_thread(|| {
+        CERTIFIED_IOV_STARTS.with(|s| s.borrow_mut().clear());
+        match first_eval {
+            FirstEval::ThroughOptimizer => {
+                let fit = optimize_population(&model, &pop, &model.default_params, &opts);
+                assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
+            }
+            FirstEval::Direct => {
+                let declines = OuterFdDeclineLog::new(pop.subjects.len());
+                let etas = freeze_flat_thetas(
+                    &model,
+                    &pop,
+                    &model.default_params,
+                    &opts,
+                    &declines,
+                    false,
+                )
+                .etas
+                .unwrap_or_else(|| panic!("{label}: every subject converged"));
+                let nll = run_inner_loop_and_nll_prepared(
+                    &model,
+                    &pop,
+                    &params,
+                    &opts,
+                    Some(&etas),
+                    Some(&mu_k),
+                    None,
+                    None,
+                    true,
+                    None,
+                )
+                .4;
+                assert!(nll.is_finite(), "{label}: NLL {nll}");
+            }
+        }
+        CERTIFIED_IOV_STARTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    });
+    let mut n_iov = 0;
+    for (i, subject) in pop.subjects.iter().enumerate() {
+        let mine: Vec<_> = starts.iter().filter(|s| s.0 == subject.id).collect();
+        if kappas[i].is_empty() {
+            assert!(mine.is_empty(), "{label}: subject {} has no κ", subject.id);
+            continue;
+        }
+        n_iov += 1;
+        assert_eq!(
+            mine.len(),
+            1,
+            "{label}: subject {}: expected one certified start (the first evaluation's)",
+            subject.id
+        );
+        let (_, psi, mu, cells) = mine[0];
+        let want_psi: Vec<u64> = ehs[i]
+            .iter()
+            .zip(mu)
+            .map(|(e, m)| (e + m).to_bits())
+            .collect();
+        let got_psi: Vec<u64> = psi.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            got_psi, want_psi,
+            "{label}: subject {}: η block of the first evaluation's start {psi:?} is not the \
+             pre-flight's η̂ {:?} + μ {mu:?}",
+            subject.id, ehs[i]
+        );
+        let want: Vec<Vec<u64>> = kappas[i]
+            .iter()
+            .map(|c| c.iter().map(|v| v.to_bits()).collect())
+            .collect();
+        let got: Vec<Vec<u64>> = cells
+            .iter()
+            .map(|c| c.iter().map(|v| v.to_bits()).collect())
+            .collect();
+        assert_eq!(
+            got, want,
+            "{label}: subject {}: κ block of the first evaluation's start {cells:?} is not the \
+             pre-flight's κ̂ {:?}",
+            subject.id, kappas[i]
+        );
+    }
+    assert!(n_iov > 0, "{label}: fixture has no IOV subject");
+}
+
+#[test]
+fn first_eval_starts_at_preflight_iov_mode_one_level() {
+    assert_first_eval_starts_at_preflight_mode(
+        "warfarin_iov",
+        warfarin_iov_fixture(),
+        FirstEval::ThroughOptimizer,
+    );
+}
+
+#[test]
+fn first_eval_starts_at_preflight_iov_mode_nested_levels() {
+    assert_first_eval_starts_at_preflight_mode(
+        "nested_levels_3",
+        nested_levels_fixture(),
+        FirstEval::ThroughOptimizer,
+    );
+}
+
+#[test]
+fn first_eval_starts_at_preflight_iov_mode_kappa_correlation() {
+    assert_first_eval_starts_at_preflight_mode(
+        "warfarin_iov ar1",
+        kappa_correlation_fixture(),
+        FirstEval::Direct,
+    );
+}
+
+/// #2217, both sides of the "subject has κ cells" gate in one test: an IOV subject's
+/// pre-flight entry is `η̂` then every cell's `κ̂`; a subject with no κ — the no-occasion
+/// subject of an IOV model, and every subject of a model with no kappa — is its `η̂`
+/// alone, bit for bit as before.
+#[test]
+fn preflight_etas_stack_kappa_only_for_subjects_with_kappa_cells() {
+    let preflight = |model: &CompiledModel, pop: &Population, opts: &FitOptions| {
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        on_one_thread(|| {
+            freeze_flat_thetas(model, pop, &model.default_params, opts, &declines, false).etas
+        })
+    };
+    let bits = |v: &DVector<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // The expected side re-runs the pre-flight's solve with a copy of its inner policy, so
+    // a legitimate change to that policy also reddens this test.
+    const POLICY_NOTE: &str = "(or the pre-flight's inner policy no longer matches \
+                               `preflight_start_modes`)";
+
+    let (model, pop, opts) = warfarin_iov_fixture();
+    let PreflightStart { ehs, kappas, .. } = preflight_start_modes(&model, &pop, &opts);
+    let got = preflight(&model, &pop, &opts).expect("warfarin_iov: every subject converged");
+    let (mut with_kappa, mut without) = (0, 0);
+    for (i, s) in pop.subjects.iter().enumerate() {
+        let want: Vec<u64> = ehs[i]
+            .iter()
+            .chain(kappas[i].iter().flatten())
+            .map(|x| x.to_bits())
+            .collect();
+        if kappas[i].is_empty() {
+            without += 1;
+        } else {
+            with_kappa += 1;
+        }
+        assert_eq!(
+            bits(&got[i]),
+            want,
+            "warfarin_iov: subject {} ({} κ cells): pre-flight entry is not (η̂, κ̂) \
+             {POLICY_NOTE}",
+            s.id,
+            kappas[i].len()
+        );
+    }
+    assert!(
+        with_kappa > 0 && without == 1,
+        "fixture: needs IOV subjects ({with_kappa}) and the one no-occasion subject ({without})"
+    );
+
+    let (model, pop, opts) = load_iov_fixture(
+        include_str!("../../examples/warfarin.ferx"),
+        "data/warfarin.csv",
+        3,
+    );
+    assert_eq!(model.n_kappa, 0, "fixture: warfarin has no kappa");
+    let PreflightStart { ehs, .. } = preflight_start_modes(&model, &pop, &opts);
+    let got = preflight(&model, &pop, &opts).expect("warfarin: every subject converged");
+    for (i, s) in pop.subjects.iter().enumerate() {
+        assert_eq!(
+            bits(&got[i]),
+            bits(&ehs[i]),
+            "warfarin (no kappa): subject {}: pre-flight entry is not η̂ alone {POLICY_NOTE}",
+            s.id
+        );
+    }
+}
+
 // ── identity_theta_scales: near-zero identity-packed θ (#2159) ───────────
 
 /// A fake objective, quadratic in each θ separately: `f = base + w·k·(v − m)²` minus
@@ -9814,4 +10188,151 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
     };
     assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
     assert_eq!(scales(0.0), vec![], "guard rejects the start");
+}
+
+// ── nlopt_scale_vector: large-magnitude identity-packed θ (#2146) ────────
+
+/// θ in order: `TVCL` 0.2 (log-packed), `BIG` 1e6, `NEG_BIG` −1e6, `SMALL` −0.01,
+/// `AT_GATE` 10, `PAST_GATE` 10.5 — every one but `TVCL` identity-packed.
+#[cfg(test)]
+const LARGE_IDENTITY_THETA_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta BIG(1000000.0, -50000000.0, 50000000.0)
+  theta NEG_BIG(-1000000.0, -50000000.0, 50000000.0)
+  theta SMALL(-0.01, -1.0, 1.0)
+  theta AT_GATE(10.0, -100.0, 100.0)
+  theta PAST_GATE(10.5, -100.0, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) + 0 * (BIG + NEG_BIG + SMALL + AT_GATE + PAST_GATE)
+  V  = 10.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The scale vector `optimize_nlopt_once` builds for `params` under `options`.
+#[cfg(test)]
+fn scale_vector_for(
+    params: &ModelParameters,
+    options: &FitOptions,
+    identity_scales: &[(usize, f64)],
+) -> Vec<f64> {
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    clamp_to_bounds(&mut x0, &bounds);
+    nlopt_scale_vector(&x0, params, &bounds, options, false, identity_scales)
+}
+
+/// An identity-packed θ above 10 in magnitude is divided by |θ₀|, both signs, while
+/// one at the gate and the near-zero covariate effect keep 1.0, as does every other
+/// coordinate of a model with an identity θ — under `auto` for both the gradient
+/// optimizers (resolved `abs`) and BOBYQA (resolved unscaled), and under an explicit
+/// `abs` (#2146). Before the fix `BIG`, `NEG_BIG` and `PAST_GATE` read 1.0.
+#[test]
+fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    let params = &model.default_params;
+    let n_theta = params.theta.len();
+    let expected_theta = [1.0, 1e6, 1e6, 1.0, 1.0, 10.5];
+    for (scaling, optimizer) in [
+        (ParameterScaling::Auto, Optimizer::NloptLbfgs),
+        (ParameterScaling::Auto, Optimizer::Slsqp),
+        (ParameterScaling::Auto, Optimizer::Bobyqa),
+        (ParameterScaling::Auto, Optimizer::Mma),
+        (ParameterScaling::Abs, Optimizer::NloptLbfgs),
+        (ParameterScaling::Abs, Optimizer::Bobyqa),
+    ] {
+        let options = FitOptions {
+            parameter_scaling: scaling,
+            optimizer,
+            ..FitOptions::default()
+        };
+        let scale = scale_vector_for(params, &options, &[]);
+        assert_eq!(
+            &scale[..n_theta],
+            &expected_theta,
+            "{scaling:?} / {optimizer:?}"
+        );
+        assert!(
+            scale[n_theta..].iter().all(|&s| s == 1.0),
+            "{scaling:?} / {optimizer:?}: Ω/Σ stay unscaled beside an identity θ: {scale:?}"
+        );
+        // A probed near-zero entry (#2159) still lands on its own coordinate.
+        let probed = scale_vector_for(params, &options, &[(3, 0.01)]);
+        assert_eq!(probed[3], 0.01, "{scaling:?} / {optimizer:?}");
+        assert_eq!(probed[1], 1e6, "{scaling:?} / {optimizer:?}");
+    }
+}
+
+/// An explicit `none` keeps meaning no scaling — `scale_params` included, which an
+/// identity θ switches off — and `rescale2` keeps its box-width vector (#2146).
+#[test]
+fn nlopt_scale_vector_leaves_explicit_none_and_rescale2_alone() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    let params = &model.default_params;
+    for scale_params in [false, true] {
+        let options = FitOptions {
+            parameter_scaling: ParameterScaling::None,
+            optimizer: Optimizer::Bobyqa,
+            scale_params,
+            ..FitOptions::default()
+        };
+        let scale = scale_vector_for(params, &options, &[]);
+        assert!(
+            scale.iter().all(|&s| s == 1.0),
+            "none, scale_params = {scale_params}: {scale:?}"
+        );
+    }
+    let options = FitOptions {
+        parameter_scaling: ParameterScaling::Rescale2,
+        optimizer: Optimizer::NloptLbfgs,
+        ..FitOptions::default()
+    };
+    let bounds = pack_with_bounds(params).bounds;
+    assert_eq!(
+        scale_vector_for(params, &options, &[]),
+        compute_rescale2_scale(&bounds)
+    );
+}
+
+/// A model with no identity θ keeps `compute_scale_packed` under `abs` (#2146 leaves
+/// it alone).
+#[test]
+fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        NEAR_ZERO_V_WARFARIN
+            .replace(
+                "theta TVV_S(1e-05, -0.0005, 0.0005)",
+                "theta TVV_S(1e-05, 1e-07, 0.0005)",
+            )
+            .as_str(),
+    )
+    .expect("model parses");
+    let params = &model.default_params;
+    let options = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        ..FitOptions::default()
+    };
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    clamp_to_bounds(&mut x0, &bounds);
+    let scale = scale_vector_for(params, &options, &[]);
+    assert_eq!(scale, compute_scale_packed(&x0, params));
+    assert!(
+        scale[1] > 1.0,
+        "log-packed TVV_S is magnitude-scaled: {scale:?}"
+    );
 }

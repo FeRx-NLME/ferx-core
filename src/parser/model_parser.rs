@@ -10017,7 +10017,15 @@ fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
 
 // ── [fit_options] block parser ──────────────────────────────────────────────
 
-fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
+/// Parse one estimation-method token — `focei`, `saem`, `vi`, an alias such as
+/// `importance_sampling` — the way a `[fit_options]` `method = …` line reads it:
+/// case-insensitive, surrounding quotes stripped. Removed spellings (`agq`) and
+/// unknown tokens are an `Err` carrying the user-facing message.
+///
+/// Public so a front end with its own `method` argument (ferx-r's
+/// `ferx_fit(method = …)`) accepts exactly the engine's tokens instead of keeping
+/// a copy that drifts each time a method is added (ferx-r #506).
+pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     let val = token
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -10310,10 +10318,13 @@ fn reject_fit_option_line(line: &str) -> String {
 
 /// Apply a `method = …` value — one method, or a `[a, b, c]` chain — to `opts`,
 /// the way a `[fit_options]` line does. `method` is the one `[fit_options]` key
-/// [`apply_fit_option`] does not take (a front end with a dedicated method
-/// argument parses it itself), so the parser and `validate_model_file_with`'s
-/// overrides (#2165) share this instead of two spellings of the rule.
-pub(crate) fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
+/// [`apply_fit_option`] does not take, so the parser, `validate_model_file_with`'s
+/// overrides (#2165) and a front end with a dedicated method argument (ferx-r
+/// #506) share this instead of separate spellings of the rule: the tokens go
+/// through [`parse_method_token`], and the final stage sets `interaction` the
+/// same way for all of them. Chain-shape rules that depend on other options (an
+/// evaluate-only stage must come last) are checked when the fit is validated.
+pub fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
     let raw = value.trim();
     // List form: `method = [a, b, c]` — chain of stages.
     if raw.starts_with('[') {
@@ -29167,16 +29178,24 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
                     branches,
                     else_body,
                 } => {
-                    // The `else` arm fires only when *every* branch condition was
-                    // false, so it is governed by all of them: dynamic if any is.
-                    let mut any_cond_dynamic = ctx_dynamic;
+                    // Branch `k` fires only when conditions `0..k` were all false and
+                    // its own is true, so it is governed by **every condition up to and
+                    // including its own**, and the `else` arm by all of them — the
+                    // running `governed` after the loop. A per-arm `ctx || cond_k`
+                    // misses an earlier dynamic condition:
+                    //
+                    //   if (ETA_SW > 0) { AUX = 1 } else if (WT > 70) { FAC = WT / 70 }
+                    //
+                    // `FAC` would fold, and `eval_cov_static_f64` decides the branches
+                    // at η = 0, so the dual walk carried `WT / 70` even where
+                    // `ETA_SW > 0` takes the first arm (#1927).
+                    let mut governed = ctx_dynamic;
                     for (cond, body) in branches {
-                        let branch_dynamic = ctx_dynamic || cond_is_dynamic(cond, dyn_vars);
-                        any_cond_dynamic |= branch_dynamic;
-                        walk(body, branch_dynamic, dyn_vars, changed);
+                        governed = governed || cond_is_dynamic(cond, dyn_vars);
+                        walk(body, governed, dyn_vars, changed);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, any_cond_dynamic, dyn_vars, changed);
+                        walk(eb, governed, dyn_vars, changed);
                     }
                 }
                 _ => {}
@@ -29263,12 +29282,8 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     // cond_k` does not, and the resulting false accept is exactly what
                     // this gate exists to prevent (round-1 review of PR #1924). The
                     // `else` arm is governed by all of them, which is the same variable
-                    // after the loop.
-                    //
-                    // `compute_cov_static_mask` has the per-arm shape and the same hole
-                    // for its own question (an `else if` body folded to a constant
-                    // although which value it takes depends on θ/η) — filed as #1927,
-                    // deliberately not changed here.
+                    // after the loop. `compute_cov_static_mask` uses the same
+                    // accumulation for its own question (#1927).
                     let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);

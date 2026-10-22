@@ -15523,3 +15523,200 @@ fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
         );
     }
 }
+
+/// Every reader of the raw ODE observable in this file is registered with the code that
+/// puts its output into observation units (`[scaling]` / LTBS / FREM). #2129 was three
+/// unregistered readers returning the amount, with a replay that shared the defect, and
+/// #2156 a fourth step (FREM) the adaptive rows still skipped. The adaptive entries name
+/// the function whose parity test pins them against the full `pk` sink.
+///
+/// Regression caught: a new function or `impl` method calling `read_observable` whose
+/// output nobody converts. Registering it here forces that decision to be made on
+/// purpose. (From the PR #2142 review, proposal 1.)
+///
+/// It checks the readers, not their callers: an entry says which sink converts the
+/// reader's output on its main route, and a caller that takes the output past that sink
+/// is outside what this test sees. `record_observations` is the known case (#2259).
+#[test]
+fn every_raw_observable_reader_names_who_converts_it() {
+    const CONVERTED_BY: &[(&str, &str)] = &[
+        (
+            "record_observations",
+            "the pk sink (compute_predictions_with_tv); NOT on the ODE branch of \
+             compute_predictions_with_states (sdtab IPRED), which skips FREM: #2259",
+        ),
+        (
+            "ode_predictions_event_driven",
+            "the pk sink (compute_predictions_with_tv)",
+        ),
+        (
+            "ode_predictions_adaptive_impl",
+            "rows: api::adaptive::adaptive_rows_to_model_scale; signals: \
+             AdaptiveMonitor::scale_readout",
+        ),
+        (
+            "adaptive_frozen_replay_tv",
+            "none: the verifier compares raw readouts by design",
+        ),
+        (
+            "adaptive_window_signal_aucs",
+            "api::adaptive::adaptive_window_aucs_to_model_scale",
+        ),
+    ];
+    let readers = raw_observable_readers(include_str!("predictions.rs"));
+    let mut found: Vec<&str> = readers.iter().map(String::as_str).collect();
+    let mut listed: Vec<&str> = CONVERTED_BY.iter().map(|(n, _)| *n).collect();
+    found.sort_unstable();
+    listed.sort_unstable();
+    assert_eq!(
+        found, listed,
+        "the raw `read_observable` readers changed: register each new one in CONVERTED_BY \
+         with the code that applies `[scaling]` / LTBS / FREM to its output (#2129, #2156), \
+         and drop any entry that no longer reads it"
+    );
+}
+
+/// The functions of `src` whose bodies call `read_observable(`: each column-0 `fn`
+/// (any visibility), and each method of a column-0 `impl` block, named `Type::method`.
+/// A nested helper `fn` inside a body counts as part of its enclosing function; comment
+/// lines are skipped. A call outside both — inside a `mod`, a `macro_rules!`, a `const`
+/// — panics, so a reader the scan cannot name fails loudly instead of being credited to
+/// the item above it.
+fn raw_observable_readers(src: &str) -> Vec<String> {
+    let mut current: Option<String> = None;
+    let mut impl_type: Option<String> = None;
+    let mut readers: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let top = !line.is_empty() && !line.starts_with(char::is_whitespace);
+        let method = impl_type.is_some()
+            && line.starts_with("    ")
+            && !line[4..].starts_with(char::is_whitespace);
+        if top {
+            if let Some(name) = fn_def_name(code) {
+                current = Some(name);
+                impl_type = None;
+            } else if let Some(ty) = impl_block_type(code) {
+                current = None;
+                impl_type = Some(ty);
+            } else if starts_other_item(code) {
+                current = None;
+                impl_type = None;
+            }
+            // Anything else at column 0 (`}`, `{`, `where`, an attribute, a closing
+            // bracket) continues the item it sits in.
+        } else if method {
+            if let Some(name) = fn_def_name(code) {
+                current = Some(format!("{}::{name}", impl_type.as_deref().unwrap_or("")));
+            }
+        }
+        // No `continue` after a definition: a one-line `fn f() { read_observable(…) }`
+        // reads it too.
+        if code.contains("read_observable(") {
+            let name = current.clone().unwrap_or_else(|| {
+                panic!("a `read_observable` call outside any fn or impl method: {line:?}")
+            });
+            if name != "read_observable" && !readers.contains(&name) {
+                readers.push(name);
+            }
+        }
+    }
+    readers
+}
+
+/// The name a `fn` definition line defines, when everything before `fn` is a qualifier:
+/// any visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`), `const`, `unsafe`,
+/// `async`, `extern "C"`.
+fn fn_def_name(code: &str) -> Option<String> {
+    let pos = code.find("fn ")?;
+    let qualifiers_only = code[..pos].split_whitespace().all(|w| {
+        w.starts_with("pub") || matches!(w, "const" | "unsafe" | "async" | "extern" | "\"C\"")
+    });
+    qualifiers_only.then(|| {
+        code[pos + 3..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    })
+}
+
+/// The self type of an `impl` line (`impl<T: X> Foo<T> {`, `impl Trait for Foo {`).
+fn impl_block_type(code: &str) -> Option<String> {
+    let rest = code.strip_prefix("unsafe ").unwrap_or(code);
+    let rest = rest.strip_prefix("impl")?;
+    if !rest.starts_with([' ', '<']) {
+        return None;
+    }
+    // Drop the impl's own generic list, then take the type after a trait's ` for `.
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 && !c.is_whitespace() => {
+                start = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let ty = &rest[start..];
+    let ty = ty.rsplit_once(" for ").map_or(ty, |(_, t)| t).trim_start();
+    Some(
+        ty.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect(),
+    )
+}
+
+/// Whether a column-0 line starts an item that is neither a `fn` nor an `impl`.
+fn starts_other_item(code: &str) -> bool {
+    let first = code
+        .split_whitespace()
+        .find(|w| !w.starts_with("pub"))
+        .unwrap_or("");
+    matches!(
+        first,
+        "mod" | "struct" | "enum" | "union" | "trait" | "static" | "const" | "type" | "use"
+    ) || first.starts_with("macro_rules!")
+}
+
+/// The scanner itself. A call inside a nested helper is attributed to the enclosing
+/// function; a comment naming the call is not a reader; a `pub(super)` function and an
+/// `impl` method (inherent and trait) are readers under their own names, not the
+/// function above them. Without this, a scanner that returned the registered list for
+/// any input would pass the guard above.
+///
+/// Regressions caught (PR #2258 review, finding 1): accept only `pub` / `pub(crate)`
+/// before `fn`, or ignore `impl` blocks, and `sup` / `Spec::read` / `Spec::step` are
+/// credited to `other` instead, so the list below loses them.
+#[test]
+fn raw_observable_reader_scan_attributes_calls_to_their_engine() {
+    let src = "fn read_observable(x: f64) -> f64 { x }\n\
+               pub(crate) fn engine() {\n    fn inner() { read_observable(1.0); }\n}\n\
+               fn quiet() {\n    // read_observable(2.0) in a comment\n}\n\
+               pub fn other() { let _ = read_observable(3.0); }\n\
+               pub(super) fn sup()\nwhere\n    T: Copy,\n{\n    read_observable(4.0);\n}\n\
+               impl<T: Clone> Spec<T> {\n    pub(crate) fn read(&self) {\n        \
+               read_observable(5.0);\n    }\n}\n\
+               impl std::fmt::Display for Spec {\n    fn step(&self) { read_observable(6.0); }\n}\n";
+    assert_eq!(
+        raw_observable_readers(src),
+        vec!["engine", "other", "sup", "Spec::read", "Spec::step"]
+    );
+}
+
+/// A call the scan cannot attribute to a function — here inside a `macro_rules!` body
+/// that follows a registered reader — fails loudly rather than being credited to that
+/// reader.
+#[test]
+#[should_panic(expected = "a `read_observable` call outside any fn or impl method")]
+fn raw_observable_reader_scan_refuses_an_unattributed_call() {
+    let src = "fn engine() { read_observable(1.0); }\n\
+               macro_rules! m {\n    () => { read_observable(2.0) };\n}\n";
+    raw_observable_readers(src);
+}

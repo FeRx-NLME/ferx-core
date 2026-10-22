@@ -127,6 +127,7 @@ impl<const N: usize> Dir<N> {
 /// (`pack_params` order; the per-subject NLL Hessian, which the caller scales by 2 to the
 /// OFV), or `None` outside the adjoint's scope. `eta_hat` is the mode (the stacked
 /// `[η, κ]` under IOV) for `unpack_params(x)`.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_cov_hessian(
     model: &CompiledModel,
     subject: &Subject,
@@ -135,7 +136,21 @@ pub(crate) fn subject_adjoint_cov_hessian(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
-    let mut sc = scope(model, subject, template, x, eta_hat)?;
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_cov_hessian_at(model, subject, &pt, eta_hat, objective)
+}
+
+/// `subject_adjoint_cov_hessian` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`] the caller unpacked once for its
+/// population.
+pub(crate) fn subject_adjoint_cov_hessian_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<DMatrix<f64>> {
+    let (template, x) = (pt.template, pt.x);
+    let mut sc = scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -201,6 +216,7 @@ pub(crate) fn cov_width_declines(
 /// The exact mode response `dη̂/dx` (one `n_eta`-vector, stacked `[η, κ]` under IOV, per
 /// packed coordinate) at the EBE `eta_hat` of `unpack_params(x)`: the EBE warm-start
 /// predictor's Jacobian (Almquist Eq. 48), FOCE's frozen-variance mode included.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_eta_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -209,12 +225,25 @@ pub(crate) fn subject_adjoint_eta_dx(
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_eta_dx_at(model, subject, &pt, eta_hat, interaction)
+}
+
+/// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
+pub(crate) fn subject_adjoint_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    interaction: bool,
+) -> Option<Vec<DVector<f64>>> {
+    let (template, x) = (pt.template, pt.x);
     let objective = if interaction {
         Objective::Focei
     } else {
         Objective::Foce
     };
-    let mut sc = scope(model, subject, template, x, eta_hat)?;
+    let mut sc = scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -225,8 +254,8 @@ pub(crate) fn subject_adjoint_eta_dx(
         x: &[f64],
         objective: Objective,
     ) -> Option<Vec<DVector<f64>>> {
-        let ctx = LikCtx::new(sc.model, subject, &sc.params);
-        let so = stacked_omega::<N>(sc.model, subject, template, &sc.params, sc.width);
+        let ctx = LikCtx::new(sc.model, subject, sc.params);
+        let so = stacked_omega::<N>(sc.model, subject, template, sc.params, sc.width);
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
         };
@@ -331,7 +360,7 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     x: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
-    let (model, params) = (sc.model, &sc.params);
+    let (model, params) = (sc.model, sc.params);
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
@@ -678,7 +707,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     dirs: &[Dir<N>],
 ) -> Option<Pass<N>> {
     debug_assert!(dirs.len() <= K);
-    let (model, params, eta) = (sc.model, &sc.params, &sc.eta[..]);
+    let (model, params, eta) = (sc.model, sc.params, &sc.eta[..]);
     let n_obs = subject.observations.len();
     let seed = |i: usize| -> [R; K] {
         std::array::from_fn(|a| {

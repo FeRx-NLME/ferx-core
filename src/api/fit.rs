@@ -942,22 +942,9 @@ fn fit_unstamped(
     //     where each expanded dose opens an occasion), the inner per-subject
     //     problem balloons; warn so the multiplication isn't silent.
     if derive_occ {
-        // Distinct occasion labels seen across observations and doses, per subject.
-        // Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
-        // (#1876): a derived rule is monotone in time, so on a subject whose observations
-        // and doses share one occasion such a row lies before or after all of them. Its κ is
-        // then at most weakly informed: only when a second such row lies between it and the
-        // first dose or observation, and the model has an `init(...)` baseline, does it
-        // govern a non-empty interval on nonzero state. Counting it would let the
-        // unidentifiable case below through, so the check errs on the conservative side.
-        let distinct_occ = |s: &Subject| -> usize {
-            let mut occs: Vec<u32> = s.occasions.clone();
-            occs.extend_from_slice(&s.dose_occasions);
-            occs.sort_unstable();
-            occs.dedup();
-            occs.len()
-        };
-        let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
+        // Distinct occasion labels seen across observations and doses, per subject; the
+        // `--simulate` pre-check reads the same count on its template (#2052).
+        let max_occ = crate::api::max_obs_dose_occasions(pop_ref);
         if max_occ <= 1 {
             return Err(EngineError::uncoded(
                 "The `iov_occasion` rule produced only a single occasion for every subject, \
@@ -1512,16 +1499,19 @@ fn fit_inner(
     // count cannot wrap and produce a bogus estimate; on overflow we still warn
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
+    // The route is predicted from the covariance step's own scope walk (#2054): no note on
+    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    let covariance_route = crate::estimation::covariance::predicted_r_route(
+        model,
+        population,
+        options,
+        init_params.mixture.is_some(),
+    );
     let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
         n_params_pre,
         options,
         !model.priors.is_empty(),
-        crate::estimation::covariance::analytic_r_expected(
-            model,
-            population,
-            options,
-            init_params.mixture.is_some(),
-        ),
+        covariance_route,
     );
     let covariance_n_evals_estimated = covariance_cost.flatten();
 
@@ -1631,9 +1621,11 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) =
-        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
-    {
+    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
+        n_params_pre,
+        covariance_cost,
+        covariance_route,
+    ) {
         accumulated_warnings.push(note);
     }
 
@@ -2530,7 +2522,7 @@ fn fit_inner(
     // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
     // nothing. Subjects are built in population order, so the zip aligns.
     if options.npde_nsim > 0 {
-        let per_subj = crate::stats::npde::compute_npde_npd(
+        let (per_subj, npde_warnings) = crate::stats::npde::compute_npde_npd_diag(
             model,
             population,
             &result.params,
@@ -2540,6 +2532,14 @@ fn fit_inner(
             // (`fitted_population`), so there is no rule to apply here (#1980).
             None,
         )?;
+        // The reference distribution's flip-flop count (#1928) has no other channel: the
+        // η = 0 refusal and the #785 EBE warning never see the reference draws. Only that
+        // one — the no-occasion warning is the fit's own, already reported for the fit.
+        result.warnings.extend(
+            npde_warnings
+                .into_iter()
+                .filter(|w| w.starts_with("W_SIMULATED_FLIP_FLOP")),
+        );
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
@@ -2910,7 +2910,7 @@ fn fit_inner(
     // families, and getting it wrong demotes a converged VI fit that was finished
     // the recommended way (`methods = vi, imp` + `imp_eval_only`).
     let objective_stage = objective_stage.unwrap_or(final_method);
-    if let Some((msg, entry)) =
+    if let Some((msg, mut entry)) =
         nonfinite_objective_warning(&mut converged, ofv, objective_stage, options)
     {
         // The estimator that produced this objective has already pushed the same
@@ -2925,6 +2925,10 @@ fn fit_inner(
         // *different* stage's non-finite objective in the same chain is a
         // different string and survives.
         warnings.retain(|w| !w.ends_with(msg.as_str()));
+        // Only this copy sees the per-subject results, so only it names the
+        // subjects (#2038) — after the de-duplication, which matches the estimator's
+        // copy on the sentence both share.
+        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population);
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -2956,6 +2960,20 @@ fn fit_inner(
     if let Some((msg, entry)) =
         absorption_flip_flop_ebe_warning(model, population, &result.params.theta, &result.eta_hats)
     {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+
+    // A non-positive or infinite CL / V on any record at the final estimates: the
+    // closed-form engines served those records 0, which NONMEM would refuse (#2104).
+    if let Some((msg, entry)) = degenerate_cl_v_warning(
+        model,
+        population,
+        &result.params.theta,
+        &result.eta_hats,
+        &result.kappas,
+        mixest_classes.as_deref(),
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }

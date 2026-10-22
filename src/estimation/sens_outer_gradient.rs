@@ -9,6 +9,7 @@
 //! with its own per-subject salvage.
 
 use crate::estimation::parameterization::theta_packs_log;
+use crate::sens::ode_provider::adjoint::{Objective, PackedPoint};
 use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::DVector;
 use rayon::prelude::*;
@@ -71,13 +72,31 @@ fn subject_gradient(
     if subject.observations.is_empty() {
         return Some(vec![0.0; x.len()]);
     }
-    crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+    let pt = PackedPoint::new(template, x)?;
+    subject_gradient_at(model, subject, &pt, eta_hat, interaction)
+}
+
+/// [`subject_gradient`] at a [`PackedPoint`] the population loop unpacked once.
+fn subject_gradient_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    interaction: bool,
+) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        return Some(vec![0.0; pt.x.len()]);
+    }
+    crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
         model,
         subject,
-        template,
-        x,
+        pt,
         eta_hat,
-        interaction,
+        if interaction {
+            Objective::Focei
+        } else {
+            Objective::Foce
+        },
     )
 }
 
@@ -98,17 +117,18 @@ pub fn per_subject_packed_gradients(
     interaction: bool,
     mixture_class: Option<usize>,
 ) -> Vec<Option<Vec<f64>>> {
+    // One unpack for the population (every subject is at the same packed point).
+    let pt = PackedPoint::new(template, x);
     population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
             let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
-            subject_gradient(
+            subject_gradient_at(
                 model,
                 subject,
-                template,
-                x,
+                pt.as_ref()?,
                 eta_hats[i].as_slice(),
                 interaction,
             )
@@ -127,6 +147,7 @@ pub fn per_subject_packed_gradients_iov(
     kappas: &[Vec<DVector<f64>>],
     interaction: bool,
 ) -> Vec<Option<Vec<f64>>> {
+    let pt = PackedPoint::new(template, x);
     population
         .subjects
         .par_iter()
@@ -136,7 +157,7 @@ pub fn per_subject_packed_gradients_iov(
             for kap in &kappas[i] {
                 stacked.extend(kap.iter().copied());
             }
-            subject_gradient(model, subject, template, x, &stacked, interaction)
+            subject_gradient_at(model, subject, pt.as_ref()?, &stacked, interaction)
         })
         .collect()
 }
@@ -163,16 +184,16 @@ pub fn population_eta_dx(
     eta_hats: &[DVector<f64>],
     interaction: bool,
 ) -> Option<Vec<Vec<DVector<f64>>>> {
+    let pt = PackedPoint::new(template, x)?;
     population
         .subjects
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            crate::sens::ode_provider::adjoint::subject_adjoint_eta_dx(
+            crate::sens::ode_provider::adjoint::subject_adjoint_eta_dx_at(
                 model,
                 s,
-                template,
-                x,
+                &pt,
                 eta_hats[i].as_slice(),
                 interaction,
             )
