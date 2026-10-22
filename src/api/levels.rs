@@ -2698,10 +2698,19 @@ struct Measured {
 }
 
 /// Whether a dose of `model` can change the state at a time the data does not
-/// hold: a compartment lag, or a per-route lag on an absorption forcing
-/// (#2131 review).
+/// hold (#2131 review): a compartment lag — the bare lag slot or an indexed
+/// `ALAGn` ([`CompiledModel::has_lagtime`]), or an `ALAGn` entry of the
+/// `dose_attr_map` the engines resolve every dose's lag through — or a
+/// per-route lag on an absorption forcing. A lag the model assigns but the
+/// engines never apply moves no arrival, so it does not count;
+/// `the_lag_predicate_sees_every_lag_the_engine_applies` pins the two
+/// together over every spelling.
 fn lagged_arrivals(model: &CompiledModel) -> bool {
-    model.has_lagtime() || model.has_route_absorption_lag()
+    model.has_lagtime()
+        || model
+            .dose_attr_map
+            .has_indexed_attr(crate::types::DoseAttr::Lag)
+        || model.has_route_absorption_lag()
 }
 
 /// Run [`dead_levels`] and [`spanned`] on every block, on the model re-parsed

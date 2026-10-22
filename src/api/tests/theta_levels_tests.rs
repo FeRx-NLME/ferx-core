@@ -9854,6 +9854,141 @@ mod absorption {
         assert!(wrong.is_empty(), "#2131 review, lag:\n{}", wrong.join("\n"));
     }
 
+    /// #2131 review, round 3. A lag written conditionally — a default, then an
+    /// `if` without `else` — is applied wherever it is nonzero, so the
+    /// straddle of [`a_record_moved_below_a_lagged_arrival_is_not_a_replicate`]
+    /// holds for it as for the plain one: global sum-to-zero binds on the
+    /// straddling data and is refused on exact replicates. The `if` alone, with
+    /// no default, is not a model: the parser refuses it, so it has no
+    /// arrival to straddle.
+    ///
+    /// Mutation — `lagged_arrivals` returning false: the straddle is refused.
+    #[test]
+    fn a_conditional_lag_separates_records_like_a_plain_one() {
+        let conditional = |c: &str| {
+            lagged_s1(c).replace(
+                "  LAG = 2.0",
+                "  LAG = 0.0\n  if (STUDY > 0) {\n    LAG = 2.0\n  }",
+            )
+        };
+        assert!(
+            conditional("").contains("if (STUDY > 0)"),
+            "the lag is conditional"
+        );
+        let mut wrong = Vec::new();
+        match try_bind(&conditional("sum_to_zero"), &lagged_at_two(true)) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("conditional straddle, global: {got:?}")),
+        }
+        match try_bind(&conditional("sum_to_zero"), &lagged_at_two(false)) {
+            Err(e) if e.contains("(through `V`) at that grouping") => {}
+            got => wrong.push(format!("conditional replicates, global: {got:?}")),
+        }
+        let bare = conditional("").replace("  LAG = 0.0\n", "");
+        match parse_full_model(&bare) {
+            Err(e) if e.contains("not on every path through it") => {}
+            got => wrong.push(format!("`if` without a default: {:?}", got.map(|_| ()))),
+        }
+        assert!(wrong.is_empty(), "conditional lag:\n{}", wrong.join("\n"));
+    }
+
+    /// #2131 review, round 3. `lagged_arrivals` against what the engine does:
+    /// on every lag spelling of an analytical and an ODE model, the predicate
+    /// is true exactly when the predictions differ from the same model without
+    /// the lag — a bolus at 0 lagged by 2, observed at 1, 2 and 3. A spelling
+    /// the predicate missed while the engine applied it would be a lagged
+    /// arrival `replicates` cannot see. (Measured: an `ALAGn` or `LAGTIME`
+    /// assigned in both branches of an `if`/`else` on an ODE model reaches
+    /// neither, and the engine applies no lag; that is the engine's to fix, and
+    /// this pins the predicate to it either way.)
+    ///
+    /// Mutations — `lagged_arrivals` dropping its `has_lagtime` term: every
+    /// applied spelling disagrees.
+    #[test]
+    fn the_lag_predicate_sees_every_lag_the_engine_applies() {
+        let analytical = |body: &str, lag: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                 omega ETA_V ~ 0.09\n  sigma ADD ~ 0.1\n[individual_parameters]\n  CL = TVCL\n  \
+                 V = TVV * exp(ETA_V)\n{body}\n[structural_model]\n  \
+                 pk one_cpt_iv(cl=CL, v=V{lag})\n[error_model]\n  DV ~ additive(ADD)\n"
+            )
+        };
+        let ode = |body: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(0.134, 0.001, 10.0)\n  theta TVV(8.1, 0.1, 500.0)\n  \
+                 theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_V ~ 0.02\n  sigma ADD ~ 0.1\n\
+                 [individual_parameters]\n  CL = TVCL\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n\
+                 {body}\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+                 [odes]\n  d/dt(depot) = -KA * depot\n  \
+                 d/dt(central) = KA * depot - CL/V * central\n[scaling]\n  obs_scale = V\n\
+                 [error_model]\n  DV ~ additive(ADD)\n"
+            )
+        };
+        let branches = |name: &str| {
+            format!("  if (TIME >= 0) {{\n    {name} = 2.0\n  }} else {{\n    {name} = 0.0\n  }}")
+        };
+        let default_then_if =
+            |name: &str| format!("  {name} = 0.0\n  if (TIME >= 0) {{\n    {name} = 2.0\n  }}");
+        let lag = ", lagtime=LAG";
+        let cells: Vec<(&str, String, String)> = vec![
+            (
+                "analytical",
+                analytical("  LAG = 2.0", lag),
+                analytical("", ""),
+            ),
+            (
+                "analytical if/else",
+                analytical(&branches("LAG"), lag),
+                analytical("", ""),
+            ),
+            (
+                "analytical default + if",
+                analytical(&default_then_if("LAG"), lag),
+                analytical("", ""),
+            ),
+            ("ODE ALAG1", ode("  ALAG1 = 2.0"), ode("")),
+            ("ODE LAGTIME", ode("  LAGTIME = 2.0"), ode("")),
+            (
+                "ODE ALAG1 default + if",
+                ode(&default_then_if("ALAG1")),
+                ode(""),
+            ),
+            ("ODE ALAG1 if/else", ode(&branches("ALAG1")), ode("")),
+            ("ODE LAGTIME if/else", ode(&branches("LAGTIME")), ode("")),
+        ];
+        let pop = population(1, 3);
+        let mut wrong = Vec::new();
+        let mut applied = 0;
+        for (tag, text, unlagged) in &cells {
+            let model = parse_full_model(text)
+                .unwrap_or_else(|e| panic!("{tag}: {e}"))
+                .model;
+            let plain = parse_full_model(unlagged).unwrap().model;
+            let y = |m: &CompiledModel| {
+                let theta = m.default_params.theta.clone();
+                predictions_at(m, &pop.subjects[0], &theta, &vec![0.0; m.n_eta], &[])
+            };
+            let (got, want) = (y(&model), y(&plain));
+            assert!(
+                got.iter().chain(&want).all(|v| v.is_finite()),
+                "{tag}: {got:?} {want:?}"
+            );
+            let engine = got != want;
+            applied += usize::from(engine);
+            if lagged_arrivals(&model) != engine {
+                wrong.push(format!(
+                    "{tag}: predicate {}, engine {engine} ({got:?} vs {want:?})",
+                    lagged_arrivals(&model)
+                ));
+            }
+        }
+        // Both sides of the predicate are reached: six spellings applied,
+        // the two if/else ODE spellings not (measured).
+        assert_eq!(applied, 6, "applied spellings");
+        assert!(wrong.is_empty(), "lag predicate:\n{}", wrong.join("\n"));
+    }
+
     /// #2131. Two arms at one visit share a level, so a block with a level per
     /// (study, time) does not resolve the observations: a random effect that
     /// moves one arm only is not a shift common to both, which is all a level
