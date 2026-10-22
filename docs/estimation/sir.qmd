@@ -47,7 +47,7 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 | `sir_resamples` | `250` | Number of resampled vectors (m). Must be less than `sir_samples` |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
-| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5. |
+| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. `normal` (or `mvn`) selects a multivariate-normal proposal (ν = ∞, #1819). Dosne (2017) recommends ν=5. |
 | `sir_scale` | `packed` | The scale the target is flat on: `packed` (log-sd for variances) or `natural` (variances, the PsN convention). See [Choosing the target scale](#choosing-the-target-scale) |
 
 ## Output

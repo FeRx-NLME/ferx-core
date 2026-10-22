@@ -4426,6 +4426,14 @@ fn test_sir_df_valid_and_invalid() {
     assert!(apply_fit_option(&mut opts, "sir_df", "1.0").is_ok());
     assert!(apply_fit_option(&mut opts, "sir_df", "0.9").is_err());
     assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
+    // #1819: `normal` / `mvn` select the multivariate-normal proposal (df = +inf),
+    // the spelling `.fitrx` writes for it.
+    for kw in ["normal", "mvn", "NORMAL"] {
+        let mut o = FitOptions::default();
+        assert!(apply_fit_option(&mut o, "sir_df", kw).is_ok(), "{kw}");
+        assert_eq!(o.sir_df, f64::INFINITY, "{kw}");
+    }
+    assert!(apply_fit_option(&mut opts, "sir_df", "gaussian").is_err());
 }
 
 /// #1723: `sir_scale` takes `packed` or `natural` (any case), defaults to

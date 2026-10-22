@@ -8735,7 +8735,8 @@ pub struct FitOptions {
     /// Degrees of freedom for the Student-t SIR proposal distribution.
     /// Heavier tails than the normal improve ESS for parameters near boundaries
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
-    /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
+    /// `f64::INFINITY` (`sir_df = normal` / `mvn` in `[fit_options]`) selects the
+    /// multivariate-normal proposal itself (#1819).
     pub sir_df: f64,
     /// The scale SIR's target is flat on — see [`SirScale`]. Default
     /// [`SirScale::Packed`] (#1723). Set via `[fit_options]` key `sir_scale`.

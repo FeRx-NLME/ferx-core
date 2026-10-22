@@ -592,7 +592,11 @@ struct SirSettingsWire {
     samples: usize,
     resamples: usize,
     seed: u64,
-    df: f64,
+    /// A finite `df` is a JSON number; the multivariate-normal proposal (`df = ∞`),
+    /// which JSON has no number for, is the `[fit_options]` token `"normal"` (#1819).
+    /// Held as a raw value and decoded in `into_settings`, so `null` or an unknown
+    /// token is `Corrupt` naming the field rather than a bare JSON error.
+    df: serde_json::Value,
     scale: String,
     keep_samples: bool,
     /// Flattened (#426): the record is nested in memory (`SirSettings::scoring`) but
@@ -660,13 +664,22 @@ fn enum_from_token<T: serde::de::DeserializeOwned>(
         .map_err(|_| FitrxError::Corrupt(format!("unknown {block}.{field} {token:?}")))
 }
 
+/// `sir.settings.df` for the multivariate-normal proposal: the `[fit_options] sir_df`
+/// token for `df = ∞` (#1819). `"mvn"` is also read, as the parser reads it.
+const SIR_DF_NORMAL: &str = "normal";
+
 impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
     fn from(s: &crate::estimation::sir::SirSettings) -> Self {
         Self {
             samples: s.samples,
             resamples: s.resamples,
             seed: s.seed,
-            df: s.df,
+            df: if s.df == f64::INFINITY {
+                serde_json::Value::String(SIR_DF_NORMAL.to_string())
+            } else {
+                // `From<f64>` writes a non-finite value as `null`, which the reader refuses.
+                serde_json::Value::from(s.df)
+            },
             scale: enum_token(&s.scale),
             keep_samples: s.keep_samples,
             scoring: ScoringSettingsWire::from(&s.scoring),
@@ -701,17 +714,31 @@ impl SirSettingsWire {
     /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
     /// default, so a value the parser would reject must not enter through the bundle.
     fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
-        if !(self.df >= 1.0) {
-            return Err(FitrxError::Corrupt(format!(
-                "sir.settings.df must be >= 1, got {}",
-                self.df
-            )));
-        }
+        let df = match &self.df {
+            serde_json::Value::String(tok)
+                if tok.eq_ignore_ascii_case(SIR_DF_NORMAL) || tok.eq_ignore_ascii_case("mvn") =>
+            {
+                f64::INFINITY
+            }
+            serde_json::Value::Number(n) => match n.as_f64() {
+                Some(v) if v >= 1.0 => v,
+                _ => {
+                    return Err(FitrxError::Corrupt(format!(
+                        "sir.settings.df must be >= 1 or \"normal\", got {n}"
+                    )))
+                }
+            },
+            other => {
+                return Err(FitrxError::Corrupt(format!(
+                    "sir.settings.df must be >= 1 or \"normal\", got {other}"
+                )))
+            }
+        };
         Ok(crate::estimation::sir::SirSettings {
             samples: self.samples,
             resamples: self.resamples,
             seed: self.seed,
-            df: self.df,
+            df,
             scale: enum_from_token("sir.settings", "scale", self.scale)?,
             keep_samples: self.keep_samples,
             scoring: self.scoring.into_settings("sir.settings")?,
@@ -4344,6 +4371,55 @@ mod tests {
             let loaded = load_edited_sir_wire(|v| v["sir"]["settings"][field] = accept.clone())
                 .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
             assert!(loaded.sir_settings.is_some(), "{field}");
+        }
+    }
+
+    /// #1819: the multivariate-normal proposal (`df = ∞`) travels as the `[fit_options]`
+    /// token `"normal"` — JSON has no number for it, and serde_json would write `null`,
+    /// which no reader accepts. Mutation: write `df` as a plain number again (the token
+    /// assertion dies, and the reload is `Corrupt` on the `null`).
+    #[test]
+    fn a_normal_sir_proposal_round_trips_as_its_fit_options_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_normal.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.sir_settings.as_mut().unwrap().df = f64::INFINITY;
+        let value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["sir"]["settings"]["df"], "normal");
+        // The control: a finite df stays a JSON number, so the change is additive.
+        let finite = serde_json::to_value(build_fit_wire(&sir_fit_with_settings())).unwrap();
+        assert_eq!(finite["sir"]["settings"]["df"], serde_json::json!(3.0));
+
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+        assert_eq!(loaded.fit.sir_settings.unwrap().df, f64::INFINITY);
+    }
+
+    /// #1819: on read, `"normal"` and `"mvn"` (any case, as `[fit_options]` reads them)
+    /// are `df = ∞`; `null`, an unknown token and a df below 1 are `Corrupt` naming
+    /// `sir.settings.df`. Mutations: drop the `mvn` arm (its row fails to load); accept
+    /// any string as ∞ (`"gaussian"` loads); map `null` to ∞ (it loads).
+    #[test]
+    fn sir_settings_df_tokens_and_their_refusals() {
+        for tok in ["normal", "mvn", "NORMAL"] {
+            let loaded = load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = tok.into())
+                .unwrap_or_else(|e| panic!("{tok} must load: {e:?}"));
+            assert_eq!(loaded.sir_settings.unwrap().df, f64::INFINITY, "{tok}");
+        }
+        for (bad, shows) in [
+            (serde_json::Value::Null, "got null"),
+            (serde_json::json!("gaussian"), "got \"gaussian\""),
+            (serde_json::json!(0.5), "got 0.5"),
+        ] {
+            match load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = bad.clone()) {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(msg.contains("sir.settings.df "), "{bad}: {msg}");
+                    assert!(msg.contains(shows), "{bad}: {msg}");
+                }
+                other => panic!("{bad}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
         }
     }
 
