@@ -101,10 +101,11 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 /// assert "no subject on the FD fallback" — which held only because the
 /// fallback warning asked the Gaussian recorder alone, which serves the PK rows
 /// and never sees the hazard (#1861). The warning now counts the route that
-/// runs, so both twins must report all 8 subjects on FD; the model-level label
-/// still reads analytic, because the recorder serves the PK rows.
+/// runs. Since #1861 the model-level label says so too: a TTE endpoint has no
+/// analytic η-channel, so it reports `finite differences`, and an all-FD
+/// population under an FD label needs no reconciling warning.
 #[test]
-fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin_on_the_analytic_path() {
+fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
     use ferx_core::{fit, FitOptions};
     const ALL_ARM_ETA: &str =
         "  if (WT > 70) {\n    H0 = 0.01 * exp(ETA_H)\n  } else {\n    H0 = 0.02 * exp(ETA_H)\n  }";
@@ -154,14 +155,14 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin_on_the_analytic_
     for (label, r) in [("all-arm", &all_arm), ("ternary", &ternary)] {
         assert!(r.ofv.is_finite(), "{label}: OFV {}", r.ofv);
         assert_eq!(
-            r.gradient_method_inner, "analytic (Dual2)",
-            "{label}: the inner gradient must be the analytic provider"
+            r.gradient_method_inner, "finite differences",
+            "{label}: every TTE subject runs the FD inner gradient"
         );
         assert!(
-            r.warnings
+            !r.warnings
                 .iter()
-                .any(|w| w.contains("8 of 8 subjects use finite-difference inner gradients")),
-            "{label}: every TTE subject runs the FD inner gradient: {:?}",
+                .any(|w| w.contains("use finite-difference inner gradients")),
+            "{label}: the label already reports FD: {:?}",
             r.warnings
         );
     }

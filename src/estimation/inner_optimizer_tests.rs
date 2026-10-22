@@ -4018,9 +4018,9 @@ mod frozen_ebe_variance {
 /// its inner η-gradient to **FD** — `subject_has_survival_records` declines it, since the
 /// hazard term has no analytic η-channel. So `ode_cumhaz_hazard`'s per-dose reads have no
 /// `Dual2` twin to keep in parity, which is what `tests/one_snapshot_dose_reads_survival.rs`
-/// states. Pinned here because the fit's model-level `gradient_method_inner` label does not
-/// say so: on that file's model it reads `analytic (Dual2)` while the per-subject route (and
-/// the run banner) is FD.
+/// states. Pinned here at the per-subject route; the model-level `gradient_method_inner`
+/// label reads FD on a TTE model since #1861
+/// (`fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd`).
 ///
 /// The control is the same subject without its event record, which the analytic recorder
 /// does serve — so the FD half is the survival record's doing, not the model's.
@@ -4083,6 +4083,139 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
         resolve_gradient_method(&model, &with_event),
         InnerGradientMethod::Fd,
         "a TTE record on a drug-driven hazard has no analytic η-channel"
+    );
+}
+
+/// #1861: the FD-fallback warning names each cause with its own count, and the model-level
+/// `gradient_method_inner` label stops claiming analytic on a TTE model.
+///
+/// One model, three subject shapes: `a` (PK only, bolus) runs analytic; `b` (`a` plus an
+/// event record) declines on its survival record; `c` (`a` with its bolus replaced by a
+/// steady-state infusion into the lagged depot, which the event walk does not serve) declines
+/// on its shape. Each population straddles one sentence of the message, so deleting either
+/// sentence — or crediting a subject to the wrong one — reddens an arm here; `[a, a]` is the
+/// silent control. The label pair is the same model with and without `[event_model]`.
+#[cfg(feature = "survival")]
+#[test]
+fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
+    use crate::types::{DoseEvent, EventType, ObsRecord, RateMode};
+    const PK: &str = "[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  theta TVLAMBDA(0.01, 0.0001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = TVF
+  ALAG = 0.5
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let tte_src = format!(
+        "{PK}[event_model]\n  cmt    = 3\n  family = exponential\n  scale  = TVLAMBDA * exp(ETA_CL)\n"
+    );
+    let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).expect("parses");
+    let (pk_model, tte_model) = (parse(PK), parse(&tte_src));
+
+    // Label: the TTE endpoint alone flips it.
+    assert!(
+        inner_reports_analytic_model(&pk_model),
+        "control: PK-only is analytic"
+    );
+    assert!(
+        !inner_reports_analytic_model(&tte_model),
+        "a TTE model's subjects with event records all run FD"
+    );
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &tte_model),
+        crate::build_info::GradientMethodKind::FiniteDifferences
+    );
+
+    let a = Subject {
+        id: "a".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![2.0, 8.0],
+        observations: vec![5.0, 3.0],
+        obs_cmts: vec![2, 2],
+        cens: vec![0, 0],
+        ..Default::default()
+    };
+    let mut b = a.clone();
+    b.id = "b".into();
+    b.obs_records = vec![ObsRecord::Event {
+        time: 20.0,
+        event_type: EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    let mut c = a.clone();
+    c.id = "c".into();
+    let mut ss = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
+    ss.rate_mode = RateMode::Fixed;
+    c.doses = vec![ss];
+    let theta = &tte_model.default_params.theta;
+    let zeros = [0.0];
+    assert_eq!(subject_inner_fd_reason(&tte_model, &a, theta, &zeros), None);
+    assert_eq!(
+        subject_inner_fd_reason(&tte_model, &b, theta, &zeros),
+        Some(InnerFdReason::Survival)
+    );
+    assert_eq!(
+        subject_inner_fd_reason(&tte_model, &c, theta, &zeros),
+        Some(InnerFdReason::Shape),
+        "fixture precondition: the SS infusion under a lag is a shape decline"
+    );
+
+    let warn = |subjects: Vec<Subject>| {
+        fd_fallback_warning(
+            &tte_model,
+            &Population {
+                subjects,
+                covariate_names: Vec::new(),
+                dv_column: "DV".into(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
+            },
+            theta,
+        )
+    };
+    const TTE: &str = "carry a time-to-event (or other non-Gaussian) record whose likelihood \
+                       term has no analytic η-gradient";
+    const SHAPE: &str = "have a shape no analytic recorder serves";
+
+    assert_eq!(
+        warn(vec![a.clone(), a.clone()]),
+        None,
+        "all-analytic is silent"
+    );
+
+    let w = warn(vec![a.clone(), b.clone()]).expect("a mixed TTE population warns");
+    assert!(
+        w.starts_with("1 of 2 subjects use finite-difference inner gradients (1 "),
+        "{w}"
+    );
+    assert!(w.contains(TTE) && !w.contains(SHAPE), "{w}");
+
+    let w = warn(vec![a.clone(), c.clone()]).expect("a mixed shape population warns");
+    assert!(
+        w.contains(&format!("(1 {SHAPE}")) && !w.contains(TTE),
+        "{w}"
+    );
+
+    let w = warn(vec![a, b, c]).expect("both causes warn");
+    assert!(
+        w.contains(&format!(
+            "2 of 3 subjects use finite-difference inner gradients (1 {TTE}; 1 {SHAPE}"
+        )),
+        "{w}"
     );
 }
 
