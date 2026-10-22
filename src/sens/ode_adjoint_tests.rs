@@ -3871,6 +3871,37 @@ fn covariate_nn_matches_reconverged_fd() {
     assert!(fd < 1e-5, "covariate NN FOCEI Hessian vs FD {fd:.2e}");
 }
 
+/// An `if` whose condition reads a network output takes the branch production takes. The
+/// generic evaluator's conditions run on an `f64` view and were handed no network outputs
+/// (the ambient thread-local they read had no writer since #2093), so `TYPICAL_PK.CL > 1`
+/// read `0 > 1` on every recording and took the `else` arm while the production predictor
+/// took the `if` one. The outputs now reach the conditions with the program's arguments.
+/// Against the reconverged FD of production's objective, with the leaves and with every
+/// network taped.
+#[cfg(feature = "nn")]
+#[test]
+fn a_condition_on_a_network_output_takes_the_production_branch() {
+    use super::NN_OUTPUT_LEAVES_OFF;
+    let src = COVARIATE_NN_IV.replace(
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL)\n",
+        "  if (TYPICAL_PK.CL > 1.0) {\n    CL = TYPICAL_PK.CL * exp(ETA_CL)\n  } else {\n    \
+         CL = 2.0 * exp(ETA_CL)\n  }\n",
+    );
+    assert_ne!(src, COVARIATE_NN_IV, "the fixture must carry the branch");
+    let (model, s) = covariate_nn_fixture_from(&src);
+    let mut worst = 0.0f64;
+    for off in [false, true] {
+        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
+        let fd = fd_oracle(&model, &s, true);
+        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
+        eprintln!("NN-output condition, leaves off = {off}: vs reconverged FD {fd:.2e}");
+        worst = worst.max(fd);
+    }
+    // Measured worst 3.1e-7 on Linux (the FD's own noise; the same as the branch-free
+    // fixture's); ~10× headroom. The `else` arm misses by O(1).
+    assert!(worst < 3e-6, "NN-output condition vs FD {worst:.2e}");
+}
+
 /// The outer gradient of a covariate-NN subject reads the networks' outputs as tape leaves
 /// and pulls their adjoints back through each network (`nn_output_leaves`), and must equal
 /// the gradient with every network taped over its weights, under FOCEI, FOCE, Laplace's

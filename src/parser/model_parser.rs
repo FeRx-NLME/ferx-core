@@ -21909,109 +21909,6 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-thread_local! {
-    /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
-    /// evaluator. Its installer (`ModelNnGuard`) was retired with the forward provider
-    /// (#2093), so it is empty in practice; the adjoint supplies NN outputs on its own
-    /// number type through `ModelNnDualGuard`.
-    static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
-    /// First dual axis of the `[covariate_nn]` output block for the generic evaluator,
-    /// or `None` (the default) to lift outputs as constants. See [`ModelNnAxisGuard`].
-    static MODEL_NN_AXIS_BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// Current `[covariate_nn]` output axis base, `None` unless a [`ModelNnAxisGuard`] is live.
-#[inline]
-fn current_nn_axis_base() -> Option<usize> {
-    MODEL_NN_AXIS_BASE.with(std::cell::Cell::get)
-}
-
-/// RAII guard that makes the generic evaluator seed every `[covariate_nn]` output as an
-/// **independent dual variable**: output `flat` (networks in `covariate_nns` order, each
-/// network's outputs in declaration order) lands on axis `base + flat`. Pair it with a
-/// source of the outputs' values at the same covariate snapshot (the retired
-/// `ModelNnGuard` before #2093).
-///
-/// This is how the FOCE/FOCEI TV-cov walk gets an exact `∂p/∂z` (and the mixed
-/// `∂²p/∂η∂z`) from one `Dual2` program evaluation, to be chained to the weight thetas
-/// with the network's backprop Jacobian — the per-event, exact form of the
-/// factorization [`crate::estimation::nn_theta_gradient`] uses with a bias finite
-/// difference (#1300). The caller owns the axis budget: every `base + flat` must be
-/// below the dual width `M` it dispatched on, or `T::var` indexes past the jet.
-///
-/// Purely crate-internal bookkeeping on the evaluator's thread-local — it adds nothing
-/// to the public `PkNum` contract, which external implementors must keep compiling
-/// against (PR #1301 review).
-pub(crate) struct ModelNnAxisGuard(Option<usize>);
-
-impl ModelNnAxisGuard {
-    /// Lift NN outputs as constants again for the guard's scope, restoring the previous
-    /// setting on drop. For a value pass that runs *inside* a seeded evaluation over a
-    /// jet-free type — the `Dual2<0>` cov-static fold in `eval_cov_static_f64` — where a
-    /// seed would index past an empty jet. A no-op when nothing is seeded.
-    fn suspend() -> Self {
-        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(None));
-        ModelNnAxisGuard(prev)
-    }
-}
-
-impl Drop for ModelNnAxisGuard {
-    fn drop(&mut self) {
-        MODEL_NN_AXIS_BASE.with(|cell| cell.set(self.0));
-    }
-}
-
-thread_local! {
-    /// `[covariate_nn]` outputs on a dual number type, set by [`ModelNnDualGuard`].
-    static MODEL_NN_DUAL: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Output `out_i` of network `nn_i` from a live [`ModelNnDualGuard`] of type `T`.
-#[inline]
-fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
-    MODEL_NN_DUAL.with(|cell| {
-        cell.borrow()
-            .as_ref()?
-            .downcast_ref::<std::rc::Rc<Vec<Vec<T>>>>()?
-            .get(nn_i as usize)?
-            .get(out_i as usize)
-            .copied()
-    })
-}
-
-/// RAII guard installing `[covariate_nn]` outputs computed on the evaluator's own number
-/// type — the network evaluated over taped weights — so the generic evaluator reads them
-/// with their derivatives, in place of the `f64` constants the retired `ModelNnGuard`
-/// installed before #2093.
-#[cfg(feature = "nn")]
-pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
-
-#[cfg(feature = "nn")]
-impl ModelNnDualGuard {
-    /// `outputs` behind an `Rc`, so a caller handing the same outputs to every recording of
-    /// a subject (`sens::ode_provider::adjoint::Leaves`) installs them without a copy.
-    pub(crate) fn enter<T: 'static>(outputs: std::rc::Rc<Vec<Vec<T>>>) -> Self {
-        ModelNnDualGuard(MODEL_NN_DUAL.with(|cell| cell.replace(Some(Box::new(outputs)))))
-    }
-}
-
-#[cfg(feature = "nn")]
-impl Drop for ModelNnDualGuard {
-    fn drop(&mut self) {
-        MODEL_NN_DUAL.with(|cell| *cell.borrow_mut() = self.0.take());
-    }
-}
-
-/// Run `f` with the ambient NN outputs borrowed. Empty unless something has filled
-/// `MODEL_NN_OUTPUTS` on this thread (its installer, `ModelNnGuard`, was retired in #2093).
-fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
-    MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
-}
-
 /// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
 /// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
 /// observe the same value a compiled readout would (the readout closure signature
@@ -27085,7 +26982,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
     eta: &[T],
     covariates: &[f64],
     vars: &[T],
-    nn_outputs: &[Vec<f64>],
+    nn_outputs: &[Vec<T>],
     stack: &mut Vec<T>,
 ) -> T {
     stack.clear();
@@ -27145,47 +27042,19 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::PushMixNum => push!(k(current_mixture_class() as f64)),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
-            // Outputs the caller computed on this number type (`ModelNnDualGuard`: the
-            // adjoint's recordings, the network over taped weights) are read as they are.
-            Op::PushNnOutput(nn_i, out_i) if nn_dual_output::<T>(nn_i, out_i).is_some() => {
-                push!(nn_dual_output::<T>(nn_i, out_i).expect("checked by the guard"));
-            }
+            // `[covariate_nn]` outputs on the evaluator's own number type, as the caller
+            // computed them (the adjoint's recordings: the network over taped weights, or
+            // the outputs as tape leaves), so their derivatives come through as they are.
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
                     .and_then(|v| v.get(out_i as usize))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        debug_assert!(
-                            false,
-                            "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i} out of bounds"
-                        );
-                        0.0
-                    });
-                // A live [`ModelNnAxisGuard`] seeds every network output on its own dual
-                // axis (`base + flat output index`), so `∂p/∂z` comes out of the same walk
-                // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
-                // always was (exact for `∂/∂η`).
-                match current_nn_axis_base() {
-                    Some(base) => {
-                        let flat: usize = nn_outputs
-                            .iter()
-                            .take(nn_i as usize)
-                            .map(Vec::len)
-                            .sum::<usize>()
-                            + out_i as usize;
-                        // The caller owns the width budget (the pre-#2093
-                        // `nn_param_derivatives_at_cov`, retired in #2093, dispatched on exactly
-                        // `n_base + n_eta + n_z`); an axis past the jet
-                        // is a wiring bug, and `var`'s bounds check fails it loudly rather
-                        // than lifting the output to a constant, which would report a zero
-                        // `∂/∂z` as analytic. The zero-width cov-static value pass runs with
-                        // seeding suspended (`ModelNnAxisGuard::suspend` in
-                        // `eval_cov_static_f64`), so it never reaches this arm.
-                        push!(T::var(v, base + flat));
-                    }
-                    None => push!(k(v)),
-                }
+                    .copied();
+                debug_assert!(
+                    v.is_some(),
+                    "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i}: no outputs handed in"
+                );
+                push!(v.unwrap_or_else(|| k(0.0)));
             }
             // The level index is integer-valued data, so its jet is empty and
             // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
@@ -27517,24 +27386,22 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     // skip nothing (every other caller passes `&[]`). Conditions are still
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
+    // `[covariate_nn]` outputs on `T` (empty for a model without a network, and for every
+    // caller whose program cannot read one).
+    nn: &[Vec<T>],
 ) {
-    // `[covariate_nn]` outputs come from the ambient `MODEL_NN_OUTPUTS` thread-local, not
-    // from a parameter, and are lifted as constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
-    // Empty when no guard is live, which is correct for every model without a network.
-    //
-    // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
-    // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
-    // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
-    // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
-    // NN guard may be entered or dropped beneath it; none is (the adjoint installs its
-    // `ModelNnDualGuard` outside this call).
-    with_nn_outputs(|nn| {
-        eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
-    })
+    // `If` conditions are evaluated on `f64` views; the outputs' view is taken once per walk.
+    let nn_val: Vec<Vec<f64>> = nn
+        .iter()
+        .map(|net| net.iter().map(|v| v.val()).collect())
+        .collect();
+    eval_statements_g_inner::<T>(
+        stmts, theta, eta, cov, vars, du, bc_stack, skip, nn, &nn_val,
+    )
 }
 
-/// The recursive body of [`eval_statements_g`], with the ambient `[covariate_nn]` outputs
-/// already resolved and borrowed by the caller.
+/// The recursive body of [`eval_statements_g`], with the `[covariate_nn]` outputs' `f64`
+/// view (`nn_val`, for the conditions) taken once by the caller.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
@@ -27546,7 +27413,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
     du: Option<&mut [T]>,
     bc_stack: &mut Vec<T>,
     skip: &[bool],
-    empty_nn: &[Vec<f64>],
+    nn: &[Vec<T>],
+    nn_val: &[Vec<f64>],
 ) {
     let mut du_opt = du;
     for s in stmts {
@@ -27555,13 +27423,13 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                 if skip.get(*idx).copied().unwrap_or(false) {
                     continue;
                 }
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -27578,8 +27446,7 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
-                    {
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, nn_val) {
                         eval_statements_g_inner::<T>(
                             body,
                             theta,
@@ -27589,7 +27456,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
-                            empty_nn,
+                            nn,
+                            nn_val,
                         );
                         taken = true;
                         break;
@@ -27606,7 +27474,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
-                            empty_nn,
+                            nn,
+                            nn_val,
                         );
                     }
                 }
@@ -29046,7 +28915,7 @@ impl OdeRhsProgram {
             }
             None => &self.stmts,
         };
-        eval_statements_g::<T>(stmts, &[], &[], &[], vars, Some(du), stack, &[]);
+        eval_statements_g::<T>(stmts, &[], &[], &[], vars, Some(du), stack, &[], &[]);
     }
 }
 
@@ -29624,14 +29493,12 @@ fn eval_endpoint_jets<const M: usize>(
         None,
         &mut stack,
         &[],
+        &[],
     );
-    let empty_nn: Vec<Vec<f64>> = Vec::new();
     outputs
         .iter()
         .map(|bc| {
-            eval_bytecode_g::<Dual1<M>>(
-                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
-            )
+            eval_bytecode_g::<Dual1<M>>(bc, &theta_d, &eta_d, &cov_vec, &vars, &[], &mut stack)
         })
         .collect()
 }
@@ -29857,6 +29724,7 @@ impl IndivParamProgram {
         theta: &[T],
         eta: &[T],
         covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
     ) -> Vec<T> {
         let cov_vec: Vec<f64> = self
             .cov_names
@@ -29888,6 +29756,7 @@ impl IndivParamProgram {
             None,
             &mut stack,
             skip,
+            nn,
         );
         self.pk_var_slots
             .iter()
@@ -29918,7 +29787,6 @@ impl IndivParamProgram {
         // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
         // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
         // future static read could not seed an axis a `Dual2<0>` does not have.
-        let _no_nn_axes = ModelNnAxisGuard::suspend();
         let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
         let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
         let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
@@ -29932,6 +29800,7 @@ impl IndivParamProgram {
             None,
             &mut stack,
             &dynamic,
+            &[],
         );
         vars.iter().map(|d| d.value).collect()
     }
@@ -30105,8 +29974,7 @@ impl OdeOutputProgram {
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &[], stack)
     }
 }
 
@@ -30157,11 +30025,8 @@ impl ScaleDerivProgram {
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<T> = Vec::new();
-        eval_bytecode_g::<T>(
-            &self.bc, theta, eta, &cov_vec, var_vals, &empty_nn, &mut stack,
-        )
+        eval_bytecode_g::<T>(&self.bc, theta, eta, &cov_vec, var_vals, &[], &mut stack)
     }
 }
 
@@ -30211,18 +30076,9 @@ impl RuvMagDerivProgram {
             T::from_f64(f64::EPSILON),
             T::from_f64(tad),
         ];
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<T> = Vec::new();
         Some(with_model_time(time, || {
-            eval_bytecode_g::<T>(
-                &self.bc,
-                theta,
-                &[],
-                &cov_vec,
-                &prog_vars,
-                &empty_nn,
-                &mut stack,
-            )
+            eval_bytecode_g::<T>(&self.bc, theta, &[], &cov_vec, &prog_vars, &[], &mut stack)
         }))
     }
 }

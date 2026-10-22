@@ -768,7 +768,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             outer.push(o);
             plain.push(p);
         }
-        (std::rc::Rc::new(outer), std::rc::Rc::new(plain))
+        (outer, plain)
     });
     #[cfg(not(feature = "nn"))]
     let _ = nn_z;
@@ -788,7 +788,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
         })
         .collect();
     #[cfg(feature = "nn")]
-    let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o));
+    let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o.as_slice()));
     #[cfg(not(feature = "nn"))]
     let leaves_outer = ThetaLeaves::theta(&th);
     let preds = record(
@@ -903,7 +903,8 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             } else {
                 let th_o: Vec<Out> = unpack_theta(template, xo);
                 #[cfg(feature = "nn")]
-                let leaves_plain = ThetaLeaves::with_nn(&th_o, preset.as_ref().map(|(_, p)| p));
+                let leaves_plain =
+                    ThetaLeaves::with_nn(&th_o, preset.as_ref().map(|(_, p)| p.as_slice()));
                 #[cfg(not(feature = "nn"))]
                 let leaves_plain = ThetaLeaves::theta(&th_o);
                 let mut terms: Vec<Out> = Vec::new();

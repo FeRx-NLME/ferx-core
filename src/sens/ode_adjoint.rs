@@ -503,7 +503,7 @@ fn unit_dirs<const N: usize>() -> [[f64; N]; N] {
 pub(super) struct ThetaLeaves<'a, T> {
     pub(super) theta: &'a [T],
     #[cfg(feature = "nn")]
-    pub(super) nn: Option<&'a std::rc::Rc<Vec<Vec<T>>>>,
+    pub(super) nn: Option<&'a [Vec<T>]>,
 }
 
 impl<'a, T> ThetaLeaves<'a, T> {
@@ -518,7 +518,7 @@ impl<'a, T> ThetaLeaves<'a, T> {
 
     /// θ leaves with the networks' outputs (`None`: evaluate the networks).
     #[cfg(feature = "nn")]
-    pub(super) fn with_nn(theta: &'a [T], nn: Option<&'a std::rc::Rc<Vec<Vec<T>>>>) -> Self {
+    pub(super) fn with_nn(theta: &'a [T], nn: Option<&'a [Vec<T>]>) -> Self {
         ThetaLeaves { theta, nn }
     }
 }
@@ -542,10 +542,7 @@ fn nn_output_leaves<'s, const N: usize, const M: usize, const TH: bool>(
     subject: &'s Subject,
     template: &ModelParameters,
     theta: &[f64],
-) -> Option<(
-    hessian::NnReduction<'s>,
-    std::rc::Rc<Vec<Vec<DualV<N, M, TH>>>>,
-)> {
+) -> Option<(hessian::NnReduction<'s>, Vec<Vec<DualV<N, M, TH>>>)> {
     #[cfg(test)]
     if NN_OUTPUT_LEAVES_OFF.with(std::cell::Cell::get) {
         return None;
@@ -562,7 +559,7 @@ fn nn_output_leaves<'s, const N: usize, const M: usize, const TH: bool>(
                 .collect()
         })
         .collect();
-    Some((red, std::rc::Rc::new(z)))
+    Some((red, z))
 }
 
 /// The weights' share of the θ adjoint under [`nn_output_leaves`]:
@@ -612,37 +609,41 @@ fn taped_params<T: VmNum>(
     eta: &[T],
     cov: &std::collections::HashMap<String, f64>,
 ) -> Vec<Option<T>> {
-    // `[covariate_nn]` outputs: the ones the recording was handed (`ThetaLeaves::nn`), or the
-    // networks over the θ (weight) inputs, on `T`.
+    // `[covariate_nn]` outputs on `T`, handed to the program as an argument: the ones the
+    // recording was given (`ThetaLeaves::nn`), or the networks over the θ (weight) inputs.
     #[cfg(feature = "nn")]
-    let _nn = (!model.covariate_nns.is_empty()).then(|| {
-        crate::parser::model_parser::ModelNnDualGuard::enter::<T>(theta.nn.cloned().unwrap_or_else(
-            || {
-                std::rc::Rc::new(
-                    model
-                        .covariate_nns
-                        .iter()
-                        .map(|nn| {
-                            let w = &theta[nn.weights_offset
-                                ..nn.weights_offset + nn.mapper.mlp().n_weights()];
-                            // Weights with no derivative (every inner recording): the network on
-                            // `f64` — memoised across the solve — lifted, not on the dual.
-                            if w.iter().all(|t| t.is_constant()) {
-                                let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
-                                if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
-                                    return y.into_iter().map(T::from_f64).collect();
-                                }
-                            }
-                            nn.mapper.forward_raw_g(w, cov)
-                        })
-                        .collect(),
-                )
-            },
-        ))
-    });
+    let computed: Vec<Vec<T>>;
+    #[cfg(feature = "nn")]
+    let nn: &[Vec<T>] = match theta.nn {
+        Some(z) => z,
+        None if model.covariate_nns.is_empty() => &[],
+        None => {
+            computed = model
+                .covariate_nns
+                .iter()
+                .map(|nn| {
+                    let w =
+                        &theta[nn.weights_offset..nn.weights_offset + nn.mapper.mlp().n_weights()];
+                    // Weights with no derivative (every inner recording): the network on
+                    // `f64` — memoised across the solve — lifted, not on the dual.
+                    if w.iter().all(|t| t.is_constant()) {
+                        let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
+                        if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
+                            return y.into_iter().map(T::from_f64).collect();
+                        }
+                    }
+                    nn.mapper.forward_raw_g(w, cov)
+                })
+                .collect();
+            &computed
+        }
+    };
     #[cfg(not(feature = "nn"))]
-    let _ = model;
-    let vals = prog.eval_params_g(theta, eta, cov);
+    let nn: &[Vec<T>] = {
+        let _ = model;
+        &[]
+    };
+    let vals = prog.eval_params_g(theta, eta, cov, nn);
     let mut by_slot = vec![None; n_slots];
     for (&(slot, _), v) in prog.pk_var_slots().iter().zip(vals) {
         if slot < n_slots {
@@ -2191,7 +2192,7 @@ fn run<const N: usize, const M: usize>(
     #[cfg(feature = "nn")]
     let nn_out = nn_output_leaves::<N, M, false>(model, subject, template, theta);
     #[cfg(feature = "nn")]
-    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z));
+    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z.as_slice()));
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
     let unit = unit_dirs::<N>();
@@ -2641,7 +2642,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     #[cfg(feature = "nn")]
     let nn_out = nn_output_leaves::<N, M2, TH>(model, subject, template, theta);
     #[cfg(feature = "nn")]
-    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z));
+    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z.as_slice()));
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
     // Node predictions at their own b_j, taped for their θ path (canonical tangents: G at
