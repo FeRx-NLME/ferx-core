@@ -1034,6 +1034,25 @@ pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subjec
         || model_uses_time_builtin(model)
 }
 
+/// Whether [`compute_predictions_with_states`] reports **approximate** compartment
+/// states for this subject on an ODE model (#1855).
+///
+/// That function routes a subject to the event-driven state pass on
+/// `has_tv_covariates() || has_resets() || model_uses_time_anywhere`, and that pass
+/// holds the disposition (CL, V, …) at the first observation's snapshot for the whole
+/// timeline (`ode_predictions_event_driven_with_states`). This is the part of that
+/// predicate where the snapshot is **not** uniform: a time-varying covariate, or an
+/// individual-parameter program reading `TIME`. The other two arms are exact — a reset
+/// alone, or an `[odes]` RHS reading time (the integrator evaluates it at the true
+/// time), keeps one snapshot for every observation.
+///
+/// `model` is the **effective** model for the subject ([`effective_model_for_eval`]):
+/// `false` for a subject served by a closed form, whose states follow the analytical
+/// rules instead.
+pub(crate) fn ode_cmt_states_approximate(model: &CompiledModel, subject: &Subject) -> bool {
+    model.ode_spec.is_some() && (subject.has_tv_covariates() || model_uses_time_builtin(model))
+}
+
 /// The occasion label to evaluate an EVID=3/4 **reset row's** `$PK` under, on the
 /// `OCC`-column IOV path (#1133).
 ///
@@ -2764,6 +2783,10 @@ pub fn compute_predictions_with_states(
         // TV-covariate and reset subjects need the event-driven path (which also
         // handles resets as break-points). Plain subjects use the simpler function
         // that avoids the per-event PK-parameter machinery.
+        //
+        // The event-driven states hold the disposition at the first observation's
+        // snapshot; `ode_cmt_states_approximate` is the subset of this branch where
+        // that snapshot is not uniform, and gates `W_DERIVED_CMT_TV_ODE` (#1855).
         let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
         let (mut ipred, states) =
             if subject.has_tv_covariates() || subject.has_resets() || uses_time {
