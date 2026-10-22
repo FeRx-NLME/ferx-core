@@ -2882,7 +2882,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_width_declines, subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
+    cov_width_declines, subject_adjoint_cov_diag_at, subject_adjoint_cov_hessian_at,
+    subject_adjoint_eta_dx_at,
 };
 #[cfg(test)]
 pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};

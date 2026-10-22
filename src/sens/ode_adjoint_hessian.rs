@@ -149,6 +149,74 @@ pub(crate) fn subject_adjoint_cov_hessian_at(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Full)? {
+        HessianOut::Full(h) => Some(h),
+        HessianOut::Diag(_) => None,
+    }
+}
+
+/// The diagonal of [`subject_adjoint_cov_hessian_at`] along the packed `axes` (in `axes`
+/// order): `∂²Fᵢ/∂x_a²` for each `a`, at `axes.len()` directions instead of `x.len()` and
+/// without the dense block — what the #2159 identity-scale pre-flight reads its candidates'
+/// curvature from. `None` outside the adjoint's scope or for an axis past `x`.
+pub(crate) fn subject_adjoint_cov_diag_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<Vec<f64>> {
+    if axes.iter().any(|&i| i >= pt.x.len()) {
+        return None;
+    }
+    match cov_hessian(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        HessianSel::Diag(axes),
+    )? {
+        HessianOut::Diag(d) => Some(d),
+        HessianOut::Full(_) => None,
+    }
+}
+
+/// Which part of the covariance Hessian a pass assembles.
+#[derive(Clone, Copy)]
+enum HessianSel<'a> {
+    /// The full `x.len()`-square matrix.
+    Full,
+    /// The diagonal entries along these packed axes.
+    Diag(&'a [usize]),
+}
+
+/// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
+enum HessianOut {
+    Full(DMatrix<f64>),
+    Diag(Vec<f64>),
+}
+
+impl HessianOut {
+    fn all_finite(&self) -> bool {
+        match self {
+            HessianOut::Full(h) => h.iter().all(|v| v.is_finite()),
+            HessianOut::Diag(d) => d.iter().all(|v| v.is_finite()),
+        }
+    }
+}
+
+/// The bucket dispatch shared by [`subject_adjoint_cov_hessian_at`] and
+/// [`subject_adjoint_cov_diag_at`].
+fn cov_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    sel: HessianSel<'_>,
+) -> Option<HessianOut> {
     let (template, x) = (pt.template, pt.x);
     let mut sc = scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
@@ -159,13 +227,19 @@ pub(crate) fn subject_adjoint_cov_hessian_at(
     // stack: this runs on the fit pool's workers (`FIT_RAYON_STACK_SIZE`), on the caller's
     // thread so every fit-scoped override (`bloq_method`, …) it reads is the fit's.
     let h = match (bucket, exact) {
-        (4, true) => hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective),
-        (8, true) => hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective),
-        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
-        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
-        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
-        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
-        (48, _) => hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
+        (4, true) => {
+            hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective, sel)
+        }
+        (8, true) => {
+            hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective, sel)
+        }
+        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective, sel),
+        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective, sel),
+        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective, sel),
+        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective, sel),
+        (48, _) => {
+            hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective, sel)
+        }
         _ => None,
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
@@ -359,7 +433,8 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     template: &ModelParameters,
     x: &[f64],
     objective: Objective,
-) -> Option<DMatrix<f64>> {
+    sel: HessianSel<'_>,
+) -> Option<HessianOut> {
     let (model, params) = (sc.model, sc.params);
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
@@ -381,7 +456,7 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
                 dirs,
             )
         };
-        if let Some(h) = red.hessian::<N>(model, &pass, template, x, sc.width) {
+        if let Some(h) = red.hessian::<N>(model, &pass, template, x, sc.width, sel) {
             #[cfg(test)]
             NN_REDUCED_HITS.with(|c| c.set(c.get() + 1));
             return Some(h);
@@ -390,13 +465,23 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let pass = |dirs: &[Dir<N>]| {
         pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
     };
-    let (w, eta_x, nodes) = mode_response::<N>(&pass, &x_dirs(n))?;
+    let axes: Vec<usize> = match sel {
+        HessianSel::Full => (0..n).collect(),
+        HessianSel::Diag(axes) => axes.to_vec(),
+    };
+    let along: Vec<Dir<N>> = axes.iter().map(|&i| Dir::x(i, [0.0; N])).collect();
+    let (w, eta_x, nodes) = mode_response::<N>(&pass, &along)?;
     // Uᵀ∇²Ψ U along u_a = (e_a, η′e_a).
-    let dirs: Vec<Dir<N>> = (0..n)
-        .map(|i| Dir::x(i, std::array::from_fn(|k| eta_x[(k, i)])))
+    let dirs: Vec<Dir<N>> = axes
+        .iter()
+        .enumerate()
+        .map(|(c, &i)| Dir::x(i, std::array::from_fn(|k| eta_x[(k, c)])))
         .collect();
-    let (_, hess) = psi_along(&pass, &w, &dirs, pass_width(nodes))?;
-    hess.iter().all(|v| v.is_finite()).then_some(hess)
+    let out = match sel {
+        HessianSel::Full => HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1),
+        HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&pass, &w, &dirs, pass_width(nodes))?),
+    };
+    out.all_finite().then_some(out)
 }
 
 /// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by reverse over forward: per pass,
@@ -412,7 +497,43 @@ fn psi_along<const N: usize>(
     let n = dirs.len();
     let mut grad = DVector::<f64>::zeros(n);
     let mut hess = DMatrix::<f64>::zeros(n, n);
-    for (c, chunk) in dirs.chunks(width.clamp(1, K)).enumerate() {
+    psi_lanes(pass, w, dirs, width, |i, g, along| {
+        grad[i] = g;
+        for (j, d) in dirs.iter().enumerate() {
+            hess[(j, i)] = along(d);
+        }
+    })?;
+    Some((grad, hess.symmetric_part()))
+}
+
+/// The diagonal of [`psi_along`]'s `∇²Ψ_w` along `dirs`: each lane read along its own
+/// direction only, `O(n)` reads instead of `O(n²)` and no `n × n` matrix.
+fn psi_diag<const N: usize>(
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
+    w: &[f64; N],
+    dirs: &[Dir<N>],
+    width: usize,
+) -> Option<Vec<f64>> {
+    let mut diag = vec![0.0; dirs.len()];
+    psi_lanes(pass, w, dirs, width, |i, _, along| {
+        diag[i] = along(&dirs[i])
+    })?;
+    Some(diag)
+}
+
+/// The sweep [`psi_along`] and [`psi_diag`] share: per pass `width` (≤ `K`) of `dirs` as
+/// the forward tangents and one sweep of `Ψ_w = F − wᵀg`, then `lane(i, ∂Ψ_w/∂u_i, along)`
+/// for each direction `i` in the pass, where `along(d)` reads `d`'s component of the column
+/// `∇²Ψ_w u_i` off the sweep.
+fn psi_lanes<const N: usize>(
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
+    w: &[f64; N],
+    dirs: &[Dir<N>],
+    width: usize,
+    mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir<N>) -> f64),
+) -> Option<()> {
+    let width = width.clamp(1, K);
+    for (c, chunk) in dirs.chunks(width).enumerate() {
         let p = pass(chunk)?;
         let psi = p.f
             - <Out as PkNum>::wsum3(
@@ -421,14 +542,12 @@ fn psi_along<const N: usize>(
             );
         let adj = rsweep::<K>(&psi.g);
         for a in 0..chunk.len() {
-            let i = c * width.clamp(1, K) + a;
-            grad[i] = psi.g[a].v;
-            for (j, d) in dirs.iter().enumerate() {
-                hess[(j, i)] = p.leaves.along(adj, a, d);
-            }
+            lane(c * width + a, psi.g[a].v, &|d: &Dir<N>| {
+                p.leaves.along(&adj, a, d)
+            });
         }
     }
-    Some((grad, hess.symmetric_part()))
+    Some(())
 }
 
 #[cfg(all(test, feature = "nn"))]
@@ -530,7 +649,8 @@ impl<'s> NnReduction<'s> {
         template: &ModelParameters,
         x: &[f64],
         width: usize,
-    ) -> Option<DMatrix<f64>> {
+        sel: HessianSel<'_>,
+    ) -> Option<HessianOut> {
         let n = x.len();
         let n_z: usize = self.z.iter().map(Vec::len).sum();
         let mut is_w = vec![false; n];
@@ -576,15 +696,41 @@ impl<'s> NnReduction<'s> {
                 c[(nr + n_z + j, *a)] = (0..n_z).map(|k| resp[(j, nr + k)] * ja[k]).sum();
             }
         }
-        let mut hess = c.transpose() * hb * &c;
-        for (k, net_h) in hz.iter().enumerate() {
-            let gk = gb[nr + k];
-            for &((a, b), v) in net_h {
-                hess[(a, b)] += gk * v;
+        let out = match sel {
+            HessianSel::Full => {
+                let mut hess = c.transpose() * hb * &c;
+                for (k, net_h) in hz.iter().enumerate() {
+                    let gk = gb[nr + k];
+                    for &((a, b), v) in net_h {
+                        hess[(a, b)] += gk * v;
+                    }
+                }
+                HessianOut::Full(hess.symmetric_part())
             }
-        }
-        let hess = hess.symmetric_part();
-        hess.iter().all(|v| v.is_finite()).then_some(hess)
+            // `cᵢᵀ H_B cᵢ` per axis plus the networks' own curvature on the diagonal, with no
+            // `n × n` product.
+            HessianSel::Diag(axes) => {
+                let mut own = vec![0.0; n];
+                for (k, net_h) in hz.iter().enumerate() {
+                    let gk = gb[nr + k];
+                    for &((a, b), v) in net_h {
+                        if a == b {
+                            own[a] += gk * v;
+                        }
+                    }
+                }
+                let hbs = hb.symmetric_part();
+                HessianOut::Diag(
+                    axes.iter()
+                        .map(|&a| {
+                            let ca = c.column(a);
+                            (ca.transpose() * &hbs * ca)[(0, 0)] + own[a]
+                        })
+                        .collect(),
+                )
+            }
+        };
+        out.all_finite().then_some(out)
     }
 
     /// `J_z` as `(packed weight axis, ∂z/∂x_a over all outputs)` and per output `k` the

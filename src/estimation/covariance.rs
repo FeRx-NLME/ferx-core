@@ -1047,6 +1047,204 @@ pub(super) enum AnalyticCovAssembly {
 /// the same matrix by one fewer route.
 const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 
+/// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
+/// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
+/// subject's occasions.
+fn stacked_mode<'a>(
+    model: &CompiledModel,
+    subject: &Subject,
+    eta_hat: &'a DVector<f64>,
+    kappas: Option<&Vec<DVector<f64>>>,
+) -> Option<std::borrow::Cow<'a, [f64]>> {
+    if model.n_kappa == 0 {
+        return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
+    }
+    let kap = kappas?;
+    if kap.len() != crate::stats::stacked_layout::group_count(subject)
+        || kap.iter().any(|k| k.len() != model.n_kappa)
+    {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(
+        eta_hat
+            .iter()
+            .copied()
+            .chain(kap.iter().flat_map(|k| k.iter().copied()))
+            .collect(),
+    ))
+}
+
+/// Test watch: `(template address, count)` — the subjects [`per_subject_adjoint`] handed to
+/// its closure for that one template, on any worker (keyed so concurrent tests do not count).
+#[cfg(test)]
+pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly`]) and the
+/// #2159 identity-scale pre-flight ([`exact_candidate_derivatives`]) share: the
+/// population-level gates, one [`PackedPoint`](crate::sens::ode_provider::adjoint::PackedPoint)
+/// for every subject, each subject's stacked mode, cooperative cancellation and the test
+/// decline hook, then `f(subject, point, mode, objective)` per subject in parallel. `None`
+/// when a gate refuses the whole population; a `None` entry is a subject `f` (or its mode)
+/// declined.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_adjoint<R: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    f: impl Fn(
+            &Subject,
+            &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+            &[f64],
+            crate::sens::ode_provider::adjoint::Objective,
+        ) -> Option<R>
+        + Sync,
+) -> Option<Vec<Option<R>>> {
+    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
+    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
+    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
+    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
+    // too; here it would additionally be reported as complete, so it is refused outright.
+    if eta_hats.len() != population.subjects.len() {
+        return None;
+    }
+    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
+    if crate::types::GradientMethod::forced_fd(model) {
+        return None;
+    }
+    // The objective differentiated is the one the fit minimised: the FOCE/FOCEI marginal,
+    // or — `agq_nodes()` is `Some` for `method = laplace` at any node count and
+    // `method = focei` with `n_agq > 1` — the quadrature marginal under its own anchor (`H̃`,
+    // or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on `H` would be
+    // "standard errors for a likelihood it never optimised" (PR #953 review finding 1), so
+    // the objective is taken from the same options the fit ran on.
+    //
+    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
+    // differentiates every one of these objectives — FOCE (its frozen-variance mode
+    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
+    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
+    let objective = cov_objective(options);
+    // One unpack for the population: every subject is at `x`.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
+    Some(
+        population
+            .subjects
+            .par_iter()
+            .zip(eta_hats.par_iter())
+            .enumerate()
+            .map(|(i, (subject, eta_hat))| {
+                let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+                // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
+                // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
+                // assembly per subject, and for the default `covariance_method = r` there is no
+                // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
+                // advertises before the covariance step (#893) was inoperative. Returning
+                // `None` alone would drop into the *more* expensive FD stencil; the caller
+                // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
+                if crate::cancel::is_cancelled(&options.cancel) {
+                    return None;
+                }
+                #[cfg(test)]
+                if forced_cov_decline::declines(&subject.id) {
+                    return None;
+                }
+                #[cfg(test)]
+                if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
+                    if let Some((addr, n)) = watch.as_mut() {
+                        if *addr == template as *const ModelParameters as usize {
+                            *n += 1;
+                        }
+                    }
+                }
+                f(subject, &pt, &b, objective)
+            })
+            .collect(),
+    )
+}
+
+/// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`
+/// (the adjoint gradient) and `∂²OFV/∂x_a²` (the R-matrix's diagonal along `axes`, at
+/// `axes.len()` directions per subject), both of [`cov_objective`]'s objective at the **same**
+/// modes, so the pair is one function's first and second derivative. What the #2159
+/// identity-scale pre-flight reads its candidates' Newton step and curvature from.
+///
+/// The modes are re-solved warm from `warm` at `cov_inner_tol`, as the covariance step does
+/// before its own R-matrix: both derivatives assume `∂lᵢ/∂η = 0` at the mode, which a fit's
+/// `inner_tol` only approximates (#2291 review). `None` — and the caller probes instead —
+/// unless every subject converges there and is served exactly, when the exact R-matrix is
+/// switched off (`analytic_cov_hessian = false`), under `gradient = fd`, or on cancel. A
+/// partial sum would be a different objective's derivatives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_candidate_derivatives(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<Vec<(f64, f64)>> {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_diag_at, subject_adjoint_gradient_at,
+    };
+    if !options.analytic_cov_hessian || warm.len() != population.subjects.len() {
+        return None;
+    }
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+        x,
+        model,
+        population,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        true,
+    );
+    if !all_converged {
+        return None;
+    }
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        &ehs,
+        &kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let d = subject_adjoint_cov_diag_at(model, subject, pt, b, objective, axes)?;
+            let pairs: Vec<(f64, f64)> = axes
+                .iter()
+                .zip(d)
+                .map(|(&a, h)| (g.get(a).copied().unwrap_or(f64::NAN), h))
+                .collect();
+            pairs
+                .iter()
+                .all(|(g, h)| g.is_finite() && h.is_finite())
+                .then_some(pairs)
+        },
+    )?;
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    // In subject order, so the sum does not depend on the thread count.
+    let mut acc = vec![(0.0, 0.0); axes.len()];
+    for pairs in per_subject {
+        for (a, (g, h)) in acc.iter_mut().zip(pairs?) {
+            // ×2: the per-subject NLL to the OFV (see `analytic_cov_assembly`).
+            a.0 += 2.0 * g;
+            a.1 += 2.0 * h;
+        }
+    }
+    Some(acc)
+}
+
 /// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
 /// the OFV convention, for as much of the population as is in scope.
 ///
@@ -1061,75 +1259,19 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
-    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
-    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
-    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
-    // too; here it would additionally be reported as complete, so it is refused outright.
-    if eta_hats.len() != population.subjects.len() {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
-    if crate::types::GradientMethod::forced_fd(model) {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // The objective this assembly differentiates is the one the fit minimised: the
-    // FOCE/FOCEI marginal, or — `agq_nodes()` is `Some` for `method = laplace` at any node
-    // count and `method = focei` with `n_agq > 1` — the quadrature marginal under its own
-    // anchor (`H̃`, or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on
-    // `H` would be "standard errors for a likelihood it never optimised" (PR #953 review
-    // finding 1), so the objective is taken from the same options the fit ran on.
-    //
-    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
-    // differentiates every one of these objectives — FOCE (its frozen-variance mode
-    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
-    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian_at, PackedPoint};
-    let objective = cov_objective(options);
+    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_at;
     let n = x_hat.len();
-    // One unpack for the population: every subject's Hessian is at `x_hat`.
-    let Some(pt) = PackedPoint::new(template, x_hat) else {
-        return AnalyticCovAssembly::Unavailable;
-    };
-    let per_subject: Vec<Option<DMatrix<f64>>> = population
-        .subjects
-        .par_iter()
-        .zip(eta_hats.par_iter())
-        .enumerate()
-        .map(|(i, (subject, eta_hat))| {
-            let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
-                let kap = kappas.get(i)?;
-                if kap.len() != crate::stats::stacked_layout::group_count(subject)
-                    || kap.iter().any(|k| k.len() != model.n_kappa)
-                {
-                    return None;
-                }
-                std::borrow::Cow::Owned(
-                    eta_hat
-                        .iter()
-                        .copied()
-                        .chain(kap.iter().flat_map(|k| k.iter().copied()))
-                        .collect(),
-                )
-            } else {
-                std::borrow::Cow::Borrowed(eta_hat.as_slice())
-            };
-            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
-            // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
-            // subject, and for the default `covariance_method = r` there is no later checkpoint
-            // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
-            // covariance step (#893) was inoperative. Returning `None` alone would drop into
-            // the *more* expensive FD stencil; the caller re-checks the flag and reports
-            // cancelled instead (PR #953 review finding 10).
-            if crate::cancel::is_cancelled(&options.cancel) {
-                return None;
-            }
-            #[cfg(test)]
-            if forced_cov_decline::declines(&subject.id) {
-                return None;
-            }
+    let Some(per_subject) = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x_hat,
+        eta_hats,
+        kappas,
+        options,
+        |subject, pt, b, objective| {
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)?;
+            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
@@ -1143,8 +1285,10 @@ pub(super) fn analytic_cov_assembly(
             // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
             // positive-definite and plausibly sized.
             Some(2.0 * h)
-        })
-        .collect();
+        },
+    ) else {
+        return AnalyticCovAssembly::Unavailable;
+    };
     // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
     // between subjects so they are not reallocated per pass. Past the last subject nothing
     // else needs them at that size, so release them on every worker of the pool (#2093):
@@ -1545,6 +1689,37 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
+    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+        xv,
+        model,
+        pop,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        parallel_subjects,
+    );
+    (params, ehs, hms, kaps)
+}
+
+/// [`reconverge_population`], and whether every subject's inner solve converged.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconverge_population_checked(
+    xv: &[f64],
+    model: &CompiledModel,
+    pop: &Population,
+    template: &ModelParameters,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    cov_inner_tol: f64,
+    parallel_subjects: bool,
+) -> (
+    ModelParameters,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    bool,
+) {
     let params = unpack_params(xv, template);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let ebes = map_subjects(pop, parallel_subjects, |i: usize| {
@@ -1564,12 +1739,14 @@ pub(super) fn reconverge_population(
     let mut ehs = Vec::with_capacity(n);
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
+    let mut all_converged = true;
     for ebe in ebes {
+        all_converged &= ebe.converged;
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps)
+    (params, ehs, hms, kaps, all_converged)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
