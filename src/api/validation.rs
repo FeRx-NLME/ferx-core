@@ -5728,12 +5728,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // Rust callers bypass the parser's lower bound. Zero must not disable FOCEI
-    // quadrature or be silently coerced to one-node Laplace by agq_nodes().
-    if options.n_agq == 0
-        && chain
-            .iter()
-            .any(|m| matches!(m, EstimationMethod::FoceI | EstimationMethod::Laplace))
-    {
+    // quadrature or be silently coerced to one-node Laplace by agq_nodes(). Refused under
+    // every method, not only the two that read it: every fit records `n_agq` in its
+    // `scoring_settings`, and a `.fitrx` holding a 0 there does not load (#1770).
+    if options.n_agq == 0 {
         diags.push(
             Diagnostic::error(
                 "E_AGQ_NODES_ZERO",
@@ -5741,6 +5739,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    // `sir_df` below 1 runs (`ChiSquared` takes any `nu > 0`) and is recorded in a
+    // `sir.settings` the `.fitrx` reader refuses (#1770). Refused here wherever SIR can
+    // run, with the code and text `run_sir` refuses it with: the in-fit SIR would
+    // otherwise only report it as a `SIR failed:` warning after the whole fit.
+    if options.sir || options.covariance_fallback == crate::types::CovarianceFallback::Sir {
+        if let Err(e) = crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df) {
+            diags.push(Diagnostic::error("E_SIR_OPTIONS", e.to_string()));
+        }
     }
 
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
@@ -5777,6 +5785,25 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         .any(|&m| matches!(m, EstimationMethod::Laplace));
     let focei_quadrature =
         chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1;
+    // The per-dimension node cap below, for a chain no quadrature reads `n_agq` in: the
+    // value goes unused but is recorded in `scoring_settings`, and a `.fitrx` holding one
+    // past the cap does not load (#1770).
+    if !(laplace_stage || focei_quadrature) && options.n_agq > crate::estimation::agq::MAX_AGQ_NODES
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_AGQ_NODES_TOO_LARGE",
+                format!(
+                    "n_agq = {} exceeds the {}-node per-dimension limit. No stage of this fit \
+                     reads it; remove n_agq or set it within 1..={}.",
+                    options.n_agq,
+                    crate::estimation::agq::MAX_AGQ_NODES,
+                    crate::estimation::agq::MAX_AGQ_NODES,
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    }
     if laplace_stage || focei_quadrature {
         // IOV is **supported**: the quadrature integrates over the stacked (η, κ₁..κ_K),
         // which is exactly what `individual_nll_iov` already scores. What IOV changes is the

@@ -990,6 +990,113 @@ impl Default for ScoringSettings {
     }
 }
 
+/// A setting outside the domain `[fit_options]` accepts for its key (#1770): the one copy
+/// of that domain for the keys a run records, shared by `fit()`'s option checks, `run_sir`,
+/// the `.fitrx` writer and its reader. `field` is the key as the caller spells it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutOfDomain {
+    pub(crate) field: &'static str,
+    pub(crate) why: String,
+    pub(crate) got: String,
+}
+
+impl OutOfDomain {
+    /// The refusal with `field` qualified by the record it was read from, as the `.fitrx`
+    /// reader and writer report it: `sir.settings.n_agq must be …`.
+    pub(crate) fn in_block(&self, block: &str) -> String {
+        format!("{block}.{self}")
+    }
+}
+
+impl std::fmt::Display for OutOfDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} must be {}, got {}", self.field, self.why, self.got)
+    }
+}
+
+/// `ode_reltol` / `ode_abstol`: positive and finite.
+pub(crate) fn ode_tol_in_domain(field: &'static str, v: f64) -> Result<(), OutOfDomain> {
+    if v > 0.0 && v.is_finite() {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field,
+        why: "a positive finite value".into(),
+        got: v.to_string(),
+    })
+}
+
+/// `ode_max_steps`: positive.
+pub(crate) fn ode_max_steps_in_domain(v: usize) -> Result<(), OutOfDomain> {
+    if v > 0 {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "ode_max_steps",
+        why: "a positive integer".into(),
+        got: v.to_string(),
+    })
+}
+
+/// `ode_stiff_abort_after`: positive or absent. `[fit_options]` reads `0` as "off", i.e.
+/// `None`, so `Some(0)` names no setting a model file can express.
+pub(crate) fn ode_stiff_abort_after_in_domain(v: Option<u32>) -> Result<(), OutOfDomain> {
+    if v != Some(0) {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "ode_stiff_abort_after",
+        why: "positive or absent".into(),
+        got: "0".into(),
+    })
+}
+
+/// `n_agq`: in `1..=MAX_AGQ_NODES`.
+pub(crate) fn n_agq_in_domain(v: usize) -> Result<(), OutOfDomain> {
+    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    if (1..=max).contains(&v) {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "n_agq",
+        why: format!("in 1..={max}"),
+        got: v.to_string(),
+    })
+}
+
+/// `sir_df`: `>= 1`, or `∞` (the `normal` token). `NaN` is refused.
+pub(crate) fn sir_df_in_domain(field: &'static str, v: f64) -> Result<(), OutOfDomain> {
+    if v >= 1.0 {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field,
+        why: ">= 1 or \"normal\"".into(),
+        got: v.to_string(),
+    })
+}
+
+impl ScoringSettings {
+    /// The first field outside the `[fit_options]` domain, if any (#1770). A record holds
+    /// `gradient_method` `auto` or `fd`: `ad` is retired (`E_AD_RETIRED`), and
+    /// [`of_run`](Self::of_run) records a run handed it as the `auto` it ran.
+    pub(crate) fn check_domain(&self) -> Result<(), OutOfDomain> {
+        ode_tol_in_domain("ode_reltol", self.ode_reltol)?;
+        ode_tol_in_domain("ode_abstol", self.ode_abstol)?;
+        ode_max_steps_in_domain(self.ode_max_steps)?;
+        n_agq_in_domain(self.n_agq)?;
+        ode_stiff_abort_after_in_domain(self.ode_stiff_abort_after)?;
+        if self.gradient_method == GradientMethod::Ad {
+            return Err(OutOfDomain {
+                field: "gradient_method",
+                why: "auto or fd".into(),
+                got: "\"ad\"".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// `options` with every scoring setting the caller left at its [`FitOptions::default`]
 /// value taken from `rec` (#426). Value-based, as `run_sir` resolves its own settings
 /// (#1758): a field equal to its default reads as "no opinion", so the caller's

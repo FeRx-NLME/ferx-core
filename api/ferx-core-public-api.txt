@@ -953,6 +953,7 @@ pub ferx_core::io::fitrx::FitrxError::Corrupt(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Io(std::io::error::Error)
 pub ferx_core::io::fitrx::FitrxError::Json(serde_json::error::Error)
 pub ferx_core::io::fitrx::FitrxError::UnsupportedVersion(alloc::string::String)
+pub ferx_core::io::fitrx::FitrxError::Unwritable(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Zip(zip::result::ZipError)
 pub struct ferx_core::io::fitrx::LoadedFit
 pub ferx_core::io::fitrx::LoadedFit::fit: ferx_core::FitResult
