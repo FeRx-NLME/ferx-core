@@ -236,3 +236,68 @@ fn run_covariance_and_run_sir_refuse_it() {
         }
     }
 }
+
+/// #1854: the covariate axis of the same freeze reaches the post-fit re-scorers too.
+/// `WT` steps from 70 to 90 at `t = 5` and `CL` reads it, so the frozen `[odes]` solve
+/// would read `CL` at the baseline `WT`. `fit()` refuses it; a `FitResult` of the
+/// `WT`-free control handed the `WT` model must be refused by `run_covariance()` and
+/// `run_sir()` as well — and handed the control, neither may return this code. The step
+/// is carried by the `t = 8` PK record: the reader keeps no covariates on discrete-state
+/// rows, so a change seen only there is time-varying to no engine.
+#[test]
+fn run_covariance_and_run_sir_refuse_a_tv_covariate_on_the_disposition() {
+    const DATA_WT: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n\
+                           1,0,.,1,100,1,0,1,0,0,70\n\
+                           1,0.5,0,0,.,5,0,0,0,0,70\n\
+                           1,1,9,0,.,1,0,0,0,0,70\n\
+                           1,1.3,1,0,.,5,0,0,0,0,70\n\
+                           1,2.6,0,0,.,5,0,0,0,0,70\n\
+                           1,5,1,0,.,5,0,0,0,0,90\n\
+                           1,8,4,0,.,1,0,0,0,0,90\n\
+                           1,12,0,0,.,5,0,0,0,0,90\n\
+                           1,20,1,0,.,5,0,0,0,0,90\n";
+    let refusing = model("TVCL * WT / 70");
+    let control = model(FREE_CL);
+    let mut f = tempfile::NamedTempFile::new().expect("create temp csv");
+    f.write_all(DATA_WT.as_bytes()).expect("write temp csv");
+    let path = f.path().to_str().expect("temp path is utf-8");
+    let (pop, _) = read_population_for(&refusing, &None, path, None, None, None, &[])
+        .expect("endpoint-routed load must succeed");
+    let opts = fit_opts();
+
+    let err = fit(&refusing, &pop, &refusing.default_params, &opts)
+        .expect_err("fit must refuse a TV covariate on CL");
+    assert_eq!(err.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{err}");
+
+    let res = fit(&control, &pop, &control.default_params, &opts).expect("control fits");
+    for (entry, out) in [
+        (
+            "run_covariance",
+            run_covariance(&res, Some(&refusing), Some(&pop), &opts),
+        ),
+        ("run_sir", run_sir(&res, Some(&refusing), Some(&pop), &opts)),
+    ] {
+        let err = out.expect_err(entry);
+        assert_eq!(
+            err.code(),
+            Some("E_ENDPOINT_TV_COVARIATE"),
+            "{entry}: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[markov_model] on CMT=5") && msg.contains("`CL` reads covariate `WT`"),
+            "{entry}: {msg}"
+        );
+    }
+    for (entry, out) in [
+        (
+            "run_covariance",
+            run_covariance(&res, Some(&control), Some(&pop), &opts),
+        ),
+        ("run_sir", run_sir(&res, Some(&control), Some(&pop), &opts)),
+    ] {
+        if let Err(e) = out {
+            assert_ne!(e.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{entry}: {e}");
+        }
+    }
+}
