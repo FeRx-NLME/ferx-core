@@ -1809,7 +1809,8 @@ pub(crate) fn compute_covariance_for(
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     // The free coordinates whose units the eigenvalue floor on `S` and `R` must not see (#2145).
-    let unit_coords = free_coordinate_units(template, x_hat, &free_idx);
+    let unit_coords =
+        free_coordinate_units(template, x_hat, &free_idx, &model.nn_weight_theta_ranges());
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
@@ -2680,7 +2681,9 @@ pub(crate) enum CoordUnits {
     /// direction, and the floor sees the coordinate as it is.
     Dimensionless,
     /// An identity-packed θ: its units are unknown to ferx, so its diagonal is equilibrated
-    /// against the largest dimensionless one (#2145).
+    /// against the largest dimensionless one (#2145). Not a `[covariate_nn]` weight, which is
+    /// identity-packed but has no user units, and stays [`Dimensionless`](Self::Dimensionless)
+    /// so a weight the data does not identify is still clipped and reported (#2273).
     IdentityTheta,
     /// A coordinate whose units are those of a known estimate `s`, so `x / s` is unit-free: an
     /// Ω Cholesky off-diagonal `L_ij`, scaled by its row's diagonal `L̂_ii` (#2274).
@@ -2789,16 +2792,24 @@ fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Ve
 /// `x_hat` (#2274), and everything else dimensionless. The walk mirrors
 /// `pack_params_with_moves`: θ, the Ω lower triangle, σ, the IOV lower triangle; the mixture
 /// overrides and the ρ's that follow are log- and Fisher-z-packed.
+///
+/// `nn_weights` are the θ ranges of the `[covariate_nn]` weights
+/// (`CompiledModel::nn_weight_theta_ranges`). A weight is identity-packed (its lower bound is
+/// `-∞`) but is not a parameter in user units, so it stays dimensionless: equilibrated, a flat
+/// weight — one feeding a saturated unit — would sit at the anchor and escape the floor and the
+/// `covariance_regularized` warning (#2273).
 fn free_coordinate_units(
     template: &ModelParameters,
     x_hat: &[f64],
     free_idx: &[usize],
+    nn_weights: &[std::ops::Range<usize>],
 ) -> Vec<CoordUnits> {
     let mut units: Vec<CoordUnits> = template
         .theta_lower
         .iter()
-        .map(|&lo| {
-            if theta_packs_log(lo) {
+        .enumerate()
+        .map(|(i, &lo)| {
+            if theta_packs_log(lo) || nn_weights.iter().any(|w| w.contains(&i)) {
                 CoordUnits::Dimensionless
             } else {
                 CoordUnits::IdentityTheta
@@ -3666,7 +3677,7 @@ mod tests {
         let x = crate::estimation::parameterization::pack_params(&t);
         // Packed: θ₀, θ₁, L₁₁, L₂₁, L₂₂, σ.
         assert_eq!(x.len(), 6);
-        let units = super::free_coordinate_units(&t, &x, &[0, 1, 2, 3, 4, 5]);
+        let units = super::free_coordinate_units(&t, &x, &[0, 1, 2, 3, 4, 5], &[]);
         let want_l11 = 0.3_f64;
         let want_l22 = (25.0 * k * k - k * k).sqrt();
         match units[3] {
@@ -3686,9 +3697,166 @@ mod tests {
             ]
         );
         // With θ₀ FIX the free block starts at θ₁, and the off-diagonal moves to index 2.
-        let free = super::free_coordinate_units(&t, &x, &[1, 2, 3, 4, 5]);
+        let free = super::free_coordinate_units(&t, &x, &[1, 2, 3, 4, 5], &[]);
         assert_eq!(free[0], Dimensionless);
         assert!(matches!(free[2], Scaled(_)));
+    }
+
+    /// A template for the #2273 tests: a log-packed `TVCL`, then `n_weights` identity-packed
+    /// θ's laid out as the parser lays out `[covariate_nn]` weights (bounds `±∞`), one Ω and
+    /// one σ. Packed: θ…, `L₁₁`, σ.
+    fn nn_weight_template(n_weights: usize) -> crate::types::ModelParameters {
+        let n = 1 + n_weights;
+        let mut theta_names = vec!["TVCL".to_string()];
+        theta_names.extend((0..n_weights).map(|j| format!("W_NET_1_1_{}", j + 1)));
+        let mut theta_lower = vec![0.001];
+        theta_lower.extend(std::iter::repeat_n(f64::NEG_INFINITY, n_weights));
+        crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: (0..n).map(|i| 0.3 + i as f64).collect(),
+            theta_names,
+            theta_lower,
+            theta_upper: vec![f64::INFINITY; n],
+            theta_fixed: vec![false; n],
+            omega: crate::types::OmegaMatrix::from_matrix(
+                DMatrix::from_element(1, 1, 0.09),
+                vec!["ETA_CL".into()],
+                true,
+            ),
+            omega_fixed: vec![false],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        }
+    }
+
+    /// #2273: a `[covariate_nn]` weight is identity-packed but carries no user units, so the
+    /// mask leaves it dimensionless. The straddle: the same θ's are flagged when no weight
+    /// range is passed, so a mask that ignored `nn_weights` fails the first half.
+    #[test]
+    fn free_coordinate_units_leaves_nn_weights_dimensionless() {
+        use super::CoordUnits::{Dimensionless, IdentityTheta};
+        // θ₀ TVCL (log); θ₁..θ₃ identity-packed, of which only θ₂..θ₃ are passed as the
+        // network's weights, so θ₁ stands in for a user θ with a negative lower bound.
+        let mut t = nn_weight_template(3);
+        let x = crate::estimation::parameterization::pack_params(&t);
+        let all: Vec<usize> = (0..x.len()).collect();
+        let units = super::free_coordinate_units(&t, &x, &all, &[2..4]);
+        assert_eq!(
+            units,
+            [
+                Dimensionless,
+                IdentityTheta,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless
+            ]
+        );
+        let unmasked = super::free_coordinate_units(&t, &x, &all, &[]);
+        assert_eq!(&unmasked[1..4], &[IdentityTheta; 3]);
+        // Indexed over the free block: with θ₁ FIX the first weight moves to index 1.
+        t.theta_fixed[1] = true;
+        let free = super::free_coordinate_units(&t, &x, &[0, 2, 3, 4, 5], &[2..4]);
+        assert_eq!(free[..3], [Dimensionless; 3]);
+    }
+
+    /// #2273: a flat `[covariate_nn]` weight — a tiny diagonal, nearly uncorrelated with the
+    /// rest, as for a weight feeding a saturated unit — is clipped by the floor exactly as it
+    /// was before #2145, so the fit still gets the regularization warning. The straddle:
+    /// flagged as an identity θ, the same coordinate is equilibrated up to the anchor and
+    /// escapes the floor.
+    #[test]
+    fn a_flat_nn_weight_is_still_clipped_by_the_floor() {
+        let t = nn_weight_template(1);
+        let x = crate::estimation::parameterization::pack_params(&t);
+        // Packed: TVCL, W, L₁₁, σ. The weight's diagonal is 1e-11, under the floor
+        // 1e-10·λmax ≈ 4e-10.
+        #[rustfmt::skip]
+        let m = DMatrix::from_row_slice(4, 4, &[
+            4.0,   1e-12, 0.3, 0.2,
+            1e-12, 1e-11, 0.0, 0.0,
+            0.3,   0.0,   2.0, 0.1,
+            0.2,   0.0,   0.1, 1.0,
+        ]);
+        let all = [0, 1, 2, 3];
+        let raw = super::invert_psd_with_floor(&m).expect("PD");
+        assert!(raw.n_clipped > 0, "fixture must be under the raw floor");
+
+        let units = super::free_coordinate_units(&t, &x, &all, &[1..2]);
+        let inv = super::invert_psd_with_floor_unit_free(&m, &units).expect("PD");
+        assert_eq!(
+            inv.n_clipped, raw.n_clipped,
+            "flat weight escaped the floor"
+        );
+        assert_eq!(inv.inverse, raw.inverse);
+        assert_eq!(inv.floor, raw.floor);
+
+        let flagged = super::free_coordinate_units(&t, &x, &all, &[]);
+        let eq = super::invert_psd_with_floor_unit_free(&m, &flagged).expect("PD");
+        assert_eq!(
+            eq.n_clipped, 0,
+            "straddle: as an identity θ the weight is not clipped"
+        );
+    }
+
+    /// #2273 end to end on the parser's layout: `CompiledModel::nn_weight_theta_ranges` covers
+    /// exactly the network's weight θ's, so a user identity-packed covariate θ is flagged and
+    /// every weight is not.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn covariate_nn_weights_are_not_flagged_as_identity_thetas() {
+        use super::CoordUnits::{Dimensionless, IdentityTheta};
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  theta KA_WT(0.1, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V
+  KA = TVKA * exp(KA_WT * (WT - 70) / 70)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+        )
+        .expect("nn model parses");
+        let t = &model.default_params;
+        // 2 declared θ + 17 weights (2→3→2: W_1 6 + b_1 3 + W_2 6 + b_2 2).
+        assert_eq!(t.theta.len(), 19);
+        let ranges = model.nn_weight_theta_ranges();
+        assert_eq!(ranges, [2..19]);
+        let x = crate::estimation::parameterization::pack_params(t);
+        let all: Vec<usize> = (0..x.len()).collect();
+        let units = super::free_coordinate_units(t, &x, &all, &ranges);
+        assert_eq!(units[..2], [Dimensionless, IdentityTheta]);
+        assert!(
+            units[2..19].iter().all(|&u| u == Dimensionless),
+            "{units:?}"
+        );
+        // Every weight is identity-packed, so without the ranges each would be flagged.
+        let unmasked = super::free_coordinate_units(t, &x, &all, &[]);
+        assert!(unmasked[2..19].iter().all(|&u| u == IdentityTheta));
     }
 
     /// #2274: an Ω Cholesky off-diagonal carries its row η's units, and so does that row's
