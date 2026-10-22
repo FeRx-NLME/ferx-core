@@ -158,9 +158,9 @@ those directions.
 They are a signal about the *model*, not only about SIR: a direction the
 covariance step had to floor is a direction the data do not inform.
 
-#### A theta's units do not move the floor or the cap
+#### Units do not move the floor or the cap
 
-Neither note depends on the units a theta is written in. A theta with a negative
+Neither note depends on the units a theta or an additive eta is written in. A theta with a negative
 lower bound is sampled as itself, so its variance in the proposal grows as `k²`
 when the theta is written `k` times larger. SIR therefore floors and caps the
 proposal in the basis the
@@ -176,6 +176,21 @@ as the covariance step rescales it. Before #2179, writing the
 warfarin example's `V` `1e5` times larger floored every other direction and moved
 an SIR interval by 25 %, `1e6` moved one 26-fold, and at `1e8` every draw was
 rejected. A theta drawn on the logit scale is dimensionless and is not rescaled.
+
+The other packed coordinate with units is an Omega Cholesky off-diagonal, which
+carries the units of its row's eta. SIR divides it by its row's estimated
+diagonal $\hat L_{ii}$, as the
+[covariance step does](parameterization.qmd#omega-offdiag-covariance-floor)
+since #2274, so the proposal and the covariance step stay in one basis. On a
+block-Omega model this changes the proposal slightly even when nothing is
+rescaled, since the basis changes. The packing rails ($|L_{ij}| \le 10$,
+$\log L_{ii} \in [-6, 6]$) still act on the draws in the file's units, so an
+additive eta written in much larger units can have draws capped or rejected by
+the rails themselves. On `data/covmuref_power.csv` with
+`V = (TVV_S + ETA_VS) / k` (`tests/identity_theta_sir_floor.rs`, macOS arm64),
+every SIR interval at $k$ from 0.5 down to $3 \times 10^{-3}$ equals the
+$k = 1$ run's to $5 \times 10^{-10}$, where the unscaled proposal moved one by
+$2 \times 10^{-4}$; at $k = 2$ the rails move one by 6 %.
 
 #### When every sample is still rejected
 
