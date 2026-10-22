@@ -9393,6 +9393,96 @@ mod absorption {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// B4d (#1962 review r1). Many sum-to-zero groups — `sum_to_zero_within`
+    /// with a group per subject — must not reach `T`'s joint solve, which is
+    /// dense in the groups: on 300 subjects of three levels each, every group
+    /// sits on one subject and enters as its per-subject differences, so no
+    /// group is solved jointly and the slope θ is the one population-wide
+    /// vector. When 20 of those groups are merged pairwise across two subjects
+    /// each, those 10 alone are solved jointly. Both agree with the difference
+    /// basis on every probe to 1e-12, and a level alone stays outside the
+    /// coded span (its group's mean is removed) while a within-group
+    /// difference is inside.
+    ///
+    /// Mutation — every group taken through `T` (300 groups solved jointly,
+    /// the cubic path the review measured).
+    #[test]
+    fn many_within_groups_stay_per_subject() {
+        let n = 300usize;
+        let rows = 4usize;
+        let lens = vec![rows; n];
+        let offsets: Vec<usize> = (0..n).map(|s| s * rows).collect();
+        let wave = |s: usize, k: usize| -> Vec<f64> {
+            (0..rows)
+                .map(|j| (0.37 * (s * rows + j) as f64 + 1.3 * k as f64).sin() + 0.2 * j as f64)
+                .collect()
+        };
+        let slope: Pieces = (0..n).map(|s| (s, wave(s, 7))).collect();
+        let mut cols = vec![slope.clone()];
+        let mut groups = vec![None];
+        for s in 0..n {
+            for k in 0..3 {
+                cols.push(vec![(s, wave(s, k))]);
+                groups.push(Some(s));
+            }
+        }
+        // Subjects 2m and 2m+1 (m < 10) in one group.
+        let merged: Vec<Option<usize>> = groups
+            .iter()
+            .map(|g| g.map(|s| if s < 20 { s / 2 } else { s }))
+            .collect();
+        let probes: Vec<Pieces> = vec![
+            vec![(5, wave(5, 0))],
+            vec![(
+                5,
+                wave(5, 0)
+                    .iter()
+                    .zip(wave(5, 1))
+                    .map(|(a, b)| a - b)
+                    .collect(),
+            )],
+            vec![(250, wave(250, 4))],
+            vec![(1, wave(1, 2)), (299, wave(299, 5))],
+            slope.clone(),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, groups, joint) in [("per subject", &groups, 0usize), ("merged", &merged, 10)] {
+            let grouped = BlockBasis::grouped(&cols, groups, &lens, &offsets);
+            let differences = BlockBasis::new(&coded_differences(&cols, groups), &lens, &offsets);
+            if grouped.joint != joint || grouped.dense.len() != 1 {
+                wrong.push(format!(
+                    "{tag}: {} groups solved jointly (want {joint}), {} population-wide vectors",
+                    grouped.joint,
+                    grouped.dense.len()
+                ));
+            }
+            if grouped.aliased() != differences.aliased() {
+                wrong.push(format!(
+                    "{tag}: aliased {} vs {}",
+                    grouped.aliased(),
+                    differences.aliased()
+                ));
+            }
+            for (k, z) in probes.iter().enumerate() {
+                let (got, want) = (grouped.residual(z), differences.residual(z));
+                match (got, want) {
+                    (Some(g), Some(w)) if g.is_finite() && (g - w).abs() < 1e-12 => {}
+                    _ => wrong.push(format!("{tag} probe {k}: {got:?} vs {want:?}")),
+                }
+            }
+            let (level, within) = (
+                grouped.residual(&probes[0]).unwrap(),
+                grouped.residual(&probes[1]).unwrap(),
+            );
+            if !(level > 1e-3 && within < 1e-12) {
+                wrong.push(format!(
+                    "{tag}: level {level:e}, within difference {within:e}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// B4. The span residual on synthetic columns: a multiple of a column is in
     /// its span, to rounding; an orthogonal part shows as its relative size; a
     /// zero column measures nothing; a repeated column adds no direction; and a

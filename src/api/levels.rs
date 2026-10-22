@@ -2150,7 +2150,6 @@ fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
 type Pieces = Vec<(usize, Vec<f64>)>;
 
 /// `a − b`, piece by piece; a subject in both keeps one piece.
-#[cfg(test)]
 fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
     let mut out = a.clone();
     for (s, v) in b {
@@ -2257,6 +2256,10 @@ struct BlockBasis {
     /// What the grouped columns change in [`BlockBasis::aliased`]'s count
     /// against the raw columns' remnants.
     coded_shift: isize,
+    /// How many groups the joint solve for `T` took: the scale review r1 of
+    /// #1962 bounds.
+    #[cfg(test)]
+    joint: usize,
 }
 
 impl BlockBasis {
@@ -2267,7 +2270,57 @@ impl BlockBasis {
 
     /// The basis of `cols`, column `j` in sum-to-zero group `groups[j]` (a
     /// group's last column is its last in `cols`).
+    ///
+    /// A group whose columns all sit on one subject — a `sum_to_zero_within`
+    /// group of one subject's levels — enters as its difference columns, which
+    /// sit on that subject too and stay per subject, as the coded columns did
+    /// before #1962 (review r1): only a group crossing subjects goes through
+    /// `T`, whose joint solve is dense in the groups. Under
+    /// `sum_to_zero_within` with one group per subject that is none of them;
+    /// a group that crosses subjects has at least one population-wide
+    /// difference column, so `T` never costs more than those did.
     fn grouped(
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        lens: &[usize],
+        offsets: &[usize],
+    ) -> Self {
+        // Per group: its last column, and whether every column sits on one
+        // subject (a zero column sits anywhere).
+        let mut last: HashMap<usize, usize> = HashMap::new();
+        let mut subject: HashMap<usize, Option<usize>> = HashMap::new();
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            let Some(g) = *g else { continue };
+            last.insert(g, j);
+            let on = subject.entry(g).or_insert(None);
+            match c.as_slice() {
+                [] => {}
+                [(s, _)] if on.is_none_or(|t| t == *s) => *on = Some(*s),
+                _ => *on = Some(usize::MAX),
+            }
+        }
+        let local = |g: &usize| subject[g] != Some(usize::MAX);
+        let mut kept_cols: Vec<Pieces> = Vec::with_capacity(cols.len());
+        let mut kept_groups: Vec<Option<usize>> = Vec::with_capacity(cols.len());
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            match g {
+                Some(g) if local(g) => {
+                    if j != last[g] {
+                        kept_cols.push(pieces_minus(c, &cols[last[g]]));
+                        kept_groups.push(None);
+                    }
+                }
+                _ => {
+                    kept_cols.push(c.clone());
+                    kept_groups.push(*g);
+                }
+            }
+        }
+        Self::grouped_raw(&kept_cols, &kept_groups, lens, offsets)
+    }
+
+    /// [`BlockBasis::grouped`] with every group taken through `T`.
+    fn grouped_raw(
         cols: &[Pieces],
         groups: &[Option<usize>],
         lens: &[usize],
@@ -2367,6 +2420,8 @@ impl BlockBasis {
             local_at,
             removed: Vec::new(),
             coded_shift: 0,
+            #[cfg(test)]
+            joint: 0,
         };
         basis.remove_groups(cols, groups, &taken, dense_at);
         #[cfg(test)]
@@ -2419,6 +2474,10 @@ impl BlockBasis {
             .iter()
             .filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j])))
             .collect();
+        #[cfg(test)]
+        {
+            self.joint = live.len();
+        }
         // Per live group, `t` for `λ = e_g` in coordinates, and the misfit of
         // each dropped column's equation over its norm.
         let mut ts: Vec<Vec<f64>> = Vec::with_capacity(live.len());
