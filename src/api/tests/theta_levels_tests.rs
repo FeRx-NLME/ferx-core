@@ -9692,17 +9692,18 @@ mod absorption {
     /// covariates all agree: each one alone tells them apart. A record the
     /// reader moved one ULP below a co-timed row is still the same instant: a
     /// replicate with nothing between (#1959), not one with a dose or reset at
-    /// the later time; two records at exactly that time see it alike.
+    /// the later time, and not one on a model whose doses arrive at a lag the
+    /// data does not hold; two records at exactly that time see it alike.
     ///
     /// Mutations — any comparison in `replicates` dropped: its row reads as
     /// replicates. The engine times compared exactly: the moved record with
-    /// nothing between does not.
+    /// nothing between does not. The lag ignored: the moved, lagged pair does.
     #[test]
     fn one_differing_field_tells_two_records_at_one_instant_apart() {
         let mut p = occ_pop(1, 1, &[1.0, 1.0], 1, false);
         let s = &mut p.subjects[0];
         s.occasions = vec![1, 1];
-        assert!(replicates(s, 0, 1), "identical records");
+        assert!(replicates(s, 0, 1, false), "identical records");
         let base = s.clone();
         let mut occ = base.clone();
         occ.occasions[1] = 2;
@@ -9716,11 +9717,19 @@ mod absorption {
             moved.same_instant(0, 1),
             "the moved record is the same instant"
         );
-        assert!(replicates(&moved, 0, 1), "moved, nothing between");
+        assert!(replicates(&moved, 0, 1, false), "moved, nothing between");
+        assert!(
+            !replicates(&moved, 0, 1, true),
+            "moved, on a model whose dose can arrive between"
+        );
+        assert!(replicates(&base, 0, 1, true), "one exact time, lagged");
         let dose = DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0);
         let mut at_dose = base.clone();
         at_dose.doses.push(dose.clone());
-        assert!(replicates(&at_dose, 0, 1), "both after the dose at 1");
+        assert!(
+            replicates(&at_dose, 0, 1, false),
+            "both after the dose at 1"
+        );
         let mut dosed = moved.clone();
         dosed.doses.push(dose);
         let mut reset = moved.clone();
@@ -9732,7 +9741,7 @@ mod absorption {
             ("a dose between", dosed),
             ("a reset between", reset),
         ] {
-            assert!(!replicates(&s, 0, 1), "{tag} differs");
+            assert!(!replicates(&s, 0, 1, false), "{tag} differs");
         }
     }
 
@@ -9785,6 +9794,64 @@ mod absorption {
         agrees_with_joint_oracle("straddle", &text, &straddle, &mut wrong);
         agrees_with_joint_oracle("replicates", &text, &replicated, &mut wrong);
         assert!(wrong.is_empty(), "#2131 review:\n{}", wrong.join("\n"));
+    }
+
+    /// [`cf_pop`] with one bolus of 100 at `TIME = 0` that arrives at the lag
+    /// of [`lagged_s1`], 2, and two records at the arrival, both written
+    /// `TIME = 2`. With `straddle` the first is one ULP below it — the trough a
+    /// reader moves below a co-timed `MDV = 1` row at the arrival (#1810),
+    /// with no dose row between the two; without, both are at exactly 2.
+    fn lagged_at_two(straddle: bool) -> Population {
+        let written = [0.0, 1.0, 2.0, 2.0, 4.0, 8.0, 12.0];
+        let mut p = cf_pop(3, 1, &written);
+        for s in p.subjects.iter_mut() {
+            if straddle {
+                s.obs_times[2] = 2.0f64.next_down();
+            }
+            s.obs_raw_times = written.to_vec();
+        }
+        p
+    }
+
+    /// S1 (`ETA_E0` on `V`, read as `central / V`) with every dose lagged by 2.
+    fn lagged_s1(contrast: &str) -> String {
+        let text = shape("S1", "STUDY, TIME", contrast)
+            .replace("  E0 = TVE0", "  E0 = TVE0\n  LAG = 2.0")
+            .replace(
+                "one_cpt_iv(cl=CL, v=V)",
+                "one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
+            );
+        assert!(text.contains("lagtime=LAG"), "the dose is lagged");
+        text
+    }
+
+    /// #2131 review, round 2. A lagged bolus changes the state at its arrival,
+    /// where the data holds no dose row: the trough moved one ULP below the
+    /// arrival reads `central = 0`, the record at it the whole dose, so S1's
+    /// `ETA_E0` moves one and not the other, which the one level they share
+    /// cannot. On a lagged model those two are not replicates, the span
+    /// certificate measures `ETA_E0` unabsorbed, and global sum-to-zero binds.
+    /// The straddle: two records at exactly the arrival still resolve, and
+    /// global is refused at the walk's site. Both agree with the joint oracle.
+    ///
+    /// Mutation — `replicates` ignoring `lagged`: the straddling population is
+    /// refused under global.
+    #[test]
+    fn a_record_moved_below_a_lagged_arrival_is_not_a_replicate() {
+        let mut wrong = Vec::new();
+        let straddle = lagged_at_two(true);
+        let replicated = lagged_at_two(false);
+        match try_bind(&lagged_s1("sum_to_zero"), &straddle) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("straddle, global: {got:?}")),
+        }
+        match try_bind(&lagged_s1("sum_to_zero"), &replicated) {
+            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("replicates, global: {got:?}")),
+        }
+        agrees_with_joint_oracle("lagged straddle", &lagged_s1, &straddle, &mut wrong);
+        agrees_with_joint_oracle("lagged replicates", &lagged_s1, &replicated, &mut wrong);
+        assert!(wrong.is_empty(), "#2131 review, lag:\n{}", wrong.join("\n"));
     }
 
     /// #2131. Two arms at one visit share a level, so a block with a level per
