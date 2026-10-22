@@ -206,6 +206,29 @@ fit's (0.240 under `r`, 0.238 under `rsr`, 0.466 under `s`) to within $3
 (was 0.064). At $k = 10^5$ on the block-Ω #432 model the `MATRIX=R` SEs match
 NONMEM 7.5.1 to $2 \times 10^{-5}$.
 
+#### An identity-packed θ and SIR's proposal {#identity-theta-sir-proposal}
+
+SIR conditions its proposal with a floor of its own: the free block of the
+packed covariance is eigendecomposed, and a direction with variance under
+`max(1e-10·λmax, 1e-12)` is reported as carrying no uncertainty and floored.
+An identity-packed θ's variance scales as $k^2$ with its units, so in large
+units it became $\lambda_{\max}$ and floored every other direction, and in
+small units it fell under `1e-12` itself. Since #2179 the proposal is
+conditioned with each identity-packed θ rescaled as in the covariance step,
+with one difference: the anchor reads each dimensionless coordinate's variance
+no larger than the bound cap lets it keep. Otherwise a direction the covariance
+step had floored (variance ~1e7) would set the θ's scale, and the cap that
+shrinks it would take the θ's variance with it. The proposal SIR falls back to
+when the covariance step fails (a non-positive-definite Hessian) floors the
+Hessian in the same rescaled coordinates.
+
+Measured on the warfarin model above with seeded SIR
+(`tests/sir_proposal_identity_theta_units.rs`, macOS arm64): at $k = 10^5$,
+$10^6$ and $3 \times 10^{-6}$ the intervals and the ESS equal the $k = 1$ run's
+to within $2 \times 10^{-10}$. Before the fix, $k = 10^5$ reported six null
+directions with the ESS cut from 172 to 27; on #2179's longer run $k = 10^6$
+collapsed every interval to a point and $k = 10^8$ rejected every draw.
+
 #### An Omega Cholesky off-diagonal and the covariance step's floor {#omega-offdiag-covariance-floor}
 
 The other packed coordinate with units is an Omega (or Omega-IOV) Cholesky
