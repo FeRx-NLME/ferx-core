@@ -2304,7 +2304,9 @@ const LARGE_IDENTITY_THETA: f64 = 10.0;
 /// - |θ₀| > [`LARGE_IDENTITY_THETA`] is divided by |θ₀| (#2146), under the resolved
 ///   unscaled strategy (BOBYQA / MMA) as well as under `abs`;
 /// - the near-zero θ in `identity_scales` take their probed scale (#2159,
-///   [`identity_theta_scales`]).
+///   [`identity_theta_scales`]), or `|x0[i]|` when that is larger — the probe ran at the
+///   first leg's start, and a restart leg starts where the stalled leg left the θ
+///   (#2272).
 fn nlopt_scale_vector(
     x0: &[f64],
     init_params: &ModelParameters,
@@ -2344,8 +2346,16 @@ fn nlopt_scale_vector(
             scale[i] = x0[i].abs();
         }
     }
+    // The probe ran once, at the first leg's start, and every leg (stall retry, restart)
+    // is handed its result. A restart starts at the stalled estimates, where a probed θ
+    // may have grown by orders of magnitude: a θ probed at 0.001 that reached 2000 would
+    // otherwise be overwritten back to scale 0.001 — a coordinate of 2e6, the shape the
+    // large-θ rule above exists to remove (#2272). So the probed scale is a floor under
+    // the θ's current magnitude, not a replacement for it. On the first leg the two are
+    // equal (the probe scales by |θ₀| and `x0[i]` is θ₀), and a θ that shrank keeps its
+    // probed scale rather than chasing zero.
     for &(i, s) in identity_scales {
-        scale[i] = s;
+        scale[i] = s.max(x0[i].abs());
     }
     scale
 }
