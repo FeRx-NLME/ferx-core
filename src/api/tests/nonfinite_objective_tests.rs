@@ -1775,18 +1775,9 @@ fn a_negative_prediction_is_scored_as_the_scorer_scores_it() {
     );
 }
 
-/// **N1e — a mixture subject is scored under its fitted class's Σ** (#2266 review 2).
-/// Class 1's proportional σ is `1e-7` (sd), class 2's is `0.5`. At `DV = 33`,
-/// `IPRED = 1` the term is `32²/1e-14 ≈ 1e17` under class 1 and `≈ 4e3` under class 2:
-/// a subject assigned to class 2 must not be named, and the same subject in class 1
-/// must be. The base Σ is class 1's, so reading `params.sigma` instead of the class's
-/// names the class-2 subject.
-///
-/// Mutation (run): pass the base `params` instead of `class_params` → the class-2
-/// half fires.
-#[test]
-fn a_mixture_subject_is_scored_under_its_fitted_class() {
-    let m = parse_model_string(
+/// Two classes of one proportional error: class 1's σ is `1e-7` (sd), class 2's `0.5`.
+fn mixture_model() -> CompiledModel {
+    parse_model_string(
         r#"
 [parameters]
   theta TVCL(1.0, 0.1, 50.0)
@@ -1807,7 +1798,21 @@ fn a_mixture_subject_is_scored_under_its_fitted_class() {
   DV ~ proportional(EPS)
 "#,
     )
-    .expect("parse");
+    .expect("parse")
+}
+
+/// **N1e — a mixture subject is scored under its fitted class's Σ** (#2266 review 2).
+/// Class 1's proportional σ is `1e-7` (sd), class 2's is `0.5`. At `DV = 33`,
+/// `IPRED = 1` the term is `32²/1e-14 ≈ 1e17` under class 1 and `≈ 4e3` under class 2:
+/// a subject assigned to class 2 must not be named, and the same subject in class 1
+/// must be. The base Σ is class 1's, so reading `params.sigma` instead of the class's
+/// names the class-2 subject.
+///
+/// Mutation (run): pass the base `params` instead of `class_params` → the class-2
+/// half fires.
+#[test]
+fn a_mixture_subject_is_scored_under_its_fitted_class() {
+    let m = mixture_model();
     let p = &m.default_params;
     let got = name_first_record(&m, p, Some(&[1]), 33.0, 1.0);
     assert!(got.contains(NAMES_NONE), "class 2: {got}");
@@ -1816,6 +1821,71 @@ fn a_mixture_subject_is_scored_under_its_fitted_class() {
     assert!(
         got.contains("observations, the first at TIME 0.5 (DV 33, IPRED 1);"),
         "class 1: {got}"
+    );
+}
+
+/// **N1e′ — the selector and the clauses agree on a mixture subject's class**
+/// (#2266 review 3), end to end through `compute_subject_results`. Every `DV` is
+/// `1000`, far above `IPRED` (≤ 10 from a 100 dose into `V = 10`): under class 1's
+/// σ = 1e-7 each record scores `≥ (990/1e-6)² ≈ 1e18`, past the `1e14` cutoff;
+/// under class 2's σ = 0.5 the subject's contribution is `≈ 1e7`. A class-2 subject
+/// must therefore get a usable contribution and not be named at all, while the same
+/// subject in class 1 is named. Scoring the contribution with the base (class-1)
+/// Σ — what the guard alone does, since it moves only `MIXNUM` — names the class-2
+/// subject, with its records then described as usable under class 2.
+///
+/// Mutation (run): drop the `class_params` swap in `compute_subject_results` → the
+/// class-2 half fires.
+#[test]
+fn a_mixture_subject_is_selected_under_its_fitted_class() {
+    let m = mixture_model();
+    let mut data = shifted_subject("A");
+    data.observations = vec![1000.0; 4];
+    let pop = population_of(vec![data]);
+    let eta = nalgebra::DVector::zeros(m.n_eta);
+    let h = nalgebra::DMatrix::zeros(4, m.n_eta);
+    let run = |class: usize| {
+        let (subjects, _) = compute_subject_results(
+            &m,
+            &pop,
+            &m.default_params,
+            std::slice::from_ref(&eta),
+            std::slice::from_ref(&h),
+            &[Vec::new()],
+            true,
+            Some(&[class]),
+            false,
+        );
+        let c = subjects[0].ofv_contribution;
+        let (msg, mut entry) = sentinel_warning();
+        let got = name_nonfinite_subjects(
+            msg.clone(),
+            &mut entry,
+            &subjects,
+            &pop,
+            &m,
+            &m.default_params,
+            Some(&[class]),
+        );
+        (c, got == msg, got)
+    };
+    let (c2, unnamed2, got2) = run(1);
+    assert!(
+        c2.is_finite() && c2 < 1e14,
+        "class 2: contribution {c2} is usable"
+    );
+    assert!(unnamed2, "class 2 is not named: {got2}");
+    let (c1, unnamed1, got1) = run(0);
+    assert!(
+        !(c1 < 1e14),
+        "premise, class 1: contribution {c1} past the cutoff"
+    );
+    assert!(
+        !unnamed1
+            && got1.contains(
+                "an unusable likelihood term on 4 of 4 observations, the first at TIME 0.5"
+            ),
+        "class 1 is named, by all four records: {got1}"
     );
 }
 

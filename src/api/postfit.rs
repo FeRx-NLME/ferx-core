@@ -636,7 +636,8 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// handed in are the MIXEST-class EBEs, so building predictions from them with
 /// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
 /// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
-/// OFV) for every subject the fit assigned to another class.
+/// OFV) for every subject the fit assigned to another class. For the same reason
+/// the subject's Ω and Σ are its class's (`mixture::class_params`), not the base.
 ///
 /// # Parallel over subjects, and why the stats come back as a value (#1329)
 ///
@@ -679,9 +680,18 @@ pub(crate) fn compute_subject_results(
             let stats_scope =
                 collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
             // Hold this subject's fitted class for the whole per-subject block.
-            let _mix_guard = mixest
-                .and_then(|m| m.get(i))
-                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let class = mixest.and_then(|m| m.get(i)).copied();
+            let _mix_guard =
+                class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            // ...and that class's Ω and Σ (#2266 review 3): the guard moves only
+            // `MIXNUM`, so scoring IWRES/CWRES and the OFV contribution with the base
+            // (class-1) Ω/Σ would describe a class-2 subject by class 1's residual
+            // model — and `name_nonfinite_subjects` selects on that contribution.
+            // Class 1's entries equal the base, so a class-1 subject is unchanged.
+            let class_params = class
+                .filter(|_| params.mixture.is_some())
+                .map(|c| crate::estimation::mixture::class_params(params, c));
+            let params = class_params.as_ref().unwrap_or(params);
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
             let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {
@@ -1829,7 +1839,8 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// A subject qualifies when its own post-fit objective contribution fails
 /// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
-/// selector, and the per-record clauses only describe it. Selecting on a non-finite
+/// selector, and the per-record clauses only describe it; both score a mixture
+/// subject under its fitted class's Ω and Σ, so they cannot disagree on its class. Selecting on a non-finite
 /// `IPRED`/`PRED` instead would name every subject with no Gaussian observation,
 /// whose predictions are `NaN` by convention ("no prediction available") and which
 /// contribute nothing wrong. A `NaN` prediction on a scored record cannot hide the
