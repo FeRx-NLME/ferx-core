@@ -1822,10 +1822,10 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 /// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
 /// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
 /// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
-/// Returns `msg` unchanged when no subject qualifies. The `details` reach only the
-/// Rust API: the YAML writes the messages, a `.fitrx` reload rebuilds the entries
-/// without them, and the R package drops them, so the message says where the
-/// subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are.
+/// Returns `msg` unchanged when no subject qualifies. The `details` reach the Rust
+/// API, the JSON and YAML outputs (`warning_details:`) and a `.fitrx` reload
+/// (#2268), but not yet the R package, so the message says where the subjects
+/// beyond the first [`NONFINITE_SUBJECTS_NAMED`] are and where they are not.
 ///
 /// A subject qualifies when its own post-fit objective contribution fails
 /// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
@@ -1896,7 +1896,8 @@ pub(crate) fn name_nonfinite_subjects(
         .join("; ");
     if named.len() > NONFINITE_SUBJECTS_NAMED {
         list.push_str(&format!(
-            "; and {} more, listed only in the Rust API's structured warning",
+            "; and {} more, listed as `unusable_subjects` in the structured warning's details \
+             (Rust API, JSON and YAML output, .fitrx; not yet in the R package)",
             named.len() - NONFINITE_SUBJECTS_NAMED
         ));
     }

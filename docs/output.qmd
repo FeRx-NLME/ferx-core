@@ -251,6 +251,13 @@ covariance_matrix:
     log_chol_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
     log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
     sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
+warnings:
+  - "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+warning_details:
+  - code: dw_autocorrelation
+    severity: "Warning"
+    message: "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+    details: {"durbin_watson":1.2,"iwres_lag1_autocorr":0.4}
 estimation:
   focei_wall_time_secs: 11.845678
   covariance_wall_time_secs: 0.500000
@@ -274,6 +281,11 @@ where `omega = L Lᵀ` (log of the Cholesky diagonal, **not** the variance).
 Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
 not log-transformed). See [Packed Parameter
 Space](estimation/parameterization.qmd) for the full layout and bounds.
+
+`warnings:` lists the warning messages. `warning_details:` follows it with
+every warning that carries a structured `details` payload — see [Where
+`details` is written](warnings.qmd#where-details-is-written). Both blocks are
+absent when there is nothing to list.
 
 ### Key Fields
 
