@@ -620,12 +620,14 @@ alike. A failed factorization stops the marginal: the part that failed is listed
 | `non-Gaussian curvature (FD Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
 | `curvature (H̃ not positive definite once the non-Gaussian Hessian is added)` | both | in place of the curvature, when the Gaussian side alone factors | a non-Gaussian term strongly non-convex at the EBE |
 | `IOV + FREM refusal` | IOV | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
+| `IOV random effects (κ̂ do not match the occasion groups)` | IOV | in place of every part, when the marginal refuses the subject's κ̂ | an EBE vector of the wrong shape |
 
 A subject with time-to-event, categorical or CTMM records is scored by the joint
 conditional form under FOCE as well, so its parts are the FOCEI names, and its
-curvature carries those terms' finite-difference Hessian. The parts are not split
-for an IOV subject, whose marginal is over the stacked `[η, κ]` system; only its
-non-Gaussian data terms are listed.
+curvature carries those terms' finite-difference Hessian. An IOV subject's
+marginal is over the stacked `[η, κ]` system, and its parts are that marginal's:
+the same names, with the `random-effect prior` over `η̂` and every occasion's `κ̂`,
+and the curvature and FOCE's `R̃` over both.
 
 A term is listed when its value is `NaN`, infinite, or past the cutoff once put on
 the contribution's `2·` scale. The message shows the raw negative
@@ -677,10 +679,14 @@ When no subject is named, such an objective gives:
 
 ```text
 No subject can be named: every subject's post-hoc FOCEI contribution at these
-estimates is usable, and the LAPLACE objective is not split by subject, so the
-failure is in a part of the LAPLACE objective that the FOCEI score does not
-share.
+estimates is usable, but the LAPLACE objective is not their sum and ferx does not
+split it by subject, so these scores cannot locate its failure; their sum (24.68)
+is usable.
 ```
+
+The sum is reported for what it is: the scores can sum past the cutoff
+themselves (`...is past the cutoff as well`), so neither case says the failure
+is in a part of the objective the scores do not share.
 
 The structured warning's `details` record this as `contribution_score`
 (`"FOCE"` or `"FOCEI"`, the marginal the contributions score),

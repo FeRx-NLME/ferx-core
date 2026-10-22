@@ -3334,6 +3334,55 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     interaction: bool,
     lin: &IovLinearization,
 ) -> f64 {
+    foce_subject_nll_iov_linearized_split(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        interaction,
+        lin,
+        None,
+    )
+}
+
+/// The parts of an IOV subject's [`foce_subject_nll_iov_linearized`] contribution, recorded
+/// by the branch that computes it, as [`foce_subject_contribution_parts`] records them for
+/// a subject without κ (#2267 review r6). The marginal is over the stacked `[η, κ]`
+/// system, so `random-effect prior` is `½(b̂ᵀΣ_b⁻¹b̂ + ln|Σ_b|)` over both, and the
+/// curvature and FOCE's `R̃` carry the κ columns of `H`. A subject the marginal refuses
+/// for its FREM rows has the one part `IOV + FREM refusal`.
+pub(crate) fn foce_subject_iov_contribution_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+) -> Vec<(String, f64)> {
+    let mut parts = Vec::new();
+    foce_subject_nll_iov_linearized_split(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        interaction,
+        lin,
+        Some(&mut parts),
+    );
+    parts
+}
+
+/// [`foce_subject_nll_iov_linearized`], recording its parts into `parts` when one is
+/// attached.
+fn foce_subject_nll_iov_linearized_split(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let IovLinearization {
         ipreds,
         b_hat,
@@ -3371,6 +3420,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     // Σ_b are not set up for FREM R-overrides.  Return a sentinel NLL so the
     // optimizer steers away from this region rather than silently ignoring FREM.
     if iov_refuses_frem(model, subject) {
+        note(&mut parts, "IOV + FREM refusal", IOV_FREM_REFUSAL_NLL);
         return IOV_FREM_REFUSAL_NLL;
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
@@ -3387,7 +3437,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         // the objective is not the one its EBE minimised.
         let rowwise = model.bloq_in_force().has_censored_row(&subject.cens);
         if !residual_cov.is_dense() || rowwise {
-            foce_subject_nll_interaction(
+            foce_subject_nll_interaction_split(
                 subject,
                 &ipreds,
                 &b_hat,
@@ -3400,9 +3450,11 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 None, // IOV + FREM unsupported (guarded above)
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
+                &[],
+                parts,
             )
         } else {
-            foce_subject_nll_interaction_dense_cov(
+            foce_subject_nll_interaction_dense_split(
                 subject,
                 &ipreds,
                 &b_hat,
@@ -3414,6 +3466,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 &p_obs_iov,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                parts,
             )
         }
     } else {
@@ -3423,7 +3476,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         // Additive error keeps f0 (bit-identical).
         // `kappas` has one length-`n_iov` vector per occasion (checked above).
         let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
-        foce_subject_nll_standard_cov(
+        foce_subject_nll_standard_split(
             subject,
             &ipreds,
             &b_hat,
@@ -3437,6 +3490,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
             None,
             pop_preds.as_deref(),
             ruv_mult.as_deref(),
+            parts,
         )
     }
 }

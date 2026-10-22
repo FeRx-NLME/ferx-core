@@ -1905,18 +1905,21 @@ impl ContributionSource {
 }
 
 /// The separately scored terms of `subject`'s contribution at `eta` (#2267), for
-/// [`name_nonfinite_subjects`], under the subject's fitted mixture class:
+/// [`name_nonfinite_subjects`], under the subject's fitted mixture class and that class's
+/// Ω and Σ. When `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given and shaped for it,
+/// these are the parts the marginal `compute_subject_results` scored records on the way,
+/// under the same `interaction` flag:
 ///
-/// * the IOV marginal's FREM refusal, alone, when it refuses the subject (`iov` — the
-///   subject was scored with κ);
-/// * otherwise, when `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given and shaped for
-///   it, the parts the marginal `compute_subject_results` scored records on the way
-///   (`stats::likelihood::foce_subject_contribution_parts`), under the same `interaction`
-///   flag: the FOCE, row-wise FOCEI or dense-`R` FOCEI branch, or the joint form of a
-///   subject with time-to-event, categorical or CTMM records, whose curvature carries
-///   their Hessian;
-/// * else (an IOV subject, whose marginal is over the stacked `[η, κ]` system this split
-///   does not rebuild) each non-Gaussian data term alone.
+/// * a subject without κ (`kappas` empty): `stats::likelihood::foce_subject_contribution_parts`
+///   — the FOCE, row-wise FOCEI or dense-`R` FOCEI branch, or the joint form of a subject
+///   with time-to-event, categorical or CTMM records, whose curvature carries their
+///   Hessian;
+/// * an IOV subject: the same branches over the stacked `[η, κ]` linearization
+///   (`stats::likelihood::foce_subject_iov_contribution_parts`, review r6), or the FREM
+///   refusal alone, or — when its κ̂ do not line up with its occasion groups, which the
+///   marginal refuses — that mismatch.
+///
+/// Without a usable `h_matrix`, each non-Gaussian data term alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn contribution_terms(
     model: &CompiledModel,
@@ -1925,9 +1928,10 @@ pub(crate) fn contribution_terms(
     eta: &DVector<f64>,
     h_matrix: Option<&DMatrix<f64>>,
     interaction: bool,
-    iov: bool,
+    kappas: &[DVector<f64>],
     mix_class: Option<usize>,
 ) -> Vec<ContributionTerm> {
+    let iov = !kappas.is_empty();
     if iov && crate::stats::likelihood::iov_refuses_frem(model, subject) {
         return vec![ContributionTerm {
             name: "IOV + FREM refusal".into(),
@@ -1948,8 +1952,8 @@ pub(crate) fn contribution_terms(
     });
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut terms: Vec<(String, f64)> = Vec::new();
-    match (iov, shaped) {
-        (false, Some(h)) => {
+    match (iov, shaped, params.omega_iov.as_ref()) {
+        (false, Some(h), _) => {
             terms = crate::stats::likelihood::foce_subject_contribution_parts(
                 model,
                 subject,
@@ -1961,6 +1965,32 @@ pub(crate) fn contribution_terms(
                 model.residual_cov_at(params),
                 interaction,
             )
+        }
+        // The linearization `compute_subject_results` builds, from the same inputs.
+        (true, Some(h), Some(omega_iov)) => {
+            terms = match crate::stats::likelihood::iov_linearization(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                kappas,
+                omega_iov,
+            ) {
+                Some(lin) => crate::stats::likelihood::foce_subject_iov_contribution_parts(
+                    model,
+                    subject,
+                    &params.theta,
+                    &params.sigma.values,
+                    interaction,
+                    &lin,
+                ),
+                None => vec![(
+                    "IOV random effects (κ̂ do not match the occasion groups)".to_string(),
+                    f64::NAN,
+                )],
+            }
         }
         #[cfg(feature = "survival")]
         _ => terms.extend(crate::stats::likelihood::non_gaussian_terms(
@@ -2051,7 +2081,8 @@ fn json_value(v: f64) -> serde_json::Value {
 /// the list. An unusable parameter-prior penalty — a population-level term no subject
 /// carries — is named after the list too. And when no subject qualifies, the warning
 /// says why rather than ending silently (#2267), in the first of these that holds:
-/// the prior penalty is unusable; the objective is one the scores are not terms of;
+/// the prior penalty is unusable; the objective is one the scores are not terms of
+/// (so they cannot locate its failure, and their sum is reported only as usable or not);
 /// the scores and the prior are each usable but their sum is past the cutoff; or their
 /// sum is usable, so the objective was evaluated at another point than the estimates
 /// and EBEs the subjects were scored at.
@@ -2146,22 +2177,31 @@ pub(crate) fn name_nonfinite_subjects(
         );
         let total = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + source.prior;
         let prior = source.prior;
+        let and_prior = if prior != 0.0 {
+            format!(", and so is the parameter-prior penalty ({prior:?})")
+        } else {
+            String::new()
+        };
         match (prior_failed, source.objective.as_deref()) {
             (true, _) => format!(
                 "{lead}, and the parameter-prior penalty, a population-level term no \
                  subject carries, is not ({prior:?})."
             ),
-            (false, Some(objective)) => format!(
-                "{lead}, and the {objective} objective is not split by subject, so the \
-                 failure is in a part of the {objective} objective that the {score} score \
-                 does not share."
-            ),
-            (false, None) => {
-                let and_prior = if prior != 0.0 {
-                    format!(", and so is the parameter-prior penalty ({prior:?})")
+            // The scores are not terms of this objective, so they cannot say where it
+            // failed (review r6): their sum is reported for what it is, not as a cause.
+            (false, Some(objective)) => {
+                let sum = if ofv_is_valid(total) {
+                    format!("their sum ({total:?}) is usable")
                 } else {
-                    String::new()
+                    format!("their sum ({total:?}) is past the cutoff as well")
                 };
+                format!(
+                    "{lead}{and_prior}, but the {objective} objective is not their sum and \
+                     ferx does not split it by subject, so these scores cannot locate its \
+                     failure; {sum}."
+                )
+            }
+            (false, None) => {
                 if ofv_is_valid(total) {
                     format!(
                         "{lead}{and_prior}, and so is their sum ({total:?}), so the objective \

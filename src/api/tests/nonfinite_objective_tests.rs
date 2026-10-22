@@ -2214,9 +2214,15 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
 /// Laplace one the sentence saying its objective is not split; with one, the
 /// Laplace list is followed by the caveat.
 ///
+/// Without unusable contributions the Laplace sentence says the scores cannot locate the
+/// failure and reports their sum on both sides of the cutoff (review r6: it used to
+/// attribute the failure to a part of Laplace the score does not share, which does not
+/// follow when the scores themselves sum past the cutoff).
+///
 /// Mutation (run): restore the unconditional `named.is_empty()` return → the "No
 /// subject can be named" assertion fires; drop the caveat → the second assertion
-/// fires; append either under the FOCEI source → the two controls fire.
+/// fires; append either under the FOCEI source → the two controls fire; swap the sum's
+/// two arms → both Laplace sentences fire.
 #[test]
 fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
@@ -2266,8 +2272,38 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
     assert_eq!(
         nobody.strip_prefix(&msg).expect("kept"),
         " No subject can be named: every subject's post-hoc FOCEI contribution at these \
-         estimates is usable, and the LAPLACE objective is not split by subject, so the \
-         failure is in a part of the LAPLACE objective that the FOCEI score does not share."
+         estimates is usable, but the LAPLACE objective is not their sum and ferx does not \
+         split it by subject, so these scores cannot locate its failure; their sum (24.68) \
+         is usable."
+    );
+    // The other side of the sum (review r6): scores each usable whose sum is past the
+    // cutoff are reported as such, not as evidence the failure is Laplace's own.
+    let large: Vec<SubjectResult> = ["A", "B"]
+        .iter()
+        .map(|id| {
+            let mut s = crate::types::test_helpers::dummy_subject(id, 1, 4);
+            s.ofv_contribution = 6e13;
+            s
+        })
+        .collect();
+    let (msg_large, mut entry_large) = sentinel_warning();
+    let past = name_nonfinite_subjects(
+        msg_large.clone(),
+        &mut entry_large,
+        &large,
+        &pop,
+        &one_cpt_model(),
+        &one_cpt_model().default_params,
+        None,
+        &laplace,
+        &no_terms,
+    );
+    assert!(
+        past.ends_with(
+            "so these scores cannot locate its failure; their sum (120000000000000.0) is past \
+             the cutoff as well."
+        ),
+        "{past}"
     );
     let details = entry.details.as_ref().expect("payload");
     assert_eq!(
@@ -2886,4 +2922,239 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
         )),
         vec!["Gaussian residual covariance R (not positive definite)".to_string()],
     );
+}
+
+/// A two-occasion subject (observations at 1–3 and 4–6, one dose per occasion) with a
+/// once-a-day kappa on `CL`, proportional error.
+fn proportional_iov() -> CompiledModel {
+    parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+    )
+    .expect("parse")
+}
+
+/// Subject `id` of [`proportional_iov`], dosed at `dose_times` (one per occasion).
+fn iov_subject(id: &str, dose_times: [f64; 2], scale: f64) -> Subject {
+    let mut s = subject_with_dose_time(id, dose_times[0], scale);
+    s.doses = dose_times
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    s.observations = [36.0, 28.0, 21.0, 34.0, 26.0, 19.0]
+        .iter()
+        .map(|y| scale * y)
+        .collect();
+    s.obs_cmts = vec![1; 6];
+    s.cens = vec![0; 6];
+    s.occasions = vec![1, 1, 1, 2, 2, 2];
+    s.dose_occasions = vec![1, 2];
+    s
+}
+
+/// **T9 — an IOV subject names the part of its stacked marginal that failed** (#2267
+/// review r6). Before, an IOV subject got no split at all: the reviewer's
+/// finite-zero-prediction case on a subject scored with κ read "every IPRED and PRED
+/// finite" and named no term. Subject 3's doses are after all its observations, so every
+/// prediction is a finite `0` and its proportional residual is scored at the variance
+/// floor; the term named is each method's own residual part, and only it. The control
+/// (doses at 0 and 3.5 for everyone) stays silent.
+///
+/// Mutation (run): send an IOV subject to `non_gaussian_terms` as before → `failed_terms`
+/// is empty and the sentence ends at "every IPRED and PRED finite".
+#[test]
+fn an_iov_subject_names_the_part_of_its_stacked_marginal_that_failed() {
+    let model = proportional_iov();
+    let pop = |late: bool| {
+        population_of(vec![
+            iov_subject("1", [0.0, 3.5], 1.0),
+            iov_subject("2", [0.0, 3.5], 1.1),
+            iov_subject("3", if late { [30.0, 31.0] } else { [0.0, 3.5] }, 0.9),
+        ])
+    };
+    for (method, residual) in [
+        (EstimationMethod::FoceI, "Gaussian residual term"),
+        (EstimationMethod::Foce, "linearized residual term"),
+    ] {
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        let control = fit(&model, &pop(false), &model.default_params, &opts).expect("fit");
+        assert!(
+            !control
+                .warnings
+                .iter()
+                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            "{method:?}: {:?}",
+            control.warnings
+        );
+
+        let result = fit(&model, &pop(true), &model.default_params, &opts).expect("fit");
+        // The κ path is what the mutation below exercises: an IOV-routed subject.
+        assert_eq!(model.n_kappa, 1, "premise: an IOV model");
+        let (message, subjects) = named_subjects(&result);
+        assert_eq!(subjects.len(), 1, "{method:?}: {subjects:?}");
+        assert_eq!(subjects[0]["id"], "3");
+        let failed: Vec<&str> = subjects[0]["failed_terms"]
+            .as_array()
+            .expect("failed_terms")
+            .iter()
+            .map(|t| t["term"].as_str().unwrap())
+            .collect();
+        assert_eq!(failed, vec![residual], "{method:?}: {message}");
+        assert!(
+            message.contains(&format!(
+                "every IPRED and PRED finite, failed term: {residual} = "
+            )),
+            "{method:?}: {message}"
+        );
+    }
+}
+
+/// **T10 — an IOV subject's parts are its stacked marginal's own.** On a healthy
+/// two-occasion subject, `2·Σ parts` reproduces `foce_subject_nll_iov_linearized` under
+/// FOCEI and FOCE, and a non-finite κ column of `H` fails FOCEI's curvature and FOCE's
+/// `R̃` alone. The straddle: the same subject split without κ (the η-only marginal)
+/// sums to a different number, so these parts are the stacked system's.
+///
+/// Measured: gaps `0` under both flags, against a bound of `1e-12·max(|c|, 1)`; the
+/// η-only sums differ from the stacked contribution by `210` (FOCEI) and `361` (FOCE),
+/// against the straddle's `0.1`. (The point is not an EBE and the data not this model's
+/// fit, so the contributions are large; the identity holds at any point.)
+///
+/// Mutation (run): pass `None` for the sink in the IOV FOCE branch → its name list is
+/// empty and fires (T9 fails too).
+#[test]
+fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
+    let model = proportional_iov();
+    let subject = iov_subject("1", [0.0, 3.5], 1.0);
+    let p = &model.default_params;
+    let omega_iov = p.omega_iov.as_ref().expect("Ω_IOV");
+    let eta = DVector::from_vec(vec![0.05]);
+    let kappas = vec![DVector::from_vec(vec![0.1]), DVector::from_vec(vec![-0.1])];
+    // `∂f/∂η_CL` at this point, from the closed form `f = (100/V)·exp(−CL/V·t)`'s
+    // shape; the identity holds for any `H`, so it only has to be finite and non-zero.
+    let h = DMatrix::from_fn(6, 1, |j, _| -0.04 * subject.obs_times[j]);
+    let lin = crate::stats::likelihood::iov_linearization(
+        &model, &subject, &p.theta, &eta, &h, &p.omega, &kappas, omega_iov,
+    )
+    .expect("one κ per occasion");
+    let failing = |list: &[(String, f64)]| -> Vec<String> {
+        list.iter()
+            .filter(|(_, v)| !crate::estimation::outer_optimizer::ofv_is_valid(2.0 * v))
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+    for (interaction, names, broken) in [
+        (
+            true,
+            vec![
+                "Gaussian residual term",
+                "random-effect prior",
+                "curvature log-determinant",
+            ],
+            "curvature (H̃ not positive definite)",
+        ),
+        (
+            false,
+            vec![
+                "linearized residual term",
+                "linearized covariance log-determinant",
+            ],
+            "linearized covariance R̃ (not positive definite)",
+        ),
+    ] {
+        let parts = crate::stats::likelihood::foce_subject_iov_contribution_parts(
+            &model,
+            &subject,
+            &p.theta,
+            &p.sigma.values,
+            interaction,
+            &lin,
+        );
+        assert_eq!(
+            parts.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            names,
+            "interaction {interaction}"
+        );
+        let c = 2.0
+            * crate::stats::likelihood::foce_subject_nll_iov_linearized(
+                &model,
+                &subject,
+                &p.theta,
+                &p.sigma.values,
+                interaction,
+                &lin,
+            );
+        let summed: f64 = parts.iter().map(|(_, v)| 2.0 * v).sum();
+        assert!(
+            c.is_finite() && failing(&parts).is_empty(),
+            "interaction {interaction}: {parts:?} vs {c}"
+        );
+        eprintln!(
+            "interaction {interaction}: contribution {c}, gap {:e}",
+            (summed - c).abs()
+        );
+        assert!(
+            (summed - c).abs() <= 1e-12 * c.abs().max(1.0),
+            "interaction {interaction}: 2·Σ parts = {summed}, contribution = {c}"
+        );
+
+        let eta_only: f64 = crate::stats::likelihood::foce_subject_contribution_parts(
+            &model,
+            &subject,
+            &p.theta,
+            &eta,
+            &h,
+            &p.omega,
+            &p.sigma.values,
+            model.residual_cov_at(p),
+            interaction,
+        )
+        .iter()
+        .map(|(_, v)| 2.0 * v)
+        .sum();
+        eprintln!("interaction {interaction}: η-only sum {eta_only}");
+        assert!(
+            (eta_only - c).abs() > 0.1,
+            "interaction {interaction}: the η-only split {eta_only} vs stacked {c}"
+        );
+
+        let mut bad = crate::stats::likelihood::iov_linearization(
+            &model, &subject, &p.theta, &eta, &h, &p.omega, &kappas, omega_iov,
+        )
+        .expect("one κ per occasion");
+        bad.h_full[(0, 1)] = f64::NAN;
+        let parts = crate::stats::likelihood::foce_subject_iov_contribution_parts(
+            &model,
+            &subject,
+            &p.theta,
+            &p.sigma.values,
+            interaction,
+            &bad,
+        );
+        assert_eq!(
+            failing(&parts),
+            vec![broken.to_string()],
+            "interaction {interaction}: a non-finite κ column fails only {broken}"
+        );
+    }
 }
