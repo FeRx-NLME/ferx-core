@@ -1078,20 +1078,19 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
 fn agq_subject_packed_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+    pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
     b_hat: &[f64],
     n_agq: usize,
     anchor: HessianAnchor,
     out: &mut [f64],
 ) -> Option<()> {
     // AGQ (either anchor, any node count) by the adjoint (`sens::ode_provider::adjoint`).
-    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient, Objective};
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
     let objective = Objective::Agq {
         n_agq,
         exact: matches!(anchor, HessianAnchor::Exact),
     };
-    let g = subject_adjoint_gradient(model, subject, template, x, b_hat, objective)?;
+    let g = subject_adjoint_gradient_at(model, subject, pt, b_hat, objective)?;
     if g.len() != out.len() || !g.iter().all(|v| v.is_finite()) {
         return None;
     }
@@ -1113,6 +1112,9 @@ pub(crate) struct SubjectScoreContext<'a> {
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     force_fd: bool,
+    /// `x` unpacked once for every subject this context scores (`None` when `x` is not
+    /// `template`'s packed length, which the adjoint declines).
+    point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
 }
 
 impl<'a> SubjectScoreContext<'a> {
@@ -1136,6 +1138,7 @@ impl<'a> SubjectScoreContext<'a> {
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
+            point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
         }
     }
 
@@ -1170,7 +1173,7 @@ impl<'a> SubjectScoreContext<'a> {
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
             use crate::sens::ode_provider::adjoint::{
-                subject_adjoint_gradient, subject_adjoint_held_ebe_score, Objective,
+                subject_adjoint_gradient_at, subject_adjoint_held_ebe_score_at, Objective,
             };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
@@ -1188,17 +1191,18 @@ impl<'a> SubjectScoreContext<'a> {
                 }
                 Some(g)
             };
-            let args = (self.model, subject, self.template, self.x, &joint_warm[..]);
-            if let Some(g) = accept(subject_adjoint_gradient(
-                args.0, args.1, args.2, args.3, args.4, objective,
-            )) {
-                return Some((g, ScoreRoute::Exact));
-            }
-            if held_ok && self.model.n_kappa == 0 {
-                if let Some(g) = accept(subject_adjoint_held_ebe_score(
-                    args.0, args.1, args.2, args.3, args.4, objective,
-                )) {
-                    return Some((g, ScoreRoute::HeldEbe));
+            if let Some(pt) = &self.point {
+                let b = &joint_warm[..];
+                let exact = subject_adjoint_gradient_at(self.model, subject, pt, b, objective);
+                if let Some(g) = accept(exact) {
+                    return Some((g, ScoreRoute::Exact));
+                }
+                if held_ok && self.model.n_kappa == 0 {
+                    let held =
+                        subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
+                    if let Some(g) = accept(held) {
+                        return Some((g, ScoreRoute::HeldEbe));
+                    }
                 }
             }
         }
@@ -1344,6 +1348,8 @@ pub fn agq_population_gradient(
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
     let _ = params;
+    // One unpack for the population: every subject is at the same packed point.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
     let per_subject: Vec<Option<Vec<f64>>> = population
         .subjects
         .par_iter()
@@ -1352,10 +1358,8 @@ pub fn agq_population_gradient(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let mut g = vec![0.0f64; n_packed];
-            agq_subject_packed_gradient(
-                model, subject, template, x, &b_hat, n_nodes, anchor, &mut g,
-            )
-            .map(|()| g)
+            agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
+                .map(|()| g)
         })
         .collect();
 

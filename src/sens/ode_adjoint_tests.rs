@@ -2495,6 +2495,138 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
     }
 }
 
+/// A packed vector of the wrong length is declined (`None`), not read past its end:
+/// `unpack_params` indexes it unchecked, and `scope` used to unpack before its own length
+/// check, so a short `x` panicked with an index out of bounds (#2294 review). Every entry
+/// point goes through `PackedPoint::new`, which checks first.
+#[test]
+fn a_packed_vector_of_the_wrong_length_declines() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    let eta = ebe_for(&one, &s, &params, 1e-10, true);
+    assert!(
+        subject_adjoint_gradient(&one, &s, &params, &x, eta.as_slice(), Objective::Focei).is_some()
+    );
+    let longer: Vec<f64> = x.iter().copied().chain([0.0]).collect();
+    for (label, bad) in [("short", &x[..x.len() - 1]), ("long", &longer[..])] {
+        for objective in [
+            Objective::Focei,
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+        ] {
+            assert!(
+                subject_adjoint_gradient(&one, &s, &params, bad, eta.as_slice(), objective)
+                    .is_none(),
+                "{label} x, {objective:?}"
+            );
+        }
+        assert!(
+            subject_adjoint_cov_hessian(&one, &s, &params, bad, eta.as_slice(), Objective::Focei)
+                .is_none(),
+            "{label} x, covariance Hessian"
+        );
+        assert!(
+            subject_adjoint_eta_dx(&one, &s, &params, bad, eta.as_slice(), true).is_none(),
+            "{label} x, mode response"
+        );
+    }
+}
+
+/// A population sweep unpacks the packed point once (`PackedPoint`), not once per subject:
+/// the FOCEI population gradient (each subject checked bit for bit against the per-subject
+/// entry point), the mode responses, the AGQ population gradient, and an AGQ score context
+/// scoring every subject, whose scores must take the exact route. On warfarin's ten
+/// subjects. The count is the regression guard: unpacking per subject cloned every θ name
+/// per subject, a third of the gradient at 1,317 θ.
+#[test]
+fn a_population_sweep_unpacks_the_packed_point_once() {
+    use super::PACKED_POINT_WATCH;
+    use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
+    use crate::estimation::sens_outer_gradient::{
+        per_subject_packed_gradients, population_eta_dx, subject_packed_gradient,
+    };
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+        "examples/warfarin.ferx",
+    ))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let etas: Vec<nalgebra::DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| ebe_for(&model, s, &params, 1e-10, true))
+        .collect();
+    let count = |f: &dyn Fn()| {
+        let key = &params as *const ModelParameters as usize;
+        *PACKED_POINT_WATCH.lock().unwrap() = Some((key, 0));
+        f();
+        PACKED_POINT_WATCH
+            .lock()
+            .unwrap()
+            .take()
+            .map_or(0, |(_, n)| n)
+    };
+    let grads = std::cell::RefCell::new(Vec::new());
+    let n = count(&|| {
+        *grads.borrow_mut() =
+            per_subject_packed_gradients(&model, &pop, &params, &x, &etas, true, None)
+    });
+    assert_eq!(n, 1, "FOCEI population gradient");
+    for (i, (g, s)) in grads.borrow().iter().zip(&pop.subjects).enumerate() {
+        let want = subject_packed_gradient(&model, s, &params, &x, etas[i].as_slice());
+        assert_eq!(
+            g.as_ref().expect("served"),
+            &want.expect("served"),
+            "subject {i}"
+        );
+    }
+    let n = count(&|| {
+        population_eta_dx(&model, &pop, &params, &x, &etas, true).expect("served");
+    });
+    assert_eq!(n, 1, "mode responses");
+    let n = count(&|| {
+        crate::estimation::agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            &params,
+            &x,
+            &etas,
+            &[],
+            1,
+            crate::types::HessianAnchor::Exact,
+        )
+        .expect("served");
+    });
+    assert_eq!(n, 1, "AGQ population gradient");
+    let options = crate::types::FitOptions {
+        method: crate::types::EstimationMethod::Laplace,
+        ..Default::default()
+    };
+    let bounds = crate::estimation::parameterization::pack_with_bounds(&params).bounds;
+    let n = count(&|| {
+        let ctx = SubjectScoreContext::new(&model, &params, &x, &options, &bounds, false);
+        for (s, eta) in pop.subjects.iter().zip(&etas) {
+            let (_, route) = ctx
+                .score_routed(s, eta.as_slice(), &[], true)
+                .expect("scored");
+            assert_eq!(route, ScoreRoute::Exact, "subject {}", s.id);
+        }
+    });
+    assert_eq!(n, 1, "AGQ score context");
+}
+
 #[test]
 fn laplace_adjoint_matches_reconverged_fd() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
