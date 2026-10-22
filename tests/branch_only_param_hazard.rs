@@ -102,8 +102,8 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 /// fallback warning asked the Gaussian recorder alone, which serves the PK rows
 /// and never sees the hazard (#1861). The warning now counts the route that
 /// runs. Since #1861 the model-level label says so too: a TTE endpoint has no
-/// analytic η-channel, so it reports `finite differences`, and an all-FD
-/// population under an FD label needs no reconciling warning.
+/// analytic η-channel, so it reports `finite differences`, and the warning still
+/// fires on the all-FD population to name the time-to-event record as the cause.
 #[test]
 fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
     use ferx_core::{fit, FitOptions};
@@ -159,10 +159,10 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
             "{label}: every TTE subject runs the FD inner gradient"
         );
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("use finite-difference inner gradients")),
-            "{label}: the label already reports FD: {:?}",
+            r.warnings.iter().any(|w| w.contains(
+                "8 of 8 subjects use finite-difference inner gradients (8 carry a time-to-event"
+            )),
+            "{label}: every TTE subject runs the FD inner gradient, and the warning says why: {:?}",
             r.warnings
         );
     }

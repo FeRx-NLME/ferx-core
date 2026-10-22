@@ -224,9 +224,9 @@ the default and the only supported path for TTE objectives.
 
 A subject that carries a TTE record runs the finite-difference inner (EBE) gradient, since
 the hazard term has no analytic η-gradient. The fit reports this as `gradient_method_inner:
-finite differences` on any model with an `[event_model]`. When only some subjects carry TTE
-records, the "*N* of *M* subjects use finite-difference inner gradients" warning counts the
-subjects that run FD and names the time-to-event record as the cause. Before #1861 the label
+finite differences` on any model with an `[event_model]`. The "*N* of *M* subjects use
+finite-difference inner gradients" warning counts the subjects that run FD and names the
+time-to-event record as the cause, also when every subject carries one. Before #1861 the label
 read `analytic (Dual2)` on a joint PK-TTE model, and the warning gave only causes that did not
 apply to TTE records.
 

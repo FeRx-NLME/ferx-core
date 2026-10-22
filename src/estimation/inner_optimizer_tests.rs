@@ -4094,7 +4094,8 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
 /// steady-state infusion into the lagged depot, which the event walk does not serve) declines
 /// on its shape. Each population straddles one sentence of the message, so deleting either
 /// sentence — or crediting a subject to the wrong one — reddens an arm here; `[a, a]` is the
-/// silent control. The label pair is the same model with and without `[event_model]`.
+/// silent control. `[b, b]` must warn although the label already reads FD (the survival
+/// cause lifts the all-FD guard), while `[c, c]` under the same FD label stays silent. The label pair is the same model with and without `[event_model]`.
 #[cfg(feature = "survival")]
 #[test]
 fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
@@ -4203,6 +4204,21 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
         "{w}"
     );
     assert!(w.contains(TTE) && !w.contains(SHAPE), "{w}");
+
+    // All-TTE: the label already reads FD, but the warning still fires to name the cause.
+    let w = warn(vec![b.clone(), b.clone()]).expect("an all-TTE population warns");
+    assert!(
+        w.starts_with(&format!(
+            "2 of 2 subjects use finite-difference inner gradients (2 {TTE})"
+        )),
+        "{w}"
+    );
+    // All-shape under the FD label stays silent: only the survival cause lifts that guard.
+    assert_eq!(
+        warn(vec![c.clone(), c.clone()]),
+        None,
+        "all-shape under an FD label"
+    );
 
     let w = warn(vec![a.clone(), c.clone()]).expect("a mixed shape population warns");
     assert!(

@@ -298,9 +298,12 @@ pub(crate) fn fd_fallback_warning(
     // the report through the SAME `inner_reports_analytic_model` predicate
     // `build_info::gradient_method_inner` uses, so the label and this warning cannot drift
     // (the ODE route was missing from the old `analytic_inner_grad_supported_model` read).
-    // A model that already reports FD and runs FD everywhere needs no warning.
+    // A model that already reports FD and runs FD everywhere needs no warning — except
+    // when subjects fall back on a survival record (#1861): the label reads FD on any TTE
+    // model, but neither it nor the banner says *why*, and a joint PK-TTE user whose PK
+    // rows the recorder serves has no other way to learn that the hazard term is the cause.
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
+    if n_fd > 0 && (n_fd < n_total || model_reports_analytic || n_survival > 0) {
         // #520 C2: on an `[odes]` model the FD inner gradient differences a numerically
         // integrated trajectory, so the integrator's tolerance is part of the gradient's
         // accuracy — measured at 25-120 OFV of stall on TMDD at the default. The note is
