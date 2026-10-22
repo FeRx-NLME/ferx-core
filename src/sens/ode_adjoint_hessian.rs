@@ -463,21 +463,27 @@ fn nn_reduce_off() -> bool {
 /// with `η′` along `a` equal to `η′_z J_z[:, a]`. The passes through the recorders are then over
 /// `|B| = n_r + n_z + N` directions instead of `n` (16 against 147 on the 141-weight
 /// `warfarin_dcm`), and the weights' own curvature comes from the networks alone.
+///
+/// The outer gradient (`run`) reads the same reduction: the outputs as tape leaves, and the
+/// weights' adjoint as one backward pass through each network.
 #[cfg(feature = "nn")]
-struct NnReduction {
+pub(super) struct NnReduction<'s> {
     /// Raw outputs per network at the current weights.
-    z: Vec<Vec<f64>>,
+    pub(super) z: Vec<Vec<f64>>,
     /// Per network: its first packed weight coordinate, its weight count, and its inputs.
-    nets: Vec<(usize, usize, std::collections::HashMap<String, f64>)>,
+    pub(super) nets: Vec<(usize, usize, &'s std::collections::HashMap<String, f64>)>,
+    /// Per network, the forward pass `z` came from, kept for the gradient's backward pass
+    /// (`MlpMapper::vjp_at`), so a gradient evaluates each network once.
+    pub(super) forward: Vec<crate::nn::NnForward>,
 }
 
 #[cfg(feature = "nn")]
-impl NnReduction {
+impl<'s> NnReduction<'s> {
     /// `None` when the reduction does not hold (a weight read directly, an input that
     /// varies over the subject's records) or does not pay (fewer weights than outputs).
-    fn build(
+    pub(super) fn build(
         model: &CompiledModel,
-        subject: &Subject,
+        subject: &'s Subject,
         template: &ModelParameters,
         theta: &[f64],
     ) -> Option<Self> {
@@ -488,6 +494,7 @@ impl NnReduction {
         }
         let mut z = Vec::new();
         let mut nets = Vec::new();
+        let mut forward = Vec::new();
         for nn in &model.covariate_nns {
             let n_w = nn.mapper.mlp().n_weights();
             let end = nn.weights_offset + n_w;
@@ -504,12 +511,16 @@ impl NnReduction {
             {
                 return None;
             }
-            z.push(nn.mapper.forward_raw_g(&theta[nn.weights_offset..end], rep));
-            nets.push((nn.weights_offset, n_w, rep.clone()));
+            let fwd = nn
+                .mapper
+                .forward_kept_raw(&theta[nn.weights_offset..end], rep)?;
+            z.push(fwd.output().to_vec());
+            forward.push(fwd);
+            nets.push((nn.weights_offset, n_w, rep));
         }
         let n_w: usize = nets.iter().map(|n| n.1).sum();
         let n_z: usize = z.iter().map(Vec::len).sum();
-        (n_w > n_z).then_some(NnReduction { z, nets })
+        (n_w > n_z).then_some(NnReduction { z, nets, forward })
     }
 
     fn hessian<const N: usize>(
@@ -757,7 +768,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             outer.push(o);
             plain.push(p);
         }
-        NnPresetGuard::enter(vec![Box::new(outer), Box::new(plain)])
+        (outer, plain)
     });
     #[cfg(not(feature = "nn"))]
     let _ = nn_z;
@@ -776,13 +787,17 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             g: lift_g(tan(k)),
         })
         .collect();
+    #[cfg(feature = "nn")]
+    let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o.as_slice()));
+    #[cfg(not(feature = "nn"))]
+    let leaves_outer = ThetaLeaves::theta(&th);
     let preds = record(
         model,
         subject,
         sc.layout.as_ref(),
         &params.theta,
         eta,
-        &th,
+        &leaves_outer,
         &et,
     )?;
     if preds.len() != n_obs {
@@ -827,7 +842,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         sc.layout.as_ref(),
                         &params.theta,
                         &[0.0; N],
-                        &th,
+                        &leaves_outer,
                         &et0,
                     )?;
                     (p0.len() == n_obs).then(|| p0.iter().map(|y| comp(y, 0)).collect())
@@ -887,6 +902,11 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 inner_l(ctx, &f, &eo, &p, None)? + half_logdet
             } else {
                 let th_o: Vec<Out> = unpack_theta(template, xo);
+                #[cfg(feature = "nn")]
+                let leaves_plain =
+                    ThetaLeaves::with_nn(&th_o, preset.as_ref().map(|(_, p)| p.as_slice()));
+                #[cfg(not(feature = "nn"))]
+                let leaves_plain = ThetaLeaves::theta(&th_o);
                 let mut terms: Vec<Out> = Vec::new();
                 for (z, c) in agq_grid::<N>(n_agq, sc.width) {
                     // b = η + √2·L⁻ᵀz, and the predictions recorded at b.
@@ -908,7 +928,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         sc.layout.as_ref(),
                         &params.theta,
                         &bv,
-                        &th_o,
+                        &leaves_plain,
                         &b,
                     )
                     .filter(|q| q.len() == n_obs)?;
@@ -930,13 +950,6 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             Some((a, inner_grad(ctx, &f, &g, &eo, &p, None)?))
         }
     };
-    // A recording that did not read the seeded outputs differentiated the wrong function.
-    #[cfg(feature = "nn")]
-    if preset.as_ref().is_some_and(NnPresetGuard::missed) {
-        return None;
-    }
-    #[cfg(feature = "nn")]
-    drop(preset);
     let (f, g) = out?;
     Some(Pass {
         f,

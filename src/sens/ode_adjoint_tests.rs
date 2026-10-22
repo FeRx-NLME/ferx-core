@@ -3729,7 +3729,11 @@ fn mixture_class_gradient_matches_reconverged_fd_under_the_class_guard() {
 /// symmetric point, and a two-dose subject on its predictions with residuals of both signs.
 #[cfg(feature = "nn")]
 fn covariate_nn_fixture() -> (CompiledModel, Subject) {
-    let src = r#"
+    covariate_nn_fixture_from(COVARIATE_NN_IV)
+}
+
+#[cfg(feature = "nn")]
+const COVARIATE_NN_IV: &str = r#"
 [parameters]
   theta TVQ(6.0, 0.1, 50.0)
   omega ETA_CL ~ 0.1
@@ -3758,6 +3762,67 @@ fn covariate_nn_fixture() -> (CompiledModel, Subject) {
 [error_model]
   DV ~ proportional(PROP)
 "#;
+
+/// [`COVARIATE_NN_IV`] with **two** networks: `CL` from one over both inputs, `V1`/`V2`
+/// from another over `WT` alone, each with its own weight block and inputs.
+#[cfg(feature = "nn")]
+const COVARIATE_NN_TWO_NETS: &str = r#"
+[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V1 ~ 0.1
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn CLNET]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.5]
+
+[covariate_nn VNET]
+  inputs     = [WT]
+  center     = [70]
+  scale      = [15]
+  outputs    = [V1, V2]
+  layers     = [2]
+  activation = tanh
+  output     = softplus
+  init       = [60.0, 50.0]
+
+[individual_parameters]
+  CL = CLNET.CL * exp(ETA_CL)
+  V1 = VNET.V1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = VNET.V2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// [`COVARIATE_NN_IV`] on the user-ODE engine: the same kinetics as `[odes]`.
+#[cfg(feature = "nn")]
+fn covariate_nn_ode_src() -> String {
+    COVARIATE_NN_IV.replace(
+        "[structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n",
+        "[structural_model]\n  ode(states=[central, peripheral])\n\n[odes]\n  \
+         d/dt(central) = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral\n  \
+         d/dt(peripheral) = (Q/V1) * central - (Q/V2) * peripheral\n\n[scaling]\n  \
+         y = central / V1\n",
+    )
+}
+
+/// The fixture's subject (two doses, the shared times, covariates `CRCL = 72`, `WT = 81`,
+/// observations on its predictions with residuals of both signs) for any covariate-NN
+/// model `src`, with θ moved off the `init` symmetric point.
+#[cfg(feature = "nn")]
+fn covariate_nn_fixture_from(src: &str) -> (CompiledModel, Subject) {
     let mut model = parse_model_string(src).unwrap();
     // Off the `init` symmetric point (zero output-layer weights would zero every hidden
     // weight's gradient).
@@ -3804,6 +3869,134 @@ fn covariate_nn_matches_reconverged_fd() {
     let (fd, _) = hessian_gaps_for(&model, &s, Objective::Focei);
     eprintln!("covariate NN FOCEI Hessian vs reconverged FD {fd:.2e}");
     assert!(fd < 1e-5, "covariate NN FOCEI Hessian vs FD {fd:.2e}");
+}
+
+/// An `if` whose condition reads a network output takes the branch production takes. The
+/// generic evaluator's conditions run on an `f64` view and were handed no network outputs
+/// (the ambient thread-local they read had no writer since #2093), so `TYPICAL_PK.CL > 1`
+/// read `0 > 1` on every recording and took the `else` arm while the production predictor
+/// took the `if` one. The outputs now reach the conditions with the program's arguments.
+/// Against the reconverged FD of production's objective, with the leaves and with every
+/// network taped.
+#[cfg(feature = "nn")]
+#[test]
+fn a_condition_on_a_network_output_takes_the_production_branch() {
+    use super::NN_OUTPUT_LEAVES_OFF;
+    let src = COVARIATE_NN_IV.replace(
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL)\n",
+        "  if (TYPICAL_PK.CL > 1.0) {\n    CL = TYPICAL_PK.CL * exp(ETA_CL)\n  } else {\n    \
+         CL = 2.0 * exp(ETA_CL)\n  }\n",
+    );
+    assert_ne!(src, COVARIATE_NN_IV, "the fixture must carry the branch");
+    let (model, s) = covariate_nn_fixture_from(&src);
+    let mut worst = 0.0f64;
+    for off in [false, true] {
+        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
+        let fd = fd_oracle(&model, &s, true);
+        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
+        eprintln!("NN-output condition, leaves off = {off}: vs reconverged FD {fd:.2e}");
+        worst = worst.max(fd);
+    }
+    // Measured worst 3.1e-7 on Linux (the FD's own noise; the same as the branch-free
+    // fixture's); ~10× headroom. The `else` arm misses by O(1).
+    assert!(worst < 3e-6, "NN-output condition vs FD {worst:.2e}");
+}
+
+/// The outer gradient of a covariate-NN subject reads the networks' outputs as tape leaves
+/// and pulls their adjoints back through each network (`nn_output_leaves`), and must equal
+/// the gradient with every network taped over its weights, under FOCEI, FOCE, Laplace's
+/// exact anchor (the taped second-order recording) and AGQ's Gauss–Newton one. On four
+/// engines: the closed-form IV walk, the same model with **two** networks (each network's
+/// mapper, offset and inputs paired with its own leaves), the closed-form oral model
+/// `warfarin_dcm` runs on, and the user-ODE recorder. Only the summation order of the
+/// weights' chain rule differs. The counter shows the leaves were read, the switch that
+/// they stood aside; every network's weight block is asserted live.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_output_leaf_gradient_equals_the_taped_networks() {
+    use super::{NN_OUTPUT_LEAF_HITS, NN_OUTPUT_LEAVES_OFF};
+    let oral = COVARIATE_NN_IV
+        .replace(
+            "  theta TVQ(6.0, 0.1, 50.0)\n",
+            "  theta TVQ(6.0, 0.1, 50.0)\n  theta TVKA(1.2, 0.05, 10.0)\n",
+        )
+        .replace(
+            "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+        )
+        .replace(
+            "  V2 = TYPICAL_PK.V2\n",
+            "  V2 = TYPICAL_PK.V2\n  KA = TVKA\n",
+        );
+    let ode = covariate_nn_ode_src();
+    let mut worst = 0.0f64;
+    for (fixture, src) in [
+        ("closed-form IV", COVARIATE_NN_IV),
+        ("two networks", COVARIATE_NN_TWO_NETS),
+        ("closed-form oral", oral.as_str()),
+        ("ODE", ode.as_str()),
+    ] {
+        let (model, s) = covariate_nn_fixture_from(src);
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        for (objective, interaction, name) in [
+            (Objective::Focei, true, "FOCEI"),
+            (Objective::Foce, false, "FOCE"),
+            (
+                Objective::Agq {
+                    n_agq: 1,
+                    exact: true,
+                },
+                true,
+                "Laplace",
+            ),
+            (
+                Objective::Agq {
+                    n_agq: 3,
+                    exact: false,
+                },
+                true,
+                "AGQ-3",
+            ),
+        ] {
+            let label = format!("{fixture}, {name}");
+            let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+            let run = |off: bool| {
+                NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
+                NN_OUTPUT_LEAF_HITS.with(|c| c.set(0));
+                let g =
+                    subject_adjoint_gradient(&model, &s, &params, &x, eta.as_slice(), objective);
+                NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
+                (g, NN_OUTPUT_LEAF_HITS.with(|c| c.get()))
+            };
+            let (taped, off_hits) = run(true);
+            let (leaves, hits) = run(false);
+            let (taped, leaves) = (
+                taped.unwrap_or_else(|| panic!("{label}: taped gradient in scope")),
+                leaves.unwrap_or_else(|| panic!("{label}: leaf gradient in scope")),
+            );
+            assert_eq!(off_hits, 0, "{label}: the switch must tape the networks");
+            assert_eq!(hits, 1, "{label}: the output leaves were not read");
+            for nn in &model.covariate_nns {
+                let (w, n_w) = (nn.weights_offset, nn.mapper.mlp().n_weights());
+                assert!(
+                    (w..w + n_w).filter(|&i| taped[i].abs() > 1e-3).count() > n_w / 2,
+                    "{label}: a vanishing weight gradient tests nothing (network at {w})"
+                );
+            }
+            for (a, b) in leaves.iter().zip(&taped) {
+                assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
+                worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+            }
+        }
+    }
+    eprintln!("covariate NN: output-leaf vs taped-network gradient {worst:.2e}");
+    // Measured worst 9.8e-15 on Linux over the four fixtures (1.4e-16 on the IV one alone);
+    // ~10× headroom.
+    assert!(
+        worst < 1e-13,
+        "output-leaf vs taped-network gradient {worst:.2e}"
+    );
 }
 
 /// The covariance Hessian of a covariate-NN subject is assembled in the networks' output
