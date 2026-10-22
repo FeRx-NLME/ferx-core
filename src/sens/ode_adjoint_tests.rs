@@ -2495,6 +2495,34 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
     }
 }
 
+/// A subject's unpacked parameters reuse the buffer the previous subject on the thread
+/// dropped (`PooledParams`): the second unpack writes into the first's θ-name strings
+/// (same allocation) and gives `unpack_params`'s value. Dropping the buffer instead of
+/// returning it to the pool, or rebuilding the names, allocates them afresh.
+#[test]
+fn scoped_parameters_reuse_the_threads_buffer() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    let first = super::PooledParams::unpack(&x, &params);
+    let name_ptr = first.theta_names[0].as_ptr();
+    drop(first);
+    let y: Vec<f64> = x.iter().map(|v| v + 0.01).collect();
+    let second = super::PooledParams::unpack(&y, &params);
+    assert_eq!(
+        second.theta_names[0].as_ptr(),
+        name_ptr,
+        "the names were reallocated"
+    );
+    assert_eq!(
+        format!("{:?}", *second),
+        format!(
+            "{:?}",
+            crate::estimation::parameterization::unpack_params(&y, &params)
+        )
+    );
+}
+
 #[test]
 fn laplace_adjoint_matches_reconverged_fd() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();

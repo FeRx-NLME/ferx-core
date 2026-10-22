@@ -705,19 +705,92 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
 
 /// Unpack a flat unconstrained vector back into ModelParameters.
 pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
+    let mut theta = Vec::with_capacity(template.theta.len());
+    let rest = unpack_values(v, template, &mut theta);
+    ModelParameters {
+        theta,
+        theta_names: template.theta_names.clone(),
+        theta_lower: template.theta_lower.clone(),
+        theta_upper: template.theta_upper.clone(),
+        theta_fixed: template.theta_fixed.clone(),
+        omega: rest.omega,
+        omega_fixed: template.omega_fixed.clone(),
+        sigma: rest.sigma,
+        sigma_fixed: template.sigma_fixed.clone(),
+        residual_correlations: rest.residual_correlations,
+        residual_correlation_fixed: template.residual_correlation_fixed.clone(),
+        omega_iov: rest.omega_iov,
+        kappa_fixed: template.kappa_fixed.clone(),
+        mixture: rest.mixture,
+    }
+}
+
+/// [`unpack_params`] into an existing `out`, whose θ-length vectors (values, names, bounds,
+/// fixed flags) are overwritten in place: with an `out` of the same shape nothing θ-sized is
+/// reallocated, which is what a per-subject caller unpacking the same `v` needs at
+/// thousands of θ (a covariate network's weights). Every field of `out` is written.
+pub(crate) fn unpack_params_into(v: &[f64], template: &ModelParameters, out: &mut ModelParameters) {
+    // Exhaustive on purpose: a field added to `ModelParameters` must be written below, or a
+    // reused `out` would carry it over from whatever it held before.
+    let ModelParameters {
+        theta,
+        theta_names,
+        theta_lower,
+        theta_upper,
+        theta_fixed,
+        omega,
+        omega_fixed,
+        sigma,
+        sigma_fixed,
+        residual_correlations,
+        residual_correlation_fixed,
+        omega_iov,
+        kappa_fixed,
+        mixture,
+    } = out;
+    let rest = unpack_values(v, template, theta);
+    // `clone_from` reuses `out`'s buffers (a `String` keeps its allocation when the name
+    // fits), so an `out` of the template's shape allocates nothing θ-sized here.
+    theta_names.clone_from(&template.theta_names);
+    theta_lower.clone_from(&template.theta_lower);
+    theta_upper.clone_from(&template.theta_upper);
+    theta_fixed.clone_from(&template.theta_fixed);
+    *omega = rest.omega;
+    omega_fixed.clone_from(&template.omega_fixed);
+    *sigma = rest.sigma;
+    sigma_fixed.clone_from(&template.sigma_fixed);
+    *residual_correlations = rest.residual_correlations;
+    residual_correlation_fixed.clone_from(&template.residual_correlation_fixed);
+    *omega_iov = rest.omega_iov;
+    kappa_fixed.clone_from(&template.kappa_fixed);
+    *mixture = rest.mixture;
+}
+
+/// The packed-dependent parts of [`unpack_params`] other than θ, which
+/// [`unpack_values`] writes into the caller's vector.
+struct UnpackedRest {
+    omega: OmegaMatrix,
+    sigma: SigmaVector,
+    residual_correlations: Vec<ResidualCorrelation>,
+    omega_iov: Option<OmegaMatrix>,
+    mixture: Option<crate::types::MixtureParams>,
+}
+
+/// The one back-transform of a packed vector, shared by [`unpack_params`] and
+/// [`unpack_params_into`]: θ into `theta` (cleared first), the rest returned.
+fn unpack_values(v: &[f64], template: &ModelParameters, theta: &mut Vec<f64>) -> UnpackedRest {
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
     let n_sigma = template.sigma.values.len();
     let mut idx = 0;
 
     // Theta — back-transform mirrors `pack_params`.
-    let theta: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            let val = theta_from_packed(v[idx], template.theta_lower[i]);
-            idx += 1;
-            val
-        })
-        .collect();
+    theta.clear();
+    theta.extend((0..n_theta).map(|i| {
+        let val = theta_from_packed(v[idx], template.theta_lower[i]);
+        idx += 1;
+        val
+    }));
 
     // Omega Cholesky. `lower_tri_iter` yields only `(i,i)` when `diagonal`, so this
     // one loop covers both cases (same packed order as `pack_params`).
@@ -808,20 +881,11 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         })
         .collect();
 
-    ModelParameters {
-        theta,
-        theta_names: template.theta_names.clone(),
-        theta_lower: template.theta_lower.clone(),
-        theta_upper: template.theta_upper.clone(),
-        theta_fixed: template.theta_fixed.clone(),
+    UnpackedRest {
         omega,
-        omega_fixed: template.omega_fixed.clone(),
         sigma,
-        sigma_fixed: template.sigma_fixed.clone(),
         residual_correlations,
-        residual_correlation_fixed: template.residual_correlation_fixed.clone(),
         omega_iov,
-        kappa_fixed: template.kappa_fixed.clone(),
         mixture,
     }
 }
@@ -2076,6 +2140,66 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// `unpack_params_into` a buffer that held a *different* model's parameters — another
+    /// θ count, IOV or not, a mixture or not — is `unpack_params`, every field and bit (by
+    /// `Debug`, which prints every field and `f64` round-trips): a field the in-place write
+    /// skipped would carry the other model's value over. Each pair runs both ways, at a
+    /// moved packed point.
+    #[test]
+    fn unpacking_into_a_reused_buffer_is_a_fresh_unpack() {
+        use crate::parser::model_parser::{parse_model_file, parse_model_string};
+        use std::path::Path;
+        let mixture = parse_model_string(
+            "[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = 10.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("mixture parses");
+        let models = [
+            parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("iov parses"),
+            parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx")).expect("cov parses"),
+            mixture,
+        ];
+        assert!(models[0].default_params.omega_iov.is_some());
+        assert!(models[2].default_params.mixture.is_some());
+        let moved = |p: &ModelParameters| -> Vec<f64> {
+            pack_params(p)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v + 0.01 * (1.0 + i as f64).sin())
+                .collect()
+        };
+        for a in &models {
+            for b in &models {
+                let (ta, tb) = (&a.default_params, &b.default_params);
+                let x = moved(tb);
+                let mut buf = unpack_params(&moved(ta), ta);
+                unpack_params_into(&x, tb, &mut buf);
+                assert_eq!(
+                    format!("{buf:?}"),
+                    format!("{:?}", unpack_params(&x, tb)),
+                    "{} θ into a buffer of {} θ",
+                    tb.theta.len(),
+                    ta.theta.len()
+                );
+            }
+        }
+    }
 
     /// `omega_cholesky_jacobian` against central finite differences of
     /// `Ω = L Lᵀ` over the packed coordinates (`ln L_ii`, `L_ij`), on a 3×3

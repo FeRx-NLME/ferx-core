@@ -44,7 +44,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
-use crate::estimation::parameterization::{lower_tri_entries, unpack_params};
+use crate::estimation::parameterization::{lower_tri_entries, unpack_params_into};
 use crate::sens::focei_kernel::{foce_f, focei_f_grad, inner_grad, inner_l, LikCtx, ParT};
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::PkNum;
@@ -164,12 +164,57 @@ pub(super) struct Scoped<'m> {
     /// model resolved at `η = 0`, which a closed-form absorption model near its flip-flop switch
     /// may route differently from `model` (resolved at `η̂`).
     pub pop_model: &'m CompiledModel,
-    pub params: ModelParameters,
+    pub params: PooledParams,
     pub width: usize,
     pub bucket: usize,
     pub eta: Vec<f64>,
     /// The subject's layout under IOV, built once for every recording of the subject.
     pub layout: Option<crate::stats::stacked_layout::StackedLayout>,
+}
+
+/// The unpacked parameters of a [`Scoped`] subject, in a buffer kept on the thread between
+/// subjects. Every subject of a population gradient unpacks the same packed point, and
+/// [`unpack_params`](crate::estimation::parameterization::unpack_params) rebuilt every
+/// θ-length vector, names included, each time: on a 1,317-θ covariate network the names'
+/// `malloc`/`free` were a third of the gradient. [`unpack_params_into`] writes a reused
+/// buffer in place instead.
+pub(super) struct PooledParams(Option<ModelParameters>);
+
+thread_local! {
+    /// Buffers returned by dropped [`PooledParams`]; a few, for the nested scopes of one
+    /// thread.
+    static PARAMS_POOL: std::cell::RefCell<Vec<ModelParameters>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl PooledParams {
+    fn unpack(x: &[f64], template: &ModelParameters) -> Self {
+        let mut p = PARAMS_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| template.clone());
+        unpack_params_into(x, template, &mut p);
+        PooledParams(Some(p))
+    }
+}
+
+impl std::ops::Deref for PooledParams {
+    type Target = ModelParameters;
+    fn deref(&self) -> &ModelParameters {
+        self.0.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for PooledParams {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            PARAMS_POOL.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < 4 {
+                    pool.push(p);
+                }
+            });
+        }
+    }
 }
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
@@ -181,7 +226,7 @@ pub(super) fn scope<'m>(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Scoped<'m>> {
-    let params = unpack_params(x, template);
+    let params = PooledParams::unpack(x, template);
     let pop_model = if model.n_kappa > 0 {
         crate::pk::effective_model_for_eval_iov(
             model,
