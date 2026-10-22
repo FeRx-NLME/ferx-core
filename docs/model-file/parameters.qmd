@@ -288,8 +288,9 @@ counts when either holds:
   counts, whether through an individual parameter, the readout, or a compartment
   state (`ETA_CL` on `CL`, read as `central / V`). Two records of a subject at
   one time sharing a level still count as one observation only when nothing in
-  the data tells them apart: the same occasion, compartment and record
-  covariates. Two arms of a study at one visit, keyed as occasions or by a
+  the data tells them apart: no dose or reset between them (a trough listed
+  before a dose at its time is not a replicate of the sample after it), and the
+  same occasion, compartment and record covariates. Two arms of a study at one visit, keyed as occasions or by a
   `TRT` column, are not: a random effect that moves only the drug arm
   (`EMAXI = EMAX * exp(ETA_EM)` in `DRUG = TRT * EMAXI * ...`) is not a shift
   common to both, which is all a level is, so it does not count. ferx measures

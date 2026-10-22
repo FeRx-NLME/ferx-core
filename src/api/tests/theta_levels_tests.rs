@@ -9687,12 +9687,16 @@ mod absorption {
         p
     }
 
-    /// #2131. Two records at one instant are replicates only while their
-    /// occasion, compartment and record covariates all agree: each one alone
-    /// tells them apart.
+    /// #2131. Two records at one instant are replicates only while no dose or
+    /// reset lies between them and their occasion, compartment and record
+    /// covariates all agree: each one alone tells them apart. A record the
+    /// reader moved one ULP below a co-timed row is still the same instant: a
+    /// replicate with nothing between (#1959), not one with a dose or reset at
+    /// the later time; two records at exactly that time see it alike.
     ///
-    /// Mutation — any of the three comparisons in `replicates` dropped: its row
-    /// reads as replicates.
+    /// Mutations — any comparison in `replicates` dropped: its row reads as
+    /// replicates. The engine times compared exactly: the moved record with
+    /// nothing between does not.
     #[test]
     fn one_differing_field_tells_two_records_at_one_instant_apart() {
         let mut p = occ_pop(1, 1, &[1.0, 1.0], 1, false);
@@ -9706,9 +9710,81 @@ mod absorption {
         cmt.obs_cmts[1] = 2;
         let mut cov = base.clone();
         cov.obs_covariates[1].insert("TRT".to_string(), 1.0);
-        for (tag, s) in [("occasion", occ), ("compartment", cmt), ("covariate", cov)] {
+        let mut moved = base.clone();
+        moved.obs_times[0] = 1.0f64.next_down();
+        assert!(
+            moved.same_instant(0, 1),
+            "the moved record is the same instant"
+        );
+        assert!(replicates(&moved, 0, 1), "moved, nothing between");
+        let dose = DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0);
+        let mut at_dose = base.clone();
+        at_dose.doses.push(dose.clone());
+        assert!(replicates(&at_dose, 0, 1), "both after the dose at 1");
+        let mut dosed = moved.clone();
+        dosed.doses.push(dose);
+        let mut reset = moved.clone();
+        reset.reset_times = vec![1.0];
+        for (tag, s) in [
+            ("occasion", occ),
+            ("compartment", cmt),
+            ("covariate", cov),
+            ("a dose between", dosed),
+            ("a reset between", reset),
+        ] {
             assert!(!replicates(&s, 0, 1), "{tag} differs");
         }
+    }
+
+    /// [`cf_pop`] at `T6` plus a second record at `TIME = 2` and a dose of 100 at
+    /// `TIME = 2`. With `straddle` the first `TIME = 2` record is the pre-dose
+    /// trough the reader moves one ULP below the dose (#614); without, both are
+    /// post-dose replicates at exactly 2. Both read `TIME = 2` as written, so
+    /// they share a level of a `[STUDY, TIME]` block either way.
+    fn dosed_at_two(straddle: bool) -> Population {
+        let written = [0.0, 1.0, 2.0, 2.0, 4.0, 8.0, 12.0];
+        let mut p = cf_pop(3, 1, &written);
+        for s in p.subjects.iter_mut() {
+            if straddle {
+                s.obs_times[2] = 2.0f64.next_down();
+            }
+            s.obs_raw_times = written.to_vec();
+            s.doses.push(DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0));
+        }
+        p
+    }
+
+    /// #2131 review. A record moved one ULP below a co-timed dose shares its
+    /// level with the post-dose record at that time, but the dose acts on one of
+    /// them only: S1's `ETA_E0` on `V`, read as `central / V`, moves the trough
+    /// and the peak by different amounts, which no shift of the one level they
+    /// share reproduces. So the block does not resolve the observations, the
+    /// span certificate measures `ETA_E0` unabsorbed, and global sum-to-zero
+    /// binds. The straddle: two post-dose replicates at exactly `TIME = 2`
+    /// still resolve, and global sum-to-zero is refused at the site the walk
+    /// names, without measuring.
+    /// Both agree with the joint oracle under every contrast.
+    ///
+    /// Mutation — `replicates` not looking for a dose between the two records:
+    /// the straddling population is refused under global.
+    #[test]
+    fn a_record_moved_below_a_dose_is_not_a_replicate_of_the_one_after() {
+        let text = |c: &str| shape("S1", "STUDY, TIME", c);
+        let mut wrong = Vec::new();
+        let straddle = dosed_at_two(true);
+        let replicated = dosed_at_two(false);
+        match try_bind(&text("sum_to_zero"), &straddle) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("straddle, global: {got:?}")),
+        }
+        match try_bind(&text("sum_to_zero"), &replicated) {
+            // The walk's own site, not the certificate: the block resolves.
+            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("replicates, global: {got:?}")),
+        }
+        agrees_with_joint_oracle("straddle", &text, &straddle, &mut wrong);
+        agrees_with_joint_oracle("replicates", &text, &replicated, &mut wrong);
+        assert!(wrong.is_empty(), "#2131 review:\n{}", wrong.join("\n"));
     }
 
     /// #2131. Two arms at one visit share a level, so a block with a level per

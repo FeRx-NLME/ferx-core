@@ -1275,11 +1275,12 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
 /// Whether a block of two or more columns resolves every subject's
 /// observations: no level holds two different observation times of one
 /// subject (#1650). Replicates at one time still resolve, since a random
-/// effect's effect is the same at both — but only replicates: two records at
-/// one instant that the data tells apart, two arms of a study keyed as
-/// occasions, a `TRT` that differs, or two compartments, can be moved
-/// differently by a random effect that the one level they share moves alike,
-/// so the block does not resolve them (#2131). The span certificate then
+/// effect's effect is the same at both — but only replicates ([`replicates`]):
+/// two records at one instant that the data tells apart — one moved a ULP
+/// below a co-timed dose, two arms of a study keyed as occasions, a `TRT`
+/// that differs, or two compartments — can be moved differently by a random
+/// effect that the one level they share moves alike, so the block does not
+/// resolve them (#2131). The span certificate then
 /// measures, row by row, whether the levels reproduce the random effect.
 ///
 /// Such a block is a free curve per subject at the observed times, so it
@@ -1298,9 +1299,8 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
-                // One instant, so a random effect moves both alike (#1959) —
-                // when nothing else tells the two records apart (#2131).
-                Some(&(_, j0)) => subject.same_instant(j0, j) && replicates(subject, j0, j),
+                // Replicates, so a random effect moves both alike (#2131).
+                Some(&(_, j0)) => replicates(subject, j0, j),
                 None => {
                     seen.push((level, j));
                     true
@@ -1310,14 +1310,29 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
     })
 }
 
-/// Whether observation records `j` and `k` of `subject` carry the same
-/// occasion, compartment and record covariates: the data gives a random
-/// effect no way to move one and not the other at one instant.
+/// Whether observation records `j` and `k` of `subject` are replicates: one
+/// instant ([`Subject::same_instant`]) with no dose or reset between them, and
+/// the same occasion, compartment and record covariates, so the data gives a
+/// random effect no way to move one and not the other.
+///
+/// One instant is not enough on its own: the reader moves a record one ULP
+/// below a co-timed row to keep file order (#614, #1810), and when that row is
+/// a dose the two records straddle it, so a random effect on the dose or on
+/// the state it changes moves the later one only. A move below a row that
+/// changes no state — an `MDV = 1` row — leaves them replicates (#1959).
 fn replicates(subject: &Subject, j: usize, k: usize) -> bool {
     fn same<T: PartialEq>(v: &[T], j: usize, k: usize) -> bool {
         v.get(j) == v.get(k)
     }
-    same(&subject.occasions, j, k)
+    let (Some(&a), Some(&b)) = (subject.obs_times.get(j), subject.obs_times.get(k)) else {
+        return false;
+    };
+    let (lo, hi) = (a.min(b), a.max(b));
+    let between = |t: f64| lo < t && t <= hi;
+    subject.same_instant(j, k)
+        && !subject.doses.iter().any(|d| between(d.time))
+        && !subject.reset_times.iter().copied().any(between)
+        && same(&subject.occasions, j, k)
         && same(&subject.obs_cmts, j, k)
         && same(&subject.obs_covariates, j, k)
 }
