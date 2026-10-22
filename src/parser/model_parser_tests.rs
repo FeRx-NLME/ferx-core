@@ -34818,3 +34818,74 @@ mod analytic_hazard_time_1919 {
         parse_model_string(&src).expect("a TIME-reading logit predictor must parse");
     }
 }
+
+// ---- #1854: per-parameter covariate dependence (the covariate axis of #1853's mask) ----
+
+/// `(name, reads any of covs)` pairs, in declaration order, on [`time_taint_model`].
+#[cfg(feature = "markov")]
+fn cov_mask_of(ip: &str, covs: &[&str]) -> Vec<(String, bool)> {
+    let model = time_taint_model(ip);
+    let mask = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present")
+        .params_reading_covariates(covs);
+    assert_eq!(
+        mask.len(),
+        model.indiv_param_names.len(),
+        "the mask must be parallel to indiv_param_names"
+    );
+    model.indiv_param_names.iter().cloned().zip(mask).collect()
+}
+
+/// Per parameter and per covariate: `CL` reads `WT` directly, `V` through an intermediate,
+/// `KA` reads `AGE` only, the rest read none. Asked for `WT` alone, `KA` must stay clear —
+/// a mask that ignores *which* covariate (any `PushCov` taints) flags it; one that stops at
+/// direct reads misses `V`.
+#[cfg(feature = "markov")]
+#[test]
+fn the_covariate_mask_flags_only_parameters_reading_the_named_covariates() {
+    let ip = "  CL   = TVCL * (WT / 70) * exp(ETA_CL)\n\
+              \x20 VW   = TVV * WT / 70\n\
+              \x20 V    = VW\n\
+              \x20 KA   = TVKA * AGE / 40\n\
+              \x20 H0   = TVH0\n\
+              \x20 BETA = TVBETA\n";
+    let wt = cov_mask_of(ip, &["WT"]);
+    for (name, want) in [
+        ("CL", true),
+        ("VW", true),
+        ("V", true),
+        ("KA", false),
+        ("H0", false),
+        ("BETA", false),
+    ] {
+        assert_eq!(reads_time(&wt, name), want, "{name} under WT: {wt:?}");
+    }
+    let age = cov_mask_of(ip, &["AGE"]);
+    for (name, want) in [("CL", false), ("V", false), ("KA", true)] {
+        assert_eq!(reads_time(&age, name), want, "{name} under AGE: {age:?}");
+    }
+    let none = cov_mask_of(ip, &[]);
+    assert!(none.iter().all(|(_, t)| !t), "no covariate named: {none:?}");
+}
+
+/// The branch rule: an assignment whose *value* is covariate-free but whose arm is chosen
+/// by a `WT` condition depends on `WT`.
+#[cfg(feature = "markov")]
+#[test]
+fn the_covariate_mask_taints_an_assignment_under_a_covariate_condition() {
+    let ip = "  if (WT > 70) {\n\
+              \x20   CL = 2.0 * TVCL * exp(ETA_CL)\n\
+              \x20 } else {\n\
+              \x20   CL = TVCL * exp(ETA_CL)\n\
+              \x20 }\n\
+              \x20 V    = TVV\n\
+              \x20 KA   = TVKA\n\
+              \x20 H0   = TVH0\n\
+              \x20 BETA = TVBETA\n";
+    let wt = cov_mask_of(ip, &["WT"]);
+    assert!(reads_time(&wt, "CL"), "CL's arm is chosen by WT: {wt:?}");
+    assert!(!reads_time(&wt, "V"), "V reads no covariate: {wt:?}");
+}

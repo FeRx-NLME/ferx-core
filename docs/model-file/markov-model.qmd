@@ -158,6 +158,14 @@ would be frozen there while the Gaussian predictions read it at every record. `f
 ([#1918](https://github.com/FeRx-NLME/ferx-core/issues/1918)); a `TIME`-dependent parameter
 the intensities' states do not depend on, and a time-homogeneous CTMM, are unaffected.
 
+The same solve reads the **baseline** covariate snapshot, so a covariate that is
+time-varying in the data and reaches such a parameter — `CL = TVCL * (WT / 70)`, with `WT`
+changing within a subject — is refused the same way, with `E_ENDPOINT_TV_COVARIATE` on
+`[markov_model]`, naming the covariate and the parameter
+([#1854](https://github.com/FeRx-NLME/ferx-core/issues/1854)), although no intensity names
+the covariate. A time-varying covariate on a dose quantity (`KA`, `F`, …) or on a parameter
+the intensities' states do not depend on is accepted.
+
 A complete runnable model is `examples/ctmm_pd_2state.ferx` (with `data/ctmm_pd_2state.csv`):
 a concentration-driven 2-state process where ferx recovers the transition intensities and the
 drug effect from the Gillespie-simulated data.

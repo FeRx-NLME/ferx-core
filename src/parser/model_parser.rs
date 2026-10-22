@@ -29112,7 +29112,36 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
 /// where every assignment carries its slot.
 #[cfg(feature = "survival")]
 fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
-    fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &stmts_read_time_builtin,
+        &cond_reads_time_builtin,
+    )
+}
+
+/// Classify each individual-parameter var slot as dependent (`true`) on an outside
+/// **source** — the `TIME` built-in for [`compute_time_dependent_mask`], a set of
+/// covariates for [`compute_covariate_dependent_mask`] (#1854) — directly or through
+/// another slot that is. `reads` / `cond_reads` answer "does this statement / condition
+/// read the source itself"; the slot propagation and the branch rule are this walk's,
+/// shared so the two questions cannot drift apart. See [`compute_time_dependent_mask`]
+/// for why each rule is what it is.
+#[cfg(feature = "survival")]
+fn compute_source_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    reads: &dyn Fn(&[Statement]) -> bool,
+    cond_reads: &dyn Fn(&Condition) -> bool,
+) -> Vec<bool> {
+    fn walk(
+        stmts: &[Statement],
+        ctx_time: bool,
+        time_vars: &mut Vec<bool>,
+        changed: &mut bool,
+        reads: &dyn Fn(&[Statement]) -> bool,
+        cond_reads: &dyn Fn(&Condition) -> bool,
+    ) {
         // The slot list the two slot-walks take, rebuilt per statement group from the
         // current mask (`n_vars` is tens, and this runs once per model).
         let tainted = |mask: &[bool]| -> Vec<usize> {
@@ -29129,7 +29158,7 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     }
                     let one = std::slice::from_ref(s);
                     let slots = tainted(time_vars);
-                    if ctx_time || stmts_read_time_builtin(one) || stmts_read_slots(one, &slots) {
+                    if ctx_time || reads(one) || stmts_read_slots(one, &slots) {
                         if let Some(slot) = time_vars.get_mut(*idx) {
                             *slot = true;
                             *changed = true;
@@ -29158,13 +29187,11 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);
-                        governed = governed
-                            || cond_reads_time_builtin(cond)
-                            || cond_reads_slots(cond, &slots);
-                        walk(body, governed, time_vars, changed);
+                        governed = governed || cond_reads(cond) || cond_reads_slots(cond, &slots);
+                        walk(body, governed, time_vars, changed, reads, cond_reads);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, governed, time_vars, changed);
+                        walk(eb, governed, time_vars, changed, reads, cond_reads);
                     }
                 }
                 // No wildcard arm, for the reason `bytecode_is_dynamic`'s `Op` list has
@@ -29194,12 +29221,98 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
     let mut time_vars = vec![false; n_vars];
     loop {
         let mut changed = false;
-        walk(stmts, false, &mut time_vars, &mut changed);
+        walk(
+            stmts,
+            false,
+            &mut time_vars,
+            &mut changed,
+            reads,
+            cond_reads,
+        );
         if !changed {
             break;
         }
     }
     time_vars
+}
+
+/// Classify each individual-parameter var slot as dependent (`true`) on any of the
+/// covariates at `cov_idx` — indices into [`IndivParamProgram`]'s `cov_names`, the slice
+/// `Op::PushCov` / [`Expression::CovariateIdx`] read — directly or through another slot
+/// (#1854). The covariate axis of [`compute_time_dependent_mask`], on the same walk.
+///
+/// Two reads are attributed conservatively, both in the direction of a false refusal:
+/// a `[covariate_nn]` output (its inputs are covariates, chosen outside this program, so
+/// any NN read counts as reading the set), and an unresolved `Covariate` / `Variable`
+/// name, which the resolved program does not contain.
+#[cfg(feature = "markov")]
+fn compute_covariate_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    cov_idx: &[usize],
+) -> Vec<bool> {
+    fn expr_reads(e: &Expression, cov_idx: &[usize]) -> bool {
+        match e {
+            Expression::CovariateIdx(i) => cov_idx.contains(i),
+            Expression::NnOutput { .. } | Expression::Covariate(_) | Expression::Variable(_) => {
+                true
+            }
+            Expression::Literal(_)
+            | Expression::Theta(_)
+            | Expression::VariableIdx(_)
+            | Expression::Eta(_)
+            | Expression::Time
+            | Expression::MixNum => false,
+            Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+                expr_reads(a, cov_idx) || expr_reads(b, cov_idx)
+            }
+            Expression::UnaryFn(_, a) => expr_reads(a, cov_idx),
+            Expression::ThetaGather { idx, .. } => expr_reads(idx, cov_idx),
+            Expression::Conditional(c, t, f) => {
+                cond_reads(c, cov_idx) || expr_reads(t, cov_idx) || expr_reads(f, cov_idx)
+            }
+        }
+    }
+    fn cond_reads(c: &Condition, cov_idx: &[usize]) -> bool {
+        match c {
+            Condition::Compare(a, _, b) => expr_reads(a, cov_idx) || expr_reads(b, cov_idx),
+            Condition::And(a, b) | Condition::Or(a, b) => {
+                cond_reads(a, cov_idx) || cond_reads(b, cov_idx)
+            }
+            Condition::Not(a) => cond_reads(a, cov_idx),
+            Condition::Present(e) => expr_reads(e, cov_idx),
+        }
+    }
+    fn stmts_read(stmts: &[Statement], cov_idx: &[usize]) -> bool {
+        stmts.iter().any(|s| match s {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                bc.ops.iter().any(|op| match op {
+                    Op::PushCov(i) => cov_idx.contains(&(*i as usize)),
+                    Op::PushNnOutput(..) => true,
+                    _ => false,
+                })
+            }
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => expr_reads(e, cov_idx),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, b)| cond_reads(c, cov_idx) || stmts_read(b, cov_idx))
+                    || else_body.as_deref().is_some_and(|b| stmts_read(b, cov_idx))
+            }
+        })
+    }
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &|one: &[Statement]| stmts_read(one, cov_idx),
+        &|c: &Condition| cond_reads(c, cov_idx),
+    )
 }
 
 /// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
@@ -29692,6 +29805,27 @@ impl IndivParamProgram {
     #[cfg(feature = "survival")]
     pub(crate) fn params_reading_time(&self) -> Vec<bool> {
         let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
+        (0..self.n_top_level_vars)
+            .map(|i| mask.get(i).copied().unwrap_or(true))
+            .collect()
+    }
+
+    /// Which **top-level individual parameters** depend on any of the covariates
+    /// `names`, one `bool` per entry of [`crate::types::CompiledModel::indiv_param_names`]
+    /// and in that order — the covariate axis of [`Self::params_reading_time`] (#1854),
+    /// with the same slot-layout contract and the same fail-closed `true` for a slot the
+    /// mask does not cover. A name this block never reads contributes nothing, but a
+    /// `[covariate_nn]` output read counts as reading every name (see
+    /// [`compute_covariate_dependent_mask`]).
+    #[cfg(feature = "markov")]
+    pub(crate) fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
+        let cov_idx: Vec<usize> = self
+            .cov_names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| names.contains(&n.as_str()).then_some(i))
+            .collect();
+        let mask = compute_covariate_dependent_mask(&self.stmts, self.n_vars, &cov_idx);
         (0..self.n_top_level_vars)
             .map(|i| mask.get(i).copied().unwrap_or(true))
             .collect()
