@@ -21976,7 +21976,7 @@ fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
     MODEL_NN_DUAL.with(|cell| {
         cell.borrow()
             .as_ref()?
-            .downcast_ref::<Vec<Vec<T>>>()?
+            .downcast_ref::<std::rc::Rc<Vec<Vec<T>>>>()?
             .get(nn_i as usize)?
             .get(out_i as usize)
             .copied()
@@ -21992,7 +21992,9 @@ pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
 
 #[cfg(feature = "nn")]
 impl ModelNnDualGuard {
-    pub(crate) fn enter<T: 'static>(outputs: Vec<Vec<T>>) -> Self {
+    /// `outputs` behind an `Rc`, so a caller handing the same outputs to every recording of
+    /// a subject (`sens::ode_provider::adjoint::Leaves`) installs them without a copy.
+    pub(crate) fn enter<T: 'static>(outputs: std::rc::Rc<Vec<Vec<T>>>) -> Self {
         ModelNnDualGuard(MODEL_NN_DUAL.with(|cell| cell.replace(Some(Box::new(outputs)))))
     }
 }

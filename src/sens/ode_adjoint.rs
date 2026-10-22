@@ -417,76 +417,57 @@ fn unit_dirs<const N: usize>() -> [[f64; N]; N] {
     std::array::from_fn(|k| std::array::from_fn(|m| if m == k { 1.0 } else { 0.0 }))
 }
 
-#[cfg(feature = "nn")]
-thread_local! {
-    /// `[covariate_nn]` raw outputs fixed for the recordings on this thread, one
-    /// `Vec<Vec<T>>` (per network, per output) per number type, set by [`NnPresetGuard`].
-    static NN_PRESET: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Set when a recording found presets but none of its number type: the caller's
-    /// seeding never reached the networks, so its pass is void.
-    static NN_PRESET_MISS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// The θ leaves of one recording and, when the weights reach the likelihood through the
+/// networks' outputs alone ([`hessian::NnReduction`]), those outputs on the **same** number
+/// type: the recording reads them in place of evaluating the networks over the weights. The
+/// type is the guarantee — a recording can only be handed outputs of its own type, so there
+/// is no thread-local channel to miss or to nest (#2293 review).
+pub(super) struct ThetaLeaves<'a, T> {
+    pub(super) theta: &'a [T],
+    #[cfg(feature = "nn")]
+    pub(super) nn: Option<&'a std::rc::Rc<Vec<Vec<T>>>>,
 }
 
-/// RAII: the `[covariate_nn]` outputs every recording on this thread reads in place of
-/// evaluating the networks over the taped weights. The covariance Hessian's reduced basis
-/// (`ode_adjoint_hessian`) seeds the outputs themselves as pass directions; the weights
-/// reach the likelihood through them alone (`nn_output_chain_supported`).
-#[cfg(feature = "nn")]
-pub(super) struct NnPresetGuard;
-
-#[cfg(feature = "nn")]
-impl NnPresetGuard {
-    pub(super) fn enter(sets: Vec<Box<dyn std::any::Any>>) -> Self {
-        NN_PRESET.with(|c| *c.borrow_mut() = sets);
-        NN_PRESET_MISS.with(|m| m.set(false));
-        NnPresetGuard
-    }
-
-    /// Whether a recording under this guard found no preset of its number type.
-    pub(super) fn missed(&self) -> bool {
-        NN_PRESET_MISS.with(std::cell::Cell::get)
-    }
-}
-
-#[cfg(feature = "nn")]
-impl Drop for NnPresetGuard {
-    fn drop(&mut self) {
-        NN_PRESET.with(|c| c.borrow_mut().clear());
-    }
-}
-
-/// The preset outputs of type `T`, if a [`NnPresetGuard`] is live.
-#[cfg(feature = "nn")]
-fn nn_preset<T: VmNum>() -> Option<Vec<Vec<T>>> {
-    NN_PRESET.with(|c| {
-        let sets = c.borrow();
-        if sets.is_empty() {
-            return None;
+impl<'a, T> ThetaLeaves<'a, T> {
+    /// θ leaves alone: every network is evaluated on the recording's number type.
+    pub(super) fn theta(theta: &'a [T]) -> Self {
+        ThetaLeaves {
+            theta,
+            #[cfg(feature = "nn")]
+            nn: None,
         }
-        let hit = sets
-            .iter()
-            .find_map(|b| b.downcast_ref::<Vec<Vec<T>>>().cloned());
-        if hit.is_none() {
-            NN_PRESET_MISS.with(|m| m.set(true));
-        }
-        hit
-    })
+    }
+
+    /// θ leaves with the networks' outputs (`None`: evaluate the networks).
+    #[cfg(feature = "nn")]
+    pub(super) fn with_nn(theta: &'a [T], nn: Option<&'a std::rc::Rc<Vec<Vec<T>>>>) -> Self {
+        ThetaLeaves { theta, nn }
+    }
+}
+
+impl<T> std::ops::Deref for ThetaLeaves<'_, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.theta
+    }
 }
 
 /// The [`hessian::NnReduction`] of `subject` at `theta` and its outputs as leaves on the
 /// outer tape (one value leaf per output, no η-tangent: the inputs are subject-static, so
-/// the outputs do not move with η), for the recordings to read through an
-/// [`NnPresetGuard`]. `None` when the reduction does not hold, and the networks are taped
-/// over their weights as before.
+/// the outputs do not move with η), handed to the recordings in their [`ThetaLeaves`].
+/// `None` when the reduction does not hold, and the networks are taped over their weights
+/// as before.
 #[cfg(feature = "nn")]
 #[allow(clippy::type_complexity)]
-fn nn_output_leaves<const N: usize, const M: usize, const TH: bool>(
+fn nn_output_leaves<'s, const N: usize, const M: usize, const TH: bool>(
     model: &CompiledModel,
-    subject: &Subject,
+    subject: &'s Subject,
     template: &ModelParameters,
     theta: &[f64],
-) -> Option<(hessian::NnReduction, Vec<Vec<DualV<N, M, TH>>>)> {
+) -> Option<(
+    hessian::NnReduction<'s>,
+    std::rc::Rc<Vec<Vec<DualV<N, M, TH>>>>,
+)> {
     #[cfg(test)]
     if NN_OUTPUT_LEAVES_OFF.with(std::cell::Cell::get) {
         return None;
@@ -503,7 +484,7 @@ fn nn_output_leaves<const N: usize, const M: usize, const TH: bool>(
                 .collect()
         })
         .collect();
-    Some((red, z))
+    Some((red, std::rc::Rc::new(z)))
 }
 
 /// The weights' share of the θ adjoint under [`nn_output_leaves`]:
@@ -518,11 +499,15 @@ fn add_nn_weight_adjoint<L>(
     at: impl Fn(&L) -> f64,
     theta_adj: &mut [f64],
 ) -> Option<()> {
-    for (net, (&(off, n_w, ref cov), zl)) in red.nets.iter().zip(leaves).enumerate() {
+    for (net, ((&(off, n_w, _), fwd), zl)) in
+        red.nets.iter().zip(&red.forward).zip(leaves).enumerate()
+    {
         let zbar: Vec<f64> = zl.iter().map(&at).collect();
-        let gw = model.covariate_nns[net]
-            .mapper
-            .vjp_raw(&theta[off..off + n_w], cov, &zbar)?;
+        let gw =
+            model.covariate_nns[net]
+                .mapper
+                .mlp()
+                .vjp_at(fwd, &theta[off..off + n_w], &zbar)?;
         for (t, g) in theta_adj[off..off + n_w].iter_mut().zip(gw) {
             *t += g;
         }
@@ -545,33 +530,35 @@ fn taped_params<T: VmNum>(
     model: &CompiledModel,
     prog: &crate::parser::model_parser::IndivParamProgram,
     n_slots: usize,
-    theta: &[T],
+    theta: &ThetaLeaves<'_, T>,
     eta: &[T],
     cov: &std::collections::HashMap<String, f64>,
 ) -> Vec<Option<T>> {
-    // `[covariate_nn]` outputs: the networks over the θ (weight) inputs, on `T`, or the
-    // outputs a caller fixed for this thread's recordings (`NnPresetGuard`).
+    // `[covariate_nn]` outputs: the ones the recording was handed (`ThetaLeaves::nn`), or the
+    // networks over the θ (weight) inputs, on `T`.
     #[cfg(feature = "nn")]
     let _nn = (!model.covariate_nns.is_empty()).then(|| {
-        crate::parser::model_parser::ModelNnDualGuard::enter::<T>(nn_preset::<T>().unwrap_or_else(
+        crate::parser::model_parser::ModelNnDualGuard::enter::<T>(theta.nn.cloned().unwrap_or_else(
             || {
-                model
-                    .covariate_nns
-                    .iter()
-                    .map(|nn| {
-                        let w = &theta
-                            [nn.weights_offset..nn.weights_offset + nn.mapper.mlp().n_weights()];
-                        // Weights with no derivative (every inner recording): the network on
-                        // `f64` — memoised across the solve — lifted, not on the dual.
-                        if w.iter().all(|t| t.is_constant()) {
-                            let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
-                            if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
-                                return y.into_iter().map(T::from_f64).collect();
+                std::rc::Rc::new(
+                    model
+                        .covariate_nns
+                        .iter()
+                        .map(|nn| {
+                            let w = &theta[nn.weights_offset
+                                ..nn.weights_offset + nn.mapper.mlp().n_weights()];
+                            // Weights with no derivative (every inner recording): the network on
+                            // `f64` — memoised across the solve — lifted, not on the dual.
+                            if w.iter().all(|t| t.is_constant()) {
+                                let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
+                                if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
+                                    return y.into_iter().map(T::from_f64).collect();
+                                }
                             }
-                        }
-                        nn.mapper.forward_raw_g(w, cov)
-                    })
-                    .collect()
+                            nn.mapper.forward_raw_g(w, cov)
+                        })
+                        .collect(),
+                )
             },
         ))
     });
@@ -641,7 +628,7 @@ fn record_ode<T: VmNum>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
@@ -707,7 +694,7 @@ fn record_analytic<T: VmNum>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     if !closed_form_serves(model, subject) || closed_form_reshapes_f_window(model, subject) {
@@ -860,7 +847,7 @@ fn record_ode_iov<T: VmNum>(
     layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
@@ -991,7 +978,7 @@ fn closed_form_finish<T: VmNum>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
     prog: &crate::parser::model_parser::IndivParamProgram,
     mut preds: Vec<T>,
@@ -1058,7 +1045,7 @@ fn record_analytic_events<T: VmNum>(
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     use crate::sens::propagate::PkDual;
@@ -1286,7 +1273,7 @@ fn record_algebraic<T: VmNum>(
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     let readout = model.analytic_readout.as_ref()?;
@@ -1374,7 +1361,7 @@ fn record<T: VmNum>(
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     let built;
@@ -1398,7 +1385,7 @@ fn record_cells<T: VmNum>(
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     theta: &[f64],
     eta: &[f64],
-    th: &[T],
+    th: &ThetaLeaves<'_, T>,
     et: &[T],
 ) -> Option<Vec<T>> {
     if model.is_algebraic() {
@@ -1458,8 +1445,16 @@ fn canonical_jets<const N: usize, const M: usize>(
     let th: Vec<DualV<N, M>> = theta.iter().map(|&v| DualV::constant(v)).collect();
     let unit = unit_dirs::<N>();
     let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
-    record(model, subject, lay, theta, eta, &th, &et)
-        .filter(|p| p.len() == subject.observations.len())
+    record(
+        model,
+        subject,
+        lay,
+        theta,
+        eta,
+        &ThetaLeaves::theta(&th),
+        &et,
+    )
+    .filter(|p| p.len() == subject.observations.len())
 }
 
 /// [`canonical_jets`] at first order (`(f, ∂f/∂η)`), the inner loop's per-step recording, on
@@ -1476,8 +1471,16 @@ fn canonical_jets1<const N: usize>(
     let th: Vec<DualF<N, 0>> = theta.iter().map(|&v| DualF::constant(v)).collect();
     let unit = unit_dirs::<N>();
     let et: [DualF<N, 0>; N] = std::array::from_fn(|k| DualF::free(eta[k], unit[k], []));
-    record(model, subject, lay, theta, eta, &th, &et)
-        .filter(|p| p.len() == subject.observations.len())
+    record(
+        model,
+        subject,
+        lay,
+        theta,
+        eta,
+        &ThetaLeaves::theta(&th),
+        &et,
+    )
+    .filter(|p| p.len() == subject.observations.len())
 }
 
 /// The model the predictor would evaluate for this subject (a closed-form absorption model
@@ -2110,12 +2113,12 @@ fn run<const N: usize, const M: usize>(
     #[cfg(feature = "nn")]
     let nn_out = nn_output_leaves::<N, M, false>(model, subject, template, theta);
     #[cfg(feature = "nn")]
-    let nn_guard = nn_out
-        .as_ref()
-        .map(|(_, z)| NnPresetGuard::enter(vec![Box::new(z.clone())]));
+    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z));
+    #[cfg(not(feature = "nn"))]
+    let lv = ThetaLeaves::theta(&th);
     let unit = unit_dirs::<N>();
     let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
-    let preds = record(model, subject, lay, theta, eta, &th, &et)?;
+    let preds = record(model, subject, lay, theta, eta, &lv, &et)?;
     let n_obs = preds.len();
     if n_obs != subject.observations.len() {
         return None;
@@ -2130,19 +2133,13 @@ fn run<const N: usize, const M: usize>(
             lay,
             theta,
             &zeros,
-            &th,
+            &lv,
             &[DualV::constant(0.0); N],
         )?;
         (p0.len() == n_obs).then_some(p0)?.into()
     } else {
         None
     };
-    #[cfg(feature = "nn")]
-    if nn_guard.as_ref().is_some_and(NnPresetGuard::missed) {
-        return None;
-    }
-    #[cfg(feature = "nn")]
-    drop(nn_guard);
 
     // ---- 2. w = H⁻¹∇_η F, from (F, ∇_η l) over a forward η-dual: no tape --------------
     // f carries its η-tangents G, and G its tangents ∂G/∂η = ∂²f/∂η² (the Hessian payload),
@@ -2201,26 +2198,18 @@ fn run<const N: usize, const M: usize>(
         }
     }
     let adj = vsweep::<N, 1>(top);
-    #[allow(unused_mut)]
-    let mut theta_adj: Vec<f64> = th
-        .iter()
-        .map(|t| {
-            if t.i == NONE {
-                0.0
-            } else {
-                adj[vadj_index::<N, 1>(t.i, 0, 0)]
-            }
-        })
-        .collect();
+    // A leaf's value-component adjoint (θ, and the networks' outputs under the reduction).
+    let at = |l: &DualV<N, M>| {
+        if l.i == NONE {
+            0.0
+        } else {
+            adj[vadj_index::<N, 1>(l.i, 0, 0)]
+        }
+    };
+    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+    let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
     #[cfg(feature = "nn")]
     if let Some((red, z)) = &nn_out {
-        let at = |l: &DualV<N, M>| {
-            if l.i == NONE {
-                0.0
-            } else {
-                adj[vadj_index::<N, 1>(l.i, 0, 0)]
-            }
-        };
         add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
     }
     let out = packed_gradient(
@@ -2574,9 +2563,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     #[cfg(feature = "nn")]
     let nn_out = nn_output_leaves::<N, M2, TH>(model, subject, template, theta);
     #[cfg(feature = "nn")]
-    let nn_guard = nn_out
-        .as_ref()
-        .map(|(_, z)| NnPresetGuard::enter(vec![Box::new(z.clone())]));
+    let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z));
+    #[cfg(not(feature = "nn"))]
+    let lv = ThetaLeaves::theta(&th);
     // Node predictions at their own b_j, taped for their θ path (canonical tangents: G at
     // the node, for the linearisation in b).
     let node_preds: Vec<Vec<DualV<N, M2, TH>>> = grid
@@ -2588,7 +2577,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 lay,
                 theta,
                 b,
-                &th,
+                &lv,
                 &eta_leaves::<N, M2, TH>(b, &unit),
             )
             .filter(|p| p.len() == n_obs)
@@ -2718,16 +2707,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     };
     // The recording at η̂, along `dirs` (tangent m is the derivative along column m).
     let et = eta_leaves::<N, M2, TH>(eta, &dirs);
-    let p2 = record(model, subject, lay, theta, eta, &th, &et)?;
+    let p2 = record(model, subject, lay, theta, eta, &lv, &et)?;
     if p2.len() != n_obs {
         return None;
     }
-    #[cfg(feature = "nn")]
-    if nn_guard.as_ref().is_some_and(NnPresetGuard::missed) {
-        return None;
-    }
-    #[cfg(feature = "nn")]
-    drop(nn_guard);
     // `weights`: whether the θ adjoint is wanted (sweep 2), so the networks' backward
     // passes run once.
     let sweep = |adj: &[f64], weights: bool| -> Option<([f64; N], Vec<f64>)> {
@@ -2774,7 +2757,7 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             vsweep::<N, 1>(top)
         };
         let at = |d: &DualV<N, M2, TH>| if d.i == NONE { 0.0 } else { vs[vidx(d.i, 0)] };
-        #[allow(unused_mut)]
+        #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
         let mut theta_adj: Vec<f64> = th.iter().map(at).collect();
         #[cfg(feature = "nn")]
         if let (Some((red, z)), true) = (&nn_out, weights) {
