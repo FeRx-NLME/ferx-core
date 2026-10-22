@@ -82,9 +82,93 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
         .collect()
 }
 
+/// The `[derived] compartments[i]` warnings for subjects whose individual parameters
+/// vary along their timeline — `W_DERIVED_CMT_TV_ANALYTICAL` and `W_DERIVED_CMT_TV_ODE`,
+/// at most one of each.
+///
+/// Each subject is classified on the engine that serves it at the fitted `(θ, η̂)`
+/// ([`pk::effective_model_for_eval`], the same call `compute_predictions_with_states`
+/// makes), so a closed-form transit/IG subject rerouted to its ODE twin is reported as
+/// ODE, not as NaN. IOV subjects (non-empty κ) are skipped: their states are empty for
+/// a different reason, `W_DERIVED_CMT_IOV_UNSUPPORTED`.
+///
+/// | engine | TV covariate or `TIME`-reading individual params | states | warning |
+/// |---|---|---|---|
+/// | analytical | neither | superposition, exact | — |
+/// | analytical | either or both | empty → NaN | `_TV_ANALYTICAL` |
+/// | ODE | neither (a reset, or an `[odes]` RHS reading time, keeps one snapshot) | exact | — |
+/// | ODE | either or both | disposition frozen at the first observation | `_TV_ODE` |
+///
+/// The analytical row's `TIME` column asks [`pk::model_uses_time_anywhere`], the
+/// predicate its state routing asks; the ODE row's asks
+/// [`pk::ode_cmt_states_approximate`]. Each message names the cause(s) present among
+/// its own subjects, so a fit with only a `TIME`-reading model is not told about
+/// covariates it does not have.
+pub(crate) fn derived_cmt_time_varying_warnings(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<String> {
+    // (any subject with a TV covariate, any subject on a TIME-reading model), per engine.
+    let mut analytical = (false, false);
+    let mut ode = (false, false);
+    for (i, subject) in population.subjects.iter().enumerate() {
+        if kappas.get(i).is_some_and(|k| !k.is_empty()) {
+            continue;
+        }
+        let eta = eta_hats.get(i).map_or(&[][..], |e| e.as_slice());
+        let m = pk::effective_model_for_eval(model, subject, theta, eta);
+        let (slot, tv_cov, time) = if m.ode_spec.is_some() {
+            if !pk::ode_cmt_states_approximate(m, subject) {
+                continue;
+            }
+            let tv_cov = subject.has_tv_covariates();
+            (&mut ode, tv_cov, pk::model_uses_time_builtin(m))
+        } else {
+            let (tv_cov, time) = (subject.has_tv_covariates(), pk::model_uses_time_anywhere(m));
+            if !(tv_cov || time) {
+                continue;
+            }
+            (&mut analytical, tv_cov, time)
+        };
+        slot.0 |= tv_cov;
+        slot.1 |= time;
+    }
+    let cause = |(tv_cov, time): (bool, bool)| match (tv_cov, time) {
+        (true, true) => "time-varying covariates or individual parameters that read TIME",
+        (true, false) => "time-varying covariates",
+        _ => "individual parameters that read TIME",
+    };
+    let mut out = Vec::new();
+    if analytical.0 || analytical.1 {
+        out.push(format!(
+            "W_DERIVED_CMT_TV_ANALYTICAL: analytical model with {} — compartment \
+             states are not available for those subjects; [derived] expressions that \
+             reference compartments[i] evaluate to NaN for them.",
+            cause(analytical)
+        ));
+    }
+    if ode.0 || ode.1 {
+        out.push(format!(
+            "W_DERIVED_CMT_TV_ODE: ODE model with {} — compartment states for those \
+             subjects are approximate (the disposition parameters at the first \
+             observation are held for the whole state pass; ipred is exact). Use \
+             compartments[i] results with care for those subjects.",
+            cause(ode)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
+
+#[cfg(test)]
+#[path = "tests/derived_cmt_tv_warning_tests.rs"]
+mod derived_cmt_tv_warning_tests;
 
 #[cfg(test)]
 #[path = "tests/optimizer_label_tests.rs"]
@@ -2629,31 +2713,17 @@ fn fit_inner(
                     .to_string(),
             );
         }
-        // Analytical TV-covariate subjects: states would be computed with baseline
-        // PK params while ipred uses time-varying params — inconsistency is worse
-        // than NaN, so the states path returns empty for such subjects.
-        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
-            warnings.push(
-                "W_DERIVED_CMT_TV_ANALYTICAL: analytical model with time-varying \
-                 covariates — compartment states are not available for subjects \
-                 with TV covariates; [derived] expressions that reference \
-                 compartments[i] evaluate to NaN for those subjects."
-                    .to_string(),
-            );
-        }
-        // ODE TV-covariate subjects: states are computed via a deterministic pass
-        // using first-obs PK params — approximate when CL/V/etc. vary over time.
-        // ipred (from the event-driven path) is exact; only states are approximate.
-        if model.ode_spec.is_some() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
-            warnings.push(
-                "W_DERIVED_CMT_TV_ODE: ODE model with time-varying covariates — \
-                 compartment states for TV-covariate subjects are approximate \
-                 (first-observation PK parameters used for the deterministic state \
-                 pass; ipred is exact). Use compartments[i] results with care for \
-                 those subjects."
-                    .to_string(),
-            );
-        }
+        // Time-varying individual parameters (TV covariates, or a `TIME`-reading
+        // individual-parameter program): NaN states on the analytical engine,
+        // approximate ones on the ODE engine. Decided per subject on the engine that
+        // actually serves it (#1855).
+        warnings.extend(derived_cmt_time_varying_warnings(
+            model,
+            population,
+            &result.params.theta,
+            &result.eta_hats,
+            &result.kappas,
+        ));
         // Analytical model with EVID=3/4 resets: superposition is invalid across
         // reset boundaries. Per-obs compartment states are empty (→ NaN) and the
         // grid-integral path also returns NaN for affected sessions.
