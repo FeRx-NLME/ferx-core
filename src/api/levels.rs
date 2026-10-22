@@ -2151,12 +2151,6 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// non-finite column, or one already in the span, adds no direction.
 #[cfg(test)]
 fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    orthonormal_basis_with(cols, &mut Vec::new())
-}
-
-/// [`orthonormal_basis`], pushing each nonzero finite column's remnant
-/// `‖c − P c‖ / ‖c‖` against the columns before it onto `remnants`.
-fn orthonormal_basis_with(cols: &[Vec<f64>], remnants: &mut Vec<f64>) -> Vec<Vec<f64>> {
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for c in cols {
         let c_norm = dot(c, c).sqrt();
@@ -2166,8 +2160,7 @@ fn orthonormal_basis_with(cols: &[Vec<f64>], remnants: &mut Vec<f64>) -> Vec<Vec
         let mut v = c.clone();
         project_out(&mut v, &basis);
         let n = dot(&v, &v).sqrt();
-        remnants.push(n / c_norm);
-        if n > 1e-12 * c_norm {
+        if n > DROP_TOL * c_norm {
             basis.push(v.into_iter().map(|x| x / n).collect());
         }
     }
@@ -2181,12 +2174,21 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// `v` minus its projection on the orthonormal `basis`, projected twice (one
 /// re-orthogonalisation pass, as [`orthonormal_basis`] builds it).
 fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
+    project_out_coefs(v, basis);
+}
+
+/// [`project_out`], returning the coefficient of `v` on each basis vector,
+/// both passes summed.
+fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
+    let mut coefs = vec![0.0; basis.len()];
     for _ in 0..2 {
-        for b in basis {
+        for (b, c) in basis.iter().zip(coefs.iter_mut()) {
             let d = dot(v, b);
             v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            *c += d;
         }
     }
+    coefs
 }
 
 /// A population-wide column of [`carried`], as its nonzero per-subject
@@ -2206,14 +2208,83 @@ fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
     out
 }
 
+/// Whether two columns are the same vector — `a − b` is zero. A raw column
+/// holds only pieces with a nonzero entry, so that is the same subjects with
+/// the same values.
+fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
+    fn sorted(p: &Pieces) -> Vec<&(usize, Vec<f64>)> {
+        let mut v: Vec<&(usize, Vec<f64>)> = p.iter().collect();
+        v.sort_by_key(|(s, _)| *s);
+        v
+    }
+    a.len() == b.len() && sorted(a) == sorted(b)
+}
+
+/// Under this ratio a combination of sum-to-zero functionals is representable
+/// on the columns of a [`BlockBasis`] (#1962): the misfit of the equations of
+/// the columns Gram–Schmidt dropped as already in the span, each over its
+/// column's norm, as a singular value of the misfit part of the orthonormalised
+/// `(t, misfit)` pairs. A dropped column lies in the span to [`DROP_TOL`] of its
+/// norm, so a representable combination leaves a misfit of that order; one that
+/// is not leaves one of the order of the functional. Measured over the 2464
+/// bases the `api::levels` tests build in [`carried`], macOS arm64 debug: a
+/// representable combination reaches at most 4.2e-11, one that is not at least
+/// 8.5e-2; the constant sits 4.4 decades above the one and 4.9 below the other.
+/// In the same run the loose rank count's direction test ([`SPAN_TOL`] on a
+/// group's last column against `A`) saw at most 5.3e-11 where the column is
+/// held and at least 1.4e-2 where it adds a direction.
+const CONSISTENT_TOL: f64 = 1e-6;
+
+/// A column keeping at most this fraction of its norm against the columns
+/// before it adds no direction to a [`BlockBasis`].
+const DROP_TOL: f64 = 1e-12;
+
+#[cfg(test)]
+thread_local! {
+    /// Per [`BlockBasis`] built on this thread, its population-wide vector
+    /// count: the scale #1962 bounds, read by the tests without a clock.
+    static DENSE_COUNTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A column of a [`BlockBasis`] as Gram–Schmidt took it: its coefficients on
+/// the basis vectors before it, as `(first coordinate, coefficients)`
+/// segments, and the coordinate and norm of the basis vector it added, if it
+/// added one.
+struct Taken {
+    coefs: Vec<(usize, Vec<f64>)>,
+    added: Option<(usize, f64)>,
+    norm: f64,
+    group: Option<usize>,
+}
+
 /// An orthonormal basis of the span of [`Pieces`] columns that keeps their
 /// subject structure (#1961 review, F1): columns on one subject's records are
 /// orthonormalised per subject — they are orthogonal across subjects for free
 /// — and only the columns spanning several subjects (a θ read on every
-/// record, sum-to-zero's difference against another subject's level) become
-/// population-wide vectors, orthogonalised against those per-subject bases
-/// first. The span is the one a dense basis of every column would have; the
-/// cost is in the population-wide columns alone.
+/// record, a level read by several subjects) become population-wide vectors,
+/// orthogonalised against those per-subject bases first. The span is the one
+/// a dense basis of every column would have; the cost is in the
+/// population-wide columns alone.
+///
+/// A column may belong to a sum-to-zero group (#1962). The basis then spans
+/// `A`: the ungrouped columns, and each group's columns under the constraint
+/// that their coefficients sum to zero — the span of each column's difference
+/// against its group's last, which is what the contrast codes. Those
+/// differences cross subjects whenever the levels do, one population-wide
+/// vector per level and a cost cubic in the subjects, so the basis is built on
+/// the raw columns instead, spanning `Q ⊇ A`, and the directions the groups
+/// remove are kept apart: an orthonormal `T` with `Q = A ⊕ T`, one direction
+/// per group at most. `R_A z` then has `‖R_A z‖² = ‖R_Q z‖² + ‖Tᵀ z‖²`.
+///
+/// `t ∈ Q` is orthogonal to `A` exactly when it is orthogonal to every
+/// ungrouped column and every column of group `g` has the same inner product
+/// `λ_g` with it. In the coordinates of the orthonormal basis that is a
+/// triangular system in the order Gram–Schmidt took the columns — per subject,
+/// then population-wide — for the columns that added a basis vector, and an
+/// equation to satisfy for each it dropped: solved per group for `λ = e_g`,
+/// the `λ` whose dropped equations hold (to [`CONSISTENT_TOL`]) give `T`. A
+/// group none of whose functionals is representable — the intercept that
+/// carries the levels' mean — removes nothing, and `A = Q` there.
 struct BlockBasis {
     /// Per subject, the orthonormal basis of its one-subject columns.
     local: Vec<Vec<Vec<f64>>>,
@@ -2224,20 +2295,136 @@ struct BlockBasis {
     /// Per nonzero finite column, `‖c − P c‖ / ‖c‖` against the columns
     /// orthonormalised before it.
     remnants: Vec<f64>,
+    /// Per subject, the coordinate of its first local basis vector; the
+    /// population-wide ones follow every subject's.
+    local_at: Vec<usize>,
+    /// `T`, orthonormal, in the coordinates of the basis.
+    removed: Vec<Vec<f64>>,
+    /// What the grouped columns change in [`BlockBasis::aliased`]'s count
+    /// against the raw columns' remnants.
+    coded_shift: isize,
+    /// How many groups the joint solve for `T` took: the scale review r1 of
+    /// #1962 bounds.
+    #[cfg(test)]
+    joint: usize,
 }
 
 impl BlockBasis {
+    #[cfg(test)]
     fn new(cols: &[Pieces], lens: &[usize], offsets: &[usize]) -> Self {
+        Self::grouped(cols, &vec![None; cols.len()], lens, offsets)
+    }
+
+    /// The basis of `cols`, column `j` in sum-to-zero group `groups[j]` (a
+    /// group's last column is its last in `cols`).
+    ///
+    /// A group whose columns all sit on one subject — a `sum_to_zero_within`
+    /// group of one subject's levels — enters as its difference columns, which
+    /// sit on that subject too and stay per subject, as the coded columns did
+    /// before #1962 (review r1): only a group crossing subjects goes through
+    /// `T`, whose joint solve is dense in the groups. Under
+    /// `sum_to_zero_within` with one group per subject that is none of them;
+    /// a group that crosses subjects has at least one population-wide
+    /// difference column, so `T` never costs more than those did.
+    fn grouped(
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        lens: &[usize],
+        offsets: &[usize],
+    ) -> Self {
+        // Per group: its last column, and whether every column sits on one
+        // subject (a zero column sits anywhere).
+        let mut last: HashMap<usize, usize> = HashMap::new();
+        let mut subject: HashMap<usize, Option<usize>> = HashMap::new();
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            let Some(g) = *g else { continue };
+            last.insert(g, j);
+            let on = subject.entry(g).or_insert(None);
+            match c.as_slice() {
+                [] => {}
+                [(s, _)] if on.is_none_or(|t| t == *s) => *on = Some(*s),
+                _ => *on = Some(usize::MAX),
+            }
+        }
+        let local = |g: &usize| subject[g] != Some(usize::MAX);
+        let mut kept_cols: Vec<Pieces> = Vec::with_capacity(cols.len());
+        let mut kept_groups: Vec<Option<usize>> = Vec::with_capacity(cols.len());
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            match g {
+                Some(g) if local(g) => {
+                    if j != last[g] {
+                        kept_cols.push(pieces_minus(c, &cols[last[g]]));
+                        kept_groups.push(None);
+                    }
+                }
+                _ => {
+                    kept_cols.push(c.clone());
+                    kept_groups.push(*g);
+                }
+            }
+        }
+        Self::grouped_raw(&kept_cols, &kept_groups, lens, offsets)
+    }
+
+    /// [`BlockBasis::grouped`] with every group taken through `T`.
+    fn grouped_raw(
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        lens: &[usize],
+        offsets: &[usize],
+    ) -> Self {
         let n_rows: usize = lens.iter().sum();
-        let mut singles: Vec<Vec<Vec<f64>>> = vec![Vec::new(); lens.len()];
-        for col in cols.iter().filter(|c| c.len() == 1) {
-            singles[col[0].0].push(col[0].1.clone());
+        let norm_of = |c: &Pieces| c.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+        let mut singles: Vec<Vec<usize>> = vec![Vec::new(); lens.len()];
+        for (j, col) in cols.iter().enumerate().filter(|(_, c)| c.len() == 1) {
+            singles[col[0].0].push(j);
         }
         let mut remnants: Vec<f64> = Vec::new();
-        let local: Vec<Vec<Vec<f64>>> = singles
+        // Per column taken, in order: (column, subject or population-wide,
+        // per-subject coefficients, population-wide coefficients, added norm).
+        let mut taken_local: Vec<(usize, usize, Vec<f64>, Option<f64>)> = Vec::new();
+        let mut local: Vec<Vec<Vec<f64>>> = Vec::with_capacity(lens.len());
+        for (s, js) in singles.iter().enumerate() {
+            let mut basis: Vec<Vec<f64>> = Vec::new();
+            for &j in js {
+                let c = &cols[j][0].1;
+                let c_norm = dot(c, c).sqrt();
+                if c_norm == 0.0 || !c_norm.is_finite() {
+                    continue;
+                }
+                let mut v = c.clone();
+                let coefs = project_out_coefs(&mut v, &basis);
+                let n = dot(&v, &v).sqrt();
+                remnants.push(n / c_norm);
+                let added = (n > DROP_TOL * c_norm).then_some(n);
+                if added.is_some() {
+                    basis.push(v.into_iter().map(|x| x / n).collect());
+                }
+                taken_local.push((j, s, coefs, added));
+            }
+            local.push(basis);
+        }
+        let local_at: Vec<usize> = local
             .iter()
-            .map(|c| orthonormal_basis_with(c, &mut remnants))
+            .scan(0, |at, b| {
+                let o = *at;
+                *at += b.len();
+                Some(o)
+            })
             .collect();
+        let dense_at: usize = local.iter().map(|b| b.len()).sum();
+        let mut taken: Vec<Taken> = Vec::new();
+        for (j, s, coefs, added) in taken_local {
+            // A column's coefficients run over the basis before it, so the
+            // vector it adds is the next one.
+            let k = local_at[s] + coefs.len();
+            taken.push(Taken {
+                added: added.map(|n| (k, n)),
+                coefs: vec![(local_at[s], coefs)],
+                norm: norm_of(&cols[j]),
+                group: groups[j],
+            });
+        }
         // Each multi-subject column, projected against the local bases and the
         // dense part so far, adds a direction only when what is left is not
         // rounding of the *original* column — the test `orthonormal_basis`
@@ -2245,56 +2432,268 @@ impl BlockBasis {
         // column inside the local span would turn ~1e-17 of rounding into a
         // unit vector and shrink every residual (#1961 review r2, R2-1).
         let mut dense: Vec<Vec<f64>> = Vec::new();
-        for col in cols.iter().filter(|c| c.len() > 1) {
-            let c_norm = col.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+        for (j, col) in cols.iter().enumerate().filter(|(_, c)| c.len() > 1) {
+            let c_norm = norm_of(col);
             if c_norm == 0.0 || !c_norm.is_finite() {
                 continue;
             }
             let mut v = vec![0.0; n_rows];
+            let mut coefs: Vec<(usize, Vec<f64>)> = Vec::new();
             for (s, piece) in col {
                 let mut piece = piece.clone();
-                project_out(&mut piece, &local[*s]);
+                coefs.push((local_at[*s], project_out_coefs(&mut piece, &local[*s])));
                 v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(&piece);
             }
-            project_out(&mut v, &dense);
+            coefs.push((dense_at, project_out_coefs(&mut v, &dense)));
             let n = dot(&v, &v).sqrt();
             remnants.push(n / c_norm);
-            if n > 1e-12 * c_norm {
+            let added = (n > DROP_TOL * c_norm).then_some((dense_at + dense.len(), n));
+            if added.is_some() {
                 dense.push(v.into_iter().map(|x| x / n).collect());
             }
+            taken.push(Taken {
+                coefs,
+                added,
+                norm: c_norm,
+                group: groups[j],
+            });
         }
-        BlockBasis {
+        let mut basis = BlockBasis {
             local,
             dense,
             offsets: offsets.to_vec(),
             n_rows,
             remnants,
+            local_at,
+            removed: Vec::new(),
+            coded_shift: 0,
+            #[cfg(test)]
+            joint: 0,
+        };
+        basis.remove_groups(cols, groups, &taken, dense_at);
+        #[cfg(test)]
+        DENSE_COUNTS.with(|d| d.borrow_mut().push(basis.dense.len()));
+        basis
+    }
+
+    /// `T` (see [`BlockBasis`]) and the grouped columns' shift of
+    /// [`BlockBasis::aliased`], from the columns as Gram–Schmidt `taken` them.
+    fn remove_groups(
+        &mut self,
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        taken: &[Taken],
+        dense_at: usize,
+    ) {
+        let dim = dense_at + self.dense.len();
+        // Per group, in order of first appearance: its columns.
+        let mut members: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (j, g) in groups.iter().enumerate() {
+            let Some(g) = *g else { continue };
+            match members.iter_mut().find(|(h, _)| *h == g) {
+                Some((_, js)) => js.push(j),
+                None => members.push((g, vec![j])),
+            }
         }
+        if members.is_empty() {
+            return;
+        }
+        let nonzero = |c: &Pieces| {
+            let n = c.iter().map(|(_, v)| dot(v, v)).sum::<f64>();
+            n != 0.0 && n.is_finite()
+        };
+        // The coded columns are each column's difference against its group's
+        // last: count the nonzero ones against the nonzero raw ones.
+        let mut shift: isize = 0;
+        for (_, js) in &members {
+            let last = &cols[*js.last().expect("a group has a column")];
+            let coded = js[..js.len() - 1]
+                .iter()
+                .filter(|&&j| !pieces_equal(&cols[j], last))
+                .count();
+            let raw = js.iter().filter(|&&j| nonzero(&cols[j])).count();
+            shift += coded as isize - raw as isize;
+        }
+        // A group with a zero column leaves its constraint nothing to act on:
+        // that column's equation forces `λ_g = 0`, and the group removes no
+        // direction.
+        let live: Vec<&(usize, Vec<usize>)> = members
+            .iter()
+            .filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j])))
+            .collect();
+        #[cfg(test)]
+        {
+            self.joint = live.len();
+        }
+        // Per live group, `t` for `λ = e_g` in coordinates, and the misfit of
+        // each dropped column's equation over its norm.
+        let mut ts: Vec<Vec<f64>> = Vec::with_capacity(live.len());
+        let mut misfits: Vec<Vec<f64>> = Vec::with_capacity(live.len());
+        for (g, _) in &live {
+            let mut t = vec![0.0; dim];
+            let mut misfit = Vec::new();
+            for col in taken {
+                let rhs = if col.group == Some(*g) { 1.0 } else { 0.0 };
+                let acc: f64 = col
+                    .coefs
+                    .iter()
+                    .map(|(at, c)| dot(c, &t[*at..*at + c.len()]))
+                    .sum();
+                match col.added {
+                    Some((k, n)) => t[k] = (rhs - acc) / n,
+                    None => misfit.push((acc - rhs) / col.norm),
+                }
+            }
+            ts.push(t);
+            misfits.push(misfit);
+        }
+        // The `λ` whose misfit vanishes against its `t`. A group's `t` alone
+        // can be zero — every column of it dropped — and still complete
+        // another's: two levels of one block summing to a level of another
+        // tie their `λ` (2 : 1), and neither unit `λ` is consistent. So the
+        // stacked `(t, misfit)` are orthonormalised together, which no `λ`
+        // annuls (both vanish only when every equation's right-hand side
+        // does), and the misfit part's small singular directions are the `λ`
+        // sought: a singular value there is `‖misfit‖ / ‖(t, misfit)‖`.
+        let mut units: Vec<Vec<f64>> = Vec::new();
+        for (t, m) in ts.into_iter().zip(misfits) {
+            let mut w = t;
+            w.extend(m);
+            let w_norm = dot(&w, &w).sqrt();
+            if w_norm == 0.0 || !w_norm.is_finite() {
+                continue;
+            }
+            project_out(&mut w, &units);
+            let n = dot(&w, &w).sqrt();
+            if n > DROP_TOL * w_norm {
+                units.push(w.into_iter().map(|x| x / n).collect());
+            }
+        }
+        let n_drop = units.first().map_or(0, |u| u.len() - dim);
+        if !units.is_empty() {
+            let r = units.len();
+            // A zero row keeps the matrix at least square, so the SVD returns
+            // a right singular vector for every unit.
+            let rows = n_drop.max(r);
+            let misfit = nalgebra::DMatrix::from_fn(rows, r, |i, a| {
+                units[a].get(dim + i).copied().unwrap_or(0.0)
+            });
+            let svd = misfit.svd(false, true);
+            let v_t = svd.v_t.expect("requested");
+            for (i, sv) in svd.singular_values.iter().enumerate() {
+                if sv.is_nan() || *sv >= CONSISTENT_TOL {
+                    continue;
+                }
+                let mut t = vec![0.0; dim];
+                for (a, u) in units.iter().enumerate() {
+                    let w = v_t[(i, a)];
+                    t.iter_mut().zip(&u[..dim]).for_each(|(x, y)| *x += w * y);
+                }
+                let n = dot(&t, &t).sqrt();
+                self.removed.push(t.into_iter().map(|x| x / n).collect());
+            }
+        }
+        // Each live group's last column adds the direction its difference
+        // columns lack, unless `A` and the groups before it already hold it:
+        // that is the coded columns' rank against the raw ones.
+        let mut held: Vec<Vec<f64>> = Vec::new();
+        for (_, js) in &live {
+            let d = &cols[*js.last().expect("a group has a column")];
+            let d_norm = d.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+            let (coords, _) = self.project(d);
+            let mut s: Vec<f64> = self
+                .removed
+                .iter()
+                .map(|t| dot_coords(t, &coords))
+                .collect();
+            project_out(&mut s, &held);
+            let n = dot(&s, &s).sqrt();
+            if n >= SPAN_TOL * d_norm {
+                shift += 1;
+            }
+            if n > DROP_TOL * d_norm {
+                held.push(s.into_iter().map(|x| x / n).collect());
+            }
+        }
+        self.coded_shift = shift;
+    }
+
+    /// `z`'s coordinates on the basis, as `(first coordinate, values)`
+    /// segments, and its remnant outside the raw columns' span.
+    fn project(&self, z: &Pieces) -> (Vec<(usize, Vec<f64>)>, Vec<f64>) {
+        let mut coords = Vec::with_capacity(z.len() + 1);
+        let mut r = vec![0.0; self.n_rows];
+        for (s, piece) in z {
+            let mut piece = piece.clone();
+            coords.push((
+                self.local_at[*s],
+                project_out_coefs(&mut piece, &self.local[*s]),
+            ));
+            r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
+        }
+        let dense_at =
+            self.local_at.last().copied().unwrap_or(0) + self.local.last().map_or(0, |b| b.len());
+        coords.push((dense_at, project_out_coefs(&mut r, &self.dense)));
+        (coords, r)
     }
 
     /// How many nonzero columns kept less than [`SPAN_TOL`] of their norm
     /// against the columns orthonormalised before them (#1977): the columns'
     /// rank deficiency at that tolerance, whatever order they were taken in.
+    /// A sum-to-zero group counts as its coded columns, the differences
+    /// against its last (#1962): those number one fewer than its raw columns,
+    /// and its last column adds back what they lack unless the rest already
+    /// holds it.
     fn aliased(&self) -> usize {
-        self.remnants.iter().filter(|r| **r < SPAN_TOL).count()
+        let raw = self.remnants.iter().filter(|r| **r < SPAN_TOL).count() as isize;
+        (raw + self.coded_shift).max(0) as usize
     }
 
-    /// `‖z − P z‖ / ‖z‖`; `None` when `z` is zero. A non-finite value comes
-    /// back as `NaN`, which no tolerance accepts.
+    /// `‖z − P z‖ / ‖z‖`, `P` the projection on the coded span `A`; `None`
+    /// when `z` is zero. A non-finite value comes back as `NaN`, which no
+    /// tolerance accepts.
     fn residual(&self, z: &Pieces) -> Option<f64> {
         let z_norm = z.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
         if z_norm == 0.0 {
             return None;
         }
-        let mut r = vec![0.0; self.n_rows];
-        for (s, piece) in z {
-            let mut piece = piece.clone();
-            project_out(&mut piece, &self.local[*s]);
-            r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
-        }
-        project_out(&mut r, &self.dense);
-        Some(dot(&r, &r).sqrt() / z_norm)
+        let (coords, r) = self.project(z);
+        let removed: f64 = self
+            .removed
+            .iter()
+            .map(|t| dot_coords(t, &coords).powi(2))
+            .sum();
+        Some((dot(&r, &r) + removed).sqrt() / z_norm)
     }
+}
+
+/// The coded columns of `cols` under `groups`, each grouped column but its
+/// group's last taken against that last one: the columns
+/// [`BlockBasis::grouped`] spans without building them.
+#[cfg(test)]
+fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
+    let mut out = Vec::new();
+    for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+        match g {
+            None => out.push(c.clone()),
+            Some(g) => {
+                let last = (0..cols.len())
+                    .rev()
+                    .find(|&k| groups[k] == Some(*g))
+                    .unwrap();
+                if j != last {
+                    out.push(pieces_minus(c, &cols[last]));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `t · c`, `t` dense in the coordinates of a [`BlockBasis`] and `c` as
+/// segments.
+fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
+    c.iter().map(|(at, v)| dot(v, &t[*at..*at + v.len()])).sum()
 }
 
 /// Whether a contrast's coded block, with the rest of the model, reproduces an
@@ -2345,17 +2744,28 @@ impl BlockBasis {
 /// Measured over every guard the `api::levels` tests reach (2334 with the
 /// two-block tests of #1963, macOS arm64 debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
 /// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
-/// below the other.
+/// below the other. Under sum-to-zero the count is taken on the raw levels and
+/// shifted to the coded ones ([`BlockBasis::aliased`], #1962); over the 2464
+/// bases the tests build it gave the rank verdict the difference columns gave
+/// in every one, and the count itself in all but one, where a difference of
+/// two 2e-8-norm levels kept 1.3e-9 of its norm at its own rounding floor and
+/// counted a third deficiency in a block whose exact deficiency is two.
 ///
 /// Only branches that refuse without it ask for it, so a model that binds
 /// without the certificate never pays for it. On those branches it costs the
-/// population-wide columns of a [`BlockBasis`]: the other θ, and under
-/// sum-to-zero one difference per level against its group's last — cubic in
-/// the subject count there (#1961 review, F1: on a 5-η `two_cpt_oral`
-/// intercept model, release, 0.16 s at 200 subjects, 1.1 s at 400, 19 s at
-/// 1000, where the binder before #1840 refused in ~20 ms). The coarser random
-/// effects' columns, one per unit, are built only when the point is not
-/// already held without them.
+/// population-wide columns of a [`BlockBasis`]: the other θ, and the levels
+/// read by more than one subject. Under sum-to-zero the coded columns — each
+/// level's difference against its group's last — cross subjects whenever the
+/// levels do, one population-wide column per level and a cost cubic in the
+/// subjects (#1961 review, F1: 19 s at 1000 subjects on a 5-η `two_cpt_oral`
+/// intercept model, release, where the binder before #1840 refused in
+/// ~20 ms). So the basis takes the raw levels, tagged with their group, and
+/// keeps apart the at most one direction per group the contrast removes
+/// (#1962, [`BlockBasis::grouped`]): on the same fixture 48 ms at 200
+/// subjects, 56 ms at 400 and 0.29 s at 1000 (release, macOS arm64), the
+/// refusal text unchanged. The coarser random effects'
+/// columns, one per unit, are built only when the point is not already held
+/// without them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Carried {
     /// Every unit column of the random effect lies in the span: the contrast
@@ -2485,43 +2895,48 @@ fn carried(
 
         // A block's level columns (a `FIX` level moves nothing), coded by its
         // contrast over its groups: under `none` every level, under `ref` the
-        // first level of each group dropped, under sum-to-zero each level but
-        // its group's last taken against that last one. `None` when anything
-        // is non-finite.
+        // first level of each group dropped. Under sum-to-zero every level,
+        // tagged with its group: the coded span, each level but its group's
+        // last taken against that last one, is what [`BlockBasis::grouped`]
+        // spans on those tags (#1962). `None` when anything is non-finite.
         let coded_cols = |decl: &LevelBlockDecl,
                           thetas: &[Option<usize>],
                           groups: &[usize],
                           contrast: LevelContrast|
-         -> Option<Vec<Pieces>> {
+         -> Option<Vec<(Pieces, Option<usize>)>> {
             let column = level_index_column(decl.name());
+            // Per level, the subjects that read it.
+            let mut readers: Vec<Vec<usize>> = vec![Vec::new(); thetas.len()];
+            for &s in &all {
+                let mut read = indices_read(&population.subjects[s], &column);
+                read.sort_by(f64::total_cmp);
+                read.dedup();
+                for index in read {
+                    let i = index as usize;
+                    if index == i as f64 && (1..=thetas.len()).contains(&i) {
+                        readers[i - 1].push(s);
+                    }
+                }
+            }
             let mut level_cols: Vec<Pieces> = Vec::with_capacity(thetas.len());
             for (i, k) in thetas.iter().enumerate() {
-                let readers: Vec<usize> = all
-                    .iter()
-                    .copied()
-                    .filter(|&s| {
-                        indices_read(&population.subjects[s], &column).contains(&((i + 1) as f64))
-                    })
-                    .collect();
                 let col = match *k {
                     Some(k) => {
                         let h = SPAN_STEP * theta[k].abs().max(1.0);
-                        diff_col(&readers, h, &|d, th, _, _| th[k] += d)?
+                        diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)?
                     }
                     None => Pieces::new(),
                 };
                 level_cols.push(col);
             }
             let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
-            let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
             let mut out = Vec::new();
-            for i in 0..level_cols.len() {
+            for (i, col) in level_cols.into_iter().enumerate() {
                 match contrast {
-                    LevelContrast::Unconstrained => out.push(level_cols[i].clone()),
-                    LevelContrast::Ref if !first(i) => out.push(level_cols[i].clone()),
-                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
-                        let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
-                        out.push(pieces_minus(&level_cols[i], &level_cols[j]));
+                    LevelContrast::Unconstrained => out.push((col, None)),
+                    LevelContrast::Ref if !first(i) => out.push((col, None)),
+                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
+                        out.push((col, Some(groups[i])))
                     }
                     _ => {}
                 }
@@ -2529,24 +2944,37 @@ fn carried(
             Some(out)
         };
 
+        // The columns, and per column its sum-to-zero group, numbered across
+        // the blocks.
         let mut cols: Vec<Pieces> = Vec::new();
+        let mut tags: Vec<Option<usize>> = Vec::new();
+        let push_coded = |coded: Vec<(Pieces, Option<usize>)>,
+                          cols: &mut Vec<Pieces>,
+                          tags: &mut Vec<Option<usize>>| {
+            let base = tags.iter().flatten().map(|g| g + 1).max().unwrap_or(0);
+            for (c, g) in coded {
+                cols.push(c);
+                tags.push(g.map(|g| base + g));
+            }
+        };
         for &k in &other_thetas {
             let Some(c) = theta_col(k) else {
                 return Carried::Held;
             };
             cols.push(c);
+            tags.push(None);
         }
         for (o, thetas) in others.iter().zip(&other_levels) {
             let Some(c) = coded_cols(o.decl, thetas, &o.groups, o.contrast) else {
                 return Carried::Held;
             };
-            cols.extend(c);
+            push_coded(c, &mut cols, &mut tags);
         }
         let n_other = cols.len();
         let Some(own_coded) = coded_cols(decl, &level_thetas, &groups, contrast) else {
             return Carried::Held;
         };
-        cols.extend(own_coded);
+        push_coded(own_coded, &mut cols, &mut tags);
 
         // Per unit of each random effect: its column. A unit is a subject for
         // an η, an occasion group of a subject for a κ.
@@ -2604,12 +3032,13 @@ fn carried(
         // their one column per unit (#1961 review, F1). It is held whatever the
         // rank says, so it never builds the other θ's basis either; nor does a
         // full basis with no aliased column, whose other θ are independent too.
-        let basis = BlockBasis::new(&cols, &lens, &offsets);
+        let basis = BlockBasis::grouped(&cols, &tags, &lens, &offsets);
         if outside(&basis) != Some(true) {
             return Carried::Held;
         }
         if basis.aliased() > 0
-            && basis.aliased() > BlockBasis::new(&cols[..n_other], &lens, &offsets).aliased()
+            && basis.aliased()
+                > BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets).aliased()
         {
             return Carried::Held;
         }
@@ -2631,9 +3060,10 @@ fn carried(
             let Some(c) = unit_cols(r, is_kappa) else {
                 return Carried::Held;
             };
+            tags.extend(std::iter::repeat_n(None, c.len()));
             cols.extend(c);
         }
-        if outside(&BlockBasis::new(&cols, &lens, &offsets)) != Some(true) {
+        if outside(&BlockBasis::grouped(&cols, &tags, &lens, &offsets)) != Some(true) {
             return Carried::Held;
         }
     }
