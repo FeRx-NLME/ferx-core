@@ -635,12 +635,21 @@ fn freeze_flat_thetas(
                 init_params,
                 &params.theta,
                 &x,
-                &grad,
-                (&ehs, &kappas),
+                &ehs,
                 options,
                 (&nn_reg, &priors),
                 candidates,
             )
+        };
+        // Whether the optimizer could take a move of the θ's own size, without re-solving:
+        // the penalized objective at the start's EBEs is finite and below the `1e20` wall.
+        // The exact rule's stand-in for the probes' "an infeasible probe scales the θ" arm
+        // (#2291 review).
+        let feasible = |i: usize, value: f64| {
+            let p = with_theta(i, value);
+            let v = 2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options)
+                + identity_probe_penalty(&p, &nn_reg, &priors);
+            ofv_is_valid(v)
         };
         identity_theta_scales(
             &params.theta,
@@ -655,6 +664,7 @@ fn freeze_flat_thetas(
                 }
                 exact(candidates)
             },
+            feasible,
             |i, value| {
                 #[cfg(test)]
                 IDENTITY_PROBE_SOLVES.with(|c| c.set(c.get() + 1));
@@ -676,10 +686,13 @@ fn freeze_flat_thetas(
 }
 
 /// The slope and curvature `(∂f/∂x_i, ∂²f/∂x_i²)` of the penalized objective the #2159
-/// pre-flight probes, along each of `candidates`, at the start: `clean_grad` (the clean
-/// −2LL's adjoint gradient there) plus the penalties' gradient, and the exact R-matrix's
-/// candidate block ([`crate::estimation::covariance::analytic_hessian_block`]) plus the
-/// penalties' curvature. `None` when a subject is outside the R-matrix's scope.
+/// pre-flight probes, along each of `candidates`, at the start: the exact −2LL derivatives
+/// ([`crate::estimation::covariance::exact_candidate_derivatives`]: the adjoint gradient and
+/// the R-matrix's diagonal, at the same tightly reconverged modes) plus the penalties'
+/// gradient and curvature. `None` — and the probes — when those are not available exactly:
+/// a subject outside the recorders' scope or unconverged at the tight tolerance, the exact
+/// R-matrix switched off, or an active NN smoothness penalty, whose Hessian is Gauss–Newton
+/// only (`NnRegularizer::hessian_is_exact`).
 #[allow(clippy::too_many_arguments)]
 fn identity_exact_derivatives(
     model: &CompiledModel,
@@ -687,8 +700,7 @@ fn identity_exact_derivatives(
     template: &ModelParameters,
     theta: &[f64],
     x: &[f64],
-    clean_grad: &[f64],
-    (ehs, kappas): (&[DVector<f64>], &[Vec<DVector<f64>>]),
+    warm: &[DVector<f64>],
     options: &FitOptions,
     (nn_reg, priors): (
         &crate::estimation::nn_reg::NnRegularizer,
@@ -696,17 +708,20 @@ fn identity_exact_derivatives(
     ),
     candidates: &[usize],
 ) -> Option<Vec<(f64, f64)>> {
-    let h = crate::estimation::covariance::analytic_hessian_block(
-        model, population, template, x, ehs, kappas, options, candidates,
+    if !nn_reg.hessian_is_exact() {
+        return None;
+    }
+    let clean = crate::estimation::covariance::exact_candidate_derivatives(
+        model, population, template, x, warm, options, candidates,
     )?;
-    let mut g = clean_grad.to_vec();
+    let mut g = vec![0.0; x.len()];
     nn_reg.penalty_and_gradient(theta, &mut g);
     priors.penalty_and_gradient(x, &mut g);
-    let mut curvature: Vec<f64> = (0..candidates.len()).map(|c| h[(c, c)]).collect();
+    let mut pen = vec![0.0; candidates.len()];
     let mut add_diagonal = |a: usize, b: usize, v: f64| {
         if a == b {
             if let Some(c) = candidates.iter().position(|&i| i == a) {
-                curvature[c] += v;
+                pen[c] += v;
             }
         }
     };
@@ -715,8 +730,9 @@ fn identity_exact_derivatives(
     Some(
         candidates
             .iter()
-            .zip(curvature)
-            .map(|(&i, h)| (g.get(i).copied().unwrap_or(f64::NAN), h))
+            .zip(clean)
+            .zip(pen)
+            .map(|((&i, (gc, hc)), hp)| (gc + g.get(i).copied().unwrap_or(f64::NAN), hc + hp))
             .collect(),
     )
 }
@@ -796,6 +812,7 @@ fn identity_theta_scales(
     held: impl Fn(usize) -> bool,
     base_ofv: impl FnOnce() -> f64,
     exact: impl FnOnce(&[usize]) -> Option<Vec<(f64, f64)>>,
+    mut feasible: impl FnMut(usize, f64) -> bool,
     mut probe_ofv: impl FnMut(usize, f64) -> f64,
 ) -> Vec<(usize, f64)> {
     let n = theta.len().min(theta_lower.len()).min(theta_upper.len());
@@ -831,10 +848,13 @@ fn identity_theta_scales(
         if let Some(d) = &exact {
             let (g, h) = d[c];
             let delta = points[1] - points[0];
-            if !(h * delta * delta > 1e-6 * (1.0 + base.abs())) {
-                continue;
-            }
-            if (g / h).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude {
+            let scaled = h * delta * delta > 1e-6 * (1.0 + base.abs())
+                && (g / h).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude;
+            // The probes' other arm: a move of the θ's own size the optimizer cannot take
+            // (a non-finite or walled objective) scales it, whatever the local derivatives
+            // say. Checked at the probe points with the EBEs held, only for a θ the
+            // derivatives would leave on the unit scale.
+            if scaled || points.iter().any(|&p| p != t && !feasible(i, p)) {
                 scales.push((i, magnitude));
             }
             continue;
@@ -962,6 +982,8 @@ fn mixture_identity_theta_scales(
         || ofv_at(&params),
         // The R-matrix recorders do not differentiate the K-fold mixture objective.
         |_| None,
+        // Only the exact rule asks; the probes judge feasibility themselves.
+        |_, _| true,
         |i, value| {
             let mut p = params.clone();
             p.theta[i] = value;

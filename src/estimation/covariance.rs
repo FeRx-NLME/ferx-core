@@ -459,7 +459,7 @@ pub(crate) fn combine_covariance(
     method: CovarianceMethod,
     r_inv: DMatrix<f64>,
     s: &DMatrix<f64>,
-    unit_coords: &[bool],
+    unit_coords: &[CoordUnits],
 ) -> Option<DMatrix<f64>> {
     match method {
         CovarianceMethod::Hessian => Some(r_inv),
@@ -474,7 +474,7 @@ pub(crate) fn combine_covariance(
 ///
 /// The rank test is the floor of [`invert_psd_with_floor_unit_free`], so an identity-packed θ
 /// written in large or small units is not refused as rank-deficient (#2145).
-fn invert_cross_product(s: &DMatrix<f64>, unit_coords: &[bool]) -> Option<DMatrix<f64>> {
+fn invert_cross_product(s: &DMatrix<f64>, unit_coords: &[CoordUnits]) -> Option<DMatrix<f64>> {
     match invert_psd_with_floor_unit_free(s, unit_coords) {
         Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
         _ => None,
@@ -542,7 +542,7 @@ pub(crate) fn combine_covariance_and_reference(
     r_inv: DMatrix<f64>,
     r_inv_ref: Option<DMatrix<f64>>,
     s: &DMatrix<f64>,
-    unit_coords: &[bool],
+    unit_coords: &[CoordUnits],
 ) -> Option<(DMatrix<f64>, Option<DMatrix<f64>>)> {
     let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s, unit_coords));
     Some((
@@ -1074,13 +1074,21 @@ fn stacked_mode<'a>(
     ))
 }
 
-/// The exact OFV Hessian's `axes` block, `∂²OFV/∂x_a∂x_b` for `a, b` in `axes` (packed
-/// coordinates, `axes` order), at the modes `eta_hats`/`kappas` — the R-matrix of
-/// [`analytic_cov_assembly`] restricted to a few coordinates, at `axes.len()` directions per
-/// subject instead of `x.len()`. `None` unless every subject is served: the #2159
-/// identity-scale pre-flight reads its candidates' curvature from it, and a partial sum is a
-/// different objective's curvature.
-pub(crate) fn analytic_hessian_block(
+/// Test watch: `(template address, count)` — the subjects [`per_subject_adjoint`] handed to
+/// its closure for that one template, on any worker (keyed so concurrent tests do not count).
+#[cfg(test)]
+pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly`]) and the
+/// #2159 identity-scale pre-flight ([`exact_candidate_derivatives`]) share: the
+/// population-level gates, one [`PackedPoint`](crate::sens::ode_provider::adjoint::PackedPoint)
+/// for every subject, each subject's stacked mode, cooperative cancellation and the test
+/// decline hook, then `f(subject, point, mode, objective)` per subject in parallel. `None`
+/// when a gate refuses the whole population; a `None` entry is a subject `f` (or its mode)
+/// declined.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_adjoint<R: Send>(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
@@ -1088,32 +1096,151 @@ pub(crate) fn analytic_hessian_block(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-    axes: &[usize],
-) -> Option<DMatrix<f64>> {
-    if eta_hats.len() != population.subjects.len() || crate::types::GradientMethod::forced_fd(model)
-    {
+    f: impl Fn(
+            &Subject,
+            &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+            &[f64],
+            crate::sens::ode_provider::adjoint::Objective,
+        ) -> Option<R>
+        + Sync,
+) -> Option<Vec<Option<R>>> {
+    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
+    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
+    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
+    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
+    // too; here it would additionally be reported as complete, so it is refused outright.
+    if eta_hats.len() != population.subjects.len() {
         return None;
     }
+    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
+    if crate::types::GradientMethod::forced_fd(model) {
+        return None;
+    }
+    // The objective differentiated is the one the fit minimised: the FOCE/FOCEI marginal,
+    // or — `agq_nodes()` is `Some` for `method = laplace` at any node count and
+    // `method = focei` with `n_agq > 1` — the quadrature marginal under its own anchor (`H̃`,
+    // or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on `H` would be
+    // "standard errors for a likelihood it never optimised" (PR #953 review finding 1), so
+    // the objective is taken from the same options the fit ran on.
+    //
+    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
+    // differentiates every one of these objectives — FOCE (its frozen-variance mode
+    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
+    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
     let objective = cov_objective(options);
-    let per_subject: Vec<Option<DMatrix<f64>>> = population
-        .subjects
-        .par_iter()
-        .zip(eta_hats.par_iter())
-        .enumerate()
-        .map(|(i, (subject, eta_hat))| {
-            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
-            crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_on(
-                model, subject, template, x, &b, objective, axes,
-            )
-            .filter(|h| h.iter().all(|v| v.is_finite()))
-        })
-        .collect();
-    rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
-    let k = axes.len();
-    let mut acc = DMatrix::<f64>::zeros(k, k);
-    for h in per_subject {
-        // ×2: the per-subject NLL Hessian to the OFV (see `analytic_cov_assembly`).
-        acc += 2.0 * h?;
+    // One unpack for the population: every subject is at `x`.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
+    Some(
+        population
+            .subjects
+            .par_iter()
+            .zip(eta_hats.par_iter())
+            .enumerate()
+            .map(|(i, (subject, eta_hat))| {
+                let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+                // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
+                // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
+                // assembly per subject, and for the default `covariance_method = r` there is no
+                // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
+                // advertises before the covariance step (#893) was inoperative. Returning
+                // `None` alone would drop into the *more* expensive FD stencil; the caller
+                // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
+                if crate::cancel::is_cancelled(&options.cancel) {
+                    return None;
+                }
+                #[cfg(test)]
+                if forced_cov_decline::declines(&subject.id) {
+                    return None;
+                }
+                #[cfg(test)]
+                if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
+                    if let Some((addr, n)) = watch.as_mut() {
+                        if *addr == template as *const ModelParameters as usize {
+                            *n += 1;
+                        }
+                    }
+                }
+                f(subject, &pt, &b, objective)
+            })
+            .collect(),
+    )
+}
+
+/// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`
+/// (the adjoint gradient) and `∂²OFV/∂x_a²` (the R-matrix's diagonal along `axes`, at
+/// `axes.len()` directions per subject), both of [`cov_objective`]'s objective at the **same**
+/// modes, so the pair is one function's first and second derivative. What the #2159
+/// identity-scale pre-flight reads its candidates' Newton step and curvature from.
+///
+/// The modes are re-solved warm from `warm` at `cov_inner_tol`, as the covariance step does
+/// before its own R-matrix: both derivatives assume `∂lᵢ/∂η = 0` at the mode, which a fit's
+/// `inner_tol` only approximates (#2291 review). `None` — and the caller probes instead —
+/// unless every subject converges there and is served exactly, when the exact R-matrix is
+/// switched off (`analytic_cov_hessian = false`), under `gradient = fd`, or on cancel. A
+/// partial sum would be a different objective's derivatives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_candidate_derivatives(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<Vec<(f64, f64)>> {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_diag_at, subject_adjoint_gradient_at,
+    };
+    if !options.analytic_cov_hessian || warm.len() != population.subjects.len() {
+        return None;
+    }
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+        x,
+        model,
+        population,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        true,
+    );
+    if !all_converged {
+        return None;
+    }
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        &ehs,
+        &kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let d = subject_adjoint_cov_diag_at(model, subject, pt, b, objective, axes)?;
+            let pairs: Vec<(f64, f64)> = axes
+                .iter()
+                .zip(d)
+                .map(|(&a, h)| (g.get(a).copied().unwrap_or(f64::NAN), h))
+                .collect();
+            pairs
+                .iter()
+                .all(|(g, h)| g.is_finite() && h.is_finite())
+                .then_some(pairs)
+        },
+    )?;
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    // In subject order, so the sum does not depend on the thread count.
+    let mut acc = vec![(0.0, 0.0); axes.len()];
+    for pairs in per_subject {
+        for (a, (g, h)) in acc.iter_mut().zip(pairs?) {
+            // ×2: the per-subject NLL to the OFV (see `analytic_cov_assembly`).
+            a.0 += 2.0 * g;
+            a.1 += 2.0 * h;
+        }
     }
     Some(acc)
 }
@@ -1132,55 +1259,19 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
-    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
-    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
-    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
-    // too; here it would additionally be reported as complete, so it is refused outright.
-    if eta_hats.len() != population.subjects.len() {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
-    if crate::types::GradientMethod::forced_fd(model) {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // The objective this assembly differentiates is the one the fit minimised: the
-    // FOCE/FOCEI marginal, or — `agq_nodes()` is `Some` for `method = laplace` at any node
-    // count and `method = focei` with `n_agq > 1` — the quadrature marginal under its own
-    // anchor (`H̃`, or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on
-    // `H` would be "standard errors for a likelihood it never optimised" (PR #953 review
-    // finding 1), so the objective is taken from the same options the fit ran on.
-    //
-    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
-    // differentiates every one of these objectives — FOCE (its frozen-variance mode
-    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
-    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian;
-    let objective = cov_objective(options);
+    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_at;
     let n = x_hat.len();
-    let per_subject: Vec<Option<DMatrix<f64>>> = population
-        .subjects
-        .par_iter()
-        .zip(eta_hats.par_iter())
-        .enumerate()
-        .map(|(i, (subject, eta_hat))| {
-            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
-            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
-            // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
-            // subject, and for the default `covariance_method = r` there is no later checkpoint
-            // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
-            // covariance step (#893) was inoperative. Returning `None` alone would drop into
-            // the *more* expensive FD stencil; the caller re-checks the flag and reports
-            // cancelled instead (PR #953 review finding 10).
-            if crate::cancel::is_cancelled(&options.cancel) {
-                return None;
-            }
-            #[cfg(test)]
-            if forced_cov_decline::declines(&subject.id) {
-                return None;
-            }
+    let Some(per_subject) = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x_hat,
+        eta_hats,
+        kappas,
+        options,
+        |subject, pt, b, objective| {
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = subject_adjoint_cov_hessian(model, subject, template, x_hat, &b, objective)?;
+            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
@@ -1194,8 +1285,10 @@ pub(super) fn analytic_cov_assembly(
             // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
             // positive-definite and plausibly sized.
             Some(2.0 * h)
-        })
-        .collect();
+        },
+    ) else {
+        return AnalyticCovAssembly::Unavailable;
+    };
     // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
     // between subjects so they are not reallocated per pass. Past the last subject nothing
     // else needs them at that size, so release them on every worker of the pool (#2093):
@@ -1596,6 +1689,37 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
+    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+        xv,
+        model,
+        pop,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        parallel_subjects,
+    );
+    (params, ehs, hms, kaps)
+}
+
+/// [`reconverge_population`], and whether every subject's inner solve converged.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconverge_population_checked(
+    xv: &[f64],
+    model: &CompiledModel,
+    pop: &Population,
+    template: &ModelParameters,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    cov_inner_tol: f64,
+    parallel_subjects: bool,
+) -> (
+    ModelParameters,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    bool,
+) {
     let params = unpack_params(xv, template);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let ebes = map_subjects(pop, parallel_subjects, |i: usize| {
@@ -1615,12 +1739,14 @@ pub(super) fn reconverge_population(
     let mut ehs = Vec::with_capacity(n);
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
+    let mut all_converged = true;
     for ebe in ebes {
+        all_converged &= ebe.converged;
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps)
+    (params, ehs, hms, kaps, all_converged)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
@@ -1860,7 +1986,7 @@ pub(crate) fn compute_covariance_for(
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     // The free coordinates whose units the eigenvalue floor on `S` and `R` must not see (#2145).
-    let unit_coords = identity_theta_free_mask(template, &free_idx);
+    let unit_coords = free_coordinate_units(template, x_hat, &free_idx);
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
@@ -2723,21 +2849,45 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
     })
 }
 
+/// How a packed free coordinate carries units, as the eigenvalue floor of
+/// [`invert_psd_with_floor_unit_free`] must treat it (#2145, #2274).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CoordUnits {
+    /// Log-θ, the log-Cholesky Ω diagonal, log-σ, Fisher-z ρ: a tiny diagonal entry is a flat
+    /// direction, and the floor sees the coordinate as it is.
+    Dimensionless,
+    /// An identity-packed θ: its units are unknown to ferx, so its diagonal is equilibrated
+    /// against the largest dimensionless one (#2145).
+    IdentityTheta,
+    /// A coordinate whose units are those of a known estimate `s`, so `x / s` is unit-free: an
+    /// Ω Cholesky off-diagonal `L_ij`, scaled by its row's diagonal `L̂_ii` (#2274).
+    Scaled(f64),
+}
+
 /// [`invert_psd_with_floor`] with the floor made independent of the units of the coordinates
-/// flagged in `unit_coords` (#2145).
+/// `units` marks as carrying them (#2145, #2274).
 ///
-/// An identity-packed θ (a negative lower bound, `theta_packs_log`) is the one packed
-/// coordinate that carries units: writing it in units `k` times larger divides its row and
-/// column of `R` or `S` by `k`. The floor, taken from the raw spectrum, then clips a
-/// well-determined fit purely because of those units — under `covariance_method = s` that is a
-/// rejected `S`, under `r`/`rsr` an understated SE. So each flagged coordinate with a positive,
-/// finite diagonal is rescaled first, `C = D⁻¹ M D⁻¹` with `dᵢ = sqrt(Mᵢᵢ / g)`, `g` the
-/// largest **unflagged** positive diagonal entry, so its diagonal entry in `C` is `g` whatever
-/// its units. With no usable unflagged entry (every free coordinate an identity-packed θ, e.g.
-/// Ω and σ FIX) `g = 1`, i.e. Jacobi scaling of the flagged block: any anchor read off a
-/// flagged diagonal would move with the units, and the absolute `1e-12` floor would clip on
-/// them again. The floor is applied to `C`'s
-/// spectrum and the result mapped back, `M⁻¹ = D⁻¹ C⁻¹ D⁻¹`.
+/// Two kinds of packed coordinate carry units, and writing either in units `k` times larger
+/// divides its row and column of `R` or `S` by `k`. The floor, taken from the raw spectrum,
+/// then clips a well-determined fit purely because of those units — under
+/// `covariance_method = s` that is a rejected `S`, under `r`/`rsr` an understated SE. So each
+/// is rescaled first, `C = D⁻¹ M D⁻¹`; the floor is applied to `C`'s spectrum and the result
+/// mapped back, `M⁻¹ = D⁻¹ C⁻¹ D⁻¹`.
+///
+/// - **An Ω Cholesky off-diagonal** ([`CoordUnits::Scaled`]). With `Ω = L·Lᵀ`, `L_ij` (`i > j`)
+///   has the units of `η_i` — of `BASE` itself when `BASE = TVBASE + ETA_B` — and so has `L_ii`.
+///   `dᵢ = 1 / L̂_ii` makes the coordinate exactly unit-free (#2274). The scale is the estimate,
+///   not the matrix, so a genuinely flat off-diagonal direction is still clipped; ferx cannot
+///   tell from the packed vector whether an η enters additively, so every off-diagonal is
+///   scaled, which moves the floor on any block-Ω model by an O(1) factor (`L̂_ii` is ~0.1–1
+///   for an exponential η). A non-positive or non-finite scale keeps `dᵢ = 1`.
+/// - **An identity-packed θ** ([`CoordUnits::IdentityTheta`], a negative lower bound) has units
+///   ferx knows nothing about. Each with a positive, finite diagonal gets `dᵢ = sqrt(Mᵢᵢ / g)`,
+///   `g` the largest positive diagonal entry of the **other** coordinates after their own
+///   scaling, so its diagonal entry in `C` is `g` whatever its units. With no usable other
+///   entry (every free coordinate an identity-packed θ, e.g. Ω and σ FIX) `g = 1`, i.e. Jacobi
+///   scaling of the flagged block: any anchor read off a flagged diagonal would move with the
+///   units, and the absolute `1e-12` floor would clip on them again.
 ///
 /// The largest rather than a mean: a mean is dragged down by exactly the flat dimensionless
 /// direction the floor exists to catch, and would then pull a well-determined θ under the floor
@@ -2745,25 +2895,21 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 /// other coordinate is tested against, where the dimensionless block alone puts it (within the
 /// factor the off-diagonals allow).
 ///
-/// Every other coordinate keeps `dᵢ = 1`. Log-θ, the log-Cholesky Ω diagonal, log-σ and ρ are
-/// dimensionless, so there a tiny diagonal entry *is* a flat direction and the floor must keep seeing it — which
-/// full Jacobi scaling of every coordinate would hide, since a diagonal matrix equilibrates to
-/// the identity. A flagged coordinate with a non-positive or non-finite diagonal also keeps
-/// `dᵢ = 1`: a parameter with no information is still clipped.
-///
-/// Not covered: an Ω Cholesky **off-diagonal** is identity-packed and carries the units of its
-/// η's (an additive η, say), so a block Ω on such η's can still meet a unit-dependent floor.
-/// Only θ's are flagged by the covariance step (`identity_theta_free_mask`).
+/// Every [`CoordUnits::Dimensionless`] coordinate keeps `dᵢ = 1`. Log-θ, the log-Cholesky Ω
+/// diagonal, log-σ and ρ are dimensionless, so there a tiny diagonal entry *is* a flat direction
+/// and the floor must keep seeing it — which full Jacobi scaling of every coordinate would hide,
+/// since a diagonal matrix equilibrates to the identity. A flagged θ with a non-positive or
+/// non-finite diagonal also keeps `dᵢ = 1`: a parameter with no information is still clipped.
 ///
 /// The returned `min_eigenvalue`, `max_eigenvalue` and `floor` are those of `C`, so the
-/// regularization warning built from them no longer moves with a θ's units either.
+/// regularization warning built from them no longer moves with these units either.
 pub(crate) fn invert_psd_with_floor_unit_free(
     sym: &DMatrix<f64>,
-    unit_coords: &[bool],
+    units: &[CoordUnits],
 ) -> Option<RegularizedInverse> {
     let n = sym.nrows();
-    debug_assert_eq!(unit_coords.len(), n, "one flag per coordinate");
-    let Some(d) = unit_coordinate_scales(sym, unit_coords) else {
+    debug_assert_eq!(units.len(), n, "one flag per coordinate");
+    let Some(d) = unit_coordinate_scales(sym, units) else {
         return invert_psd_with_floor(sym);
     };
     let mut c = sym.clone();
@@ -2784,41 +2930,79 @@ pub(crate) fn invert_psd_with_floor_unit_free(
 }
 
 /// The diagonal scaling `d` of [`invert_psd_with_floor_unit_free`], or `None` when it is the
-/// identity (no flagged coordinate with a usable diagonal), so the unscaled path is taken
-/// unchanged.
-fn unit_coordinate_scales(sym: &DMatrix<f64>, unit_coords: &[bool]) -> Option<Vec<f64>> {
-    let usable = |i: usize| {
-        let m = sym[(i, i)];
-        m.is_finite() && m > 0.0
-    };
+/// identity (no coordinate with a usable scale), so the unscaled path is taken unchanged.
+fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Vec<f64>> {
+    let usable = |m: f64| m.is_finite() && m > 0.0;
     let n = sym.nrows();
-    if !(0..n).any(|i| unit_coords[i] && usable(i)) {
+    // The known scales first: `dᵢ = 1 / sᵢ`, so `Cᵢᵢ = Mᵢᵢ·sᵢ²`.
+    let mut d: Vec<f64> = units
+        .iter()
+        .map(|u| match *u {
+            CoordUnits::Scaled(s) if usable(s) => 1.0 / s,
+            _ => 1.0,
+        })
+        .collect();
+    let is_theta = |i: usize| units[i] == CoordUnits::IdentityTheta && usable(sym[(i, i)]);
+    if !(0..n).any(|i| is_theta(i) || d[i] != 1.0) {
         return None;
     }
     let g = (0..n)
-        .filter(|&i| !unit_coords[i] && usable(i))
-        .map(|i| sym[(i, i)])
+        .filter(|&i| units[i] != CoordUnits::IdentityTheta)
+        .map(|i| sym[(i, i)] / (d[i] * d[i]))
+        .filter(|&m| usable(m))
         .reduce(f64::max)
         .unwrap_or(1.0);
-    Some(
-        (0..n)
-            .map(|i| {
-                if unit_coords[i] && usable(i) {
-                    (sym[(i, i)] / g).sqrt()
-                } else {
-                    1.0
-                }
-            })
-            .collect(),
-    )
+    for (i, di) in d.iter_mut().enumerate() {
+        if is_theta(i) {
+            *di = (sym[(i, i)] / g).sqrt();
+        }
+    }
+    Some(d)
 }
 
-/// Which free coordinates of the covariance step carry units: the identity-packed θ's
-/// (`theta_packs_log` false), the mask [`invert_psd_with_floor_unit_free`] equilibrates (#2145).
-fn identity_theta_free_mask(template: &ModelParameters, free_idx: &[usize]) -> Vec<bool> {
+/// How each free coordinate of the covariance step carries units, the mask
+/// [`invert_psd_with_floor_unit_free`] reads: an identity-packed θ (`theta_packs_log` false,
+/// #2145), an Ω or Ω_IOV Cholesky off-diagonal scaled by its row's diagonal `L̂_ii` read off
+/// `x_hat` (#2274), and everything else dimensionless. The walk mirrors
+/// `pack_params_with_moves`: θ, the Ω lower triangle, σ, the IOV lower triangle; the mixture
+/// overrides and the ρ's that follow are log- and Fisher-z-packed.
+fn free_coordinate_units(
+    template: &ModelParameters,
+    x_hat: &[f64],
+    free_idx: &[usize],
+) -> Vec<CoordUnits> {
+    let mut units: Vec<CoordUnits> = template
+        .theta_lower
+        .iter()
+        .map(|&lo| {
+            if theta_packs_log(lo) {
+                CoordUnits::Dimensionless
+            } else {
+                CoordUnits::IdentityTheta
+            }
+        })
+        .collect();
+    let at = unpack_params(x_hat, template);
+    let push_omega = |chol: &DMatrix<f64>, diagonal: bool, units: &mut Vec<CoordUnits>| {
+        for (i, j) in lower_tri_iter(chol.nrows(), diagonal) {
+            units.push(if i == j {
+                CoordUnits::Dimensionless
+            } else {
+                CoordUnits::Scaled(chol[(i, i)])
+            });
+        }
+    };
+    push_omega(&at.omega.chol, at.omega.diagonal, &mut units);
+    units.extend(std::iter::repeat_n(
+        CoordUnits::Dimensionless,
+        template.sigma.values.len(),
+    ));
+    if let Some(ref iov) = at.omega_iov {
+        push_omega(&iov.chol, iov.diagonal, &mut units);
+    }
     free_idx
         .iter()
-        .map(|&i| i < template.theta.len() && !theta_packs_log(template.theta_lower[i]))
+        .map(|&i| units.get(i).copied().unwrap_or(CoordUnits::Dimensionless))
         .collect()
 }
 
@@ -3453,6 +3637,20 @@ mod tests {
         (0..m.nrows()).map(|k| m[(k, k)]).collect()
     }
 
+    /// The #2145 mask from booleans: `true` an identity-packed θ, `false` dimensionless.
+    fn theta_flags(flags: &[bool]) -> Vec<super::CoordUnits> {
+        flags
+            .iter()
+            .map(|&f| {
+                if f {
+                    super::CoordUnits::IdentityTheta
+                } else {
+                    super::CoordUnits::Dimensionless
+                }
+            })
+            .collect()
+    }
+
     /// `M` with coordinate `j` written in units `k` times larger: row and column `j` divided
     /// by `k`, exactly what a change of units does to an identity-packed θ's block of `R` or `S`.
     fn rescale_coordinate(m: &DMatrix<f64>, j: usize, k: f64) -> DMatrix<f64> {
@@ -3488,7 +3686,7 @@ mod tests {
         let m = DMatrix::from_row_slice(3, 3, &[4.0, 0.6, 0.3, 0.6, 1.0, 0.2, 0.3, 0.2, 0.8]);
         let m_inv = m.clone().try_inverse().expect("PD");
         let flag_1 = [false, true, false];
-        let at_k1 = super::invert_psd_with_floor_unit_free(&m, &flag_1).expect("PD");
+        let at_k1 = super::invert_psd_with_floor_unit_free(&m, &theta_flags(&flag_1)).expect("PD");
         for k in [1e6, 1e-6] {
             let mk = rescale_coordinate(&m, 1, k);
             // The fixture straddles the floor: unscaled, the rescale alone is clipped.
@@ -3498,7 +3696,8 @@ mod tests {
                 "k = {k}: fixture must be under the raw floor"
             );
 
-            let inv = super::invert_psd_with_floor_unit_free(&mk, &flag_1).expect("PD");
+            let inv =
+                super::invert_psd_with_floor_unit_free(&mk, &theta_flags(&flag_1)).expect("PD");
             assert_eq!(inv.n_clipped, 0, "k = {k}: flagged coordinate was clipped");
             // (Mₖ)⁻¹ = row/column 1 of M⁻¹ multiplied by k.
             let want = rescale_coordinate(&m_inv, 1, 1.0 / k);
@@ -3521,7 +3720,8 @@ mod tests {
 
             // The same rescale on a coordinate that is not flagged: still clipped.
             let unflagged =
-                super::invert_psd_with_floor_unit_free(&mk, &[true, false, false]).expect("PD");
+                super::invert_psd_with_floor_unit_free(&mk, &theta_flags(&[true, false, false]))
+                    .expect("PD");
             assert!(
                 unflagged.n_clipped > 0,
                 "k = {k}: an unflagged coordinate escaped the floor"
@@ -3539,12 +3739,14 @@ mod tests {
         let corr = DMatrix::from_row_slice(2, 2, &[1.0, rho, rho, 1.0]);
         for k in [1.0, 1e6, 1e-6] {
             let mk = rescale_coordinate(&corr, 1, k);
-            let inv = super::invert_psd_with_floor_unit_free(&mk, &[false, true]).expect("PSD");
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &theta_flags(&[false, true]))
+                .expect("PSD");
             assert_eq!(
                 inv.n_clipped, 1,
                 "k = {k}: collinear pair escaped the floor"
             );
-            let both = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PSD");
+            let both = super::invert_psd_with_floor_unit_free(&mk, &theta_flags(&[true, true]))
+                .expect("PSD");
             assert_eq!(
                 both.n_clipped, 1,
                 "k = {k}: all-flagged collinear pair escaped"
@@ -3552,7 +3754,8 @@ mod tests {
         }
 
         let no_info = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![2.0, 0.0]));
-        let inv = super::invert_psd_with_floor_unit_free(&no_info, &[false, true]).expect("PSD");
+        let inv = super::invert_psd_with_floor_unit_free(&no_info, &theta_flags(&[false, true]))
+            .expect("PSD");
         assert_eq!(
             inv.n_clipped, 1,
             "a flagged coordinate with no score must stay clipped"
@@ -3561,7 +3764,9 @@ mod tests {
         // Exactly one clip: the flat entry. The flagged θ's anchor is the largest unflagged
         // diagonal; a geometric mean (1e-10 here) drags it onto the floor beside the flat one.
         let flat = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-20, 1.0, 3e8]));
-        let inv = super::invert_psd_with_floor_unit_free(&flat, &[false, false, true]).expect("PD");
+        let inv =
+            super::invert_psd_with_floor_unit_free(&flat, &theta_flags(&[false, false, true]))
+                .expect("PD");
         assert_eq!(
             inv.n_clipped, 1,
             "a flat dimensionless direction must stay clipped"
@@ -3577,7 +3782,7 @@ mod tests {
     fn unit_free_floor_is_unit_free_when_every_coordinate_is_flagged() {
         let one = DMatrix::from_element(1, 1, 1e-14);
         assert_eq!(super::invert_psd_with_floor(&one).expect("PD").n_clipped, 1);
-        let inv = super::invert_psd_with_floor_unit_free(&one, &[true]).expect("PD");
+        let inv = super::invert_psd_with_floor_unit_free(&one, &theta_flags(&[true])).expect("PD");
         assert_eq!(
             inv.n_clipped, 0,
             "an all-flagged θ in large units was clipped"
@@ -3592,7 +3797,8 @@ mod tests {
         let m_inv = m.clone().try_inverse().expect("PD");
         for (k0, k1) in [(1e7, 1e-7), (1e8, 1e8)] {
             let mk = rescale_coordinate(&rescale_coordinate(&m, 0, k0), 1, k1);
-            let inv = super::invert_psd_with_floor_unit_free(&mk, &[true, true]).expect("PD");
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &theta_flags(&[true, true]))
+                .expect("PD");
             assert_eq!(inv.n_clipped, 0, "k = ({k0}, {k1}): clipped");
             let want = rescale_coordinate(&rescale_coordinate(&m_inv, 0, 1.0 / k0), 1, 1.0 / k1);
             let gap = max_rel_gap(&inv.inverse, &want);
@@ -3601,10 +3807,15 @@ mod tests {
         }
     }
 
-    /// The mask the covariance step passes: identity-packed θ's (a negative lower bound) only,
-    /// indexed over the free coordinates.
+    /// The mask the covariance step passes, indexed over the free coordinates: identity-packed
+    /// θ's (a negative lower bound) flagged, the Ω Cholesky off-diagonal scaled by its row's
+    /// estimated diagonal `L̂_ii` (#2274), everything else dimensionless.
     #[test]
-    fn identity_theta_free_mask_flags_identity_packed_thetas_only() {
+    fn free_coordinate_units_flags_identity_thetas_and_scales_omega_off_diagonals() {
+        use super::CoordUnits::{Dimensionless, IdentityTheta, Scaled};
+        // Ω = [[0.09, 0.3k], [0.3k, (5k)²]] at k = 1e3: L₁₁ = 0.3, L₂₁ = k, L₂₂ = √(25k² − k²).
+        let k = 1e3_f64;
+        let omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.3 * k, 0.3 * k, 25.0 * k * k]);
         let t = crate::types::ModelParameters {
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
@@ -3614,8 +3825,12 @@ mod tests {
             theta_lower: vec![-100.0, 0.0],
             theta_upper: vec![100.0, 50.0],
             theta_fixed: vec![false; 2],
-            omega: crate::types::OmegaMatrix::from_diagonal(&[0.09], vec!["E1".into()]),
-            omega_fixed: vec![false],
+            omega: crate::types::OmegaMatrix::from_matrix(
+                omega,
+                vec!["E1".into(), "E2".into()],
+                false,
+            ),
+            omega_fixed: vec![false; 3],
             sigma: crate::types::SigmaVector {
                 values: vec![0.05],
                 names: vec!["PROP_ERR".into()],
@@ -3625,15 +3840,121 @@ mod tests {
             kappa_fixed: vec![],
             mixture: None,
         };
-        // Packed: θ₀, θ₁, ω, σ. All free; then with θ₀ FIX the free block starts at θ₁.
+        let x = crate::estimation::parameterization::pack_params(&t);
+        // Packed: θ₀, θ₁, L₁₁, L₂₁, L₂₂, σ.
+        assert_eq!(x.len(), 6);
+        let units = super::free_coordinate_units(&t, &x, &[0, 1, 2, 3, 4, 5]);
+        let want_l11 = 0.3_f64;
+        let want_l22 = (25.0 * k * k - k * k).sqrt();
+        match units[3] {
+            Scaled(s) => assert!(((s - want_l22) / want_l22).abs() < 1e-12, "{s}"),
+            u => panic!("L₂₁ is {u:?}"),
+        }
+        assert!(((t.omega.chol[(1, 0)] - k) / k).abs() < 1e-12);
+        assert!((t.omega.chol[(0, 0)] - want_l11).abs() < 1e-12);
         assert_eq!(
-            super::identity_theta_free_mask(&t, &[0, 1, 2, 3]),
-            vec![true, false, false, false]
+            [units[0], units[1], units[2], units[4], units[5]],
+            [
+                IdentityTheta,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless
+            ]
         );
+        // With θ₀ FIX the free block starts at θ₁, and the off-diagonal moves to index 2.
+        let free = super::free_coordinate_units(&t, &x, &[1, 2, 3, 4, 5]);
+        assert_eq!(free[0], Dimensionless);
+        assert!(matches!(free[2], Scaled(_)));
+    }
+
+    /// #2274: an Ω Cholesky off-diagonal carries its row η's units, and so does that row's
+    /// diagonal `L̂_ii`, so scaling the coordinate by `L̂_ii` makes the floor's decision
+    /// unit-free. The straddle: the same rescale, unscaled, is clipped; scaled by `k·L̂_ii` it is
+    /// not, and the inverse is the rescaled inverse of the original. A coordinate whose scale is
+    /// genuinely tiny is still clipped — the scale is the estimate, not the matrix.
+    #[test]
+    fn unit_free_floor_scales_an_off_diagonal_by_its_row_diagonal() {
+        use super::CoordUnits::{Dimensionless, Scaled};
+        let m = DMatrix::from_row_slice(3, 3, &[4.0, 0.6, 0.3, 0.6, 1.0, 0.2, 0.3, 0.2, 0.8]);
+        let m_inv = m.clone().try_inverse().expect("PD");
+        let l_ii = 0.7;
+        let at_k1 = super::invert_psd_with_floor_unit_free(
+            &m,
+            &[Dimensionless, Scaled(l_ii), Dimensionless],
+        )
+        .expect("PD");
+        for k in [1e6, 1e-6] {
+            let mk = rescale_coordinate(&m, 1, k);
+            assert!(
+                super::invert_psd_with_floor(&mk).expect("PD").n_clipped > 0,
+                "k = {k}: fixture must be under the raw floor"
+            );
+            let units = [Dimensionless, Scaled(k * l_ii), Dimensionless];
+            let inv = super::invert_psd_with_floor_unit_free(&mk, &units).expect("PD");
+            assert_eq!(inv.n_clipped, 0, "k = {k}: scaled off-diagonal was clipped");
+            let want = rescale_coordinate(&m_inv, 1, 1.0 / k);
+            let gap = max_rel_gap(&inv.inverse, &want);
+            eprintln!("k = {k:e}: inverse gap {gap:.2e}");
+            assert!(gap < 1e-12, "k = {k}: {gap}");
+            for (got, want) in [
+                (inv.max_eigenvalue, at_k1.max_eigenvalue),
+                (inv.min_eigenvalue, at_k1.min_eigenvalue),
+                (inv.floor, at_k1.floor),
+            ] {
+                assert!(
+                    ((got - want) / want).abs() < 1e-12,
+                    "k = {k}: {got} vs k = 1 {want}"
+                );
+            }
+            // An unscaled coordinate in the same units: still clipped.
+            let unscaled = super::invert_psd_with_floor_unit_free(&mk, &[Dimensionless; 3]);
+            assert!(unscaled.expect("PD").n_clipped > 0, "k = {k}");
+        }
+
+        // The θ anchor is read after the off-diagonal's scaling: a large-unit off-diagonal is the
+        // largest raw diagonal here, and anchoring on it would drag the θ to a unit-dependent g.
+        let three = DMatrix::from_row_slice(3, 3, &[1.0, 0.1, 0.0, 0.1, 2.0, 0.3, 0.0, 0.3, 0.5]);
+        let base = super::invert_psd_with_floor_unit_free(
+            &three,
+            &[super::CoordUnits::IdentityTheta, Dimensionless, Scaled(1.0)],
+        )
+        .expect("PD");
+        let small = rescale_coordinate(&three, 2, 1e-9);
+        let moved = super::invert_psd_with_floor_unit_free(
+            &small,
+            &[
+                super::CoordUnits::IdentityTheta,
+                Dimensionless,
+                Scaled(1e-9),
+            ],
+        )
+        .expect("PD");
+        assert!(((moved.max_eigenvalue - base.max_eigenvalue) / base.max_eigenvalue).abs() < 1e-12);
+
+        // A row diagonal estimated at ~0 (ω_ii collapsed): the off-diagonal is a flat direction
+        // in unit-free terms and the floor still clips it.
+        let inv = super::invert_psd_with_floor_unit_free(
+            &m,
+            &[Dimensionless, Scaled(1e-8), Dimensionless],
+        )
+        .expect("PD");
         assert_eq!(
-            super::identity_theta_free_mask(&t, &[1, 2, 3]),
-            vec![false, false, false]
+            inv.n_clipped, 1,
+            "a collapsed row's off-diagonal escaped the floor"
         );
+        // A non-positive or non-finite scale is ignored rather than trusted.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let inv = super::invert_psd_with_floor_unit_free(
+                &m,
+                &[Dimensionless, Scaled(bad), Dimensionless],
+            )
+            .expect("PD");
+            assert_eq!(
+                inv.inverse,
+                super::invert_psd_with_floor(&m).expect("PD").inverse
+            );
+        }
     }
 
     #[test]
@@ -3790,7 +4111,7 @@ mod tests {
                 r_inv.clone(),
                 Some(r_inv_ref.clone()),
                 s,
-                &[false, false],
+                &[super::CoordUnits::Dimensionless; 2],
             )
             .expect("sandwich never inverts S");
             let cov_ref = cov_ref.expect("a reference was supplied");
@@ -3841,7 +4162,7 @@ mod tests {
             r_inv.clone(),
             Some(r_inv_ref.clone()),
             &s_asym,
-            &[false, false],
+            &[super::CoordUnits::Dimensionless; 2],
         )
         .expect("sandwich never inverts S");
         let reference = reference.expect("a reference was supplied");
@@ -3864,7 +4185,7 @@ mod tests {
             r_inv.clone(),
             None,
             &s_loaded,
-            &[false, false],
+            &[super::CoordUnits::Dimensionless; 2],
         )
         .expect("sandwich never inverts S");
         assert!(none_ref.is_none());
@@ -5323,7 +5644,8 @@ mod tests {
         )
         .expect("S");
         let want = super::embed_free(
-            &super::invert_cross_product(&s, &vec![false; s.nrows()]).expect("S⁻¹ exists"),
+            &super::invert_cross_product(&s, &vec![super::CoordUnits::Dimensionless; s.nrows()])
+                .expect("S⁻¹ exists"),
             &free_idx,
             x.len(),
         );

@@ -99,17 +99,29 @@ leaves the feasible region. A start the guard rejects is not probed.
 
 When every subject is inside the exact R-matrix's scope (a Gaussian endpoint, no
 `gradient = fd`, the subject's random effects within the
-[analytic widths](foce.qmd#known-fd-fallbacks)), the same
-quadratic is read off exact derivatives at θ₀ instead of the two probes: the
-adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate,
-penalties included. The second difference is then $f''\delta^2$ and the minimizer's
-distance the Newton step $|f'/f''|$, with the same two cuts. That costs one
-R-matrix pass along the candidates — no inner solve at all — where the probes cost
-two population inner solves per candidate, which grew with the number of θ: on a
-1,317-θ covariate network the probes took 68 of an 87 s fit. With no probe there
-is no infeasible probe either, so the "a probe the optimizer could not take" arm
-applies to the probe route only. `[mixture]` models, and any fit with a subject
-outside that scope, take the probes.
+[analytic widths](foce.qmd#known-fd-fallbacks)), the same quadratic is read off exact
+derivatives at θ₀ instead of the two probes. The EBEs are re-solved once, warm, at the
+covariance step's tolerance (`cov_inner_tol`), and at those modes the pre-flight takes
+the adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate, both
+of the same objective, penalties included. The second difference is then
+$f''\delta^2$ and the minimizer's distance the Newton step $|f'/f''|$, with the same
+two cuts. A θ those derivatives would leave on the unit scale is still checked at the
+two probe points with the EBEs held, without re-solving: a non-finite or walled
+objective there means the optimizer could not take a move of the θ's own size, and the
+θ is scaled, as on the probe route.
+
+That costs one warm inner solve and one R-matrix pass along the candidates, where the
+probes cost two cold population inner solves per candidate, which grew with the number
+of θ: on a 1,317-θ covariate network the probes took 68 of an 87 s fit.
+
+The probes are used instead when any of these holds:
+
+- a subject does not converge at that tolerance;
+- `analytic_cov_hessian = false`;
+- the model is a `[mixture]`;
+- a subject is outside that scope;
+- `nn_smooth_lambda > 0`, since the smoothness penalty's Hessian is its Gauss–Newton
+  part only, not the exact curvature.
 
 The statistic is a ratio of objective differences, so the decision does not change
 when every likelihood contribution is repeated — more subjects, or more
@@ -178,12 +190,6 @@ with a θ's units. When every free coordinate is an identity-packed θ (Omega an
 Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a
 unit diagonal instead.
 
-One packed coordinate with units is **not** rescaled: an Omega Cholesky
-off-diagonal (`chol_<i>_<j>`) is identity-packed and carries the units of its
-η's. For η's on a log scale (`CL = TVCL·exp(ETA_CL)`) those are dimensionless,
-but a block Omega on additive η's in large or small units can still meet a
-floor that depends on those units.
-
 Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its
 FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at
 $k = 10^5$ and $10^6$, `s` used to fail and `r`/`rsr` reported
@@ -192,6 +198,32 @@ fit's (0.240 under `r`, 0.238 under `rsr`, 0.466 under `s`) to within $3
 \times 10^{-10}$, and at $k = 3 \times 10^{-6}$ TVKA's SE is 0.149 under `r`
 (was 0.064). At $k = 10^5$ on the block-Ω #432 model the `MATRIX=R` SEs match
 NONMEM 7.5.1 to $2 \times 10^{-5}$.
+
+#### An Omega Cholesky off-diagonal and the covariance step's floor {#omega-offdiag-covariance-floor}
+
+The other packed coordinate with units is an Omega (or Omega-IOV) Cholesky
+off-diagonal (`chol_<i>_<j>`). With $\Omega = L L^\top$, $L_{ij}$ ($i > j$) has
+the units of $\eta_i$: dimensionless for an η on a log scale
+(`CL = TVCL·exp(ETA_CL)`), but the units of the parameter itself for an additive
+one (`BASE = TVBASE + ETA_B`). Its row's diagonal $L_{ii}$ has the same units, so
+since #2274 the floor tests each off-diagonal divided by its row's estimated
+$\hat L_{ii}$, which is unit-free whether the η is additive or not (ferx cannot
+tell from the packed vector which it is). The scale is the estimate, not the
+matrix, so a genuinely flat off-diagonal direction is still clipped. On a
+block-Omega model this moves the floor by an O(1) factor ($\hat L_{ii}$ is
+typically 0.1–1 for a log-scale η), so a standard error the floor was already
+binding on can change in its last digits; one it was not binding on is
+unchanged.
+
+The packing rails ($|L_{ij}| \le 10$, $\log L_{ii} \in [-6, 6]$) already limit
+how far an additive η's units can stretch, so it takes a direction that is
+weak in its own right for the units to decide whether it is clipped. Measured
+on `data/covmuref_power.csv` with `V = (TVV_S + ETA_VS) / k` in a block with
+`ETA_CL` and a barely-informed allometric-exponent θ
+(`tests/cov_floor_omega_offdiag_units.rs`, macOS arm64): at $k = 3 \times
+10^{-4}$ the $L_{21}$ diagonal reaches $10^7$, and before #2274 `r` and `rsr`
+reported a regularized step and `s` refused $S$; every SE now equals the $k = 1$
+fit's to within $10^{-6}$, at $k = 15$ as well.
 
 ## Bounds
 

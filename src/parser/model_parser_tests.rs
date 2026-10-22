@@ -15585,11 +15585,10 @@ fn clamp_dual2_matches_fd_in_every_regime() {
 fn clamp_derivative_convention_on_the_bounds() {
     use crate::sens::dual2::Dual2;
     let bc = compile_bytecode(&parse_indexed_expr("clamp(X, 0.2, 0.8)"));
-    let nn: Vec<Vec<f64>> = Vec::new();
     let grad_at = |x: f64| {
         let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(0.0, 1)];
         let mut s: Vec<Dual2<2>> = Vec::new();
-        eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut s).grad[0]
+        eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut s).grad[0]
     };
     assert_eq!(
         grad_at(0.2),
@@ -16988,7 +16987,7 @@ fn bc_g_dual2_fd(expr: &Expression, x: f64, y: f64, gtol: f64, htol: f64) {
     let bc = compile_bytecode(expr);
     let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
     let mut sd: Vec<Dual2<2>> = Vec::new();
-    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut sd);
     let v = |a: f64, b: f64| {
         let mut s: Vec<f64> = Vec::new();
         eval_bytecode(&bc, &[], &[], &[], &[a, b], &nn, &mut s)
@@ -17106,7 +17105,7 @@ fn mod_zero_divisor_agrees_across_all_three_evaluators() {
         let vm = eval_bytecode(&bc, &[], &[], &[], &vars, &nn, &mut s);
         let vd = [Dual2::<2>::var(7.25, 0), Dual2::<2>::var(b, 1)];
         let mut sd: Vec<Dual2<2>> = Vec::new();
-        let dual = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        let dual = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut sd);
         assert_eq!(tree, want, "eval_expr: 7.25 mod {b:e}");
         assert_eq!(vm, want, "f64 VM: 7.25 mod {b:e}");
         assert_eq!(dual.value, want, "Dual2 VM: 7.25 mod {b:e}");
@@ -17139,7 +17138,6 @@ fn mod_zero_divisor_agrees_across_all_three_evaluators() {
 fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     use crate::sens::dual2::Dual2;
     let expr = binop(BinOp::Mod, varidx(0), varidx(1));
-    let nn: Vec<Vec<f64>> = Vec::new();
     let bc = compile_bytecode(&expr);
     for (x, y) in [
         (1.3, 2.5),
@@ -17152,7 +17150,7 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
         bc_g_f64_matches(&expr, &[x, y]);
         let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
         let mut sd: Vec<Dual2<2>> = Vec::new();
-        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut sd);
         assert_eq!(
             d.value.to_bits(),
             x.rem_euclid(y).to_bits(),
@@ -17164,7 +17162,7 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     // The zero-divisor guard still returns a constant.
     let vd = [Dual2::<2>::var(1.3, 0), Dual2::<2>::var(0.0, 1)];
     let mut sd: Vec<Dual2<2>> = Vec::new();
-    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+    let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut sd);
     assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
 }
 
@@ -17179,7 +17177,6 @@ fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
     use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
     type V = DualV<2, 2, true>;
     let expr = binop(BinOp::Mod, varidx(0), varidx(1));
-    let nn: Vec<Vec<f64>> = Vec::new();
     let bc = compile_bytecode(&expr);
     let w = [0.6, -1.1, 0.8, 0.5, -0.7];
     for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
@@ -17190,7 +17187,7 @@ fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
             V::leaf(y, [0.0, 1.0], [0.0; 2]),
         ];
         let mut sd: Vec<V> = Vec::new();
-        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &[], &mut sd);
         assert_eq!(
             f.v.to_bits(),
             x.rem_euclid(y).to_bits(),
@@ -17306,11 +17303,10 @@ fn assert_dm_matches_reference(e: &Expression) {
     let time = 3.25;
     let want = dm_reference(e, &vars, &covs, time);
     let bc = compile_bytecode(e);
-    let nn: Vec<Vec<f64>> = Vec::new();
     let mut stack: Vec<Dm> = Vec::new();
     let got = {
         let _t = ModelTimeGuard::enter(time);
-        eval_bytecode_g::<Dm>(&bc, &[], &[], &covs, &vars, &nn, &mut stack)
+        eval_bytecode_g::<Dm>(&bc, &[], &[], &covs, &vars, &[], &mut stack)
     };
     // Bit for bit, any `NaN` matching any `NaN`.
     let eq = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
@@ -17464,7 +17460,7 @@ fn bytecode_g_underflow_fallback_keeps_the_operand_order() {
         bc.ops.push(op);
         bc.max_stack = 1;
         let nn: Vec<Vec<f64>> = Vec::new();
-        let dual = eval_bytecode_g::<Dm>(&bc, &[], &[], &[], &[], &nn, &mut Vec::new());
+        let dual = eval_bytecode_g::<Dm>(&bc, &[], &[], &[], &[], &[], &mut Vec::new());
         assert_eq!(dual.value, want, "{op:?}: dual VM");
     }
 }
@@ -17566,7 +17562,17 @@ fn eval_statements_g_matches_f64_and_fd() {
     ];
     let mut dud = vec![Dual2::<1>::constant(0.0)];
     let mut sd: Vec<Dual2<1>> = Vec::new();
-    eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd, &[]);
+    eval_statements_g::<Dual2<1>>(
+        &stmts,
+        &[],
+        &[],
+        &[],
+        &mut vd,
+        Some(&mut dud),
+        &mut sd,
+        &[],
+        &[],
+    );
 
     assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
     // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.
@@ -20784,7 +20790,7 @@ fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
         let eta = [0.2_f64, eta_sw];
         let th_d = [Dual2::<3>::var(theta[0], 0)];
         let et_d = [Dual2::<3>::var(eta[0], 1), Dual2::<3>::var(eta[1], 2)];
-        let got = prog.eval_params_g::<Dual2<3>>(&th_d, &et_d, &cov)[cl_row];
+        let got = prog.eval_params_g::<Dual2<3>>(&th_d, &et_d, &cov, &[])[cl_row];
         let want = f64_cl(&theta, &eta);
         assert!(want.is_finite() && got.value.is_finite());
         assert_eq!(
