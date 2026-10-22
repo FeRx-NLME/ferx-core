@@ -2928,7 +2928,15 @@ fn fit_inner(
         // Only this copy sees the per-subject results, so only it names the
         // subjects (#2038) — after the de-duplication, which matches the estimator's
         // copy on the sentence both share.
-        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population);
+        let msg = name_nonfinite_subjects(
+            msg,
+            &mut entry,
+            &subjects,
+            population,
+            model,
+            &result.params,
+            mixest_classes.as_deref(),
+        );
         warnings.push(msg);
         native_warnings.push(entry);
     }

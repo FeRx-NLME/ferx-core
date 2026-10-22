@@ -27,7 +27,8 @@ use crate::estimation::outer_optimizer::{
     DIVERGENCE_OFV, NONFINITE_OBJECTIVE_TOKEN,
 };
 use crate::parser::model_parser::parse_model_string;
-use crate::types::{ViFinalOfv, WarningCode, WarningSeverity};
+use crate::types::{BloqMethod, ViFinalOfv, WarningCode, WarningSeverity};
+
 use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1078,29 +1079,40 @@ fn population_of(subjects: Vec<Subject>) -> Population {
 /// **N1 — every cell of the sentence, in one message.**
 ///
 /// The input space is the subject's contribution (valid, at the sentinel, `NaN`, or
-/// finite but past the cutoff) × its predictions (finite, or not on some records).
-/// Four subjects cover the cells that change the text:
+/// finite but past the cutoff) × its records' own likelihood terms (all usable, or
+/// not on some records) × its predictions (finite, or not on some records). On
+/// [`one_cpt_model`]'s proportional error an `IPRED` of 0 is scored at the variance
+/// floor, `DV² × 1e12`, so `shifted_subject`'s `DV`s (33.3, 16.7, 5.6, 2 at `TIME`
+/// 0.5, 2, 8, 24) straddle the `1e14` cutoff between `TIME` 8 and 24. Four subjects
+/// cover the cells that change the text:
 ///
-/// | subject | contribution | predictions | named as |
-/// |---|---|---|---|
-/// | `A` | `2e20` | `IPRED` `NaN` at obs 2, `PRED` `NaN` at obs 3 | 2 of 4, first at `TIME` 8 |
-/// | `B` | `12.34` | every `IPRED` and `PRED` `NaN` | not named |
-/// | `C` | `4.6e14` | finite | "every IPRED and PRED finite" |
-/// | `D` | `NaN` | finite | "every IPRED and PRED finite" |
+/// | subject | contribution | `IPRED` | `PRED` | named as |
+/// |---|---|---|---|---|
+/// | `A` | `2e20` | 0 at `TIME` 2 and 24, `NaN` at 8 | `NaN` at 24 | terms 2 of 4 from `TIME` 2; predictions 2 of 4 from `TIME` 8 |
+/// | `B` | `12.34` | `NaN` | `NaN` | not named |
+/// | `C` | `4.6e14` | 0 at `TIME` 0.5 | finite | terms 1 of 4 at `TIME` 0.5; "every IPRED and PRED finite" |
+/// | `D` | `NaN` | finite | finite | "every … term usable"; "every IPRED and PRED finite" |
 ///
 /// `B` is the straddle: its predictions are worse than `A`'s, and it is the subject
 /// with no Gaussian observation whose `NaN` predictions are the "no prediction
-/// available" convention. Its contribution is valid, so it is not named. The whole
-/// appended sentence is compared exactly, so deleting any clause of it fires.
+/// available" convention. Its contribution is valid, so it is not named. `A`'s zeros
+/// straddle the per-record cutoff (`16.7² × 1e12 ≥ 1e14 > 2² × 1e12`), and its first
+/// unusable term comes before its first non-finite prediction, which is #2266's
+/// shape. The whole appended sentence is compared exactly, so deleting any clause of
+/// it fires.
 ///
 /// Mutation (run):
 /// * select on non-finite predictions instead of the contribution → `B` is named and
 ///   `C` and `D` are not;
 /// * select on `ofv_contribution >= DIVERGENCE_OFV` → `D`'s `NaN` drops out;
-/// * count only `IPRED` → `A` reads "1 of 4";
+/// * count only `IPRED` → `A` reads "1 of 4" in the prediction clause;
 /// * take the `TIME` from `obs_times` → `A` reads `TIME 58`;
-/// * drop the "{n} of {N} subjects" lead, the contribution, the records clause or
-///   the `TIME` clause → the sentence comparison fires.
+/// * flag a term only when it is not finite → `A`'s starts at `TIME 8` and `C`
+///   reads "every … term usable";
+/// * drop the `NaN`-prediction check ahead of the floor → `A` reads "1 of 4";
+/// * drop the "{n} of {N} subjects" lead, the contribution, either records clause,
+///   or the `TIME`, `DV` or `IPRED` of the term clause → the sentence comparison
+///   fires.
 #[test]
 fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     let pop = population_of(vec![
@@ -1111,18 +1123,30 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     ]);
     let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     a.ofv_contribution = 2e20;
+    a.ipred[1] = 0.0;
     a.ipred[2] = f64::NAN;
+    a.ipred[3] = 0.0;
     a.pred[3] = f64::NAN;
     let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
     b.ipred = vec![f64::NAN; 4];
     b.pred = vec![f64::NAN; 4];
     let mut c = crate::types::test_helpers::dummy_subject("C", 1, 4);
     c.ofv_contribution = 4.6e14;
+    c.ipred[0] = 0.0;
     let mut d = crate::types::test_helpers::dummy_subject("D", 1, 4);
     d.ofv_contribution = f64::NAN;
 
+    let m = one_cpt_model();
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[a, b, c, d], &pop);
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[a, b, c, d],
+        &pop,
+        &m,
+        &m.default_params,
+        None,
+    );
 
     let added = full
         .strip_prefix(&msg)
@@ -1130,9 +1154,13 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     assert_eq!(
         added,
         " 3 of 4 subjects have an objective contribution that is itself unusable: \
-         A (contribution 2e20, a non-finite IPRED or PRED on 2 of 4 observations, the first \
-         at TIME 8); C (contribution 460000000000000.0, every IPRED and PRED finite); \
-         D (contribution NaN, every IPRED and PRED finite)."
+         A (contribution 2e20, an unusable likelihood term on 2 of 4 observations, the \
+         first at TIME 2 (DV 16.666666666666668, IPRED 0); a non-finite IPRED or PRED on 2 \
+         of 4 observations, the first at TIME 8); C (contribution 460000000000000.0, an \
+         unusable likelihood term on 1 of 4 observations, the first at TIME 0.5 \
+         (DV 33.333333333333336, IPRED 0); every IPRED and PRED finite); D (contribution \
+         NaN, every observation's likelihood term usable on its own; every IPRED and PRED \
+         finite)."
     );
     assert_eq!(
         entry.message, full,
@@ -1151,11 +1179,14 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
         subjects,
         &vec![
             serde_json::json!({"id": "A", "ofv_contribution": 2e20,
-                "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0}),
+                "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0,
+                "unusable_terms": 2, "first_unusable_term_time": 2.0}),
             serde_json::json!({"id": "C", "ofv_contribution": 4.6e14,
-                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
+                "unusable_terms": 1, "first_unusable_term_time": 0.5}),
             serde_json::json!({"id": "D", "ofv_contribution": "NaN",
-                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
+                "unusable_terms": 0, "first_unusable_term_time": null}),
         ],
         "JSON has no NaN, so a non-finite contribution is carried as a string"
     );
@@ -1170,6 +1201,7 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
 /// "0 of 2 subjects" sentence and `details` an `unusable_subjects` key, and this fires.
 #[test]
 fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
+    let m = one_cpt_model();
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let subjects = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
@@ -1177,7 +1209,15 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
     ];
     let (msg, mut entry) = sentinel_warning();
     let before = entry.clone();
-    let out = name_nonfinite_subjects(msg.clone(), &mut entry, &subjects, &pop);
+    let out = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &subjects,
+        &pop,
+        &m,
+        &m.default_params,
+        None,
+    );
     assert_eq!(out, msg);
     assert_eq!(entry.message, before.message);
     assert_eq!(entry.details, before.details);
@@ -1193,15 +1233,27 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
 /// `B` and `first_time` is `8.0`, and this fires.
 #[test]
 fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
+    let m = one_cpt_model();
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
     b.ofv_contribution = 2e20;
     b.ipred[2] = f64::NAN;
     let a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[b, a], &pop);
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[b, a],
+        &pop,
+        &m,
+        &m.default_params,
+        None,
+    );
     assert!(
-        full.ends_with("B (contribution 2e20, a non-finite IPRED or PRED on 1 of 4 observations)."),
+        full.ends_with(
+            "B (contribution 2e20, likelihood terms not checked; a non-finite IPRED or PRED \
+             on 1 of 4 observations)."
+        ),
         "{full}"
     );
     let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
@@ -1211,6 +1263,16 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
         "{subjects}"
     );
     assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
+    assert_eq!(
+        subjects[0]["first_unusable_term_time"],
+        serde_json::Value::Null,
+        "{subjects}"
+    );
+    assert_eq!(
+        subjects[0]["unusable_terms"],
+        serde_json::Value::Null,
+        "unchecked, not zero: {subjects}"
+    );
 }
 
 /// **N3b — the third way `first_time` is `null`** (#2148 review): the subject is
@@ -1220,6 +1282,7 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
 /// finite `TIME` at that record the field would be a number.
 #[test]
 fn a_non_finite_written_time_is_carried_as_null() {
+    let m = one_cpt_model();
     let mut data = shifted_subject("A");
     data.obs_raw_times[2] = f64::NAN;
     let pop = population_of(vec![data]);
@@ -1227,8 +1290,12 @@ fn a_non_finite_written_time_is_carried_as_null() {
     a.ofv_contribution = 2e20;
     a.ipred[2] = f64::NAN;
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop);
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params, None);
     assert!(full.ends_with("the first at TIME NaN)."), "{full}");
+    assert!(
+        full.contains("the first at TIME NaN (DV 5.555555555555555, IPRED NaN);"),
+        "{full}"
+    );
     let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
     assert_eq!(
         subjects[0]["first_time"],
@@ -1247,6 +1314,7 @@ fn a_non_finite_written_time_is_carried_as_null() {
 /// assertion fires.
 #[test]
 fn the_message_caps_the_named_subjects_and_the_details_do_not() {
+    let m = one_cpt_model();
     let ids: Vec<String> = (1..=12).map(|k| format!("s{k:02}")).collect();
     let pop = population_of(ids.iter().map(|id| shifted_subject(id)).collect());
     let subjects: Vec<SubjectResult> = ids
@@ -1258,7 +1326,15 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         })
         .collect();
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop);
+    let full = name_nonfinite_subjects(
+        msg,
+        &mut entry,
+        &subjects,
+        &pop,
+        &m,
+        &m.default_params,
+        None,
+    );
 
     assert!(full.contains(" 12 of 12 subjects "), "{full}");
     assert!(full.contains("s10 (contribution 2e20"), "{full}");
@@ -1411,8 +1487,9 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
     assert!(
         message.ends_with(
             " 1 of 10 subjects have an objective contribution that is itself unusable: \
-             3 (contribution 2e20, a non-finite IPRED or PRED on 11 of 11 observations, the \
-             first at TIME 0.5)."
+             3 (contribution 2e20, an unusable likelihood term on 11 of 11 observations, the \
+             first at TIME 0.5 (DV 4.3905, IPRED NaN); a non-finite IPRED or PRED on 11 of \
+             11 observations, the first at TIME 0.5)."
         ),
         "{message}"
     );
@@ -1446,8 +1523,9 @@ fn a_negative_covariate_on_one_record_names_the_record() {
         assert!(
             message.ends_with(
                 " 1 of 10 subjects have an objective contribution that is itself unusable: \
-                 3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, \
-                 the first at TIME 4)."
+                 3 (contribution 2e20, an unusable likelihood term on 8 of 11 observations, \
+                 the first at TIME 4 (DV 11.0602, IPRED NaN); a non-finite IPRED or PRED on 8 \
+                 of 11 observations, the first at TIME 4)."
             ),
             "{engine}: {message}"
         );
@@ -1457,4 +1535,404 @@ fn a_negative_covariate_on_one_record_names_the_record() {
             "{engine}: only subject 3 is named: {subjects:?}"
         );
     }
+}
+
+/// **N1b — a runaway residual-error η is named although `IWRES` reads 0** (#2266
+/// review). Under `iiv_on_ruv` the record's variance is scaled by `exp(2η)`, which
+/// overflows to `inf` at `η = 400`: the likelihood scores that record at `inf`, while
+/// `IWRES`, divided by `√V`, reads `0`. A selector on `IWRES` reported "every …
+/// term usable" here. The control is the same subject at `η = 0`, so the naming is
+/// caused by the η, and the subject's `IWRES` is set to `0` in both so it cannot be
+/// what decides.
+///
+/// Mutation (run): select on `IWRES²` → the `η = 400` half fires; drop the
+/// `residual_var_scale` factor from the term → the same.
+#[test]
+fn a_runaway_residual_error_eta_names_every_record() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  omega ETA_RUV ~ 0.05
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+  iiv_on_ruv = ETA_RUV
+"#,
+    )
+    .expect("parse");
+    let pop = population_of(vec![shifted_subject("A")]);
+    for (eta_ruv, want) in [
+        (
+            400.0,
+            "an unusable likelihood term on 4 of 4 observations, the first at TIME 0.5 \
+             (DV 33.333333333333336, IPRED 1);",
+        ),
+        (
+            0.0,
+            "every observation's likelihood term usable on its own;",
+        ),
+    ] {
+        let mut a = crate::types::test_helpers::dummy_subject("A", 2, 4);
+        a.ofv_contribution = 2e20;
+        a.eta[1] = eta_ruv;
+        a.iwres = vec![0.0; 4];
+        let (msg, mut entry) = sentinel_warning();
+        let full =
+            name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params, None);
+        assert!(full.contains(want), "η_RUV = {eta_ruv}: {full}");
+    }
+}
+
+/// **N1c — a censored record is scored by its own M3 term, not as a Gaussian one.**
+/// Under `bloq_method = m3` a `CENS = 1` row contributes `−log Φ((LLOQ − f)/√V)`, which
+/// is small when the prediction is far below the limit; the Gaussian term of the
+/// same `DV` and an `IPRED` of 0 is `DV² × 1e12`. One record, both methods: the term
+/// has to come from the likelihood's own censoring branch, not a Gaussian formula.
+#[test]
+fn a_censored_record_is_scored_by_its_m3_term() {
+    let pop = population_of(vec![{
+        let mut d = shifted_subject("A");
+        d.cens[0] = 1;
+        d
+    }]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    a.ofv_contribution = 2e20;
+    a.ipred[0] = 0.0;
+    for (bloq, want) in [
+        (
+            BloqMethod::M3,
+            "every observation's likelihood term usable on its own;",
+        ),
+        (
+            BloqMethod::Drop,
+            "an unusable likelihood term on 1 of 4 observations, the first at TIME 0.5 \
+             (DV 33.333333333333336, IPRED 0);",
+        ),
+    ] {
+        let mut m = one_cpt_model();
+        m.bloq_method = bloq;
+        let (msg, mut entry) = sentinel_warning();
+        let full = name_nonfinite_subjects(
+            msg,
+            &mut entry,
+            &[a.clone()],
+            &pop,
+            &m,
+            &m.default_params,
+            None,
+        );
+        assert!(full.contains(want), "{}: {full}", bloq.label());
+    }
+}
+
+/// `data/warfarin.csv` with a `WT` column, where subject 3 gains an observation at
+/// `TIME 0` (with the dose) and every one of its observations reads `dv`.
+fn warfarin_with_constant_dv(dv: f64) -> Population {
+    use std::io::Write;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/warfarin.csv");
+    let text = std::fs::read_to_string(path).expect("data/warfarin.csv");
+    let mut lines = text.lines();
+    let mut csv = format!("{},WT\n", lines.next().expect("header"));
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').collect();
+        match (cols[0], cols[3]) {
+            ("3", "1") => {
+                csv.push_str(&format!("{line},70\n3,0,{dv},0,.,1,0,0,70\n"));
+            }
+            ("3", _) => csv.push_str(&format!("3,{},{dv},0,.,1,0,0,70\n", cols[1])),
+            _ => csv.push_str(&format!("{line},70\n")),
+        }
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::read_nonmem_csv(f.path(), Some(&["WT"]), None).expect("read the #2266 fixture")
+}
+
+/// **N7 — the issue's reproduction (#2266): both engines name the `TIME 0` record.**
+///
+/// Subject 3 of warfarin gets an observation at `TIME 0`, with the oral dose, so both
+/// engines predict a finite `0` there whatever η̂ is, and a proportional error scores
+/// it at the variance floor, `DV² × 1e12`. That record alone makes the contribution
+/// unusable. Two `DV` levels, measured:
+///
+/// | `DV` | engine | η̂ | predictions | prediction clause |
+/// |---|---|---|---|---|
+/// | 200 | both | ≈ (−5.7, −3.0, 1.3) | all finite | "every IPRED and PRED finite" |
+/// | 20000 | closed form | ≈ (−6.6, −726, −8.6) | `IPRED` `NaN` at `TIME` 0, 0 after | first at `TIME 0` |
+/// | 20000 | ODE | ≈ (−3.8e10, −3.9e10, 8.0e10) | `IPRED` 0 at `TIME` 0, `NaN` after | first at `TIME 0.5` |
+///
+/// At 20000 the EBE runs away and the engines disagree on the predictions, which is
+/// what #2266 reported: the prediction clause names `TIME 0.5` on the ODE and the
+/// closed form, at 200, names no record at all. The likelihood-term clause must name
+/// `TIME 0` in all four cells. The prediction clauses are asserted too, so the cells
+/// keep straddling: if both engines stopped disagreeing, the fixture would no longer
+/// test the property the issue is about.
+///
+/// Mutation (run): name the first non-finite prediction in the term clause →
+/// the ODE at 20000 names `TIME 0.5` and both engines at 200 name nothing; flag a
+/// term only when it is not finite → the ODE at 20000 and both at 200 fire.
+#[test]
+fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
+    let expected_predictions = |dv: f64, ode: bool| match (dv == 200.0, ode) {
+        (true, _) => "every IPRED and PRED finite",
+        (false, false) => "the first at TIME 0)",
+        (false, true) => {
+            "a non-finite IPRED or PRED on 11 of 12 observations, the first at TIME 0.5)"
+        }
+    };
+    for dv in [200.0, 20000.0] {
+        let pop = warfarin_with_constant_dv(dv);
+        for (engine, ode) in [("ODE", true), ("closed form", false)] {
+            let result = evaluate(&wt_power_model(ode), &pop);
+            let (message, subjects) = named_subjects(&result);
+            assert_eq!(
+                subjects.len(),
+                1,
+                "{engine} at DV {dv}: only subject 3 is named: {subjects:?}"
+            );
+            assert_eq!(subjects[0]["id"], "3", "{engine} at DV {dv}");
+            assert_eq!(
+                subjects[0]["first_unusable_term_time"], 0.0,
+                "{engine} at DV {dv}: {subjects:?}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "observations, the first at TIME 0 (DV {dv}, IPRED "
+                )),
+                "{engine} at DV {dv}: the term clause names TIME 0: {message}"
+            );
+            assert!(
+                message.contains(expected_predictions(dv, ode)),
+                "{engine} at DV {dv}: premise, the prediction clause: {message}"
+            );
+        }
+    }
+}
+
+/// One subject `A` (`shifted_subject`) whose first record reads `dv`, named by a
+/// sentinel warning with `ipred0` as that record's `IPRED`; returns the sentence.
+fn name_first_record(
+    model: &CompiledModel,
+    params: &crate::types::ModelParameters,
+    mixest: Option<&[usize]>,
+    dv: f64,
+    ipred0: f64,
+) -> String {
+    let mut data = shifted_subject("A");
+    data.observations[0] = dv;
+    let pop = population_of(vec![data]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", model.n_eta, 4);
+    a.eta = nalgebra::DVector::zeros(model.n_eta);
+    a.ofv_contribution = 2e20;
+    a.ipred = vec![ipred0, 2.5, 3.0, 2.0];
+    let (msg, mut entry) = sentinel_warning();
+    name_nonfinite_subjects(msg, &mut entry, &[a], &pop, model, params, mixest)
+}
+
+const NAMES_FIRST: &str =
+    "an unusable likelihood term on 1 of 4 observations, the first at TIME 0.5";
+const NAMES_NONE: &str = "every observation's likelihood term usable on its own;";
+
+/// **N1d — the term is the scorer's, not a floored copy** (#2266 review 2). FOCEI
+/// scores a record at its raw `IPRED`: a proportional error (σ = 0.2) on `DV = 20`
+/// at `IPRED = −1` has `V = 0.04` and a term of `21²/0.04 + ln 0.04 ≈ 1.1e4`. Flooring
+/// the prediction to `1e-12` first, as the SAEM/IS objective does, scores it at
+/// `20² × 1e12 = 4e14` and names it. The straddle is `IPRED = 0`, where `V` itself is
+/// at its floor and the record is unusable either way.
+///
+/// Mutation (run): floor the prediction before the variance → the `−1` half fires.
+#[test]
+fn a_negative_prediction_is_scored_as_the_scorer_scores_it() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse");
+    let p = &m.default_params;
+    let got = name_first_record(&m, p, None, 20.0, -1.0);
+    assert!(got.contains(NAMES_NONE), "IPRED −1: {got}");
+    let got = name_first_record(&m, p, None, 20.0, 0.0);
+    assert!(
+        got.contains(&format!("{NAMES_FIRST} (DV 20, IPRED 0);")),
+        "IPRED 0: {got}"
+    );
+}
+
+/// Two classes of one proportional error: class 1's σ is `1e-7` (sd), class 2's `0.5`.
+fn mixture_model() -> CompiledModel {
+    parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.04
+  sigma EPS ~ 1e-7 (sd)
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  sigma(2) EPS ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+"#,
+    )
+    .expect("parse")
+}
+
+/// **N1e — a mixture subject is scored under its fitted class's Σ** (#2266 review 2).
+/// Class 1's proportional σ is `1e-7` (sd), class 2's is `0.5`. At `DV = 33`,
+/// `IPRED = 1` the term is `32²/1e-14 ≈ 1e17` under class 1 and `≈ 4e3` under class 2:
+/// a subject assigned to class 2 must not be named, and the same subject in class 1
+/// must be. The base Σ is class 1's, so reading `params.sigma` instead of the class's
+/// names the class-2 subject.
+///
+/// Mutation (run): pass the base `params` instead of `class_params` → the class-2
+/// half fires.
+#[test]
+fn a_mixture_subject_is_scored_under_its_fitted_class() {
+    let m = mixture_model();
+    let p = &m.default_params;
+    let got = name_first_record(&m, p, Some(&[1]), 33.0, 1.0);
+    assert!(got.contains(NAMES_NONE), "class 2: {got}");
+    // Class 1 names the other records too (their residuals are as large).
+    let got = name_first_record(&m, p, Some(&[0]), 33.0, 1.0);
+    assert!(
+        got.contains("observations, the first at TIME 0.5 (DV 33, IPRED 1);"),
+        "class 1: {got}"
+    );
+}
+
+/// **N1e′ — the selector and the clauses agree on a mixture subject's class**
+/// (#2266 review 3), end to end through `compute_subject_results`. Every `DV` is
+/// `1000`, far above `IPRED` (≤ 10 from a 100 dose into `V = 10`): under class 1's
+/// σ = 1e-7 each record scores `≥ (990/1e-6)² ≈ 1e18`, past the `1e14` cutoff;
+/// under class 2's σ = 0.5 the subject's contribution is `≈ 1e7`. A class-2 subject
+/// must therefore get a usable contribution and not be named at all, while the same
+/// subject in class 1 is named. Scoring the contribution with the base (class-1)
+/// Σ — what the guard alone does, since it moves only `MIXNUM` — names the class-2
+/// subject, with its records then described as usable under class 2.
+///
+/// Mutation (run): drop the `class_params` swap in `compute_subject_results` → the
+/// class-2 half fires.
+#[test]
+fn a_mixture_subject_is_selected_under_its_fitted_class() {
+    let m = mixture_model();
+    let mut data = shifted_subject("A");
+    data.observations = vec![1000.0; 4];
+    let pop = population_of(vec![data]);
+    let eta = nalgebra::DVector::zeros(m.n_eta);
+    let h = nalgebra::DMatrix::zeros(4, m.n_eta);
+    let run = |class: usize| {
+        let (subjects, _) = compute_subject_results(
+            &m,
+            &pop,
+            &m.default_params,
+            std::slice::from_ref(&eta),
+            std::slice::from_ref(&h),
+            &[Vec::new()],
+            true,
+            Some(&[class]),
+            false,
+        );
+        let c = subjects[0].ofv_contribution;
+        let (msg, mut entry) = sentinel_warning();
+        let got = name_nonfinite_subjects(
+            msg.clone(),
+            &mut entry,
+            &subjects,
+            &pop,
+            &m,
+            &m.default_params,
+            Some(&[class]),
+        );
+        (c, got == msg, got)
+    };
+    let (c2, unnamed2, got2) = run(1);
+    assert!(
+        c2.is_finite() && c2 < 1e14,
+        "class 2: contribution {c2} is usable"
+    );
+    assert!(unnamed2, "class 2 is not named: {got2}");
+    let (c1, unnamed1, got1) = run(0);
+    assert!(
+        !(c1 < 1e14),
+        "premise, class 1: contribution {c1} past the cutoff"
+    );
+    assert!(
+        !unnamed1
+            && got1.contains(
+                "an unusable likelihood term on 4 of 4 observations, the first at TIME 0.5"
+            ),
+        "class 1 is named, by all four records: {got1}"
+    );
+}
+
+/// **N1f — the fitted residual correlation, not the declared one** (#2266 review 2).
+/// A combined error `V = (fσ_p)² + σ_a² + 2ρ·fσ_p·σ_a` with `fσ_p = σ_a = 1` (at
+/// `IPRED = 10`) is `2` at the declared `ρ = 0` and `0` at a fitted `ρ = −1`, floored
+/// to `1e-12`, so `DV = 30` scores `20² × 1e12 = 4e14` there and `≈ 200` at `ρ = 0`. Setting only the parameters' `ρ` must name the record; the
+/// declared model alone must not.
+///
+/// Mutation (run): build the covariance from the model's declaration
+/// (`residual_cov_theta`) → the fitted half fires.
+#[test]
+fn the_fitted_residual_correlation_is_the_one_scored() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP, ADD) = [0.01, 0.0, 1.0]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP, ADD)
+"#,
+    )
+    .expect("parse");
+    let declared = &m.default_params;
+    assert_eq!(
+        declared.residual_correlations.len(),
+        1,
+        "premise: one declared correlation, at ρ = 0: {:?}",
+        declared.residual_correlations
+    );
+    let got = name_first_record(&m, declared, None, 30.0, 10.0);
+    assert!(got.contains(NAMES_NONE), "declared ρ = 0: {got}");
+    let mut fitted = declared.clone();
+    fitted.residual_correlations[0].rho = -1.0;
+    let got = name_first_record(&m, &fitted, None, 30.0, 10.0);
+    assert!(
+        got.contains(&format!("{NAMES_FIRST} (DV 30, IPRED 10);")),
+        "fitted ρ = −1: {got}"
+    );
 }
