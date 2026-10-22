@@ -1895,16 +1895,22 @@ impl ContributionSource {
 }
 
 /// The separately scored terms of `subject`'s contribution at `eta` (#2267), for
-/// [`name_nonfinite_subjects`]: the IOV marginal's FREM refusal alone when it refuses
-/// the subject (`iov` — the subject was scored with κ), else each non-Gaussian data term
-/// under the subject's fitted mixture class. The Gaussian data term, the `η` prior and
-/// the curvature determinant are not split out; a contribution none of these terms
-/// explains failed in one of them.
+/// [`name_nonfinite_subjects`], under the subject's fitted mixture class:
+///
+/// * the IOV marginal's FREM refusal, alone, when it refuses the subject (`iov` — the
+///   subject was scored with κ);
+/// * the Gaussian side's parts — residual term, censored (M3) term, random-effect prior,
+///   curvature log-determinant (`stats::likelihood::gaussian_marginal_parts`) — when the
+///   subject is scored without κ and `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given
+///   and shaped for it. An IOV subject's marginal is over the stacked `[η, κ]` system,
+///   which this split does not rebuild;
+/// * each non-Gaussian data term.
 pub(crate) fn contribution_terms(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h_matrix: Option<&DMatrix<f64>>,
     iov: bool,
     mix_class: Option<usize>,
 ) -> Vec<ContributionTerm> {
@@ -1916,18 +1922,35 @@ pub(crate) fn contribution_terms(
     }
     let _mix_guard =
         mix_class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+    let mut terms: Vec<(String, f64)> = Vec::new();
+    let shaped = h_matrix.filter(|h| {
+        h.nrows() == subject.observations.len()
+            && h.ncols() == eta.len()
+            && params.omega.matrix.nrows() == eta.len()
+    });
+    if let (false, Some(h)) = (iov, shaped) {
+        terms.extend(crate::stats::likelihood::gaussian_marginal_parts(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            h,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(params),
+        ));
+    }
     #[cfg(feature = "survival")]
-    {
-        crate::stats::likelihood::non_gaussian_terms(model, subject, theta, eta)
-            .into_iter()
-            .map(|(name, nll)| ContributionTerm { name, nll })
-            .collect()
-    }
-    #[cfg(not(feature = "survival"))]
-    {
-        let _ = (theta, eta);
-        Vec::new()
-    }
+    terms.extend(crate::stats::likelihood::non_gaussian_terms(
+        model,
+        subject,
+        &params.theta,
+        eta.as_slice(),
+    ));
+    terms
+        .into_iter()
+        .map(|(name, nll)| ContributionTerm { name, nll })
+        .collect()
 }
 
 /// The per-subject term scorer `name_nonfinite_subjects` calls for each subject it
@@ -1965,12 +1988,15 @@ fn json_value(v: f64) -> serde_json::Value {
 /// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
 /// none is, it says so ("no Gaussian observation" for a subject that has none), since
 /// the cause is then not in the predictions. It then names each term `terms` scores
-/// that is itself unusable — a time-to-event term at the `1e20` hazard sentinel, a
-/// categorical or CTMM term, the IOV + FREM refusal (#2267) — or, when the subject
-/// has non-Gaussian terms and every one is usable, says that. A contribution none of
-/// this explains failed in the Gaussian variance (usually a proportional error on a
-/// prediction of 0, which scores `DV² × 1e12` per observation at the variance floor),
-/// the `η` prior, or a curvature determinant that is not positive definite.
+/// that is itself unusable (#2267): a Gaussian part — the residual term (a proportional
+/// error on a prediction of 0 scores `DV² × 1e12` per observation at the variance
+/// floor), a residual variance that is not finite and positive, the censored (M3) term,
+/// the random-effect prior, the curvature log-determinant or an `H̃` that is not
+/// positive definite — a time-to-event term at the `1e20` hazard sentinel, a
+/// categorical or CTMM term, or the IOV + FREM refusal. When every scored term is
+/// usable it says that, so a reader knows the failure is in how they combine (only
+/// their sum, FOCE's linearization, the non-Gaussian curvature) rather than in one of
+/// them.
 ///
 /// A term is judged on the OFV scale the contribution carries, `2·nll`, against the
 /// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
@@ -2094,7 +2120,7 @@ pub(crate) fn name_nonfinite_subjects(
                 .collect();
             let terms = match failed.len() {
                 0 if n.terms.is_empty() => String::new(),
-                0 => ", every non-Gaussian term usable".to_string(),
+                0 => ", every separately scored term usable".to_string(),
                 1 => format!(", failed term: {}", failed[0]),
                 _ => format!(", failed terms: {}", failed.join(", ")),
             };

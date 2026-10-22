@@ -1492,7 +1492,8 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
         message.ends_with(
             " 1 of 10 subjects have an objective contribution that is itself unusable: \
              3 (contribution 2e20, a non-finite IPRED or PRED on 11 of 11 observations, the \
-             first at TIME 0.5)."
+             first at TIME 0.5, failed terms: Gaussian residual term = NaN, curvature (H̃ not \
+             positive definite) = NaN)."
         ),
         "{message}"
     );
@@ -1527,7 +1528,8 @@ fn a_negative_covariate_on_one_record_names_the_record() {
             message.ends_with(
                 " 1 of 10 subjects have an objective contribution that is itself unusable: \
                  3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, \
-                 the first at TIME 4)."
+                 the first at TIME 4, failed terms: Gaussian residual term = NaN, curvature \
+                 (H̃ not positive definite) = NaN)."
             ),
             "{engine}: {message}"
         );
@@ -1559,7 +1561,7 @@ fn term(name: &str, nll: f64) -> crate::api::postfit::ContributionTerm {
 /// | subject | contribution | Gaussian obs | terms | named as |
 /// |---|---|---|---|---|
 /// | `T` | `2e20` | none | TTE `1e20` | "no Gaussian observation, failed term: …" |
-/// | `U` | `NaN` | 4, finite | TTE `3.25` | "every IPRED and PRED finite, every non-Gaussian term usable" |
+/// | `U` | `NaN` | 4, finite | TTE `3.25` | "every IPRED and PRED finite, every separately scored term usable" |
 /// | `V` | `2e18` | 4, finite | the IOV + FREM refusal | "failed term: IOV + FREM refusal = 1e18" |
 /// | `W` | `2e20` | 4, finite | TTE `NaN`, categorical `1e20` | "failed terms: …, …" |
 /// | `X` | `12.34` | 4, finite | TTE `1e20` | not named |
@@ -1571,8 +1573,8 @@ fn term(name: &str, nll: f64) -> crate::api::postfit::ContributionTerm {
 ///
 /// Mutation (run): drop the `n_obs == 0` arm → `T` reads "every IPRED and PRED
 /// finite"; filter the failed terms on `is_finite()` instead of `ofv_is_valid` → `T`
-/// and `V` lose their term and read "every non-Gaussian term usable"; drop the "every
-/// non-Gaussian term usable" arm, the singular/plural split, or the value → the
+/// and `V` lose their term and read "every separately scored term usable"; drop the "every
+/// separately scored term usable" arm, the singular/plural split, or the value → the
 /// sentence comparison fires; select on the terms → `X` is named.
 #[test]
 fn the_sentence_names_the_term_that_failed() {
@@ -1614,8 +1616,8 @@ fn the_sentence_names_the_term_that_failed() {
         full.strip_prefix(&msg).expect("the gate's message is kept"),
         " 4 of 5 subjects have an objective contribution that is itself unusable: \
          T (contribution 2e20, no Gaussian observation, failed term: time-to-event on CMT 2 = \
-         1e20); U (contribution NaN, every IPRED and PRED finite, every non-Gaussian term \
-         usable); V (contribution 2e18, every IPRED and PRED finite, failed term: IOV + FREM \
+         1e20); U (contribution NaN, every IPRED and PRED finite, every separately scored \
+         term usable); V (contribution 2e18, every IPRED and PRED finite, failed term: IOV + FREM \
          refusal = 1e18); W (contribution 2e20, every IPRED and PRED finite, failed terms: \
          time-to-event on CMT 2 = NaN, categorical = 1e20)."
     );
@@ -2009,5 +2011,214 @@ fn a_term_is_judged_on_the_ofv_scale_and_shown_raw() {
     assert_eq!(
         entry.details.as_ref().expect("payload")["unusable_subjects"][0]["failed_terms"],
         serde_json::json!([{"term": "time-to-event on CMT 2", "nll": 6e13}])
+    );
+}
+
+/// A one-compartment IV bolus with proportional error, one η on `CL`, optionally under
+/// `bloq_method = m3`.
+fn proportional_iv(m3: bool) -> CompiledModel {
+    let fit_options = if m3 {
+        "[fit_options]\n  bloq_method = m3\n"
+    } else {
+        ""
+    };
+    parse_model_string(&format!(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+{fit_options}"#
+    ))
+    .expect("parse")
+}
+
+/// **T7 — the reviewer's case, end to end: a Gaussian residual term at the variance
+/// floor** (#2267 review r3). Subject 3's dose is at `TIME 30`, after all four of its
+/// observations, so every prediction is a finite `0`. A proportional error then scores
+/// each observation at the variance floor, about `DV² × 1e12`, and the contribution is
+/// past the cutoff with nothing non-finite anywhere. Before the Gaussian split the
+/// sentence ended at "every IPRED and PRED finite" and named no term. Now it names the
+/// residual term, and only it: the prior and curvature are usable, which is what makes
+/// the attribution mean something. FOCE and FOCEI both name it — under FOCE the
+/// residual is at `PRED`, also `0`. The control (dose at 0 for everyone) stays silent.
+///
+/// Mutation (run): drop the Gaussian parts from `contribution_terms` → `failed_terms` is
+/// empty and the sentence ends at "every IPRED and PRED finite", the review's report.
+#[test]
+fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
+    let model = proportional_iv(false);
+    let pop = |late: bool| {
+        population_of(vec![
+            subject_with_dose_time("1", 0.0, 1.0),
+            subject_with_dose_time("2", 0.0, 1.2),
+            subject_with_dose_time("3", if late { 30.0 } else { 0.0 }, 0.9),
+        ])
+    };
+    for method in [EstimationMethod::FoceI, EstimationMethod::Foce] {
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        let control = fit(&model, &pop(false), &model.default_params, &opts).expect("fit");
+        assert!(
+            !control
+                .warnings
+                .iter()
+                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            "{method:?}: {:?}",
+            control.warnings
+        );
+
+        let result = fit(&model, &pop(true), &model.default_params, &opts).expect("fit");
+        let (message, subjects) = named_subjects(&result);
+        assert_eq!(subjects.len(), 1, "{method:?}: {subjects:?}");
+        assert_eq!(subjects[0]["id"], "3");
+        let failed = subjects[0]["failed_terms"]
+            .as_array()
+            .expect("failed_terms");
+        assert_eq!(
+            failed
+                .iter()
+                .map(|t| t["term"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Gaussian residual term"],
+            "{method:?}: only the residual term fails: {message}"
+        );
+        let nll = failed[0]["nll"].as_f64().expect("a finite residual term");
+        assert!(
+            nll >= 0.5 * DIVERGENCE_OFV,
+            "{method:?}: past the cutoff on the 2·nll scale: {nll}"
+        );
+        assert!(
+            message.contains(&format!(
+                "3 (contribution {:?}, every IPRED and PRED finite, failed term: Gaussian \
+                 residual term = {nll:?})",
+                result.subjects[2].ofv_contribution
+            )),
+            "{method:?}: {message}"
+        );
+    }
+}
+
+/// **T8 — the Gaussian parts are the marginal's own, censored row included.** On a
+/// healthy FOCEI subject at its EBE, `2·Σ parts` reproduces `foce_subject_nll_cov`'s
+/// contribution, with an M3-censored row so the censored term is live. This is what
+/// makes a named part a part of the contribution rather than a separate diagnostic.
+/// Then each failure the parts exist to name is fed in one at a time: a runaway `η̂`
+/// fails the prior alone, and a non-finite `∂f/∂η` the curvature alone.
+///
+/// Measured: the contribution is `0.0065`, the realised gap `6.3e-16` (one reassociated
+/// sum of four finite numbers), against a bound of `1e-12·max(|c|, 1) = 1e-12` — about
+/// 1600× headroom. The censored term is `0.0017`, so dropping it moves the sum by
+/// `3.5e-3`, far past the bound.
+///
+/// Mutation (run): drop the `0.5·` on any part → the sum is off by that part; leave
+/// `cens_hess` out of `H̃` → the curvature and the sum move; drop the censored arm → the
+/// sum is short by the censored term and its presence assertion fires.
+#[test]
+fn the_gaussian_parts_sum_to_the_focei_contribution_and_each_can_fail_alone() {
+    let model = proportional_iv(true);
+    // Data the model fits (`C = 10·exp(−0.1·t)` at the initial estimates: 9.5, 8.2, 4.5,
+    // 0.9), the last row censored at an LLOQ of 1.0, close enough above its prediction that
+    // its `−log Φ` is not rounded to 0 (at 1.5 it was, and the sum could not see the
+    // censored term). A fixture the
+    // model cannot fit makes `H̃` itself non-PD through the censored row, and the
+    // contribution is then the sentinel this test needs to be absent.
+    let mut subject = subject_with_dose_time("1", 0.0, 1.0);
+    subject.observations = vec![9.0, 8.5, 4.2, 1.0];
+    subject.cens = vec![0, 0, 0, 1];
+    let params = model.default_params.clone();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        ..Default::default()
+    };
+    let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+        &model, &subject, &params, 200, 1e-8, None, None, 0, &opts,
+    );
+    let parts = |eta: &DVector<f64>, h: &DMatrix<f64>| {
+        crate::stats::likelihood::gaussian_marginal_parts(
+            &model,
+            &subject,
+            &params.theta,
+            eta,
+            h,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+        )
+    };
+    let healthy = parts(&ebe.eta, &ebe.h_matrix);
+    let names: Vec<&str> = healthy.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "Gaussian residual term",
+            "censored (M3) term",
+            "random-effect prior",
+            "curvature log-determinant"
+        ]
+    );
+    let contribution = 2.0
+        * crate::stats::likelihood::foce_subject_nll_cov(
+            &model,
+            &subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            true,
+        );
+    let summed: f64 = healthy.iter().map(|(_, v)| 2.0 * v).sum();
+    assert!(
+        healthy.iter().all(|(_, v)| v.is_finite()) && contribution.is_finite(),
+        "{healthy:?} vs {contribution}"
+    );
+    assert!(
+        (summed - contribution).abs() <= 1e-12 * contribution.abs().max(1.0),
+        "2·Σ parts = {summed}, contribution = {contribution}: {healthy:?}"
+    );
+
+    let failing = |list: &[(String, f64)]| -> Vec<String> {
+        list.iter()
+            .filter(|(_, v)| !crate::estimation::outer_optimizer::ofv_is_valid(2.0 * v))
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+    assert_eq!(failing(&healthy), Vec::<String>::new());
+
+    // η̂ = 1e8 against ω² = 0.04: ½η²/ω² ≈ 1.25e17. The prediction is `0` there (CL is
+    // `inf`), so the residual fails too; the curvature with the EBE's own `H` stays
+    // usable. The prior alone is asserted to be named, and its value checked.
+    let runaway = DVector::from_vec(vec![1e8]);
+    let prior = parts(&runaway, &ebe.h_matrix);
+    let (_, prior_nll) = prior
+        .iter()
+        .find(|(n, _)| n == "random-effect prior")
+        .expect("prior part");
+    assert!(
+        *prior_nll > 1e17 && failing(&prior).contains(&"random-effect prior".to_string()),
+        "{prior:?}"
+    );
+
+    let mut bad_h = ebe.h_matrix.clone();
+    bad_h[(0, 0)] = f64::NAN;
+    assert_eq!(
+        failing(&parts(&ebe.eta, &bad_h)),
+        vec!["curvature (H̃ not positive definite)".to_string()],
+        "a non-finite ∂f/∂η fails the curvature and nothing else"
     );
 }

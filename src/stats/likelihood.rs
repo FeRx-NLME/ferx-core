@@ -2100,6 +2100,96 @@ pub(crate) fn foce_subject_nll_interaction_corr(
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
 
+/// The Gaussian side of one subject's marginal at `eta_hat`, split into the parts
+/// [`foce_subject_nll_interaction_corr`] sums, for `W_NONFINITE_OBJECTIVE` to name the
+/// one that failed (#2267). Each is `(name, nll)` on the raw NLL scale — half its
+/// share of the `2·nll` contribution, like [`non_gaussian_terms`]:
+///
+/// * `Gaussian residual term` — `½Σ[r²/V + ln V]` over the quantified rows, at the
+///   predictions at `eta_hat` (absent for a subject with no Gaussian observation);
+/// * `Gaussian residual variance` — `NaN` in its place when a row's variance is not
+///   finite and positive, where the marginal returns its sentinel;
+/// * `censored (M3) term` — the censored rows' `−log Φ` tail, when the fit censors any;
+/// * `random-effect prior` — `½(η̂ᵀΩ⁻¹η̂ + ln|Ω|)`;
+/// * `curvature log-determinant` — `½ ln|H̃|`, or `NaN` named `curvature (H̃ not
+///   positive definite)` when its Cholesky fails, where the marginal returns its sentinel.
+///
+/// This is the FOCEI (interaction) form for every caller. Under FOCE the contribution is
+/// the Sheiner–Beal marginal instead, which linearizes these same parts around the
+/// population prediction, so a part named here is where the subject's likelihood fails
+/// at its EBE rather than a term the FOCE number literally contains. `H̃` holds no TTE,
+/// categorical or CTMM curvature; those terms are reported by [`non_gaussian_terms`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gaussian_marginal_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+) -> Vec<(String, f64)> {
+    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+    } else {
+        Vec::new()
+    };
+    let frem_r_override =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), model.residual_error_eta);
+    let n_eta = eta_hat.len();
+    let bloq = model.bloq_in_force();
+    let mut parts = Vec::new();
+    let g = gaussian_foce_accum(
+        subject,
+        &ipreds,
+        h_matrix,
+        &model.error_spec,
+        sigma_values,
+        bloq,
+        &p_obs,
+        n_eta,
+        frem_r_override.as_deref(),
+        model.residual_error_eta,
+        ruv_scale,
+        ruv_mult.as_deref(),
+        Some(residual_cov.pairs),
+    );
+    match &g {
+        Some(g) => {
+            if !subject.observations.is_empty() {
+                parts.push(("Gaussian residual term".to_string(), 0.5 * g.data_ll));
+            }
+            if bloq.has_censored_row(&subject.cens) {
+                parts.push(("censored (M3) term".to_string(), 0.5 * g.bloq_term));
+            }
+        }
+        None => parts.push((
+            "Gaussian residual variance (non-finite or non-positive)".to_string(),
+            f64::NAN,
+        )),
+    }
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    parts.push((
+        "random-effect prior".to_string(),
+        0.5 * (eta_prior + omega.log_det),
+    ));
+    if let Some(g) = g {
+        let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
+        parts.push(match htilde.cholesky() {
+            Some(c) => (
+                "curvature log-determinant".to_string(),
+                0.5 * chol_log_det(&c.l()),
+            ),
+            None => ("curvature (H̃ not positive definite)".to_string(), f64::NAN),
+        });
+    }
+    parts
+}
+
 /// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
 /// residual covariance — the dense-`R` generalisation of
 /// [`foce_subject_nll_interaction`].

@@ -552,11 +552,12 @@ The two engines can also disagree on the same subject: the closed form may
 report every prediction finite where the ODE solver reports most of them
 non-finite. So also read the records before the named `TIME`.
 
-When a named subject's predictions are all finite, the sentence says so
-(`every IPRED and PRED finite`, or `no Gaussian observation` for a subject that
-has none, such as a time-to-event-only subject), and the cause is not in the
-predictions. The sentence then names the separately scored term that failed
-(#2267):
+#### Which term failed
+
+The sentence then names each separately scored part of the subject's likelihood
+whose own value is unusable (#2267). A subject with all predictions finite reads
+`every IPRED and PRED finite`, or `no Gaussian observation` when it has none (a
+time-to-event-only subject, for example), and the named term is where to look:
 
 ```text
 1 of 30 subjects have an objective contribution that is itself unusable:
@@ -564,19 +565,32 @@ predictions. The sentence then names the separately scored term that failed
 CMT 2 = 1e20).
 ```
 
-The terms scored separately are each time-to-event endpoint (`time-to-event on
-CMT n`; an overflowing or non-positive hazard maps to the `1e20` sentinel), the
-`categorical` term, the `CTMM` term, and the `IOV + FREM refusal`, the value the
-IOV likelihood returns for a subject with FREM covariate rows, which it does not
-support. A term is listed when its value is `NaN`, infinite, or past the cutoff
-once put on the contribution's `2·` scale; the message shows the raw negative
-log-likelihood, so a term printed as `6e13` is listed. When the subject has non-Gaussian terms and every one is usable,
-the sentence says `every non-Gaussian term usable`.
+The parts scored separately:
 
-When neither the predictions nor a term explains the contribution, the failure is
-in a part that is not split out: the Gaussian residual variance (a proportional
-error on a prediction of `0` is the usual case), the random-effect prior, or a
-curvature matrix that is not positive definite.
+| Term | What it is | Typical cause |
+|---|---|---|
+| `Gaussian residual term` | the Gaussian observations' `½Σ[r²/V + ln V]` at the subject's EBE | a proportional error on a prediction of `0`, which scores about `DV² × 1e12` per observation at the variance floor; or a `NaN` prediction |
+| `Gaussian residual variance (non-finite or non-positive)` | in place of the residual term when a row's variance cannot be used | a residual model returning `NaN` or `≤ 0` |
+| `censored (M3) term` | the censored rows' `−log Φ` tail, under `bloq_method = m3` | an LLOQ far from the prediction |
+| `random-effect prior` | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` | a runaway EBE |
+| `curvature log-determinant` | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it cannot be factored | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
+| `time-to-event on CMT n`, `categorical`, `CTMM` | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
+| `IOV + FREM refusal` | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
+
+The Gaussian parts are the FOCEI marginal's own: under FOCEI they sum exactly to
+the contribution. Under FOCE the contribution is the Sheiner–Beal marginal, which
+linearizes the same parts around the population prediction, so a named part says
+where the subject's likelihood fails at its EBE rather than quoting a term of the
+FOCE number. They are not split for an IOV subject, whose marginal is over the
+stacked `[η, κ]` system.
+
+A term is listed when its value is `NaN`, infinite, or past the cutoff once put on
+the contribution's `2·` scale. The message shows the raw negative
+log-likelihood, so a term printed as `6e13` is listed. When every scored term is
+usable the sentence says `every separately scored term usable`. The failure is then
+in how the parts combine, not in any one of them: only their sum is past the
+cutoff, FOCE's linearization differs, or it is the non-Gaussian terms' share of
+the curvature.
 
 A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian

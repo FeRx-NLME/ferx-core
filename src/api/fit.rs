@@ -2941,8 +2941,9 @@ fn fit_inner(
             contribution_terms(
                 model,
                 data,
-                &result.params.theta,
-                s.eta.as_slice(),
+                &result.params,
+                &s.eta,
+                result.h_matrices.get(i),
                 result.kappas.get(i).is_some_and(|k| !k.is_empty()),
                 mixest_classes.as_ref().and_then(|m| m.get(i).copied()),
             )
