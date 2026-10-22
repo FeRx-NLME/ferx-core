@@ -2661,6 +2661,40 @@ pub fn write_result_json(result: &FitResult, path: &str) -> Result<(), String> {
 /// Write the curated, human-readable parameter estimates and uncertainty as
 /// YAML to `path` (`{model}-fit.yaml`). This is a selected subset for reading;
 /// for the complete machine-readable result use [`write_result_json`].
+/// The `warning_details:` block (#2268): every structured warning that carries a
+/// `details` payload, with its code, message and the payload itself, so the data a
+/// message points at (`W_NONFINITE_OBJECTIVE`'s `unusable_subjects`, `flip_flop`'s
+/// subjects, …) reaches a YAML reader. `warnings:` above stays a list of strings for
+/// existing consumers. Strings and the payload are written as JSON, which is valid
+/// YAML flow syntax and escapes whatever the message contains. Absent when no
+/// warning has a payload.
+fn write_yaml_warning_details(
+    f: &mut impl std::io::Write,
+    entries: &[crate::types::WarningEntry],
+) -> Result<(), String> {
+    fn json<T: serde::Serialize + ?Sized>(v: &T) -> Result<String, String> {
+        serde_json::to_string(v).map_err(|e| e.to_string())
+    }
+    let with_details: Vec<_> = entries
+        .iter()
+        .filter_map(|e| e.details.as_ref().map(|d| (e, d)))
+        .collect();
+    if with_details.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::from("\nwarning_details:\n");
+    for (e, details) in with_details {
+        out.push_str(&format!("  - code: {}\n", e.category));
+        out.push_str(&format!("    severity: {}\n", json(&e.severity)?));
+        if let Some(m) = &e.source_method {
+            out.push_str(&format!("    source_method: {}\n", json(m)?));
+        }
+        out.push_str(&format!("    message: {}\n", json(&e.message)?));
+        out.push_str(&format!("    details: {}\n", json(details)?));
+    }
+    f.write_all(out.as_bytes()).map_err(|e| e.to_string())
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -3511,6 +3545,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  - \"{}\"", w).map_err(|e| e.to_string())?;
         }
     }
+    write_yaml_warning_details(&mut f, &result.warnings_structured)?;
 
     // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
     // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,

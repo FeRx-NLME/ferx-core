@@ -1268,7 +1268,7 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         crate::api::postfit::NONFINITE_SUBJECTS_NAMED
     );
     assert!(
-        full.ends_with("; and 2 more, listed only in the Rust API's structured warning."),
+        full.ends_with("; and 2 more, listed in the warning's details (`unusable_subjects`)."),
         "{full}"
     );
     let listed = entry.details.as_ref().expect("payload")["unusable_subjects"]

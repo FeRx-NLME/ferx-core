@@ -154,6 +154,14 @@ struct FitWire {
     max_unconverged_subjects: u32,
     total_ebe_fallbacks: u32,
     warnings: Vec<String>,
+    /// The structured warnings that carry a `details` payload (#2268), as
+    /// `WarningEntry` JSON. Only those: every other entry is rebuilt from
+    /// `warnings` on load, exactly as a fresh fit builds it. Kept as raw values
+    /// so a bundle naming a `WarningCode` this version does not know still loads
+    /// (that entry is re-classified from its message instead). Absent on bundles
+    /// written before #2268, which reload with the rebuilt entries alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warning_details: Vec<serde_json::Value>,
     saem_mu_ref_m_step_evals_saved: Option<u64>,
     #[serde(default)]
     saem_n_subjects_hmc: Option<usize>,
@@ -1144,6 +1152,12 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         max_unconverged_subjects: r.max_unconverged_subjects,
         total_ebe_fallbacks: r.total_ebe_fallbacks,
         warnings: r.warnings.clone(),
+        warning_details: r
+            .warnings_structured
+            .iter()
+            .filter(|e| e.details.is_some())
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect(),
         saem_mu_ref_m_step_evals_saved: r.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: r.saem_n_subjects_hmc,
         saem_mh_accept_tail: r.saem_mh_accept_tail,
@@ -2780,7 +2794,7 @@ fn wire_to_fit_result(
         std::mem::take(&mut w.sigma.residual_correlation_fixed)
     };
 
-    Ok(FitResult {
+    let mut fit = FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
         method,
@@ -2824,10 +2838,12 @@ fn wire_to_fit_result(
         n_parameters: w.n_parameters,
         n_iterations: w.n_iterations,
         interaction: w.interaction,
+        // The entries with a `details` payload come off the wire; the rebuild
+        // below keys them to their `warnings` message and classifies the rest.
         warnings_structured: w
-            .warnings
-            .iter()
-            .map(|s| crate::types::classify_warning(s))
+            .warning_details
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
             .collect(),
         warnings: w.warnings,
         sir_ci_theta,
@@ -2947,7 +2963,9 @@ fn wire_to_fit_result(
         left_init: w.left_init,
         omega_is_diagonal: w.omega_is_diagonal,
         kappa_is_diagonal: w.kappa_is_diagonal,
-    })
+    };
+    crate::api::rebuild_warnings_structured(&mut fit);
+    Ok(fit)
 }
 
 /// Minimal CSV row parser handling quoted fields and doubled-quote escapes.
@@ -3236,6 +3254,93 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["schema_version"], FitResult::JSON_SCHEMA_VERSION);
         assert_eq!(parsed["converged"], true);
+    }
+
+    /// #2268: a warning's `details` payload survives the YAML write and a `.fitrx`
+    /// save and reload unchanged. The fit carries one at-source entry with a payload
+    /// under a chain prefix (so the reload has to rebuild the `[FOCEI] ` key to match
+    /// it) and one plain message, which reloads classified and without a payload.
+    #[test]
+    fn warning_details_survive_yaml_and_fitrx_round_trip() {
+        use crate::types::{WarningCode, WarningEntry, WarningSeverity};
+        let details = serde_json::json!({
+            "ofv": "NaN",
+            "unusable_subjects": [{"id": "S1", "n_obs": 3}, {"id": "S2", "n_obs": 3}],
+        });
+        let native = WarningEntry {
+            severity: WarningSeverity::Critical,
+            category: WarningCode::Convergence,
+            message: "W_NONFINITE_OBJECTIVE: the objective is \"NaN\"; and 2 more".into(),
+            source_method: Some("FOCEI".into()),
+            details: Some(details.clone()),
+        };
+        const PLAIN: &str = "a plain note";
+        let mut r = minimal_fit_result();
+        r.warnings = vec![format!("[FOCEI] {}", native.message), PLAIN.into()];
+        r.warnings_structured = vec![native.clone()];
+        crate::api::rebuild_warnings_structured(&mut r);
+        assert_eq!(r.warnings_structured.len(), 2);
+        let json = |e: &WarningEntry| serde_json::to_value(e).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run1.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.warnings, r.warnings);
+        assert_eq!(l.warnings_structured.len(), 2);
+        assert_eq!(
+            json(&l.warnings_structured[0]),
+            json(&native),
+            "the payload reloads"
+        );
+        let plain = &l.warnings_structured[1];
+        assert_eq!((plain.message.as_str(), &plain.details), (PLAIN, &None));
+
+        // The YAML of the reloaded fit lists the payload, and only that warning.
+        let yaml_path = dir.path().join("run1-fit.yaml");
+        crate::io::output::write_estimates_yaml(&l, yaml_path.to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        let block = yaml
+            .split("\nwarning_details:\n")
+            .nth(1)
+            .expect("block written");
+        let field = |key: &str| -> serde_json::Value {
+            let prefix = format!("    {key}: ");
+            let line = block.lines().find_map(|l| l.strip_prefix(prefix.as_str()));
+            serde_json::from_str(line.unwrap_or_else(|| panic!("no {key}:\n{yaml}"))).unwrap()
+        };
+        assert!(block.starts_with("  - code: convergence\n"), "{yaml}");
+        assert_eq!(field("details"), details);
+        assert_eq!(field("message"), serde_json::json!(native.message));
+        assert_eq!(field("source_method"), serde_json::json!("FOCEI"));
+        assert_eq!(field("severity"), serde_json::json!("Critical"));
+        assert_eq!(block.matches("  - code: ").count(), 1, "{yaml}");
+
+        // A bundle saved before #2268 has no `warning_details`, and one naming a
+        // code this version does not know still loads: both re-classify the message.
+        let mut wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(wire["warning_details"].as_array().map(Vec::len), Some(1));
+        wire["warning_details"][0]["category"] = "a_future_code".into();
+        let unknown: FitWire = serde_json::from_value(wire.clone()).unwrap();
+        wire.as_object_mut().unwrap().remove("warning_details");
+        let old: FitWire = serde_json::from_value(wire).unwrap();
+        for (label, w) in [("unknown code", unknown), ("pre-#2268", old)] {
+            let l = wire_to_fit_result(w, r.subjects.clone(), Vec::new()).unwrap();
+            let e = &l.warnings_structured[0];
+            assert_eq!(e.message, native.message, "{label}");
+            assert_eq!(e.source_method.as_deref(), Some("FOCEI"), "{label}");
+            assert!(e.details.is_none(), "{label}");
+        }
+
+        // A fit with no payload writes neither the wire key nor the YAML block.
+        let bare = minimal_fit_result();
+        let wire = serde_json::to_value(build_fit_wire(&bare)).unwrap();
+        assert!(wire.get("warning_details").is_none());
+        crate::io::output::write_estimates_yaml(&bare, yaml_path.to_str().unwrap()).unwrap();
+        assert!(!std::fs::read_to_string(&yaml_path)
+            .unwrap()
+            .contains("warning_details"));
     }
 
     #[test]

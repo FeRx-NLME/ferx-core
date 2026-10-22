@@ -564,9 +564,8 @@ A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian
 observation, and that subject contributes nothing wrong. The message names at
 most ten subjects. The `unusable_subjects` array in the structured warning's
-`details` lists all of them. Only the Rust API carries it
-(`FitResult::warnings_structured`): the R package, the YAML output and a
-reloaded `.fitrx` file keep the message and drop `details`.
+`details` lists all of them; see [Where `details` is
+written](#where-details-is-written) for the outputs that carry it.
 
 No sentence is added when every subject's contribution is valid. That happens
 when:
@@ -637,6 +636,25 @@ instance of it: the offending value *is* the payload, so a non-finite `ofv` is
 carried as the string `"NaN"` / `"inf"` / `"-inf"` (JSON has no non-finite
 numbers) instead of dropping the key. Only `convergence` warnings raised by this
 check carry `details`; a plain "did not converge" carries none.
+
+### Where `details` is written
+
+A payload is part of the fit's output, not only of the Rust value (#2268):
+
+- **Rust API** — `FitResult::warnings_structured`.
+- **JSON output** — each entry of `warnings_structured`, as above.
+- **YAML output** — a `warning_details:` list after `warnings:`, one item per
+  warning that has a payload, with its `code`, `severity`, `source_method`
+  (when set), `message` and `details`. The strings and the payload are written
+  as JSON, which YAML reads as flow syntax. `warnings:` itself stays a list of
+  message strings, and the block is absent when no warning has a payload.
+- **`.fitrx`** — `fit.json` stores the entries that have a payload under
+  `warning_details`, and a reload restores them unchanged. Every other entry is
+  rebuilt from `warnings` on load, the way a fresh fit builds it. A bundle saved
+  before #2268 has no such field and reloads without the at-source payloads.
+
+The R package reads `warnings_structured` without the `details` column until its
+matching change lands.
 
 ## How codes are assigned
 
