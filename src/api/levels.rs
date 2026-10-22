@@ -167,7 +167,7 @@ fn bind_levels_on_data(
     let absorbing: Vec<bool> = decls
         .iter()
         .zip(&measured)
-        .map(|(decl, m)| !absorbed(decl, with_occasions, &m.spanned).is_empty())
+        .map(|(decl, m)| !absorbed(decl, with_occasions, m).is_empty())
         .collect();
     let mut resolved: Vec<Option<Result<(LevelContrast, Vec<usize>), String>>> =
         vec![None; decls.len()];
@@ -1275,12 +1275,18 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
 /// Whether a block of two or more columns resolves every subject's
 /// observations: no level holds two different observation times of one
 /// subject (#1650). Replicates at one time still resolve, since a random
-/// effect's effect is the same at both.
+/// effect's effect is the same at both — but only replicates ([`replicates`]):
+/// two records at one instant that the data tells apart — one moved a ULP
+/// below a co-timed dose, two arms of a study keyed as occasions, a `TRT`
+/// that differs, or two compartments — can be moved differently by a random
+/// effect that the one level they share moves alike, so the block does not
+/// resolve them (#2131). The span certificate then
+/// measures, row by row, whether the levels reproduce the random effect.
 ///
 /// Such a block is a free curve per subject at the observed times, so it
 /// reproduces any per-subject effect at all, whatever route a random effect
 /// takes to `y`.
-fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool {
+fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged: bool) -> bool {
     if decl.columns().len() < 2 {
         return false;
     }
@@ -1293,8 +1299,8 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
-                // One instant, so a random effect moves both alike (#1959).
-                Some(&(_, j0)) => subject.same_instant(j0, j),
+                // Replicates, so a random effect moves both alike (#2131).
+                Some(&(_, j0)) => replicates(subject, j0, j, lagged),
                 None => {
                     seen.push((level, j));
                     true
@@ -1302,6 +1308,42 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
             }
         })
     })
+}
+
+/// Whether observation records `j` and `k` of `subject` are replicates: one
+/// instant ([`Subject::same_instant`]) with no dose or reset between them, and
+/// the same occasion, compartment and record covariates, so the data gives a
+/// random effect no way to move one and not the other.
+///
+/// One instant is not enough on its own: the reader moves a record one ULP
+/// below a co-timed row to keep file order (#614, #1810), and when that row is
+/// a dose the two records straddle it, so a random effect on the dose or on
+/// the state it changes moves the later one only. A move below a row that
+/// changes no state — an `MDV = 1` row — leaves them replicates (#1959).
+///
+/// A dose can also change the state at its arrival, `dose.time + lag`, which
+/// on a `lagged` model ([`lagged_arrivals`]) the θ and η place and the data
+/// does not: a moved record can sit just below a lagged arrival with no dose
+/// row between the two. So on such a model two records the engine clock
+/// separates at all are not replicates, and the span certificate measures
+/// them; two at one exact engine time still are, since every arrival at that
+/// time acts on both or on neither.
+fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
+    fn same<T: PartialEq>(v: &[T], j: usize, k: usize) -> bool {
+        v.get(j) == v.get(k)
+    }
+    let (Some(&a), Some(&b)) = (subject.obs_times.get(j), subject.obs_times.get(k)) else {
+        return false;
+    };
+    let (lo, hi) = (a.min(b), a.max(b));
+    let between = |t: f64| lo < t && t <= hi;
+    subject.same_instant(j, k)
+        && (a == b || !lagged)
+        && !subject.doses.iter().any(|d| between(d.time))
+        && !subject.reset_times.iter().copied().any(between)
+        && same(&subject.occasions, j, k)
+        && same(&subject.obs_cmts, j, k)
+        && same(&subject.obs_covariates, j, k)
 }
 
 /// Whether every covariate in `covariates` is constant within every unit's
@@ -1457,9 +1499,13 @@ enum Placement<'a> {
 /// random effects [`measure_levels`] measures, and where [`absorbed`] takes a
 /// site from the walk and where from the measurement — so the two cannot
 /// disagree on which random effects are silent (#1874 review, F12).
-fn placements<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Placement<'a>> {
+fn placements<'a>(
+    decl: &'a LevelBlockDecl,
+    population: &Population,
+    lagged: bool,
+) -> Vec<Placement<'a>> {
     let units = nesting_units(decl, population);
-    let resolving = resolves_observations(decl, population);
+    let resolving = resolves_observations(decl, population, lagged);
     decl.eta_couplings
         .iter()
         .zip(units)
@@ -1482,9 +1528,10 @@ fn placements<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Plac
 fn absorbed<'a>(
     decl: &'a LevelBlockDecl,
     population: &Population,
-    spanned: &[Option<Span>],
+    measured: &Measured,
 ) -> Vec<Absorbed<'a>> {
-    placements(decl, population)
+    let spanned = &measured.spanned;
+    placements(decl, population, measured.lagged)
         .into_iter()
         .enumerate()
         .filter_map(|(k, placement)| {
@@ -2645,6 +2692,25 @@ struct Measured {
     dead: DeadLevels,
     spanned: Vec<Option<Span>>,
     model: Option<std::rc::Rc<CompiledModel>>,
+    /// Whether a dose of the model can arrive after its record
+    /// ([`lagged_arrivals`]), measured or not: [`replicates`] reads it.
+    lagged: bool,
+}
+
+/// Whether a dose of `model` can change the state at a time the data does not
+/// hold (#2131 review): a compartment lag — the bare lag slot or an indexed
+/// `ALAGn` ([`CompiledModel::has_lagtime`]), or an `ALAGn` entry of the
+/// `dose_attr_map` the engines resolve every dose's lag through — or a
+/// per-route lag on an absorption forcing. A lag the model assigns but the
+/// engines never apply moves no arrival, so it does not count;
+/// `the_lag_predicate_sees_every_lag_the_engine_applies` pins the two
+/// together over every spelling.
+fn lagged_arrivals(model: &CompiledModel) -> bool {
+    model.has_lagtime()
+        || model
+            .dose_attr_map
+            .has_indexed_attr(crate::types::DoseAttr::Lag)
+        || model.has_route_absorption_lag()
 }
 
 /// Run [`dead_levels`] and [`spanned`] on every block, on the model re-parsed
@@ -2673,6 +2739,7 @@ fn measure_levels(
         })
         .collect();
     let model = parse_full_model_with(model_text, &none)?.model;
+    let lagged = lagged_arrivals(&model);
     if !dead_check_reads_every_channel(&model) {
         return Ok(decls
             .iter()
@@ -2680,6 +2747,7 @@ fn measure_levels(
                 dead: DeadLevels::default(),
                 spanned: vec![None; decl.eta_couplings.len()],
                 model: None,
+                lagged,
             })
             .collect());
     }
@@ -2688,7 +2756,7 @@ fn measure_levels(
         .iter()
         .zip(discovered)
         .map(|(decl, levels)| {
-            let silent: Vec<(usize, Unit)> = placements(decl, population)
+            let silent: Vec<(usize, Unit)> = placements(decl, population, lagged)
                 .into_iter()
                 .enumerate()
                 .filter_map(|(k, placement)| match placement {
@@ -2700,6 +2768,7 @@ fn measure_levels(
                 dead: dead_levels(&model, decl, levels, population),
                 spanned: spanned(&model, decl, levels, population, &silent),
                 model: Some(model.clone()),
+                lagged,
             }
         })
         .collect())
@@ -2886,7 +2955,7 @@ fn resolve_contrast(
     let nested = decl.columns().len() >= 2;
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
     let dead = &measured.dead;
-    let absorbed = absorbed(decl, population, &measured.spanned);
+    let absorbed = absorbed(decl, population, measured);
     if absorbed.len() >= 2 {
         return Err(jointly_absorbed_message(
             &block, decl, &absorbed, population,

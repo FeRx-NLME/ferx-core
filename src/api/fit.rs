@@ -2949,7 +2949,17 @@ fn fit_inner(
                 mixest_classes.as_ref().and_then(|m| m.get(i).copied()),
             )
         };
-        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population, &source, &scorer);
+        let msg = name_nonfinite_subjects(
+            msg,
+            &mut entry,
+            &subjects,
+            population,
+            model,
+            &result.params,
+            mixest_classes.as_deref(),
+            &source,
+            &scorer,
+        );
         warnings.push(msg);
         native_warnings.push(entry);
     }

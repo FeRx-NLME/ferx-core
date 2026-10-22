@@ -5671,10 +5671,12 @@ impl CompiledModel {
     ///      so routing it through the lag-aware paths is correct and only
     ///      forgoes the fast path.
     ///
-    /// Known gap, unchanged here: a `lagtime=` binding to a name assigned only
-    /// inside an `if` without `else` resolves in `build_pk_param_fn` (which sees
-    /// every assigned name) but is not in `indiv_param_names`, so route 1 misses
-    /// it.
+    /// A `lagtime=` binding to a name assigned only inside an `if` without
+    /// `else` used to resolve in `build_pk_param_fn` while missing from
+    /// `indiv_param_names`; the parser now refuses such a name ("assigned inside
+    /// an `if`, but not on every path through it"), so no model reaches this
+    /// predicate with it (pinned by
+    /// `a_conditional_lag_separates_records_like_a_plain_one`).
     pub fn has_lagtime(&self) -> bool {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
     }
@@ -7295,10 +7297,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
-    } else if lower.contains("w_iov_no_occasions") {
+    } else if lower.contains("w_iov_no_occasions") || lower.contains("w_frem_drawn_eta") {
         // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
-        // A simulated subject handled specially, like the arm above; matched on its token
-        // so no prose arm has to stay clear of its wording.
+        // #2245: a FREM model simulated subjects at a drawn covariate η.
+        // Simulated subjects handled specially, like the arm above; matched on the token
+        // so no prose arm has to stay clear of the wording.
         (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):

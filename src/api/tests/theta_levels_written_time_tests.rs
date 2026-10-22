@@ -237,7 +237,7 @@ fn same_instant_tolerates_the_move_and_not_a_reset() {
     assert_eq!(s.obs_times[2], 2.0, "{:?}", s.obs_times);
     assert!(s.same_instant(1, 2));
     assert!(
-        resolves_observations(&decl(&parsed), &pop),
+        resolves_observations(&decl(&parsed), &pop, false),
         "the moved replicate"
     );
 
@@ -253,7 +253,7 @@ fn same_instant_tolerates_the_move_and_not_a_reset() {
     assert_ne!(s.obs_times[1], s.obs_times[3]);
     assert!(!s.same_instant(1, 3));
     assert!(
-        !resolves_observations(&decl(&parsed), &pop),
+        !resolves_observations(&decl(&parsed), &pop, false),
         "the reset periods"
     );
 }
