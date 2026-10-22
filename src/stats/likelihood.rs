@@ -482,6 +482,69 @@ pub(crate) fn accumulate_non_gaussian_nll(
     }
 }
 
+/// Each non-Gaussian data term of one subject at `eta`, named, one per TTE endpoint
+/// (ascending CMT), then the categorical and the CTMM term when the model has one —
+/// the terms [`accumulate_non_gaussian_nll`] sums, kept apart so
+/// `W_NONFINITE_OBJECTIVE` can say which one failed (#2267). Raw NLLs, not the
+/// OFV-scale `2·` the contribution carries.
+///
+/// An `OdeAccumulated` hazard is re-solved here rather than read off the #570 shared
+/// solve, which agrees to solver tolerance; a diverged solve is `NaN` on both and maps
+/// to the same `1e20` sentinel. Empty for a subject with no non-Gaussian record.
+#[cfg(feature = "survival")]
+pub(crate) fn non_gaussian_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<(String, f64)> {
+    let mut terms = Vec::new();
+    if subject.obs_records.is_empty() {
+        return terms;
+    }
+    let mut cmts: Vec<&usize> = model.endpoints.keys().collect();
+    cmts.sort();
+    for cmt in cmts {
+        if let crate::types::EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = &model.endpoints[cmt]
+        {
+            let records: Vec<ObsRecord> = subject
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if records.is_empty() {
+                continue;
+            }
+            let nll = tte_endpoint_nll(model, subject, hazard, *recurrence, &records, theta, eta);
+            terms.push((format!("time-to-event on CMT {cmt}"), nll));
+        }
+    }
+    if model.has_discrete() {
+        let nll = crate::categorical::discrete_subject_nll(model, subject, theta, eta);
+        terms.push(("categorical".to_string(), nll));
+    }
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        let nll = crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+        terms.push(("CTMM".to_string(), nll));
+    }
+    terms
+}
+
+/// What the IOV marginal returns for a subject with FREM covariate rows, which it
+/// refuses: the augmented `b̂` and block-diagonal `Σ_b` are not set up for FREM
+/// R-overrides. Named so `W_NONFINITE_OBJECTIVE` reports the refusal as such (#2267).
+pub(crate) const IOV_FREM_REFUSAL_NLL: f64 = 1e18;
+
+/// Whether the IOV marginal refuses `subject` (see [`IOV_FREM_REFUSAL_NLL`]). Only
+/// consulted for a subject scored with κ.
+pub(crate) fn iov_refuses_frem(model: &CompiledModel, subject: &Subject) -> bool {
+    model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0)
+}
+
 /// Hot-path variant that additionally threads through a pre-built
 /// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
 /// and Jacobian build the schedule once per `find_ebe` call and reuse
@@ -2883,8 +2946,8 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     // IOV + FREM is unsupported: the augmented b̂ vector and block-diagonal
     // Σ_b are not set up for FREM R-overrides.  Return a sentinel NLL so the
     // optimizer steers away from this region rather than silently ignoring FREM.
-    if model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0) {
-        return 1e18;
+    if iov_refuses_frem(model, subject) {
+        return IOV_FREM_REFUSAL_NLL;
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);

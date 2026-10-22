@@ -1819,13 +1819,119 @@ pub(crate) fn nonfinite_objective_warning(
 /// more"; the `details` payload lists every one (#2038).
 pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 
+/// One separately scored part of a subject's objective contribution (#2267): a
+/// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
+/// the raw value, not the OFV-scale `2·` the contribution carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionTerm {
+    pub(crate) name: String,
+    pub(crate) nll: f64,
+}
+
+/// What `SubjectResult::ofv_contribution` is, relative to the objective
+/// `W_NONFINITE_OBJECTIVE` gated (#2267).
+///
+/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal, under
+/// the fitted class for a mixture. Only a FOCE-family objective (FOCE, FOCEI and the
+/// two Gauss–Newton methods, without quadrature or a mixture) is the sum of those
+/// scores; for every other one — Laplace/AGQ, SAEM, IMP, IMPMAP, VI's final OFV, a
+/// mixture marginal — the objective can be unusable while every score is usable, and
+/// the reverse.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionSource {
+    /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
+    pub(crate) score: &'static str,
+    /// The objective's name when the contributions are not its terms, else `None`.
+    pub(crate) objective: Option<String>,
+}
+
+impl ContributionSource {
+    /// The source for an objective produced by `method` and contributions scored under
+    /// `options.interaction` (the post-fit options), `mixture` when the fit is one.
+    pub(crate) fn of(method: EstimationMethod, options: &FitOptions, mixture: bool) -> Self {
+        let score = if options.interaction { "FOCEI" } else { "FOCE" };
+        let agq = FitOptions::agq_nodes_for(method, options.n_agq);
+        let same = matches!(
+            method,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::FoceGnHybrid
+        ) && crate::types::interaction_for(method, options.interaction)
+            == options.interaction
+            && agq.is_none()
+            && !mixture;
+        let objective = (!same).then(|| {
+            let mut name = method.label().to_string();
+            if let Some(n) = agq.filter(|&n| n > 1) {
+                name = format!("{name} (n_agq = {n})");
+            }
+            if mixture {
+                name.push_str(" mixture");
+            }
+            name
+        });
+        Self { score, objective }
+    }
+}
+
+/// The separately scored terms of `subject`'s contribution at `eta` (#2267), for
+/// [`name_nonfinite_subjects`]: the IOV marginal's FREM refusal alone when it refuses
+/// the subject (`iov` — the subject was scored with κ), else each non-Gaussian data term
+/// under the subject's fitted mixture class. The Gaussian data term, the `η` prior and
+/// the curvature determinant are not split out; a contribution none of these terms
+/// explains failed in one of them.
+pub(crate) fn contribution_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    iov: bool,
+    mix_class: Option<usize>,
+) -> Vec<ContributionTerm> {
+    if iov && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        return vec![ContributionTerm {
+            name: "IOV + FREM refusal".into(),
+            nll: crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+        }];
+    }
+    let _mix_guard =
+        mix_class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+    #[cfg(feature = "survival")]
+    {
+        crate::stats::likelihood::non_gaussian_terms(model, subject, theta, eta)
+            .into_iter()
+            .map(|(name, nll)| ContributionTerm { name, nll })
+            .collect()
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        let _ = (theta, eta);
+        Vec::new()
+    }
+}
+
+/// The per-subject term scorer `name_nonfinite_subjects` calls for each subject it
+/// names: population index, data, post-fit result.
+pub(crate) type TermScorer<'a> =
+    dyn Fn(usize, &Subject, &SubjectResult) -> Vec<ContributionTerm> + 'a;
+
+/// A non-finite value as JSON: a number when finite, else its `Debug` string, since
+/// JSON has no `NaN`.
+fn json_value(v: f64) -> serde_json::Value {
+    if v.is_finite() {
+        serde_json::json!(v)
+    } else {
+        serde_json::json!(v.to_string())
+    }
+}
+
 /// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
 /// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
 /// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
-/// Returns `msg` unchanged when no subject qualifies. The `details` reach only the
-/// Rust API: the YAML writes the messages, a `.fitrx` reload rebuilds the entries
-/// without them, and the R package drops them, so the message says where the
-/// subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are.
+/// The `details` reach only the Rust API: the YAML writes the messages, a `.fitrx`
+/// reload rebuilds the entries without them, and the R package drops them, so the
+/// message says where the subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are.
 ///
 /// A subject qualifies when its own post-fit objective contribution fails
 /// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
@@ -1837,23 +1943,43 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// For each subject named, the sentence gives the contribution and the observations
 /// whose `IPRED` or `PRED` is not finite, with the written `TIME` of the first. When
-/// none is, it says so, since the cause is then not in the predictions: usually a
-/// proportional error on a prediction of 0, which scores `DV² × 1e12` per
-/// observation at the variance floor, but also a non-Gaussian term, a non-PD
-/// covariance, or a refused subject.
+/// none is, it says so ("no Gaussian observation" for a subject that has none), since
+/// the cause is then not in the predictions. It then names each term `terms` scores
+/// that is itself unusable — a time-to-event term at the `1e20` hazard sentinel, a
+/// categorical or CTMM term, the IOV + FREM refusal (#2267) — or, when the subject
+/// has non-Gaussian terms and every one is usable, says that. A contribution none of
+/// this explains failed in the Gaussian variance (usually a proportional error on a
+/// prediction of 0, which scores `DV² × 1e12` per observation at the variance floor),
+/// the `η` prior, or a curvature determinant that is not positive definite.
+///
+/// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
+/// objective is not their sum, the sentence says so after the list; and when it names
+/// nobody, it says why rather than returning `msg` unchanged (#2267). Only a
+/// FOCE-family objective with no unusable contribution returns `msg` unchanged: its
+/// failure is then outside every single contribution — a value recorded at another
+/// point, or a sum of usable ones past the cutoff.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
-/// whose position does not match `population` gets no `TIME`.
+/// whose position does not match `population` gets no `TIME` and no terms.
 pub(crate) fn name_nonfinite_subjects(
     msg: String,
     entry: &mut WarningEntry,
     subjects: &[SubjectResult],
     population: &Population,
+    source: &ContributionSource,
+    terms: &TermScorer<'_>,
 ) -> String {
-    let named: Vec<(&SubjectResult, Vec<usize>, Option<&Subject>)> = subjects
+    use crate::estimation::outer_optimizer::ofv_is_valid;
+    struct Named<'a> {
+        s: &'a SubjectResult,
+        bad: Vec<usize>,
+        data: Option<&'a Subject>,
+        terms: Vec<ContributionTerm>,
+    }
+    let named: Vec<Named<'_>> = subjects
         .iter()
         .enumerate()
-        .filter(|(_, s)| !crate::estimation::outer_optimizer::ofv_is_valid(s.ofv_contribution))
+        .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
         .map(|(i, s)| {
             let bad: Vec<usize> = (0..s.n_obs)
                 .filter(|&j| {
@@ -1862,60 +1988,103 @@ pub(crate) fn name_nonfinite_subjects(
                 })
                 .collect();
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
-            (s, bad, data)
+            let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
+            Named {
+                s,
+                bad,
+                data,
+                terms,
+            }
         })
         .collect();
-    if named.is_empty() {
-        return msg;
-    }
-    let describe = |(s, bad, data): &(&SubjectResult, Vec<usize>, Option<&Subject>)| {
-        let records = match (bad.first(), data) {
-            (None, _) => "every IPRED and PRED finite".to_string(),
-            (Some(&j), Some(d)) => format!(
-                "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
-                bad.len(),
-                s.n_obs,
-                d.readout_time(j)
-            ),
-            (Some(_), None) => format!(
-                "a non-finite IPRED or PRED on {} of {} observations",
-                bad.len(),
-                s.n_obs
-            ),
+    let caveat = source.objective.as_deref().map(|objective| {
+        format!(
+            " These are post-hoc {} contributions at the EBEs, not terms of the {objective} \
+             objective, which ferx does not split by subject.",
+            source.score
+        )
+    });
+    let full = if named.is_empty() {
+        let Some(objective) = source.objective.as_deref() else {
+            return msg;
         };
         format!(
-            "{} (contribution {:?}, {records})",
-            s.id, s.ofv_contribution
+            "{msg} No subject can be named: the {objective} objective is not split by \
+             subject, and every subject's post-hoc {score} contribution at these estimates \
+             is usable, so the failure is in a part of the {objective} objective that the \
+             {score} score does not share.",
+            score = source.score
+        )
+    } else {
+        let describe = |n: &Named<'_>| {
+            let records = match (n.bad.first(), n.data) {
+                (None, _) if n.s.n_obs == 0 => "no Gaussian observation".to_string(),
+                (None, _) => "every IPRED and PRED finite".to_string(),
+                (Some(&j), Some(d)) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
+                    n.bad.len(),
+                    n.s.n_obs,
+                    d.readout_time(j)
+                ),
+                (Some(_), None) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations",
+                    n.bad.len(),
+                    n.s.n_obs
+                ),
+            };
+            let failed: Vec<String> = n
+                .terms
+                .iter()
+                .filter(|t| !ofv_is_valid(t.nll))
+                .map(|t| format!("{} = {:?}", t.name, t.nll))
+                .collect();
+            let terms = match failed.len() {
+                0 if n.terms.is_empty() => String::new(),
+                0 => ", every non-Gaussian term usable".to_string(),
+                1 => format!(", failed term: {}", failed[0]),
+                _ => format!(", failed terms: {}", failed.join(", ")),
+            };
+            format!(
+                "{} (contribution {:?}, {records}{terms})",
+                n.s.id, n.s.ofv_contribution
+            )
+        };
+        let mut list = named
+            .iter()
+            .take(NONFINITE_SUBJECTS_NAMED)
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if named.len() > NONFINITE_SUBJECTS_NAMED {
+            list.push_str(&format!(
+                "; and {} more, listed only in the Rust API's structured warning",
+                named.len() - NONFINITE_SUBJECTS_NAMED
+            ));
+        }
+        format!(
+            "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
+             {list}.{}",
+            named.len(),
+            subjects.len(),
+            caveat.unwrap_or_default()
         )
     };
-    let mut list = named
-        .iter()
-        .take(NONFINITE_SUBJECTS_NAMED)
-        .map(describe)
-        .collect::<Vec<_>>()
-        .join("; ");
-    if named.len() > NONFINITE_SUBJECTS_NAMED {
-        list.push_str(&format!(
-            "; and {} more, listed only in the Rust API's structured warning",
-            named.len() - NONFINITE_SUBJECTS_NAMED
-        ));
-    }
-    let full = format!(
-        "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
-         {list}.",
-        named.len(),
-        subjects.len()
-    );
     let payload: Vec<serde_json::Value> = named
         .iter()
-        .map(|(s, bad, data)| {
-            let c = s.ofv_contribution;
+        .map(|n| {
+            let failed: Vec<serde_json::Value> = n
+                .terms
+                .iter()
+                .filter(|t| !ofv_is_valid(t.nll))
+                .map(|t| serde_json::json!({"term": t.name, "nll": json_value(t.nll)}))
+                .collect();
             serde_json::json!({
-                "id": s.id,
-                "ofv_contribution": if c.is_finite() { serde_json::json!(c) } else { serde_json::json!(c.to_string()) },
-                "nonfinite_predictions": bad.len(),
-                "n_obs": s.n_obs,
-                "first_time": bad.first().zip(*data).map(|(&j, d)| d.readout_time(j)),
+                "id": n.s.id,
+                "ofv_contribution": json_value(n.s.ofv_contribution),
+                "nonfinite_predictions": n.bad.len(),
+                "n_obs": n.s.n_obs,
+                "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "failed_terms": failed,
             })
         })
         .collect();
@@ -1923,6 +2092,11 @@ pub(crate) fn name_nonfinite_subjects(
         map.insert(
             "unusable_subjects".into(),
             serde_json::Value::Array(payload),
+        );
+        map.insert("contribution_score".into(), serde_json::json!(source.score));
+        map.insert(
+            "contributions_are_objective_terms".into(),
+            serde_json::json!(source.objective.is_none()),
         );
     }
     entry.message = full.clone();

@@ -1064,6 +1064,20 @@ fn shifted_subject(id: &str) -> Subject {
     s
 }
 
+/// The contribution source of a FOCEI fit: the contributions are its own terms.
+fn foce_source() -> ContributionSource {
+    ContributionSource::of(EstimationMethod::FoceI, &FitOptions::default(), false)
+}
+
+/// A term scorer for a model with no separately scored term.
+fn no_terms(
+    _: usize,
+    _: &Subject,
+    _: &SubjectResult,
+) -> Vec<crate::api::postfit::ContributionTerm> {
+    Vec::new()
+}
+
 fn population_of(subjects: Vec<Subject>) -> Population {
     Population {
         subjects,
@@ -1122,7 +1136,14 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     d.ofv_contribution = f64::NAN;
 
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[a, b, c, d], &pop);
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[a, b, c, d],
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
 
     let added = full
         .strip_prefix(&msg)
@@ -1151,11 +1172,14 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
         subjects,
         &vec![
             serde_json::json!({"id": "A", "ofv_contribution": 2e20,
-                "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0}),
+                "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0,
+                "failed_terms": []}),
             serde_json::json!({"id": "C", "ofv_contribution": 4.6e14,
-                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
+                "failed_terms": []}),
             serde_json::json!({"id": "D", "ofv_contribution": "NaN",
-                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null}),
+                "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
+                "failed_terms": []}),
         ],
         "JSON has no NaN, so a non-finite contribution is carried as a string"
     );
@@ -1177,7 +1201,14 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
     ];
     let (msg, mut entry) = sentinel_warning();
     let before = entry.clone();
-    let out = name_nonfinite_subjects(msg.clone(), &mut entry, &subjects, &pop);
+    let out = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &subjects,
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
     assert_eq!(out, msg);
     assert_eq!(entry.message, before.message);
     assert_eq!(entry.details, before.details);
@@ -1199,7 +1230,14 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
     b.ipred[2] = f64::NAN;
     let a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[b, a], &pop);
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[b, a],
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
     assert!(
         full.ends_with("B (contribution 2e20, a non-finite IPRED or PRED on 1 of 4 observations)."),
         "{full}"
@@ -1227,7 +1265,7 @@ fn a_non_finite_written_time_is_carried_as_null() {
     a.ofv_contribution = 2e20;
     a.ipred[2] = f64::NAN;
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop);
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &foce_source(), &no_terms);
     assert!(full.ends_with("the first at TIME NaN)."), "{full}");
     let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
     assert_eq!(
@@ -1258,7 +1296,7 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         })
         .collect();
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop);
+    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop, &foce_source(), &no_terms);
 
     assert!(full.contains(" 12 of 12 subjects "), "{full}");
     assert!(full.contains("s10 (contribution 2e20"), "{full}");
@@ -1452,6 +1490,352 @@ fn a_negative_covariate_on_one_record_names_the_record() {
             subjects.len(),
             1,
             "{engine}: only subject 3 is named: {subjects:?}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  T — which term failed, and which objective the contributions belong to (#2267)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn term(name: &str, nll: f64) -> crate::api::postfit::ContributionTerm {
+    crate::api::postfit::ContributionTerm {
+        name: name.into(),
+        nll,
+    }
+}
+
+/// **T1 — the sentence names the term that failed.**
+///
+/// The input space is the subject's contribution (valid or not) × its separately
+/// scored terms (none, all usable, one failed, two failed) × whether it has a Gaussian
+/// observation. The cells that change the text:
+///
+/// | subject | contribution | Gaussian obs | terms | named as |
+/// |---|---|---|---|---|
+/// | `T` | `2e20` | none | TTE `1e20` | "no Gaussian observation, failed term: …" |
+/// | `U` | `NaN` | 4, finite | TTE `3.25` | "every IPRED and PRED finite, every non-Gaussian term usable" |
+/// | `V` | `2e18` | 4, finite | the IOV + FREM refusal | "failed term: IOV + FREM refusal = 1e18" |
+/// | `W` | `2e20` | 4, finite | TTE `NaN`, categorical `1e20` | "failed terms: …, …" |
+/// | `X` | `12.34` | 4, finite | TTE `1e20` | not named |
+///
+/// `X` is the straddle: a failing term with a valid contribution is not named, so the
+/// selector is still the contribution and the terms only describe it. `T` is the
+/// issue's TTE-only subject, which used to read "every IPRED and PRED finite" because
+/// it has no prediction at all.
+///
+/// Mutation (run): drop the `n_obs == 0` arm → `T` reads "every IPRED and PRED
+/// finite"; filter the failed terms on `is_finite()` instead of `ofv_is_valid` → `T`
+/// and `V` lose their term and read "every non-Gaussian term usable"; drop the "every
+/// non-Gaussian term usable" arm, the singular/plural split, or the value → the
+/// sentence comparison fires; select on the terms → `X` is named.
+#[test]
+fn the_sentence_names_the_term_that_failed() {
+    let ids = ["T", "U", "V", "W", "X"];
+    let pop = population_of(ids.iter().map(|id| shifted_subject(id)).collect());
+    let mut t = crate::types::test_helpers::dummy_subject("T", 1, 0);
+    t.ofv_contribution = 2e20;
+    let mut u = crate::types::test_helpers::dummy_subject("U", 1, 4);
+    u.ofv_contribution = f64::NAN;
+    let mut v = crate::types::test_helpers::dummy_subject("V", 1, 4);
+    v.ofv_contribution = 2e18;
+    let mut w = crate::types::test_helpers::dummy_subject("W", 1, 4);
+    w.ofv_contribution = 2e20;
+    let x = crate::types::test_helpers::dummy_subject("X", 1, 4);
+    let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
+        assert_eq!((data.id.as_str(), s.id.as_str()), (ids[i], ids[i]));
+        match ids[i] {
+            "T" | "X" => vec![term("time-to-event on CMT 2", 1e20)],
+            "U" => vec![term("time-to-event on CMT 2", 3.25)],
+            "V" => vec![term("IOV + FREM refusal", 1e18)],
+            "W" => vec![
+                term("time-to-event on CMT 2", f64::NAN),
+                term("categorical", 1e20),
+            ],
+            other => panic!("{other}"),
+        }
+    };
+
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[t, u, v, w, x],
+        &pop,
+        &foce_source(),
+        &scorer,
+    );
+    assert_eq!(
+        full.strip_prefix(&msg).expect("the gate's message is kept"),
+        " 4 of 5 subjects have an objective contribution that is itself unusable: \
+         T (contribution 2e20, no Gaussian observation, failed term: time-to-event on CMT 2 = \
+         1e20); U (contribution NaN, every IPRED and PRED finite, every non-Gaussian term \
+         usable); V (contribution 2e18, every IPRED and PRED finite, failed term: IOV + FREM \
+         refusal = 1e18); W (contribution 2e20, every IPRED and PRED finite, failed terms: \
+         time-to-event on CMT 2 = NaN, categorical = 1e20)."
+    );
+    let details = entry.details.as_ref().expect("payload");
+    assert_eq!(details["contribution_score"], "FOCEI", "{details}");
+    assert_eq!(
+        details["contributions_are_objective_terms"], true,
+        "{details}"
+    );
+    let failed: Vec<&serde_json::Value> = details["unusable_subjects"]
+        .as_array()
+        .expect("subjects")
+        .iter()
+        .map(|s| &s["failed_terms"])
+        .collect();
+    assert_eq!(
+        failed,
+        vec![
+            &serde_json::json!([{"term": "time-to-event on CMT 2", "nll": 1e20}]),
+            &serde_json::json!([]),
+            &serde_json::json!([{"term": "IOV + FREM refusal", "nll": 1e18}]),
+            &serde_json::json!([
+                {"term": "time-to-event on CMT 2", "nll": "NaN"},
+                {"term": "categorical", "nll": 1e20}
+            ]),
+        ]
+    );
+}
+
+/// **T2 — which objectives the post-hoc score is a term of.** Only the FOCE family,
+/// without quadrature or a mixture, sums the contributions `compute_subject_results`
+/// scores; every other objective is named, with its node count and mixture.
+///
+/// Mutation (run): drop any clause of `same` → its row fires; drop the `n_agq` or the
+/// mixture suffix → its row fires.
+#[test]
+fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
+    use EstimationMethod::*;
+    let opts = |interaction: bool, n_agq: usize| FitOptions {
+        interaction,
+        n_agq,
+        ..FitOptions::default()
+    };
+    let cases: [(EstimationMethod, bool, usize, bool, &str, Option<&str>); 11] = [
+        (Foce, false, 1, false, "FOCE", None),
+        (FoceI, true, 1, false, "FOCEI", None),
+        (FoceGn, true, 1, false, "FOCEI", None),
+        (FoceGnHybrid, false, 1, false, "FOCE", None),
+        (FoceI, true, 3, false, "FOCEI", Some("FOCEI (n_agq = 3)")),
+        (Laplace, true, 1, false, "FOCEI", Some("LAPLACE")),
+        (
+            Laplace,
+            true,
+            5,
+            false,
+            "FOCEI",
+            Some("LAPLACE (n_agq = 5)"),
+        ),
+        (Saem, true, 1, false, "FOCEI", Some("SAEM")),
+        (Imp, false, 1, false, "FOCE", Some("IMP")),
+        (FoceI, true, 1, true, "FOCEI", Some("FOCEI mixture")),
+        // A FOCE objective whose contributions were scored under interaction is not
+        // their sum either.
+        (Foce, true, 1, false, "FOCEI", Some("FOCE")),
+    ];
+    for (method, interaction, n_agq, mixture, score, objective) in cases {
+        let got = ContributionSource::of(method, &opts(interaction, n_agq), mixture);
+        assert_eq!(
+            (got.score, got.objective.as_deref()),
+            (score, objective),
+            "{method:?}, interaction {interaction}, n_agq {n_agq}, mixture {mixture}"
+        );
+    }
+}
+
+/// **T3 — an objective the contributions are not terms of says so, and says why it
+/// names nobody.** The same subjects under the FOCEI source and a Laplace one: with no
+/// unusable contribution the FOCEI warning is left as the gate wrote it (N2), and the
+/// Laplace one gains the sentence saying why it cannot name anyone; with one, the
+/// Laplace list is followed by the caveat.
+///
+/// Mutation (run): restore the unconditional `named.is_empty()` return → the "No
+/// subject can be named" assertion fires; drop the caveat → the second assertion
+/// fires; append either under the FOCEI source → the two controls fire.
+#[test]
+fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody() {
+    let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
+    let laplace = ContributionSource::of(EstimationMethod::Laplace, &FitOptions::default(), false);
+    let healthy = [
+        crate::types::test_helpers::dummy_subject("A", 1, 4),
+        crate::types::test_helpers::dummy_subject("B", 1, 4),
+    ];
+    let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
+    b.ofv_contribution = 2e20;
+    let one_bad = [crate::types::test_helpers::dummy_subject("A", 1, 4), b];
+
+    let (msg, mut entry) = sentinel_warning();
+    let control = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &healthy,
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
+    assert_eq!(
+        control, msg,
+        "a FOCEI objective with no unusable term is left alone"
+    );
+
+    let (msg, mut entry) = sentinel_warning();
+    let nobody =
+        name_nonfinite_subjects(msg.clone(), &mut entry, &healthy, &pop, &laplace, &no_terms);
+    assert_eq!(
+        nobody.strip_prefix(&msg).expect("kept"),
+        " No subject can be named: the LAPLACE objective is not split by subject, and \
+         every subject's post-hoc FOCEI contribution at these estimates is usable, so the \
+         failure is in a part of the LAPLACE objective that the FOCEI score does not share."
+    );
+    let details = entry.details.as_ref().expect("payload");
+    assert_eq!(
+        details["unusable_subjects"],
+        serde_json::json!([]),
+        "{details}"
+    );
+    assert_eq!(
+        details["contributions_are_objective_terms"], false,
+        "{details}"
+    );
+    assert_eq!(entry.message, nobody);
+
+    let (msg, mut entry) = sentinel_warning();
+    let control = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &one_bad,
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
+    assert!(
+        control.ends_with("every IPRED and PRED finite)."),
+        "{control}"
+    );
+
+    let (msg, mut entry) = sentinel_warning();
+    let listed = name_nonfinite_subjects(msg, &mut entry, &one_bad, &pop, &laplace, &no_terms);
+    assert!(
+        listed.ends_with(
+            "B (contribution 2e20, every IPRED and PRED finite). These are post-hoc FOCEI \
+             contributions at the EBEs, not terms of the LAPLACE objective, which ferx does \
+             not split by subject."
+        ),
+        "{listed}"
+    );
+}
+
+/// An exponential TTE-only model whose rate carries `exp(Z)`, on the 30-subject
+/// `data/tte_exponential.csv` with a `Z` column: `0` everywhere, or `1000` on subject
+/// 3, where the rate overflows to `inf` and `tte_nll_from_curves` maps the subject to
+/// its `1e20` sentinel.
+#[cfg(feature = "survival")]
+fn overflowing_tte(overflow: bool) -> (CompiledModel, Population) {
+    use std::io::Write;
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA + Z)
+"#,
+    )
+    .expect("parse");
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/tte_exponential.csv");
+    let text = std::fs::read_to_string(path).expect("data/tte_exponential.csv");
+    let mut lines = text.lines();
+    let mut csv = format!("{},Z\n", lines.next().expect("header"));
+    for line in lines {
+        let z = if overflow && line.starts_with("3,") {
+            "1000"
+        } else {
+            "0"
+        };
+        csv.push_str(&format!("{line},{z}\n"));
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    let (pop, _) = crate::api::read_population_for(
+        &model,
+        &None,
+        f.path().to_str().expect("utf-8 path"),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("data");
+    (model, pop)
+}
+
+/// **T4 — end to end, the issue's TTE reproduction, on a FOCE-family objective and a
+/// Laplace one.** Subject 3 of a TTE-only population has an overflowing hazard. Before
+/// #2267 it was named "every IPRED and PRED finite", which it meets trivially: it has
+/// no Gaussian prediction. Now the sentence names the TTE term at its sentinel, and
+/// under Laplace says the contributions are FOCEI ones. The control (`Z = 0`) pins that
+/// the naming is caused by the overflow and that a healthy fit stays silent.
+///
+/// Mutation (run): pass a scorer returning no term in `fit_inner` → the "failed
+/// term" clause is missing; pass `ContributionSource::of(EstimationMethod::FoceI, …)`
+/// there → the Laplace caveat is missing.
+#[cfg(feature = "survival")]
+#[test]
+fn an_overflowing_hazard_names_its_time_to_event_term() {
+    let run = |method: EstimationMethod, overflow: bool| {
+        let (model, pop) = overflowing_tte(overflow);
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        fit(&model, &pop, &model.default_params, &opts).expect("fit")
+    };
+    let subject_3 = "3 (contribution 2e20, no Gaussian observation, failed term: \
+                     time-to-event on CMT 2 = 1e20).";
+    for (method, tail) in [
+        (EstimationMethod::FoceI, String::new()),
+        (
+            EstimationMethod::Laplace,
+            " These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE \
+             objective, which ferx does not split by subject."
+                .to_string(),
+        ),
+    ] {
+        let control = run(method, false);
+        assert!(
+            crate::estimation::outer_optimizer::ofv_is_valid(control.ofv),
+            "{method:?}: premise: Z = 0 is a healthy fit; ofv = {}",
+            control.ofv
+        );
+        assert!(
+            !control
+                .warnings
+                .iter()
+                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            "{method:?}: {:?}",
+            control.warnings
+        );
+
+        let result = run(method, true);
+        let (message, subjects) = named_subjects(&result);
+        let want = format!(
+            " 1 of 30 subjects have an objective contribution that is itself unusable: \
+             {subject_3}{tail}"
+        );
+        assert!(message.ends_with(&want), "{method:?}: {message}");
+        assert_eq!(
+            subjects[0]["failed_terms"],
+            serde_json::json!([{"term": "time-to-event on CMT 2", "nll": 1e20}]),
+            "{method:?}"
         );
     }
 }

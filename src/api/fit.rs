@@ -2928,7 +2928,21 @@ fn fit_inner(
         // Only this copy sees the per-subject results, so only it names the
         // subjects (#2038) — after the de-duplication, which matches the estimator's
         // copy on the sentence both share.
-        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population);
+        // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
+        // objective, so the source says which, and the scorer splits out the terms the
+        // predictions cannot describe (#2267).
+        let source = ContributionSource::of(objective_stage, options, mixest_classes.is_some());
+        let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
+            contribution_terms(
+                model,
+                data,
+                &result.params.theta,
+                s.eta.as_slice(),
+                result.kappas.get(i).is_some_and(|k| !k.is_empty()),
+                mixest_classes.as_ref().and_then(|m| m.get(i).copied()),
+            )
+        };
+        let msg = name_nonfinite_subjects(msg, &mut entry, &subjects, population, &source, &scorer);
         warnings.push(msg);
         native_warnings.push(entry);
     }
