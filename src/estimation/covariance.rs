@@ -1084,9 +1084,13 @@ pub(super) fn analytic_cov_assembly(
     // differentiates every one of these objectives — FOCE (its frozen-variance mode
     // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
     // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian;
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian_at, PackedPoint};
     let objective = cov_objective(options);
     let n = x_hat.len();
+    // One unpack for the population: every subject's Hessian is at `x_hat`.
+    let Some(pt) = PackedPoint::new(template, x_hat) else {
+        return AnalyticCovAssembly::Unavailable;
+    };
     let per_subject: Vec<Option<DMatrix<f64>>> = population
         .subjects
         .par_iter()
@@ -1125,7 +1129,7 @@ pub(super) fn analytic_cov_assembly(
                 return None;
             }
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = subject_adjoint_cov_hessian(model, subject, template, x_hat, &b, objective)?;
+            let h = subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
