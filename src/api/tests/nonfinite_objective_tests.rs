@@ -28,6 +28,7 @@ use crate::estimation::outer_optimizer::{
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{BloqMethod, ViFinalOfv, WarningCode, WarningSeverity};
+
 use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1078,24 +1079,27 @@ fn population_of(subjects: Vec<Subject>) -> Population {
 /// **N1 — every cell of the sentence, in one message.**
 ///
 /// The input space is the subject's contribution (valid, at the sentinel, `NaN`, or
-/// finite but past the cutoff) × its residual terms (all usable, or not on some
-/// records) × its predictions (finite, or not on some records). Four subjects cover
-/// the cells that change the text:
+/// finite but past the cutoff) × its records' own likelihood terms (all usable, or
+/// not on some records) × its predictions (finite, or not on some records). On
+/// [`one_cpt_model`]'s proportional error an `IPRED` of 0 is scored at the variance
+/// floor, `DV² × 1e12`, so `shifted_subject`'s `DV`s (33.3, 16.7, 5.6, 2 at `TIME`
+/// 0.5, 2, 8, 24) straddle the `1e14` cutoff between `TIME` 8 and 24. Four subjects
+/// cover the cells that change the text:
 ///
-/// | subject | contribution | residual terms | predictions | named as |
+/// | subject | contribution | `IPRED` | `PRED` | named as |
 /// |---|---|---|---|---|
-/// | `A` | `2e20` | `IWRES` `9.9e6` at `TIME` 0.5, `1e8` at 2, `NaN` at 8 | `IPRED` `NaN` at 8, `PRED` `NaN` at 24 | residual 2 of 4 from `TIME` 2; prediction 2 of 4 from `TIME` 8 |
-/// | `B` | `12.34` | every `IWRES` `NaN` | every `IPRED` and `PRED` `NaN` | not named |
-/// | `C` | `4.6e14` | `IWRES` `2e7` at `TIME` 0.5, where `IPRED` is 0 | finite | residual 1 of 4 at `TIME` 0.5; "every IPRED and PRED finite" |
-/// | `D` | `NaN` | finite | finite | "every residual term usable"; "every IPRED and PRED finite" |
+/// | `A` | `2e20` | 0 at `TIME` 2 and 24, `NaN` at 8 | `NaN` at 24 | terms 2 of 4 from `TIME` 2; predictions 2 of 4 from `TIME` 8 |
+/// | `B` | `12.34` | `NaN` | `NaN` | not named |
+/// | `C` | `4.6e14` | 0 at `TIME` 0.5 | finite | terms 1 of 4 at `TIME` 0.5; "every IPRED and PRED finite" |
+/// | `D` | `NaN` | finite | finite | "every … term usable"; "every IPRED and PRED finite" |
 ///
 /// `B` is the straddle: its predictions are worse than `A`'s, and it is the subject
 /// with no Gaussian observation whose `NaN` predictions are the "no prediction
-/// available" convention. Its contribution is valid, so it is not named. `A`'s first
-/// two residuals straddle the per-record cutoff (`9.9e6² < 1e14 ≤ 1e8²`), and its
-/// first unusable residual comes before its first non-finite prediction, which is
-/// #2266's shape. `C` is the proportional error on a prediction of 0. The whole
-/// appended sentence is compared exactly, so deleting any clause of it fires.
+/// available" convention. Its contribution is valid, so it is not named. `A`'s zeros
+/// straddle the per-record cutoff (`16.7² × 1e12 ≥ 1e14 > 2² × 1e12`), and its first
+/// unusable term comes before its first non-finite prediction, which is #2266's
+/// shape. The whole appended sentence is compared exactly, so deleting any clause of
+/// it fires.
 ///
 /// Mutation (run):
 /// * select on non-finite predictions instead of the contribution → `B` is named and
@@ -1103,11 +1107,11 @@ fn population_of(subjects: Vec<Subject>) -> Population {
 /// * select on `ofv_contribution >= DIVERGENCE_OFV` → `D`'s `NaN` drops out;
 /// * count only `IPRED` → `A` reads "1 of 4" in the prediction clause;
 /// * take the `TIME` from `obs_times` → `A` reads `TIME 58`;
-/// * flag a residual only when `IWRES` is not finite → `A`'s starts at `TIME 8` and
-///   `C` reads "every residual term usable";
-/// * test `|IWRES|` instead of `IWRES²` against the cutoff → `A`'s `9.9e6` counts;
+/// * flag a term only when it is not finite → `A`'s starts at `TIME 8` and `C`
+///   reads "every … term usable";
+/// * drop the `NaN`-prediction check ahead of the floor → `A` reads "1 of 4";
 /// * drop the "{n} of {N} subjects" lead, the contribution, either records clause,
-///   or the `TIME`, `DV` or `IPRED` of the residual clause → the sentence comparison
+///   or the `TIME`, `DV` or `IPRED` of the term clause → the sentence comparison
 ///   fires.
 #[test]
 fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
@@ -1119,29 +1123,28 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     ]);
     let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     a.ofv_contribution = 2e20;
-    a.iwres[0] = 9.9e6;
-    a.iwres[1] = 1e8;
+    a.ipred[1] = 0.0;
     a.ipred[2] = f64::NAN;
-    a.iwres[2] = f64::NAN;
+    a.ipred[3] = 0.0;
     a.pred[3] = f64::NAN;
     let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
     b.ipred = vec![f64::NAN; 4];
     b.pred = vec![f64::NAN; 4];
-    b.iwres = vec![f64::NAN; 4];
     let mut c = crate::types::test_helpers::dummy_subject("C", 1, 4);
     c.ofv_contribution = 4.6e14;
     c.ipred[0] = 0.0;
-    c.iwres[0] = 2e7;
     let mut d = crate::types::test_helpers::dummy_subject("D", 1, 4);
     d.ofv_contribution = f64::NAN;
 
+    let m = one_cpt_model();
     let (msg, mut entry) = sentinel_warning();
     let full = name_nonfinite_subjects(
         msg.clone(),
         &mut entry,
         &[a, b, c, d],
         &pop,
-        BloqMethod::Drop,
+        &m,
+        &m.default_params,
     );
 
     let added = full
@@ -1150,12 +1153,13 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     assert_eq!(
         added,
         " 3 of 4 subjects have an objective contribution that is itself unusable: \
-         A (contribution 2e20, an unusable residual term on 2 of 4 observations, the first \
-         at TIME 2 (DV 16.666666666666668, IPRED 2); a non-finite IPRED or PRED on 2 of 4 \
-         observations, the first at TIME 8); C (contribution 460000000000000.0, an \
-         unusable residual term on 1 of 4 observations, the first at TIME 0.5 \
+         A (contribution 2e20, an unusable likelihood term on 2 of 4 observations, the \
+         first at TIME 2 (DV 16.666666666666668, IPRED 0); a non-finite IPRED or PRED on 2 \
+         of 4 observations, the first at TIME 8); C (contribution 460000000000000.0, an \
+         unusable likelihood term on 1 of 4 observations, the first at TIME 0.5 \
          (DV 33.333333333333336, IPRED 0); every IPRED and PRED finite); D (contribution \
-         NaN, every residual term usable on its own; every IPRED and PRED finite)."
+         NaN, every observation's likelihood term usable on its own; every IPRED and PRED \
+         finite)."
     );
     assert_eq!(
         entry.message, full,
@@ -1175,13 +1179,13 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
         &vec![
             serde_json::json!({"id": "A", "ofv_contribution": 2e20,
                 "nonfinite_predictions": 2, "n_obs": 4, "first_time": 8.0,
-                "unusable_residuals": 2, "first_unusable_residual_time": 2.0}),
+                "unusable_terms": 2, "first_unusable_term_time": 2.0}),
             serde_json::json!({"id": "C", "ofv_contribution": 4.6e14,
                 "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
-                "unusable_residuals": 1, "first_unusable_residual_time": 0.5}),
+                "unusable_terms": 1, "first_unusable_term_time": 0.5}),
             serde_json::json!({"id": "D", "ofv_contribution": "NaN",
                 "nonfinite_predictions": 0, "n_obs": 4, "first_time": null,
-                "unusable_residuals": 0, "first_unusable_residual_time": null}),
+                "unusable_terms": 0, "first_unusable_term_time": null}),
         ],
         "JSON has no NaN, so a non-finite contribution is carried as a string"
     );
@@ -1196,6 +1200,7 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
 /// "0 of 2 subjects" sentence and `details` an `unusable_subjects` key, and this fires.
 #[test]
 fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
+    let m = one_cpt_model();
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let subjects = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
@@ -1203,7 +1208,14 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
     ];
     let (msg, mut entry) = sentinel_warning();
     let before = entry.clone();
-    let out = name_nonfinite_subjects(msg.clone(), &mut entry, &subjects, &pop, BloqMethod::Drop);
+    let out = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &subjects,
+        &pop,
+        &m,
+        &m.default_params,
+    );
     assert_eq!(out, msg);
     assert_eq!(entry.message, before.message);
     assert_eq!(entry.details, before.details);
@@ -1219,19 +1231,25 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
 /// `B` and `first_time` is `8.0`, and this fires.
 #[test]
 fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
+    let m = one_cpt_model();
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
     b.ofv_contribution = 2e20;
     b.ipred[2] = f64::NAN;
-    b.iwres[2] = f64::NAN;
     let a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg.clone(), &mut entry, &[b, a], &pop, BloqMethod::Drop);
+    let full = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &[b, a],
+        &pop,
+        &m,
+        &m.default_params,
+    );
     assert!(
         full.ends_with(
-            "B (contribution 2e20, an unusable residual term on 1 of 4 observations, the \
-             first being observation 3 (IPRED NaN); a non-finite IPRED or PRED on 1 of 4 \
-             observations)."
+            "B (contribution 2e20, likelihood terms not checked; a non-finite IPRED or PRED \
+             on 1 of 4 observations)."
         ),
         "{full}"
     );
@@ -1243,9 +1261,14 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
     );
     assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
     assert_eq!(
-        subjects[0]["first_unusable_residual_time"],
+        subjects[0]["first_unusable_term_time"],
         serde_json::Value::Null,
         "{subjects}"
+    );
+    assert_eq!(
+        subjects[0]["unusable_terms"],
+        serde_json::Value::Null,
+        "unchecked, not zero: {subjects}"
     );
 }
 
@@ -1256,15 +1279,15 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
 /// finite `TIME` at that record the field would be a number.
 #[test]
 fn a_non_finite_written_time_is_carried_as_null() {
+    let m = one_cpt_model();
     let mut data = shifted_subject("A");
     data.obs_raw_times[2] = f64::NAN;
     let pop = population_of(vec![data]);
     let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
     a.ofv_contribution = 2e20;
     a.ipred[2] = f64::NAN;
-    a.iwres[2] = f64::NAN;
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, BloqMethod::Drop);
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params);
     assert!(full.ends_with("the first at TIME NaN)."), "{full}");
     assert!(
         full.contains("the first at TIME NaN (DV 5.555555555555555, IPRED NaN);"),
@@ -1288,6 +1311,7 @@ fn a_non_finite_written_time_is_carried_as_null() {
 /// assertion fires.
 #[test]
 fn the_message_caps_the_named_subjects_and_the_details_do_not() {
+    let m = one_cpt_model();
     let ids: Vec<String> = (1..=12).map(|k| format!("s{k:02}")).collect();
     let pop = population_of(ids.iter().map(|id| shifted_subject(id)).collect());
     let subjects: Vec<SubjectResult> = ids
@@ -1299,7 +1323,7 @@ fn the_message_caps_the_named_subjects_and_the_details_do_not() {
         })
         .collect();
     let (msg, mut entry) = sentinel_warning();
-    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop, BloqMethod::Drop);
+    let full = name_nonfinite_subjects(msg, &mut entry, &subjects, &pop, &m, &m.default_params);
 
     assert!(full.contains(" 12 of 12 subjects "), "{full}");
     assert!(full.contains("s10 (contribution 2e20"), "{full}");
@@ -1449,7 +1473,7 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
     assert!(
         message.ends_with(
             " 1 of 10 subjects have an objective contribution that is itself unusable: \
-             3 (contribution 2e20, an unusable residual term on 11 of 11 observations, the \
+             3 (contribution 2e20, an unusable likelihood term on 11 of 11 observations, the \
              first at TIME 0.5 (DV 4.3905, IPRED NaN); a non-finite IPRED or PRED on 11 of \
              11 observations, the first at TIME 0.5)."
         ),
@@ -1485,7 +1509,7 @@ fn a_negative_covariate_on_one_record_names_the_record() {
         assert!(
             message.ends_with(
                 " 1 of 10 subjects have an objective contribution that is itself unusable: \
-                 3 (contribution 2e20, an unusable residual term on 8 of 11 observations, \
+                 3 (contribution 2e20, an unusable likelihood term on 8 of 11 observations, \
                  the first at TIME 4 (DV 11.0602, IPRED NaN); a non-finite IPRED or PRED on 8 \
                  of 11 observations, the first at TIME 4)."
             ),
@@ -1499,28 +1523,90 @@ fn a_negative_covariate_on_one_record_names_the_record() {
     }
 }
 
-/// **N1b — a row the fit scored as censored has no residual term to name** (#2266).
-/// Its `IWRES` is blanked to `NaN` under `bloq_method = m3`, which is not a defect of
-/// the record. Under `drop` the same row was fitted as an ordinary observation, so a
-/// `NaN` there is one. One subject, both methods: forcing the censoring test either
-/// way reddens one half.
+/// **N1b — a runaway residual-error η is named although `IWRES` reads 0** (#2266
+/// review). Under `iiv_on_ruv` the record's variance is scaled by `exp(2η)`, which
+/// overflows to `inf` at `η = 400`: the likelihood scores that record at `inf`, while
+/// `IWRES`, divided by `√V`, reads `0`. A selector on `IWRES` reported "every …
+/// term usable" here. The control is the same subject at `η = 0`, so the naming is
+/// caused by the η, and the subject's `IWRES` is set to `0` in both so it cannot be
+/// what decides.
+///
+/// Mutation (run): select on `IWRES²` → the `η = 400` half fires; drop the
+/// `residual_var_scale` factor from the term → the same.
 #[test]
-fn a_censored_row_is_not_named_as_an_unusable_residual() {
+fn a_runaway_residual_error_eta_names_every_record() {
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  omega ETA_RUV ~ 0.05
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+  iiv_on_ruv = ETA_RUV
+"#,
+    )
+    .expect("parse");
     let pop = population_of(vec![shifted_subject("A")]);
-    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
-    a.ofv_contribution = 2e20;
-    a.cens[3] = 1;
-    a.iwres[3] = f64::NAN;
-    for (bloq, want) in [
-        (BloqMethod::M3, "every residual term usable on its own;"),
+    for (eta_ruv, want) in [
         (
-            BloqMethod::Drop,
-            "an unusable residual term on 1 of 4 observations, the first at TIME 24 \
-             (DV 2, IPRED 4);",
+            400.0,
+            "an unusable likelihood term on 4 of 4 observations, the first at TIME 0.5 \
+             (DV 33.333333333333336, IPRED 1);",
+        ),
+        (
+            0.0,
+            "every observation's likelihood term usable on its own;",
         ),
     ] {
+        let mut a = crate::types::test_helpers::dummy_subject("A", 2, 4);
+        a.ofv_contribution = 2e20;
+        a.eta[1] = eta_ruv;
+        a.iwres = vec![0.0; 4];
         let (msg, mut entry) = sentinel_warning();
-        let full = name_nonfinite_subjects(msg, &mut entry, &[a.clone()], &pop, bloq);
+        let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &m, &m.default_params);
+        assert!(full.contains(want), "η_RUV = {eta_ruv}: {full}");
+    }
+}
+
+/// **N1c — a censored record is scored by its own M3 term, not as a Gaussian one.**
+/// Under `bloq_method = m3` a `CENS = 1` row contributes `−log Φ((LLOQ − f)/√V)`, which
+/// is small when the prediction is far below the limit; the Gaussian term of the
+/// same `DV` and an `IPRED` of 0 is `DV² × 1e12`. One record, both methods: the term
+/// has to come from the likelihood's own censoring branch, not a Gaussian formula.
+#[test]
+fn a_censored_record_is_scored_by_its_m3_term() {
+    let pop = population_of(vec![{
+        let mut d = shifted_subject("A");
+        d.cens[0] = 1;
+        d
+    }]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
+    a.ofv_contribution = 2e20;
+    a.ipred[0] = 0.0;
+    for (bloq, want) in [
+        (
+            BloqMethod::M3,
+            "every observation's likelihood term usable on its own;",
+        ),
+        (
+            BloqMethod::Drop,
+            "an unusable likelihood term on 1 of 4 observations, the first at TIME 0.5 \
+             (DV 33.333333333333336, IPRED 0);",
+        ),
+    ] {
+        let mut m = one_cpt_model();
+        m.bloq_method = bloq;
+        let (msg, mut entry) = sentinel_warning();
+        let full =
+            name_nonfinite_subjects(msg, &mut entry, &[a.clone()], &pop, &m, &m.default_params);
         assert!(full.contains(want), "{}: {full}", bloq.label());
     }
 }
@@ -1563,16 +1649,16 @@ fn warfarin_with_constant_dv(dv: f64) -> Population {
 ///
 /// At 20000 the EBE runs away and the engines disagree on the predictions, which is
 /// what #2266 reported: the prediction clause names `TIME 0.5` on the ODE and the
-/// closed form, at 200, names no record at all. The residual clause must name
+/// closed form, at 200, names no record at all. The likelihood-term clause must name
 /// `TIME 0` in all four cells. The prediction clauses are asserted too, so the cells
 /// keep straddling: if both engines stopped disagreeing, the fixture would no longer
 /// test the property the issue is about.
 ///
-/// Mutation (run): name the first non-finite prediction in the residual clause →
+/// Mutation (run): name the first non-finite prediction in the term clause →
 /// the ODE at 20000 names `TIME 0.5` and both engines at 200 name nothing; flag a
-/// residual only when `IWRES` is not finite → the ODE at 20000 and both at 200 fire.
+/// term only when it is not finite → the ODE at 20000 and both at 200 fire.
 #[test]
-fn a_runaway_ebe_names_the_record_with_the_unusable_residual_on_both_engines() {
+fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
     let expected_predictions = |dv: f64, ode: bool| match (dv == 200.0, ode) {
         (true, _) => "every IPRED and PRED finite",
         (false, false) => "the first at TIME 0)",
@@ -1592,14 +1678,14 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_residual_on_both_engines() {
             );
             assert_eq!(subjects[0]["id"], "3", "{engine} at DV {dv}");
             assert_eq!(
-                subjects[0]["first_unusable_residual_time"], 0.0,
+                subjects[0]["first_unusable_term_time"], 0.0,
                 "{engine} at DV {dv}: {subjects:?}"
             );
             assert!(
                 message.contains(&format!(
                     "observations, the first at TIME 0 (DV {dv}, IPRED "
                 )),
-                "{engine} at DV {dv}: the residual clause names TIME 0: {message}"
+                "{engine} at DV {dv}: the term clause names TIME 0: {message}"
             );
             assert!(
                 message.contains(expected_predictions(dv, ode)),

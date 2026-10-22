@@ -1228,44 +1228,18 @@ fn obs_nll_subject_from_preds_with_semantics(
                     }
                 }
             }
-            // FREM covariate pseudo-observations predict a covariate *value* (any
-            // real: centered/standardized/log-scale covariates are routinely ≤ 0),
-            // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
-            // covariate prediction up to 1e-12 fabricates a huge residual and, on the
-            // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
-            // (#406). Ordinary PK rows keep the positivity clamp.
-            let f = if frem_var.is_some() || semantics != PredNllSemantics::Marginal {
-                f
-            } else {
-                model.floor_prediction(f)
-            };
-            let v = match frem_var {
-                Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
-                Some(vv) => vv,
-                None if semantics == PredNllSemantics::Marginal => {
-                    (model.residual_variance_at_scaled(
-                        err_keys[j],
-                        f,
-                        sigma_values,
-                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    ) * ruv_scale)
-                        .max(1e-12)
-                }
-                None => {
-                    model.residual_variance_at_scaled(
-                        err_keys[j],
-                        f,
-                        sigma_values,
-                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    ) * ruv_scale
-                }
-            };
-            let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if model.bloq_in_force().is_censored_row(cens) {
-                nll += -m3_logcdf(y, f, v.sqrt(), cens);
-            } else {
-                nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
-            }
+            nll += obs_nll_term(
+                model,
+                subject.cens.get(j).copied().unwrap_or(0),
+                y,
+                f,
+                sigma_values,
+                frem_var,
+                ruv_scale,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                err_keys[j],
+                semantics,
+            );
         }
     }
 
@@ -1278,6 +1252,110 @@ fn obs_nll_subject_from_preds_with_semantics(
     }
 
     nll
+}
+
+/// One observation's term of [`obs_nll_subject_from_preds`]' per-record loop: the
+/// Gaussian `½(ln V + (y − f)²/V)`, or the M3 `−log Φ` on a row censored for this fit.
+/// The loop and [`obs_neg2ll_terms`] both call it, so the term `W_NONFINITE_OBJECTIVE`
+/// names a record by is the one the likelihood sums (#2266).
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_term(
+    model: &CompiledModel,
+    cens: i8,
+    y: f64,
+    f: f64,
+    sigma_values: &[f64],
+    frem_var: Option<f64>,
+    ruv_scale: f64,
+    ruv_mult: Option<&[f64]>,
+    err_key: usize,
+    semantics: PredNllSemantics,
+) -> f64 {
+    // FREM covariate pseudo-observations predict a covariate *value* (any
+    // real: centered/standardized/log-scale covariates are routinely ≤ 0),
+    // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
+    // covariate prediction up to 1e-12 fabricates a huge residual and, on the
+    // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
+    // (#406). Ordinary PK rows keep the positivity clamp.
+    let f = if frem_var.is_some() || semantics != PredNllSemantics::Marginal {
+        f
+    } else {
+        model.floor_prediction(f)
+    };
+    let v = match frem_var {
+        Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
+        Some(vv) => vv,
+        None if semantics == PredNllSemantics::Marginal => {
+            (model.residual_variance_at_scaled(err_key, f, sigma_values, ruv_mult) * ruv_scale)
+                .max(1e-12)
+        }
+        None => model.residual_variance_at_scaled(err_key, f, sigma_values, ruv_mult) * ruv_scale,
+    };
+    if model.bloq_in_force().is_censored_row(cens) {
+        -m3_logcdf(y, f, v.sqrt(), cens)
+    } else {
+        0.5 * (v.ln() + (y - f).powi(2) / v)
+    }
+}
+
+/// Each observation's own `−2 log L` term at the predictions `preds` and random
+/// effects `eta` — twice the per-record term [`obs_nll_subject_from_preds`] sums on
+/// its diagonal path, residual variance, `ln V`, `iiv_on_ruv` scale, FREM override and
+/// M3 term included (#2266). `None` for a record no Gaussian term scores (a
+/// non-Gaussian endpoint's row). A non-finite prediction gives `NaN`, since the
+/// positivity floor would otherwise turn it into `1e-12` (`f64::max` drops `NaN`).
+///
+/// Under a dense residual covariance (`block_sigma` across records, a `correlation`
+/// line) the likelihood does not split by record; this is the diagonal term, which
+/// is what a single record contributes on its own.
+pub(crate) fn obs_neg2ll_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+) -> Vec<Option<f64>> {
+    let frem_ov =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
+    let ruv_scale = model.residual_var_scale(eta);
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let err_keys = model.error_spec.obs_keys(subject);
+    subject
+        .observations
+        .iter()
+        .enumerate()
+        .map(|(j, &y)| {
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                return None;
+            }
+            let f = preds.get(j).copied().unwrap_or(f64::NAN);
+            if !f.is_finite() {
+                return Some(f64::NAN);
+            }
+            let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            Some(
+                2.0 * obs_nll_term(
+                    model,
+                    subject.cens.get(j).copied().unwrap_or(0),
+                    y,
+                    f,
+                    sigma_values,
+                    frem_var,
+                    ruv_scale,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                    err_keys[j],
+                    PredNllSemantics::Marginal,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
@@ -6976,4 +7054,86 @@ pub(crate) fn conditional_obs_nll_from_preds(
         eta,
         semantics,
     )
+}
+
+#[cfg(test)]
+mod obs_term_tests {
+    use super::*;
+    use crate::types::BloqMethod;
+    use approx::assert_relative_eq;
+    use std::collections::HashMap;
+
+    /// #2266: the per-record terms `W_NONFINITE_OBJECTIVE` names a record by are the
+    /// terms the likelihood sums. Combined error, `iiv_on_ruv` at a non-zero η and one
+    /// M3-censored row, so each part of `obs_nll_term` is live; the sum must equal
+    /// twice `obs_nll_subject_from_preds` to rounding (the sums associate differently).
+    #[test]
+    fn obs_neg2ll_terms_sum_to_the_likelihood() {
+        let mut model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  omega ETA_RUV ~ 0.05
+  sigma PROP ~ 0.1 (sd)
+  sigma ADD ~ 0.5 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP, ADD)
+  iiv_on_ruv = ETA_RUV
+"#,
+        )
+        .expect("parse");
+        model.bloq_method = BloqMethod::M3;
+        let subject = Subject {
+            obs_rgroup: Vec::new(),
+            id: "1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![50.0, 4.0, 30.0, 45.0, 35.0, 25.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0, 1, 0, 0, 0, 0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let preds = [48.0, 3.0, 33.0, 41.0, 30.0, 27.0];
+        let eta = [0.1, 0.7];
+        let p = &model.default_params;
+        let terms = obs_neg2ll_terms(&model, &subject, &preds, &p.theta, &p.sigma.values, &eta);
+        assert!(
+            terms.iter().all(|t| t.is_some_and(f64::is_finite)),
+            "{terms:?}"
+        );
+        let sum: f64 = terms.iter().map(|t| t.unwrap()).sum();
+        let nll = obs_nll_subject_from_preds(
+            &model,
+            &subject,
+            &preds,
+            &p.theta,
+            &p.sigma.values,
+            ResidualCov::block_sigma(&[]),
+            &eta,
+        );
+        assert_relative_eq!(sum, 2.0 * nll, max_relative = 1e-14);
+    }
 }

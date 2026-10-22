@@ -1837,31 +1837,35 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 ///
 /// For each subject named, the sentence gives the contribution, then two clauses:
 ///
-/// 1. **The records whose own residual term is unusable (#2266)**, with the written
-///    `TIME`, `DV` and `IPRED` of the first. A record's term is `IWRES²`, the weighted
-///    residual it adds to the individual objective at η̂, and it is unusable when it
-///    fails the same `ofv_is_valid` test as the objective: a non-finite `IWRES`, or
-///    one past `√DIVERGENCE_OFV = 1e7`. This is the record to look at first. A
+/// 1. **The records whose own likelihood term is unusable (#2266)**, with the
+///    written `TIME`, `DV` and `IPRED` of the first. The term is the record's own
+///    `−2 log L` at η̂ and the fitted parameters, from
+///    [`crate::stats::likelihood`]'s per-record term (`obs_neg2ll_terms`) — the one
+///    the likelihood sums, so the residual variance, `ln V`, an `iiv_on_ruv` scale
+///    and an M3 censored term are all in it. It is unusable when it fails the same
+///    `ofv_is_valid` test as the objective. This is the record to look at first. A
 ///    runaway η̂ can leave an early record with a finite `IPRED` of 0 that a
 ///    proportional error scores at `DV² × 1e12` (the variance floor), and the first
 ///    non-finite *prediction* then names a later record, or none: on the same
 ///    subject the closed form and the ODE disagree on the predictions but agree on
-///    this record. A row the fit scored as censored has no residual term (its `IWRES`
-///    is blanked), so it is skipped.
+///    this record. A runaway residual-error η makes `V` infinite, which `IWRES`
+///    (divided by `√V`) reports as `0`; the term reports it as `inf`. A record no
+///    Gaussian term scores (a non-Gaussian endpoint's row) is skipped.
 /// 2. The observations whose `IPRED` or `PRED` is not finite, with the written
 ///    `TIME` of the first, as #2038 wrote it. When none is, it says so: the cause is
 ///    then a finite prediction the residual model cannot score (clause 1 names it),
 ///    a non-Gaussian term, a non-PD covariance, or a refused subject.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
-/// whose position does not match `population` gets no `TIME`, and its first unusable
-/// residual is named by its 1-based observation number instead.
+/// whose position does not match `population` gets no `TIME`, and since its `DV`s
+/// are then unknown, no likelihood clause either.
 pub(crate) fn name_nonfinite_subjects(
     msg: String,
     entry: &mut WarningEntry,
     subjects: &[SubjectResult],
     population: &Population,
-    bloq: crate::types::BloqMethod,
+    model: &CompiledModel,
+    params: &ModelParameters,
 ) -> String {
     let ofv_is_valid = crate::estimation::outer_optimizer::ofv_is_valid;
     let named: Vec<NamedSubject> = subjects
@@ -1875,11 +1879,24 @@ pub(crate) fn name_nonfinite_subjects(
                         && s.pred.get(j).is_some_and(|v| v.is_finite()))
                 })
                 .collect();
-            let unusable: Vec<usize> = (0..s.n_obs)
-                .filter(|&j| !bloq.is_censored_row(s.cens.get(j).copied().unwrap_or(0)))
-                .filter(|&j| !s.iwres.get(j).is_some_and(|w| ofv_is_valid(w * w)))
-                .collect();
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
+            let unusable: Vec<usize> = data
+                .map(|d| {
+                    crate::stats::likelihood::obs_neg2ll_terms(
+                        model,
+                        d,
+                        &s.ipred,
+                        &params.theta,
+                        &params.sigma.values,
+                        s.eta.as_slice(),
+                    )
+                })
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.is_some_and(|t| !ofv_is_valid(t)))
+                .map(|(j, _)| j)
+                .collect();
             NamedSubject {
                 s,
                 bad,
@@ -1898,25 +1915,17 @@ pub(crate) fn name_nonfinite_subjects(
             unusable,
             data,
         } = n;
-        let ipred_at = |j: usize| s.ipred.get(j).copied().unwrap_or(f64::NAN);
         let residuals = match (unusable.first(), data) {
-            (None, _) => "every residual term usable on its own".to_string(),
+            (_, None) => "likelihood terms not checked".to_string(),
+            (None, Some(_)) => "every observation's likelihood term usable on its own".to_string(),
             (Some(&j), Some(d)) => format!(
-                "an unusable residual term on {} of {} observations, the first at TIME {} \
+                "an unusable likelihood term on {} of {} observations, the first at TIME {} \
                  (DV {}, IPRED {})",
                 unusable.len(),
                 s.n_obs,
                 d.readout_time(j),
                 d.observations.get(j).copied().unwrap_or(f64::NAN),
-                ipred_at(j)
-            ),
-            (Some(&j), None) => format!(
-                "an unusable residual term on {} of {} observations, the first being \
-                 observation {} (IPRED {})",
-                unusable.len(),
-                s.n_obs,
-                j + 1,
-                ipred_at(j)
+                s.ipred.get(j).copied().unwrap_or(f64::NAN)
             ),
         };
         let records = match (bad.first(), data) {
@@ -1966,8 +1975,8 @@ pub(crate) fn name_nonfinite_subjects(
                 "nonfinite_predictions": n.bad.len(),
                 "n_obs": n.s.n_obs,
                 "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
-                "unusable_residuals": n.unusable.len(),
-                "first_unusable_residual_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "unusable_terms": n.data.map(|_| n.unusable.len()),
+                "first_unusable_term_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
             })
         })
         .collect();
@@ -1982,7 +1991,7 @@ pub(crate) fn name_nonfinite_subjects(
 }
 
 /// One subject [`name_nonfinite_subjects`] names: its result, the observations with a
-/// non-finite `IPRED` or `PRED`, those with an unusable residual term, and its data
+/// non-finite `IPRED` or `PRED`, those with an unusable likelihood term, and its data
 /// when the result lines up with it.
 struct NamedSubject<'a> {
     s: &'a SubjectResult,

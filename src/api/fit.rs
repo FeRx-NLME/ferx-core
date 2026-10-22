@@ -2933,7 +2933,8 @@ fn fit_inner(
             &mut entry,
             &subjects,
             population,
-            model.bloq_in_force(),
+            model,
+            &result.params,
         );
         warnings.push(msg);
         native_warnings.push(entry);
