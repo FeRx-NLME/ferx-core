@@ -269,6 +269,12 @@ pub(crate) const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
 /// `inflation = 4.0` is the recommended default: heavier tails account for the
 /// uncertainty introduced by the non-PD correction.
 ///
+/// Relative to the largest is still not invariant to rescaling *one* coordinate, which is
+/// what writing an identity-packed θ in other units does. So the floor is taken on the
+/// equilibrated `C = D⁻¹ H D⁻¹` of [`invert_psd_with_floor_unit_free`], with the same `units`
+/// mask and so the same `dᵢ`, and the proposal mapped back, `D⁻¹ · C̃⁻¹ · D⁻¹` (#2179). With
+/// no coordinate to rescale `D = I` and `H` is used as it is.
+///
 /// The result is embedded into the full packed-parameter covariance (zeros for
 /// FIX parameters) and explicitly symmetrised, since the eigen-reconstruction
 /// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
@@ -277,8 +283,16 @@ pub(crate) fn build_non_pd_fallback_proposal(
     free_idx: &[usize],
     n_full: usize,
     inflation: f64,
+    units: &[CoordUnits],
 ) -> DMatrix<f64> {
-    let eig = SymmetricEigen::new(hess_free_sym.clone());
+    let n = hess_free_sym.nrows();
+    debug_assert_eq!(units.len(), n, "one flag per coordinate");
+    let scales = unit_coordinate_scales(hess_free_sym, units);
+    let cond = match &scales {
+        Some(d) => DMatrix::from_fn(n, n, |i, j| hess_free_sym[(i, j)] / (d[i] * d[j])),
+        None => hess_free_sym.clone(),
+    };
+    let eig = SymmetricEigen::new(cond);
     // Largest absolute eigenvalue anchors the relative floor. Guard the
     // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
     // stays positive and we never divide by zero.
@@ -293,7 +307,14 @@ pub(crate) fn build_non_pd_fallback_proposal(
     // any floating-point asymmetry from the matrix products.
     let cov_free_raw =
         &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
-    let cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    let mut cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    if let Some(d) = &scales {
+        for i in 0..n {
+            for j in 0..n {
+                cov_free[(i, j)] /= d[i] * d[j];
+            }
+        }
+    }
     embed_free(&cov_free, free_idx, n_full)
 }
 
@@ -2317,8 +2338,13 @@ pub(crate) fn compute_covariance_for(
             // So only build the proposal when the eigenvalues are finite.
             match extract_eigenvalues(&hess_free_sym) {
                 Some(eigvals) => {
-                    let fallback_proposal =
-                        build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+                    let fallback_proposal = build_non_pd_fallback_proposal(
+                        &hess_free_sym,
+                        &free_idx,
+                        n,
+                        4.0,
+                        &unit_coords,
+                    );
                     return CovarianceStepResult::FailedNonPd {
                         reason: format_non_pd_warning(&eigvals),
                         fallback_proposal,
@@ -2410,6 +2436,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &unit_coords,
                     ),
                 }
             }
@@ -2432,6 +2459,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &unit_coords,
                     ),
                 };
             }
@@ -2934,7 +2962,7 @@ pub(crate) fn invert_psd_with_floor_unit_free(
 
 /// The diagonal scaling `d` of [`invert_psd_with_floor_unit_free`], or `None` when it is the
 /// identity (no coordinate with a usable scale), so the unscaled path is taken unchanged.
-fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Vec<f64>> {
+pub(crate) fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Vec<f64>> {
     let usable = |m: f64| m.is_finite() && m > 0.0;
     let n = sym.nrows();
     // The known scales first: `dᵢ = 1 / sᵢ`, so `Cᵢᵢ = Mᵢᵢ·sᵢ²`.
@@ -2975,7 +3003,7 @@ fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Ve
 /// `-∞`) but is not a parameter in user units, so it stays dimensionless: equilibrated, a flat
 /// weight — one feeding a saturated unit — would sit at the anchor and escape the floor and the
 /// `covariance_regularized` warning (#2273).
-fn free_coordinate_units(
+pub(crate) fn free_coordinate_units(
     template: &ModelParameters,
     x_hat: &[f64],
     free_idx: &[usize],

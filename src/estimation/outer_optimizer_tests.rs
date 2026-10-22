@@ -440,7 +440,8 @@ fn test_invert_psd_with_floor_rejects_negative_definite() {
     // extract_eigenvalues succeeds and the proposal is all-finite and PD.
     let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
     assert!(eigs.iter().all(|e| e.is_finite()));
-    let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     assert!(
         proposal.iter().all(|v| v.is_finite()),
         "fallback proposal must be finite for a finite non-PD Hessian"
@@ -4192,7 +4193,8 @@ fn bench_cov_hessian_throughput() {
 fn build_fallback_proposal_is_pd_and_inflated() {
     let hess = DMatrix::from_row_slice(2, 2, &[-2.0_f64, 0.0, 0.0, 4.0]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     // Result must be symmetric PD.
     assert!(proposal[(0, 0)] > 0.0, "diagonal must be positive");
     assert!(proposal[(1, 1)] > 0.0, "diagonal must be positive");
@@ -4222,7 +4224,8 @@ fn build_fallback_proposal_is_pd_and_inflated() {
 fn build_fallback_proposal_zeros_fixed_params() {
     let hess = DMatrix::from_row_slice(1, 1, &[2.0_f64]);
     let free_idx = [0usize];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0, &[CoordUnits::Dimensionless; 1]);
     assert_eq!(proposal.nrows(), 3);
     assert_eq!(proposal.ncols(), 3);
     assert!(
@@ -4243,7 +4246,8 @@ fn build_fallback_proposal_caps_condition_number() {
     // diag(1000, 1e-9): one well-determined direction, one near-flat.
     let hess = DMatrix::from_row_slice(2, 2, &[1000.0_f64, 0.0, 0.0, 1e-9]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     let eig = SymmetricEigen::new(proposal.clone());
     let max_var = eig.eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
     let min_var = eig.eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
@@ -4261,6 +4265,59 @@ fn build_fallback_proposal_caps_condition_number() {
         max_var / min_var,
         FALLBACK_PROPOSAL_MAX_COND
     );
+}
+
+/// #2179: the fallback proposal's relative floor must not see an identity-packed θ's units.
+/// Writing coordinate 1 in units `k` times smaller divides its row and column of the Hessian by
+/// `k`. Unflagged, at `k = 1e6` its curvature (`2e-12`) falls under `|λ|_max / 1e8 = 4e-8`, and at
+/// `k = 1e-6` its `2e12` lifts the floor to `2e4` over both other directions. Flagged, the
+/// proposal at every `k` is the `k = 1` one with row and column 1 scaled by `k`, each entry
+/// relative to `sqrt(Pᵢᵢ Pⱼⱼ)`. The straddle: unflagged, the same Hessians miss it by orders
+/// of magnitude.
+#[test]
+fn build_fallback_proposal_is_unit_free_for_an_identity_theta() {
+    let hess = DMatrix::from_row_slice(3, 3, &[4.0, 0.5, 0.2, 0.5, 2.0, 0.3, 0.2, 0.3, -1.0]);
+    let units = [
+        CoordUnits::Dimensionless,
+        CoordUnits::IdentityTheta,
+        CoordUnits::Dimensionless,
+    ];
+    let f = |k: f64, i: usize| if i == 1 { k } else { 1.0 };
+    let reference = build_non_pd_fallback_proposal(&hess, &[0, 1, 2], 3, 4.0, &units);
+    let worst_gap = |p: &DMatrix<f64>, k: f64| {
+        let mut worst = 0.0_f64;
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(p[(i, j)].is_finite(), "k = {k}: P({i},{j}) = {}", p[(i, j)]);
+                let want = reference[(i, j)] * f(k, i) * f(k, j);
+                let scale = (reference[(i, i)] * reference[(j, j)]).sqrt() * f(k, i) * f(k, j);
+                worst = worst.max((p[(i, j)] - want).abs() / scale);
+            }
+        }
+        worst
+    };
+    for k in [1e6, 1e-6] {
+        let hess_k = DMatrix::from_fn(3, 3, |i, j| hess[(i, j)] / (f(k, i) * f(k, j)));
+        let flagged = build_non_pd_fallback_proposal(&hess_k, &[0, 1, 2], 3, 4.0, &units);
+        let worst = worst_gap(&flagged, k);
+        eprintln!("k = {k:e}: worst rel {worst:.3e}");
+        // Measured: 4.7e-16 (k = 1e6), 5.8e-16 (k = 1e-6); bound 1e-12. Unflagged: ~1.0 at both.
+        assert!(worst < 1e-12, "k = {k}: worst rel {worst}");
+
+        let unflagged = build_non_pd_fallback_proposal(
+            &hess_k,
+            &[0, 1, 2],
+            3,
+            4.0,
+            &[CoordUnits::Dimensionless; 3],
+        );
+        let miss = worst_gap(&unflagged, k);
+        eprintln!("k = {k:e}: unflagged worst rel {miss:.3e}");
+        assert!(
+            miss > 1e-2,
+            "k = {k}: the fixture no longer reaches the floor unflagged"
+        );
+    }
 }
 
 // ── select_fd_step ───────────────────────────────────────────────────────
