@@ -1275,7 +1275,12 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
 /// Whether a block of two or more columns resolves every subject's
 /// observations: no level holds two different observation times of one
 /// subject (#1650). Replicates at one time still resolve, since a random
-/// effect's effect is the same at both.
+/// effect's effect is the same at both — but only replicates: two records at
+/// one instant that the data tells apart, two arms of a study keyed as
+/// occasions, a `TRT` that differs, or two compartments, can be moved
+/// differently by a random effect that the one level they share moves alike,
+/// so the block does not resolve them (#2131). The span certificate then
+/// measures, row by row, whether the levels reproduce the random effect.
 ///
 /// Such a block is a free curve per subject at the observed times, so it
 /// reproduces any per-subject effect at all, whatever route a random effect
@@ -1293,8 +1298,9 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
-                // One instant, so a random effect moves both alike (#1959).
-                Some(&(_, j0)) => subject.same_instant(j0, j),
+                // One instant, so a random effect moves both alike (#1959) —
+                // when nothing else tells the two records apart (#2131).
+                Some(&(_, j0)) => subject.same_instant(j0, j) && replicates(subject, j0, j),
                 None => {
                     seen.push((level, j));
                     true
@@ -1302,6 +1308,18 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
             }
         })
     })
+}
+
+/// Whether observation records `j` and `k` of `subject` carry the same
+/// occasion, compartment and record covariates: the data gives a random
+/// effect no way to move one and not the other at one instant.
+fn replicates(subject: &Subject, j: usize, k: usize) -> bool {
+    fn same<T: PartialEq>(v: &[T], j: usize, k: usize) -> bool {
+        v.get(j) == v.get(k)
+    }
+    same(&subject.occasions, j, k)
+        && same(&subject.obs_cmts, j, k)
+        && same(&subject.obs_covariates, j, k)
 }
 
 /// Whether every covariate in `covariates` is constant within every unit's

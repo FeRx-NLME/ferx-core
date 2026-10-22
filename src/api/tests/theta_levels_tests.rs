@@ -9627,6 +9627,142 @@ mod absorption {
     fn branches_p16() -> String {
         format!("  if (OCC > 1) {{\n    E0 = {S}\n  }} else {{\n    E0 = 2 * ({S})\n  }}")
     }
+
+    /// #2131's model: one study per subject, a placebo arm (`OCC = 1`, `TRT =
+    /// 0`) and a drug arm (`OCC = 2`, `TRT = 1`) at every visit, so both arms of
+    /// a study read one level at each time. `ETA_EM` is on the drug effect, read
+    /// by the drug arm only; with `both`, it is on `BASE` with the drug's time
+    /// shape instead, read by both arms alike.
+    fn arms_2131(contrast: &str, both: bool, tve0: bool) -> String {
+        let modifier = if contrast.is_empty() {
+            String::new()
+        } else {
+            format!(", contrast = {contrast}")
+        };
+        let (shift, em) = if both {
+            (" + ETA_EM * TIME / (TIME + ET50)", "EMAX")
+        } else {
+            ("", "EMAX * exp(ETA_EM)")
+        };
+        let (theta, base) = if tve0 {
+            (
+                "  theta TVE0(1.5, -10.0, 10.0)\n",
+                "TVE0 + PLACEBO + ETA_E0",
+            )
+        } else {
+            ("", "PLACEBO")
+        };
+        let omega = if tve0 { "  omega ETA_E0 ~ 4.0\n" } else { "" };
+        format!(
+            r#"
+[parameters]
+{theta}  theta PLACEBO[STUDY, TIME{modifier}](0.0, -50.0, 50.0)
+  theta EMAX(3.0, 0.1, 20.0)
+  theta ET50(1.5, 0.1, 20.0)
+{omega}  omega ETA_EM ~ 0.09
+  kappa KAPPA_ARM ~ 1.0
+  sigma ADD ~ 0.1
+[individual_parameters]
+  BASE = {base} + KAPPA_ARM{shift}
+  EMAXI = {em}
+  DRUG = TRT * EMAXI * TIME / (TIME + ET50)
+[structural_model]
+  y = BASE - DRUG
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    /// [`occ_pop`] with two arms per study, `TRT` the arm's 0/1 treatment flag.
+    fn trt_pop() -> Population {
+        let mut p = occ_pop(3, 1, &T6, 2, true);
+        for s in p.subjects.iter_mut() {
+            for m in s.obs_covariates.iter_mut() {
+                let trt = m["OCC"] - 1.0;
+                m.insert("TRT".to_string(), trt);
+            }
+        }
+        p.covariate_names.push("TRT".to_string());
+        p
+    }
+
+    /// #2131. Two records at one instant are replicates only while their
+    /// occasion, compartment and record covariates all agree: each one alone
+    /// tells them apart.
+    ///
+    /// Mutation — any of the three comparisons in `replicates` dropped: its row
+    /// reads as replicates.
+    #[test]
+    fn one_differing_field_tells_two_records_at_one_instant_apart() {
+        let mut p = occ_pop(1, 1, &[1.0, 1.0], 1, false);
+        let s = &mut p.subjects[0];
+        s.occasions = vec![1, 1];
+        assert!(replicates(s, 0, 1), "identical records");
+        let base = s.clone();
+        let mut occ = base.clone();
+        occ.occasions[1] = 2;
+        let mut cmt = base.clone();
+        cmt.obs_cmts[1] = 2;
+        let mut cov = base.clone();
+        cov.obs_covariates[1].insert("TRT".to_string(), 1.0);
+        for (tag, s) in [("occasion", occ), ("compartment", cmt), ("covariate", cov)] {
+            assert!(!replicates(&s, 0, 1), "{tag} differs");
+        }
+    }
+
+    /// #2131. Two arms at one visit share a level, so a block with a level per
+    /// (study, time) does not resolve the observations: a random effect that
+    /// moves one arm only is not a shift common to both, which is all a level
+    /// is. The issue's model binds — `auto` and explicit within leave each
+    /// study's mean to `ETA_E0`, and `ETA_EM` keeps a direction of its own —
+    /// and without `TVE0` and `ETA_E0` it binds under `none`, where before both
+    /// were refused as absorbing `ETA_EM`. The straddle: the same models with
+    /// `ETA_EM` read alike by both arms are still refused, by the span
+    /// certificate's measured clause now that the walk names no route. Three
+    /// of the four models agree with the joint oracle under every contrast.
+    ///
+    /// Mutation — `resolves_observations` taking two records at one instant as
+    /// replicates whatever tells them apart (the pre-#2131 rule): the drug-arm
+    /// rows are refused with "absorb `ETA_E0` and `ETA_EM` together".
+    #[test]
+    fn two_arms_sharing_a_level_do_not_absorb_a_drug_arm_eta() {
+        let pop = trt_pop();
+        let mut wrong = Vec::new();
+        for (c, want) in [
+            ("", LevelContrast::SumToZeroWithin),
+            ("sum_to_zero_within", LevelContrast::SumToZeroWithin),
+        ] {
+            match try_bind(&arms_2131(c, false, true), &pop) {
+                Ok((got, 15)) if got == want => {}
+                got => wrong.push(format!("drug arm {c:?}: {got:?}")),
+            }
+            match try_bind(&arms_2131(c, true, true), &pop) {
+                Err(e) if e.contains("`ETA_E0` and `ETA_EM` together") => {}
+                got => wrong.push(format!("both arms {c:?}: {got:?}")),
+            }
+        }
+        match try_bind(&arms_2131("none", false, false), &pop) {
+            Ok((LevelContrast::Unconstrained, 18)) => {}
+            got => wrong.push(format!("drug arm, none, no TVE0: {got:?}")),
+        }
+        match try_bind(&arms_2131("none", true, false), &pop) {
+            Err(e) if e.contains(MEASURED_AT) && e.contains("`ETA_EM`") => {}
+            got => wrong.push(format!("both arms, none, no TVE0: {got:?}")),
+        }
+        // Not "both arms, no TVE0": with nothing carrying the levels' mean the
+        // oracle prefers global sum-to-zero under `auto`, while a nested block
+        // that absorbs a random effect resolves `auto` to within — the same
+        // choice before #2131, by the route clause, so not this issue's.
+        for (tag, both, tve0) in [
+            ("drug arm", false, true),
+            ("both arms", true, true),
+            ("drug arm, no TVE0", false, false),
+        ] {
+            agrees_with_joint_oracle(tag, &|c| arms_2131(c, both, tve0), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "#2131:\n{}", wrong.join("\n"));
+    }
 }
 
 // ── #1730: re-binding a model already bound ─────────────────────────────────
