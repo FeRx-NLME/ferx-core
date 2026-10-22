@@ -324,11 +324,11 @@ fn try_joint_pktte_shared_solve(
         })
         .collect();
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
-    // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
-    // No-op for Form-C / no-init / linear-scale models; FREM is excluded by the guard.
+    // (compute_predictions_with_tv_into_with_schedule): init impulse, then the sink's
+    // shared tail ([scaling], LTBS, FREM override). No-op for Form-C / no-init /
+    // linear-scale models; the FREM step is a no-op too, since the guard excludes FREM.
     crate::pk::add_analytical_init(model, subject, theta, eta, &mut preds);
-    crate::pk::apply_scaling(model, subject, theta, eta, &mut preds);
-    crate::pk::apply_log_transform(model, &mut preds);
+    crate::pk::to_observation_scale(model, subject, theta, eta, &mut preds);
 
     Some(JointPkTteSolve {
         preds,
