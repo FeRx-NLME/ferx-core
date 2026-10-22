@@ -373,6 +373,38 @@ equations by default, and integrates non-stiff systems with an adaptive Dormand-
 
 The solver automatically adapts step sizes based on local error estimates.
 
+### Two prediction engines agree to solver tolerance, not bit-for-bit {#engine-reproducibility}
+
+An ODE subject is integrated by one of two engines. A subject with no time-varying
+covariates, resets or `TIME` reads takes the **single-pass** engine: one solve per dose
+interval, with the observations as output points. Every other subject takes the
+**event-driven** walk, which starts a fresh solve at every record so that each record's
+covariate snapshot governs the interval ending there. Both meet `ode_reltol` /
+`ode_abstol`, but they take different steps, so their predictions agree to the solver
+tolerance and not to the last bit.
+
+This shows up when two datasets that should predict the same land on different engines.
+Before scoring, `fit()` clears the per-record snapshots of every subject whose referenced
+covariates never differ from its baseline value, so such a subject runs on the
+single-pass engine. Two consequences
+([#1873](https://github.com/FeRx-NLME/ferx-core/issues/1873)):
+
+- Changing a covariate at a single record moves that subject to the event-driven engine.
+  Its IPRED can then move by about the solver tolerance, even when the changed value
+  reaches nothing the predictions read (for example, a transit `MTT` at an observation
+  record, where no dose reads it). Measured at the default tolerances, the gap was
+  3.4e-7 relative. It falls to 4.8e-11 at `ode_reltol = 1e-8` and to 4.0e-15 at `1e-12`.
+  Anything evaluated at the EBE, such as η̂ or a `[derived]` integral, inherits the gap.
+- `predict()` and `compute_predictions_with_states` do not prune, so they run on the
+  subject exactly as given. The data reader attaches snapshots to a subject as soon as any
+  covariate column varies within it, including a column the model never reads (a `DAY`
+  column, say). Such a subject, and a hand-built `Population` that carries constant
+  snapshots, is event-driven in `predict()` and single-pass inside `fit()`, so the two
+  report IPREDs that differ at the solver tolerance.
+
+If a comparison has to be exact, put both sides on the same engine, or tighten
+`ode_reltol` / `ode_abstol` until the gap is below what you are measuring.
+
 ### A right-hand side that reads model time is always integrated {#non-autonomous-rhs}
 
 For some models ferx skips integration entirely. A static multi-route absorption model with a

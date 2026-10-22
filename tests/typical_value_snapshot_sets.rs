@@ -1733,3 +1733,97 @@ fn states_read_each_dose_attribute_at_its_own_record_not_the_first() {
          another dose record's F1"
     );
 }
+
+/// #1873 — `fit()`'s IPRED for the S9 pair (no `[derived]` block) differed between the
+/// arms at integrator tolerance, while `compute_predictions_with_states` on the same two
+/// populations agreed bit-for-bit. That is not a `$PK` value leaking into the step control.
+/// `fit()` scores the population `fitted_population` prepares, and its
+/// `prune_irrelevant_tv_covariates` clears a subject's snapshots when no referenced
+/// covariate differs from the baseline. The control (`WT = 0` everywhere) is pruned onto
+/// the single-pass ODE engine, which integrates each dose interval in one solve with
+/// `saveat` at the observations. The bad arm keeps a varying `WT` and stays on the
+/// event-driven walk, which restarts the stepper at every record. Two engines, two step
+/// sequences.
+///
+/// Pinned three ways:
+/// - **the straddle**: the prune routes the control off the event-driven path and keeps the
+///   bad arm on it. Without this, the next two checks could pass with both arms on one
+///   engine.
+/// - **`fit()`'s IPRED is `compute_predictions_with_states` on the pruned population** at the
+///   fit's own θ, bit-for-bit, per arm. Dies if `fit()` stops pruning, or prunes a subject
+///   whose covariate does vary.
+/// - **the arms agree to integrator tolerance, and the gap closes with it**: two
+///   engines integrating the same system. Bounds measured on macOS arm64 (worst
+///   relative gap over the four observations): 3.37e-7 at the default 1e-4/1e-6, 4.78e-11
+///   at 1e-8/1e-10 and 3.99e-15 at 1e-12/1e-14; each bound is ~10× that. A dose
+///   quantity read at observation 1 (`MTT = −9` clamps the transit kernel) loses the drug
+///   and misses every bound by orders of magnitude.
+#[test]
+fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
+    use ferx_core::{fit, EstimationMethod, FitOptions};
+    let src = TV_COV_TRANSIT_AUC_MODEL
+        .split("[derived]")
+        .next()
+        .expect("model text");
+    let model = parse_full_model(src).expect("model parses").model;
+    for (reltol, abstol, bound) in [
+        (1e-4, 1e-6, 3e-6),
+        (1e-8, 1e-10, 5e-10),
+        (1e-12, 1e-14, 4e-14),
+    ] {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            verbose: false,
+            ode_reltol: reltol,
+            ode_abstol: abstol,
+            ..FitOptions::default()
+        };
+        // `compute_predictions_with_states` reads the spec's own tolerances; `fit()` arms
+        // them as a fit-scoped override.
+        let mut synced = parse_full_model(src).expect("model parses").model;
+        synced.sync_ode_solver_opts(&opts);
+
+        let arm = |wt_obs1: f64| -> (Vec<f64>, bool) {
+            let pop = population(states_subject(two_bolus_doses(), 2, wt_obs1), &["WT"]);
+            assert!(
+                pop.subjects[0].has_tv_covariates(),
+                "both arms start with snapshots"
+            );
+            let res = fit(&model, &pop, &model.default_params, &opts).expect("maxiter-0 fit runs");
+            let mut pruned = pop.clone();
+            pruned.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            let subject = &pruned.subjects[0];
+            let (want, _) =
+                ferx_core::pk::compute_predictions_with_states(&synced, subject, &res.theta, &[]);
+            let got = res.subjects[0].ipred.clone();
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "rtol {reltol:e}, WT = {wt_obs1} at observation 1: fit()'s IPRED is not the \
+                 prediction of the population it scores: {got:?} vs {want:?}"
+            );
+            (got, subject.has_tv_covariates())
+        };
+        let ((bad, bad_tv), (ctl, ctl_tv)) = (arm(10.0), arm(0.0));
+        assert!(
+            bad_tv && !ctl_tv,
+            "the straddle is gone: after the prune the bad arm must stay event-driven \
+             ({bad_tv}) and the control must take the single-pass path ({ctl_tv})"
+        );
+        let mut worst = 0.0_f64;
+        for (b, c) in bad.iter().zip(&ctl) {
+            assert!(
+                b.is_finite() && c.is_finite() && *c > 0.1,
+                "live drug: {bad:?} vs {ctl:?}"
+            );
+            worst = worst.max(((b - c) / c).abs());
+        }
+        assert!(
+            worst <= bound,
+            "rtol {reltol:e}: the two engines disagree by {worst:e} relative, beyond the \
+             tolerance-level {bound:e}: {bad:?} vs {ctl:?}"
+        );
+    }
+}
