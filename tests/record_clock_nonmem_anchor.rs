@@ -17,6 +17,23 @@
 //! On the merge-base `9a12c915`, TeunP measured the worst `PRED` error as 3.90, 4.00 and 2.47,
 //! so each anchor is red without the fixes.
 //!
+//! * `addl_tie` (#1909): an `ADDL`-implied dose is not an event record in NONMEM. The advance
+//!   across it runs under the next record at or after it, so the implied dose takes that
+//!   record's covariates, not its parent row's. Fourteen cases on `ADVAN1` with
+//!   `CL = TVCL·X`. IDs 1–9: an `EVID=2` or `MDV=1` row, an observation, or nothing at the
+//!   implied dose's time; a constant-`X` control; explicit doses tied with an `EVID=2` row
+//!   in either order; an `ADDL` infusion; and a train whose next record is two doses away.
+//!   IDs 10–14 give the record at the implied dose's time a different `X` from the record
+//!   after it, so each rule of the selection is visible in `PRED`: a co-timed record
+//!   governs (10); co-timed records resolve by file order, in both orders (11, 12); and
+//!   an explicit dose governs, after the implied one (13) or tied with it (14). Each case
+//!   is multi-dose, so each implied dose lands on residual drug. The analytic and ODE twins
+//!   run against the same `.tab`. NONMEM 7.5.1, `METHOD=0 MAXEVAL=0`, `.tab` at 17
+//!   significant figures. The control stream equals the `.lst`'s echo up to layout. A
+//!   closed form outside both engines, a sum of exponentials over the records,
+//!   reproduces the `.tab` to rounding under this rule. Under the parent-row rule it
+//!   reproduces ferx before the fix: a worst error of 2.34 (30 %, ID 9 at `TIME 30`).
+//!
 //! Tier 2: one `predict()` per anchor.
 
 use ferx_core::{parse_model_file, predict, read_nonmem_csv};
@@ -56,11 +73,13 @@ fn nonmem_preds(name: &str) -> Vec<(String, f64, f64)> {
         .collect()
 }
 
-/// Runs the `_fit.ferx` twin's `predict()` on `csv` and returns the worst `|PRED − NONMEM|`.
-/// `pk_only` is each subject's expected pk-only record times: the rows must reach the engine,
-/// or the anchor would pass on a reader that drops them only where `PRED` cannot see it.
-fn worst_pred_error(anchor: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 {
-    let model_path = format!("nonmem_anchor/{anchor}_fit.ferx");
+/// Runs the `_fit.ferx` twin's `predict()` on `csv` and returns the worst `|PRED − NONMEM|`
+/// against `results/<anchor>.tab`; `twin` names the `nonmem_anchor/<twin>_fit.ferx` model
+/// (the anchor's own name but for a second engine's twin of one `.ctl`). `pk_only` is each
+/// subject's expected pk-only record times: the rows must reach the engine, or the anchor
+/// would pass on a reader that drops them only where `PRED` cannot see it.
+fn worst_pred_error(anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 {
+    let model_path = format!("nonmem_anchor/{twin}_fit.ferx");
     let model = parse_model_file(Path::new(&model_path)).unwrap_or_else(|e| panic!("{e}"));
     let csv = format!("nonmem_anchor/{csv}.csv");
     let pop = read_nonmem_csv(Path::new(&csv), None, None).unwrap_or_else(|e| panic!("{e}"));
@@ -109,6 +128,7 @@ fn a_leading_evid2_or_mdv1_record_starts_the_clock_matches_nonmem() {
     worst_pred_error(
         "evid2_clock",
         "evid2_clock",
+        "evid2_clock",
         &[
             ("1", &[0.0]),
             ("2", &[0.0]),
@@ -133,8 +153,37 @@ fn co_timed_records_follow_file_order_matches_nonmem() {
         ("6", at4),
         ("7", &[]),
     ];
-    worst_pred_error("tied_evid2", "tied_evid2", pk_only);
-    worst_pred_error("tied_evid2_advan1", "tied_evid2", pk_only);
+    worst_pred_error("tied_evid2", "tied_evid2", "tied_evid2", pk_only);
+    worst_pred_error(
+        "tied_evid2_advan1",
+        "tied_evid2_advan1",
+        "tied_evid2",
+        pk_only,
+    );
+}
+
+#[test]
+fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_nonmem() {
+    // ID 6 lists its EVID=2 row before the co-timed dose, so #1810 moves it one ULP below 12.
+    let at12: &[f64] = &[12.0];
+    let pk_only: &[(&str, &[f64])] = &[
+        ("1", at12),
+        ("2", at12),
+        ("3", &[]),
+        ("4", &[]),
+        ("5", &[]),
+        ("6", at12),
+        ("7", at12),
+        ("8", at12),
+        ("9", &[24.0]),
+        ("10", at12),
+        ("11", at12),
+        ("12", at12),
+        ("13", &[]),
+        ("14", &[]),
+    ];
+    worst_pred_error("addl_tie", "addl_tie", "addl_tie", pk_only);
+    worst_pred_error("addl_tie", "addl_tie_ode", "addl_tie", pk_only);
 }
 
 // Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |PRED − NONMEM| 2.79e-9

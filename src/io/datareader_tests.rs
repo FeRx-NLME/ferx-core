@@ -1073,6 +1073,94 @@ fn test_cotimed_evid2_nudge_holds_at_large_time() {
     assert!(s.pk_only_times[0] < s.doses[1].time);
 }
 
+// ── #1909: an ADDL-implied dose takes the snapshot of the record that ends its interval ──
+// NONMEM runs no `$PK` at an implied dose; the advance across it runs under the first
+// event record at or after it in (TIME, file order). `nonmem_anchor/addl_tie` measures it.
+
+/// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X`.
+fn addl_subject(rows: &str) -> crate::types::Subject {
+    let f = write_csv(&format!("ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X\n{rows}"));
+    read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0)
+}
+
+/// `(time, X)` of each dose, in the engines' order.
+fn dose_x(s: &crate::types::Subject) -> Vec<(f64, f64)> {
+    s.doses
+        .iter()
+        .zip(&s.dose_covariates)
+        .map(|(d, c)| (d.time, c["X"]))
+        .collect()
+}
+
+#[test]
+fn an_implied_dose_takes_the_next_records_snapshot() {
+    // `addl_tie` case 4: X steps to 2 at the observation at 18, nothing at 12. The dose at
+    // 12 is governed by that observation; the one at 24 by the observation at 30. The
+    // explicit dose keeps its own row's X.
+    let s = addl_subject(
+        "1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
+         1,40,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(
+        dose_x(&s),
+        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 3.0), (36.0, 4.0)]
+    );
+}
+
+#[test]
+fn an_implied_dose_co_timed_with_a_record_takes_that_records_snapshot() {
+    // Cases 1 and 3: an EVID=2 row, and then an observation, at the implied dose's TIME.
+    // The tie is `>=`: a `>` would hand the dose at 12 the snapshot of the record at 18.
+    for row12 in ["1,12,.,2,1,.,.,.,2", "1,12,5,0,0,.,.,.,2"] {
+        let s = addl_subject(&format!(
+            "1,0,.,1,1,100,1,12,1\n{row12}\n1,18,5,0,0,.,.,.,3\n"
+        ));
+        assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0)], "{row12}");
+    }
+}
+
+#[test]
+fn co_timed_candidates_resolve_by_file_order() {
+    // Two records at 12, an observation (X=3) then an EVID=2 row (X=2): the first in file
+    // order governs, whatever its kind.
+    let s = addl_subject(
+        "1,0,.,1,1,100,1,12,1\n1,12,5,0,0,.,.,.,3\n1,12,.,2,1,.,.,.,2\n1,18,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 3.0)]);
+    // The reverse order picks the EVID=2 row.
+    let s = addl_subject(
+        "1,0,.,1,1,100,1,12,1\n1,12,.,2,1,.,.,.,2\n1,12,5,0,0,.,.,.,3\n1,18,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0)]);
+}
+
+#[test]
+fn an_explicit_dose_or_a_reset_can_govern_an_implied_dose() {
+    // An explicit dose at 20 (X=5) is the next record after the implied dose at 12.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,1,1,50,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 5.0), (20.0, 5.0)]);
+    // So is a reset (EVID=3, X=7) at 20.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,3,1,.,.,.,7\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 7.0)]);
+    // Another implied dose is not a record: the doses at 12 and 24 both look past each
+    // other to the observation at 30.
+    let s = addl_subject("1,0,.,1,1,100,2,12,1\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 6.0), (24.0, 6.0)]);
+}
+
+#[test]
+fn an_implied_dose_after_the_last_record_keeps_its_parents_snapshot() {
+    // Nothing at or after 24 or 36, so nothing observes those doses; they keep X=1.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
+    assert_eq!(
+        dose_x(&s),
+        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 1.0), (36.0, 1.0)]
+    );
+}
+
 #[test]
 fn test_no_resets_leaves_reset_times_empty() {
     let csv = "ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n";

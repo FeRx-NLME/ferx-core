@@ -2528,6 +2528,8 @@ fn parse_subject(
     // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
     // honor NONMEM record order at equal TIME (see the obs/dose tie-break pass).
     let mut dose_rec: Vec<usize> = Vec::new();
+    // Whether each dose was implied by its row's `ADDL`, parallel to `dose_rec` (#1909).
+    let mut dose_implied: Vec<bool> = Vec::new();
     let mut obs_rec: Vec<usize> = Vec::new();
     // The same for each pk-only record, parallel to `pk_only_times` (#1810).
     let mut pk_only_rec: Vec<usize> = Vec::new();
@@ -2669,6 +2671,8 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+    // File-order record index of each reset, parallel to `reset_times` in row order (#1909).
+    let mut reset_rec: Vec<usize> = Vec::new();
     let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut reset_occasions: Vec<u32> = Vec::new();
 
@@ -3024,6 +3028,7 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            reset_rec.push(row_seq);
             // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
             // reads (#1969). Doses below do the same.
             if time_offset != 0.0 {
@@ -3112,6 +3117,7 @@ fn parse_subject(
                 reset_period_times.push((time, raw_time));
             }
             dose_rec.push(row_seq);
+            dose_implied.push(false);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
@@ -3165,9 +3171,13 @@ fn parse_subject(
                             reset_period_times.push((addl_time, raw_time + (k as f64) * ii));
                         }
                         dose_rec.push(row_seq);
+                        dose_implied.push(true);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
                         }
+                        // The parent row's snapshot for now. Once every record is read,
+                        // the pass after the dose sort replaces it with the snapshot of
+                        // the record that ends this dose's interval (#1909).
                         if any_tv {
                             dose_covariates.push(locf_state.clone());
                         }
@@ -3531,11 +3541,62 @@ fn parse_subject(
     } else {
         Vec::new()
     };
-    let sorted_dose_cov: Vec<HashMap<String, f64>> = if any_tv {
+    let mut sorted_dose_cov: Vec<HashMap<String, f64>> = if any_tv {
         perm.iter().map(|&i| dose_covariates[i].clone()).collect()
     } else {
         Vec::new()
     };
+
+    // ── An ADDL-implied dose runs under the `$PK` of the record that ends its interval (#1909) ──
+    // NONMEM does not run `$PK` at a dose implied by `ADDL`: it is not an event record. The
+    // advance across it runs under the values of the next event record, the first one at
+    // or after the dose in (TIME, file order), and the implied dose only adds its mass on
+    // the way (before a co-timed observation, which sees it). ferx's engines treat every
+    // dose as a record whose snapshot governs the interval ending at it, and the reader
+    // gave an implied dose its parent row's snapshot, so the parent's covariates governed
+    // up to each dose of the train — in `nonmem_anchor/addl_tie`, 10–30 % on every later
+    // observation once a covariate changed after the parent row. Giving the implied dose
+    // the governing record's snapshot instead makes the engines' rule NONMEM's: the
+    // interval ending at it and the one after it both run under that record. Which of
+    // the co-timed records the engines reach first then no longer matters, which is why
+    // the #1810 pass below may keep ranking an implied dose by its parent's row.
+    //
+    // A reset row is a record like any other here. The occasion shift puts every reset
+    // past the end of any train recorded before it, so one can govern only the interval
+    // ending at a train's last dose, never tie with it. An implied dose with no record at
+    // or after it keeps its parent's snapshot; nothing observes it.
+    if any_tv && dose_implied.contains(&true) {
+        let sorted_implied: Vec<bool> = perm.iter().map(|&i| dose_implied[i]).collect();
+        for k in (0..sorted_doses.len()).filter(|&k| sorted_implied[k]) {
+            let t = sorted_doses[k].time;
+            // The first record at or after `t` by (time, row), over every kind.
+            let doses_at = (0..sorted_doses.len())
+                .filter(|&d| !sorted_implied[d])
+                .map(|d| {
+                    (
+                        sorted_doses[d].time,
+                        sorted_dose_rec[d],
+                        &sorted_dose_cov[d],
+                    )
+                });
+            let obs_at =
+                (0..obs_times.len()).map(|j| (obs_times[j], obs_rec[j], &obs_covariates[j]));
+            let pk_only_at = (0..pk_only_times.len())
+                .map(|m| (pk_only_times[m], pk_only_rec[m], &pk_only_covariates[m]));
+            let resets_at = (0..reset_times.len())
+                .map(|r| (reset_times[r], reset_rec[r], &reset_covariates[r]));
+            let governing = doses_at
+                .chain(obs_at)
+                .chain(pk_only_at)
+                .chain(resets_at)
+                .filter(|&(u, _, _)| u >= t)
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                .map(|(_, _, cov)| cov.clone());
+            if let Some(cov) = governing {
+                sorted_dose_cov[k] = cov;
+            }
+        }
+    }
 
     // Reset events are recorded in row order. The occasion shift above already forces
     // every reset past `max_eff_time`, so `reset_times` leaves the row loop strictly
