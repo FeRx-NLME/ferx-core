@@ -1118,6 +1118,21 @@ where
 
     // The SS note first, then the bundle — the order the simulate paths use.
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    // A supplied η (#1594) is the FREM fit's EBE, conditioned on the subject's own covariate
+    // rows, so only the subjects whose η was drawn are counted (#2245).
+    warnings.extend(super::frem_drawn_eta_warning(
+        model,
+        population.subjects.len(),
+        population
+            .subjects
+            .iter()
+            .zip(&supplied_etas)
+            .filter(|(_, e)| e.is_none())
+            .map(|(s, _)| s),
+        "A controller reading `ControllerCtx::covariates` doses these subjects on covariate \
+         values their PK does not follow. Supply the FREM fit's EBEs as `SuppliedEtas` \
+         (`AdaptiveInputs::with_etas`), which are conditioned on each subject's covariate rows.",
+    ));
     warnings.extend(super::non_fit_diagnostics(
         model,
         population,

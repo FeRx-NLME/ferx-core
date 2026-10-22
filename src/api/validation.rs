@@ -2497,6 +2497,49 @@ pub(crate) fn no_occasion_warning(
     })
 }
 
+/// `W_FREM_DRAWN_ETA` when a FREM model is simulated with η drawn from Ω for some subjects
+/// (#2245). A FREM model carries its covariates only through the extended Ω: no individual
+/// parameter reads them, so a subject's covariate η is what links its covariate value to its
+/// PK. An unconditional draw `η = L·z` gives every subject a fresh covariate η, and its PK
+/// follows that draw instead of the covariate value in its own data rows.
+///
+/// `drawn` holds the subjects whose η was drawn — every subject on `simulate()`, the ones
+/// without a supplied η on the adaptive path. Silent when it is empty, and on a non-FREM
+/// model. The `FREMTYPE` sentence is gated on a drawn subject carrying a `FREMTYPE > 0` row,
+/// the only rows where the drawn covariate value shows up in the output.
+///
+/// `remedy` is the closing sentence, because the sound routes differ by entry point:
+/// `SimulateOptions::match_method` exists only on `simulate_with_options`, supplied η only
+/// on the adaptive path.
+pub(crate) fn frem_drawn_eta_warning<'a>(
+    model: &CompiledModel,
+    n_subjects: usize,
+    drawn: impl IntoIterator<Item = &'a Subject>,
+    remedy: &str,
+) -> Option<String> {
+    model.frem_config.as_ref()?;
+    let (mut n_drawn, mut any_frem_row) = (0usize, false);
+    for s in drawn {
+        n_drawn += 1;
+        any_frem_row |= s.fremtype.iter().any(|&t| t > 0);
+    }
+    if n_drawn == 0 {
+        return None;
+    }
+    let rows = if any_frem_row {
+        " Their FREMTYPE rows report the drawn covariate values, not the ones in the data."
+    } else {
+        ""
+    };
+    Some(format!(
+        "W_FREM_DRAWN_ETA: {n_drawn} of {n_subjects} subject(s) of this FREM model were \
+         simulated with an eta drawn from Omega, covariate etas included. A FREM model links \
+         its covariates to the PK only through the correlations in Omega, so the PK of each of \
+         these subjects follows its drawn covariate etas, not its own covariate values.{rows} \
+         {remedy}"
+    ))
+}
+
 /// Built-in absorption input-rate models (e.g. `transit()`) are integrated
 /// through the standard ODE prediction paths. Two combinations are not yet
 /// supported and are rejected here — loudly — rather than silently mis-modeled:
