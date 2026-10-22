@@ -568,9 +568,9 @@ The terms scored separately are each time-to-event endpoint (`time-to-event on
 CMT n`; an overflowing or non-positive hazard maps to the `1e20` sentinel), the
 `categorical` term, the `CTMM` term, and the `IOV + FREM refusal`, the value the
 IOV likelihood returns for a subject with FREM covariate rows, which it does not
-support. A term is listed when its own value is `NaN`, infinite or past the
-cutoff, with that raw negative log-likelihood (not the `2·` scale of the
-contribution). When the subject has non-Gaussian terms and every one is usable,
+support. A term is listed when its value is `NaN`, infinite, or past the cutoff
+once put on the contribution's `2·` scale; the message shows the raw negative
+log-likelihood, so a term printed as `6e13` is listed. When the subject has non-Gaussian terms and every one is usable,
 the sentence says `every non-Gaussian term usable`.
 
 When neither the predictions nor a term explains the contribution, the failure is
@@ -586,41 +586,53 @@ most ten subjects. The `unusable_subjects` array in the structured warning's
 (`FitResult::warnings_structured`): the R package, the YAML output and a
 reloaded `.fitrx` file keep the message and drop `details`.
 
-No sentence is added when every subject's contribution is valid and the
-objective is FOCE or FOCEI. That happens when:
+#### When no subject is named
 
-* the objective was clamped at a point the subjects were not scored at;
-* the subjects are each below the cutoff and only their sum is past it — ten
-  subjects of `1.6e13` each, for example.
+When every subject's contribution is valid, the warning says why no subject can
+be named (#2267), with the first of these that applies:
+
+* **The parameter-prior penalty is unusable.** `fit()` adds it to the data
+  objective, and no subject carries it: `...and the parameter-prior penalty, a
+  population-level term no subject carries, is not (inf).` An unusable penalty
+  next to named subjects is added after the list instead.
+* **The objective is not the sum of the contributions** — see below.
+* **Only the sum is past the cutoff**, as with ten subjects of `1.6e13` each:
+  `...but their sum (160000000000000.0) is past the cutoff.`
+* **The sum is usable**, so the objective was evaluated at another point than the
+  estimates and EBEs the subjects are scored at — a trial point an optimizer
+  stopped on, for example.
 
 #### Contributions from another objective
 
-The contributions are always the post-hoc FOCE/FOCEI score at the EBEs. For an
-objective that is not their sum — Laplace or adaptive quadrature (`n_agq > 1`),
-SAEM, IMP, IMPMAP, VI's final OFV, or a mixture — the warning says so (#2267).
-After a list of named subjects it adds:
+The contributions are always the post-hoc FOCE/FOCEI score at the EBEs, and ferx
+classifies the objective by what was published rather than by the method name.
+FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP and VI's
+`vi_final_ofv = laplace` all publish the sum of these same scores. The ones that
+do not are Laplace and adaptive quadrature (`n_agq > 1`, including an
+`agq_eval_only` readout), BAYES (whose `ofv` is a joint NLL at the posterior
+mean), and a mixture's class-marginal (#2267). After a list of named subjects
+the warning then adds:
 
 ```text
 These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE
 objective, which ferx does not split by subject.
 ```
 
-When no subject's contribution is unusable, such an objective cannot name anyone,
-and the warning says why instead of saying nothing:
+When no subject is named, such an objective gives:
 
 ```text
-No subject can be named: the LAPLACE objective is not split by subject, and
-every subject's post-hoc FOCEI contribution at these estimates is usable, so the
+No subject can be named: every subject's post-hoc FOCEI contribution at these
+estimates is usable, and the LAPLACE objective is not split by subject, so the
 failure is in a part of the LAPLACE objective that the FOCEI score does not
 share.
 ```
 
 The structured warning's `details` record this as `contribution_score`
-(`"FOCE"` or `"FOCEI"`, the marginal the contributions score) and
-`contributions_are_objective_terms` (`false` for such an objective, whose
-`unusable_subjects` may then be empty). Each subject's `failed_terms` lists the
-terms named in the message as `{term, nll}` objects, `nll` a string when it is not
-finite.
+(`"FOCE"` or `"FOCEI"`, the marginal the contributions score),
+`contributions_are_objective_terms` (`false` for such an objective) and
+`ofv_prior`; `unusable_subjects` is then present and may be empty. Each subject's
+`failed_terms` lists the terms named in the message as `{term, nll}` objects, `nll`
+raw and a string when it is not finite.
 
 ### The one exception
 
@@ -658,7 +670,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite), and `failed_terms`; with it, `contribution_score` and `contributions_are_objective_terms` ([Which subjects](#which-subjects)) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite), and `failed_terms`; with it, `contribution_score`, `contributions_are_objective_terms` and `ofv_prior` ([Which subjects](#which-subjects)) |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 

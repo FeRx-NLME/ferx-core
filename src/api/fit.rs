@@ -2931,7 +2931,12 @@ fn fit_inner(
         // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
         // objective, so the source says which, and the scorer splits out the terms the
         // predictions cannot describe (#2267).
-        let source = ContributionSource::of(objective_stage, options, mixest_classes.is_some());
+        let source = ContributionSource::of(
+            objective_stage,
+            options,
+            mixest_classes.is_some(),
+            ofv_prior,
+        );
         let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
             contribution_terms(
                 model,

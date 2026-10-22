@@ -1831,47 +1831,66 @@ pub(crate) struct ContributionTerm {
 /// What `SubjectResult::ofv_contribution` is, relative to the objective
 /// `W_NONFINITE_OBJECTIVE` gated (#2267).
 ///
-/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal, under
-/// the fitted class for a mixture. Only a FOCE-family objective (FOCE, FOCEI and the
-/// two Gauss–Newton methods, without quadrature or a mixture) is the sum of those
-/// scores; for every other one — Laplace/AGQ, SAEM, IMP, IMPMAP, VI's final OFV, a
-/// mixture marginal — the objective can be unusable while every score is usable, and
-/// the reverse.
+/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal
+/// (`foce_subject_nll_cov` / the IOV form), under the fitted class for a mixture. The
+/// published objective is classified by what it *is*, not by the estimator's name: FOCE,
+/// FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP (estimating or `imp_eval_only`
+/// standalone) and VI's `vi_final_ofv = laplace` all publish `2·pop_nll` — the sum of
+/// these same scores at the same EBEs. Only three objectives are something else, and
+/// can be unusable while every score is usable or the reverse:
+///
+/// * quadrature — `laplace` at any `n_agq` (its exact-Hessian anchor already differs
+///   at one node) and `focei` with `n_agq > 1`, including an `agq_eval_only` readout;
+/// * `bayes`, whose `ofv` is `2·Σ` joint NLL at the posterior mean, not a marginal;
+/// * a mixture, whose objective is the class-marginal.
+///
+/// Plus the case where the objective's FOCE/FOCEI flag is not the one the scores were
+/// computed under. `prior` is the parameter-prior penalty `fit()` adds to the data
+/// objective, a population-level term no subject carries.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContributionSource {
     /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
     pub(crate) score: &'static str,
     /// The objective's name when the contributions are not its terms, else `None`.
     pub(crate) objective: Option<String>,
+    /// The parameter-prior penalty in the gated objective (`ofv_prior`; `0` unpriored).
+    pub(crate) prior: f64,
 }
 
 impl ContributionSource {
-    /// The source for an objective produced by `method` and contributions scored under
-    /// `options.interaction` (the post-fit options), `mixture` when the fit is one.
-    pub(crate) fn of(method: EstimationMethod, options: &FitOptions, mixture: bool) -> Self {
+    /// The source for the objective `method` published, with contributions scored under
+    /// `options.interaction` (the post-fit options), `mixture` when the fit is one, and
+    /// `prior` the penalty added to it.
+    pub(crate) fn of(
+        method: EstimationMethod,
+        options: &FitOptions,
+        mixture: bool,
+        prior: f64,
+    ) -> Self {
         let score = if options.interaction { "FOCEI" } else { "FOCE" };
         let agq = FitOptions::agq_nodes_for(method, options.n_agq);
-        let same = matches!(
-            method,
-            EstimationMethod::Foce
-                | EstimationMethod::FoceI
-                | EstimationMethod::FoceGn
-                | EstimationMethod::FoceGnHybrid
-        ) && crate::types::interaction_for(method, options.interaction)
-            == options.interaction
-            && agq.is_none()
-            && !mixture;
+        let same = agq.is_none()
+            && method != EstimationMethod::Bayes
+            && !mixture
+            && crate::types::interaction_for(method, options.interaction) == options.interaction;
         let objective = (!same).then(|| {
             let mut name = method.label().to_string();
             if let Some(n) = agq.filter(|&n| n > 1) {
                 name = format!("{name} (n_agq = {n})");
+            }
+            if method == EstimationMethod::Bayes {
+                name.push_str(" posterior-mean");
             }
             if mixture {
                 name.push_str(" mixture");
             }
             name
         });
-        Self { score, objective }
+        Self {
+            score,
+            objective,
+            prior,
+        }
     }
 }
 
@@ -1952,12 +1971,19 @@ fn json_value(v: f64) -> serde_json::Value {
 /// prediction of 0, which scores `DV² × 1e12` per observation at the variance floor),
 /// the `η` prior, or a curvature determinant that is not positive definite.
 ///
+/// A term is judged on the OFV scale the contribution carries, `2·nll`, against the
+/// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
+/// contribution and is named.
+///
 /// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
-/// objective is not their sum, the sentence says so after the list; and when it names
-/// nobody, it says why rather than returning `msg` unchanged (#2267). Only a
-/// FOCE-family objective with no unusable contribution returns `msg` unchanged: its
-/// failure is then outside every single contribution — a value recorded at another
-/// point, or a sum of usable ones past the cutoff.
+/// objective is not their sum (see [`ContributionSource`]), the sentence says so after
+/// the list. An unusable parameter-prior penalty — a population-level term no subject
+/// carries — is named after the list too. And when no subject qualifies, the warning
+/// says why rather than ending silently (#2267), in the first of these that holds:
+/// the prior penalty is unusable; the objective is one the scores are not terms of;
+/// the scores and the prior are each usable but their sum is past the cutoff; or their
+/// sum is usable, so the objective was evaluated at another point than the estimates
+/// and EBEs the subjects were scored at.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
 /// whose position does not match `population` gets no `TIME` and no terms.
@@ -1970,6 +1996,9 @@ pub(crate) fn name_nonfinite_subjects(
     terms: &TermScorer<'_>,
 ) -> String {
     use crate::estimation::outer_optimizer::ofv_is_valid;
+    // A term's `nll` is raw; the contribution it sits in is `2·nll`-scaled.
+    let term_failed = |t: &ContributionTerm| !ofv_is_valid(2.0 * t.nll);
+    let prior_failed = !ofv_is_valid(source.prior);
     struct Named<'a> {
         s: &'a SubjectResult,
         bad: Vec<usize>,
@@ -2005,16 +2034,40 @@ pub(crate) fn name_nonfinite_subjects(
         )
     });
     let full = if named.is_empty() {
-        let Some(objective) = source.objective.as_deref() else {
-            return msg;
-        };
-        format!(
-            "{msg} No subject can be named: the {objective} objective is not split by \
-             subject, and every subject's post-hoc {score} contribution at these estimates \
-             is usable, so the failure is in a part of the {objective} objective that the \
-             {score} score does not share.",
-            score = source.score
-        )
+        let score = source.score;
+        let lead = format!(
+            "{msg} No subject can be named: every subject's post-hoc {score} contribution \
+             at these estimates is usable"
+        );
+        let total = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + source.prior;
+        let prior = source.prior;
+        match (prior_failed, source.objective.as_deref()) {
+            (true, _) => format!(
+                "{lead}, and the parameter-prior penalty, a population-level term no \
+                 subject carries, is not ({prior:?})."
+            ),
+            (false, Some(objective)) => format!(
+                "{lead}, and the {objective} objective is not split by subject, so the \
+                 failure is in a part of the {objective} objective that the {score} score \
+                 does not share."
+            ),
+            (false, None) => {
+                let and_prior = if prior != 0.0 {
+                    format!(", and so is the parameter-prior penalty ({prior:?})")
+                } else {
+                    String::new()
+                };
+                if ofv_is_valid(total) {
+                    format!(
+                        "{lead}{and_prior}, and so is their sum ({total:?}), so the objective \
+                         was evaluated at another point than the estimates and EBEs the \
+                         subjects are scored at."
+                    )
+                } else {
+                    format!("{lead}{and_prior}, but their sum ({total:?}) is past the cutoff.")
+                }
+            }
+        }
     } else {
         let describe = |n: &Named<'_>| {
             let records = match (n.bad.first(), n.data) {
@@ -2035,7 +2088,7 @@ pub(crate) fn name_nonfinite_subjects(
             let failed: Vec<String> = n
                 .terms
                 .iter()
-                .filter(|t| !ofv_is_valid(t.nll))
+                .filter(|t| term_failed(t))
                 .map(|t| format!("{} = {:?}", t.name, t.nll))
                 .collect();
             let terms = match failed.len() {
@@ -2061,9 +2114,18 @@ pub(crate) fn name_nonfinite_subjects(
                 named.len() - NONFINITE_SUBJECTS_NAMED
             ));
         }
+        let prior = if prior_failed {
+            format!(
+                " The parameter-prior penalty, a population-level term no subject carries, is \
+                 unusable as well ({:?}).",
+                source.prior
+            )
+        } else {
+            String::new()
+        };
         format!(
             "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
-             {list}.{}",
+             {list}.{}{prior}",
             named.len(),
             subjects.len(),
             caveat.unwrap_or_default()
@@ -2075,7 +2137,7 @@ pub(crate) fn name_nonfinite_subjects(
             let failed: Vec<serde_json::Value> = n
                 .terms
                 .iter()
-                .filter(|t| !ofv_is_valid(t.nll))
+                .filter(|t| term_failed(t))
                 .map(|t| serde_json::json!({"term": t.name, "nll": json_value(t.nll)}))
                 .collect();
             serde_json::json!({
@@ -2098,6 +2160,7 @@ pub(crate) fn name_nonfinite_subjects(
             "contributions_are_objective_terms".into(),
             serde_json::json!(source.objective.is_none()),
         );
+        map.insert("ofv_prior".into(), json_value(source.prior));
     }
     entry.message = full.clone();
     full

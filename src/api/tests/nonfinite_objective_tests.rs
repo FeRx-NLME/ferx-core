@@ -769,13 +769,20 @@ fn a_non_finite_prior_penalty_demotes_a_fit_whose_likelihood_is_finite() {
          unpenalized likelihood it was handed",
         result.ofv
     );
+    // #2267 review r1: every subject's contribution is usable here, so the warning
+    // must say the prior is what failed rather than end without naming anything.
+    let warning = result
+        .warnings
+        .iter()
+        .find(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN))
+        .unwrap_or_else(|| panic!("{:?}", result.warnings));
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
-        "{:?}",
-        result.warnings
+        warning.ends_with(
+            " No subject can be named: every subject's post-hoc FOCEI contribution at \
+             these estimates is usable, and the parameter-prior penalty, a population-level \
+             term no subject carries, is not (inf)."
+        ),
+        "{warning}"
     );
 }
 
@@ -1066,7 +1073,7 @@ fn shifted_subject(id: &str) -> Subject {
 
 /// The contribution source of a FOCEI fit: the contributions are its own terms.
 fn foce_source() -> ContributionSource {
-    ContributionSource::of(EstimationMethod::FoceI, &FitOptions::default(), false)
+    ContributionSource::of(EstimationMethod::FoceI, &FitOptions::default(), false, 0.0)
 }
 
 /// A term scorer for a model with no separately scored term.
@@ -1185,22 +1192,23 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
     );
 }
 
-/// **N2 — nothing to name, nothing added.** A sentinel objective whose every subject
-/// has a valid post-fit contribution (the objective was clamped at a trial point,
-/// not at the estimates the subjects are scored at) keeps the gate's message and
-/// payload exactly, rather than appending "0 of 2 subjects".
+/// **N2 — nothing to name, and the warning says why** (#2267; before it, the message
+/// was left as the gate wrote it). A sentinel FOCEI objective whose every subject has
+/// a valid post-fit contribution, with no prior, has two explanations, told apart by
+/// the sum of the contributions: a usable sum means the objective was evaluated at
+/// another point than the subjects are scored at; a sum past the cutoff means it
+/// failed only as a sum. Never "0 of 2 subjects".
 ///
-/// Mutation (run): drop the `named.is_empty()` return → the message grows a
-/// "0 of 2 subjects" sentence and `details` an `unusable_subjects` key, and this fires.
+/// Mutation (run): swap the `ofv_is_valid(total)` arms → both sentences fire; leave
+/// the prior out of `total` → no change here (prior 0), which T5 covers.
 #[test]
-fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
+fn a_warning_with_no_unusable_subject_says_why_it_names_nobody() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let subjects = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
         crate::types::test_helpers::dummy_subject("B", 1, 4),
     ];
     let (msg, mut entry) = sentinel_warning();
-    let before = entry.clone();
     let out = name_nonfinite_subjects(
         msg.clone(),
         &mut entry,
@@ -1209,9 +1217,43 @@ fn a_warning_with_no_unusable_subject_is_left_as_the_gate_wrote_it() {
         &foce_source(),
         &no_terms,
     );
-    assert_eq!(out, msg);
-    assert_eq!(entry.message, before.message);
-    assert_eq!(entry.details, before.details);
+    assert_eq!(
+        out.strip_prefix(&msg).expect("kept"),
+        " No subject can be named: every subject's post-hoc FOCEI contribution at these \
+         estimates is usable, and so is their sum (24.68), so the objective was evaluated \
+         at another point than the estimates and EBEs the subjects are scored at."
+    );
+    assert_eq!(entry.message, out);
+    let details = entry.details.as_ref().expect("payload");
+    assert_eq!(
+        details["unusable_subjects"],
+        serde_json::json!([]),
+        "{details}"
+    );
+    assert_eq!(details["ofv_prior"], 0.0, "{details}");
+
+    let large: Vec<SubjectResult> = ["A", "B"]
+        .iter()
+        .map(|id| {
+            let mut s = crate::types::test_helpers::dummy_subject(id, 1, 4);
+            s.ofv_contribution = 6e13;
+            s
+        })
+        .collect();
+    let (msg, mut entry) = sentinel_warning();
+    let out = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &large,
+        &pop,
+        &foce_source(),
+        &no_terms,
+    );
+    assert_eq!(
+        out.strip_prefix(&msg).expect("kept"),
+        " No subject can be named: every subject's post-hoc FOCEI contribution at these \
+         estimates is usable, but their sum (120000000000000.0) is past the cutoff."
+    );
 }
 
 /// **N3 — a result that does not line up with the population gets no `TIME`.**
@@ -1600,12 +1642,15 @@ fn the_sentence_names_the_term_that_failed() {
     );
 }
 
-/// **T2 — which objectives the post-hoc score is a term of.** Only the FOCE family,
-/// without quadrature or a mixture, sums the contributions `compute_subject_results`
-/// scores; every other objective is named, with its node count and mixture.
+/// **T2 — which objectives the post-hoc score is a term of.** Classified by the
+/// objective published, not the estimator: every `2·pop_nll` objective (FOCE family,
+/// SAEM, IMP, IMPMAP, VI's Laplace final OFV) sums the contributions
+/// `compute_subject_results` scores; quadrature, BAYES's posterior-mean NLL, a mixture
+/// marginal and an interaction mismatch are named, with node count and mixture.
 ///
-/// Mutation (run): drop any clause of `same` → its row fires; drop the `n_agq` or the
-/// mixture suffix → its row fires.
+/// Mutation (run): drop any clause of `same` → its row fires; drop the `n_agq`, BAYES
+/// or mixture suffix → its row fires; go back to a FOCE-family method list → the
+/// SAEM/IMP/IMPMAP/VI rows fire.
 #[test]
 fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
     use EstimationMethod::*;
@@ -1614,7 +1659,7 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
         n_agq,
         ..FitOptions::default()
     };
-    let cases: [(EstimationMethod, bool, usize, bool, &str, Option<&str>); 11] = [
+    let cases: [(EstimationMethod, bool, usize, bool, &str, Option<&str>); 15] = [
         (Foce, false, 1, false, "FOCE", None),
         (FoceI, true, 1, false, "FOCEI", None),
         (FoceGn, true, 1, false, "FOCEI", None),
@@ -1629,15 +1674,21 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
             "FOCEI",
             Some("LAPLACE (n_agq = 5)"),
         ),
-        (Saem, true, 1, false, "FOCEI", Some("SAEM")),
-        (Imp, false, 1, false, "FOCE", Some("IMP")),
+        // SAEM, IMP, IMPMAP and VI's `vi_final_ofv = laplace` publish `2·pop_nll`,
+        // the sum of these scores (review r1).
+        (Saem, true, 1, false, "FOCEI", None),
+        (Imp, false, 1, false, "FOCE", None),
+        (Impmap, true, 1, false, "FOCEI", None),
+        (Vi, true, 1, false, "FOCEI", None),
+        (Saem, true, 1, true, "FOCEI", Some("SAEM mixture")),
+        (Bayes, true, 1, false, "FOCEI", Some("BAYES posterior-mean")),
         (FoceI, true, 1, true, "FOCEI", Some("FOCEI mixture")),
         // A FOCE objective whose contributions were scored under interaction is not
         // their sum either.
         (Foce, true, 1, false, "FOCEI", Some("FOCE")),
     ];
     for (method, interaction, n_agq, mixture, score, objective) in cases {
-        let got = ContributionSource::of(method, &opts(interaction, n_agq), mixture);
+        let got = ContributionSource::of(method, &opts(interaction, n_agq), mixture, 0.0);
         assert_eq!(
             (got.score, got.objective.as_deref()),
             (score, objective),
@@ -1648,8 +1699,8 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
 
 /// **T3 — an objective the contributions are not terms of says so, and says why it
 /// names nobody.** The same subjects under the FOCEI source and a Laplace one: with no
-/// unusable contribution the FOCEI warning is left as the gate wrote it (N2), and the
-/// Laplace one gains the sentence saying why it cannot name anyone; with one, the
+/// unusable contribution the FOCEI warning gives N2's sum sentence, and the
+/// Laplace one the sentence saying its objective is not split; with one, the
 /// Laplace list is followed by the caveat.
 ///
 /// Mutation (run): restore the unconditional `named.is_empty()` return → the "No
@@ -1658,7 +1709,12 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
 #[test]
 fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
-    let laplace = ContributionSource::of(EstimationMethod::Laplace, &FitOptions::default(), false);
+    let laplace = ContributionSource::of(
+        EstimationMethod::Laplace,
+        &FitOptions::default(),
+        false,
+        0.0,
+    );
     let healthy = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
         crate::types::test_helpers::dummy_subject("B", 1, 4),
@@ -1676,9 +1732,9 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &foce_source(),
         &no_terms,
     );
-    assert_eq!(
-        control, msg,
-        "a FOCEI objective with no unusable term is left alone"
+    assert!(
+        !control.contains("LAPLACE") && !control.contains("not split by subject"),
+        "a FOCEI objective's contributions are its terms: {control}"
     );
 
     let (msg, mut entry) = sentinel_warning();
@@ -1686,8 +1742,8 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         name_nonfinite_subjects(msg.clone(), &mut entry, &healthy, &pop, &laplace, &no_terms);
     assert_eq!(
         nobody.strip_prefix(&msg).expect("kept"),
-        " No subject can be named: the LAPLACE objective is not split by subject, and \
-         every subject's post-hoc FOCEI contribution at these estimates is usable, so the \
+        " No subject can be named: every subject's post-hoc FOCEI contribution at these \
+         estimates is usable, and the LAPLACE objective is not split by subject, so the \
          failure is in a part of the LAPLACE objective that the FOCEI score does not share."
     );
     let details = entry.details.as_ref().expect("payload");
@@ -1838,4 +1894,117 @@ fn an_overflowing_hazard_names_its_time_to_event_term() {
             "{method:?}"
         );
     }
+}
+
+/// **T5 — the prior penalty is named, before and after a list.** An unusable prior
+/// alongside a named subject is appended after the list; alongside none it is the
+/// reason given, ahead of the Laplace and sum explanations; and a usable prior enters
+/// the sum, so `6e13 + 6e13 + 5` reads as the sum past the cutoff with the prior
+/// quoted. The end-to-end form is G5's last assertion.
+///
+/// Mutation (run): drop the `prior_failed` arm → the second assertion reads the
+/// Laplace sentence; drop the post-list clause → the first fires; leave the prior out
+/// of `total` or of the clause → the third fires.
+#[test]
+fn an_unusable_prior_penalty_is_named_as_a_population_level_term() {
+    let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
+    let source =
+        |method, prior| ContributionSource::of(method, &FitOptions::default(), false, prior);
+    let mut b = crate::types::test_helpers::dummy_subject("B", 1, 4);
+    b.ofv_contribution = 2e20;
+    let one_bad = [crate::types::test_helpers::dummy_subject("A", 1, 4), b];
+    let healthy = [
+        crate::types::test_helpers::dummy_subject("A", 1, 4),
+        crate::types::test_helpers::dummy_subject("B", 1, 4),
+    ];
+
+    let (msg, mut entry) = sentinel_warning();
+    let listed = name_nonfinite_subjects(
+        msg,
+        &mut entry,
+        &one_bad,
+        &pop,
+        &source(EstimationMethod::FoceI, f64::NAN),
+        &no_terms,
+    );
+    assert!(
+        listed.ends_with(
+            "B (contribution 2e20, every IPRED and PRED finite). The parameter-prior \
+             penalty, a population-level term no subject carries, is unusable as well (NaN)."
+        ),
+        "{listed}"
+    );
+    assert_eq!(entry.details.as_ref().expect("payload")["ofv_prior"], "NaN");
+
+    let (msg, mut entry) = sentinel_warning();
+    let nobody = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &healthy,
+        &pop,
+        &source(EstimationMethod::Laplace, f64::INFINITY),
+        &no_terms,
+    );
+    assert_eq!(
+        nobody.strip_prefix(&msg).expect("kept"),
+        " No subject can be named: every subject's post-hoc FOCEI contribution at these \
+         estimates is usable, and the parameter-prior penalty, a population-level term no \
+         subject carries, is not (inf)."
+    );
+
+    let large: Vec<SubjectResult> = ["A", "B"]
+        .iter()
+        .map(|id| {
+            let mut s = crate::types::test_helpers::dummy_subject(id, 1, 4);
+            s.ofv_contribution = 6e13;
+            s
+        })
+        .collect();
+    let (msg, mut entry) = sentinel_warning();
+    let sum = name_nonfinite_subjects(
+        msg.clone(),
+        &mut entry,
+        &large,
+        &pop,
+        &source(EstimationMethod::FoceI, 5.0),
+        &no_terms,
+    );
+    assert_eq!(
+        sum.strip_prefix(&msg).expect("kept"),
+        " No subject can be named: every subject's post-hoc FOCEI contribution at these \
+         estimates is usable, and so is the parameter-prior penalty (5.0), but their sum \
+         (120000000000005.0) is past the cutoff."
+    );
+}
+
+/// **T6 — a term is judged on the contribution's OFV scale.** Its `nll` is raw and the
+/// contribution carries `2·nll`, so a raw `6e13` term is a `1.2e14` contribution and is
+/// named, while a raw `4e13` one (`8e13`) is not; both are shown raw.
+///
+/// Mutation (run): compare the raw `nll` with the cutoff → the `6e13` term drops out
+/// of the sentence and of `failed_terms`.
+#[test]
+fn a_term_is_judged_on_the_ofv_scale_and_shown_raw() {
+    let pop = population_of(vec![shifted_subject("A")]);
+    let mut a = crate::types::test_helpers::dummy_subject("A", 1, 0);
+    a.ofv_contribution = 2e14;
+    let scorer = |_: usize, _: &Subject, _: &SubjectResult| {
+        vec![
+            term("time-to-event on CMT 2", 6e13),
+            term("categorical", 4e13),
+        ]
+    };
+    let (msg, mut entry) = sentinel_warning();
+    let full = name_nonfinite_subjects(msg, &mut entry, &[a], &pop, &foce_source(), &scorer);
+    assert!(
+        full.ends_with(
+            "A (contribution 200000000000000.0, no Gaussian observation, failed term: \
+             time-to-event on CMT 2 = 60000000000000.0)."
+        ),
+        "{full}"
+    );
+    assert_eq!(
+        entry.details.as_ref().expect("payload")["unusable_subjects"][0]["failed_terms"],
+        serde_json::json!([{"term": "time-to-event on CMT 2", "nll": 6e13}])
+    );
 }
