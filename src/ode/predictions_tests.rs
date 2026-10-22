@@ -15536,14 +15536,14 @@ fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
 ///
 /// It checks the readers, not their callers: an entry says which sink converts the
 /// reader's output on its main route, and a caller that takes the output past that sink
-/// is outside what this test sees. `record_observations` is the known case (#2259).
+/// is outside what this test sees.
 #[test]
 fn every_raw_observable_reader_names_who_converts_it() {
     const CONVERTED_BY: &[(&str, &str)] = &[
         (
             "record_observations",
-            "the pk sink (compute_predictions_with_tv); NOT on the ODE branch of \
-             compute_predictions_with_states (sdtab IPRED), which skips FREM: #2259",
+            "the pk sink's tail (pk::to_observation_scale), from compute_predictions_with_tv \
+             and the ODE branch of compute_predictions_with_states (sdtab IPRED, #2259)",
         ),
         (
             "ode_predictions_event_driven",
