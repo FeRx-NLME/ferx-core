@@ -2677,17 +2677,13 @@ fn emit_eta_infos(
     }
 }
 
-/// Every assignment, top level and inside `if` branches, in statement order.
-fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
-}
-
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
 /// level): each is `(if statement, branch)`, the statement numbered in
 /// flattening order and the branch by position, `else` last.
 type Scope = Vec<(usize, usize)>;
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`].
+/// Every assignment, top level and inside `if` branches, in statement order,
+/// with its [`Scope`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
@@ -3061,7 +3057,10 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
-/// - no η-free assignment writes a row whose `eta_map` names an η;
+/// - no η-free assignment writes a row whose `eta_map` names an η, unless a
+///   a later assignment unconditionally replaces it
+///   ([`unconditionally_replaced`]): `CL = TVCL` then `CL = TVCL * exp(ETA_CL)`
+///   leaves only the direct value on the row (#1691);
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -3074,11 +3073,11 @@ fn lognormal_eta_chain_exact(
     eta_map: &[i32],
     n_eta_bsv: usize,
 ) -> bool {
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let (mut assigns, mut scopes) = (Vec::new(), Vec::new());
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, &mut assigns, &mut scopes);
     let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
     let mut carrying: Vec<String> = Vec::new();
-    for (lhs, expr) in assigns {
+    for (def, &(lhs, expr)) in assigns.iter().enumerate() {
         if is_synthetic_readout_param(lhs) {
             continue;
         }
@@ -3093,8 +3092,8 @@ fn lognormal_eta_chain_exact(
             // An η-free value on a row whose `eta_map` names an η (an η-free
             // `else` branch, a reassignment): `sel_flat` still names the η, so
             // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
-            // review round 2).
-            if row_eta.is_some() {
+            // review round 2). One that never reaches the row is harmless.
+            if row_eta.is_some() && !unconditionally_replaced(&assigns, &scopes, def) {
                 return false;
             }
             continue;
@@ -3110,6 +3109,26 @@ fn lognormal_eta_chain_exact(
         }
     }
     true
+}
+
+/// Whether definition `def` is unconditionally replaced: a later assignment to
+/// the same variable whose scope is a prefix of `def`'s, so every evaluation
+/// that runs `def` runs the replacement after it (the in-force rule of
+/// [`ScaleWalk::root_scale`], #1687). A reassignment inside a narrower `if`,
+/// including a later one, leaves `def` live on the other path, and one in the
+/// other branch of the `if` holding `def` never runs with it; neither counts.
+///
+/// What reads the variable while `def` is in force is not asked: it reads an
+/// η-free value, which is not what the gate tests. The row's own value is the
+/// replacement's, judged when the gate reaches it.
+fn unconditionally_replaced(assigns: &[(&str, &Expression)], scopes: &[Scope], def: usize) -> bool {
+    let (var, _) = assigns[def];
+    let scope = &scopes[def];
+    assigns
+        .iter()
+        .zip(scopes)
+        .skip(def + 1)
+        .any(|((lhs, _), other)| *lhs == var && scope.starts_with(other))
 }
 
 /// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and
