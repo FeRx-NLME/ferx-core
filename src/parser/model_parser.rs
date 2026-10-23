@@ -2677,17 +2677,6 @@ fn emit_eta_infos(
     }
 }
 
-/// Every assignment, top level and inside `if` branches, in statement order.
-fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(
-        stmts,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        out,
-        &mut Vec::new(),
-    );
-}
-
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
 /// level): each is `(if statement, branch)`, the statement numbered in
 /// flattening order and the branch by position, `else` last.
@@ -2697,8 +2686,8 @@ type Scope = Vec<(usize, usize)>;
 /// `(number of bodies, else included; whether there is an else)`.
 type IfShape = (usize, bool);
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`] and each
-/// `if` statement's [`IfShape`].
+/// Every assignment, top level and inside `if` branches, in statement order,
+/// with its [`Scope`], and each `if` statement's [`IfShape`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
@@ -2769,6 +2758,74 @@ struct ScaleWalk<'a> {
     memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
 }
 
+/// Where one definition is **in force**, per branch path, as a walk over the
+/// later assignments in order (#1689): the rule [`ScaleWalk::root_scale`] and
+/// [`unconditionally_replaced`] share, so the two cannot drift apart.
+///
+/// A later assignment to the same variable ends the definition for every later
+/// assignment whose scope has the reassignment's scope as a prefix (the rest of
+/// that branch, and whatever it nests), and an `if` with an `else` whose every
+/// branch ends it, recursively, ends it for the rest of the scope that holds the
+/// `if`. It is **replaced** once it ends in the definition's own scope or an
+/// enclosing one; a reassignment inside an `if` without an `else`, or in only
+/// some branches, leaves it live on the other path. An assignment in the other
+/// branch of the `if` that holds the definition never sees it
+/// ([`in_sibling_branches`]).
+struct InForce<'s> {
+    scope: &'s Scope,
+    /// Scopes where a reassignment has ended the definition.
+    ended: Vec<Scope>,
+}
+
+impl<'s> InForce<'s> {
+    fn new(scope: &'s Scope) -> Self {
+        Self {
+            scope,
+            ended: Vec::new(),
+        }
+    }
+
+    fn is_ended(&self, s: &[(usize, usize)]) -> bool {
+        self.ended.iter().any(|k| s.starts_with(k))
+    }
+
+    /// Whether the definition is in force at an assignment in scope `other`:
+    /// not in the other branch of an `if` that holds it, and not after a
+    /// reassignment earlier on this path.
+    fn reaches(&self, other: &Scope) -> bool {
+        !in_sibling_branches(self.scope, other) && !self.is_ended(other)
+    }
+
+    /// Record a reassignment in scope `other`, which the definition
+    /// [`Self::reaches`]; `true` once that replaces the definition.
+    fn end(&mut self, other: &Scope, ifs: &[IfShape]) -> bool {
+        // End it in this scope, then in each enclosing scope whose `if` now has
+        // every branch, `else` included, ended.
+        let mut k = other.clone();
+        loop {
+            if self.scope.starts_with(&k) {
+                return true;
+            }
+            self.ended.push(k.clone());
+            let Some(&(id, _)) = k.last() else {
+                return false;
+            };
+            let (n_branches, has_else) = ifs[id - 1];
+            let parent = &k[..k.len() - 1];
+            let exhaustive = has_else
+                && (0..n_branches).all(|b| {
+                    let mut s = parent.to_vec();
+                    s.push((id, b));
+                    self.is_ended(&s)
+                });
+            if !exhaustive {
+                return false;
+            }
+            k.pop();
+        }
+    }
+}
+
 impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
         let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
@@ -2809,18 +2866,9 @@ impl<'a> ScaleWalk<'a> {
 
     /// The distinct scale(s) of a leaf that reached the root of definition `def`.
     ///
-    /// The definition is **in force** from the next assignment on, per branch
-    /// path: a later assignment to the same variable ends it for every later
-    /// assignment whose scope has the reassignment's scope as a prefix (the
-    /// rest of that branch, and whatever it nests), and an `if` with an `else`
-    /// whose every branch ends it, recursively, ends it for the rest of the
-    /// scope that holds the `if` (#1689). It is **replaced** once it ends in
-    /// the definition's own scope or an enclosing one; a reassignment inside
-    /// an `if` without an `else`, or in only some branches, leaves it live on
-    /// the other path. An assignment in the other branch of the `if` that
-    /// holds the definition never sees it ([`in_sibling_branches`]). Its
-    /// **readers** are the assignments where it is in force that read the
-    /// variable (a reassignment reads it before ending it).
+    /// Its **readers** are the later assignments where the definition is in
+    /// force ([`InForce`], #1689) that read the variable (a reassignment reads
+    /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
     /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
@@ -2847,17 +2895,11 @@ impl<'a> ScaleWalk<'a> {
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         let mut out = Vec::new();
         let (mut read, mut replaced) = (false, false);
-        // Scopes where a reassignment has ended the definition.
-        let mut ended: Vec<Scope> = Vec::new();
-        let is_ended =
-            |ended: &[Scope], s: &[(usize, usize)]| ended.iter().any(|k| s.starts_with(k));
+        let mut in_force = InForce::new(scope);
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
-            if in_sibling_branches(scope, other) {
-                continue; // the other branch of an `if` never sees this definition
-            }
-            if is_ended(&ended, other) {
-                continue; // a reassignment earlier on this path replaced it
+            if !in_force.reaches(other) {
+                continue;
             }
             if !consumed || *lhs == var {
                 for s in leaf_scales(e, &is_var) {
@@ -2868,33 +2910,9 @@ impl<'a> ScaleWalk<'a> {
                     }
                 }
             }
-            if *lhs == var {
-                // End it in this scope, then in each enclosing scope whose `if`
-                // now has every branch, `else` included, ended.
-                let mut k = other.clone();
-                loop {
-                    if scope.starts_with(&k) {
-                        replaced = true;
-                        break;
-                    }
-                    ended.push(k.clone());
-                    let Some(&(id, _)) = k.last() else { break };
-                    let (n_branches, has_else) = self.ifs[id - 1];
-                    let parent = &k[..k.len() - 1];
-                    let exhaustive = has_else
-                        && (0..n_branches).all(|b| {
-                            let mut s = parent.to_vec();
-                            s.push((id, b));
-                            is_ended(&ended, &s)
-                        });
-                    if !exhaustive {
-                        break;
-                    }
-                    k.pop();
-                }
-                if replaced {
-                    break;
-                }
+            if *lhs == var && in_force.end(other, &self.ifs) {
+                replaced = true;
+                break;
             }
         }
         if !read || (consumed && !replaced) {
@@ -3113,7 +3131,11 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
-/// - no η-free assignment writes a row whose `eta_map` names an η;
+/// - no η-free assignment writes a row whose `eta_map` names an η, unless a
+///   a later assignment unconditionally replaces it
+///   ([`unconditionally_replaced`]): `CL = TVCL` then `CL = TVCL * exp(ETA_CL)`,
+///   or an `if`-`else` defining `CL` directly in every branch, leaves only the
+///   direct value on the row (#1691);
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -3126,11 +3148,11 @@ fn lognormal_eta_chain_exact(
     eta_map: &[i32],
     n_eta_bsv: usize,
 ) -> bool {
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
     let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
     let mut carrying: Vec<String> = Vec::new();
-    for (lhs, expr) in assigns {
+    for (def, &(lhs, expr)) in assigns.iter().enumerate() {
         if is_synthetic_readout_param(lhs) {
             continue;
         }
@@ -3145,8 +3167,8 @@ fn lognormal_eta_chain_exact(
             // An η-free value on a row whose `eta_map` names an η (an η-free
             // `else` branch, a reassignment): `sel_flat` still names the η, so
             // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
-            // review round 2).
-            if row_eta.is_some() {
+            // review round 2). One that never reaches the row is harmless.
+            if row_eta.is_some() && !unconditionally_replaced(&assigns, &scopes, &ifs, def) {
                 return false;
             }
             continue;
@@ -3162,6 +3184,33 @@ fn lognormal_eta_chain_exact(
         }
     }
     true
+}
+
+/// Whether definition `def` is unconditionally replaced: every evaluation that
+/// runs it runs a later assignment to the same variable after it, by the
+/// in-force rule [`ScaleWalk::root_scale`] uses ([`InForce`], #1687 / #1689) —
+/// a reassignment in the same or an enclosing scope, or an `if` with an `else`
+/// that reassigns in every branch. A reassignment in only some branches leaves
+/// `def` live on the other path, and one in the other branch of the `if`
+/// holding `def` never runs with it; neither counts.
+///
+/// What reads the variable while `def` is in force is not asked: it reads an
+/// η-free value, which is not what the gate tests. The row's own value is the
+/// replacement's, judged when the gate reaches it.
+fn unconditionally_replaced(
+    assigns: &[(&str, &Expression)],
+    scopes: &[Scope],
+    ifs: &[IfShape],
+    def: usize,
+) -> bool {
+    let (var, _) = assigns[def];
+    let mut in_force = InForce::new(&scopes[def]);
+    for ((lhs, _), other) in assigns.iter().zip(scopes).skip(def + 1) {
+        if *lhs == var && in_force.reaches(other) && in_force.end(other, ifs) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and

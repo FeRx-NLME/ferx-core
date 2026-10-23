@@ -34783,6 +34783,119 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
 }
 
+// ── #1691: the log-normal η-chain gate and an η-free definition it replaces ──
+
+/// The #1691 probe table, each row with the gate's answer and whether the
+/// closed-form chain `∂p/∂η = p · sel_flat` is exact for it. Before #1691 the
+/// η-free arm declined on the **first** `CL = TVCL` of
+/// `CL = TVCL; CL = TVCL * exp(ETA_CL)`, although the direct definition
+/// replaces it on every path. Every `false` row whose chain is inexact must
+/// stay `false`; the comment on each names the mutation that flips it.
+#[test]
+fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definition() {
+    const V: &str = "\n  V = TVV * exp(ETA_V)";
+    let cases: &[(&str, &str, bool)] = &[
+        ("direct", "  CL = TVCL * exp(ETA_CL)", true),
+        // The fix. Dies under: the η-free arm declining unconditionally again.
+        (
+            "eta-free definition replaced by a direct one",
+            "  CL = TVCL\n  CL = TVCL * exp(ETA_CL)",
+            true,
+        ),
+        (
+            "eta-free definition inside an if, replaced at top level",
+            "  if (WT > 70) {\n    CL = TVCL\n  }\n  CL = TVCL * exp(ETA_CL)",
+            true,
+        ),
+        // Replaced on both paths of an `if` with an `else` (#1689). Dies under:
+        // `InForce::end` no longer lifting an exhaustive `if` to its parent.
+        (
+            "eta-free definition replaced in every branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        // Inexact on the WT ≤ 70 path: the `else` keeps the η-free value. Dies
+        // under: `end` lifting an `if` whose branches are not all ended.
+        (
+            "eta-free definition replaced in one branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             Z = TVV\n  }",
+            false,
+        ),
+        // Exact (∂CL/∂η = CL) but `CL` reads a carrying variable: conservative.
+        (
+            "direct then rescaled",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = CL * 2",
+            false,
+        ),
+        // Inexact (truth 0): the η-free reassignment is the row's value.
+        // Dies under: `unconditionally_replaced` counting the definition itself.
+        (
+            "direct then eta-free",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL",
+            false,
+        ),
+        // Inexact on the WT ≤ 70 path. Dies under: dropping the scope-prefix
+        // test, so a reassignment inside a later `if` counts as a replacement.
+        (
+            "eta-free definition replaced only inside a later if",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  }",
+            false,
+        ),
+        // Inexact on the else path. Dies under: an assignment in the sibling
+        // branch counting as a replacement.
+        (
+            "eta-free else branch",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL\n  }",
+            false,
+        ),
+        (
+            "eta-free if branch, direct else branch",
+            "  if (WT > 70) {\n    CL = TVCL\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }",
+            false,
+        ),
+        // Inexact: the last value is η-free. The middle definition is skipped
+        // as replaced, the last is not. Dies under: `unconditionally_replaced`
+        // counting the definition itself (`skip(def)`).
+        (
+            "eta-free twice after a direct one",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL\n  CL = TVCL * 2",
+            false,
+        ),
+        (
+            "both branches direct",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        (
+            "both branches direct, then a rescale in an if",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }\n  if (SEX > 0) {\n    CL = CL * 2\n  }",
+            false,
+        ),
+        (
+            "direct, then direct inside an if",
+            "  CL = TVCL * exp(ETA_CL)\n  if (WT > 70) {\n    CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        (
+            "direct, then a different eta",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL * exp(ETA_V)",
+            false,
+        ),
+    ];
+    for (label, indiv, want) in cases {
+        let m = eta_scale_model(&format!("{indiv}{V}"), "");
+        assert_eq!(
+            m.indiv_param_partials.lognormal_eta_chain,
+            Some(*want),
+            "{label}"
+        );
+    }
+}
+
 /// #1919 — an analytic hazard's `HazardParamFn` takes no time, so a `TIME` read in its
 /// parameters (directly, or through a reached `[individual_parameters]` value) is refused
 /// at parse rather than silently read at the ambient model time (0 on the likelihood path).
