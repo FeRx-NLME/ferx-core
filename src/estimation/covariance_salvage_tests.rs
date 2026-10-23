@@ -1550,6 +1550,11 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
 /// integrates it rather than solving it by matrix exponential — with its tolerances baked by
 /// `[fit_options]`, or left at the default when `tol` is `None`.
 fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
+    one_state_ode_at("-(CL/V) * central / (1 + central / (5 * V))", tol)
+}
+
+/// [`ode_model_at`]'s model with right-hand side `rhs` for `d/dt(central)`.
+fn one_state_ode_at(rhs: &str, tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
     let fit_options = tol.map_or(String::new(), |(r, a)| {
         format!("[fit_options]\n  ode_reltol = {r:e}\n  ode_abstol = {a:e}\n")
     });
@@ -1558,7 +1563,7 @@ fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
          omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.15\n  sigma PROP_ERR ~ 0.04\n\
          [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
          [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
-         [odes]\n  d/dt(central) = -(CL/V) * central / (1 + central / (5 * V))\n\
+         [odes]\n  d/dt(central) = {rhs}\n\
          [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit_options}"
     ))
     .unwrap()
@@ -1572,9 +1577,10 @@ fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
 /// stencil ran at and not a stencil that ignores tolerance. Deleting the tight scope (or
 /// leaving the whole-population base at the fit's tolerance) reddens the first assertion.
 ///
-/// The override itself: `None` once the fit is on the plateau or tighter, and on a linear
-/// model `auto` solves by matrix exponential; each of `reltol` / `abstol` tightened only where
-/// it is looser, so a tight `reltol` with a loose `abstol` moves `abstol` alone.
+/// The override itself: `None` once the fit is on the plateau or tighter; each of `reltol` /
+/// `abstol` tightened only where it is looser, so a tight `reltol` with a loose `abstol` moves
+/// `abstol` alone. A linear model `auto` solves by matrix exponential is armed too — see
+/// `the_fd_stencil_override_covers_a_segment_the_matrix_exponential_declines`.
 #[test]
 fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
     use crate::types::{CovarianceMethod, FitOptions};
@@ -1603,8 +1609,8 @@ fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
     let ov = super::cov_ode_override(&mixed, &options).expect("abstol");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-9), Some(1e-8)));
     assert!(
-        super::cov_ode_override(&padded_ode_model(0), &options).is_none(),
-        "a linear model solved by matrix exponential carries no integration noise"
+        super::cov_ode_override(&padded_ode_model(0), &options).is_some(),
+        "a linear model solved by matrix exponential can still decline a segment to the integrator"
     );
 
     // One set of modes for every cell, so the warm starts cannot differ between them.
@@ -1674,6 +1680,91 @@ fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
             "{method:?}: control — the step must read the tolerance at all"
         );
     }
+}
+
+/// #520 review round 3: a linear model `auto` solves by matrix exponential (#852) still
+/// integrates every segment the exponential declines, and those integrate under the
+/// covariance override like any other. The decline is forced through the solver's test seam
+/// (`FORCE_LINEAR_DECLINE`), set on the worker of a one-thread pool and carried by the fit
+/// scope onto the one-thread pool the override arms, so every stencil point sees it. Under the seam the default-tolerance step must equal
+/// the plateau-pinned one bit for bit, and a `1e-9` / `1e-11` control must differ — which
+/// also shows the seam reached the stencil, since an exact segment reads no tolerance at all.
+/// Restoring the `Linear` exemption in `cov_ode_override` reddens the first assertion.
+#[test]
+fn the_fd_stencil_override_covers_a_segment_the_matrix_exponential_declines() {
+    use crate::ode::solver::FORCE_LINEAR_DECLINE;
+    use crate::types::FitOptions;
+    let mut population = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/two_cpt_oral_cov.csv"),
+        None,
+        None,
+    )
+    .expect("two_cpt_oral_cov.csv loads");
+    population.subjects.truncate(6);
+    let options = FitOptions {
+        analytic_cov_hessian: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let linear = |tol| one_state_ode_at("-(CL/V) * central", tol);
+    let default = linear(None);
+    let plateau = linear(Some((1e-6, 1e-8)));
+    assert_eq!(
+        default
+            .ode_spec
+            .as_ref()
+            .expect("an [odes] model")
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "fixture: `auto` solves this model by matrix exponential"
+    );
+
+    let p = default.default_params.clone();
+    let x = crate::estimation::parameterization::pack_params(&p);
+    let (etas, hs): (Vec<_>, Vec<_>) = population
+        .subjects
+        .iter()
+        .map(|s| {
+            let e = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                &plateau, s, &p, 200, 1e-8, None, None, 0, &options,
+            );
+            (e.eta, e.h_matrix)
+        })
+        .unzip();
+    let kappas = vec![Vec::new(); population.subjects.len()];
+    // On the one worker of a one-thread pool, so a step with no override to arm (the pinned
+    // cells) runs its `par_iter`s where the seam is set too, and no other test sees it.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let cov = |m: &crate::types::CompiledModel| {
+        let out = pool.install(|| {
+            FORCE_LINEAR_DECLINE.set(true);
+            let out =
+                super::compute_covariance(&x, &p, m, &population, &etas, &hs, &kappas, &options);
+            FORCE_LINEAR_DECLINE.set(false);
+            out
+        });
+        match out {
+            super::CovarianceStepResult::Success(out) => out.matrix,
+            super::CovarianceStepResult::Unusable(r) => panic!("{r}"),
+            super::CovarianceStepResult::FailedNonPd { reason, .. } => panic!("{reason}"),
+        }
+    };
+    let at_default = cov(&default);
+    let at_plateau = cov(&plateau);
+    let at_tight = cov(&linear(Some((1e-9, 1e-11))));
+    assert!(at_default.iter().all(|v| v.is_finite()));
+    assert_eq!(
+        at_default, at_plateau,
+        "declined segments of the default-tolerance step must integrate at the plateau"
+    );
+    assert_ne!(
+        at_plateau, at_tight,
+        "control — the forced decline must reach the stencil, or no tolerance is read"
+    );
 }
 
 /// #520 review: the override keys on the model *having* an integrator, not on the per-subject

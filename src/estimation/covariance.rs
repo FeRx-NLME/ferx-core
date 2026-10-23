@@ -890,10 +890,14 @@ const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 /// stationarity, only a smooth objective, and the tighter one is the smoother.
 ///
 /// `None` when the model has no integrator at all (a closed form without an absorption ODE
-/// twin), when the tolerance already sits on the plateau, or when the model is solved exactly
-/// by matrix exponential (#852), whose objective carries no integration noise. Read on the
-/// thread the step runs on, where the fit's override is armed, so the tolerance compared is
-/// the one the fit actually integrates at.
+/// twin) or when the tolerance already sits on the plateau. Read on the thread the step runs
+/// on, where the fit's override is armed, so the tolerance compared is the one the fit
+/// actually integrates at.
+///
+/// A model solved by matrix exponential (#852) is **not** exempt: the exponential declines a
+/// segment it cannot propagate (possibly at a perturbed stencil point only), and a declined
+/// segment is integrated at the tolerance armed here (#520 review round 3). The exact segments
+/// ignore the tolerance, so on those the override changes no number.
 ///
 /// Keyed on the twin's *existence*, not on [`OdeToleranceFacts::from_route`]'s per-subject
 /// walk: the flip-flop reroute ([`crate::pk::effective_model_for_eval`]) is decided per
@@ -912,9 +916,7 @@ fn cov_ode_override(
             .and_then(|eq| eq.built().ode_spec.as_ref())
     })?;
     let eff = spec.effective_solver_opts();
-    if eff.method == crate::ode::OdeMethod::Linear
-        || (eff.reltol <= COV_FD_PLATEAU_RELTOL && eff.abstol <= COV_FD_PLATEAU_ABSTOL)
-    {
+    if eff.reltol <= COV_FD_PLATEAU_RELTOL && eff.abstol <= COV_FD_PLATEAU_ABSTOL {
         return None;
     }
     Some(crate::ode::solver::OdeSolverOverride {
