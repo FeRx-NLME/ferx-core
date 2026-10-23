@@ -429,6 +429,10 @@ mod entry_point_errors_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
+// #2181: a covariate is present when every subject carries it, not when it is listed.
+#[cfg(test)]
+#[path = "tests/covariate_presence_tests.rs"]
+mod covariate_presence_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]

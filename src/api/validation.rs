@@ -77,7 +77,9 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// programmatically may populate each `Subject::covariates` map and leave the name
 /// list empty — a construction the predictors have always resolved fine, since they
 /// read the per-subject map (`Subject::obs_cov`), not the list. So a name every
-/// subject's map carries counts as present. Without this, `predict()` gaining the
+/// subject carries counts as present, and only that: a name that is listed but
+/// missing from some subject is missing (#2181), since the predictor would read it
+/// as 0 for that subject. Without this, `predict()` gaining the
 /// check (#1028) would have started panicking on those callers even though nothing
 /// about their predictions was undefined.
 ///
@@ -160,11 +162,7 @@ fn unread_column_diagnostic(unread: &[&str]) -> Diagnostic {
 /// The historical `E_MISSING_COVARIATE`, byte-for-byte: `plain` are names the data
 /// does not have under that exact spelling.
 fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diagnostic {
-    let available = if population.covariate_names.is_empty() {
-        "(none)".to_string()
-    } else {
-        population.covariate_names.join(", ")
-    };
+    let available = available_covariate_columns(population);
     // `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
     // ordinary covariates everywhere else — including `[scaling]`, which is
     // deliberate (`docs/model-file/scaling.qmd`) so a dataset that really carries a
@@ -210,15 +208,45 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 }
 
 /// Whether `population` carries the covariate `name` in the sense
-/// [`check_covariates`] documents: listed in `covariate_names`, or in every
-/// subject's own map.
-fn population_carries(population: &Population, name: &str) -> bool {
-    population.covariate_names.iter().any(|n| n == name)
-        || (!population.subjects.is_empty()
-            && population
-                .subjects
-                .iter()
-                .all(|s| s.covariates.contains_key(name)))
+/// [`check_covariates`] documents: every subject carries it. Decided from the
+/// subjects alone, never from `covariate_names` (#2181): the predictors read the
+/// per-subject maps, so a name that is listed but missing from some subject is read
+/// as 0 for that subject. An empty population carries nothing.
+///
+/// The subject-static map decides, not the per-record snapshots: every lookup
+/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
+/// such snapshots, an adaptive decision before the first record — falls back to it,
+/// so a name the static map lacks is read as 0 there even when every observation
+/// snapshot has it. The CSV reader fills the static map with each subject's first
+/// value.
+///
+/// Shared with the `[adaptive_dosing]` `observe` check in
+/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
+    !population.subjects.is_empty()
+        && population
+            .subjects
+            .iter()
+            .all(|s| s.covariates.contains_key(name))
+}
+
+/// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed
+/// names the population carries ([`population_carries`]), `(none)` if there are none.
+/// A listed name some subject lacks is left out, or the message would name the
+/// covariate as both missing and available (#2181). A CSV-read population carries
+/// every listed name, so its list is `covariate_names` unchanged.
+pub(crate) fn available_covariate_columns(population: &Population) -> String {
+    let carried: Vec<&str> = population
+        .covariate_names
+        .iter()
+        .filter(|n| population_carries(population, n))
+        .map(|s| s.as_str())
+        .collect();
+    if carried.is_empty() {
+        "(none)".to_string()
+    } else {
+        carried.join(", ")
+    }
 }
 
 /// `(block, synthesized index column)` of every **bound** level block whose column the
