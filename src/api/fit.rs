@@ -487,23 +487,7 @@ pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: b
     }
 }
 
-/// Whether an estimation method's outer optimizer applies the covariate-NN
-/// regularization penalties (`nn_l2` / `nn_smooth`). The FOCE family does —
-/// every outer optimizer under `foce` / `focei` / `laplace` (NLopt, built-in
-/// BFGS, trust-region) and both Gauss–Newton variants — and so does VI, which
-/// folds the same penalty gradient into its Adam step (see `run_vi`). SAEM,
-/// IMP/IMPMAP and Bayes do not touch the penalty.
-pub(crate) fn applies_nn_regularization(method: EstimationMethod) -> bool {
-    matches!(
-        method,
-        EstimationMethod::Foce
-            | EstimationMethod::FoceI
-            | EstimationMethod::Laplace
-            | EstimationMethod::FoceGn
-            | EstimationMethod::FoceGnHybrid
-            | EstimationMethod::Vi
-    )
-}
+pub(crate) use crate::estimation::nn_reg::applies_nn_regularization;
 
 /// A pre-run warning when `nn_l2` / `nn_smooth` are set but the chain's final
 /// stage does not apply them (see [`applies_nn_regularization`]). `None` when
