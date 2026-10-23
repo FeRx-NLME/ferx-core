@@ -74,9 +74,12 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 IMP's proposal lags one iteration behind the parameters, so the bookkeeping
 between iterations matters. The closed-form mu-ref step moves each packed θ by
 the population mean of η, and the posterior of η moves the other way by the same
-amount. ferx moves each subject's stored proposal mean with it — per class under
-a mixture, as the #619 covariate group step already did — so the proposal stays
-on the posterior while the individual parameters do not change.
+amount. ferx translates each subject's stored importance draws with it — the
+samples and their weighted mean, per class under a mixture, as the #619
+covariate group step already did for its own η — so the proposal stays on the
+posterior while the individual parameters do not change. The samples move as
+well because a time-varying #619 group step later in the same iteration (under
+`impmap` too) scores them at the shifted θ.
 
 Until #1365 those stored means were left where they were. From a cold start the
 first step is several posterior SDs, so on iteration 2 every subject went

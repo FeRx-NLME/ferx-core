@@ -196,8 +196,9 @@ fn covariance_to_proposal_hessian(
     }
 }
 
-/// Move one subject's stored IMP proposal moments by `−shift` in η-space,
-/// keeping the weighted covariance `S − m mᵀ` unchanged.
+/// Translate one subject's importance draws by `−shift` in η-space: every
+/// sampled η, the weighted mean, and the second moment, so the weights and the
+/// weighted covariance `S − m mᵀ` are unchanged.
 ///
 /// The closed-form mu-ref step adds `δ_e` to the packed θ (= mu) anchoring η_e,
 /// so the individual parameter `φ = mu + η` is unchanged only if the posterior of
@@ -207,7 +208,16 @@ fn covariance_to_proposal_hessian(
 /// posterior SDs on the first iteration, which is what collapsed every subject's
 /// ESS on iteration 2 (#1365). This is the plain-pair twin of the #619 group
 /// step's `recentre_eta` bookkeeping.
-fn shift_proposal_moments(d: &mut SubjectDraws, shift: &[f64]) {
+///
+/// The samples move too, not only the moments: later in the same iteration a
+/// #619 group with `needs_data_term` scores these draws against a θ that already
+/// carries the shift, and it must see each sample at its unchanged `φ`.
+fn shift_draws(d: &mut SubjectDraws, shift: &[f64]) {
+    for eta in d.etas.iter_mut() {
+        for (e, &s) in eta.iter_mut().zip(shift.iter()) {
+            *e -= s;
+        }
+    }
     let m_old = DVector::from_column_slice(&d.mean);
     for (m, &s) in d.mean.iter_mut().zip(shift.iter()) {
         *m -= s;
@@ -1495,11 +1505,14 @@ fn run_mcem(
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
                 applied[e] = log_theta[t] - before;
             }
-            // Keep φ fixed across the shift for the next IMP proposal (#1365);
-            // see `shift_proposal_moments`. IMPMAP re-solves the mode instead.
-            if recenter == ProposalRecenter::SampleMoments && applied.iter().any(|&a| a != 0.0) {
+            // Keep φ fixed across the shift (#1365); see `shift_draws`. The
+            // next IMP proposal is centred on these moments, and the #619
+            // numerical group step below scores these samples at the shifted θ
+            // — under IMPMAP too, which is why this is not gated on `recenter`.
+            // Ω above was taken from the pre-shift draws, as before.
+            if applied.iter().any(|&a| a != 0.0) {
                 for d in draws.iter_mut() {
-                    shift_proposal_moments(d, &applied);
+                    shift_draws(d, &applied);
                 }
             }
         }
@@ -2756,7 +2769,7 @@ fn run_mcem_mixture(
                 }
                 if shift.iter().any(|&a| a != 0.0) {
                     for d in class.iter_mut() {
-                        shift_proposal_moments(d, &shift);
+                        shift_draws(d, &shift);
                     }
                 }
             }
@@ -4312,23 +4325,55 @@ mod tests {
     }
 
     #[test]
-    fn shift_proposal_moments_moves_the_mean_and_keeps_the_covariance() {
+    fn shift_draws_moves_samples_and_mean_and_keeps_the_covariance() {
         // #1365: after the closed-form mu-ref step adds δ to the packed θ, the
-        // stored IMP proposal moments must move by −δ on that η and leave the
-        // weighted covariance S − m mᵀ untouched — including its cross terms
-        // with an η that did not move. Before the fix the moments were left
-        // stale, so the next proposal sat δ off the posterior.
-        let mean = vec![0.4, -0.2];
-        let cov = DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.05]);
+        // stored draws must move by −δ on that η — every sample as well as the
+        // moments — and leave the weights and the weighted covariance S − m mᵀ
+        // untouched, including its cross terms with an η that did not move.
+        let etas = vec![vec![0.1, -0.5], vec![0.7, 0.3], vec![0.4, -0.4]];
+        let weights = vec![0.25, 0.25, 0.5];
+        let mut mean = vec![0.0; 2];
+        let mut s2 = DMatrix::<f64>::zeros(2, 2);
+        for (eta, &w) in etas.iter().zip(&weights) {
+            let v = DVector::from_column_slice(eta);
+            for (a, &x) in mean.iter_mut().zip(eta) {
+                *a += w * x;
+            }
+            s2 += w * &v * v.transpose();
+        }
         let m = DVector::from_column_slice(&mean);
+        let cov = &s2 - &m * m.transpose();
         let mut d = SubjectDraws::cancelled(2);
+        d.etas = etas.clone();
+        d.weights = weights.clone();
         d.mean = mean.clone();
-        d.second_moment = &cov + &m * m.transpose();
+        d.second_moment = s2;
 
-        shift_proposal_moments(&mut d, &[0.35, 0.0]);
+        shift_draws(&mut d, &[0.35, 0.0]);
 
-        assert!((d.mean[0] - 0.05).abs() < 1e-15, "mean[0] = {}", d.mean[0]);
-        assert_eq!(d.mean[1], -0.2, "an unshifted η keeps its mean");
+        // The samples moved with the moments: the shifted mean is still the
+        // weighted mean of the shifted samples.
+        for (k, (got, was)) in d.etas.iter().zip(&etas).enumerate() {
+            assert!(
+                (got[0] - (was[0] - 0.35)).abs() < 1e-15,
+                "sample {k} η₀ = {}",
+                got[0]
+            );
+            assert_eq!(got[1], was[1], "sample {k}: an unshifted η keeps its value");
+        }
+        assert_eq!(d.weights, weights, "weights are unchanged");
+        let wmean: f64 = d.etas.iter().zip(&d.weights).map(|(e, w)| w * e[0]).sum();
+        assert!(
+            (wmean - d.mean[0]).abs() < 1e-15,
+            "{wmean} vs {}",
+            d.mean[0]
+        );
+        assert!(
+            (d.mean[0] - (mean[0] - 0.35)).abs() < 1e-15,
+            "mean[0] = {}",
+            d.mean[0]
+        );
+        assert_eq!(d.mean[1], mean[1], "an unshifted η keeps its mean");
         let m_new = DVector::from_column_slice(&d.mean);
         let cov_new = &d.second_moment - &m_new * m_new.transpose();
         for i in 0..2 {

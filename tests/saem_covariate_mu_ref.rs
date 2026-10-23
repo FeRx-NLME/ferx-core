@@ -1235,3 +1235,85 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );
 }
+
+/// #1365 review: the closed-form shift of a **plain** mu-reference (`TVV`) must
+/// translate the retained importance draws, not only their moments, because a
+/// #619 group on the **numerical** engine (`CL`'s renal group, made time-varying
+/// here so it needs the observation term) scores those same draws in the same
+/// iteration at a θ that already carries the `TVV` shift. With stale samples
+/// every draw's V is off by `exp(δ)`, and the group step fits TVCL/TH_CRCL to
+/// that wrong V.
+///
+/// `TVV` starts at 15 against ≈ 49 so the first shift is ≈ 1.2 log units. The
+/// fixture was confirmed to reach the data-term branch of the group step on
+/// every iteration of both methods. Measured (macOS arm64, `ci-fast`), 5
+/// iterations, K = 300, seed 619:
+///
+/// | | IMP `ofv` / TH_CRCL | IMPMAP `ofv` / TH_CRCL |
+/// |---|---|---|
+/// | samples translated | −1168.14 / 0.0318 | −1168.13 / 0.0318 |
+/// | moments only (the round-1 fix) | −1140.40 / 0.0116 | −1121.32 / 0.0007 |
+///
+/// The −1160 and 0.02 bounds sit between the two rows with ≥ 8 units and
+/// ≥ 0.008 of headroom either side. 30 iterations from the anchor's own start
+/// (`TVV` 40) give −1170.6 with or without the translation, so the bounds are
+/// not a statement about where the fit converges.
+#[test]
+fn a_plain_mu_ref_shift_translates_the_draws_a_numerical_group_step_scores() {
+    let src = std::fs::read_to_string("nonmem_anchor/covmuref_additive_saem_fit.ferx")
+        .expect("anchor model file")
+        .replace("theta TVV(40.0,", "theta TVV(15.0,");
+    let model = parse_full_model(&src).expect("model parses").model;
+    // Make CRCL drift within each subject (+0.5 per hour) so the group must
+    // keep the observation term in its M-step.
+    let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i > 0 {
+            let mut f: Vec<String> = line.split(',').map(String::from).collect();
+            let t: f64 = f[1].parse().unwrap();
+            let c: f64 = f[6].parse().unwrap();
+            f[6] = format!("{}", c + 0.5 * t);
+            out.push_str(&f.join(","));
+        } else {
+            assert!(line.ends_with(",CRCL"), "CRCL must be column 7: {line}");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("covmuref_additive_tvcrcl.csv");
+    std::fs::write(&path, out).unwrap();
+    let pop = read_nonmem_csv(&path, None, None).expect("time-varying data loads");
+
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let opts = FitOptions {
+            method,
+            imp_iterations: 5,
+            impmap_iterations: 5,
+            imp_samples: 300,
+            impmap_samples: 300,
+            imp_auto: false,
+            impmap_auto: false,
+            imp_averaging: 1,
+            impmap_averaging: 1,
+            imp_seed: Some(619),
+            impmap_seed: Some(619),
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+        // `< -1160` is `false` for NaN.
+        assert!(
+            r.ofv < -1160.0,
+            "{method:?}: OFV {} — the group step scored stale draws (#1365)",
+            r.ofv
+        );
+        let th_crcl = theta(&r, "TH_CRCL");
+        assert!(
+            th_crcl > 0.02,
+            "{method:?}: TH_CRCL {th_crcl} collapsed toward its bound (#1365)"
+        );
+    }
+}
