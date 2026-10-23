@@ -29713,6 +29713,15 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "a conditional overwrite that adds it again",
             "  A = RE\n  if (WT > 70) {\n    A = A + RE\n  }\n  CL = TVCL * exp(A)",
         ),
+        // Dies under: `origin_scope` filing a read-modify-write overwrite as
+        // a virtual sibling branch (#1724 review). `CL` is a parameter, so the
+        // original definition ends on the overwrite's root once, as does the
+        // overwrite's own leaf; maxed, that is 1, but on `WT > 70` `CL` holds
+        // `TVCL + 2·RE`.
+        (
+            "a conditional overwrite of a parameter that adds it again, was Additive",
+            "  CL = TVCL + RE\n  if (WT > 70) {\n    CL = CL + RE\n  }",
+        ),
     ]
     .into_iter()
     .map(|(l, t)| (format!("{v}{t}"), l))

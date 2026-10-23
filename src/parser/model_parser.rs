@@ -2856,15 +2856,22 @@ impl<'a> ScaleWalk<'a> {
     /// virtual sibling branch (`usize::MAX`) of the first later origin that
     /// overwrites its variable inside an `if` below it.
     ///
-    /// An overwrite that reads the variable (`if (WT > 70) { A = A + ETA }`)
-    /// needs no exception: `def` then reaches every terminal after it both
-    /// through the overwrite and around it, so its own count is already 2.
+    /// Only a pure replacement qualifies. An overwrite that reads the
+    /// variable (`if (WT > 70) { CL = CL + ETA }`) adds to `def`'s value on
+    /// the branch it runs, so the two are summed as usual: when `CL` is a
+    /// parameter, `def` ends on the overwrite's root once and so does the
+    /// overwrite's own leaf, which is `2·ETA` on that branch.
     fn origin_scope(&self, def: usize, origins: &[usize]) -> Scope {
         let (var, _) = self.assigns[def];
         let own = &self.scopes[def];
+        let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         for &y in origins.iter().filter(|&&y| y > def) {
             let theirs = &self.scopes[y];
-            if self.assigns[y].0 == var && theirs.len() > own.len() && theirs.starts_with(own) {
+            if self.assigns[y].0 == var
+                && theirs.len() > own.len()
+                && theirs.starts_with(own)
+                && !reads_node(self.assigns[y].1, &is_var)
+            {
                 let mut v = theirs[..=own.len()].to_vec();
                 if let Some(last) = v.last_mut() {
                     last.1 = usize::MAX;
