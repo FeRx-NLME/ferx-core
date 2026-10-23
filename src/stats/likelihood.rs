@@ -324,11 +324,11 @@ fn try_joint_pktte_shared_solve(
         })
         .collect();
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
-    // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
-    // No-op for Form-C / no-init / linear-scale models; FREM is excluded by the guard.
+    // (compute_predictions_with_tv_into_with_schedule): init impulse, then the sink's
+    // shared tail ([scaling], LTBS, FREM override). No-op for Form-C / no-init /
+    // linear-scale models; the FREM step is a no-op too, since the guard excludes FREM.
     crate::pk::add_analytical_init(model, subject, theta, eta, &mut preds);
-    crate::pk::apply_scaling(model, subject, theta, eta, &mut preds);
-    crate::pk::apply_log_transform(model, &mut preds);
+    crate::pk::to_observation_scale(model, subject, theta, eta, &mut preds);
 
     Some(JointPkTteSolve {
         preds,
@@ -480,6 +480,69 @@ pub(crate) fn accumulate_non_gaussian_nll(
     {
         *acc += factor * crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
     }
+}
+
+/// Each non-Gaussian data term of one subject at `eta`, named, one per TTE endpoint
+/// (ascending CMT), then the categorical and the CTMM term when the model has one —
+/// the terms [`accumulate_non_gaussian_nll`] sums, kept apart so
+/// `W_NONFINITE_OBJECTIVE` can say which one failed (#2267). Raw NLLs, not the
+/// OFV-scale `2·` the contribution carries.
+///
+/// An `OdeAccumulated` hazard is re-solved here rather than read off the #570 shared
+/// solve, which agrees to solver tolerance; a diverged solve is `NaN` on both and maps
+/// to the same `1e20` sentinel. Empty for a subject with no non-Gaussian record.
+#[cfg(feature = "survival")]
+pub(crate) fn non_gaussian_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<(String, f64)> {
+    let mut terms = Vec::new();
+    if subject.obs_records.is_empty() {
+        return terms;
+    }
+    let mut cmts: Vec<&usize> = model.endpoints.keys().collect();
+    cmts.sort();
+    for cmt in cmts {
+        if let crate::types::EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = &model.endpoints[cmt]
+        {
+            let records: Vec<ObsRecord> = subject
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if records.is_empty() {
+                continue;
+            }
+            let nll = tte_endpoint_nll(model, subject, hazard, *recurrence, &records, theta, eta);
+            terms.push((format!("time-to-event on CMT {cmt}"), nll));
+        }
+    }
+    if model.has_discrete() {
+        let nll = crate::categorical::discrete_subject_nll(model, subject, theta, eta);
+        terms.push(("categorical".to_string(), nll));
+    }
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        let nll = crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+        terms.push(("CTMM".to_string(), nll));
+    }
+    terms
+}
+
+/// What the IOV marginal returns for a subject with FREM covariate rows, which it
+/// refuses: the augmented `b̂` and block-diagonal `Σ_b` are not set up for FREM
+/// R-overrides. Named so `W_NONFINITE_OBJECTIVE` reports the refusal as such (#2267).
+pub(crate) const IOV_FREM_REFUSAL_NLL: f64 = 1e18;
+
+/// Whether the IOV marginal refuses `subject` (see [`IOV_FREM_REFUSAL_NLL`]). Only
+/// consulted for a subject scored with κ.
+pub(crate) fn iov_refuses_frem(model: &CompiledModel, subject: &Subject) -> bool {
+    model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0)
 }
 
 /// Hot-path variant that additionally threads through a pre-built
@@ -1424,6 +1487,97 @@ pub(crate) fn foce_subject_nll_cov(
     residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
+    foce_subject_nll_cov_split(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        None,
+    )
+}
+
+/// Where a marginal records its parts for `W_NONFINITE_OBJECTIVE` (#2267): `None` on
+/// every scoring path, so the value a caller gets back is computed the same way either
+/// way. Each part is `(name, nll)` on the raw NLL scale — half its share of the `2·nll`
+/// contribution.
+type PartSink<'a> = Option<&'a mut Vec<(String, f64)>>;
+
+/// Record one part when a sink is attached.
+fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
+    if let Some(p) = parts.as_deref_mut() {
+        p.push((name.to_string(), nll));
+    }
+}
+
+/// The parts of `subject`'s [`foce_subject_nll_cov`] contribution, recorded by the branch
+/// that computes it (#2267): the Sheiner–Beal marginal under FOCE, the row-wise or
+/// dense-`R` Almquist marginal under FOCEI, and the joint form with the time-to-event,
+/// categorical and CTMM terms and their curvature. When the marginal returns its
+/// sentinel, the part that made it is recorded as `NaN` under a name saying why, and the
+/// parts it never reached are absent. Healthy, `2·Σ nll` is the contribution, to
+/// rounding. The names:
+///
+/// * FOCE — `linearized residual term` (`½ rᵀR̃⁻¹r` over the quantified rows),
+///   `linearized covariance log-determinant` (`½ ln|R̃|`, `R̃ = HΩHᵀ + R`), or
+///   `linearized covariance R̃ (not positive definite)` in their place;
+/// * FOCEI — `Gaussian residual term` (`½(rᵀR⁻¹r + ln|R|)` at the predictions at
+///   `eta_hat`), or `Gaussian residual variance (non-finite or non-positive)` on the
+///   row-wise path and `Gaussian residual covariance R (not positive definite)` on the
+///   dense one in its place; `random-effect prior` (`½(η̂ᵀΩ⁻¹η̂ + ln|Ω|)`);
+///   `curvature log-determinant` (`½ ln|H̃|`), or `curvature (H̃ not positive definite)`;
+/// * both — `censored (M3) term`, when the fit censors one of the subject's rows;
+/// * a subject with time-to-event, categorical or CTMM records — every one of those data
+///   terms (as [`non_gaussian_terms`] names them), the Gaussian residual term, prior and
+///   curvature under FOCE as well, since that branch is the joint conditional form; and
+///   a failed curvature names the non-Gaussian FD Hessian when it is not finite, or says
+///   `once the non-Gaussian Hessian is added` when the Gaussian `H̃` alone factors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_contribution_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+) -> Vec<(String, f64)> {
+    let mut parts = Vec::new();
+    foce_subject_nll_cov_split(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        Some(&mut parts),
+    );
+    parts
+}
+
+/// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_cov_split(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))] mut parts: PartSink<'_>,
+) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
     // #570: at the EBE mode the Gaussian `ipreds` solve and the at-mode TTE-term solve
     // are both at `eta_hat`; when the subject qualifies, share one augmented integration
@@ -1471,6 +1625,8 @@ pub(crate) fn foce_subject_nll_cov(
         let n_eta = eta_hat.len();
         let mut tte_nll_at_mode = 0.0_f64;
         let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
+        // Per-CMT terms for the part sink, in CMT order (`endpoints` is a hash map).
+        let mut tte_parts: Vec<(usize, f64)> = Vec::new();
 
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte {
@@ -1503,7 +1659,7 @@ pub(crate) fn foce_subject_nll_cov(
                 };
                 // #570: at the mode, read H/h off the shared solve when available; the
                 // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
-                tte_nll_at_mode += match (joint_share.as_ref(), hazard) {
+                let endpoint_nll = match (joint_share.as_ref(), hazard) {
                     (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
                         model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
                         s,
@@ -1512,11 +1668,20 @@ pub(crate) fn foce_subject_nll_cov(
                     ),
                     _ => tte_fn(eta_hat.as_slice()),
                 };
+                tte_nll_at_mode += endpoint_nll;
+                if parts.is_some() {
+                    tte_parts.push((*cmt, endpoint_nll));
+                }
                 if n_eta > 0 {
                     let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
                 }
             }
+        }
+
+        tte_parts.sort_by_key(|&(cmt, _)| cmt);
+        for (cmt, nll) in tte_parts {
+            note(&mut parts, &format!("time-to-event on CMT {cmt}"), nll);
         }
 
         // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
@@ -1527,7 +1692,9 @@ pub(crate) fn foce_subject_nll_cov(
             let discrete_fn = |eta_eval: &[f64]| {
                 crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
             };
-            tte_nll_at_mode += discrete_fn(eta_hat.as_slice());
+            let mode = discrete_fn(eta_hat.as_slice());
+            note(&mut parts, "categorical", mode);
+            tte_nll_at_mode += mode;
             if n_eta > 0 {
                 let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
                 tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
@@ -1542,6 +1709,7 @@ pub(crate) fn foce_subject_nll_cov(
                 crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
             };
             let mode = ctmm_fn(eta_hat.as_slice());
+            note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
             // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
             // observed transition underflowing, or a negative off-diagonal, under the
@@ -1588,6 +1756,7 @@ pub(crate) fn foce_subject_nll_cov(
             interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
+            parts,
         );
     }
 
@@ -1610,7 +1779,7 @@ pub(crate) fn foce_subject_nll_cov(
         || subject.fremtype.iter().any(|&ft| ft > 0);
     if interaction {
         if !residual_cov.is_dense() || rowwise {
-            foce_subject_nll_interaction_corr(
+            foce_subject_nll_interaction_split(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1624,9 +1793,10 @@ pub(crate) fn foce_subject_nll_cov(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 residual_cov.pairs,
+                parts,
             )
         } else {
-            foce_subject_nll_interaction_dense_cov(
+            foce_subject_nll_interaction_dense_split(
                 subject,
                 &ipreds,
                 eta_hat,
@@ -1638,6 +1808,7 @@ pub(crate) fn foce_subject_nll_cov(
                 &p_obs,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                parts,
             )
         }
     } else {
@@ -1650,7 +1821,7 @@ pub(crate) fn foce_subject_nll_cov(
         // (always ≥0). Skipped for additive error (variance is f-independent,
         // so f0 and f(η=0) give the same R) to keep that path bit-identical.
         let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
-        foce_subject_nll_standard_cov(
+        foce_subject_nll_standard_split(
             subject,
             &ipreds,
             eta_hat,
@@ -1664,6 +1835,7 @@ pub(crate) fn foce_subject_nll_cov(
             frem_r_override.as_deref(),
             pop_preds.as_deref(),
             ruv_mult.as_deref(),
+            parts,
         )
     }
 }
@@ -1793,6 +1965,43 @@ pub(crate) fn foce_subject_nll_standard_cov(
     // path. Scales each observation's sigma loadings in R.
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
+    foce_subject_nll_standard_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        residual_cov,
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        r_pred_override,
+        ruv_mult,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_standard_cov`], recording its parts into `parts` when one is
+/// attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_standard_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    r_pred_override: Option<&[f64]>,
+    ruv_mult: Option<&[Vec<f64>]>,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
@@ -1884,7 +2093,17 @@ pub(crate) fn foce_subject_nll_standard_cov(
 
     let chol = match r_tilde.clone().cholesky() {
         Some(c) => c,
-        None => return 1e20,
+        None => {
+            if m3 {
+                note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
+            }
+            note(
+                &mut parts,
+                "linearized covariance R̃ (not positive definite)",
+                f64::NAN,
+            );
+            return 1e20;
+        }
     };
 
     // Residuals: y - f0 over the quantified rows.
@@ -1894,6 +2113,20 @@ pub(crate) fn foce_subject_nll_standard_cov(
     let solved = chol.solve(&residuals);
     let quad_form = residuals.dot(&solved);
     let log_det_r = chol_log_det(&chol.l());
+
+    if nq > 0 {
+        note(&mut parts, "linearized residual term", 0.5 * quad_form);
+    }
+    if m3 {
+        note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
+    }
+    if nq > 0 {
+        note(
+            &mut parts,
+            "linearized covariance log-determinant",
+            0.5 * log_det_r,
+        );
+    }
 
     0.5 * (quad_form + log_det_r + bloq_term)
 }
@@ -2004,6 +2237,43 @@ pub(crate) fn foce_subject_nll_interaction_corr(
     ruv_mult: Option<&[Vec<f64>]>,
     correlations: &[ResidualCorrelation],
 ) -> f64 {
+    foce_subject_nll_interaction_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        bloq_method,
+        p_obs,
+        frem_r_override,
+        residual_error_eta,
+        ruv_mult,
+        correlations,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_interaction_corr`], recording its parts into `parts` when one is
+/// attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_interaction_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    residual_error_eta: Option<usize>,
+    ruv_mult: Option<&[Vec<f64>]>,
+    correlations: &[ResidualCorrelation],
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
@@ -2020,21 +2290,59 @@ pub(crate) fn foce_subject_nll_interaction_corr(
         ruv_scale,
         ruv_mult,
         Some(correlations),
+        None,
     ) else {
+        note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
         return 1e20;
     };
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
     // (`cens_hess` = 0 unless the subject has M3-censored rows.)
     let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            note(&mut parts, CURVATURE_FAILED, f64::NAN);
+            return 1e20;
+        }
     };
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
+}
+
+/// The part named when a row-wise residual variance is not finite and positive.
+const RESIDUAL_VARIANCE_FAILED: &str = "Gaussian residual variance (non-finite or non-positive)";
+/// The part named when `H̃` does not factor.
+const CURVATURE_FAILED: &str = "curvature (H̃ not positive definite)";
+
+/// Record the conditional Gaussian data parts: the residual term when the subject has a
+/// Gaussian observation, and the censored term when the fit censors one of its rows.
+fn note_gaussian_data(
+    parts: &mut PartSink<'_>,
+    subject: &Subject,
+    bloq_method: BloqMethod,
+    data_ll: f64,
+    bloq_term: f64,
+) {
+    if !subject.observations.is_empty() {
+        note(parts, "Gaussian residual term", 0.5 * data_ll);
+    }
+    if bloq_method.has_censored_row(&subject.cens) {
+        note(parts, "censored (M3) term", 0.5 * bloq_term);
+    }
 }
 
 /// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
@@ -2116,6 +2424,39 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
     // dense data term), so `∂R/∂η_r = 2R` joins `B`.
     residual_error_eta: Option<usize>,
 ) -> f64 {
+    foce_subject_nll_interaction_dense_split(
+        subject,
+        ipreds,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        error_spec,
+        residual_cov,
+        p_obs,
+        ruv_mult,
+        residual_error_eta,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_interaction_dense_cov`], recording its parts into `parts` when one
+/// is attached (see [`foce_subject_contribution_parts`]).
+#[allow(clippy::too_many_arguments)]
+fn foce_subject_nll_interaction_dense_split(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>,
+    p_obs: &[f64],
+    ruv_mult: Option<&[Vec<f64>]>,
+    residual_error_eta: Option<usize>,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2144,7 +2485,14 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
 
     let chol = match r.clone().cholesky() {
         Some(c) => c,
-        None => return 1e20,
+        None => {
+            note(
+                &mut parts,
+                "Gaussian residual covariance R (not positive definite)",
+                f64::NAN,
+            );
+            return 1e20;
+        }
     };
     let r_inv = chol.inverse();
 
@@ -2218,11 +2566,25 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
     }
 
     let htilde = term1 + 0.5 * b + &omega.inv;
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(&mut parts, "Gaussian residual term", 0.5 * data_ll);
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            note(&mut parts, CURVATURE_FAILED, f64::NAN);
+            return 1e20;
+        }
     };
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
@@ -2260,6 +2622,8 @@ fn foce_subject_nll_interaction_with_tte(
     // path. Scales the Gaussian (PK) rows' variance and f-derivative; the TTE
     // rows carry no residual variance so the multiplier never touches them.
     ruv_mult: Option<&[Vec<f64>]>,
+    // The part sink (#2267); the caller has recorded the non-Gaussian data terms.
+    mut parts: PartSink<'_>,
 ) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
@@ -2277,18 +2641,35 @@ fn foce_subject_nll_interaction_with_tte(
         ruv_scale,
         ruv_mult, // custom residual magnitude (#484) — scales the Gaussian PK rows
         None,
+        None,
     ) else {
+        note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
         return 1e20;
     };
+    note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
 
     // Combine Gaussian and TTE data terms.
     // TTE NLL is scaled by 2 here to match the Gaussian data_ll convention
     // (both are halved at the end via the 0.5 factor).
     let data_ll = g.data_ll + 2.0 * tte_data_nll;
+    // The part sink classifies a failed `H̃` by whether the non-Gaussian Hessian is what
+    // broke it, so it keeps the Gaussian side and that Hessian's finiteness before the sum.
+    let gaussian_htilde = parts.is_some().then(|| {
+        let mut h = g.hrh.clone() + &omega.inv;
+        if interaction {
+            h += 0.5 * &g.ctc + &g.cens_hess;
+        }
+        (h, tte_hessian.iter().all(|x| x.is_finite()))
+    });
     // Accumulate TTE Hessian into the Gaussian Jacobian outer-product matrix.
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    note(
+        &mut parts,
+        "random-effect prior",
+        0.5 * (eta_prior + omega.log_det),
+    );
     // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. The censored
     // `cens_hess` (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`) is FOCEI-order
     // curvature — its `g2` folds in `∂v/∂f`/`∂²v/∂f²`, and the `C·z`/`C·m` terms are
@@ -2302,8 +2683,26 @@ fn foce_subject_nll_interaction_with_tte(
     };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
+        None => {
+            let name = match gaussian_htilde {
+                Some((_, false)) => {
+                    "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                     CTMM terms not finite)"
+                }
+                Some((h, true)) if h.clone().cholesky().is_some() => {
+                    "curvature (H̃ not positive definite once the non-Gaussian Hessian is added)"
+                }
+                _ => CURVATURE_FAILED,
+            };
+            note(&mut parts, name, f64::NAN);
+            return 1e20;
+        }
     };
+    note(
+        &mut parts,
+        "curvature log-determinant",
+        0.5 * log_det_htilde,
+    );
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
@@ -2327,6 +2726,69 @@ struct GaussianFoceTerms {
     /// Added directly (unscaled) to `H̃`, so censored rows enter `log|H̃|`
     /// consistently with quantified rows. Zero when no censored rows.
     cens_hess: DMatrix<f64>,
+}
+
+/// Each observation's own `−2 log L` term in the FOCEI conditional data term at
+/// `ipreds` and `eta_hat` (#2266): `r²/V + ln V` on a quantified row, `−2 log Φ` on
+/// a row censored for this fit, read off [`gaussian_foce_accum`]'s own sweep, so
+/// every input the scorer resolves is resolved the same way — raw `IPRED` (no
+/// positivity floor) and unclamped `V`, the live `block_sigma` correlations in
+/// `residual_cov`, the SDE process-noise variance, FREM overrides, the `iiv_on_ruv`
+/// scale and a custom residual magnitude. A row whose `V` the scorer rejects (not
+/// finite or not positive) is `NaN`, the row that sends the subject to the sentinel.
+/// The terms sum to the marginal's `data_ll + bloq_term` when every row is usable.
+///
+/// Under FOCE (no interaction) or a dense residual covariance the marginal does not
+/// split by record; this is still what each record contributes at η̂ on its own.
+pub(crate) fn conditional_obs_neg2ll_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    ipreds: &[f64],
+    eta_hat: &[f64],
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+) -> Vec<f64> {
+    let n_obs = subject.observations.len();
+    if ipreds.len() != n_obs {
+        return vec![f64::NAN; n_obs];
+    }
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
+    } else {
+        Vec::new()
+    };
+    // The joint TTE path scores its Gaussian rows with no FREM override and the
+    // legacy (uncorrelated) variance; mirror it so a joint subject's terms are its own.
+    #[cfg(feature = "survival")]
+    let joint_tte = !subject.obs_records.is_empty();
+    #[cfg(not(feature = "survival"))]
+    let joint_tte = false;
+    let frem_r_override = if joint_tte {
+        None
+    } else {
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values)
+    };
+    let correlations = (!joint_tte).then_some(residual_cov.pairs);
+    let mut terms = vec![f64::NAN; n_obs];
+    let _ = gaussian_foce_accum(
+        subject,
+        ipreds,
+        &DMatrix::<f64>::zeros(n_obs, 0),
+        &model.error_spec,
+        sigma_values,
+        model.bloq_in_force(),
+        &p_obs,
+        0,
+        frem_r_override.as_deref(),
+        model.residual_error_eta,
+        ruv_scale_from(eta_hat, model.residual_error_eta),
+        ruv_mult.as_deref(),
+        correlations,
+        Some(&mut terms),
+    );
+    terms
 }
 
 /// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
@@ -2359,6 +2821,11 @@ fn gaussian_foce_accum(
     // row-wise (censored or FREM rows), `None` for the legacy variance. The caller makes
     // that call (it has asked `ResidualCov::is_dense`), not an emptiness test here.
     correlations: Option<&[ResidualCorrelation]>,
+    // `Some` records each row's own `−2 log L` term (`r²/V + ln V`, or `−2 log Φ` on a
+    // censored row) at its index (#2266). A row with an unusable `V` is recorded as
+    // `NaN` and the sweep continues instead of returning, so every row is recorded;
+    // the returned terms are then not a marginal's and the caller ignores them.
+    mut row_terms: Option<&mut [f64]>,
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
     let mult_row = |j: usize| -> Option<&[f64]> { ruv_mult.map(|m| m[j].as_slice()) };
@@ -2411,10 +2878,20 @@ fn gaussian_foce_accum(
         };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
-            return None;
+            match row_terms.as_deref_mut() {
+                Some(t) => {
+                    t[j] = f64::NAN;
+                    continue;
+                }
+                None => return None,
+            }
         }
         let r = subject.observations[j] - f;
-        data_ll += r * r / v + v.ln();
+        let term = r * r / v + v.ln();
+        if let Some(t) = row_terms.as_deref_mut() {
+            t[j] = term;
+        }
+        data_ll += term;
 
         // a_j = row j of H (∂f_j/∂η); c̃_{j,k} = (∂R_j/∂η_k)/R_j.
         // For a PK eta: (∂R/∂f)·a / R.
@@ -2470,10 +2947,20 @@ fn gaussian_foce_accum(
         // f-independent, so `d`/`d2` (∂v/∂f, ∂²v/∂f²) are unchanged.
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
-            return None;
+            match row_terms.as_deref_mut() {
+                Some(t) => {
+                    t[j] = f64::NAN;
+                    continue;
+                }
+                None => return None,
+            }
         }
         let cens = subject.cens.get(j).copied().unwrap_or(0);
-        bloq_term += -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
+        let term = -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
+        if let Some(t) = row_terms.as_deref_mut() {
+            t[j] = term;
+        }
+        bloq_term += term;
 
         // Censored curvature for `H̃` (`L = −logΦ`): structural `g2·a·aᵀ` plus, under
         // `iiv_on_ruv`, the residual-eta coupling `C·z` on (rr,rr) and `C·m·a_l` on the
@@ -2847,6 +3334,55 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     interaction: bool,
     lin: &IovLinearization,
 ) -> f64 {
+    foce_subject_nll_iov_linearized_split(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        interaction,
+        lin,
+        None,
+    )
+}
+
+/// The parts of an IOV subject's [`foce_subject_nll_iov_linearized`] contribution, recorded
+/// by the branch that computes it, as [`foce_subject_contribution_parts`] records them for
+/// a subject without κ (#2267 review r6). The marginal is over the stacked `[η, κ]`
+/// system, so `random-effect prior` is `½(b̂ᵀΣ_b⁻¹b̂ + ln|Σ_b|)` over both, and the
+/// curvature and FOCE's `R̃` carry the κ columns of `H`. A subject the marginal refuses
+/// for its FREM rows has the one part `IOV + FREM refusal`.
+pub(crate) fn foce_subject_iov_contribution_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+) -> Vec<(String, f64)> {
+    let mut parts = Vec::new();
+    foce_subject_nll_iov_linearized_split(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        interaction,
+        lin,
+        Some(&mut parts),
+    );
+    parts
+}
+
+/// [`foce_subject_nll_iov_linearized`], recording its parts into `parts` when one is
+/// attached.
+fn foce_subject_nll_iov_linearized_split(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    interaction: bool,
+    lin: &IovLinearization,
+    mut parts: PartSink<'_>,
+) -> f64 {
     let IovLinearization {
         ipreds,
         b_hat,
@@ -2883,8 +3419,9 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     // IOV + FREM is unsupported: the augmented b̂ vector and block-diagonal
     // Σ_b are not set up for FREM R-overrides.  Return a sentinel NLL so the
     // optimizer steers away from this region rather than silently ignoring FREM.
-    if model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0) {
-        return 1e18;
+    if iov_refuses_frem(model, subject) {
+        note(&mut parts, "IOV + FREM refusal", IOV_FREM_REFUSAL_NLL);
+        return IOV_FREM_REFUSAL_NLL;
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
@@ -2900,7 +3437,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         // the objective is not the one its EBE minimised.
         let rowwise = model.bloq_in_force().has_censored_row(&subject.cens);
         if !residual_cov.is_dense() || rowwise {
-            foce_subject_nll_interaction(
+            foce_subject_nll_interaction_split(
                 subject,
                 &ipreds,
                 &b_hat,
@@ -2913,9 +3450,11 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 None, // IOV + FREM unsupported (guarded above)
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
+                &[],
+                parts,
             )
         } else {
-            foce_subject_nll_interaction_dense_cov(
+            foce_subject_nll_interaction_dense_split(
                 subject,
                 &ipreds,
                 &b_hat,
@@ -2927,6 +3466,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
                 &p_obs_iov,
                 ruv_mult.as_deref(),
                 model.residual_error_eta,
+                parts,
             )
         }
     } else {
@@ -2936,7 +3476,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         // Additive error keeps f0 (bit-identical).
         // `kappas` has one length-`n_iov` vector per occasion (checked above).
         let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
-        foce_subject_nll_standard_cov(
+        foce_subject_nll_standard_split(
             subject,
             &ipreds,
             &b_hat,
@@ -2950,6 +3490,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
             None,
             pop_preds.as_deref(),
             ruv_mult.as_deref(),
+            parts,
         )
     }
 }
@@ -6937,6 +7478,93 @@ DV ~ proportional(PROP_ERR)
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
     }
+    /// #2267 review r4: the joint (time-to-event, categorical, CTMM) marginal records the
+    /// curvature it actually factors, which carries the non-Gaussian FD Hessian, and says
+    /// when that Hessian is what broke it. Healthy, `2·(Σ parts + non-Gaussian data)`
+    /// is the contribution — under FOCEI and FOCE, whose `H̃` differ.
+    ///
+    /// Measured: the healthy gap is `0` under both flags, against a bound of `1e-12·nll`.
+    ///
+    /// Mutation (run): invert the Gaussian-`H̃` test → the `−1e6` case reads the plain
+    /// name; drop the finiteness arm → the `NaN` case reads another name.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_joint_marginal_names_a_curvature_the_non_gaussian_hessian_broke() {
+        let subject = make_simple_subject();
+        let ipreds: Vec<f64> = subject.observations.iter().map(|y| 1.05 * y).collect();
+        let h = DMatrix::from_fn(6, 1, |j, _| -0.1 * ipreds[j] * subject.obs_times[j]);
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let eta = DVector::from_vec(vec![0.1]);
+        let tte_nll = 2.0;
+        let run = |h: &DMatrix<f64>, tte_h: f64, interaction: bool| {
+            let mut parts = Vec::new();
+            let nll = foce_subject_nll_interaction_with_tte(
+                &subject,
+                &ipreds,
+                &eta,
+                h,
+                &omega,
+                &[0.1],
+                &ErrorSpec::Single(ErrorModel::Proportional),
+                BloqMethod::Drop,
+                &[],
+                tte_nll,
+                DMatrix::from_element(1, 1, tte_h),
+                interaction,
+                None,
+                None,
+                Some(&mut parts),
+            );
+            (nll, parts)
+        };
+        let names = |parts: &[(String, f64)]| -> Vec<String> {
+            parts.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for interaction in [true, false] {
+            let (nll, parts) = run(&h, 3.0, interaction);
+            assert_eq!(
+                names(&parts),
+                [
+                    "Gaussian residual term",
+                    "random-effect prior",
+                    "curvature log-determinant"
+                ],
+                "interaction = {interaction}"
+            );
+            let summed = parts.iter().map(|(_, v)| v).sum::<f64>() + tte_nll;
+            eprintln!(
+                "interaction = {interaction}: gap {:e}",
+                (summed - nll).abs()
+            );
+            assert!(
+                nll.is_finite() && nll < 1e3 && (summed - nll).abs() <= 1e-12 * nll.abs(),
+                "interaction = {interaction}: Σ parts + tte = {summed}, marginal = {nll}"
+            );
+        }
+
+        // The straddle: each case is a sentinel of the same marginal, named for its cause.
+        let broken = [
+            (
+                h.clone(),
+                -1e6,
+                "curvature (H̃ not positive definite once the non-Gaussian Hessian is added)",
+            ),
+            (
+                h.clone(),
+                f64::NAN,
+                "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                 CTMM terms not finite)",
+            ),
+            (DMatrix::from_element(6, 1, f64::NAN), 3.0, CURVATURE_FAILED),
+        ];
+        for (h, tte_h, want) in broken {
+            let (nll, parts) = run(&h, tte_h, true);
+            assert_eq!(nll, 1e20, "{want}");
+            let last = parts.last().expect("a curvature part");
+            assert!(last.0 == want && last.1.is_nan(), "{parts:?}");
+        }
+    }
 }
 
 /// Conditional observation NLL from precomputed predictions, using the exact
@@ -6976,4 +7604,103 @@ pub(crate) fn conditional_obs_nll_from_preds(
         eta,
         semantics,
     )
+}
+
+#[cfg(test)]
+mod conditional_obs_terms_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// #2266: the per-record terms `W_NONFINITE_OBJECTIVE` names a record by sum to
+    /// the FOCEI scorer's data term. At η̂ = 0 with `H = 0` the scorer
+    /// (`foce_subject_nll_cov`, interaction) reduces to `½(data_ll + bloq_term)`:
+    /// `η̂ᵀΩ⁻¹η̂ = 0` and `H̃ = Ω⁻¹`, so `log|Ω|` and `log|H̃|` cancel. The model is an
+    /// SDE, so the EKF process-noise variance is in both; dropping it from either
+    /// side breaks the equality (it is ~`p_obs` against `σ² = 1` per record).
+    #[test]
+    fn conditional_terms_sum_to_the_focei_data_term_of_an_sde_model() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[diffusion]
+  central ~ 0.5
+[error_model]
+  DV ~ additive(ADD)
+"#,
+        )
+        .expect("parse");
+        assert!(model.is_sde(), "premise: an SDE model");
+        let subject = Subject {
+            obs_rgroup: Vec::new(),
+            id: "1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.6, 1.5, 1.2, 0.9],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 4],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let p = &model.default_params;
+        let eta = DVector::zeros(model.n_eta);
+        let ipreds = model_predictions(&model, &subject, &p.theta, eta.as_slice());
+        let terms = conditional_obs_neg2ll_terms(
+            &model,
+            &subject,
+            &p.theta,
+            &ipreds,
+            eta.as_slice(),
+            &p.sigma.values,
+            model.residual_cov_at(p),
+        );
+        assert!(terms.iter().all(|t| t.is_finite()), "{terms:?}");
+        let p_obs = ekf_p_obs(&model, &subject, &p.theta, eta.as_slice(), &p.sigma.values);
+        assert!(
+            p_obs.iter().any(|&v| v > 1e-3),
+            "premise: the process noise is live: {p_obs:?}"
+        );
+        let scorer = foce_subject_nll_cov(
+            &model,
+            &subject,
+            &p.theta,
+            &eta,
+            &DMatrix::zeros(subject.observations.len(), model.n_eta),
+            &p.omega,
+            &p.sigma.values,
+            model.residual_cov_at(p),
+            true,
+        );
+        let sum: f64 = terms.iter().sum();
+        assert!(
+            (sum - 2.0 * scorer).abs() <= 1e-12 * sum.abs().max(1.0),
+            "Σ terms {sum} vs scorer data term {}",
+            2.0 * scorer
+        );
+    }
 }

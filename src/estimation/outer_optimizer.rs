@@ -485,24 +485,25 @@ fn freeze_flat_thetas(
         )
     };
     let reconverged_ofv = |theta_i: usize, value: f64| reconverged(theta_i, value).0;
+    // The clean −2LL gradient at the start: the flat-θ test below, and the slope of the
+    // #2159 identity-scale rule.
+    let mut grad_eval_idx = 0usize;
+    let grad = population_gradient(
+        &x,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        &bounds,
+        options,
+        &mut grad_eval_idx,
+        OuterTrial::unknown(),
+        declines,
+    );
     let frozen = 'freeze: {
-        let mut grad_eval_idx = 0usize;
-        let grad = population_gradient(
-            &x,
-            n_subj,
-            init_params,
-            model,
-            population,
-            &ehs,
-            &hms,
-            &kappas,
-            &bounds,
-            options,
-            &mut grad_eval_idx,
-            OuterTrial::unknown(),
-            declines,
-        );
-
         // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
         // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
         // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
@@ -624,13 +625,49 @@ fn freeze_flat_thetas(
                 options.max_unconverged_frac,
             )
         };
+        // The slope and curvature of the penalized objective along each candidate, from the
+        // gradient above and the exact R-matrix's candidate block; `None` (and the probes)
+        // when a subject is outside the recorders' scope.
+        let exact = |candidates: &[usize]| {
+            identity_exact_derivatives(
+                model,
+                population,
+                init_params,
+                &params.theta,
+                &x,
+                &ehs,
+                options,
+                (&nn_reg, &priors),
+                candidates,
+            )
+        };
+        // Whether the optimizer could take a move of the θ's own size, without re-solving:
+        // the penalized objective at the start's EBEs is finite and below the `1e20` wall.
+        // The exact rule's stand-in for the probes' "an infeasible probe scales the θ" arm
+        // (#2291 review).
+        let feasible = |i: usize, value: f64| {
+            let p = with_theta(i, value);
+            let v = 2.0 * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, options)
+                + identity_probe_penalty(&p, &nn_reg, &priors);
+            ofv_is_valid(v)
+        };
         identity_theta_scales(
             &params.theta,
             &init_params.theta_lower,
             &init_params.theta_upper,
             held,
             || objective(base_ofv(), &params, &base_stats),
+            |candidates: &[usize]| {
+                #[cfg(test)]
+                if IDENTITY_EXACT_OFF.with(std::cell::Cell::get) {
+                    return None;
+                }
+                exact(candidates)
+            },
+            feasible,
             |i, value| {
+                #[cfg(test)]
+                IDENTITY_PROBE_SOLVES.with(|c| c.set(c.get() + 1));
                 let (clean, stats) = reconverged(i, value);
                 objective(clean, &with_theta(i, value), &stats)
             },
@@ -646,6 +683,58 @@ fn freeze_flat_thetas(
             .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
     }
+}
+
+/// The slope and curvature `(∂f/∂x_i, ∂²f/∂x_i²)` of the penalized objective the #2159
+/// pre-flight probes, along each of `candidates`, at the start: the exact −2LL derivatives
+/// ([`crate::estimation::covariance::exact_candidate_derivatives`]: the adjoint gradient and
+/// the R-matrix's diagonal, at the same tightly reconverged modes) plus the penalties'
+/// gradient and curvature. `None` — and the probes — when those are not available exactly:
+/// a subject outside the recorders' scope or unconverged at the tight tolerance, the exact
+/// R-matrix switched off, or an active NN smoothness penalty, whose Hessian is Gauss–Newton
+/// only (`NnRegularizer::hessian_is_exact`).
+#[allow(clippy::too_many_arguments)]
+fn identity_exact_derivatives(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    theta: &[f64],
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    (nn_reg, priors): (
+        &crate::estimation::nn_reg::NnRegularizer,
+        &crate::estimation::priors::PriorSet,
+    ),
+    candidates: &[usize],
+) -> Option<Vec<(f64, f64)>> {
+    if !nn_reg.hessian_is_exact() {
+        return None;
+    }
+    let clean = crate::estimation::covariance::exact_candidate_derivatives(
+        model, population, template, x, warm, options, candidates,
+    )?;
+    let mut g = vec![0.0; x.len()];
+    nn_reg.penalty_and_gradient(theta, &mut g);
+    priors.penalty_and_gradient(x, &mut g);
+    let mut pen = vec![0.0; candidates.len()];
+    let mut add_diagonal = |a: usize, b: usize, v: f64| {
+        if a == b {
+            if let Some(c) = candidates.iter().position(|&i| i == a) {
+                pen[c] += v;
+            }
+        }
+    };
+    nn_reg.add_packed_hessian(theta, &mut add_diagonal);
+    priors.add_hessian(&mut add_diagonal);
+    Some(
+        candidates
+            .iter()
+            .zip(clean)
+            .zip(pen)
+            .map(|((&i, (gc, hc)), hp)| (gc + g.get(i).copied().unwrap_or(f64::NAN), hc + hp))
+            .collect(),
+    )
 }
 
 /// An identity-packed θ (negative lower bound) whose initial magnitude is below this
@@ -722,6 +811,8 @@ fn identity_theta_scales(
     theta_upper: &[f64],
     held: impl Fn(usize) -> bool,
     base_ofv: impl FnOnce() -> f64,
+    exact: impl FnOnce(&[usize]) -> Option<Vec<(f64, f64)>>,
+    mut feasible: impl FnMut(usize, f64) -> bool,
     mut probe_ofv: impl FnMut(usize, f64) -> f64,
 ) -> Vec<(usize, f64)> {
     let n = theta.len().min(theta_lower.len()).min(theta_upper.len());
@@ -741,13 +832,33 @@ fn identity_theta_scales(
     if !ofv_is_valid(base) {
         return Vec::new();
     }
+    // The same quadratic from exact derivatives at θ₀, when every subject has them: its
+    // second difference over the probe spacing is `f″·δ²` and its minimizer is the Newton
+    // step `−f′/f″` (#2159 follow-up).
+    let exact = exact(&candidates).filter(|d| {
+        d.len() == candidates.len() && d.iter().all(|(g, h)| g.is_finite() && h.is_finite())
+    });
     let mut scales = Vec::new();
-    for i in candidates {
+    for (c, i) in candidates.into_iter().enumerate() {
         let t = theta[i];
         let magnitude = t.abs();
         let Some(points) = identity_probe_points(t, theta_lower[i], theta_upper[i]) else {
             continue;
         };
+        if let Some(d) = &exact {
+            let (g, h) = d[c];
+            let delta = points[1] - points[0];
+            let scaled = h * delta * delta > 1e-6 * (1.0 + base.abs())
+                && (g / h).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude;
+            // The probes' other arm: a move of the θ's own size the optimizer cannot take
+            // (a non-finite or walled objective) scales it, whatever the local derivatives
+            // say. Checked at the probe points with the EBEs held, only for a θ the
+            // derivatives would leave on the unit scale.
+            if scaled || points.iter().any(|&p| p != t && !feasible(i, p)) {
+                scales.push((i, magnitude));
+            }
+            continue;
+        }
         // Objectives at the three points in ascending order; θ₀ is one of them.
         let mut f = [0.0; 3];
         for (fk, &xk) in f.iter_mut().zip(&points) {
@@ -869,6 +980,10 @@ fn mixture_identity_theta_scales(
         &init_params.theta_upper,
         |i| init_params.theta_fixed.get(i).copied().unwrap_or(false),
         || ofv_at(&params),
+        // The R-matrix recorders do not differentiate the K-fold mixture objective.
+        |_| None,
+        // Only the exact rule asks; the probes judge feasibility themselves.
+        |_, _| true,
         |i, value| {
             let mut p = params.clone();
             p.theta[i] = value;
@@ -2304,7 +2419,9 @@ const LARGE_IDENTITY_THETA: f64 = 10.0;
 /// - |θ₀| > [`LARGE_IDENTITY_THETA`] is divided by |θ₀| (#2146), under the resolved
 ///   unscaled strategy (BOBYQA / MMA) as well as under `abs`;
 /// - the near-zero θ in `identity_scales` take their probed scale (#2159,
-///   [`identity_theta_scales`]).
+///   [`identity_theta_scales`]), or `|x0[i]|` when that is larger — the probe ran at the
+///   first leg's start, and a restart leg starts where the stalled leg left the θ
+///   (#2272).
 fn nlopt_scale_vector(
     x0: &[f64],
     init_params: &ModelParameters,
@@ -2344,8 +2461,16 @@ fn nlopt_scale_vector(
             scale[i] = x0[i].abs();
         }
     }
+    // The probe ran once, at the first leg's start, and every leg (stall retry, restart)
+    // is handed its result. A restart starts at the stalled estimates, where a probed θ
+    // may have grown by orders of magnitude: a θ probed at 0.001 that reached 2000 would
+    // otherwise be overwritten back to scale 0.001 — a coordinate of 2e6, the shape the
+    // large-θ rule above exists to remove (#2272). So the probed scale is a floor under
+    // the θ's current magnitude, not a replacement for it. On the first leg the two are
+    // equal (the probe scales by |θ₀| and `x0[i]` is θ₀), and a θ that shrank keeps its
+    // probed scale rather than chasing zero.
     for &(i, s) in identity_scales {
-        scale[i] = s;
+        scale[i] = s.max(x0[i].abs());
     }
     scale
 }
@@ -3511,6 +3636,11 @@ fn tight_per_subject_gradients(
 
 #[cfg(test)]
 thread_local! {
+    /// The #2159 pre-flight's probe re-solves on this thread: one population inner solve
+    /// each, the cost the exact rule exists to remove.
+    pub(crate) static IDENTITY_PROBE_SOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: decide the #2159 identity scales from the probes alone.
+    pub(crate) static IDENTITY_EXACT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

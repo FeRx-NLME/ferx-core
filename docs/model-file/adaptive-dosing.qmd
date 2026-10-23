@@ -165,6 +165,12 @@ Each subject's η is still drawn from the fitted Ω. To simulate known patients 
 their own fitted η instead, see
 [Supplied individual values](#supplied-individual-values).
 
+On a FREM model that draw includes the covariate η, so a subject's PK does not
+follow its own covariate values, while a controller reading
+`ControllerCtx::covariates` doses on them. The result reports this as
+`W_FREM_DRAWN_ETA`; supply the FREM fit's EBEs instead. See
+[FREM: Limitations](../estimation/frem.qmd#limitations).
+
 The block compiles to exactly the controller, monitor, and engine described
 below, so every guarantee in [Monitors](#monitors) and
 [Verification](#verification-on-by-default) applies unchanged, and `result` is

@@ -251,7 +251,7 @@ Of the input refusals, these carry a code:
   (`E_FIT_INPUT_MODEL`);
 - ODE solver settings on a `FitOptions` built in code that no solver can run
   with (`E_ODE_SOLVER_OPTIONS`): an `ode_reltol` or `ode_abstol` that is not
-  finite and positive, or `ode_max_steps = 0`. A model file's `[fit_options]`
+  finite and positive, `ode_max_steps = 0`, or `ode_stiff_abort_after = Some(0)`. A model file's `[fit_options]`
   refuses the same values when it is parsed (`E_PARSE`);
 - a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly
   inside (0, 1), so `run_sir()` has no logit-scale proposal for it
@@ -260,8 +260,10 @@ Of the input refusals, these carry a code:
   refit. `simulate_with_uncertainty()` with the asymptotic method refuses it the
   same way;
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
-  above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
-  prior. `fit()` with `sir = true` reports the same text as a warning;
+  above `sir_samples`, a `sir_df` below 1, `sir_scale = natural` under a
+  prior. `fit()` refuses a `sir_df` below 1 up front when SIR can run
+  ([#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)), and with
+  `sir = true` reports the other two as a warning;
 - a fit in which every estimated parameter is FIX (θ, Ω and σ, and Ω_IOV,
   `block_sigma` correlations and `[mixture]` overrides where the model has
   them), so SIR has nothing to sample
@@ -440,7 +442,7 @@ covariance step that followed produced usable standard errors.
 | `multi_start` | Info | Multi-start note. | Inspect which start won. |
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
-| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). Also `W_IOV_NO_OCCASIONS`: a `kappa` model simulated subjects that carry no occasion label at κ = 0, with no inter-occasion variability, from `simulate_with_options_diag` and `simulate_with_uncertainty_diag` (#1955), or simulated their NPDE/NPD reference distribution that way, from `compute_npde_npd_diag` (#1980). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. For `W_IOV_NO_OCCASIONS`, label the occasions in the data (`iov_column`) or pass the model's `iov_occasion` rule; see [IOV: Simulation](model-file/iov.qmd#simulation). |
+| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). Also `W_IOV_NO_OCCASIONS`: a `kappa` model simulated subjects that carry no occasion label at κ = 0, with no inter-occasion variability, from `simulate_with_options_diag` and `simulate_with_uncertainty_diag` (#1955), or simulated their NPDE/NPD reference distribution that way, from `compute_npde_npd_diag` (#1980). Also `W_FREM_DRAWN_ETA`: a FREM model simulated subjects at an η drawn from Ω, covariate η included, so their PK does not follow their own covariate values (#2245). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. For `W_IOV_NO_OCCASIONS`, label the occasions in the data (`iov_column`) or pass the model's `iov_occasion` rule; see [IOV: Simulation](model-file/iov.qmd#simulation). For `W_FREM_DRAWN_ETA`, supply the FREM fit's EBEs or set `match_method`; see [FREM: Limitations](estimation/frem.qmd#limitations). |
 
 ### Absorption diagnostics {#codes-absorption}
 
@@ -532,51 +534,168 @@ When the subjects' own contributions at the final estimates show where the
 objective went wrong, the warning ends with one more sentence naming them
 (#2038). A subject is named when its objective contribution is itself unusable
 (`NaN`, infinite, or past the cutoff). For each one it gives the contribution and
-the observations whose `IPRED` or `PRED` is not finite, with the `TIME` of the
-first as written in the data:
+two clauses, each with a `TIME` as written in the data:
 
 ```text
 1 of 10 subjects have an objective contribution that is itself unusable:
-3 (contribution 2e20, a non-finite IPRED or PRED on 8 of 11 observations, the
-first at TIME 4).
+3 (contribution 2e20, an unusable likelihood term on 1 of 12 observations, the
+first at TIME 0 (DV 200, IPRED 0); every IPRED and PRED finite).
+```
+
+The first clause names the observations whose **own likelihood term** is
+unusable (#2266), and the `DV` and `IPRED` of the first. That term is the
+record's `−2 log L` in the FOCEI conditional data term at the subject's EBE, read
+off the scorer's own computation, with the raw `IPRED` and the fitted residual
+variance. It includes the fitted residual correlations, an SDE's process noise,
+an `iiv_on_ruv` scale and an M3 censored term. A mixture subject is scored under
+its fitted class. The term is unusable when it fails the same test as the
+objective (`NaN`, infinite, or at least `1e14`), or when the scorer cannot use
+its variance at all. Start with this record. Above, the prediction at `TIME 0`
+is a finite `0`, which a proportional error scores at the variance floor,
+`DV² × 1e12`. No prediction is non-finite, so the prediction clause has no
+record to name. A runaway `iiv_on_ruv` random effect is caught the same way:
+its variance overflows to infinity, so the record is named even though `IWRES`
+reads `0`. Under FOCE, or residuals correlated across records, the objective
+does not split by record, and the term is what the record contributes at the
+EBE on its own. When the subject cannot be matched to its data, the clause
+reads `likelihood terms not checked`.
+
+The second clause names the observations whose `IPRED` or `PRED` is not finite:
+
+```text
+3 (contribution 2e20, an unusable likelihood term on 8 of 11 observations, the
+first at TIME 4 (DV 11.0602, IPRED NaN); a non-finite IPRED or PRED on 8 of 11
+observations, the first at TIME 4).
 ```
 
 Here the model's `CL` went non-finite at `TIME 4`, and every later prediction
-of the subject inherited it. The first record is then a better place to start
-than the count: on it the parameter model (a power of a negative covariate, a
-`log` of zero) or the structural model produced a value the likelihood could not
-score. It is a starting point, not always the cause. A runaway random effect can
-leave an earlier record with a finite prediction of `0` that the residual model
-already cannot score, and the first non-finite prediction then comes after it.
-The two engines can also disagree on the same subject: the closed form may
-report every prediction finite where the ODE solver reports most of them
-non-finite. So also read the records before the named `TIME`.
+of the subject inherited it. On that record the parameter model (a power of a
+negative covariate, a `log` of zero) or the structural model produced a value the
+likelihood could not score.
 
-When a named subject's predictions are all finite, the sentence says so
-(`every IPRED and PRED finite`), and the cause is not in the predictions. A
-proportional error on a prediction of `0` is the usual case. A non-Gaussian
-term can do it as well (a time-to-event, binary or Markov likelihood), as can a
-covariance matrix that is not positive definite, or a subject the likelihood
-refuses outright, such as IOV combined with FREM. A subject with no Gaussian
-observation meets the condition trivially.
+The two clauses can name different records. A runaway random effect can leave an
+early record with a finite prediction of `0` that the residual model already
+cannot score, and the first non-finite prediction then comes after it. The two
+engines can also disagree on the predictions for the same subject: on such a
+subject the closed form may report a non-finite prediction at one record and
+finite ones elsewhere, where the ODE solver reports the opposite. The likelihood-term
+clause names the same record on both, so read that one first.
+
+When neither clause names a record (`every observation's likelihood term usable
+on its own; every IPRED and PRED finite`), the cause is not in a single Gaussian record. Many
+records whose terms are each large but below the cutoff can add up past it. A
+non-Gaussian term can do it as well (a time-to-event, binary or Markov
+likelihood), as can a covariance matrix that is not positive definite, or a
+subject the likelihood refuses outright, such as IOV combined with FREM. The
+term clause below says which.
+
+#### Which term failed
+
+The sentence then names each separately scored part of the subject's likelihood
+whose own value is unusable (#2267). A subject with all predictions finite reads
+`every IPRED and PRED finite`, or `no Gaussian observation` when it has none (a
+time-to-event-only subject, for example), and the named term is where to look:
+
+```text
+1 of 30 subjects have an objective contribution that is itself unusable:
+3 (contribution 2e20, no Gaussian observation, failed term: time-to-event on
+CMT 2 = 1e20).
+```
+
+The parts are recorded by the marginal that scored the contribution, on the branch
+it took, so a healthy subject's parts sum to its contribution under FOCE and FOCEI
+alike. A failed factorization stops the marginal: the part that failed is listed as
+`NaN` under a name saying why, and the parts after it are absent.
+
+| Term | Branch | What it is | Typical cause |
+|---|---|---|---|
+| `Gaussian residual term` | FOCEI | `½(rᵀR⁻¹r + ln\|R\|)` at the subject's EBE | a proportional error on a prediction of `0`, about `DV² × 1e12` per observation at the variance floor; a `NaN` prediction |
+| `Gaussian residual variance (non-finite or non-positive)` | FOCEI | in place of the residual term when a row's variance cannot be used | a residual model returning `NaN` or `≤ 0` |
+| `Gaussian residual covariance R (not positive definite)` | FOCEI, correlated `R` | in place of the residual term when `R` does not factor | a residual correlation outside its admissible range |
+| `linearized residual term` | FOCE | `½ rᵀR̃⁻¹r`, `r = y − f₀`, over the quantified rows | as for the Gaussian residual term, at `PRED` |
+| `linearized covariance log-determinant` | FOCE | `½ ln\|R̃\|`, `R̃ = HΩHᵀ + R` | a variance or `∂f/∂η` past the cutoff |
+| `linearized covariance R̃ (not positive definite)` | FOCE | in place of the two above when `R̃` does not factor | a non-finite `∂f/∂η` or variance |
+| `censored (M3) term` | both | the censored rows' `−log Φ` tail, under `bloq_method = m3` | an LLOQ far from the prediction |
+| `random-effect prior` | FOCEI | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` (FOCE carries it inside `R̃`) | a runaway EBE |
+| `curvature log-determinant` | FOCEI | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it does not factor | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
+| `time-to-event on CMT n`, `categorical`, `CTMM` | both | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
+| `non-Gaussian curvature (FD Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
+| `curvature (H̃ not positive definite once the non-Gaussian Hessian is added)` | both | in place of the curvature, when the Gaussian side alone factors | a non-Gaussian term strongly non-convex at the EBE |
+| `IOV + FREM refusal` | IOV | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
+| `IOV random effects (κ̂ do not match the occasion groups)` | IOV | in place of every part, when the marginal refuses the subject's κ̂ | an EBE vector of the wrong shape |
+
+A subject with time-to-event, categorical or CTMM records is scored by the joint
+conditional form under FOCE as well, so its parts are the FOCEI names, and its
+curvature carries those terms' finite-difference Hessian. An IOV subject's
+marginal is over the stacked `[η, κ]` system, and its parts are that marginal's:
+the same names, with the `random-effect prior` over `η̂` and every occasion's `κ̂`,
+and the curvature and FOCE's `R̃` over both.
+
+A term is listed when its value is `NaN`, infinite, or past the cutoff once put on
+the contribution's `2·` scale. The message shows the raw negative
+log-likelihood, so a term printed as `6e13` is listed. When every scored term is
+usable the sentence says `every separately scored term usable`. The failure is then
+in how the parts combine, not in any one of them: only their sum is past the
+cutoff.
 
 A subject with a non-finite prediction and a valid contribution is not named.
 `IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian
 observation, and that subject contributes nothing wrong. The message names at
 most ten subjects. The `unusable_subjects` array in the structured warning's
-`details` lists all of them. Only the Rust API carries it
-(`FitResult::warnings_structured`): the R package, the YAML output and a
-reloaded `.fitrx` file keep the message and drop `details`.
+`details` lists all of them; see [Where `details` is
+written](#where-details-is-written) for the outputs that carry it.
 
-No sentence is added when every subject's contribution is valid. That happens
-when:
+#### When no subject is named
 
-* the objective was clamped at a point the subjects were not scored at;
-* the subjects are each below the cutoff and only their sum is past it — ten
-  subjects of `1.6e13` each, for example;
-* the objective comes from a method other than FOCE or FOCEI. The contributions
-  are always the post-hoc FOCE/FOCEI score, so an AGQ, IMP, SAEM, Laplace or
-  mixture objective can be unusable while every contribution is valid.
+When every subject's contribution is valid, the warning says why no subject can
+be named (#2267), with the first of these that applies:
+
+* **The parameter-prior penalty is unusable.** `fit()` adds it to the data
+  objective, and no subject carries it: `...and the parameter-prior penalty, a
+  population-level term no subject carries, is not (inf).` An unusable penalty
+  next to named subjects is added after the list instead.
+* **The objective is not the sum of the contributions** — see below.
+* **Only the sum is past the cutoff**, as with ten subjects of `1.6e13` each:
+  `...but their sum (160000000000000.0) is past the cutoff.`
+* **The sum is usable**, so the objective was evaluated at another point than the
+  estimates and EBEs the subjects are scored at — a trial point an optimizer
+  stopped on, for example.
+
+#### Contributions from another objective
+
+The contributions are always the post-hoc FOCE/FOCEI score at the EBEs, and ferx
+classifies the objective by what was published rather than by the method name.
+FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP and VI's
+`vi_final_ofv = laplace` all publish the sum of these same scores. The ones that
+do not are Laplace and adaptive quadrature (`n_agq > 1`, including an
+`agq_eval_only` readout), BAYES (whose `ofv` is a joint NLL at the posterior
+mean), and a mixture's class-marginal (#2267). After a list of named subjects
+the warning then adds:
+
+```text
+These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE
+objective, which ferx does not split by subject.
+```
+
+When no subject is named, such an objective gives:
+
+```text
+No subject can be named: every subject's post-hoc FOCEI contribution at these
+estimates is usable, but the LAPLACE objective is not their sum and ferx does not
+split it by subject, so these scores cannot locate its failure; their sum (24.68)
+is usable.
+```
+
+The sum is reported for what it is: the scores can sum past the cutoff
+themselves (`...is past the cutoff as well`), so neither case says the failure
+is in a part of the objective the scores do not share.
+
+The structured warning's `details` record this as `contribution_score`
+(`"FOCE"` or `"FOCEI"`, the marginal the contributions score),
+`contributions_are_objective_terms` (`false` for such an objective) and
+`ofv_prior`; `unusable_subjects` is then present and may be empty. Each subject's
+`failed_terms` lists the terms named in the message as `{term, nll}` objects, `nll`
+raw and a string when it is not finite.
 
 ### The one exception
 
@@ -614,7 +733,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations whose `IPRED` or `PRED` is not finite), `n_obs` and `first_time` (the written `TIME` of the first of them; `null` when every prediction is finite, when the result could not be matched to its subject in the data, or when that written `TIME` is itself not finite) ([Which subjects](#which-subjects)) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations with a non-finite `IPRED` or `PRED`), `n_obs` and `first_time` (the written `TIME` of the first; `null` when there is none, the subject is unmatched, or that `TIME` is not finite), and `unusable_terms` / `first_unusable_term_time`, the same for likelihood terms, and `failed_terms`; with it, `contribution_score`, `contributions_are_objective_terms` and `ofv_prior` ([Which subjects](#which-subjects)) |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 
@@ -637,6 +756,25 @@ instance of it: the offending value *is* the payload, so a non-finite `ofv` is
 carried as the string `"NaN"` / `"inf"` / `"-inf"` (JSON has no non-finite
 numbers) instead of dropping the key. Only `convergence` warnings raised by this
 check carry `details`; a plain "did not converge" carries none.
+
+### Where `details` is written
+
+A payload is part of the fit's output, not only of the Rust value (#2268):
+
+- **Rust API** — `FitResult::warnings_structured`.
+- **JSON output** — each entry of `warnings_structured`, as above.
+- **YAML output** — a `warning_details:` list after `warnings:`, one item per
+  warning that has a payload, with its `code`, `severity`, `source_method`
+  (when set), `message` and `details`. The strings and the payload are written
+  as JSON, which YAML reads as flow syntax. `warnings:` itself stays a list of
+  message strings, and the block is absent when no warning has a payload.
+- **`.fitrx`** — `fit.json` stores the entries that have a payload under
+  `warning_details`, and a reload restores them unchanged. Every other entry is
+  rebuilt from `warnings` on load, the way a fresh fit builds it. A bundle saved
+  before #2268 has no such field and reloads without the at-source payloads.
+
+The R package reads `warnings_structured` without the `details` column until its
+matching change lands.
 
 ## How codes are assigned
 

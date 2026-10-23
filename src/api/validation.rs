@@ -2052,11 +2052,9 @@ pub(crate) fn check_level_labels(
 ///   level. That κ is then the parent's random effect by another name, and the two
 ///   variances cannot be told apart. A level where some parents have several members
 ///   is identified and is not refused.
-/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
-///   levels each lie within one group of a level that carries a κ (the innermost such
-///   level is named). The block could then absorb that κ, and the level-block binder
-///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
-///   block whose levels cross those groups cannot absorb the κ and binds as before.
+///
+/// A `theta NAME[COL, …]` level block that nests in the groups of a κ's level is not
+/// refused here: the level-block binder measures the κ on those groups (#2034).
 fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use crate::stats::nested_levels::label_path;
     let Some(levels) = model.nested_levels() else {
@@ -2133,60 +2131,6 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
         }
     }
 
-    // A level block that nests in the groups of a level carrying a κ. The innermost such
-    // level is named: a block nested in an arm is nested in its study too.
-    for decl in model.theta_blocks().level_blocks() {
-        for (l, level) in levels.levels.iter().enumerate().rev() {
-            if !levels.kappa_level.contains(&l) {
-                continue;
-            }
-            let mut owner: std::collections::HashMap<Vec<u64>, (usize, Vec<u64>)> =
-                std::collections::HashMap::new();
-            let mut nests = true;
-            'nest: for (s, subj) in population.subjects.iter().enumerate() {
-                for j in 0..subj.obs_times.len() {
-                    let cov = subj.obs_cov(j);
-                    let key: Option<Vec<u64>> = decl
-                        .columns()
-                        .iter()
-                        .map(|c| {
-                            cov.get(c)
-                                .copied()
-                                .filter(|v| !v.is_nan())
-                                .map(f64::to_bits)
-                        })
-                        .collect();
-                    let (Some(key), Some(path)) = (key, label_path(levels, cov)) else {
-                        nests = false;
-                        break 'nest;
-                    };
-                    let unit = (s, path[..=l].to_vec());
-                    if *owner.entry(key).or_insert_with(|| unit.clone()) != unit {
-                        nests = false;
-                        break 'nest;
-                    }
-                }
-            }
-            if nests {
-                return vec![Diagnostic::error(
-                    "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
-                    format!(
-                        "theta {}[{}]: each of its levels lies within one `{}` group, so it \
-                         could absorb a kappa at `{}`. Under nested levels the check that \
-                         decides whether it does is not available yet, so the model is \
-                         refused rather than fitted unchecked. Key the block on columns whose \
-                         levels cross the `{}` groups, or fit it without nested levels.",
-                        decl.name(),
-                        decl.columns().join(", "),
-                        level.name,
-                        level.name,
-                        level.name
-                    ),
-                )
-                .with_block("parameters")];
-            }
-        }
-    }
     Vec::new()
 }
 
@@ -2495,6 +2439,49 @@ pub(crate) fn no_occasion_warning(
             population.subjects.len()
         )
     })
+}
+
+/// `W_FREM_DRAWN_ETA` when a FREM model is simulated with η drawn from Ω for some subjects
+/// (#2245). A FREM model carries its covariates only through the extended Ω: no individual
+/// parameter reads them, so a subject's covariate η is what links its covariate value to its
+/// PK. An unconditional draw `η = L·z` gives every subject a fresh covariate η, and its PK
+/// follows that draw instead of the covariate value in its own data rows.
+///
+/// `drawn` holds the subjects whose η was drawn — every subject on `simulate()`, the ones
+/// without a supplied η on the adaptive path. Silent when it is empty, and on a non-FREM
+/// model. The `FREMTYPE` sentence is gated on a drawn subject carrying a `FREMTYPE > 0` row,
+/// the only rows where the drawn covariate value shows up in the output.
+///
+/// `remedy` is the closing sentence, because the sound routes differ by entry point:
+/// `SimulateOptions::match_method` exists only on `simulate_with_options`, supplied η only
+/// on the adaptive path.
+pub(crate) fn frem_drawn_eta_warning<'a>(
+    model: &CompiledModel,
+    n_subjects: usize,
+    drawn: impl IntoIterator<Item = &'a Subject>,
+    remedy: &str,
+) -> Option<String> {
+    model.frem_config.as_ref()?;
+    let (mut n_drawn, mut any_frem_row) = (0usize, false);
+    for s in drawn {
+        n_drawn += 1;
+        any_frem_row |= s.fremtype.iter().any(|&t| t > 0);
+    }
+    if n_drawn == 0 {
+        return None;
+    }
+    let rows = if any_frem_row {
+        " Their FREMTYPE rows report the drawn covariate values, not the ones in the data."
+    } else {
+        ""
+    };
+    Some(format!(
+        "W_FREM_DRAWN_ETA: {n_drawn} of {n_subjects} subject(s) of this FREM model were \
+         simulated with an eta drawn from Omega, covariate etas included. A FREM model links \
+         its covariates to the PK only through the correlations in Omega, so the PK of each of \
+         these subjects follows its drawn covariate etas, not its own covariate values.{rows} \
+         {remedy}"
+    ))
 }
 
 /// Built-in absorption input-rate models (e.g. `transit()`) are integrated
@@ -5685,12 +5672,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // Rust callers bypass the parser's lower bound. Zero must not disable FOCEI
-    // quadrature or be silently coerced to one-node Laplace by agq_nodes().
-    if options.n_agq == 0
-        && chain
-            .iter()
-            .any(|m| matches!(m, EstimationMethod::FoceI | EstimationMethod::Laplace))
-    {
+    // quadrature or be silently coerced to one-node Laplace by agq_nodes(). Refused under
+    // every method, not only the two that read it: every fit records `n_agq` in its
+    // `scoring_settings`, and a `.fitrx` holding a 0 there does not load (#1770).
+    if options.n_agq == 0 {
         diags.push(
             Diagnostic::error(
                 "E_AGQ_NODES_ZERO",
@@ -5698,6 +5683,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    // `sir_df` below 1 runs (`ChiSquared` takes any `nu > 0`) and is recorded in a
+    // `sir.settings` the `.fitrx` reader refuses (#1770). Refused here wherever SIR can
+    // run, with the code and text `run_sir` refuses it with: the in-fit SIR would
+    // otherwise only report it as a `SIR failed:` warning after the whole fit.
+    if options.sir || options.covariance_fallback == crate::types::CovarianceFallback::Sir {
+        if let Err(e) = crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df) {
+            diags.push(Diagnostic::error("E_SIR_OPTIONS", e.to_string()));
+        }
     }
 
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
@@ -5734,6 +5729,25 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         .any(|&m| matches!(m, EstimationMethod::Laplace));
     let focei_quadrature =
         chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1;
+    // The per-dimension node cap below, for a chain no quadrature reads `n_agq` in: the
+    // value goes unused but is recorded in `scoring_settings`, and a `.fitrx` holding one
+    // past the cap does not load (#1770).
+    if !(laplace_stage || focei_quadrature) && options.n_agq > crate::estimation::agq::MAX_AGQ_NODES
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_AGQ_NODES_TOO_LARGE",
+                format!(
+                    "n_agq = {} exceeds the {}-node per-dimension limit. No stage of this fit \
+                     reads it; remove n_agq or set it within 1..={}.",
+                    options.n_agq,
+                    crate::estimation::agq::MAX_AGQ_NODES,
+                    crate::estimation::agq::MAX_AGQ_NODES,
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    }
     if laplace_stage || focei_quadrature {
         // IOV is **supported**: the quadrature integrates over the stacked (η, κ₁..κ_K),
         // which is exactly what `individual_nll_iov` already scores. What IOV changes is the

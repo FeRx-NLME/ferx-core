@@ -1034,6 +1034,25 @@ pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subjec
         || model_uses_time_builtin(model)
 }
 
+/// Whether [`compute_predictions_with_states`] reports **approximate** compartment
+/// states for this subject on an ODE model (#1855).
+///
+/// That function routes a subject to the event-driven state pass on
+/// `has_tv_covariates() || has_resets() || model_uses_time_anywhere`, and that pass
+/// holds the disposition (CL, V, …) at the first observation's snapshot for the whole
+/// timeline (`ode_predictions_event_driven_with_states`). This is the part of that
+/// predicate where the snapshot is **not** uniform: a time-varying covariate, or an
+/// individual-parameter program reading `TIME`. The other two arms are exact — a reset
+/// alone, or an `[odes]` RHS reading time (the integrator evaluates it at the true
+/// time), keeps one snapshot for every observation.
+///
+/// `model` is the **effective** model for the subject ([`effective_model_for_eval`]):
+/// `false` for a subject served by a closed form, whose states follow the analytical
+/// rules instead.
+pub(crate) fn ode_cmt_states_approximate(model: &CompiledModel, subject: &Subject) -> bool {
+    model.ode_spec.is_some() && (subject.has_tv_covariates() || model_uses_time_builtin(model))
+}
+
 /// The occasion label to evaluate an EVID=3/4 **reset row's** `$PK` under, on the
 /// `OCC`-column IOV path (#1133).
 ///
@@ -1534,6 +1553,43 @@ pub(crate) fn compute_event_pk_params_iov(
 /// value instead of `-inf`/`NaN`.
 pub(crate) const LTBS_FLOOR: f64 = 1e-12;
 
+/// The post-engine tail of the `pk` sink: `[scaling]`, then
+/// [`finish_on_observation_scale`]. Every non-IOV prediction sink ends here
+/// (`compute_predictions_with_tv`, the ODE branch of
+/// [`compute_predictions_with_states`]), so a step added to the tail reaches all of
+/// them at once — #2129, #2156 and #2259 were each a sink with its own, incomplete
+/// copy of this sequence.
+pub(crate) fn to_observation_scale(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    apply_scaling(model, subject, theta, eta, preds);
+    finish_on_observation_scale(model, subject, theta, eta, preds);
+}
+
+/// The part of the `pk` sink's tail that follows `[scaling]`: the LTBS log-wrap, then
+/// the FREM override. A sink whose `[scaling]` step reads a per-occasion or
+/// per-window η (`predict_iov`, `api::adaptive::adaptive_rows_to_model_scale`) runs
+/// that step itself and calls this; every other sink calls [`to_observation_scale`].
+///
+/// The FREM override comes last: a covariate pseudo-observation is `θ_k + η_m` on the
+/// raw additive scale, so neither `[scaling]` nor the log-wrap may touch it. `eta_bsv`
+/// is the BSV η (the FREM etas are between-subject effects); a κ-augmented
+/// `[η_bsv | κ…]` vector also works, since the override only reads BSV slots.
+pub(crate) fn finish_on_observation_scale(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    preds: &mut [f64],
+) {
+    apply_log_transform(model, preds);
+    apply_frem_prediction_override(model, subject, theta, eta_bsv, preds);
+}
+
 /// Log-transform predictions in place when the model uses log-transform-both-sides
 /// (LTBS); a no-op otherwise. Applied at every prediction sink so the effective
 /// prediction is `log(f)` everywhere — FOCE linearization, residuals, IWRES/CWRES,
@@ -1916,14 +1972,10 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
         // identical `[η_bsv]` vector), or no observation carries an occasion label.
         apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
     }
-    // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
-    // this is the single log-wrap point for the IOV path — predictions are
-    // logged exactly once.
-    apply_log_transform(model, &mut preds);
-
-    // FREM override AFTER scaling and log-transform: covariate pseudo-observations
-    // are predicted as theta + eta (raw additive), regardless of the PK error model.
-    apply_frem_prediction_override(model, subject, theta, eta_bsv, &mut preds);
+    // LTBS log-wrap, then the FREM override — the sink's shared tail after the
+    // per-occasion `[scaling]` pass above. The IOV dispatch above is total (ODE or
+    // event-driven), so predictions are logged exactly once.
+    finish_on_observation_scale(model, subject, theta, eta_bsv, &mut preds);
     preds
 }
 
@@ -2731,6 +2783,10 @@ pub fn compute_predictions_with_states(
         // TV-covariate and reset subjects need the event-driven path (which also
         // handles resets as break-points). Plain subjects use the simpler function
         // that avoids the per-event PK-parameter machinery.
+        //
+        // The event-driven states hold the disposition at the first observation's
+        // snapshot; `ode_cmt_states_approximate` is the subset of this branch where
+        // that snapshot is not uniform, and gates `W_DERIVED_CMT_TV_ODE` (#1855).
         let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
         let (mut ipred, states) =
             if subject.has_tv_covariates() || subject.has_resets() || uses_time {
@@ -2750,13 +2806,13 @@ pub fn compute_predictions_with_states(
                 // Single-pass: one ODE integration yields both ipred and states.
                 crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject)
             };
-        // Apply [scaling] and LTBS log-transform — the single insertion point
-        // shared with compute_predictions_with_tv_into_with_schedule (lines 1153–1154).
-        // Without this, ODE models with `obs_scale` or `log_transform = true` would
-        // get raw, unscaled ipred in SubjectResult. For Form C (ODE output_fn) models,
-        // model.scaling is ScalingSpec::None, so apply_scaling is a no-op there.
-        apply_scaling(model, subject, theta, eta, &mut ipred);
-        apply_log_transform(model, &mut ipred);
+        // The sink's tail ([scaling], LTBS, FREM override), shared with
+        // compute_predictions_with_tv_into_with_schedule. Without it, ODE models with
+        // `obs_scale` or `log_transform = true` would get raw, unscaled ipred in
+        // SubjectResult, and a FREMTYPE > 0 covariate row the ODE readout instead of
+        // θ_k + η_m (#2259). For Form C (ODE output_fn) models, model.scaling is
+        // ScalingSpec::None, so the scaling step is a no-op there.
+        to_observation_scale(model, subject, theta, eta, &mut ipred);
         (ipred, states)
     } else {
         // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
@@ -3365,14 +3421,10 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
     // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those. Analytic
     // Form C sets `ScalingSpec::None` too (the readout replaces the output), so
     // `apply_scaling` is a no-op here for it.
-    apply_scaling(model, subject, theta, eta, &mut preds);
-    apply_log_transform(model, &mut preds);
-
-    // FREM override AFTER log-transform and scaling: replace predictions for
-    // FREMTYPE > 0 observations with theta[k] + eta[m] (raw covariate values).
-    // Covariate pseudo-observations use an additive model (Y = theta + eta + eps)
-    // regardless of the PK error model, so the log-transform must not apply.
-    apply_frem_prediction_override(model, subject, theta, eta, &mut preds);
+    //
+    // Then LTBS and the FREM override (FREMTYPE > 0 rows become θ_k + η_m on the raw
+    // additive scale). `to_observation_scale` is the one copy of this tail.
+    to_observation_scale(model, subject, theta, eta, &mut preds);
     preds
 }
 

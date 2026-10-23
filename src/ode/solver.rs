@@ -436,18 +436,25 @@ impl OdeSolverOverride {
 
     /// Reject values that the model-file parser would reject before they can
     /// reach a worker pool through the public Rust API.
+    ///
+    /// The domain is the one the `.fitrx` reader holds a recorded `ScoringSettings` to
+    /// (`fit_inputs::ode_tol_in_domain` and siblings), so a fit that runs records a bundle
+    /// that loads (#1770). `ode_stiff_abort_after = Some(0)` is refused with them: the
+    /// parser reads `0` as "off", and a run on `Some(0)` would record a value no model
+    /// file can spell.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
-            if let Some(value) = value {
-                if !value.is_finite() || value <= 0.0 {
-                    return Err(format!("{name} must be finite and positive, got {value}"));
-                }
+        use crate::estimation::fit_inputs::{
+            ode_max_steps_in_domain, ode_stiff_abort_after_in_domain, ode_tol_in_domain,
+        };
+        let check = || {
+            for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
+                value.map_or(Ok(()), |v| ode_tol_in_domain(name, v))?;
             }
-        }
-        if self.max_steps == Some(0) {
-            return Err("ode_max_steps must be positive, got 0".to_string());
-        }
-        Ok(())
+            self.max_steps.map_or(Ok(()), ode_max_steps_in_domain)?;
+            self.stiff_abort_after
+                .map_or(Ok(()), ode_stiff_abort_after_in_domain)
+        };
+        check().map_err(|e| e.to_string())
     }
 
     /// Cache-key equality uses the float representation explicitly. Validation
@@ -2793,8 +2800,8 @@ mod tests {
     /// Every field has to survive the trip onto a pool worker, since the pool is keyed by the
     /// override and a key collision would hand a fit someone else's settings. The two cases a
     /// "did anything change" assertion cannot catch are here: `stiff_abort_after` of
-    /// `Some(Some(0))` (abort on the first clamp) must stay distinct from `Some(None)` (no
-    /// budget), and `auto_switch: Some(false)` from "unset".
+    /// `Some(Some(1))` (abort on the first clamp; `Some(0)` is refused, #1770) must stay
+    /// distinct from `Some(None)` (no budget), and `auto_switch: Some(false)` from "unset".
     #[test]
     fn every_overridable_field_reaches_a_pool_worker() {
         let baked = OdeSolverOptions {
@@ -2819,7 +2826,7 @@ mod tests {
                 abstol: Some(1e-12),
                 max_steps: Some(123_456),
                 method: Some(method),
-                stiff_abort_after: Some(Some(0)),
+                stiff_abort_after: Some(Some(1)),
                 auto_switch: Some(false),
             };
             let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
@@ -2829,7 +2836,7 @@ mod tests {
                 assert_eq!(eff.abstol, 1e-12);
                 assert_eq!(eff.max_steps, 123_456);
                 assert_eq!(eff.method, method, "{method:?} did not reach the worker");
-                assert_eq!(eff.stiff_abort_after, Some(0));
+                assert_eq!(eff.stiff_abort_after, Some(1));
                 assert!(!eff.auto_switch);
             });
         }

@@ -31,6 +31,10 @@ impl NnRegularizer {
         false
     }
 
+    pub(crate) fn hessian_is_exact(&self) -> bool {
+        true
+    }
+
     pub(crate) fn penalty_value(&self, _theta: &[f64]) -> f64 {
         0.0
     }

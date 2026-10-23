@@ -953,6 +953,7 @@ pub ferx_core::io::fitrx::FitrxError::Corrupt(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Io(std::io::error::Error)
 pub ferx_core::io::fitrx::FitrxError::Json(serde_json::error::Error)
 pub ferx_core::io::fitrx::FitrxError::UnsupportedVersion(alloc::string::String)
+pub ferx_core::io::fitrx::FitrxError::Unwritable(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Zip(zip::result::ZipError)
 pub struct ferx_core::io::fitrx::LoadedFit
 pub ferx_core::io::fitrx::LoadedFit::fit: ferx_core::FitResult
@@ -1019,6 +1020,7 @@ pub ferx_core::io::output::OmegaRowsOptions::init_as_sd: bool
 pub ferx_core::io::output::OmegaRowsOptions::type_tag: bool
 pub ferx_core::io::output::OmegaRowsOptions::typical_value_spread: bool
 pub const ferx_core::io::output::THETA_BLOCK_COMPACT_MIN: usize
+pub fn ferx_core::io::output::block_summary(values: &[f64]) -> (f64, f64, f64)
 pub fn ferx_core::io::output::compact_theta_blocks(names: &[alloc::string::String]) -> alloc::vec::Vec<(alloc::string::String, core::ops::range::Range<usize>)>
 pub fn ferx_core::io::output::format_comparison(runs: &[(alloc::string::String, &ferx_core::FitResult)]) -> alloc::string::String
 pub fn ferx_core::io::output::format_kappa_rows_from(input: &ferx_core::io::output::KappaRowsInput<'_>, opts: ferx_core::io::output::KappaRowsOptions) -> alloc::string::String
