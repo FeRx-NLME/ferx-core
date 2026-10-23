@@ -15112,24 +15112,16 @@ fn build_ode_spec(
     // equilibration integrates the augmented system including `__chz`.
     //
     // The injected line is always top-level (`d/dt(__chz_<cmt>) = <hazard>` is
-    // pushed as its own `[odes]` line), so no `If` recursion is needed for the
-    // exclusion and the user's `if` bodies are walked exactly as before. By this
-    // point `resolve_variable_indices` has rewritten every `DiffEq` to
-    // `DiffEqBc(slot, _)`; `DiffEqIdx` is matched too because it is a documented
-    // fallback form and silently skipping it would widen the flag, not narrow it.
+    // pushed as its own `[odes]` line). Dropping it is not enough on its own: an
+    // `[odes]` intermediate the hazard alone consumes (`TT = TIME` … `hazard =
+    // f(TT)`) is an ordinary assignment, and keeping it made the PK block read
+    // time although no PK derivative depends on it (#1279). So the view is a
+    // **dataflow cut** — an intermediate survives only if some retained
+    // derivative line transitively reads it; see `pk_block_statements`.
     let pk_stmts: Vec<Statement> = if chz_state_slots.is_empty() {
         Vec::new()
     } else {
-        stmts_owned
-            .iter()
-            .filter(|s| match s {
-                Statement::DiffEqBc(slot, _) | Statement::DiffEqIdx(slot, _) => {
-                    !chz_state_slots.contains(slot)
-                }
-                _ => true,
-            })
-            .cloned()
-            .collect()
+        pk_block_statements(&stmts_owned, chz_state_slots)
     };
     // The one view every PK-block-only question below is asked of, so the `__chz`
     // exclusion has a single implementation. With no injected lines the filter is a
@@ -27892,6 +27884,93 @@ fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
     })
 }
 
+/// The statements the **PK block** depends on: the RHS with the injected
+/// joint-PK-TTE hazard lines (`d/dt(__chz_*)`, slots in `chz_state_slots`)
+/// removed, and with every assignment removed that no retained derivative line
+/// reads, directly or through a chain of intermediates (#1279).
+///
+/// A fixpoint over the set of *live* assignment targets: start with none live,
+/// cut, then mark live every target the cut program reads, and repeat until the
+/// set stops growing. It only grows, so it terminates. Flow-insensitive — a
+/// target is live if *any* retained statement reads it, wherever the read sits —
+/// which can only keep more than strictly needed, never less.
+///
+/// An `if` survives when any arm keeps a statement, with its conditions intact,
+/// so a condition guarding a retained derivative still counts as a read. An
+/// unresolved `Assign` / `DiffEq` has no slot to test and is always kept, and
+/// `DiffEqIdx` / `AssignIdx` are matched alongside the bytecode forms: silently
+/// dropping a shape this does not model would narrow the flag, not widen it.
+fn pk_block_statements(stmts: &[Statement], chz_state_slots: &[usize]) -> Vec<Statement> {
+    fn cut(stmts: &[Statement], chz: &[usize], live: &[usize]) -> Vec<Statement> {
+        stmts
+            .iter()
+            .filter_map(|s| match s {
+                Statement::DiffEqBc(k, _) | Statement::DiffEqIdx(k, _) => {
+                    (!chz.contains(k)).then(|| s.clone())
+                }
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    live.contains(t).then(|| s.clone())
+                }
+                Statement::Assign(..) | Statement::DiffEq(..) => Some(s.clone()),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let branches: Vec<(Condition, Vec<Statement>)> = branches
+                        .iter()
+                        .map(|(c, b)| (c.clone(), cut(b, chz, live)))
+                        .collect();
+                    let else_body = else_body.as_deref().map(|b| cut(b, chz, live));
+                    let kept = branches.iter().any(|(_, b)| !b.is_empty())
+                        || else_body.as_ref().is_some_and(|b| !b.is_empty());
+                    kept.then_some(Statement::If {
+                        branches,
+                        else_body,
+                    })
+                }
+            })
+            .collect()
+    }
+    fn targets(stmts: &[Statement], out: &mut Vec<usize>) {
+        for s in stmts {
+            match s {
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    if !out.contains(t) {
+                        out.push(*t);
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        targets(b, out);
+                    }
+                    if let Some(b) = else_body {
+                        targets(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    targets(stmts, &mut all);
+    let mut live: Vec<usize> = Vec::new();
+    loop {
+        let kept = cut(stmts, chz_state_slots, &live);
+        let before = live.len();
+        for t in &all {
+            if !live.contains(t) && stmts_read_slots(&kept, &[*t]) {
+                live.push(*t);
+            }
+        }
+        if live.len() == before {
+            return kept;
+        }
+    }
+}
+
 /// Whether an expression reads the bare `TIME` built-in.
 ///
 /// `TIME` is **not** a variable slot: it resolves to `Op::PushTime` /
@@ -29101,10 +29180,11 @@ impl OdeRhsProgram {
     /// Safe to ask on a non-joint model: with no injected lines the two are equal
     /// by construction, asserted rather than assumed.
     ///
-    /// Deliberately over-declines one shape: an intermediate that reads time and
-    /// is used only by the hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level
-    /// `AssignBc`, not one of the excluded derivative lines, so it still reads
-    /// wide. Conservative in the correct direction; a dataflow cut is out of scope.
+    /// The exclusion is a dataflow cut, not a statement-kind filter (#1279): an
+    /// `[odes]` intermediate consumed only by the hazard (`TT = TIME` … `hazard =
+    /// f(TT)`), or a chain of them, is excluded with it, so the flag does not depend
+    /// on whether the hazard's time term was factored out. An intermediate any PK
+    /// derivative line reads, transitively, still counts.
     pub(crate) fn pk_reads_model_time(&self) -> bool {
         self.pk_reads_model_time
     }
@@ -29149,15 +29229,11 @@ impl OdeRhsProgram {
     /// Composed from the two accessors rather than the two fields, for the reason given on
     /// [`Self::reads_model_time`]: neither may quietly become dead code.
     ///
-    /// **Inherits [`Self::pk_reads_model_time`]'s documented over-decline** (#1166), and
-    /// that costs more here. A time-reading `[odes]` intermediate consumed only by the
-    /// hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level `AssignBc`, not one of the
-    /// excluded derivative lines, so such a joint model reads `true` and is warned about
-    /// although its PK block is autonomous. Over-declining is free for #1166's own
-    /// consumer — a gate choosing a gradient route — and is a false positive for a
-    /// user-facing diagnostic. Accepted rather than narrowed: the dataflow cut is #1166's
-    /// deferred change, not this one's. Pinned by
-    /// `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    /// Shares [`Self::pk_reads_model_time`]'s PK-block view, so a time-reading `[odes]`
+    /// intermediate consumed only by the hazard does not make a joint model warn (#1279).
+    /// Before the dataflow cut it did — #1166's kind filter kept every intermediate, an
+    /// over-decline free for its routing consumer and a false positive for this diagnostic.
+    /// Pinned by `a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn`.
     pub(crate) fn pk_reads_absolute_time(&self) -> bool {
         self.pk_reads_tafd() || self.pk_reads_solver_time()
     }
