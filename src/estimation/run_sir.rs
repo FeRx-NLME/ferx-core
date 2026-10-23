@@ -939,6 +939,8 @@ mod tests {
                 ode_stiff_abort_after: Some(9),
                 ode_auto_switch: false,
                 gradient_method: crate::types::GradientMethod::Fd,
+                nn_l2_lambda: Some(0.25),
+                nn_smooth_lambda: Some(0.5),
             },
         }
     }
