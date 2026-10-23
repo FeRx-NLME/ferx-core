@@ -206,12 +206,13 @@ fn covariance_to_proposal_hessian(
 /// proposal on the stored weighted mean, so leaving it stale puts the proposal
 /// `δ_e` off the posterior it is meant to sample — from a cold start several
 /// posterior SDs on the first iteration, which is what collapsed every subject's
-/// ESS on iteration 2 (#1365). This is the plain-pair twin of the #619 group
-/// step's `recentre_eta` bookkeeping.
+/// ESS on iteration 2 (#1365). Each #619 group step applies the same
+/// translation with its own per-subject shift `Δ_i`.
 ///
 /// The samples move too, not only the moments: later in the same iteration a
-/// #619 group with `needs_data_term` scores these draws against a θ that already
-/// carries the shift, and it must see each sample at its unchanged `φ`.
+/// #619 group scores these draws against a θ that already carries the shift
+/// (the samples on the numerical engine, the mean on the exact one), and it must
+/// see each sample at its unchanged `φ`.
 fn shift_draws(d: &mut SubjectDraws, shift: &[f64]) {
     for eta in d.etas.iter_mut() {
         for (e, &s) in eta.iter_mut().zip(shift.iter()) {
@@ -1543,7 +1544,6 @@ fn run_mcem(
                     v
                 }
             };
-            let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
             let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
             for (gi, group) in cov_mu_groups.iter().enumerate() {
                 // Not pinned above, so the weighted M-step already owned these
@@ -1554,6 +1554,10 @@ fn run_mcem(
                     continue;
                 }
                 let theta_now = unpack_all(&log_theta);
+                // Read per group, not once before the loop: an earlier group's
+                // step re-centred the draws below, and the exact engine folds
+                // every other eta's mean into its target through Ω's cross terms.
+                let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
                 let input = GroupStepInput {
                     theta: &theta_now,
                     theta_lower: &init_params.theta_lower,
@@ -1612,7 +1616,11 @@ fn run_mcem(
                     log_theta[t] =
                         pack_one(t, theta_star[t]).clamp(log_theta_lower[t], log_theta_upper[t]);
                 }
-                // Keep φ_i fixed across the step. IMP (`SampleMoments`) centres the
+                // Keep φ_i fixed across the step, in the samples as well as the
+                // moments, for IMP and IMPMAP alike: a later group in this loop
+                // scores these draws (`d.etas` on the numerical engine, `d.mean`
+                // on the exact one) at a θ that already carries this group's move
+                // (#1365 review). IMP (`SampleMoments`) also centres the
                 // next iteration's proposal on this iteration's weighted posterior
                 // mean of η; the group step just moved each subject's mu by
                 // Δ_i = g(A_i(θ_new)) − g(A_i(θ_old)), so the posterior of η has
@@ -1625,19 +1633,21 @@ fn run_mcem(
                 // φ-space bookkeeping; the second moment follows so the proposal
                 // covariance `S − m mᵀ` is unchanged. This is the per-subject twin
                 // of SAEM's `e[eta_idx] -= delta` re-centring, and like it covers
-                // every member's eta of a joint group (#1620).
-                if recenter == ProposalRecenter::SampleMoments {
-                    let theta_new = unpack_all(&log_theta);
-                    let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
-                    for (i, d) in draws.iter_mut().enumerate() {
-                        let m_old = DVector::from_column_slice(&d.mean);
-                        if !group.recentre_eta(&mut d.mean, &deltas, i) {
-                            continue;
-                        }
-                        let m_new = DVector::from_column_slice(&d.mean);
-                        d.second_moment = &d.second_moment - &m_old * m_old.transpose()
-                            + &m_new * m_new.transpose();
+                // every member's eta of a joint group (#1620). Each subject moves
+                // by one vector, so the samples, mean and second moment translate
+                // together through `shift_draws`.
+                let theta_new = unpack_all(&log_theta);
+                let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
+                for (i, d) in draws.iter_mut().enumerate() {
+                    // `recentre_eta` is the one place the per-member delta is
+                    // read (a non-finite entry leaves that eta alone); applied to
+                    // zero it yields −Δ_i, the shift `shift_draws` subtracts.
+                    let mut neg_shift = vec![0.0f64; n_eta];
+                    if !group.recentre_eta(&mut neg_shift, &deltas, i) {
+                        continue;
                     }
+                    let shift: Vec<f64> = neg_shift.iter().map(|v| -v).collect();
+                    shift_draws(d, &shift);
                 }
             }
         }
