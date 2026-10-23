@@ -251,7 +251,7 @@ Of the input refusals, these carry a code:
   (`E_FIT_INPUT_MODEL`);
 - ODE solver settings on a `FitOptions` built in code that no solver can run
   with (`E_ODE_SOLVER_OPTIONS`): an `ode_reltol` or `ode_abstol` that is not
-  finite and positive, or `ode_max_steps = 0`. A model file's `[fit_options]`
+  finite and positive, `ode_max_steps = 0`, or `ode_stiff_abort_after = Some(0)`. A model file's `[fit_options]`
   refuses the same values when it is parsed (`E_PARSE`);
 - a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly
   inside (0, 1), so `run_sir()` has no logit-scale proposal for it
@@ -260,8 +260,10 @@ Of the input refusals, these carry a code:
   refit. `simulate_with_uncertainty()` with the asymptotic method refuses it the
   same way;
 - SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
-  above `sir_samples`, an invalid `sir_df`, `sir_scale = natural` under a
-  prior. `fit()` with `sir = true` reports the same text as a warning;
+  above `sir_samples`, a `sir_df` below 1, `sir_scale = natural` under a
+  prior. `fit()` refuses a `sir_df` below 1 up front when SIR can run
+  ([#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)), and with
+  `sir = true` reports the other two as a warning;
 - a fit in which every estimated parameter is FIX (θ, Ω and σ, and Ω_IOV,
   `block_sigma` correlations and `[mixture]` overrides where the model has
   them), so SIR has nothing to sample

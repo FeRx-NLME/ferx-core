@@ -550,6 +550,105 @@ fn fit_carries_the_options_check_code() {
     assert_eq!(err.to_string(), want.message);
 }
 
+/// #1770: `fit()` refuses, under any method, the recorded settings a `.fitrx` reader
+/// would refuse — not only where a stage reads them. Before, `n_agq = 0` passed under
+/// `foce`, `sir_df = 0.5` ran SIR, and `ode_stiff_abort_after = Some(0)` ran an analytic
+/// model; each fit then saved a bundle that did not load. Each row pairs the refusal with
+/// its accepted boundary on the same fixture, so a check that refused everything fails the
+/// accept half. The SIR gate is straddled too: `sir_df = 0.5` with no SIR to run is
+/// recorded nowhere and stays accepted.
+///
+/// Mutations: restore the FOCEI/Laplace-only condition on `E_AGQ_NODES_ZERO`; drop the
+/// non-quadrature `E_AGQ_NODES_TOO_LARGE`; drop the `sir_df` check or its
+/// `covariance_fallback` arm; drop `ode_stiff_abort_after_in_domain` from
+/// `OdeSolverOverride::validate`.
+#[test]
+fn fit_refuses_recorded_settings_outside_the_fit_options_domain() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    let foce = |set: &dyn Fn(&mut FitOptions)| {
+        let mut o = FitOptions {
+            method: EstimationMethod::Foce,
+            ..FitOptions::default()
+        };
+        set(&mut o);
+        o
+    };
+    let refused: [(&str, FitOptions, &str, String); 5] = [
+        (
+            "n_agq = 0",
+            foce(&|o| o.n_agq = 0),
+            "E_AGQ_NODES_ZERO",
+            "n_agq must be at least 1".into(),
+        ),
+        (
+            "n_agq past the cap",
+            foce(&|o| o.n_agq = max + 1),
+            "E_AGQ_NODES_TOO_LARGE",
+            format!("n_agq = {} exceeds the {max}-node", max + 1),
+        ),
+        (
+            "sir_df under sir = true",
+            foce(&|o| {
+                o.sir = true;
+                o.sir_df = 0.5;
+            }),
+            "E_SIR_OPTIONS",
+            "sir_df must be >= 1 or \"normal\", got 0.5".into(),
+        ),
+        (
+            "sir_df under covariance_fallback = sir",
+            foce(&|o| {
+                o.covariance_fallback = crate::types::CovarianceFallback::Sir;
+                o.sir_df = 0.5;
+            }),
+            "E_SIR_OPTIONS",
+            "sir_df must be >= 1 or \"normal\", got 0.5".into(),
+        ),
+        (
+            "ode_stiff_abort_after = Some(0) on an analytic model",
+            foce(&|o| o.ode_stiff_abort_after = Some(0)),
+            "E_ODE_SOLVER_OPTIONS",
+            "ode_stiff_abort_after must be positive or absent, got 0".into(),
+        ),
+    ];
+    for (name, opts, code, text) in refused {
+        let err = fit(&model, &pop, &model.default_params, &opts).expect_err(name);
+        assert_eq!(err.code(), Some(code), "{name}: {err}");
+        assert!(err.to_string().starts_with(&text), "{name}: {err}");
+    }
+
+    let accepted: [(&str, FitOptions); 5] = [
+        ("n_agq = 1", foce(&|o| o.n_agq = 1)),
+        ("n_agq at the cap", foce(&|o| o.n_agq = max)),
+        (
+            "sir_df = 1 under sir = true",
+            foce(&|o| {
+                o.sir = true;
+                o.sir_df = 1.0;
+            }),
+        ),
+        (
+            "sir_df = normal under covariance_fallback = sir",
+            foce(&|o| {
+                o.covariance_fallback = crate::types::CovarianceFallback::Sir;
+                o.sir_df = f64::INFINITY;
+            }),
+        ),
+        ("sir_df = 0.5 with no SIR to run", foce(&|o| o.sir_df = 0.5)),
+    ];
+    for (name, opts) in accepted {
+        let errors: Vec<_> = check_model_options(&model, &opts)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .collect();
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+    }
+    let budget = foce(&|o| o.ode_stiff_abort_after = Some(1)).ode_solver_override();
+    assert_eq!(budget.validate(), Ok(()), "ode_stiff_abort_after = Some(1)");
+}
+
 /// #2062 review 2, F2: ODE solver settings no solver can run with reach `fit()` as
 /// `E_ODE_SOLVER_OPTIONS`, the code `run_sir` / `run_covariance` give them (#2044). The
 /// check runs in `install_on_fit_pool` before any start, so the single-start and the
@@ -573,7 +672,7 @@ fn fit_carries_the_ode_solver_options_code() {
         );
         assert!(
             err.to_string()
-                .starts_with("ode_reltol must be finite and positive"),
+                .starts_with("ode_reltol must be a positive finite value"),
             "n_starts = {n_starts}: {err}"
         );
     }

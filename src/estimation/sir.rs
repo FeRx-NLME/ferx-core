@@ -109,6 +109,13 @@ impl SirSettings {
             scoring: crate::ScoringSettings::from_options(options),
         }
     }
+
+    /// The first field outside the `[fit_options]` domain, if any (#1770): `df`, then the
+    /// scoring half. Fields are named as the record names them (`df`, not `sir_df`).
+    pub(crate) fn check_domain(&self) -> Result<(), crate::estimation::fit_inputs::OutOfDomain> {
+        crate::estimation::fit_inputs::sir_df_in_domain("df", self.df)?;
+        self.scoring.check_domain()
+    }
 }
 
 impl Default for SirSettings {
@@ -1121,6 +1128,10 @@ fn run_sir_in_box(
             "sir_resamples must be <= sir_samples",
         ));
     }
+    // `[fit_options]`' domain, not `ChiSquared`'s (`nu > 0`): a df in (0, 1) would run, and
+    // be recorded in a `sir.settings` the `.fitrx` reader refuses (#1770).
+    crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df)
+        .map_err(|e| crate::api::sir_options(e.to_string()))?;
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
     // out of the same walk (#1252) — both are consulted below, and building the

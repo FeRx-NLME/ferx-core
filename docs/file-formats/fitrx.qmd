@@ -255,7 +255,15 @@ and, flat beside them, the scoring settings below. The enums are written as thei
 `[fit_options]` tokens (`"natural"`, `"lbfgs"`, `"rodas5p"`); an unknown token,
 a value `[fit_options]` would reject (`df < 1`, a non-positive ODE tolerance,
 `n_agq` out of range, …) or a `seed` that disagrees with the top-level `sir_seed`
-fails the load as corrupt. `df` is a JSON number, except for the
+fails the load as corrupt. The writer holds both records to the same rule
+([#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)): `save_fit` refuses
+a `FitResult` whose `sir_settings` or `scoring_settings` holds such a value
+(`FitrxError::Unwritable`, naming the field, and no file is written), so a bundle
+is never saved that cannot be loaded. `fit()` never records one; only a result
+edited afterwards can hold one. The top-level `sir_seed` is written from
+`sir_settings.seed` whenever the record is present: the record is canonical, so a
+fit whose `sir_settings.seed` was edited before saving loads with both fields
+agreeing. `df` is a JSON number, except for the
 multivariate-normal proposal (`sir_df = normal`, `df = ∞`), which JSON has no number
 for: it is written as the token `"normal"`, and `"normal"` or `"mvn"` reads back as
 `∞`; a `null` `df` is corrupt ([#1819](https://github.com/FeRx-NLME/ferx-core/issues/1819)).

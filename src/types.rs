@@ -7977,7 +7977,10 @@ pub struct FitResult {
     /// The seed the SIR draws actually used: `sir_seed` when it was set, the
     /// built-in default otherwise, so the run is reproducible from this field
     /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
-    /// Equal to `sir_settings.seed` whenever SIR ran.
+    /// Equal to `sir_settings.seed` whenever SIR ran. Where the two disagree — a
+    /// `sir_settings.seed` edited after the fit — `sir_settings.seed` is canonical:
+    /// [`run_sir`](crate::run_sir) draws with it, and `save_fit` writes this field from
+    /// it (#1770).
     ///
     /// Except on a fit produced before #1758 (a `.fitrx` with no `sir.settings`),
     /// where the field echoes the seed the fit was *given*: `None` for a SIR run
