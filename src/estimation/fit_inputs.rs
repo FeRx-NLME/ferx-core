@@ -80,6 +80,46 @@ pub(crate) const STALE_FINGERPRINT_WARNING: &str = "this fit's population finger
      from another ferx version's scheme, so the population was not verified against the one \
      the fit was given";
 
+/// The note for a fit whose labels say it ran on finite differences while this post-hoc
+/// step, under the record's `auto`, takes the analytic route (#1862). See
+/// [`note_unrecorded_fd_route`].
+pub(crate) const UNRECORDED_FD_ROUTE_WARNING: &str = "this fit's gradient_method_inner is \
+     finite differences, but its scoring record does not say gradient_method = fd (a .fitrx \
+     saved before #1835 did not record it), so this step re-solves the EBEs on the analytic \
+     gradient, and builds the analytic R-matrix where the model is in its scope; if the fit \
+     ran gradient = fd, pass gradient_method = fd to score it as it ran";
+
+/// Put [`UNRECORDED_FD_ROUTE_WARNING`] on a post-hoc step's `warnings` when it applies,
+/// and take a copy carried over from an earlier step off when it does not (#1862).
+///
+/// A `.fitrx` saved before #1835 records no `gradient_method`, so an FD fit's bundle loads
+/// `auto` and a post-hoc step with default options goes analytic. It does still carry the
+/// fit's route labels, but those are not inferred from: `gradient_method_inner` is the
+/// *model-level* scope of the engine that wrote the bundle, not the user's flag, and an
+/// `auto` fit outside that scope reads `finite differences` too — every in-scope ODE model
+/// did before #926. Inferring `Fd` would put such an analytic fit on the FD stencil. So the
+/// step keeps its route and says so: it warns when the fit's inner label is FD, its outer
+/// label is not analytic (an FD fit's is FD, or `N/A` under BOBYQA), and the step's own
+/// inner route is analytic. The last is read inside the step's fit scope, so a resolved
+/// `Fd` — the record's or the caller's — makes it FD and the step silent; and on the
+/// engine that wrote the label it is the label's own predicate, so an `auto` fit outside
+/// the analytic scope (whose covariance scope, `recorder_in_scope` and no `gradient = fd`,
+/// sits inside the inner one) is silent too.
+pub(crate) fn note_unrecorded_fd_route(
+    fit: &FitResult,
+    model: &CompiledModel,
+    warnings: &mut Vec<String>,
+) {
+    use crate::build_info::GradientMethodKind;
+    warnings.retain(|w| w != UNRECORDED_FD_ROUTE_WARNING);
+    if fit.gradient_method_inner == GradientMethodKind::FiniteDifferences.as_str()
+        && fit.gradient_method_outer != GradientMethodKind::Analytic.as_str()
+        && crate::estimation::inner_optimizer::inner_reports_analytic_model(model)
+    {
+        warnings.push(UNRECORDED_FD_ROUTE_WARNING.to_string());
+    }
+}
+
 /// Why the model file is read: it decides the wording of a failure to read it.
 #[derive(Clone, Copy)]
 enum ModelFileUse {
