@@ -29680,6 +29680,29 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "a reassignment adds it again, was Additive",
             "  CL = TVCL + RE\n  CL = CL + RE",
         ),
+        // Dies under: `def_reach` stopping at an `exp` the root is a product
+        // of, instead of following it into `log_root` (the #1724 example).
+        (
+            "an exp intermediate multiplied in twice, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "an exp intermediate beside its own exp, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * exp(RE) * EV",
+        ),
+        // Dies under: `log_root` not recursing into a reader's own readers.
+        (
+            "an exp intermediate through a second product, was LogNormal",
+            "  EV = exp(RE)\n  E2 = EV * 2\n  CL = TVCL * E2 / EV",
+        ),
+        // The other side of `origin_scope`: an overwrite that reads the
+        // variable — on `WT > 70` `A` holds `2·RE`. (Custom through the
+        // original definition's own two routes, through the overwrite and
+        // around it, so it holds with `origin_scope`'s virtual branch.)
+        (
+            "a conditional overwrite that adds it again",
+            "  A = RE\n  if (WT > 70) {\n    A = A + RE\n  }\n  CL = TVCL * exp(A)",
+        ),
     ]
     .into_iter()
     .map(|(l, t)| (format!("{v}{t}"), l))
@@ -29694,7 +29717,7 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
 #[test]
 fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, EtaParamType); 7] = [
+    let rows: [(&str, &str, EtaParamType); 10] = [
         // Dies under: an inline `if`'s branches summed, not maxed (`max` is
         // desugared to `if (RE >= 0) RE else 0`, and the condition read is
         // not a scale position at all).
@@ -29736,6 +29759,27 @@ fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
         (
             "one alias into two parameters",
             "  A = RE\n  CL = TVCL * exp(A)\n  V = TVV * exp(ETA_V) * exp(A)",
+            LogNormal,
+        ),
+        // Dies under: `log_root` taking every reader's product as one
+        // terminal — the `exp` is multiplied into two parameters, once each.
+        (
+            "an exp intermediate in two products",
+            "  EV = exp(RE)\n  CL = TVCL * EV\n  V = TVV * exp(ETA_V) * EV",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate multiplied in once",
+            "  V = TVV * exp(ETA_V)\n  EV = exp(RE)\n  CL = TVCL / EV",
+            LogNormal,
+        ),
+        // Dies under: `origin_scope` deleted — the definition the `if`
+        // overwrites and the overwrite are summed, though each evaluation
+        // sees one of them (#1724 review).
+        (
+            "a conditional overwrite that does not read it",
+            "  V = TVV * exp(ETA_V)\n  A = RE\n  if (WT > 70) {\n    A = RE\n  }\n  \
+             CL = TVCL * exp(A)",
             LogNormal,
         ),
         // Dies under: `reach_add` counting a `Custom` arrival as a scale.

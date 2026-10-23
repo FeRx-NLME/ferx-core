@@ -659,11 +659,14 @@ same `exp`, `inv_logit` or parameter twice in one evaluation enters it as
 `2·η`: `log V = log TVV + 2·η`, whose CV is `√(e^{4ω} − 1)` (70.1% at
 ω = 0.1), not `100·√ω` (31.6%). So it is custom, however the two reads are
 spelled — two `exp` factors, `exp(ETA_V + ETA_V)`, an intermediate read twice
-(`ECL = ETA_CL`, `CL = TVCL * exp(ECL) * exp(ECL)`), two intermediates built
-from one (`B = A + 1`, `C = A + 2`, `exp(B + C)`), or a later line that adds
-it again (`CL = TVCL + ETA_CL`, then `CL = CL + ETA_CL`) (#1724). Reads that
-no single evaluation makes together count once: the two branches of an `if`,
-or `max(ETA, 0)`, which reads the ETA in a condition. A sign never changes the
+(`ECL = ETA_CL`, `CL = TVCL * exp(ECL) * exp(ECL)`), an `exp` intermediate
+multiplied in twice (`EV = exp(ETA_V)`, `V = TVV * EV * EV`), two
+intermediates built from one (`B = A + 1`, `C = A + 2`, `exp(B + C)`), or a
+later line that adds it again (`CL = TVCL + ETA_CL`, then
+`CL = CL + ETA_CL`) (#1724). Reads that no single evaluation makes together
+count once: the two branches of an `if`, an `if` that overwrites a variable
+without reading it (`A = ETA`, then `if (WT > 70) { A = ETA }`), or
+`max(ETA, 0)`, which reads the ETA in a condition. A sign never changes the
 CV, so a minus anywhere on the way keeps the label.
 
 An ETA that reaches the top of an intermediate variable is followed to where
