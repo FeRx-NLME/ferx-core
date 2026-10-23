@@ -122,8 +122,8 @@ impl GroupMember<'_> {
         }
     }
 
-    /// The eta-free typical value `A(θ, covariates)`, locals inlined.
-    pub(crate) fn typical(&self) -> &crate::parser::model_parser::Expression {
+    /// The eta-free typical value `A(θ, covariates)`, locals resolved.
+    pub(crate) fn typical(&self) -> &crate::parser::model_parser::TypicalProgram {
         &self.spec.typical
     }
 

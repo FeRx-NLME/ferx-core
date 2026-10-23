@@ -1697,6 +1697,8 @@ fn off_default_scoring() -> ScoringSettings {
         ode_stiff_abort_after: Some(9),
         ode_auto_switch: false,
         gradient_method: crate::types::GradientMethod::Fd,
+        nn_l2_lambda: Some(0.25),
+        nn_smooth_lambda: Some(0.5),
     }
 }
 
@@ -1752,6 +1754,8 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
         gradient_method: _,
+        nn_l2_lambda: _,
+        nn_smooth_lambda: _,
     } = rec.clone();
     macro_rules! field {
         ($f:ident) => {
@@ -1906,6 +1910,8 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
         gradient_method: _,
+        nn_l2_lambda: _,
+        nn_smooth_lambda: _,
     } = rec.clone();
     macro_rules! differs {
         ($f:ident) => {
@@ -2465,4 +2471,73 @@ fn verify_notes_what_it_could_not_compare() {
             SUPPLIED
         )
     );
+}
+
+/// #1862: the clauses of `note_unrecorded_fd_route`, each on its own. The note needs the
+/// fit's inner label FD, its outer label not analytic, and the step's own inner route
+/// analytic — a resolved `Fd` (armed, as the step's fit scope arms it) or the model's own
+/// flag makes that route FD. A carried-over copy is taken off when the note no longer
+/// applies, and never doubled.
+///
+/// Mutations: drop the inner-label clause → the `(analytic, N/A)` row warns; drop the
+/// outer-label clause → the `(FD, analytic)` row warns; drop the route clause → the armed
+/// and stamped rows warn; drop the `retain` → the carried-over rows keep or double it.
+#[test]
+fn unrecorded_fd_route_note_clauses() {
+    use crate::build_info::GradientMethodKind as K;
+    let (fd, analytic, na) = (
+        K::FiniteDifferences.as_str(),
+        K::Analytic.as_str(),
+        K::NotApplicable.as_str(),
+    );
+    let note = |inner: &str, outer: &str, model: &CompiledModel, carried: bool| {
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        fit.gradient_method_inner = inner.into();
+        fit.gradient_method_outer = outer.into();
+        let mut w = vec!["other".to_string()];
+        if carried {
+            w.push(UNRECORDED_FD_ROUTE_WARNING.to_string());
+        }
+        note_unrecorded_fd_route(&fit, model, &mut w);
+        assert_eq!(w[0], "other", "an unrelated warning is kept");
+        match w.len() {
+            1 => false,
+            2 => {
+                assert_eq!(w[1], UNRECORDED_FD_ROUTE_WARNING);
+                true
+            }
+            _ => panic!("the note is pushed once: {w:?}"),
+        }
+    };
+    let auto = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Auto);
+    let stamped = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Fd);
+    assert!(
+        crate::estimation::inner_optimizer::inner_reports_analytic_model(&auto),
+        "premise: the fixture is in analytic inner scope"
+    );
+
+    assert!(note(fd, fd, &auto, false), "(FD, FD)");
+    assert!(note(fd, na, &auto, false), "(FD, N/A): BOBYQA");
+    assert!(
+        note(fd, fd, &auto, true),
+        "carried over and still applies: once"
+    );
+    assert!(!note(fd, analytic, &auto, false), "(FD, analytic)");
+    assert!(!note(analytic, na, &auto, false), "(analytic, N/A)");
+    assert!(
+        !note(analytic, analytic, &auto, true),
+        "carried over, no longer applies"
+    );
+    assert!(
+        !note(fd, fd, &stamped, false),
+        "the model's own gradient = fd"
+    );
+    {
+        let _fd = crate::types::arm_forced_fd(true);
+        assert!(
+            !note(fd, fd, &auto, false),
+            "a resolved gradient_method = fd"
+        );
+        assert!(!note(fd, fd, &auto, true), "…takes a carried-over copy off");
+    }
 }

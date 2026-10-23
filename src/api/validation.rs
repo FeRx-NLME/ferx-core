@@ -77,7 +77,9 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// programmatically may populate each `Subject::covariates` map and leave the name
 /// list empty — a construction the predictors have always resolved fine, since they
 /// read the per-subject map (`Subject::obs_cov`), not the list. So a name every
-/// subject's map carries counts as present. Without this, `predict()` gaining the
+/// subject carries counts as present, and only that: a name that is listed but
+/// missing from some subject is missing (#2181), since the predictor would read it
+/// as 0 for that subject. Without this, `predict()` gaining the
 /// check (#1028) would have started panicking on those callers even though nothing
 /// about their predictions was undefined.
 ///
@@ -160,11 +162,7 @@ fn unread_column_diagnostic(unread: &[&str]) -> Diagnostic {
 /// The historical `E_MISSING_COVARIATE`, byte-for-byte: `plain` are names the data
 /// does not have under that exact spelling.
 fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diagnostic {
-    let available = if population.covariate_names.is_empty() {
-        "(none)".to_string()
-    } else {
-        population.covariate_names.join(", ")
-    };
+    let available = available_covariate_columns(population);
     // `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
     // ordinary covariates everywhere else — including `[scaling]`, which is
     // deliberate (`docs/model-file/scaling.qmd`) so a dataset that really carries a
@@ -210,15 +208,45 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 }
 
 /// Whether `population` carries the covariate `name` in the sense
-/// [`check_covariates`] documents: listed in `covariate_names`, or in every
-/// subject's own map.
-fn population_carries(population: &Population, name: &str) -> bool {
-    population.covariate_names.iter().any(|n| n == name)
-        || (!population.subjects.is_empty()
-            && population
-                .subjects
-                .iter()
-                .all(|s| s.covariates.contains_key(name)))
+/// [`check_covariates`] documents: every subject carries it. Decided from the
+/// subjects alone, never from `covariate_names` (#2181): the predictors read the
+/// per-subject maps, so a name that is listed but missing from some subject is read
+/// as 0 for that subject. An empty population carries nothing.
+///
+/// The subject-static map decides, not the per-record snapshots: every lookup
+/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
+/// such snapshots, an adaptive decision before the first record — falls back to it,
+/// so a name the static map lacks is read as 0 there even when every observation
+/// snapshot has it. The CSV reader fills the static map with each subject's first
+/// value.
+///
+/// Shared with the `[adaptive_dosing]` `observe` check in
+/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
+    !population.subjects.is_empty()
+        && population
+            .subjects
+            .iter()
+            .all(|s| s.covariates.contains_key(name))
+}
+
+/// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed
+/// names the population carries ([`population_carries`]), `(none)` if there are none.
+/// A listed name some subject lacks is left out, or the message would name the
+/// covariate as both missing and available (#2181). A CSV-read population carries
+/// every listed name, so its list is `covariate_names` unchanged.
+pub(crate) fn available_covariate_columns(population: &Population) -> String {
+    let carried: Vec<&str> = population
+        .covariate_names
+        .iter()
+        .filter(|n| population_carries(population, n))
+        .map(|s| s.as_str())
+        .collect();
+    if carried.is_empty() {
+        "(none)".to_string()
+    } else {
+        carried.join(", ")
+    }
 }
 
 /// `(block, synthesized index column)` of every **bound** level block whose column the
@@ -2095,11 +2123,9 @@ pub(crate) fn check_level_labels(
 ///   level. That κ is then the parent's random effect by another name, and the two
 ///   variances cannot be told apart. A level where some parents have several members
 ///   is identified and is not refused.
-/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
-///   levels each lie within one group of a level that carries a κ (the innermost such
-///   level is named). The block could then absorb that κ, and the level-block binder
-///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
-///   block whose levels cross those groups cannot absorb the κ and binds as before.
+///
+/// A `theta NAME[COL, …]` level block that nests in the groups of a κ's level is not
+/// refused here: the level-block binder measures the κ on those groups (#2034).
 fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use crate::stats::nested_levels::label_path;
     let Some(levels) = model.nested_levels() else {
@@ -2176,60 +2202,6 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
         }
     }
 
-    // A level block that nests in the groups of a level carrying a κ. The innermost such
-    // level is named: a block nested in an arm is nested in its study too.
-    for decl in model.theta_blocks().level_blocks() {
-        for (l, level) in levels.levels.iter().enumerate().rev() {
-            if !levels.kappa_level.contains(&l) {
-                continue;
-            }
-            let mut owner: std::collections::HashMap<Vec<u64>, (usize, Vec<u64>)> =
-                std::collections::HashMap::new();
-            let mut nests = true;
-            'nest: for (s, subj) in population.subjects.iter().enumerate() {
-                for j in 0..subj.obs_times.len() {
-                    let cov = subj.obs_cov(j);
-                    let key: Option<Vec<u64>> = decl
-                        .columns()
-                        .iter()
-                        .map(|c| {
-                            cov.get(c)
-                                .copied()
-                                .filter(|v| !v.is_nan())
-                                .map(f64::to_bits)
-                        })
-                        .collect();
-                    let (Some(key), Some(path)) = (key, label_path(levels, cov)) else {
-                        nests = false;
-                        break 'nest;
-                    };
-                    let unit = (s, path[..=l].to_vec());
-                    if *owner.entry(key).or_insert_with(|| unit.clone()) != unit {
-                        nests = false;
-                        break 'nest;
-                    }
-                }
-            }
-            if nests {
-                return vec![Diagnostic::error(
-                    "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
-                    format!(
-                        "theta {}[{}]: each of its levels lies within one `{}` group, so it \
-                         could absorb a kappa at `{}`. Under nested levels the check that \
-                         decides whether it does is not available yet, so the model is \
-                         refused rather than fitted unchecked. Key the block on columns whose \
-                         levels cross the `{}` groups, or fit it without nested levels.",
-                        decl.name(),
-                        decl.columns().join(", "),
-                        level.name,
-                        level.name,
-                        level.name
-                    ),
-                )
-                .with_block("parameters")];
-            }
-        }
-    }
     Vec::new()
 }
 

@@ -18489,30 +18489,60 @@ fn simplify_collapses_zero_and_one() {
 // exercises the full pipeline: parsing → resolve → differentiate →
 // simplify → store on CompiledModel.
 
-/// Numerically evaluate a stored partial Expression with the same inputs
-/// the pk_param_fn closure sees. Returns the partial's value at
-/// (theta, eta, covariates), with `vars` cleared to zero (intermediates
-/// aren't realized — they show up in the partial expression through
-/// chain-rule substitution at differentiation time, so the eval here
-/// doesn't need to recompute them).
+/// Numerically evaluate one stored partial, ∂(row `row`)/∂`axis`, with the
+/// same inputs the pk_param_fn closure sees. The partials are a derivative
+/// program (#1699, `IndivParamPartials::tangent_base`): the rows' primal
+/// values fill their slots and every earlier row's partial along `axis` fills
+/// its tangent slot, in declaration order, before row `row` is read.
 fn eval_partial(
-    partial: &Expression,
+    partials: &IndivParamPartials,
+    row: usize,
+    axis: DiffAxis,
     theta: &[f64],
     eta: &[f64],
     cov: &HashMap<String, f64>,
-    var_count: usize,
 ) -> f64 {
-    let mut cov_vec = vec![0.0_f64; cov.len()];
+    eval_partials_along(partials, axis, theta, eta, cov)[row]
+}
+
+/// Every row's partial along `axis`, by running the derivative program
+/// (`eval_partial`).
+fn eval_partials_along(
+    partials: &IndivParamPartials,
+    axis: DiffAxis,
+    theta: &[f64],
+    eta: &[f64],
+    cov: &HashMap<String, f64>,
+) -> Vec<f64> {
     // Build a deterministic cov ordering matching the partial's
     // CovariateIdx references. For these tests we use NO covariates.
     let mut keys: Vec<&String> = cov.keys().collect();
     keys.sort();
-    for (i, k) in keys.iter().enumerate() {
-        cov_vec[i] = cov[k.as_str()];
-    }
-    let mut vars = vec![0.0_f64; var_count];
+    let cov_vec: Vec<f64> = keys.iter().map(|k| cov[k.as_str()]).collect();
     let nn_outputs: Vec<Vec<f64>> = Vec::new();
-    eval_expression_indexed(partial, theta, eta, &cov_vec, &mut vars, &nn_outputs)
+    let n = partials.names.len();
+    let mut vars = vec![0.0_f64; partials.tangent_base + n];
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = eval_expression_indexed(
+            &partials.values[i],
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            &nn_outputs,
+        );
+        let d = match axis {
+            DiffAxis::Theta(k) => &partials.d_d_theta[i][k],
+            DiffAxis::Eta(k) => &partials.d_d_eta[i][k],
+            DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
+        };
+        let dv = eval_expression_indexed(d, theta, eta, &cov_vec, &mut vars, &nn_outputs);
+        vars[partials.slots[i]] = v;
+        vars[partials.tangent_base + i] = dv;
+        out.push(dv);
+    }
+    out
 }
 
 /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂θ_k.
@@ -18601,7 +18631,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
     let cov: HashMap<String, f64> = HashMap::new();
     for i in 0..3 {
         for k in 0..3 {
-            let sym = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+            let sym = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
             let fd = fd_d_theta(m, i, k, theta, eta, &cov);
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18609,7 +18639,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
                 partials.names[i],
                 k,
             );
-            let sym = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+            let sym = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
             let fd = fd_d_eta(m, i, k, theta, eta, &cov);
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18655,7 +18685,7 @@ fn indiv_partials_zero_for_cross_axis() {
     let cov: HashMap<String, f64> = HashMap::new();
     // Cross-η partials (indiv i, η k ≠ i).
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
-        let v = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
         assert!(
             v.abs() < 1e-12,
             "∂{}/∂η_{} should be 0, got {v}",
@@ -18665,7 +18695,7 @@ fn indiv_partials_zero_for_cross_axis() {
     }
     // Cross-θ partials.
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
-        let v = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
         assert!(
             v.abs() < 1e-12,
             "∂{}/∂θ_{} should be 0, got {v}",
@@ -18711,13 +18741,13 @@ fn indiv_partials_logit_inv_logit_chain() {
     let eta = &[0.05, -0.1, 0.15, 0.2];
     let cov: HashMap<String, f64> = HashMap::new();
     // F's row: position 3. Verify ∂F/∂η_F (index 3) and ∂F/∂THETA_F (index 3).
-    let sym = eval_partial(&partials.d_d_eta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Eta(3), theta, eta, &cov);
     let fd = fd_d_eta(m, 3, 3, theta, eta, &cov);
     assert!(
         (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
         "∂F/∂η_F: sym={sym}, fd={fd}",
     );
-    let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Theta(3), theta, eta, &cov);
     let fd = fd_d_theta(m, 3, 3, theta, eta, &cov);
     assert!(
         (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18725,7 +18755,7 @@ fn indiv_partials_logit_inv_logit_chain() {
     );
     // F doesn't depend on ETA_CL/V/KA — those partials must evaluate to 0.
     for k in 0..3 {
-        let v = eval_partial(&partials.d_d_eta[3][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, 3, DiffAxis::Eta(k), theta, eta, &cov);
         assert!(v.abs() < 1e-12, "∂F/∂η_{k} should be 0, got {v}");
     }
 }
@@ -18776,7 +18806,7 @@ fn indiv_partials_chain_rule_through_intermediate() {
     let eta = &[0.0, 0.0, 0.3]; // η_CL=0, η_V=0, η_KAM=0.3
     let cov: HashMap<String, f64> = HashMap::new();
     // KA is at indiv-param index 3, η_KAM is at eta index 2.
-    let sym = eval_partial(&partials.d_d_eta[3][2], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Eta(2), theta, eta, &cov);
     let expected = theta[2] * theta[3] * eta[2].exp(); // TVKA * TVKAM * exp(ETA_KAM)
     assert!(
         (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
@@ -18789,10 +18819,10 @@ fn indiv_partials_chain_rule_through_intermediate() {
         "∂KA/∂η_KAM: sym={sym}, fd={fd}",
     );
     // ∂KA/∂η_CL = 0 (no chain to ETA_CL).
-    let v = eval_partial(&partials.d_d_eta[3][0], theta, eta, &cov, 8);
+    let v = eval_partial(partials, 3, DiffAxis::Eta(0), theta, eta, &cov);
     assert!(v.abs() < 1e-12, "∂KA/∂η_CL should be 0, got {v}");
     // ∂KA/∂TVKAM (θ index 3): TVKA * exp(ETA_KAM).
-    let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Theta(3), theta, eta, &cov);
     let expected = theta[2] * eta[2].exp();
     assert!(
         (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
@@ -29360,7 +29390,7 @@ fn re_scale_twins(
 fn a_reassignment_is_followed_before_the_consumer_check() {
     use crate::types::EtaParamType::{self, *};
     let head = "  V = TVV * exp(ETA_V)\n  CL = TVCL + RE\n";
-    let rows: [(&str, &str, EtaParamType); 12] = [
+    let rows: [(&str, &str, EtaParamType); 17] = [
         // Dies under: the consumer check before the reassignment (the bug).
         ("one *, was Additive", "  CL = CL * TVV", Custom),
         // Dies under: every replaced definition pushing `Custom`.
@@ -29410,6 +29440,41 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  if (WT > 70) {\n    CL = exp(CL)\n  }",
             Custom,
         ),
+        // Dies under: an `if` whose every branch reassigns not replacing the
+        // definition (#1689: the fall-through `Additive` was pushed). Was Custom.
+        (
+            "exhaustive if/else exp",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    CL = exp(CL)\n  }",
+            LogNormal,
+        ),
+        // Dies under: the exhaustiveness check stopping at the outer `if`
+        // instead of recursing into a nested one. Was Custom.
+        (
+            "exhaustive nested if/else exp",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    \
+             if (WT > 70) {\n      CL = exp(CL)\n    } else {\n      CL = exp(CL)\n    }\n  }",
+            LogNormal,
+        ),
+        // Dies under: an `if` without an `else` counted as exhaustive.
+        (
+            "if/else if, no else, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else if (WT > 70) {\n    CL = exp(CL)\n  }",
+            Custom,
+        ),
+        // Dies under: one reassigning branch counted as covering the `if`.
+        (
+            "if/else, only one branch reassigns, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    V2 = TVV\n  }",
+            Custom,
+        ),
+        // Dies under: the exhaustiveness check counting a nested `if` without
+        // an `else` as covering its branch.
+        (
+            "exhaustive outer, non-exhaustive nested, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    \
+             if (WT > 70) {\n      CL = exp(CL)\n    }\n  }",
+            Custom,
+        ),
     ];
     let mut wrong = Vec::new();
     for (label, tail, want) in rows {
@@ -29431,7 +29496,7 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
 #[test]
 fn a_definition_is_read_only_while_it_is_in_force() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, &str, EtaParamType); 5] = [
+    let rows: [(&str, &str, &str, EtaParamType); 7] = [
         (
             // Dies under: readers scanned from the first statement, not from
             // the one after the definition (`CLX` reads the earlier `ECL`).
@@ -29482,6 +29547,27 @@ fn a_definition_is_read_only_while_it_is_in_force() {
              if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = TVCL\n  }\n  \
              if (SEX > 0) {\n    CL = CL * TVV\n  }",
             "CL",
+            Custom,
+        ),
+        (
+            // Dies under: a reassignment in a branch not ending the outer
+            // definition for later readers in that branch (#1689 comment: the
+            // first branch's `CL` reads the local `ECL = 0`). Was Custom.
+            "reassigned in a branch, read later in that branch",
+            "  V = TVV * exp(ETA_V)\n  ECL = RE\n  \
+             if (WT > 70) {\n    ECL = 0\n    CL = TVCL + ECL\n  } else {\n    \
+             CL = TVCL * exp(ECL)\n  }",
+            "ECL",
+            LogNormal,
+        ),
+        (
+            // Dies under: a branch's reassignment ending the definition after
+            // the `if` too (the `else` leaves it live, so `CL2` still reads it).
+            "reassigned in one branch, read after the if",
+            "  V = TVV * exp(ETA_V)\n  ECL = RE\n  \
+             if (WT > 70) {\n    ECL = 0\n  } else {\n    V2 = TVV\n  }\n  \
+             CL = TVCL * exp(ECL)\n  CL2 = TVCL + ECL",
+            "ECL",
             Custom,
         ),
     ];
@@ -29731,6 +29817,228 @@ fn the_inliner_is_linear_on_a_diamond() {
                 "inliner, {label}: depth {d} is linear"
             );
         }
+    }
+}
+
+/// #1699, the recorded-covariate half: a diamond that feeds a covariate group
+/// (`X0 = TVV * WT`, `CL = TVCL * X_d * exp(ETA_CL)`, two thetas) is recorded,
+/// and its stored typical value is a [`TypicalProgram`] of one line per
+/// definition, so both the nodes the scans handle and the nodes the program
+/// holds are linear in the depth. Materialising the typical value as one tree
+/// expanded every path: measured with the definition inlined at each use
+/// (`Inlined::materialise` without its reference arm), the `+` diamond's scans
+/// handled 409 / 5 281 / 82 153 nodes at depth 4 / 8 / 12 and its typical value
+/// held 125 / 2 045 / 32 765; with the program, 169 / 301 / 433 and 42 / 78 /
+/// 114. Flattening the chain through definitions instead grows the `*`
+/// diamond's program to 2 045 nodes at depth 8.
+///
+/// The value is checked as well as the cost, at a depth small enough for the
+/// closed form: `X_{n+1} = 2 X_n + 5` (`+`), `6 X_n²` (`*`).
+///
+/// Dies under: removing the `defs.index` lookup or the reference return in
+/// `Inlined::materialise` (both counts); `flatten_chain(…, true, …)` in
+/// `TypicalParts::build` (`*` diamond).
+#[test]
+fn a_recorded_covariate_group_is_linear_on_a_diamond() {
+    for op in ["+", "*"] {
+        let measure = |d: usize| {
+            let src = op_diamond(d, "TVV * WT", op) + &format!("CL = TVCL * X{d} * exp(ETA_CL)\n");
+            let (_, groups, nodes) = inline_counted(&src);
+            assert_eq!(groups.len(), 1, "{op} diamond, depth {d}: one group");
+            let g = &groups[0];
+            assert_eq!(g.theta_names, ["TVCL", "TVV"], "{op} diamond, depth {d}");
+            assert_eq!(g.covariate_names, ["WT"], "{op} diamond, depth {d}");
+            (nodes, g.typical.node_count(), groups)
+        };
+        // The value, at depth 3: TVCL = 1.3, TVV = 1.1, WT = 0.9.
+        let (_, _, groups) = measure(3);
+        let mut x: f64 = 1.1 * 0.9;
+        for _ in 0..3 {
+            x = if op == "+" {
+                2.0 * x + 5.0
+            } else {
+                6.0 * x * x
+            };
+        }
+        let got = group_typical(&groups[0], &[1.3, 1.1], &[("WT", 0.9)]);
+        assert!(
+            (got - 1.3 * x).abs() <= 1e-12 * (1.3 * x).abs(),
+            "{op} diamond: typical {got} vs {}",
+            1.3 * x
+        );
+        // From depth 1: level 0 reads `X0`, a different first step.
+        let (s1, p1, _) = measure(1);
+        let (s2, p2, _) = measure(2);
+        let (scan_level, prog_level) = (s2 - s1, p2 - p1);
+        assert!(
+            scan_level > 0 && prog_level > 0,
+            "{op} diamond: the levels are read"
+        );
+        for d in [10, 20, 30] {
+            let (s, p, _) = measure(d);
+            assert_eq!(
+                s - s1,
+                (d - 1) * scan_level,
+                "{op} diamond: depth {d} scans are linear"
+            );
+            assert_eq!(
+                p - p1,
+                (d - 1) * prog_level,
+                "{op} diamond: depth {d} program is linear"
+            );
+        }
+    }
+}
+
+/// Nodes in `e`, conditions included.
+fn expr_nodes(e: &Expression) -> usize {
+    fn cond_nodes(c: &Condition) -> usize {
+        1 + match c {
+            Condition::Compare(l, _, r) => expr_nodes(l) + expr_nodes(r),
+            Condition::And(l, r) | Condition::Or(l, r) => cond_nodes(l) + cond_nodes(r),
+            Condition::Not(c) => cond_nodes(c),
+            Condition::Present(e) => expr_nodes(e),
+        }
+    }
+    1 + match e {
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => expr_nodes(l) + expr_nodes(r),
+        Expression::UnaryFn(_, a) => expr_nodes(a),
+        Expression::ThetaGather { idx, .. } => expr_nodes(idx),
+        Expression::Conditional(c, t, f) => cond_nodes(c) + expr_nodes(t) + expr_nodes(f),
+        _ => 0,
+    }
+}
+
+/// The symbolic partials of `src` (thetas `TVCL`, `TVV`; etas `ETA_CL`,
+/// `ETA_V`), built from its statements alone.
+fn diamond_partials(src: &str) -> IndivParamPartials {
+    let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
+    let stmts = stmts_of(src, &tn, &en);
+    let names = assigned_vars_in_order(&stmts);
+    let var_idx: HashMap<String, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    build_indiv_param_partials(&stmts, &var_idx, &HashMap::new(), 2, 2)
+}
+
+/// #1699: the `[individual_parameters]` partials are a derivative program — a
+/// row reads an upstream row's partial through its tangent slot — so on a
+/// diamond of intermediates they hold a fixed number of nodes per level,
+/// linear in the depth. Inlining each upstream partial into its readers copied
+/// a value reached along `2^d` paths `2^d` times: measured with the partial inlined, the
+/// `+` diamond's partials held 10 238 nodes at depth 8 and 163 838 at depth 12
+/// (78 at depth 1, 158 at depth 2), and a parse at depth 30 ran out of memory. The depths are checked in
+/// increasing order, so a regression fails at depth 10 instead of running
+/// depth 30.
+///
+/// Dies under: `chain_entry` in `build_indiv_param_partials` returning the
+/// partial itself (`s.clone()`) for every shape, i.e. inlining it.
+#[test]
+fn the_symbolic_partials_are_linear_on_a_diamond() {
+    let cases: [(&str, &str); 2] = [
+        ("+", "CL = TVCL * exp(ETA_CL + X{d})\n"),
+        ("*", "CL = TVCL * X{d} * exp(ETA_CL)\n"),
+    ];
+    for (op, tail) in cases {
+        let count = |d: usize| {
+            let src = op_diamond(d, "TVV * exp(ETA_V)", op) + &tail.replace("{d}", &d.to_string());
+            let p = diamond_partials(&src);
+            assert_eq!(
+                p.names.len(),
+                3 * d + 2,
+                "{op} diamond, depth {d}: one row per line"
+            );
+            p.d_d_theta
+                .iter()
+                .chain(&p.d_d_eta)
+                .flatten()
+                .map(expr_nodes)
+                .sum::<usize>()
+        };
+        // From depth 1: level 0 reads `X0`, whose partials are leaves.
+        let c1 = count(1);
+        let per_level = count(2) - c1;
+        assert!(per_level > 0, "{op} diamond: the levels carry partials");
+        for d in [10, 20, 30] {
+            assert_eq!(
+                count(d) - c1,
+                (d - 1) * per_level,
+                "{op} diamond: depth {d} is linear"
+            );
+        }
+    }
+}
+
+/// The derivative program on a diamond computes the derivative of the value
+/// path: every row, every θ and η axis, against central finite differences of
+/// the rows' own primal values. The `*` diamond keeps both the product rule's
+/// primal factor (read from a primal slot) and its tangent factor (read from a
+/// tangent slot) live at every level, and `X0 = TVV * exp(ETA_V)` makes each
+/// level depend on a θ and an η. Measured worst relative error 4.2e-10 (`+`) and
+/// 1.0e-10 (`*`) against a `1e-6` bound.
+///
+/// Dies under: writing a row's partial to a tangent slot other than
+/// `tangent_base + row` (or a reader naming one), and the primal factor read
+/// as `0` — the zero-filled `vars` the pre-#1699 `eval_partial` passed.
+#[test]
+fn the_symbolic_partials_on_a_diamond_match_fd() {
+    for op in ["+", "*"] {
+        let src =
+            op_diamond(3, "TVV * exp(ETA_V)", op) + "CL = TVCL * X3 * exp(ETA_CL + X1 / 100)\n";
+        let p = diamond_partials(&src);
+        let theta = [1.3, 1.1];
+        let eta = [0.2, -0.15];
+        let cov: HashMap<String, f64> = HashMap::new();
+        let primal = |theta: &[f64], eta: &[f64]| -> Vec<f64> {
+            let mut vars = vec![0.0_f64; p.tangent_base];
+            p.values
+                .iter()
+                .zip(&p.slots)
+                .map(|(e, &slot)| {
+                    let v = eval_expression_indexed(e, theta, eta, &[], &mut vars, &[]);
+                    vars[slot] = v;
+                    v
+                })
+                .collect()
+        };
+        let mut worst = 0.0_f64;
+        for axis in [
+            DiffAxis::Theta(0),
+            DiffAxis::Theta(1),
+            DiffAxis::Eta(0),
+            DiffAxis::Eta(1),
+        ] {
+            let sym = eval_partials_along(&p, axis, &theta, &eta, &cov);
+            let (mut tp, mut tm, mut ep, mut em) = (theta, theta, eta, eta);
+            let h = 1e-6;
+            match axis {
+                DiffAxis::Theta(k) => {
+                    tp[k] += h;
+                    tm[k] -= h;
+                }
+                DiffAxis::Eta(k) => {
+                    ep[k] += h;
+                    em[k] -= h;
+                }
+                DiffAxis::Variable(_) => unreachable!(),
+            }
+            let (plus, minus) = (primal(&tp, &ep), primal(&tm, &em));
+            for (i, s) in sym.iter().enumerate() {
+                let fd = (plus[i] - minus[i]) / (2.0 * h);
+                assert!(s.is_finite() && fd.is_finite(), "{op}: row {i} {axis:?}");
+                let rel = (s - fd).abs() / s.abs().max(fd.abs()).max(1e-8);
+                assert!(
+                    rel < 1e-6,
+                    "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}",
+                    p.names[i]
+                );
+                worst = worst.max(rel);
+            }
+        }
+        eprintln!("{op} diamond: worst relative error {worst:e}");
     }
 }
 
@@ -30142,7 +30450,13 @@ fn assert_inliner_matches_eager(
         };
         let want = eager[at].as_ref().expect("an assignment");
         let view = scope.view(at, raw);
-        let got = view.materialise();
+        let mut defs = ProgramDefs::default();
+        let root = view.materialise(&mut defs);
+        let got = TypicalProgram {
+            defs: defs.defs,
+            root,
+        }
+        .inlined();
         assert_eq!(
             format!("{got:?}"),
             format!("{want:?}"),
@@ -30155,11 +30469,37 @@ fn assert_inliner_matches_eager(
             format!("{:?}", classify_mu_ref(want, tn, en, &[])),
             "{label}: `{name}` mu-ref"
         );
+        // A group's typical value compares by value: the program keeps each
+        // definition one operand of a chain (#1699), so a definition in the
+        // middle of a product associates differently from the eager tree's.
+        let group = |g: Option<(usize, CovariateMuRef)>| {
+            g.map(|(e, mut g)| {
+                let typical =
+                    std::mem::replace(&mut g.typical, TypicalProgram::of(Expression::Literal(0.0)));
+                let covs = g.covariate_names.clone();
+                (format!("{:?}", (e, g)), typical, covs)
+            })
+        };
+        let got_group = group(classify_covariate_mu_ref(view, tn, en, n_bsv));
+        let want_group = group(classify_covariate_mu_ref(want, tn, en, n_bsv));
         assert_eq!(
-            format!("{:?}", classify_covariate_mu_ref(view, tn, en, n_bsv)),
-            format!("{:?}", classify_covariate_mu_ref(want, tn, en, n_bsv)),
+            got_group.as_ref().map(|g| &g.0),
+            want_group.as_ref().map(|g| &g.0),
             "{label}: `{name}` covariate group"
         );
+        if let (Some((_, got_t, names)), Some((_, want_t, _))) = (&got_group, &want_group) {
+            let theta: Vec<f64> = (0..tn.len()).map(|i| 1.1 + 0.07 * i as f64).collect();
+            let covs: HashMap<String, f64> = names
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.clone(), 0.8 + 0.13 * i as f64))
+                .collect();
+            let (g, w) = (got_t.eval(&theta, &covs), want_t.eval(&theta, &covs));
+            assert!(
+                g.is_finite() && (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                "{label}: `{name}` typical value {g} vs {w}"
+            );
+        }
         assert_eq!(
             split_typical_and_eta(view).map(|(_, e, t)| (e, t)),
             split_typical_and_eta(want).map(|(_, e, t)| (e, t)),
@@ -30176,12 +30516,12 @@ fn assert_inliner_matches_eager(
 /// shapes the examples lack: a definition read inside a conditional's arm and
 /// its condition (substituted in both since #1422), a forward reference (it resolves against the definition's
 /// own scope), the written-out logit forms, a chain through a pure alias, and
-/// a product with the definition in the middle (the built typical value
-/// re-associates through it).
+/// a product with the definition in the middle (the built typical value keeps
+/// it one operand, so its value, not its tree, matches the eager one's).
 /// Dies under: no substitution into a conditional (`Conditional` dropped
 /// from `Inlined::rewrites_children`); use-site resolution (`limit` not narrowed to the
-/// definition's index); `flatten_chain` not flattening through definitions in
-/// `TypicalParts::build`.
+/// definition's index); a [`TypicalProgram`] line read by the wrong index
+/// (`defs.len()` taken after the push in `Inlined::materialise`).
 #[test]
 fn the_inliner_matches_the_eager_one() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
@@ -34725,6 +35065,119 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     let split = cond(cmp(varidx(1), CmpOp::Gt, lit(0.0)), varidx(0), varidx(1));
     let bc = compile_bytecode(&split);
     assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
+}
+
+// ── #1691: the log-normal η-chain gate and an η-free definition it replaces ──
+
+/// The #1691 probe table, each row with the gate's answer and whether the
+/// closed-form chain `∂p/∂η = p · sel_flat` is exact for it. Before #1691 the
+/// η-free arm declined on the **first** `CL = TVCL` of
+/// `CL = TVCL; CL = TVCL * exp(ETA_CL)`, although the direct definition
+/// replaces it on every path. Every `false` row whose chain is inexact must
+/// stay `false`; the comment on each names the mutation that flips it.
+#[test]
+fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definition() {
+    const V: &str = "\n  V = TVV * exp(ETA_V)";
+    let cases: &[(&str, &str, bool)] = &[
+        ("direct", "  CL = TVCL * exp(ETA_CL)", true),
+        // The fix. Dies under: the η-free arm declining unconditionally again.
+        (
+            "eta-free definition replaced by a direct one",
+            "  CL = TVCL\n  CL = TVCL * exp(ETA_CL)",
+            true,
+        ),
+        (
+            "eta-free definition inside an if, replaced at top level",
+            "  if (WT > 70) {\n    CL = TVCL\n  }\n  CL = TVCL * exp(ETA_CL)",
+            true,
+        ),
+        // Replaced on both paths of an `if` with an `else` (#1689). Dies under:
+        // `InForce::end` no longer lifting an exhaustive `if` to its parent.
+        (
+            "eta-free definition replaced in every branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        // Inexact on the WT ≤ 70 path: the `else` keeps the η-free value. Dies
+        // under: `end` lifting an `if` whose branches are not all ended.
+        (
+            "eta-free definition replaced in one branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             Z = TVV\n  }",
+            false,
+        ),
+        // Exact (∂CL/∂η = CL) but `CL` reads a carrying variable: conservative.
+        (
+            "direct then rescaled",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = CL * 2",
+            false,
+        ),
+        // Inexact (truth 0): the η-free reassignment is the row's value.
+        // Dies under: `unconditionally_replaced` counting the definition itself.
+        (
+            "direct then eta-free",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL",
+            false,
+        ),
+        // Inexact on the WT ≤ 70 path. Dies under: dropping the scope-prefix
+        // test, so a reassignment inside a later `if` counts as a replacement.
+        (
+            "eta-free definition replaced only inside a later if",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  }",
+            false,
+        ),
+        // Inexact on the else path. Dies under: an assignment in the sibling
+        // branch counting as a replacement.
+        (
+            "eta-free else branch",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL\n  }",
+            false,
+        ),
+        (
+            "eta-free if branch, direct else branch",
+            "  if (WT > 70) {\n    CL = TVCL\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }",
+            false,
+        ),
+        // Inexact: the last value is η-free. The middle definition is skipped
+        // as replaced, the last is not. Dies under: `unconditionally_replaced`
+        // counting the definition itself (`skip(def)`).
+        (
+            "eta-free twice after a direct one",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL\n  CL = TVCL * 2",
+            false,
+        ),
+        (
+            "both branches direct",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        (
+            "both branches direct, then a rescale in an if",
+            "  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }\n  if (SEX > 0) {\n    CL = CL * 2\n  }",
+            false,
+        ),
+        (
+            "direct, then direct inside an if",
+            "  CL = TVCL * exp(ETA_CL)\n  if (WT > 70) {\n    CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        (
+            "direct, then a different eta",
+            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL * exp(ETA_V)",
+            false,
+        ),
+    ];
+    for (label, indiv, want) in cases {
+        let m = eta_scale_model(&format!("{indiv}{V}"), "");
+        assert_eq!(
+            m.indiv_param_partials.lognormal_eta_chain,
+            Some(*want),
+            "{label}"
+        );
+    }
 }
 
 /// #1919 — an analytic hazard's `HazardParamFn` takes no time, so a `TIME` read in its

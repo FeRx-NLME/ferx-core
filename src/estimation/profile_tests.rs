@@ -675,3 +675,38 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
         out.warnings[0]
     );
 }
+
+// ── #2285: the profiled outer stop ─────────────────────────────────────────────────
+
+/// A profiled gradient fit stops on [`PROFILED_GRADIENT_FTOL_REL`], not the unprofiled
+/// `1e-6` that let L-BFGS report `converged: true` 3.9e-4 above A2's optimum; BOBYQA
+/// keeps the unprofiled rule and a user's `outer_ftol` wins over both. The fit-level
+/// regression is `a2_a_nearby_start_reaches_nonmems_optimum` (slow).
+#[test]
+fn a_profiled_gradient_fit_stops_on_its_own_ftol() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let model = &p.parsed.model;
+    let o = options(&p);
+    assert_eq!(o.outer_ftol, None, "fixture sets outer_ftol");
+    let unprofiled = resolve_outer_ftol(model.has_non_gaussian(), model.is_ode_based(), None);
+    assert_eq!(unprofiled, 1e-6);
+    for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
+        assert_eq!(profiled_ftol(algo, model, &o), PROFILED_GRADIENT_FTOL_REL);
+    }
+    assert!(PROFILED_GRADIENT_FTOL_REL < unprofiled);
+    assert_eq!(
+        profiled_ftol(nlopt::Algorithm::Bobyqa, model, &o),
+        unprofiled
+    );
+    let user = FitOptions {
+        outer_ftol: Some(3e-7),
+        ..o.clone()
+    };
+    for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Bobyqa] {
+        assert_eq!(profiled_ftol(algo, model, &user), 3e-7);
+    }
+    assert!(
+        matches!(profiled_algorithm(&o), nlopt::Algorithm::Lbfgs),
+        "auto"
+    );
+}

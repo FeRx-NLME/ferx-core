@@ -931,8 +931,10 @@ trait RhsView<'a>: Copy {
     fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
         std::rc::Rc::new(typical_summary_of(self))
     }
-    /// This subtree as an owned expression.
-    fn materialise(self) -> Expression;
+    /// This subtree as an owned expression, each substituted local definition
+    /// it reaches emitted once into `defs` and read by reference
+    /// ([`TypicalProgram`]).
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression;
 }
 
 impl<'a> RhsView<'a> for &'a Expression {
@@ -942,8 +944,146 @@ impl<'a> RhsView<'a> for &'a Expression {
     fn child(self, child: &'a Expression) -> Self {
         child
     }
-    fn materialise(self) -> Expression {
+    fn materialise(self, _: &mut ProgramDefs) -> Expression {
         self.clone()
+    }
+}
+
+/// An eta-free typical value `A(θ, covariates)` as a straight-line program
+/// (#1699): every local `[individual_parameters]` definition it reads is
+/// emitted **once**, into `defs`, and read through `VariableIdx(j)` — by a
+/// later definition or by `root` — instead of being inlined at each use. On a
+/// diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`) the
+/// inlined tree holds `2^d` copies of `X0`; the program holds one line per
+/// definition. A definition whose body is a leaf (`T = TVCL`) is substituted in
+/// place.
+///
+/// Nothing else is a `VariableIdx` here: the typical value is built from the
+/// unresolved statements, whose locals are `Variable` nodes, and every one the
+/// inliner resolved has become a reference.
+#[derive(Debug, Clone)]
+pub(crate) struct TypicalProgram {
+    /// The definitions, in dependency order: `defs[j]` reads only `defs[..j]`.
+    pub(crate) defs: Vec<Expression>,
+    /// The typical value itself.
+    pub(crate) root: Expression,
+}
+
+impl TypicalProgram {
+    /// A program with no definitions.
+    #[cfg(test)]
+    pub(crate) fn of(root: Expression) -> Self {
+        Self {
+            defs: Vec::new(),
+            root,
+        }
+    }
+
+    /// The typical value at `theta` and one subject's covariate snapshot.
+    pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
+        let mut values = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let v = eval_expr(
+                d,
+                theta,
+                &[],
+                &TypicalEnv {
+                    covariates,
+                    defs: &values,
+                },
+                &[],
+            );
+            values.push(v);
+        }
+        eval_expr(
+            &self.root,
+            theta,
+            &[],
+            &TypicalEnv {
+                covariates,
+                defs: &values,
+            },
+            &[],
+        )
+    }
+
+    /// The typical value as one tree, every reference replaced by its
+    /// definition — the `2^d` tree on a diamond, so for small test inputs only.
+    #[cfg(test)]
+    pub(crate) fn inlined(&self) -> Expression {
+        fn sub(e: &Expression, done: &[Expression]) -> Expression {
+            match e {
+                Expression::VariableIdx(j) => done[*j].clone(),
+                Expression::BinOp(l, op, r) => {
+                    Expression::BinOp(Box::new(sub(l, done)), *op, Box::new(sub(r, done)))
+                }
+                Expression::Power(b, x) => {
+                    Expression::Power(Box::new(sub(b, done)), Box::new(sub(x, done)))
+                }
+                Expression::UnaryFn(n, a) => Expression::UnaryFn(n.clone(), Box::new(sub(a, done))),
+                Expression::Conditional(c, t, f) => Expression::Conditional(
+                    Box::new(map_condition_operands(c, &mut |x| sub(x, done))),
+                    Box::new(sub(t, done)),
+                    Box::new(sub(f, done)),
+                ),
+                _ => e.clone(),
+            }
+        }
+        let mut done: Vec<Expression> = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let e = sub(d, &done);
+            done.push(e);
+        }
+        sub(&self.root, &done)
+    }
+
+    /// Nodes in the definitions and the root together (conditions included).
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        fn cond(c: &Condition) -> usize {
+            let mut n = 1;
+            for_each_condition_operand(c, &mut |x| n += nodes(x));
+            n
+        }
+        fn nodes(e: &Expression) -> usize {
+            1 + match e {
+                Expression::BinOp(l, _, r) | Expression::Power(l, r) => nodes(l) + nodes(r),
+                Expression::UnaryFn(_, a) => nodes(a),
+                Expression::ThetaGather { idx, .. } => nodes(idx),
+                Expression::Conditional(c, t, f) => cond(c) + nodes(t) + nodes(f),
+                _ => 0,
+            }
+        }
+        self.defs.iter().map(nodes).sum::<usize>() + nodes(&self.root)
+    }
+}
+
+/// The definitions a [`TypicalProgram`] is being built with, and which
+/// substituted definition (by body address) each one is.
+#[derive(Default)]
+pub(crate) struct ProgramDefs {
+    defs: Vec<Expression>,
+    index: HashMap<*const Expression, usize>,
+}
+
+/// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
+/// the definitions computed so far by index. A stray local name reads `0.0`
+/// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
+/// rather than letting it through.
+struct TypicalEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    defs: &'a [f64],
+}
+
+impl EvalEnv for TypicalEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => f64::EPSILON,
+            Expression::VariableIdx(j) => self.defs.get(*j).copied().unwrap_or(0.0),
+            _ => 0.0,
+        }
     }
 }
 
@@ -1202,34 +1342,50 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
         done
     }
 
-    fn materialise(self) -> Expression {
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression {
         #[cfg(test)]
         INLINED_NODES.with(|c| c.set(c.get() + 1));
+        if let Some(d) = self.def {
+            if !self.rewrites_children() {
+                return self.expr.clone();
+            }
+            if let Some(&j) = defs.index.get(&d) {
+                return Expression::VariableIdx(j);
+            }
+            let body = Inlined { def: None, ..self }.materialise(defs);
+            let j = defs.defs.len();
+            defs.defs.push(body);
+            defs.index.insert(d, j);
+            return Expression::VariableIdx(j);
+        }
         if self.rewrites_children() {
             match self.expr {
                 Expression::BinOp(l, op, r) => {
                     return Expression::BinOp(
-                        Box::new(self.child(l).materialise()),
+                        Box::new(self.child(l).materialise(defs)),
                         *op,
-                        Box::new(self.child(r).materialise()),
+                        Box::new(self.child(r).materialise(defs)),
                     )
                 }
                 Expression::Power(b, e) => {
                     return Expression::Power(
-                        Box::new(self.child(b).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(b).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 Expression::UnaryFn(name, a) => {
-                    return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
+                    return Expression::UnaryFn(
+                        name.clone(),
+                        Box::new(self.child(a).materialise(defs)),
+                    )
                 }
                 Expression::Conditional(c, t, e) => {
                     return Expression::Conditional(
                         Box::new(map_condition_operands(c, &mut |x| {
-                            self.child(x).materialise()
+                            self.child(x).materialise(defs)
                         })),
-                        Box::new(self.child(t).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(t).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 _ => {}
@@ -1901,15 +2057,20 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
         s
     }
 
-    fn build(self) -> Expression {
-        match self {
-            TypicalParts::Whole(v) => v.materialise(),
+    /// The typical value as a [`TypicalProgram`]. A chain is re-associated to
+    /// the left down to its definitions, each of which stays one operand: one
+    /// line of the program, not its own operands flattened in, which on a `*`
+    /// diamond would walk every path (#1699).
+    fn build(self) -> TypicalProgram {
+        let mut defs = ProgramDefs::default();
+        let root = match self {
+            TypicalParts::Whole(v) => v.materialise(&mut defs),
             TypicalParts::Chain(op, parts) => {
                 let mut operands = Vec::new();
                 for p in parts {
-                    flatten_chain(p, op, true, &mut operands);
+                    flatten_chain(p, op, false, &mut operands);
                 }
-                let mut operands = operands.into_iter().map(|o| o.materialise());
+                let mut operands = operands.into_iter().map(|o| o.materialise(&mut defs));
                 let first = operands
                     .next()
                     .expect("a split keeps at least one operand besides the eta");
@@ -1917,6 +2078,10 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                     Expression::BinOp(Box::new(a), op, Box::new(o))
                 })
             }
+        };
+        TypicalProgram {
+            defs: defs.defs,
+            root,
         }
     }
 }
@@ -2055,7 +2220,7 @@ fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize)> {
 /// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
 /// definition is eta-free, so the eta's operand is never inside one, and
 /// flattening it would walk every path of a diamond. [`TypicalParts::build`]
-/// flattens through them, so the built chain is the one the full tree gives.
+/// keeps them whole too, each one line of its [`TypicalProgram`] (#1699).
 fn flatten_chain<'a, V: RhsView<'a>>(v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>) {
     match v.expr() {
         Expression::BinOp(l, o, r) if *o == op && (through_definitions || !v.is_definition()) => {
@@ -2677,21 +2842,21 @@ fn emit_eta_infos(
     }
 }
 
-/// Every assignment, top level and inside `if` branches, in statement order.
-fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
-}
-
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
 /// level): each is `(if statement, branch)`, the statement numbered in
 /// flattening order and the branch by position, `else` last.
 type Scope = Vec<(usize, usize)>;
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`].
+/// The shape of one `if` statement, indexed by its [`Scope`] number less one:
+/// `(number of bodies, else included; whether there is an else)`.
+type IfShape = (usize, bool);
+
+/// Every assignment, top level and inside `if` branches, in statement order,
+/// with its [`Scope`], and each `if` statement's [`IfShape`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
-    next_if: &mut usize,
+    ifs: &mut Vec<IfShape>,
     out: &mut Vec<(&'a str, &'a Expression)>,
     scopes: &mut Vec<Scope>,
 ) {
@@ -2705,12 +2870,15 @@ fn flatten_assigns_scoped<'a>(
                 branches,
                 else_body,
             } => {
-                *next_if += 1;
-                let id = *next_if;
+                ifs.push((
+                    branches.len() + usize::from(else_body.is_some()),
+                    else_body.is_some(),
+                ));
+                let id = ifs.len();
                 let bodies = branches.iter().map(|(_, b)| b).chain(else_body);
                 for (branch, body) in bodies.enumerate() {
                     scope.push((id, branch));
-                    flatten_assigns_scoped(body, scope, next_if, out, scopes);
+                    flatten_assigns_scoped(body, scope, ifs, out, scopes);
                     scope.pop();
                 }
             }
@@ -2750,18 +2918,88 @@ thread_local! {
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
     scopes: Vec<Scope>,
+    ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
     memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
 }
 
+/// Where one definition is **in force**, per branch path, as a walk over the
+/// later assignments in order (#1689): the rule [`ScaleWalk::root_scale`] and
+/// [`unconditionally_replaced`] share, so the two cannot drift apart.
+///
+/// A later assignment to the same variable ends the definition for every later
+/// assignment whose scope has the reassignment's scope as a prefix (the rest of
+/// that branch, and whatever it nests), and an `if` with an `else` whose every
+/// branch ends it, recursively, ends it for the rest of the scope that holds the
+/// `if`. It is **replaced** once it ends in the definition's own scope or an
+/// enclosing one; a reassignment inside an `if` without an `else`, or in only
+/// some branches, leaves it live on the other path. An assignment in the other
+/// branch of the `if` that holds the definition never sees it
+/// ([`in_sibling_branches`]).
+struct InForce<'s> {
+    scope: &'s Scope,
+    /// Scopes where a reassignment has ended the definition.
+    ended: Vec<Scope>,
+}
+
+impl<'s> InForce<'s> {
+    fn new(scope: &'s Scope) -> Self {
+        Self {
+            scope,
+            ended: Vec::new(),
+        }
+    }
+
+    fn is_ended(&self, s: &[(usize, usize)]) -> bool {
+        self.ended.iter().any(|k| s.starts_with(k))
+    }
+
+    /// Whether the definition is in force at an assignment in scope `other`:
+    /// not in the other branch of an `if` that holds it, and not after a
+    /// reassignment earlier on this path.
+    fn reaches(&self, other: &Scope) -> bool {
+        !in_sibling_branches(self.scope, other) && !self.is_ended(other)
+    }
+
+    /// Record a reassignment in scope `other`, which the definition
+    /// [`Self::reaches`]; `true` once that replaces the definition.
+    fn end(&mut self, other: &Scope, ifs: &[IfShape]) -> bool {
+        // End it in this scope, then in each enclosing scope whose `if` now has
+        // every branch, `else` included, ended.
+        let mut k = other.clone();
+        loop {
+            if self.scope.starts_with(&k) {
+                return true;
+            }
+            self.ended.push(k.clone());
+            let Some(&(id, _)) = k.last() else {
+                return false;
+            };
+            let (n_branches, has_else) = ifs[id - 1];
+            let parent = &k[..k.len() - 1];
+            let exhaustive = has_else
+                && (0..n_branches).all(|b| {
+                    let mut s = parent.to_vec();
+                    s.push((id, b));
+                    self.is_ended(&s)
+                });
+            if !exhaustive {
+                return false;
+            }
+            k.pop();
+        }
+    }
+}
+
 impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
-        let (mut assigns, mut scopes) = (Vec::new(), Vec::new());
-        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, &mut assigns, &mut scopes);
+        let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
         let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
         Self {
             assigns,
             scopes,
+            ifs,
             consumers,
             memo,
         }
@@ -2793,13 +3031,9 @@ impl<'a> ScaleWalk<'a> {
 
     /// The distinct scale(s) of a leaf that reached the root of definition `def`.
     ///
-    /// The definition is **in force** from the next assignment up to and
-    /// including the first later assignment to the same variable in the same or
-    /// an enclosing scope (a reassignment inside an `if`, including a later
-    /// `if`, leaves it live on the other path); an assignment in the other
-    /// branch of the `if` that holds the definition never sees it
-    /// ([`in_sibling_branches`]). Its **readers** are the assignments in that
-    /// range that read the variable.
+    /// Its **readers** are the later assignments where the definition is in
+    /// force ([`InForce`], #1689) that read the variable (a reassignment reads
+    /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
     /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
@@ -2826,10 +3060,11 @@ impl<'a> ScaleWalk<'a> {
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         let mut out = Vec::new();
         let (mut read, mut replaced) = (false, false);
+        let mut in_force = InForce::new(scope);
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
-            if in_sibling_branches(scope, other) {
-                continue; // the other branch of an `if` never sees this definition
+            if !in_force.reaches(other) {
+                continue;
             }
             if !consumed || *lhs == var {
                 for s in leaf_scales(e, &is_var) {
@@ -2840,7 +3075,7 @@ impl<'a> ScaleWalk<'a> {
                     }
                 }
             }
-            if *lhs == var && scope.starts_with(other) {
+            if *lhs == var && in_force.end(other, &self.ifs) {
                 replaced = true;
                 break;
             }
@@ -3061,7 +3296,11 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
-/// - no η-free assignment writes a row whose `eta_map` names an η;
+/// - no η-free assignment writes a row whose `eta_map` names an η, unless a
+///   a later assignment unconditionally replaces it
+///   ([`unconditionally_replaced`]): `CL = TVCL` then `CL = TVCL * exp(ETA_CL)`,
+///   or an `if`-`else` defining `CL` directly in every branch, leaves only the
+///   direct value on the row (#1691);
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -3074,11 +3313,11 @@ fn lognormal_eta_chain_exact(
     eta_map: &[i32],
     n_eta_bsv: usize,
 ) -> bool {
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
     let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
     let mut carrying: Vec<String> = Vec::new();
-    for (lhs, expr) in assigns {
+    for (def, &(lhs, expr)) in assigns.iter().enumerate() {
         if is_synthetic_readout_param(lhs) {
             continue;
         }
@@ -3093,8 +3332,8 @@ fn lognormal_eta_chain_exact(
             // An η-free value on a row whose `eta_map` names an η (an η-free
             // `else` branch, a reassignment): `sel_flat` still names the η, so
             // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
-            // review round 2).
-            if row_eta.is_some() {
+            // review round 2). One that never reaches the row is harmless.
+            if row_eta.is_some() && !unconditionally_replaced(&assigns, &scopes, &ifs, def) {
                 return false;
             }
             continue;
@@ -3110,6 +3349,33 @@ fn lognormal_eta_chain_exact(
         }
     }
     true
+}
+
+/// Whether definition `def` is unconditionally replaced: every evaluation that
+/// runs it runs a later assignment to the same variable after it, by the
+/// in-force rule [`ScaleWalk::root_scale`] uses ([`InForce`], #1687 / #1689) —
+/// a reassignment in the same or an enclosing scope, or an `if` with an `else`
+/// that reassigns in every branch. A reassignment in only some branches leaves
+/// `def` live on the other path, and one in the other branch of the `if`
+/// holding `def` never runs with it; neither counts.
+///
+/// What reads the variable while `def` is in force is not asked: it reads an
+/// η-free value, which is not what the gate tests. The row's own value is the
+/// replacement's, judged when the gate reaches it.
+fn unconditionally_replaced(
+    assigns: &[(&str, &Expression)],
+    scopes: &[Scope],
+    ifs: &[IfShape],
+    def: usize,
+) -> bool {
+    let (var, _) = assigns[def];
+    let mut in_force = InForce::new(&scopes[def]);
+    for ((lhs, _), other) in assigns.iter().zip(scopes).skip(def + 1) {
+        if *lhs == var && in_force.reaches(other) && in_force.end(other, ifs) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and
@@ -25519,16 +25785,15 @@ fn eval_expression(
 
 /// Evaluate an eta-free typical value `A(θ, covariates)` — a
 /// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
-/// Local variables were inlined at detection time, so the variable environment
-/// is empty; a stray name would read as `0.0`, which is why detection rejects
-/// them rather than letting one through.
+/// The local definitions it reads were resolved at detection time into the
+/// program's own lines ([`TypicalProgram`]); a stray name would read as `0.0`,
+/// which is why detection rejects them rather than letting one through.
 pub(crate) fn eval_typical_value(
-    expr: &Expression,
+    typical: &TypicalProgram,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let vars: HashMap<String, f64> = HashMap::new();
-    eval_expression(expr, theta, &[], covariates, &vars, &[])
+    typical.eval(theta, covariates)
 }
 
 #[inline]
@@ -30771,6 +31036,24 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The partials are a **derivative program**, not closed-form trees (#1699):
+    /// a partial reaches an upstream row's partial along the *same* axis
+    /// through the tangent slot `VariableIdx(tangent_base + j)`, `j` that
+    /// row's index here, rather than through an inlined copy of it. So
+    /// `d_d_theta[i][k]` is evaluated after `d_d_theta[j][k]` for every
+    /// `j < i`, with each result written to `vars[tangent_base + j]`
+    /// (`dX' = dB + dC`, one line per intermediate) and the primal slots
+    /// holding the values the rows compute. Inlined, a value reached along
+    /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
+    /// parse ran out of memory at depth 30. An upstream partial that simplified
+    /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
+    /// partials still fold away. Equal to `vars.len()` of the primal program.
+    pub(crate) tangent_base: usize,
+    /// The primal variable slot each row assigns, parallel to `names`.
+    pub(crate) slots: Vec<usize>,
+    /// Each row's right-hand side in resolved form, parallel to
+    /// `names`: the primal program the tangent program reads.
+    pub(crate) values: Vec<Expression>,
     /// The compiled individual-parameter program, so the analytic (adjoint)
     /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
     /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
@@ -30826,6 +31109,9 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            tangent_base: 0,
+            slots: Vec::new(),
+            values: Vec::new(),
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
@@ -30850,6 +31136,11 @@ impl IndivParamPartials {
 /// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
 /// intermediate references get chain-ruled correctly.
 ///
+/// The chain context maps an upstream row's slot to its *tangent slot*, not to
+/// its partial (see `IndivParamPartials::tangent_base`), so each partial is
+/// the size of its own right-hand side's derivative and the whole program is
+/// linear in the block (#1699).
+///
 /// Top-level `If` and any non-`Assign` variant is skipped. Returns
 /// `IndivParamPartials::empty()` if there are no top-level Assigns.
 fn build_indiv_param_partials(
@@ -30859,17 +31150,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Per-axis chain context: variable slot → precomputed partial Expression
-    // for THIS axis. Indexed by axis index, populated incrementally as we
-    // walk the assignments in source order.
+    // Past every primal slot, so a tangent slot never aliases a variable.
+    let tangent_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    // Per-axis chain context: variable slot → what a read of it differentiates
+    // to along THIS axis (its tangent slot, or the partial itself when that is
+    // a leaf). Indexed by axis index, populated incrementally as we walk the
+    // assignments in source order.
     let mut chain_theta: Vec<HashMap<usize, Expression>> =
         (0..n_theta_base).map(|_| HashMap::new()).collect();
     let mut chain_eta: Vec<HashMap<usize, Expression>> =
         (0..n_eta_extended).map(|_| HashMap::new()).collect();
 
     let mut names: Vec<String> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut values: Vec<Expression> = Vec::new();
     let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
     let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
+
+    // A leaf partial is copied into its readers — constant size, and it keeps
+    // `0` foldable by `simplify_expr` — anything larger is read by reference.
+    let chain_entry = |s: &Expression, row: usize| -> Expression {
+        match s {
+            Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..)
+            | Expression::Conditional(..)
+            | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent_base + row),
+            _ => s.clone(),
+        }
+    };
 
     for stmt in stmts {
         let Statement::Assign(name, raw_expr) = stmt else {
@@ -30898,18 +31207,19 @@ fn build_indiv_param_partials(
              parser pipeline bug (var_idx must be built from the same name list before \
              differentiation)",
         );
+        let row = names.len();
 
         let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
         for k in 0..n_theta_base {
             let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
             let s = simplify_expr(&d);
-            // Store the simplified partial into the chain context BEFORE
-            // pushing — any later assignment that references slot `k` will
-            // chain-rule through this expression. Always insert (even
-            // Literal(0)) so the chain map's "key present ⇔ slot is an
-            // upstream indiv-param" invariant is robust to zero partials.
+            // Record this row in the chain context BEFORE pushing — any later
+            // assignment that references slot `k` will chain-rule through it.
+            // Always insert (even Literal(0)) so the chain map's "key present
+            // ⇔ slot is an upstream indiv-param" invariant is robust to zero
+            // partials.
             if slot != usize::MAX {
-                chain_theta[k].insert(slot, s.clone());
+                chain_theta[k].insert(slot, chain_entry(&s, row));
             }
             row_theta.push(s);
         }
@@ -30919,12 +31229,14 @@ fn build_indiv_param_partials(
             let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
             let s = simplify_expr(&d);
             if slot != usize::MAX {
-                chain_eta[k].insert(slot, s.clone());
+                chain_eta[k].insert(slot, chain_entry(&s, row));
             }
             row_eta.push(s);
         }
 
         names.push(name.clone());
+        slots.push(slot);
+        values.push(resolved);
         d_d_theta.push(row_theta);
         d_d_eta.push(row_eta);
     }
@@ -30933,6 +31245,9 @@ fn build_indiv_param_partials(
         names,
         d_d_theta,
         d_d_eta,
+        tangent_base,
+        slots,
+        values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,

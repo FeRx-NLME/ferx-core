@@ -3897,8 +3897,9 @@ pub struct CovariateMuRef {
     /// of declining the group. Empty on the entries themselves.
     pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
-    /// `[individual_parameters]` definition it referenced already inlined.
-    pub(crate) typical: crate::parser::model_parser::Expression,
+    /// `[individual_parameters]` definition it referenced resolved: each one
+    /// emitted once as a line of the program and read by reference (#1699).
+    pub(crate) typical: crate::parser::model_parser::TypicalProgram,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7192,6 +7193,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_nn_penalty") {
+        // #1352: what a regularized DCM fit's standard errors are. A route note on the
+        // covariance step, so `run_covariance` replaces it with the step it reruns. Info
+        // where `R` carries the penalty (`r` / `rsr`: penalized-ML SEs, as asked); Warning
+        // under `s`, whose SEs ignore it. Its own token, ahead of the prose arms: the
+        // message says "covariance" and "penalized" in words other arms could claim.
+        if lower.contains("not represented") {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
+        } else {
+            (WarningSeverity::Info, WarningCode::CovarianceStep)
+        }
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
