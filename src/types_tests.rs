@@ -214,6 +214,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -270,6 +271,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         pk_only_occasions: Vec::new(),
         fremtype: vec![0],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -2428,6 +2430,7 @@ fn bare_subject(id: &str) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
     }
 }
 
@@ -4237,4 +4240,19 @@ mod kappa_correlation_auto_route {
             );
         }
     }
+}
+
+#[test]
+fn time_varying_covariate_names_inspects_endpoint_rows() {
+    // #1854: the reader keeps no other trace of a covariate on a CTMM / TTE row, so a
+    // change seen only there — here the baseline row is an endpoint row — must be read
+    // from `endpoint_covariates`. Without that field the doses alone look constant.
+    let mut s = bare_subject("1");
+    s.dose_covariates = vec![
+        HashMap::from([("WT".to_string(), 0.0)]),
+        HashMap::from([("WT".to_string(), 0.0)]),
+    ];
+    assert!(s.time_varying_covariate_names().is_empty());
+    s.endpoint_covariates = vec![HashMap::from([("WT".to_string(), 1.0)])];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
 }

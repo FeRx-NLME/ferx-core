@@ -3062,6 +3062,7 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
             });
         }
         Population {

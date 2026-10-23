@@ -48,7 +48,11 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   (`pk_only_raw_times`) and the written `TIME` of each dose and reset row of a
 ///   reset period that restarts `TIME` (`reset_period_times`), the `TIME`
 ///   `[individual_parameters]` now reads there.
-pub(crate) const SCHEME: u32 = 4;
+/// - `5`: #1854. The reader keeps the covariate snapshot of each endpoint row
+///   (`endpoint_covariates`) when a covariate is time-varying, hashed with the other
+///   snapshots, so a fit of a population differing only in an endpoint row's covariate
+///   is caught.
+pub(crate) const SCHEME: u32 = 5;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
@@ -397,6 +401,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         pk_only_occasions,
         fremtype,
         obs_records,
+        endpoint_covariates,
     } = s;
 
     let mut r = Encoder::default();
@@ -456,6 +461,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         obs_covariates,
         pk_only_covariates,
         reset_covariates,
+        endpoint_covariates,
     ] {
         c.len(snapshots.len());
         snapshots.iter().for_each(|m| c.map(m));

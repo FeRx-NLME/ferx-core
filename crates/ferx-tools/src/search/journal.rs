@@ -657,6 +657,7 @@ fn data_fingerprint(data: &Population) -> String {
             pk_only_occasions,
             fremtype,
             obs_records,
+            endpoint_covariates,
         } = subject;
 
         let _ = writeln!(buf, "id={id}");
@@ -696,6 +697,9 @@ fn data_fingerprint(data: &Population) -> String {
         write_covariates(&mut buf, "obs_covariates", obs_covariates);
         write_covariates(&mut buf, "pk_only_covariates", pk_only_covariates);
         write_covariates(&mut buf, "reset_covariates", reset_covariates);
+        // Writes nothing when empty (#1854): data with no time-varying covariate on an
+        // endpoint row keeps its digest.
+        write_covariates(&mut buf, "endpoint_covariates", endpoint_covariates);
     }
 
     ferx_core::io::hash::sha256_bytes(buf.as_bytes())

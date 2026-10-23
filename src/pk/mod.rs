@@ -3498,6 +3498,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
         };
 
         let static_subject = base(vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)]);
@@ -3823,6 +3824,7 @@ mod tests {
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
 
         let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
@@ -4079,6 +4081,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
 
         let theta = model.default_params.theta.clone();
@@ -4126,6 +4129,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subj, &pk);
@@ -4187,6 +4191,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         }
     }
 
@@ -4443,6 +4448,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subject, &pk);
@@ -5211,6 +5217,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         }
     }
 
@@ -5876,6 +5883,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
         let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];
         let pk_obs: Vec<PkParams> = vec![pk.clone(); obs_times.len()];

@@ -213,6 +213,7 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
     };
     Population {
         subjects: vec![subject],
@@ -614,6 +615,7 @@ fn tiny_population() -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         })
         .collect();
     Population {

@@ -1096,6 +1096,16 @@ pub struct Subject {
     /// (Track D) endpoints, so it must be present on the default build. Only the
     /// TTE `Event` variant it can hold stays behind the `survival` feature.
     pub obs_records: Vec<ObsRecord>,
+    /// LOCF covariate snapshot of each data row routed to a non-Gaussian endpoint (the
+    /// rows behind [`Self::obs_records`]), in reading order. Empty when no covariate is
+    /// time-varying, like the other per-event snapshots.
+    ///
+    /// **Not** parallel to `obs_records` — one TTE row can yield two records, or none
+    /// until its interval closes — and no engine evaluates `$PK` from it. It exists so
+    /// [`Self::time_varying_covariate_names`] sees a covariate that changes only on an
+    /// endpoint row (a CTMM state, a TTE event): without it such a change reached no
+    /// snapshot at all, and an endpoint that reads the baseline was not refused (#1854).
+    pub endpoint_covariates: Vec<HashMap<String, f64>>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
@@ -1456,7 +1466,10 @@ impl Subject {
             // EVID=3/4 rows too (#1133): a reset row's `$PK` seeds `[odes] init(...)`, so a
             // covariate that steps only on a reset row is load-bearing and must be reported
             // as varying — the same reason `pk_only_covariates` is chained here.
-            .chain(self.reset_covariates.iter());
+            .chain(self.reset_covariates.iter())
+            // Endpoint rows (CTMM states, TTE events; #1854): the subject's baseline can
+            // come from one, and a change there is a change in the data.
+            .chain(self.endpoint_covariates.iter());
         for snap in snapshots {
             for (name, &val) in snap {
                 match first_seen.get(name.as_str()) {
