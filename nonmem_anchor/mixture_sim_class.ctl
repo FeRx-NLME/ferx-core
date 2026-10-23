@@ -8,6 +8,9 @@ $PROBLEM #2163: a [mixture] model under $SIM draws each subject's class
 $INPUT ID TIME DV AMT EVID CMT WT
 $DATA mixture_sim_class.csv IGNORE=@
 $SUBROUTINES ADVAN1 TRANS2
+; $MIX reads data items only through $CONTR DATA; WT is the value on the subject's
+; first observation record, and WT is constant within a subject.
+$CONTR DATA=(WT)
 
 $MIX
   NSPOP = 2

@@ -83,7 +83,7 @@ fn summary() -> Vec<Line> {
 }
 
 /// NONMEM drew its classes at the mixing probabilities, so its quantiles are a mixture
-/// reference and not, say, all class 1. Measured worst |z|: MEASURED.
+/// reference and not, say, all class 1. Measured worst |z|: 1.64 (NONMEM 7.5.1).
 #[test]
 fn nonmem_draws_classes_at_the_mixing_probabilities() {
     let lines = summary();
@@ -112,7 +112,8 @@ fn nonmem_draws_classes_at_the_mixing_probabilities() {
 /// The share of ferx samples below each NONMEM quantile Q_p is p, within 4 SD of the
 /// two-sample difference, `sqrt(2·p(1−p)/n)`: NONMEM's quantile carries the sampling
 /// error of its own n. 150 comparisons (3 terciles × 5 times × IPRED/DV × 5 levels).
-/// Measured worst |z|: MEASURED. All-class-1 ferx (before #2163): MEASURED_PRE.
+/// Measured worst |z|: 2.42 (DV at t = 0.5, stratum 1, p = 0.9); the largest of 150
+/// independent N(0, 1) draws is about 2.7. All-class-1 ferx (before #2163): 93.2.
 #[test]
 fn ferx_simulates_the_nonmem_mixture_distribution() {
     let model = parse_model_file(std::path::Path::new(&anchor("mixture_sim_class.ferx"))).unwrap();

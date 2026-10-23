@@ -653,9 +653,9 @@ The model is simulated under NONMEM 7.5.1 `$SIMULATION ONLYSIM` and under
 comparison is between distributions, not rows. In each WT tercile, at each time, and
 for both IPRED and DV, the share of ferx samples that fall below each NONMEM quantile
 (10th to 90th percentile) is that quantile's level. The worst of the 150 comparisons
-is NONMEM_WORST_Z standard deviations. NONMEM's own class-1 share in each tercile
+is 2.4 standard deviations. NONMEM's own class-1 share in each tercile
 matches the mean P(1) of that tercile. If every subject is simulated as class 1, as
-before the fix, the worst comparison is PRE_FIX_Z standard deviations. The test is
+before the fix, the worst comparison is 93 standard deviations. The test is
 `tests/mixture_simulate_nonmem_anchor.rs`.
 
 ## Not yet supported
