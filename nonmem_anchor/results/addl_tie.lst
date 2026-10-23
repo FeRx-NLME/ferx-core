@@ -1,4 +1,4 @@
-Thu Oct 22 11:15:07 UTC 2026
+Thu Oct 22 19:09:06 UTC 2026
 $PROBLEM    #1909: an ADDL-implied dose tied with a pk-only row
 ;           (ADVAN1,CL=TVCL*X)
 ; 1 EVID=2 at an implied dose (12) / 2 EVID=0,MDV=1 there / 3 an observation there /
@@ -52,7 +52,7 @@ Days until program expires : 357
 0DATA CHECKOUT RUN:              NO
  DATA SET LOCATED ON UNIT NO.:    2
  THIS UNIT TO BE REWOUND:        NO
- NO. OF DATA RECS IN DATA SET:       58
+ NO. OF DATA RECS IN DATA SET:       90
  NO. OF DATA ITEMS IN DATA SET:  11
  ID DATA ITEM IS DATA ITEM NO.:   1
  DEP VARIABLE IS DATA ITEM NO.:   3
@@ -64,8 +64,8 @@ Days until program expires : 357
 0FORMAT FOR DATA:
  (11E4.0)
 
- TOT. NO. OF OBS RECS:       37
- TOT. NO. OF INDIVIDUALS:        9
+ TOT. NO. OF OBS RECS:       59
+ TOT. NO. OF INDIVIDUALS:       14
 0LENGTH OF THETA:   2
 0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
 0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
@@ -219,7 +219,7 @@ Days until program expires : 357
 
 
 
- #OBJV:********************************************     1487.602       **************************************************
+ #OBJV:********************************************     2219.819       **************************************************
 1
  ************************************************************************************************************************
  ********************                                                                                ********************
@@ -279,6 +279,6 @@ Days until program expires : 357
 +        1.00E-01
  
  Elapsed finaloutput time in seconds:     0.01
- #CPUT: Total CPU Time in Seconds,        0.039
+ #CPUT: Total CPU Time in Seconds,        0.049
 Stop Time:
-Thu Oct 22 11:15:15 UTC 2026
+Thu Oct 22 19:09:19 UTC 2026
