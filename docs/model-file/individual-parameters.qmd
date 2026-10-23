@@ -663,11 +663,15 @@ spelled — two `exp` factors, `exp(ETA_V + ETA_V)`, an intermediate read twice
 multiplied in twice (`EV = exp(ETA_V)`, `V = TVV * EV * EV`), two
 intermediates built from one (`B = A + 1`, `C = A + 2`, `exp(B + C)`), or a
 later line that adds it again (`CL = TVCL + ETA_CL`, then
-`CL = CL + ETA_CL`, even inside an `if`) (#1724). Reads that no single evaluation makes together
-count once: the two branches of an `if`, an `if` that overwrites a variable
-without reading it (`A = ETA`, then `if (WT > 70) { A = ETA }`), or
-`max(ETA, 0)`, which reads the ETA in a condition. A sign never changes the
-CV, so a minus anywhere on the way keeps the label.
+`CL = CL + ETA_CL`, even inside an `if`, and through an alias: `OLD = CL`,
+then `CL = OLD + ETA_CL`) (#1724). Reads that no single evaluation makes
+together count once: the two branches of an `if`, an `if` that overwrites a
+variable without using its old value (`A = ETA`, then
+`if (WT > 70) { A = ETA }`), or `max(ETA, 0)`, which reads the ETA in a
+condition. An `exp` is evaluated once, so reading an `exp` intermediate more
+than once outside a product keeps the label: `EV = exp(ETA_CL)`,
+`CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. A sign never changes the CV, so
+a minus anywhere on the way keeps the label.
 
 An ETA that reaches the top of an intermediate variable is followed to where
 that variable is used, exactly as a kappa is (see

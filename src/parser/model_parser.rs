@@ -3094,21 +3094,22 @@ impl<'a> ScaleWalk<'a> {
     /// virtual sibling branch (`usize::MAX`) of the first later origin that
     /// overwrites its variable inside an `if` below it.
     ///
-    /// Only a pure replacement qualifies. An overwrite that reads the
-    /// variable (`if (WT > 70) { CL = CL + ETA }`) adds to `def`'s value on
-    /// the branch it runs, so the two are summed as usual: when `CL` is a
-    /// parameter, `def` ends on the overwrite's root once and so does the
-    /// overwrite's own leaf, which is `2·ETA` on that branch.
+    /// Only a pure replacement qualifies. An overwrite that `def`'s value
+    /// flows into ([`Self::flows_into`]), directly
+    /// (`if (WT > 70) { CL = CL + ETA }`) or through an alias (`OLD = CL`,
+    /// `if (WT > 70) { CL = OLD + ETA }`), adds to it on the branch it runs,
+    /// so the two are summed as usual: when `CL` is a parameter, `def` ends on
+    /// the overwrite's root once and so does the overwrite's own leaf, which
+    /// is `2·ETA` on that branch.
     fn origin_scope(&self, def: usize, origins: &[usize]) -> Scope {
         let (var, _) = self.assigns[def];
         let own = &self.scopes[def];
-        let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         for &y in origins.iter().filter(|&&y| y > def) {
             let theirs = &self.scopes[y];
             if self.assigns[y].0 == var
                 && theirs.len() > own.len()
                 && theirs.starts_with(own)
-                && !reads_node(self.assigns[y].1, &is_var)
+                && !self.flows_into(def, y)
             {
                 let mut v = theirs[..=own.len()].to_vec();
                 if let Some(last) = v.last_mut() {
@@ -3163,8 +3164,11 @@ impl<'a> ScaleWalk<'a> {
     /// root carries the `exp` into the reader's product, which is followed
     /// the same way, so `EV = exp(ETA_V)`, `V = TVV * EV * EV` reaches `V`'s
     /// product twice (`log V = log TVV + 2η`). Any other read leaves the leaf
-    /// on this `exp`, as the walk always has. The definition's range, the
-    /// consumer stop and the reader combination are [`Self::root_scale`]'s.
+    /// on this `exp`, as the walk always has, and the `exp` is reached at most
+    /// once however many such reads there are: it is evaluated once, so
+    /// `EV = exp(ETA_CL)`, `CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. The
+    /// definition's range, the consumer stop and the reader combination are
+    /// [`Self::root_scale`]'s.
     fn log_root(&self, def: usize) -> ScaleReach {
         if let Some(done) = &self.log_memo.borrow()[def] {
             return done.clone();
@@ -3175,7 +3179,7 @@ impl<'a> ScaleWalk<'a> {
             root_product_key(self.assigns[def].1),
             crate::types::EtaParamType::LogNormal,
         );
-        let out = self.follow(def, here, &|j, is_var| {
+        let mut out = self.follow(def, here, &|j, is_var| {
             let (factors, others) = product_reads(self.assigns[j].1, is_var);
             let mut r = ScaleReach::new();
             if factors > 0 {
@@ -3189,6 +3193,11 @@ impl<'a> ScaleWalk<'a> {
             }
             r
         });
+        for (t, n) in out.iter_mut() {
+            if *t == here {
+                *n = 1;
+            }
+        }
         self.log_memo.borrow_mut()[def] = Some(out.clone());
         out
     }
@@ -3197,6 +3206,12 @@ impl<'a> ScaleWalk<'a> {
     /// [`Self::root_scale`] and [`Self::log_root`]: `read(j, is_var)` is where
     /// reader `j`'s reads of the variable end, and `here` is the terminal of a
     /// definition nothing reads or a consumer reads before any replacement.
+    ///
+    /// For a parameter, a reader that does not reassign it counts only for
+    /// what flows back into a later definition of it ([`Self::is_own`]):
+    /// `OLD = CL`, `if (WT > 70) { CL = OLD + ETA_CL }` ends on the
+    /// reassignment's root through `OLD` as well (#1724), while `K10 = CL / V`
+    /// still does not change the label.
     fn follow(
         &self,
         def: usize,
@@ -3215,8 +3230,11 @@ impl<'a> ScaleWalk<'a> {
             if !in_force.reaches(other) {
                 continue;
             }
-            if !consumed || *lhs == var {
-                let r = read(j, &is_var);
+            {
+                let mut r = read(j, &is_var);
+                if consumed && *lhs != var {
+                    r.retain(|(t, _)| self.is_own(t, var));
+                }
                 if !r.is_empty() {
                     readers.push((other.as_slice(), r));
                 }
@@ -3232,6 +3250,60 @@ impl<'a> ScaleWalk<'a> {
             reach_add(&mut out, here, 1);
         }
         out
+    }
+
+    /// Whether terminal `t` is on a definition of `var`: its root, or a call
+    /// in its expression. `Custom` is on none.
+    fn is_own(&self, t: &Terminal, var: &str) -> bool {
+        match *t {
+            Terminal::Root(d) => self.assigns[d].0 == var,
+            Terminal::Call(key, _) => self.assigns.iter().any(|&(lhs, e)| {
+                lhs == var && {
+                    let mut hit = false;
+                    visit_expr_nodes(e, &mut |n| hit |= std::ptr::eq(n, key as *const Expression));
+                    hit
+                }
+            }),
+            Terminal::Custom => false,
+        }
+    }
+
+    /// Whether definition `def`'s value flows into definition `y`: `y` reads
+    /// its variable where it is in force, or reads a definition that does,
+    /// and so on. A read in an `if` condition is not a flow.
+    fn flows_into(&self, def: usize, y: usize) -> bool {
+        let mut seen = vec![false; self.assigns.len()];
+        let mut stack = vec![def];
+        while let Some(d) = stack.pop() {
+            let (var, _) = self.assigns[d];
+            let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
+            let mut in_force = InForce::new(&self.scopes[d]);
+            for (j, (lhs, e)) in self
+                .assigns
+                .iter()
+                .enumerate()
+                .skip(d + 1)
+                .take_while(|(j, _)| *j <= y)
+            {
+                let other = &self.scopes[j];
+                if !in_force.reaches(other) {
+                    continue;
+                }
+                if reads_node(e, &is_var) {
+                    if j == y {
+                        return true;
+                    }
+                    if !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+                if *lhs == var && in_force.end(other, &self.ifs) {
+                    break;
+                }
+            }
+        }
+        false
     }
 }
 

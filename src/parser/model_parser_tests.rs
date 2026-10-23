@@ -29808,6 +29808,18 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "a conditional overwrite of a parameter that adds it again, was Additive",
             "  CL = TVCL + RE\n  if (WT > 70) {\n    CL = CL + RE\n  }",
         ),
+        // Dies under: `origin_scope` testing a direct read instead of
+        // `flows_into`, and under `follow` skipping a parameter's readers that
+        // do not reassign it — the old value reaches the overwrite through
+        // `OLD`, so on `WT > 70` `CL` holds `2·RE` (#1724 review).
+        (
+            "an alias fed into a conditional overwrite of a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD + RE\n  }",
+        ),
+        (
+            "an alias fed into a conditional overwrite of a log-normal parameter, was LogNormal",
+            "  CL = TVCL * exp(RE)\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD * exp(RE)\n  }",
+        ),
     ]
     .into_iter()
     .map(|(l, t)| (format!("{v}{t}"), l))
@@ -29822,7 +29834,7 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
 #[test]
 fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, EtaParamType); 12] = [
+    let rows: [(&str, &str, EtaParamType); 15] = [
         // Dies under: an inline `if`'s branches summed, not maxed (`max` is
         // desugared to `if (RE >= 0) RE else 0`, and the condition read is
         // not a scale position at all).
@@ -29899,6 +29911,26 @@ fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
             "  V = TVV * exp(ETA_V)\n  A = RE\n  if (WT > 70) {\n    A = RE\n  }\n  \
              CL = TVCL * exp(A)",
             LogNormal,
+        ),
+        // Dies under: `log_root` counting each off-product read of an `exp`
+        // intermediate as an arrival at it — `CL = 2·exp(RE)`, log-normal, as
+        // the inline spelling below already was (#1724 review).
+        (
+            "an exp intermediate added to itself",
+            "  V = TVV * exp(ETA_V)\n  EV = exp(RE)\n  CL = EV + EV",
+            LogNormal,
+        ),
+        (
+            "two exps added inline",
+            "  V = TVV * exp(ETA_V)\n  CL = exp(RE) + exp(RE)",
+            LogNormal,
+        ),
+        // Dies under: `follow` keeping every terminal of a parameter's other
+        // readers — `V`'s `exp` is not on a definition of `CL`.
+        (
+            "a parameter read inside another parameter's exp",
+            "  CL = TVCL + RE\n  V = TVV * exp(ETA_V + CL)",
+            Additive,
         ),
         // Dies under: `reach_add` counting a `Custom` arrival as a scale.
         (
