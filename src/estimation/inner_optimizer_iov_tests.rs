@@ -3138,11 +3138,12 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
 /// | 1e-10 | stall keyed on `effective_for` | **`true`** | 2.03e-8 |
 ///
 /// So at `tol = 1e-8` a converged solve must have a gradient below `tol` — 6.7× headroom over
-/// the realised 1.49e-9, and the mutation lands 2× above it — and at `tol = 1e-10` a solve that
-/// claims convergence must have its gradient below `tol` too. Both are asserted; either catches
-/// the mutation. The 1.49e-9 at `tol = 1e-10` was the search stalling, not the objective's floor:
-/// since #2270 (relative BFGS pair gate, gradient-verified steps below the objective's
-/// resolution) that solve converges, at max |g| 1.12e-12.
+/// the realised 1.49e-9, and the mutation lands 2× above it — and at `tol = 1e-10` the solve must
+/// converge with its gradient below `tol` too. Both are asserted; either catches the mutation.
+/// The 1.49e-9 at `tol = 1e-10` was the search stalling, not the objective's floor: since #2270
+/// (relative BFGS pair gate, gradient-verified steps below the objective's resolution) that
+/// solve converges, at max |g| 1.12e-12 (macOS arm64 and Linux aarch64), so the second assertion
+/// also pins that improvement.
 #[test]
 fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
@@ -3226,9 +3227,9 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     );
     let (conv, gmax) = solve(1e-10);
     assert!(
-        !conv || gmax < 1e-10,
-        "a solve that claims convergence at tol 1e-10 must have its gradient below it, not stop \
-         on a plateau (max |g| {gmax:e})"
+        conv && gmax < 1e-10,
+        "at tol 1e-10 the solve must converge with its gradient below tol, not stop on a plateau \
+         or give up (converged {conv}, max |g| {gmax:e})"
     );
 }
 

@@ -4916,6 +4916,57 @@ fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
     );
 }
 
+/// A sub-resolution step the objective cannot verify is taken only when the gradient norm at
+/// least **halves** there (#2270, PR #2280 review). The same geometry as
+/// `only_an_exact_objective_takes_the_gradient_verified_step` with the seed's curvature four times
+/// too high (1024 = 32², so it inverts exactly): the full step lands on `x₀·3/4`, where `f` is
+/// higher by ~4.9e-11 (inside the resolution) and the gradient is ¾ of the start's, lower but not
+/// halved. The verification must refuse it, and the line search, which rejects the rise, takes a
+/// shorter step instead. With the halving test weakened to "any decrease", the step was taken.
+#[test]
+fn a_verified_step_must_halve_the_gradient() {
+    let lambda = 256.0;
+    let x0 = 2f64.powi(-23);
+    let cand = 0.75 * x0;
+    let obj =
+        |x: &[f64]| 10.0 + 0.5 * lambda * x[0] * x[0] + if x[0] == cand { 5e-11 } else { 0.0 };
+    let grad = |x: &[f64]| vec![lambda * x[0]];
+    let seed = DMatrix::from_element(1, 1, 4.0 * lambda);
+    // The premise: the step's gain is below the resolution, its end point lies within the
+    // resolution above the start, and the gradient there falls by a quarter, not a half.
+    let f0 = obj(&[x0]);
+    let resolution = INNER_FTOL_REL * (1.0 + f0.abs());
+    assert!(
+        obj(&[cand]) > f0 && obj(&[cand]) <= f0 + resolution,
+        "fixture premise: f"
+    );
+    assert_eq!(
+        grad(&[cand])[0] / grad(&[x0])[0],
+        0.75,
+        "fixture premise: ‖∇‖"
+    );
+    let mut x = vec![x0];
+    dense_bfgs_core(
+        &obj,
+        &grad,
+        &mut x,
+        1,
+        1,
+        1e-14,
+        None,
+        Some(&seed),
+        None,
+        &|_| false,
+        false,
+    );
+    assert!(
+        x[0] != cand && x[0] > cand && x[0] < x0,
+        "a step that lowers ‖∇‖ by a quarter must go to the line search, which shortens it: \
+         x = {:e}, the unverified end point {cand:e}",
+        x[0]
+    );
+}
+
 /// The gradient-verified step of #2270 is for exact objectives only; an ODE objective
 /// (`enable_stall`) keeps its line search and its own noise-floor exit. A differential pair
 /// across the gate: `f = 10 + ½·256·x² + e(x)` with `e(0) = 5e-11` and `e = 0` elsewhere,
