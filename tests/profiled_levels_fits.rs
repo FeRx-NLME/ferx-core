@@ -151,6 +151,8 @@ fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
 }
 
 /// The profiled F2 fit against NONMEM's own optimum, every level a `THETA` there.
+/// On #2280's inner BFGS without #2285's `xtol_rel` ceiling and verification leg, this
+/// start stopped `converged: true` (`XtolReached`) 1.584e-3 above it (Linux aarch64).
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -186,14 +188,21 @@ fn a2_nonmem_ofv() -> f64 {
 }
 
 /// #2285: A2 from starts near the file's own, where a fit that says `converged: true`
-/// must be on NONMEM's optimum. Before #2285 the profiled L-BFGS stopped on the
-/// unprofiled `ftol_rel = 1e-6` (≈ 1e-4 absolute at this OFV) while still descending:
-/// (45, 7.5, 2) reported `converged: true` 3.88e-4 above the optimum on `main`, and
-/// (45, 8, 2.2) 1.49e-4 above it on #2280's inner solver. Those are the two starts here;
-/// the other five of the issue's seven landed either way, and each fit costs as much
-/// as A2. The issue would accept `converged: false` here; this asks for the optimum,
-/// which every one of the seven now reaches. Realised on macOS arm64 at #2285's head:
-/// Δ 3.5e-8 (29 evaluations) and 3.8e-8 (31), against 3.7e-8 from the file's own start.
+/// must be on NONMEM's optimum. A profiled L-BFGS stop is only a test on one iteration,
+/// so the fit is converged when a fresh leg from its best point gains no more than
+/// `PROFILED_VERIFY_GAIN`, every leg at `xtol_rel ≤ 1e-6`. The two starts are the ones
+/// that kill each half of that rule on Linux aarch64 (`tools/linux-test.sh`, a 34-start
+/// grid around (45, 8, 2), on `main` at `5bd862b8` and on #2280's inner BFGS merged in):
+///
+/// - (45, 6, 2): with no verification leg it stops `converged: true` 2.16e-5 above the
+///   optimum on `main` and 2.27e-5 on #2280.
+/// - (40, 6, 2): with no `xtol_rel` ceiling, on #2280, every leg ends on a short step and
+///   gains under the threshold while 1.79e-5 short. On `main` it lands either way, and
+///   no start of the grid kills the ceiling there; `a_profiled_gradient_fit_caps_its_xtol`
+///   (Tier 1) is its guard on `main`'s engine.
+///
+/// With both halves, every start of that grid landed within 7.2e-7 of the optimum,
+/// converged, on both engines.
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -207,7 +216,7 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
         None,
     );
     assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
-    for start in [[45.0, 7.5, 2.0], [45.0, 8.0, 2.2]] {
+    for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0]] {
         let mut params = p.init_params.clone();
         params.theta[..3].copy_from_slice(&start);
         let (f, t) = fit(&p, &params, false);
@@ -231,8 +240,9 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
     }
 }
 
-/// Realised 2.4e-8 on Linux aarch64 (24 evaluations; 1.5e-8 macOS arm64), from the
-/// model file's inits. A
+/// Realised on Linux aarch64 from the model file's inits, #2285's verification leg
+/// included: 3.4e-8 (38 evaluations) on `main` at `5bd862b8`, 3.9e-8 (45) with #2280
+/// merged. A
 /// stopping rule, not an engine difference, sets this; 1e-5 leaves room for another
 /// platform's path to the optimum while still failing the 0.0185 BOBYQA stopped at.
 const A2_FIT_OFV: f64 = 1e-5;

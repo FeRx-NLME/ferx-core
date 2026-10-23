@@ -4218,7 +4218,7 @@ const POLISH_XTOL_REL: f64 = 1e-7;
 const POLISH_MIN_GAIN: f64 = 1e-3;
 /// Polish legs after the first BOBYQA stop, at most. Each costs at least the
 /// `2n + 1` evaluations BOBYQA spends rebuilding its interpolation model.
-const MAX_POLISH_LEGS: usize = 4;
+pub(crate) const MAX_POLISH_LEGS: usize = 4;
 
 /// Does this NLopt return need the #1782 polish leg before it may be called
 /// converged? Only a BOBYQA *tolerance* stop, which it reports three ways:
