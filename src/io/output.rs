@@ -953,10 +953,23 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
     out
 }
 
-/// `(min, median, max)` of a slice, for the compact block summary. The median
-/// is the lower of the two middle values on an even count — the levels are a
-/// nuisance block, not a quantity anyone interpolates.
-fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+/// `(min, median, max)` of a block's values — the statistic `print_results`,
+/// `format_summary` and the fit YAML print for each block [`compact_theta_blocks`]
+/// returns. The median is the **lower** of the two middle values on an even count
+/// — the levels are a nuisance block, not a quantity anyone interpolates.
+///
+/// Public so a binding that collapses the same blocks (ferx-r's `print.ferx_fit`)
+/// prints the same median as the engine instead of restating the rule (#1812):
+/// pass it `&theta[range]` for each range `compact_theta_blocks` returns.
+///
+/// Values are ordered by [`f64::total_cmp`], so a `NaN` sorts past `+inf` (or,
+/// sign bit set, below `-inf`) rather than being dropped. An empty slice has no
+/// summary and returns `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
+/// empty block.
+pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
@@ -4192,6 +4205,14 @@ mod tests {
         assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
         assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
         assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn block_summary_of_an_empty_slice_is_nan_not_a_panic() {
+        // Public since #1812: a binding can hand it any slice, so the empty case
+        // must not index out of bounds.
+        let (mn, md, mx) = block_summary(&[]);
+        assert!(mn.is_nan() && md.is_nan() && mx.is_nan());
     }
 
     #[test]
