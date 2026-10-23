@@ -394,12 +394,21 @@ with the reported OFV. Two consequences to keep in mind:
 - Multi-start (`n_starts`) and the `gn_hybrid` phase selection rank
   candidates on the penalized objective, so a heavier λ cannot be
   out-voted by a start that merely fits the data better.
-- **Standard errors** come from the curvature of the *unpenalized*
-  objective at the regularized optimum, which is not a stationary point
-  of that objective. Under a strong λ the NN-weight directions are flat
-  in the unpenalized OFV, so their SEs are large and the covariance step
-  may fall back to SIR — read NN-weight SEs as "how much the data alone
-  constrain this weight", not as posterior uncertainty under the penalty.
+- **Standard errors** are the curvature of the *penalized* objective — the
+  one the optimizer minimised — so they are penalized-ML standard errors,
+  and the fit's warnings say so. The covariance step adds the penalty's
+  exact Hessian to the R matrix (`2·nn_l2` on each weight coordinate, and
+  the smoothness term's full second derivative) on the analytic and the
+  finite-difference route alike. That matters most where the penalty is
+  doing its job: the weight directions the data does not identify are flat
+  or indefinite in the unpenalized OFV, and without the penalty the step
+  would floor them or fall back to SIR. Read an NN-weight SE as
+  uncertainty under the penalty, not as "how much the data alone
+  constrain this weight". `covariance_method = s` is the exception: `S`
+  is a sum of per-subject scores and the penalty has no per-subject part,
+  so its SEs ignore the penalty, and a warning says so. Under
+  `saem` / `imp` / `impmap` / `bayes`, which never apply the penalty,
+  nothing is added.
 
 ```
 [fit_options]

@@ -1836,6 +1836,10 @@ pub(crate) fn compute_covariance_for(
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
     let is_mixture = template.mixture.is_some();
+    // #1352: the covariate-NN regularizer, when the estimator that produced `x_hat` minimised
+    // it (`None` for an unregularized fit, and for SAEM / IMP / IMPMAP / Bayes, which never
+    // apply the penalty, so their SEs are the curvature of what they fitted).
+    let nn_reg = cov_nn_regularizer(fit_method, model, population, options);
 
     // `h_matrices` (the H from the fit) is read only by `S`
     // (`assemble_score_cross_product`): `R` reconverges the EBEs at every perturbed
@@ -2055,7 +2059,11 @@ pub(crate) fn compute_covariance_for(
         }
         return CovarianceStepResult::Success(CovarianceOutput {
             matrix: embed_free(&cov_free, &free_idx, n),
-            warnings: Vec::new(),
+            warnings: nn_reg
+                .is_some()
+                .then(|| format_nn_penalty_cov_note(CovarianceMethod::CrossProduct))
+                .into_iter()
+                .collect(),
             method: CovarianceMethod::CrossProduct,
         });
     }
@@ -2271,6 +2279,22 @@ pub(crate) fn compute_covariance_for(
     // standard errors, not posterior SDs.
     let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
     cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
+
+    // ── Covariate-NN regularization curvature (#1352) ────────────────────────
+    //
+    // The same argument as the prior's, for `nn_l2` / `nn_smooth`: the optimizer minimised
+    // `OFV_data + penalty(θ)`, and the penalty exists for exactly the weight directions the
+    // data does not identify — where the unpenalized Hessian is flat or indefinite, so leaving
+    // it out floors those directions or sends the step to SIR on the fits the feature is for.
+    // Added post-assembly for the prior's reasons too (one line covers the analytic, stencil
+    // and hybrid routes, with no extra objective evaluation), and with the penalty's *exact*
+    // Hessian rather than the Gauss–Newton one the optimizers use: this is the curvature
+    // being reported, not a search direction. NN weights are identity-packed, so a theta
+    // index is its packed index.
+    if let Some(reg) = nn_reg.as_ref() {
+        let theta = unpack_params(x_hat, template).theta;
+        reg.add_exact_packed_hessian(&theta, &mut |i, j, v| hess[(i, j)] += v);
+    }
 
     // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate cause labels:
     // a non-finite stencil result is never stored, so the entry keeps whatever was already
@@ -2567,6 +2591,12 @@ pub(crate) fn compute_covariance_for(
         eprintln!("  Covariance step successful");
     }
 
+    // #1352: say which curvature the SEs are — the penalized objective's, or (on the #1781
+    // `S⁻¹` fallback) one that cannot represent the penalty at all.
+    if nn_reg.is_some() {
+        cov_warnings.push(format_nn_penalty_cov_note(estimator));
+    }
+
     // Soft warning: cross-partial stencils that returned NaN/Inf contributed nothing, so some
     // off-diagonal correlation is missing for these parameters and their SEs may be
     // over-optimistic. *How much* is missing depends on the route — the whole cross-partial on
@@ -2585,6 +2615,56 @@ pub(crate) fn compute_covariance_for(
         method: estimator,
     })
 }
+
+/// The covariate-NN regularizer whose curvature the covariance step adds to `R` (#1352), or
+/// `None` when there is none to add: no positive `nn_l2` / `nn_smooth` on a model with a
+/// `[covariate_nn]` block, or a `fit_method` that does not apply the penalty
+/// ([`crate::estimation::nn_reg::applies_nn_regularization`]) — an unregularized estimate's
+/// SEs are the curvature of the objective it actually minimised.
+pub(crate) fn cov_nn_regularizer(
+    fit_method: EstimationMethod,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> Option<crate::estimation::nn_reg::NnRegularizer> {
+    if !crate::estimation::nn_reg::applies_nn_regularization(fit_method) {
+        return None;
+    }
+    let reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    reg.is_active().then_some(reg)
+}
+
+/// The note naming what a regularized DCM fit's standard errors are (#1352), by the estimator
+/// that produced them. `R` carries the covariate-NN penalty's curvature, so `r` and `rsr` give
+/// penalized-ML SEs; `S` is a sum of per-subject scores and the penalty has no per-subject
+/// part, so `s` — requested, or the #1781 fallback — cannot represent it.
+pub(crate) fn format_nn_penalty_cov_note(estimator: CovarianceMethod) -> String {
+    let body = match estimator {
+        CovarianceMethod::Hessian => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+             the minimised objective, so the R matrix includes the penalty's curvature: these are \
+             penalized-ML standard errors, not the data-only curvature of the reported \
+             (unpenalized) OFV."
+        }
+        CovarianceMethod::Sandwich => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+             the minimised objective: the sandwich's R includes the penalty's curvature, while S \
+             (per-subject scores) has no penalty term — penalized-ML sandwich standard errors."
+        }
+        CovarianceMethod::CrossProduct => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is not \
+             represented in these standard errors: S⁻¹ is built from per-subject scores and the \
+             penalty has no per-subject part, so they ignore it. Use covariance_method = r for \
+             penalized-ML standard errors."
+        }
+    };
+    format!("{NN_PENALTY_COV_TOKEN}: {body}")
+}
+
+/// The token every [`format_nn_penalty_cov_note`] starts with (#1352), so
+/// [`crate::types::classify_warning`] files it as a covariance-step note and `run_covariance`
+/// replaces it with the step it reruns, instead of keeping an `r` note beside an `s` one.
+pub(crate) const NN_PENALTY_COV_TOKEN: &str = "W_COV_NN_PENALTY";
 
 /// The soft warning for cross-partial stencils that came back non-finite, naming their
 /// parameters in packed order (deterministic whatever the `HashSet` iteration order) — or
@@ -3413,6 +3493,10 @@ pub(crate) fn run_covariance_step(
 #[cfg(test)]
 #[path = "covariance_salvage_tests.rs"]
 mod salvage_tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "covariance_nn_reg_tests.rs"]
+mod nn_reg_tests;
 
 #[cfg(test)]
 mod tests {

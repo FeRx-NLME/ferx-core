@@ -36,6 +36,11 @@ use crate::types::{CompiledModel, FitOptions, PkParams, Population};
 /// deviation resolves the wiggles the penalty targets without over-sampling.
 pub(crate) const NN_SMOOTH_GRID_STEP_Z: f64 = 0.25;
 
+/// Relative step for the central difference of the smoothness penalty's analytic gradient in
+/// [`NnRegularizer::add_exact_packed_hessian`] — `≈ ε^{1/3}`, the step that balances the
+/// stencil's `O(h²)` truncation against its `O(ε/h)` rounding on an analytic gradient.
+const NN_PENALTY_HESSIAN_FD_STEP: f64 = 1e-5;
+
 /// Cap on the number of grid nodes swept per NN input, bounding the curvature
 /// penalty's cost for covariates with a very wide observed range.
 pub(crate) const NN_SMOOTH_GRID_MAX_NODES: usize = 65;
@@ -1822,6 +1827,75 @@ impl NnRegularizer {
         self.accumulate(theta, None, Some(add));
     }
 
+    /// Add the penalty's **exact** Hessian through `add(i, j, v)` at packed coordinates —
+    /// what the covariance step needs (#1352), where the reported curvature must be that of
+    /// the objective actually minimised. Equal to [`Self::add_packed_hessian`] whenever
+    /// [`Self::hessian_is_exact`]; otherwise the L2 term keeps its analytic `2·λ_l2` diagonal
+    /// and the smoothness term's Hessian is the central difference of its analytic gradient,
+    /// so the `2λ Σ C·∇²C` part the Gauss–Newton form drops is included. That costs
+    /// `2·n_weights` penalty-gradient evaluations per network — forward/backward passes over
+    /// the curvature grid, no model evaluation. The result is symmetrised. No-op when inactive.
+    pub(crate) fn add_exact_packed_hessian(
+        &self,
+        theta: &[f64],
+        add: &mut dyn FnMut(usize, usize, f64),
+    ) {
+        if self.hessian_is_exact() {
+            self.add_packed_hessian(theta, add);
+            return;
+        }
+        for spec in &self.specs {
+            let off = spec.weights_offset;
+            let n_w = spec.mapper.n_weights();
+            let mut w = theta[off..off + n_w].to_vec();
+            let mut l2_add = |i: usize, j: usize, v: f64| add(off + i, off + j, v);
+            spec.mapper.l2_weight_penalty_accum(
+                &w,
+                self.l2_lambda,
+                &mut PenaltySink {
+                    grad: None,
+                    hess: Some(&mut l2_add),
+                },
+            );
+            let smooth_grad = |w: &[f64]| -> Vec<f64> {
+                let mut g = vec![0.0; n_w];
+                spec.mapper.curvature_penalty_accum(
+                    w,
+                    &spec.grid,
+                    self.smooth_lambda,
+                    &mut PenaltySink {
+                        grad: Some(&mut g),
+                        hess: None,
+                    },
+                );
+                g
+            };
+            let mut h = DMatrix::<f64>::zeros(n_w, n_w);
+            for j in 0..n_w {
+                let wj = w[j];
+                let step = NN_PENALTY_HESSIAN_FD_STEP * wj.abs().max(1.0);
+                w[j] = wj + step;
+                let gp = smooth_grad(&w);
+                w[j] = wj - step;
+                let gm = smooth_grad(&w);
+                w[j] = wj;
+                // The realised step, so the quotient divides by the distance actually moved.
+                let span = (wj + step) - (wj - step);
+                for i in 0..n_w {
+                    h[(i, j)] = (gp[i] - gm[i]) / span;
+                }
+            }
+            for i in 0..n_w {
+                for j in 0..n_w {
+                    let v = 0.5 * (h[(i, j)] + h[(j, i)]);
+                    if v != 0.0 {
+                        add(off + i, off + j, v);
+                    }
+                }
+            }
+        }
+    }
+
     fn accumulate(
         &self,
         theta: &[f64],
@@ -3359,6 +3433,79 @@ mod regularizer_fit_tests {
                 assert_relative_eq!(h[i][j], expect, epsilon = 1e-15);
             }
         }
+    }
+
+    /// `add_exact_packed_hessian` — the curvature the covariance step reports (#1352) — is
+    /// the penalty's exact Hessian: bit-equal to `add_packed_hessian` under L2 alone, and under
+    /// smoothness equal to the second difference of `penalty_value` itself (an oracle outside
+    /// the analytic gradient it is built from), while the Gauss–Newton `add_packed_hessian`
+    /// is not. The straddle is asserted, so the fixture cannot drift to a point with `C ≈ 0`,
+    /// where the two forms agree and a revert to Gauss–Newton would pass.
+    #[test]
+    fn exact_penalty_hessian_matches_the_second_difference_of_the_penalty() {
+        let (model, mut options, population) = load();
+        let theta = model.default_params.theta.clone();
+        let n = theta.len();
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let dense = |f: &dyn Fn(&mut dyn FnMut(usize, usize, f64))| {
+            let mut h = vec![vec![0.0; n]; n];
+            f(&mut |i, j, v| h[i][j] += v);
+            h
+        };
+
+        options.nn_l2_lambda = 2e-2;
+        options.nn_smooth_lambda = 0.0;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(reg.hessian_is_exact());
+        assert_eq!(
+            dense(&|a| reg.add_exact_packed_hessian(&theta, a)),
+            dense(&|a| reg.add_packed_hessian(&theta, a)),
+            "L2 only: the exact Hessian is the analytic one"
+        );
+
+        options.nn_smooth_lambda = 3e-1;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(!reg.hessian_is_exact());
+        let exact = dense(&|a| reg.add_exact_packed_hessian(&theta, a));
+        let gn = dense(&|a| reg.add_packed_hessian(&theta, a));
+        let eps = 1e-4;
+        let f = |p: &[f64]| reg.penalty_value(p);
+        let mut worst = 0.0f64;
+        let mut gn_gap = 0.0f64;
+        let mut p = theta.clone();
+        for i in 0..n {
+            for j in 0..n {
+                let in_block = (w_lo..w_hi).contains(&i) && (w_lo..w_hi).contains(&j);
+                if !in_block {
+                    assert_eq!(exact[i][j], 0.0, "exact Hessian leaked to ({i}, {j})");
+                    continue;
+                }
+                assert_eq!(exact[i][j], exact[j][i], "not symmetric at ({i}, {j})");
+                let mut at = |di: f64, dj: f64| {
+                    p[i] += di;
+                    p[j] += dj;
+                    let v = f(&p);
+                    p[i] -= di;
+                    p[j] -= dj;
+                    v
+                };
+                let fd = (at(eps, eps) - at(eps, -eps) - at(-eps, eps) + at(-eps, -eps))
+                    / (4.0 * eps * eps);
+                let err = (exact[i][j] - fd).abs();
+                assert!(err.is_finite(), "non-finite Hessian entry at ({i}, {j})");
+                worst = worst.max(err);
+                gn_gap = gn_gap.max((gn[i][j] - fd).abs());
+            }
+        }
+        // Measured on this fixture: worst |exact − FD| = 2.6e-9 (the FD oracle's own
+        // `O(eps²)` + rounding), against a Gauss–Newton gap of 5.9e-3 — the bound sits ~400×
+        // above the first and ~6,000× below the second.
+        assert!(worst < 1e-6, "exact penalty Hessian vs FD: worst {worst:e}");
+        assert!(
+            gn_gap > 100.0 * 1e-6,
+            "the fixture must sit where Gauss–Newton is not exact (gap {gn_gap:e})"
+        );
     }
 
     /// Growing the L2 strength shrinks the NN weights, flattening the learned

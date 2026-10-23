@@ -2066,7 +2066,9 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
+        // The first record's value, as the reader fills it: a covariate is present
+        // only when the subject-static map carries it (#2181).
+        covariates: HashMap::from([("FREE".to_string(), 0.0)]),
         dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
