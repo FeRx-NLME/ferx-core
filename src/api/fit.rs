@@ -825,7 +825,9 @@ fn fit_unstamped(
     ))?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
     // occasion count) is a property of the *data*, so `check_model_options` cannot check
-    // this cap. `E_AGQ_GRID_TOO_LARGE`, the code it gives the η-only grid (#1788).
+    // this cap. `E_AGQ_GRID_TOO_LARGE`, the code it gives the η-only grid (#1788). The
+    // helper counts `K` after a derived `iov_occasion` rule has labelled the population,
+    // as `fitted_population` below labels it.
     first_error(&crate::api::validation::check_agq_grid_iov(
         model, population, options,
     ))?;
@@ -851,22 +853,13 @@ fn fit_unstamped(
     //   - if the count explodes (e.g. `iov_occasion = dose` on an ADDL train,
     //     where each expanded dose opens an occasion), the inner per-subject
     //     problem balloons; warn so the multiplication isn't silent.
+    // The single-occasion refusal is `check_model_data_rule_at`'s
+    // (`E_IOV_SINGLE_OCCASION`, #1788), so `ferx check --data` reports it too; only the
+    // warning is here.
     if derive_occ {
         // Distinct occasion labels seen across observations and doses, per subject; the
         // `--simulate` pre-check reads the same count on its template (#2052).
         let max_occ = crate::api::max_obs_dose_occasions(pop_ref);
-        if max_occ <= 1 {
-            return Err(EngineError::from_diagnostic(
-                crate::api::validation::iov_single_occasion(
-                    "The `iov_occasion` rule produced only a single occasion for every \
-                     subject, so the per-occasion kappa (IOV) cannot be separated from \
-                     between-subject variability (it is unidentifiable). Use \
-                     `iov_occasion = time(...)` with breakpoints inside the sampling window, \
-                     `iov_occasion = dose` on a multiple-dose design, or supply an \
-                     `iov_column`.",
-                ),
-            ));
-        }
         // Above this many occasions per subject the derivation has almost
         // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
         // runs but the inner kappa dimensionality is n_iov * max_occ per subject.

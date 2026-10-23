@@ -362,6 +362,129 @@ fn single_derived_occasion_is_coded() {
     );
 }
 
+/// Review r1: the occasions a derived `iov_occasion` rule gives are not on the population
+/// the caller passes in, so the AGQ cap must count them after the rule has run. Here the
+/// population carries no labels at all, and `time(1.5, …, 5.5)` cuts the six observations
+/// into six windows: `d = 1 + 6 = 7`, `6^7` nodes. Counted on the unlabelled input it would
+/// be `6^1` and pass. A second population carries one stale column label per record,
+/// which the rule replaces. `fit()` and the helper `ferx check --data` calls agree.
+///
+/// Mutation — count `group_count` on `population` instead of the derived one → both
+/// cells are accepted (or refused later with another code) and the test names the cell.
+#[test]
+fn agq_grid_under_iov_counts_derived_occasions() {
+    let model = iov_model();
+    let six_obs = |labels: Vec<u32>, dose_labels: Vec<u32>| {
+        let mut pop = gaussian_population();
+        for s in &mut pop.subjects {
+            s.obs_times = (1..=6).map(f64::from).collect();
+            s.observations = vec![1.0; 6];
+            s.obs_cmts = vec![1; 6];
+            s.cens = vec![0; 6];
+            s.occasions = labels.clone();
+            s.dose_occasions = dose_labels.clone();
+        }
+        pop
+    };
+    let laplace = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 6,
+        iov_occasion: IovOccasionRule::TimeWindows(vec![1.5, 2.5, 3.5, 4.5, 5.5]),
+        ..FitOptions::default()
+    };
+    for (label, pop) in [
+        ("unlabelled", six_obs(Vec::new(), Vec::new())),
+        ("stale column labels", six_obs(vec![1; 6], vec![1])),
+    ] {
+        // The helper first: a regression here otherwise lets `fit()` start the
+        // 279936-node fit and the test hangs instead of failing.
+        assert!(
+            crate::api::validation::check_agq_grid_iov(&model, &pop, &laplace)
+                .iter()
+                .any(|d| d.code == "E_AGQ_GRID_TOO_LARGE"),
+            "{label}: the ferx check helper misses it"
+        );
+        let err = fit_refusal(&model, &pop, &model.default_params, &laplace);
+        assert_eq!(err.code(), Some("E_AGQ_GRID_TOO_LARGE"), "{label}: {err}");
+        assert!(
+            err.to_string()
+                .starts_with("method = laplace with n_agq = 6 needs a 6^7 = 279936-node"),
+            "{label}: {err}"
+        );
+    }
+    // The control: a rule giving two windows (`d = 3`, `6^3 = 216`) is under the cap.
+    let two = FitOptions {
+        iov_occasion: IovOccasionRule::TimeWindows(vec![3.5]),
+        ..laplace.clone()
+    };
+    assert!(crate::api::validation::check_agq_grid_iov(
+        &model,
+        &six_obs(Vec::new(), Vec::new()),
+        &two
+    )
+    .is_empty());
+}
+
+/// Review r1: `ferx check --data` reports the single-occasion refusal `fit()` raises, with
+/// the same code, block and message, from the model file's own `iov_occasion` rule. A
+/// rule whose breakpoint lies inside the sampling window passes both.
+///
+/// Mutation — drop `check_single_derived_occasion` from `check_model_data_rule_at` → the
+/// check side reports nothing and `fit()` accepts the model, so both halves go red.
+#[test]
+fn ferx_check_reports_a_single_derived_occasion() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d.csv");
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+    for id in 1..=3 {
+        csv.push_str(&format!("{id},0,0,100,1,1\n"));
+        for t in [1, 4, 12] {
+            csv.push_str(&format!("{id},{t},1.0,0,0,1\n"));
+        }
+    }
+    std::fs::write(&data, csv).unwrap();
+    let model_src = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  \
+        theta TVV(20.0, 0.001, 500.0)\n  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  \
+        sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  \
+        V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+        DV ~ proportional(PROP)\n[fit_options]\n  iov_occasion = time(RULE)\n";
+    let check = |rule: &str| {
+        let f = write_model(&model_src.replace("RULE", rule));
+        crate::api::validate_model_file(f.path().to_str().unwrap(), data.to_str())
+    };
+
+    let report = check("100");
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_IOV_SINGLE_OCCASION")
+        .unwrap_or_else(|| panic!("ferx check misses it: {:?}", report.diagnostics));
+    assert!(!report.valid);
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
+
+    let model = iov_model();
+    let opts = FitOptions {
+        iov_occasion: IovOccasionRule::TimeWindows(vec![100.0]),
+        ..FitOptions::default()
+    };
+    let err = fit_refusal(&model, &gaussian_population(), &model.default_params, &opts);
+    assert_eq!(
+        err.to_string(),
+        d.message,
+        "fit() and ferx check say the same"
+    );
+
+    let inside = check("6");
+    assert!(
+        !inside
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_IOV_SINGLE_OCCASION"),
+        "{:?}",
+        inside.diagnostics
+    );
+}
+
 // ── endpoint records ─────────────────────────────────────────────────────────
 
 /// A repeated-event subject whose records go back in time is `E_RTTE_RECORDS` on

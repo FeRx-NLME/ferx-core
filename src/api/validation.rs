@@ -1847,7 +1847,42 @@ pub(crate) fn check_model_data_rule_at(
     // Last, so every more specific data code — `E_NONFINITE_DV`, `E_ENDPOINT_NO_RECORDS`,
     // `E_ENDPOINT_UNROUTED` — still wins `first_error` in `fit()` with its old text (#1491).
     diags.extend(check_scored_observations(population));
+    // After every other data check: `fit()` refused this after all of them, on the
+    // population its derived rule had labelled (#757). Shared since #1788, so `ferx check
+    // --data` reports it too.
+    diags.extend(check_single_derived_occasion(model, population, iov_rule));
     diags
+}
+
+/// `E_IOV_SINGLE_OCCASION` when a derived `iov_occasion` rule (`dose` / `time(...)`) gives
+/// every subject at most one occasion (#757, #1788): the per-occasion κ is then added once
+/// per subject, exactly like an η, so it is confounded with between-subject variability
+/// and unidentifiable. The dataset-column path is guarded by `E_IOV_MISSING_OCC`, which a
+/// derived rule suppresses, so this re-establishes the invariant on the derived labels.
+///
+/// The labels are derived here as `fit()` derives them ([`with_derived_occasions`]), so a
+/// population passed in unlabelled, or with column labels the rule replaces, is counted
+/// as the fit would count it. A model with nested levels is left alone: its groups are
+/// its level cells, and `check_nested_levels` refuses a derived rule on one.
+fn check_single_derived_occasion(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
+    if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
+        return Vec::new();
+    }
+    let derived = with_derived_occasions(model, population, Some(iov_rule));
+    if max_obs_dose_occasions(&derived) > 1 {
+        return Vec::new();
+    }
+    vec![iov_single_occasion(
+        "The `iov_occasion` rule produced only a single occasion for every subject, so the \
+         per-occasion kappa (IOV) cannot be separated from between-subject variability (it \
+         is unidentifiable). Use `iov_occasion = time(...)` with breakpoints inside the \
+         sampling window, `iov_occasion = dose` on a multiple-dose design, or supply an \
+         `iov_column`.",
+    )]
 }
 
 /// A population must carry at least one record the likelihood scores (#1491).
@@ -4442,7 +4477,9 @@ pub(crate) fn check_mixture_options(
 /// `E_AGQ_GRID_TOO_LARGE` under IOV (#1788): the tensor grid is `n_agq^d` with
 /// `d = n_eta + K·n_kappa`, and `K`, the occasion count, is a property of the data, so
 /// [`check_model_options`] — which raises the same code for the η-only grid — cannot see
-/// it. Checked against the worst subject of `population`.
+/// it. Checked against the worst subject of `population` once `options.iov_occasion` has
+/// labelled it, as the fit labels it ([`with_derived_occasions`]): a derived rule's
+/// occasions are not on the population a caller passes in, and replace any column labels.
 ///
 /// `method = laplace` / `focei` at `n_agq = 1` is a single node regardless of `d`, so it
 /// always passes; only `n_agq > 1` can trip this. A later stage can request quadrature
@@ -4464,7 +4501,8 @@ pub(crate) fn check_agq_grid_iov(
     else {
         return Vec::new();
     };
-    let max_occ = population
+    let prepared = with_derived_occasions(model, population, Some(&options.iov_occasion));
+    let max_occ = prepared
         .subjects
         .iter()
         .map(|s| crate::stats::stacked_layout::group_count(s))

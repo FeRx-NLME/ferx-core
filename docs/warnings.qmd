@@ -216,7 +216,7 @@ reports each one it can reach, so the two do not disagree:
 | LTBS on a hand-built model with a proportional or combined error, per-CMT errors or an SDE | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
 | `iiv_on_ruv`: an η also used in `[individual_parameters]`; a non-interaction method | `E_IIV_ON_RUV_SHARED_ETA`; `E_IIV_ON_RUV_METHOD` | yes |
 | the AGQ grid under IOV | `E_AGQ_GRID_TOO_LARGE` | with `--data` |
-| a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | — |
+| a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | with `--data` |
 
 The file entry points add three: no data path and no `[data]` block
 (`E_DATA_PATH_MISSING`); on `run_model_simulate()`, no `[simulation]` block
