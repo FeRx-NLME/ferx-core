@@ -762,6 +762,43 @@ fn profiled_algorithm(options: &FitOptions) -> nlopt::Algorithm {
     }
 }
 
+/// `ftol_rel` of a profiled fit's gradient-based outer optimizer (L-BFGS, SLSQP) when
+/// the user set no `outer_ftol` (#2285).
+///
+/// The unprofiled default, `1e-6`, is relative to the OFV, and on the F2 anchor
+/// (`nonmem_anchor/profile_mbma_fit.ferx`, OFV ≈ 102) it stops L-BFGS on any step under
+/// 1e-4. L-BFGS met it mid-descent: from the start (45, 7.5, 2) the trace's last steps
+/// were 3.1e-4, 2.1e-5, 5.0e-5 and the run stopped `converged: true` 3.9e-4 above
+/// NONMEM's optimum. #2280's start stopped 1.6e-3 above it after a 1.2e-5 step. That
+/// default is set for the unprofiled objective, whose re-solved inner loop carries
+/// ~1e-3 of noise. The profile objective is re-solved to [`OFV_NOISE`] (1e-9 relative),
+/// so a stop it can reach sits much lower. `1e-8` is 10× that floor. Measured from the
+/// seven starts of #2285 (macOS arm64): at 1e-8, 1e-9 and 1e-10 every run lands on
+/// 101.911514 in the same 27–35 evaluations, so below 1e-8 this stop no longer binds
+/// and the run ends on `xtol_rel`. F1 at 1e-10 took one evaluation more than at the
+/// default.
+///
+/// BOBYQA keeps the unprofiled rule: it is derivative-free, and the tight stop would
+/// only spend its budget.
+pub(crate) const PROFILED_GRADIENT_FTOL_REL: f64 = 1e-8;
+
+/// The `ftol_rel` [`optimize_profiled`] sets for `algo`: the user's `outer_ftol` when
+/// set, else [`PROFILED_GRADIENT_FTOL_REL`] for a gradient method and the unprofiled
+/// `resolve_outer_ftol` for BOBYQA.
+pub(crate) fn profiled_ftol(
+    algo: nlopt::Algorithm,
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> f64 {
+    match (options.outer_ftol, algo) {
+        (Some(user), _) => user,
+        (None, nlopt::Algorithm::Bobyqa) => {
+            resolve_outer_ftol(model.has_non_gaussian(), model.is_ode_based(), None)
+        }
+        (None, _) => PROFILED_GRADIENT_FTOL_REL,
+    }
+}
+
 /// The outer loop of a fit with `profile`d blocks: NLopt over the structural packed
 /// coordinates, every evaluation a profile solve. Returns the same `OuterResult` the
 /// unprofiled path does, its `params` carrying the solved levels and the fit's own
@@ -907,14 +944,14 @@ pub(crate) fn optimize_profiled(
         }
         opt.set_maxeval(budget.max(1)).unwrap();
         opt.set_xtol_rel(options.outer_xtol).unwrap();
-        opt.set_ftol_rel(resolve_outer_ftol(
-            model.has_non_gaussian(),
-            model.is_ode_based(),
-            options.outer_ftol,
-        ))
-        .unwrap();
+        opt.set_ftol_rel(profiled_ftol(algo, model, options))
+            .unwrap();
         let mut xs: Vec<f64> = free.iter().map(|&i| x0[i]).collect();
-        match opt.optimize(&mut xs) {
+        let result = opt.optimize(&mut xs);
+        if options.verbose {
+            eprintln!("Profiled outer optimizer finished: {result:?}");
+        }
+        match result {
             Ok((status, _)) => {
                 converged = matches!(
                     status,
