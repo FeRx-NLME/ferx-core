@@ -1591,16 +1591,16 @@ fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
     };
 
     let default = ode_model_at(None);
-    let ov = super::fd_stencil_ode_override(&default, &population, &options)
+    let ov = super::fd_stencil_ode_override(&default, &options)
         .expect("a default-tolerance ODE model is tightened");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
     let plateau = ode_model_at(Some((1e-6, 1e-8)));
-    assert!(super::fd_stencil_ode_override(&plateau, &population, &options).is_none());
+    assert!(super::fd_stencil_ode_override(&plateau, &options).is_none());
     let mixed = ode_model_at(Some((1e-9, 1e-6)));
-    let ov = super::fd_stencil_ode_override(&mixed, &population, &options).expect("abstol");
+    let ov = super::fd_stencil_ode_override(&mixed, &options).expect("abstol");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-9), Some(1e-8)));
     assert!(
-        super::fd_stencil_ode_override(&padded_ode_model(0), &population, &options).is_none(),
+        super::fd_stencil_ode_override(&padded_ode_model(0), &options).is_none(),
         "a linear model solved by matrix exponential carries no integration noise"
     );
 
@@ -1643,4 +1643,64 @@ fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
         at_plateau, at_tight,
         "control: the stencil must read the tolerance at all"
     );
+}
+
+/// #520 review: the override keys on the model *having* an integrator, not on the per-subject
+/// route `OdeToleranceFacts::from_route` predicts. A transit model on a plain bolus population
+/// is reported as never integrating — yet the flip-flop reroute is decided per `(θ, η)` and
+/// can send a subject to the ODE twin at a perturbed stencil point only. Both sides in one
+/// test: `from_route` says `None` for that population, and the override is still armed; a
+/// closed form with no twin gets none. Keying the gate back on `from_route` reddens the
+/// middle assertion.
+#[test]
+fn the_fd_stencil_override_covers_a_transit_twin_the_route_walk_cannot_see() {
+    use crate::estimation::cov_diagnostics::OdeToleranceFacts;
+    use crate::types::{FitOptions, Population};
+    let transit = parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n\
+         theta TVMTT(1.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  omega ETA_CL ~ 0.09\n\
+         sigma PROP_ERR ~ 0.15\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  MTT = TVMTT\n\
+         NTR = TVN\n\
+         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .unwrap();
+    assert!(transit.ode_spec.is_none() && transit.absorption_ode_equivalent.is_some());
+    // A plain bolus subject: the transit closed form serves it, so it keeps off the twin.
+    let closed = parse_model_string(WARFARIN).unwrap();
+    let subject = warfarin_subject(&closed, &[0.2, 10.0, 1.5], &[1.0, 4.0]);
+    let population = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    assert!(
+        OdeToleranceFacts::from_route(&transit, &population).is_none(),
+        "control: the route walk sees no integration on this population"
+    );
+    let options = FitOptions::default();
+    let ov = super::fd_stencil_ode_override(&transit, &options)
+        .expect("a transit model's twin is tightened whatever the route walk says");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
+    assert!(super::fd_stencil_ode_override(&closed, &options).is_none());
+}
+
+/// #520 review: a stencil that could not be tightened says so, naming the reason, what it ran
+/// at instead, and the remedy.
+#[test]
+fn the_stencil_scope_failure_warning_names_the_fallback_and_the_remedy() {
+    let msg = super::stencil_scope_failure_warning("pool could not be built");
+    for part in [
+        "ode_reltol = 1e-6 / ode_abstol = 1e-8",
+        "(pool could not be built)",
+        "ran at the fit's own ODE tolerance",
+        "may be inflated",
+        "#520",
+    ] {
+        assert!(msg.contains(part), "missing {part:?} in {msg}");
+    }
 }

@@ -886,20 +886,22 @@ const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 /// as NONMEM's `$COVARIANCE` re-evaluation also allows: a central second difference needs no
 /// stationarity, only a smooth objective, and the tighter one is the smoother.
 ///
-/// `None` when nothing in the population integrates ([`OdeToleranceFacts::from_route`]), when
-/// the tolerance already sits on the plateau, or when the model is solved exactly by matrix
-/// exponential (#852), whose objective carries no integration noise. Read on the thread the
-/// step runs on, where the fit's override is armed, so the tolerance compared is the one the
-/// fit actually integrates at.
+/// `None` when the model has no integrator at all (a closed form without an absorption ODE
+/// twin), when the tolerance already sits on the plateau, or when the model is solved exactly
+/// by matrix exponential (#852), whose objective carries no integration noise. Read on the
+/// thread the step runs on, where the fit's override is armed, so the tolerance compared is
+/// the one the fit actually integrates at.
+///
+/// Keyed on the twin's *existence*, not on [`OdeToleranceFacts::from_route`]'s per-subject
+/// walk: the flip-flop reroute ([`crate::pk::effective_model_for_eval`]) is decided per
+/// `(θ, η)`, so a transit / inverse-Gaussian subject can reach its twin at a perturbed stencil
+/// point only, which no per-subject prediction sees (#520 review). Arming the override on a
+/// model whose subjects never integrate changes no number; it costs a pool lease.
 fn fd_stencil_ode_override(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     use crate::estimation::cov_diagnostics::{COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL};
-    if !OdeToleranceFacts::from_route(model, population)?.looser_than_cov_plateau() {
-        return None;
-    }
     let spec = model.ode_spec.as_ref().or_else(|| {
         model
             .absorption_ode_equivalent
@@ -907,7 +909,9 @@ fn fd_stencil_ode_override(
             .and_then(|eq| eq.built().ode_spec.as_ref())
     })?;
     let eff = spec.effective_solver_opts();
-    if eff.method == crate::ode::OdeMethod::Linear {
+    if eff.method == crate::ode::OdeMethod::Linear
+        || (eff.reltol <= COV_FD_PLATEAU_RELTOL && eff.abstol <= COV_FD_PLATEAU_ABSTOL)
+    {
         return None;
     }
     Some(crate::ode::solver::OdeSolverOverride {
@@ -919,6 +923,19 @@ fn fd_stencil_ode_override(
         ),
         ..options.ode_solver_override()
     })
+}
+
+/// The warning for a stencil [`fd_stencil_ode_override`] meant to tighten but could not, because
+/// the scope carrying the tighter tolerance could not be built (`reason`).
+fn stencil_scope_failure_warning(reason: &str) -> String {
+    use crate::estimation::cov_diagnostics::{COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL};
+    format!(
+        "Covariance step: the finite-difference stencil could not be run at ode_reltol = \
+         {COV_FD_PLATEAU_RELTOL:.0e} / ode_abstol = {COV_FD_PLATEAU_ABSTOL:.0e} ({reason}) and \
+         ran at the fit's own ODE tolerance instead; it amplifies integration noise by 1/h², so \
+         these standard errors may be inflated. Set ode_reltol / ode_abstol to at most those \
+         values to compute them at the plateau (#520)."
+    )
 }
 
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
@@ -2247,6 +2264,7 @@ pub(crate) fn compute_covariance_for(
     // The tolerances the stencil below integrated at, for the regularization message: the
     // fit's own, or the plateau the stencil was tightened to (#520). Read where it ran.
     let mut stencil_ode: Option<OdeToleranceFacts> = None;
+    let mut stencil_scope_failure: Option<String> = None;
 
     if let Some(scope) = fd_scope.as_ref() {
         // Test-only: every objective the probe and the stencil evaluate, counted across the
@@ -2276,7 +2294,7 @@ pub(crate) fn compute_covariance_for(
         // tolerance left the SEs 2–7× too large with no warning. All of them, or the base is
         // differenced against points from a different objective — so the whole-population
         // base is re-evaluated here rather than taken from `base_ofv`.
-        let tight = fd_stencil_ode_override(model, population, options);
+        let tight = fd_stencil_ode_override(model, options);
         let run_stencil = || {
             let f0_fd = match scope {
                 FdScope::Whole if tight.is_none() => base_ofv,
@@ -2298,10 +2316,15 @@ pub(crate) fn compute_covariance_for(
             (stencil, OdeToleranceFacts::from_route(model, population))
         };
         let (stencil, ode_seen) = match tight {
-            // A scope that cannot be built leaves the stencil at the fit's tolerance, as
-            // before #520 — never without a covariance step.
-            Some(ov) => crate::api::with_fit_scope_ode(options, ov, &run_stencil)
-                .unwrap_or_else(|_| run_stencil()),
+            // A scope that cannot be built (a pool that cannot be leased) leaves the stencil at
+            // the fit's tolerance, as before #520 — never without a covariance step, and never
+            // silently: the warning says the SEs were not computed at the plateau.
+            Some(ov) => {
+                crate::api::with_fit_scope_ode(options, ov, &run_stencil).unwrap_or_else(|e| {
+                    stencil_scope_failure = Some(stencil_scope_failure_warning(&e.to_string()));
+                    run_stencil()
+                })
+            }
             None => run_stencil(),
         };
         stencil_ode = ode_seen;
@@ -2549,7 +2572,7 @@ pub(crate) fn compute_covariance_for(
 
     let cov = embed_free(&cov_free, &free_idx, n);
 
-    let mut cov_warnings: Vec<String> = Vec::new();
+    let mut cov_warnings: Vec<String> = stencil_scope_failure.into_iter().collect();
 
     // #1514: name the salvaged subjects, unconditionally — not only when the eigenvalue floor
     // fired. The route is a property of the numbers on the page, and a user comparing two runs
