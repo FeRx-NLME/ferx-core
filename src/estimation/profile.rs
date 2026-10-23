@@ -46,9 +46,9 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
 use crate::estimation::outer_optimizer::{
-    drive_polish_legs, ebe_guard_rejects, population_gradient, resolve_outer_ftol,
-    runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd,
-    MAX_POLISH_LEGS,
+    drive_polish_legs, ebe_guard_rejects, max_scaled_deviation, population_gradient,
+    resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
+    OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
@@ -797,11 +797,15 @@ pub(crate) const PROFILED_GRADIENT_FTOL_REL: f64 = 1e-8;
 pub(crate) const PROFILED_GRADIENT_XTOL_REL: f64 = 1e-6;
 
 /// A profiled gradient-based fit is converged when a fresh L-BFGS / SLSQP leg from its
-/// best point lowers the OFV by no more than this (#2285). Absolute OFV, like A2's band:
-/// on F2 a leg from a stop short of the optimum gained at least 2.14e-5, and one from
-/// a genuine optimum at most 6.0e-8 (the earlier S1 fixture, |OFV| 3579), so 1e-6 sits
-/// 21× below the one and 17× above the other (#2285's plan, M8/M10). A leg that gains
-/// more is followed by another, up to `MAX_POLISH_LEGS`.
+/// best point lowers the OFV by no more than this (#2285). Absolute OFV, like A2's band.
+/// Measured on F2 over #2285's seven starts and a 27-start grid around them (macOS
+/// arm64, #2285's plan M8/M10): a leg from a stop short of the optimum gained at least
+/// 2.14e-5, and one from a genuine optimum at most 6.0e-8 (the earlier S1 fixture,
+/// |OFV| 3579), so on that grid 1e-6 sat 21× below the one and 17× above the other. It
+/// is not a bound beyond it: on a wider grid `main`'s start (48, 12, 3.2) took a leg
+/// that gained under 1e-6 while 1.03e-5 short, and was reported converged (#2340). A
+/// leg that gains more is followed by another, up to `MAX_POLISH_LEGS`, the cap the
+/// #1782 BOBYQA polish uses.
 pub(crate) const PROFILED_VERIFY_GAIN: f64 = 1e-6;
 
 /// The `xtol_rel` [`optimize_profiled`] sets for `algo`: `outer_xtol` capped at
@@ -813,10 +817,23 @@ pub(crate) fn profiled_xtol(algo: nlopt::Algorithm, options: &FitOptions) -> f64
     }
 }
 
+/// One verification leg as [`optimize_profiled`] ran it, for the tests: the `xtol_rel`
+/// read back from the leg itself, the gain it reported to the loop, and the incumbent's
+/// OFV before and after it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct VerifyLeg {
+    xtol: Option<f64>,
+    gain: f64,
+    before: f64,
+    after: f64,
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Verification legs [`optimize_profiled`] ran on this thread, for the tests.
-    static VERIFY_LEGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The verification legs [`optimize_profiled`] ran on this thread, for the tests.
+    static VERIFY_LEGS: std::cell::RefCell<Vec<VerifyLeg>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 type NloptReturn = Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>;
@@ -826,10 +843,18 @@ type NloptReturn = Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>;
 /// tolerance or success status, and `Failure` / `RoundoffLimited`, which `main`'s L-BFGS
 /// returns at the optimum under tight stops (M5). Not a spent budget or time, not a
 /// cancelled run, not a bad argument, and not BOBYQA (#2336).
+///
+/// `Failure` / `RoundoffLimited` only once the incumbent has `left_init`: L-BFGS also
+/// returns `Failure` when its first step fails, and a leg from that same start gains
+/// nothing, which would report the initial estimates converged. That is the case the
+/// unprofiled path's #751 guard (`failure_is_converged_plateau`) refuses; such a stop
+/// keeps the status verdict, not converged. A tolerance stop needs no such guard: it
+/// was a stop before #2285 too.
 pub(crate) fn profiled_stop_needs_verify(
     algo: nlopt::Algorithm,
     result: &NloptReturn,
     cancelled: bool,
+    left_init: bool,
 ) -> bool {
     !matches!(algo, nlopt::Algorithm::Bobyqa)
         && !cancelled
@@ -838,10 +863,13 @@ pub(crate) fn profiled_stop_needs_verify(
                 status,
                 nlopt::SuccessState::MaxEvalReached | nlopt::SuccessState::MaxTimeReached
             ),
-            Err((fail, _)) => matches!(
-                fail,
-                nlopt::FailState::Failure | nlopt::FailState::RoundoffLimited
-            ),
+            Err((fail, _)) => {
+                left_init
+                    && matches!(
+                        fail,
+                        nlopt::FailState::Failure | nlopt::FailState::RoundoffLimited
+                    )
+            }
         }
 }
 
@@ -870,11 +898,52 @@ pub(crate) fn profiled_converged(
     end: PolishEnd,
     last: &NloptReturn,
     cancelled: bool,
+    left_init: bool,
 ) -> bool {
     match end {
-        PolishEnd::Settled if profiled_stop_needs_verify(algo, last, cancelled) => true,
+        PolishEnd::Settled if profiled_stop_needs_verify(algo, last, cancelled, left_init) => true,
         PolishEnd::Settled | PolishEnd::NotNeeded => status_is_converged(last),
         PolishEnd::LegCapReached { .. } | PolishEnd::BudgetSpent | PolishEnd::Skipped => false,
+    }
+}
+
+/// The warning a profiled fit gets for how its verification ended, or `None` when it is
+/// converged. A function rather than inline `format!`s so each message is tested where
+/// it is written.
+///
+/// A budget that runs out *during* a leg ends the loop `Settled` on `MaxEvalReached`, not
+/// `BudgetSpent` (which `drive_polish_legs` returns only when nothing is left before a
+/// leg), and gets the same advice.
+pub(crate) fn profiled_verdict_warning(
+    end: PolishEnd,
+    last: &NloptReturn,
+    converged: bool,
+) -> Option<String> {
+    let budget = || {
+        "Profiled outer optimizer spent its evaluation budget before its stop was \
+         verified; increase maxiter."
+            .to_string()
+    };
+    match end {
+        PolishEnd::LegCapReached { last_gain } => Some(format!(
+            "Profiled outer optimizer was still improving after {MAX_POLISH_LEGS} \
+             verification legs (the last lowered the objective by {last_gain:.3e}), so \
+             it is not reported as converged; re-run from these estimates."
+        )),
+        PolishEnd::BudgetSpent => Some(budget()),
+        PolishEnd::Settled if matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))) => {
+            Some(budget())
+        }
+        _ if !converged => {
+            let status = match last {
+                Ok((s, _)) => format!("{s:?}"),
+                Err((f, _)) => format!("{f:?}"),
+            };
+            Some(format!(
+                "Profiled outer optimizer stopped without converging ({status})."
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -1049,6 +1118,11 @@ pub(crate) fn optimize_profiled(
             eprintln!("Profiled outer optimizer finished: {first:?}");
         }
         let cancelled = || crate::cancel::is_cancelled(&options.cancel);
+        // Has the incumbent moved off the start? Packed coordinates, unscaled here.
+        let left_init = || {
+            let b = best.lock().unwrap();
+            max_scaled_deviation(&b.x, &x0) >= INIT_ESCAPE_STEP_S
+        };
         // #2285: a gradient method's stop is not evidence of a minimum — `ftol_rel` and
         // `xtol_rel` are tests on one iteration, which L-BFGS meets mid-descent, and
         // `main`'s L-BFGS returns `Failure` at a genuine optimum. So run a fresh leg from
@@ -1058,7 +1132,7 @@ pub(crate) fn optimize_profiled(
         let (result, end) = drive_polish_legs(
             first,
             PROFILED_VERIFY_GAIN,
-            |r| profiled_stop_needs_verify(algo, r, cancelled()),
+            |r| profiled_stop_needs_verify(algo, r, cancelled(), left_init()),
             || budget.saturating_sub(n_evals.load(Ordering::Relaxed) as u32),
             |left| {
                 let (bx, before) = {
@@ -1074,46 +1148,32 @@ pub(crate) fn optimize_profiled(
                 leg.set_ftol_rel(ftol).unwrap();
                 let mut lx: Vec<f64> = free.iter().map(|&i| bx[i]).collect();
                 let r = leg.optimize(&mut lx);
-                #[cfg(test)]
-                VERIFY_LEGS.with(|c| c.set(c.get() + 1));
                 let after = best
                     .lock()
                     .unwrap()
                     .solve
                     .as_ref()
                     .map_or(before, |s| s.ofv);
+                let gain = before - after;
+                #[cfg(test)]
+                VERIFY_LEGS.with(|v| {
+                    v.borrow_mut().push(VerifyLeg {
+                        xtol: leg.get_xtol_rel(),
+                        gain,
+                        before,
+                        after,
+                    })
+                });
                 if options.verbose {
                     eprintln!(
-                        "Profiled verification leg from OFV {before:.9}: {r:?}, gain {:.3e}",
-                        before - after
+                        "Profiled verification leg from OFV {before:.9}: {r:?}, gain {gain:.3e}"
                     );
                 }
-                Some((r, before - after))
+                Some((r, gain))
             },
         );
-        converged = profiled_converged(algo, end, &result, cancelled());
-        match end {
-            PolishEnd::LegCapReached { last_gain } => warnings.push(format!(
-                "Profiled outer optimizer was still improving after {MAX_POLISH_LEGS} \
-                 verification legs (the last lowered the objective by {last_gain:.3e}), so \
-                 it is not reported as converged; re-run from these estimates."
-            )),
-            PolishEnd::BudgetSpent => warnings.push(
-                "Profiled outer optimizer spent its evaluation budget before its stop was \
-                 verified; increase maxiter."
-                    .to_string(),
-            ),
-            _ if !converged => {
-                let status = match &result {
-                    Ok((s, _)) => format!("{s:?}"),
-                    Err((f, _)) => format!("{f:?}"),
-                };
-                warnings.push(format!(
-                    "Profiled outer optimizer stopped without converging ({status})."
-                ));
-            }
-            _ => {}
-        }
+        converged = profiled_converged(algo, end, &result, cancelled(), left_init());
+        warnings.extend(profiled_verdict_warning(end, &result, converged));
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
         // levels are still solved at the initial structural point.
