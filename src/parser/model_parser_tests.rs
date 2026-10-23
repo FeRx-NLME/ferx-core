@@ -24881,6 +24881,40 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         inline,
         "an `if` whose only consumer is the hazard is not part of the PK block"
     );
+    // A later `else if` cannot govern an earlier arm, so its condition is cut with the
+    // hazard-only arm it guards — keeping it made `TT` live through the condition alone.
+    // The straddle: the same `TT` condition *before* the PK arm does govern it, as does an
+    // `else` that keeps a PK statement, which needs every condition ahead of it.
+    let ladder = |c1: &str, c2: &str, els: &str| {
+        format!(
+            "TT = TIME\n  K = 1.0\n  G = 1.0\n  if ({c1}) {{\n    K = 2.0\n  }} else if \
+             ({c2}) {{\n    G = 2.0\n  }}{els}"
+        )
+    };
+    const HAZ_G: &str = "H0 * G * exp(BETA * (central / V))";
+    assert_eq!(
+        joint_flags(" * K", &ladder("CL > 5.0", "TT > 5.0", ""), HAZ_G),
+        (false, true, true, false, false),
+        "a trailing `else if` condition read only on the way to a hazard-only arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * G",
+            &ladder("TT > 5.0", "CL > 5.0", ""),
+            "H0 * K * exp(BETA * (central / V))"
+        ),
+        (false, true, true, true, true),
+        "an earlier condition governs a later PK arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * K",
+            &ladder("CL > 5.0", "TT > 5.0", " else {\n    K = 3.0\n  }"),
+            HAZ_G
+        ),
+        (false, true, true, true, true),
+        "an `else` keeping a PK statement depends on every condition before it"
+    );
 }
 
 /// The narrowing is scoped to joint models by construction: with no injected

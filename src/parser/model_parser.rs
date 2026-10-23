@@ -27895,8 +27895,10 @@ fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
 /// target is live if *any* retained statement reads it, wherever the read sits —
 /// which can only keep more than strictly needed, never less.
 ///
-/// An `if` survives when any arm keeps a statement, with its conditions intact,
-/// so a condition guarding a retained derivative still counts as a read. An
+/// An `if` survives when any arm keeps a statement, with the conditions up to and
+/// including the last such arm (all of them when the `else` keeps one), so a
+/// condition guarding a retained statement still counts as a read and one that
+/// only follows it does not. An
 /// unresolved `Assign` / `DiffEq` has no slot to test and is always kept, and
 /// `DiffEqIdx` / `AssignIdx` are matched alongside the bytecode forms: silently
 /// dropping a shape this does not model would narrow the flag, not widen it.
@@ -27916,14 +27918,28 @@ fn pk_block_statements(stmts: &[Statement], chz_state_slots: &[usize]) -> Vec<St
                     branches,
                     else_body,
                 } => {
-                    let branches: Vec<(Condition, Vec<Statement>)> = branches
+                    let mut branches: Vec<(Condition, Vec<Statement>)> = branches
                         .iter()
                         .map(|(c, b)| (c.clone(), cut(b, chz, live)))
                         .collect();
-                    let else_body = else_body.as_deref().map(|b| cut(b, chz, live));
-                    let kept = branches.iter().any(|(_, b)| !b.is_empty())
-                        || else_body.as_ref().is_some_and(|b| !b.is_empty());
-                    kept.then_some(Statement::If {
+                    let else_body = else_body
+                        .as_deref()
+                        .map(|b| cut(b, chz, live))
+                        .filter(|b| !b.is_empty());
+                    // Arm `k` runs only after conditions `0..k` failed, so a retained
+                    // arm depends on its own condition and every earlier one — never
+                    // on a later one. Keep the condition prefix through the last live
+                    // arm (all of them when the `else` survives), as
+                    // `chz_dependency_slice` does: a trailing `else if (TT > 5)` whose
+                    // arm fed only the hazard must not make `TT` live.
+                    if else_body.is_none() {
+                        let live_arms = branches
+                            .iter()
+                            .rposition(|(_, b)| !b.is_empty())
+                            .map_or(0, |k| k + 1);
+                        branches.truncate(live_arms);
+                    }
+                    (!branches.is_empty()).then_some(Statement::If {
                         branches,
                         else_body,
                     })
