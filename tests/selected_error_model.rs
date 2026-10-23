@@ -75,6 +75,9 @@ fn free_total_pop(n_subj: usize) -> Population {
                 .iter()
                 .map(|&f| HashMap::from([("FREE".to_string(), f)]))
                 .collect();
+            // The first record's value, as the reader fills it: a covariate is
+            // present only when the subject-static map carries it (#2181).
+            s.covariates = HashMap::from([("FREE".to_string(), free_flags[0])]);
             s
         })
         .collect();
