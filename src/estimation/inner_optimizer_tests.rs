@@ -872,10 +872,10 @@ fn legacy_step(
     f0: f64,
 ) -> (f64, f64, Option<Vec<f64>>) {
     match exact_step_verified_by_gradient(obj, grad, x, d, f0, g, None, false) {
-        Some((fc, gc)) => (1.0, fc, Some(gc)),
-        None => {
+        Verdict::Verified(fc, gc) => (1.0, fc, Some(gc)),
+        Verdict::Rejected(g_full) => {
             let (alpha, f) = legacy_line_search(obj, x, d, g, n, f0);
-            (alpha, f, None)
+            (alpha, f, if alpha == 1.0 { g_full } else { None })
         }
     }
 }
@@ -5030,42 +5030,201 @@ fn a_step_below_the_objective_resolution_is_verified_by_the_gradient() {
             gain < 1e-10 && gain > 0.0,
             "fixture premise: gain {gain:.3e}"
         );
-        let mut x = start.clone();
-        let points = std::cell::RefCell::new(Vec::new());
-        let logged = |x: &[f64]| {
-            points.borrow_mut().push([x[0].to_bits(), x[1].to_bits()]);
-            grad(x)
-        };
-        let ok = dense_bfgs_core(
-            &obj,
-            &logged,
-            &mut x,
-            2,
-            200,
-            tol,
-            None,
-            Some(&seed),
-            None,
-            &never,
-            false,
-        );
-        if !(ok && gn(&x) < tol) {
-            stuck.push((k, gn(&x)));
+        for driver in ["dense", "lbfgs"] {
+            let mut x = start.clone();
+            let points = std::cell::RefCell::new(Vec::new());
+            let logged = |x: &[f64]| {
+                points.borrow_mut().push([x[0].to_bits(), x[1].to_bits()]);
+                grad(x)
+            };
+            let ok = if driver == "dense" {
+                dense_bfgs_core(
+                    &obj,
+                    &logged,
+                    &mut x,
+                    2,
+                    200,
+                    tol,
+                    None,
+                    Some(&seed),
+                    None,
+                    &never,
+                    false,
+                )
+            } else {
+                lbfgs_core(
+                    &obj, &logged, &mut x, 2, 200, tol, None, None, &never, false,
+                )
+            };
+            // Convergence is asserted for the seeded dense driver, whose first step is Newton's.
+            // Unseeded L-BFGS starts from the identity metric, whose first steps gain less than
+            // this fixture's (deliberately large) evaluation error, and from start 2 it stops
+            // unverified at ‖g‖ = 2.3e-4 (measured): a property of the fixture's noise, not of
+            // the rule. It is here for the reuse below.
+            if driver == "dense" && !(ok && gn(&x) < tol) {
+                stuck.push((k, gn(&x)));
+            }
+            // A gradient the driver already took at a point is reused there, whether a verified
+            // step took it or a rejected verification did and the line search then accepted the
+            // full step: no point has its gradient evaluated twice. Before the rejected case was
+            // reused, L-BFGS evaluated 6 gradients at 5 points from start 0, 9 at 7 from start 1.
+            let mut seen = points.borrow().clone();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                points.borrow().len(),
+                "{driver}, start {k}: a gradient was evaluated twice at one point"
+            );
         }
-        // The verified step's gradient at its end point is the driver's next gradient: no point
-        // has its gradient evaluated twice.
-        let mut seen = points.borrow().clone();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(
-            seen.len(),
-            points.borrow().len(),
-            "start {k}: a gradient was evaluated twice at one point"
-        );
     }
     assert!(
         stuck.is_empty(),
-        "starts that did not converge (index, final ‖g‖): {stuck:?}"
+        "dense: starts that did not converge (index, final ‖g‖): {stuck:?}"
+    );
+}
+
+/// A step that lands on an ODE objective (`stall_at` turns true there, a transit/IG subject
+/// crossing onto its ODE twin) has its curvature pair judged as an ODE pair: the latch is updated
+/// at the accepted point before the pair test (#2280 review, finding 6). Fixture: the
+/// `bfgs_started_next_to_the_mode_learns_its_curvature` quadratic, where every pair's `sᵀy` is
+/// ~1e-13, so the relative arm alone decides whether it updates the metric. Run A is an ODE
+/// objective everywhere; run B everywhere but the start point. From the first accepted point on
+/// both are ODE objectives, so their pairs and paths must agree bit for bit. With the latch read
+/// only before each step, B's first pair was judged exact, taken by the relative arm, and B's
+/// path left A's.
+#[test]
+fn a_step_onto_an_ode_objective_has_its_pair_judged_as_ode() {
+    let lambda = [1e6, 1.0];
+    let tol = 1e-5;
+    let obj = |x: &[f64]| 0.5 * x.iter().zip(&lambda).map(|(v, l)| l * v * v).sum::<f64>();
+    let grad = |x: &[f64]| {
+        x.iter()
+            .zip(&lambda)
+            .map(|(v, l)| l * v)
+            .collect::<Vec<_>>()
+    };
+    let start: Vec<f64> = lambda
+        .iter()
+        .map(|l| 25.0 * tol / 2f64.sqrt() / l)
+        .collect();
+    let start_bits: Vec<u64> = start.iter().map(|v| v.to_bits()).collect();
+    for (label, lbfgs) in [("dense", false), ("lbfgs", true)] {
+        let run = |stall: &dyn Fn(&[f64]) -> bool| {
+            let trials = std::cell::RefCell::new(Vec::new());
+            let logged = |x: &[f64]| {
+                trials
+                    .borrow_mut()
+                    .push(x.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                obj(x)
+            };
+            let mut x = start.clone();
+            if lbfgs {
+                lbfgs_core(&logged, &grad, &mut x, 2, 4, tol, None, None, stall, false);
+            } else {
+                dense_bfgs_core(
+                    &logged, &grad, &mut x, 2, 4, tol, None, None, None, stall, false,
+                );
+            }
+            trials.into_inner()
+        };
+        let a = run(&|_| true);
+        let b = run(&|x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>() != start_bits);
+        assert!(
+            a.len() > 3,
+            "{label}: fixture premise, the search takes several steps"
+        );
+        assert_eq!(
+            a, b,
+            "{label}: the pair of a step onto an ODE objective was judged as an exact one"
+        );
+    }
+}
+
+/// Every arm of [`choose_step`], the one step rule of both BFGS drivers and the dense
+/// driver's steepest-descent reset (#2280 review), on one 1-D fixture:
+/// `f = 10 + ½·256·x² + e(x)` from `x₀ = 2⁻²³`, where `e` adds 5e-11 (inside the resolution
+/// `1e-11·(1 + |f|)`) at the end point of the step under test. The full Newton step `d = −x₀`
+/// lands on `0`, where ∇ = 0; the short step `d = −x₀/4` lands on `¾x₀`, where ∇ falls by a
+/// quarter only.
+///
+/// | objective | gradient at the end point | arm |
+/// |---|---|---|
+/// | exact | 0 | gradient-verified step, its gradient reused |
+/// | ODE at its noise floor (not improving) | 0 | noise-floor verified step, its gradient reused |
+/// | ODE, gradient still improving | 0 | ordinary line search, shorter step, nothing reused |
+/// | ODE at its noise floor | ¾ of the start's | converged at the floor |
+/// | exact, ascent direction | — | failed |
+#[test]
+fn choose_step_takes_each_arm() {
+    let lambda = 256.0;
+    let x0 = 2f64.powi(-23);
+    let g0 = [lambda * x0];
+    let f0 = 10.0 + 0.5 * lambda * x0 * x0;
+    let grad = |x: &[f64]| vec![lambda * x[0]];
+    let run = |end: f64, d: f64, stall: bool, improving: bool| {
+        let obj = move |x: &[f64]| {
+            10.0 + 0.5 * lambda * x[0] * x[0] + if x[0] == end { 5e-11 } else { 0.0 }
+        };
+        let mut buf = [0.0];
+        choose_step(
+            &obj,
+            &grad,
+            &[x0],
+            &[d],
+            &g0,
+            f0,
+            None,
+            stall,
+            improving,
+            &mut buf,
+            false,
+        )
+    };
+    let newton = -x0;
+    match run(0.0, newton, false, false) {
+        StepChoice::Step { alpha, g_new, .. } => {
+            assert_eq!(alpha, 1.0, "exact: the verified full step");
+            assert_eq!(
+                g_new,
+                Some(vec![0.0]),
+                "exact: the end point's gradient is handed back"
+            );
+        }
+        _ => panic!("exact: the verified step must be taken"),
+    }
+    match run(0.0, newton, true, false) {
+        StepChoice::Step { alpha, g_new, .. } => {
+            assert_eq!(alpha, 1.0, "ODE floor: the verified full step");
+            assert_eq!(
+                g_new,
+                Some(vec![0.0]),
+                "ODE floor: the end point's gradient is handed back"
+            );
+        }
+        _ => panic!("ODE floor: the verified step must be taken"),
+    }
+    match run(0.0, newton, true, true) {
+        StepChoice::Step { alpha, g_new, .. } => {
+            assert!(
+                alpha > 0.0 && alpha < 1.0,
+                "ODE, improving: a shorter step, α = {alpha}"
+            );
+            assert_eq!(g_new, None, "ODE, improving: no gradient to reuse");
+        }
+        _ => panic!("ODE, improving: the line search must take a step"),
+    }
+    let short = -0.25 * x0;
+    assert!(
+        matches!(
+            run(0.75 * x0, short, true, false),
+            StepChoice::ConvergedAtFloor
+        ),
+        "ODE floor, ∇ not halved: converged at the floor"
+    );
+    assert!(
+        matches!(run(0.0, x0, false, false), StepChoice::Failed),
+        "an ascent direction: failed"
     );
 }
 
