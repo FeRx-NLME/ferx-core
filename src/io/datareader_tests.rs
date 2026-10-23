@@ -5080,6 +5080,8 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
 #[test]
 fn endpoint_rows_keep_their_covariate_snapshot() {
     let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    // Only the `survival`-gated arm below pushes to it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut arms: Vec<(&str, ObsRouting, &str)> = vec![(
         "discrete",
         ObsRouting {
