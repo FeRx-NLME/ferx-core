@@ -66,6 +66,7 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
             })
             .collect(),
         covariate_names: Vec::new(),

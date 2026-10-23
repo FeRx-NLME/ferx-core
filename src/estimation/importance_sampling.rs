@@ -2486,6 +2486,7 @@ mod tests {
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         };
         let ipreds = vec![9.0, 7.0, 99.0];
         let r_diag = vec![4.0, 2.0, 1.0];
@@ -2821,6 +2822,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
         }
     }
 
@@ -3638,6 +3640,7 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         }
     }
 

@@ -126,6 +126,7 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: FREMTYPE.to_vec(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     }
 }
 

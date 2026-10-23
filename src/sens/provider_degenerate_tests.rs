@@ -87,6 +87,7 @@ fn subject(first_rate: f64) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     }
 }
 

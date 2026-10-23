@@ -2575,6 +2575,9 @@ fn parse_subject(
     // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
     // (Track D) endpoints share one stream on the default build.
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
+    // only trace those rows leave of their covariates (#1854; see the field's doc).
+    let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
     // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
     //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
@@ -3265,6 +3268,9 @@ fn parse_subject(
                         continue;
                     }
                     let entry_time = raw_entry;
+                    if any_tv {
+                        endpoint_covariates.push(locf_state.clone());
+                    }
                     // DV must be an integer code (0/1/2).  Reject fractional values
                     // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
                     // misclassifying a censored observation.
@@ -3353,6 +3359,9 @@ fn parse_subject(
                 }
                 if skip_missing_dv {
                     continue;
+                }
+                if any_tv {
+                    endpoint_covariates.push(locf_state.clone());
                 }
                 // Design-point row under `KeepAsDesign`: there is no user DV, so
                 // write the endpoint's registered placeholder code (its first
@@ -3716,6 +3725,7 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
+            endpoint_covariates,
         },
         occ_parse_failures,
         missing_dv_rows,

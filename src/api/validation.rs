@@ -4589,6 +4589,7 @@ pub(crate) fn check_survival_tv_covariates(
             #[cfg(feature = "markov")]
             if let EndpointLikelihood::Ctmm {
                 generator_covariates,
+                generator_states,
                 ..
             } = endpoint
             {
@@ -4608,6 +4609,51 @@ pub(crate) fn check_survival_tv_covariates(
                         subject.id
                     ),
                     );
+                }
+                // A drug-driven generator also reads the `[odes]` solve, which runs under
+                // the same baseline snapshot: a time-varying covariate on the disposition
+                // it integrates (CL, V, …) is frozen too, although no intensity names it
+                // (#1854). Time-homogeneous generators never solve the ODE.
+                if !generator_states.is_empty() {
+                    match ctmm_tv_covariate_on_disposition(model, generator_states, &tv) {
+                        Ok(None) => {}
+                        Ok(Some((name, param, site))) => {
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                    "[markov_model] on CMT={cmt}: the drug-driven \
+                                 (time-inhomogeneous) CTMM generator reads model states solved \
+                                 with the individual parameters at their baseline covariate \
+                                 values, but `{param}` reads covariate `{name}`, which is \
+                                 time-varying for subject `{}`, and {site} it. Time-varying \
+                                 covariates on the disposition a state-driven transition \
+                                 intensity reads are not yet supported (#1854): the Gaussian \
+                                 predictions evaluate `[individual_parameters]` at every record \
+                                 while the CTMM pass keeps the baseline value. Hold `{name}` \
+                                 constant within each subject for now.",
+                                    subject.id
+                                ),
+                            );
+                        }
+                        Err(()) => {
+                            let name = &tv[0];
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                "[markov_model] on CMT={cmt}: covariate `{name}` is time-varying \
+                                 for subject `{}`, and this model's drug-driven \
+                                 (time-inhomogeneous) CTMM generator reads an [odes] solve run \
+                                 at the baseline covariate values, but it has no compiled \
+                                 `[odes]` / `[individual_parameters]` program, so whether the \
+                                 covariate reaches that solve cannot be determined (#1854). \
+                                 Build the model through `parse_model_string` / \
+                                 `parse_model_file`, or hold the covariate constant within each \
+                                 subject.",
+                                subject.id
+                            ),
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -4923,29 +4969,8 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
         return None;
     }
     for (cmt, states) in ctmms {
-        // What the generator's states depend on: the union of each one's backward slice.
-        let mut slice: Vec<bool> = Vec::new();
-        for s in states {
-            let one = rhs.chz_dependency_slice(s);
-            if slice.len() < one.len() {
-                slice.resize(one.len(), false);
-            }
-            for (acc, x) in slice.iter_mut().zip(one) {
-                *acc |= x;
-            }
-        }
-        for (i, name) in model.indiv_param_names.iter().enumerate() {
-            if !reads_time.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
-                continue;
-            }
-            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
-            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
-            let site = match (in_rhs, in_init) {
-                (true, true) => "the [odes] RHS and an init(...) seed read",
-                (true, false) => "the [odes] RHS reads",
-                (false, true) => "an [odes] init(...) seed reads",
-                (false, false) => continue,
-            };
+        let slice = ctmm_generator_slice(rhs, &states);
+        if let Some((name, site)) = first_param_reaching_slice(model, rhs, &reads_time, &slice) {
             return Some(format!(
                 "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) CTMM \
                  generator reads model states solved with the individual parameters frozen at \
@@ -4958,6 +4983,96 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
         }
     }
     None
+}
+
+/// What a drug-driven CTMM generator's ODE states depend on: the union of
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every state
+/// it reads. Shared by the `TIME` (#1918) and covariate (#1854) freezes.
+#[cfg(feature = "markov")]
+fn ctmm_generator_slice(
+    rhs: &crate::parser::model_parser::OdeRhsProgram,
+    states: &[usize],
+) -> Vec<bool> {
+    let mut slice: Vec<bool> = Vec::new();
+    for &s in states {
+        let one = rhs.chz_dependency_slice(s);
+        if slice.len() < one.len() {
+            slice.resize(one.len(), false);
+        }
+        for (acc, x) in slice.iter_mut().zip(one) {
+            *acc |= x;
+        }
+    }
+    slice
+}
+
+/// The first individual parameter (declaration order) flagged in `mask` that the frozen
+/// `[odes]` solve reads somewhere `slice` depends on, with where it reads it. A parameter
+/// the compiled block does not carry, or one that reaches only a dose-record quantity
+/// (#1575), is skipped — neither is frozen by the snapshot.
+#[cfg(feature = "markov")]
+fn first_param_reaching_slice<'m>(
+    model: &'m CompiledModel,
+    rhs: &crate::parser::model_parser::OdeRhsProgram,
+    mask: &[bool],
+    slice: &[bool],
+) -> Option<(&'m str, &'static str)> {
+    for (i, name) in model.indiv_param_names.iter().enumerate() {
+        if !mask.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
+            continue;
+        }
+        let in_rhs = rhs.indiv_param_reaches_chz(i, slice);
+        let in_init = rhs.init_reads_indiv_param_reaching_chz(i, slice);
+        let site = match (in_rhs, in_init) {
+            (true, true) => "the [odes] RHS and an init(...) seed read",
+            (true, false) => "the [odes] RHS reads",
+            (false, true) => "an [odes] init(...) seed reads",
+            (false, false) => continue,
+        };
+        return Some((name, site));
+    }
+    None
+}
+
+/// The covariate half of the CTMM arm of [`check_survival_tv_covariates`] (#1854): on a
+/// drug-driven generator, the first time-varying covariate (sorted) that reaches an
+/// individual parameter the frozen `[odes]` solve feeds into the generator's states,
+/// as `(covariate, parameter, site)`.
+///
+/// `markov::endpoint`'s inhomogeneous scorer integrates under one `$PK` snapshot taken at
+/// the **baseline** covariates, so a time-varying covariate on `CL` or `V` — not named by
+/// any intensity, and so invisible to `generator_covariates` — was silently read at its
+/// baseline value while the Gaussian walk read it per record. Dose-record quantities
+/// (`KA`, `F`, `ALAG`, …) are read at their own dose record since #1575 and are not
+/// refused; neither is a covariate on a parameter the generator's states never see.
+///
+/// `Err(())` when the compiled programs this needs are missing (a hand-assembled
+/// `CompiledModel`): the caller fails closed.
+#[cfg(feature = "markov")]
+fn ctmm_tv_covariate_on_disposition<'m>(
+    model: &'m CompiledModel,
+    generator_states: &[(String, usize)],
+    tv: &[String],
+) -> Result<Option<(String, &'m str, &'static str)>, ()> {
+    let rhs = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .ok_or(())?;
+    let program = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .ok_or(())?;
+    let states: Vec<usize> = generator_states.iter().map(|&(_, idx)| idx).collect();
+    let slice = ctmm_generator_slice(rhs, &states);
+    for cov in tv {
+        let mask = program.params_reading_covariates(&[cov.as_str()]);
+        if let Some((param, site)) = first_param_reaching_slice(model, rhs, &mask, &slice) {
+            return Ok(Some((cov.clone(), param, site)));
+        }
+    }
+    Ok(None)
 }
 
 /// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`

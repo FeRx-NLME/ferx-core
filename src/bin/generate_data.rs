@@ -115,6 +115,7 @@ fn simulate_subjects(
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
             }
         })
         .collect();
@@ -606,6 +607,7 @@ fn generate_two_cpt_oral_cov() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         })
         .collect();
     let pop = Population {

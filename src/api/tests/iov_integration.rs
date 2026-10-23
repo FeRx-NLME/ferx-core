@@ -146,6 +146,7 @@ fn make_iov_population() -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         })
         .collect();
     Population {
@@ -1455,6 +1456,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -1541,6 +1543,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -1690,6 +1693,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -1794,6 +1798,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -1887,6 +1892,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -1988,6 +1994,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         });
     }
     let population = Population {
@@ -2092,6 +2099,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -2456,6 +2464,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2704,6 +2713,7 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 reset_occasions: reset_label.into_iter().collect(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
             }
         })
         .collect();

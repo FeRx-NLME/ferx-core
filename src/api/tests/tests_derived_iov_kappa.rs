@@ -135,6 +135,7 @@ fn two_occasion_subject() -> Subject {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     }
 }
 
@@ -340,6 +341,7 @@ fn tad_uses_per_dose_occasion_lag() {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -445,6 +447,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -505,6 +508,7 @@ fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     Population {
         subjects: vec![subject],
@@ -876,6 +880,7 @@ fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject 
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     }
 }
 
@@ -1050,6 +1055,7 @@ fn ss_dose_with_analytical_init_warns() {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -1119,6 +1125,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -1184,6 +1191,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -1267,6 +1275,7 @@ fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
         reset_occasions: Vec::new(),
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
     }
 }
 

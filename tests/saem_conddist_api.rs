@@ -62,6 +62,7 @@ fn template_population(n: usize) -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
         })
         .collect();
 
