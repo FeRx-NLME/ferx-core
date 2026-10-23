@@ -247,6 +247,8 @@ fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_recor
 
 // Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |PRED − NONMEM| 2.79e-9
 // (evid2_clock; 4.7e-11 on tied_evid2_advan1, 0 on tied_evid2), so 36× headroom. The `.tab`
-// prints 11 significant figures, about 1e-9 at these magnitudes. Each regression the anchors
-// exist for moves a PRED by 2.5 or more.
+// prints 11 significant figures, about 1e-9 at these magnitudes. The #1909 anchors print 17
+// and stay under 1.1e-14 (Linux x86_64 at 5998edf2; 3.2e-14 on addl_dt, macOS arm64). The
+// smallest regression they catch moves a PRED by 8.3e-2: the governing record taken strictly
+// after the dose, on addl_dt.
 const PRED_TOL: f64 = 1e-7;

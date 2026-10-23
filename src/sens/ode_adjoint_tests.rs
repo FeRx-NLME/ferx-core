@@ -1006,9 +1006,11 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
 fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     // (ODE, IOV, time-varying X, bound): one row per seeder that copies the lag — the
     // closed-form walk, `seed_tvcov_snapshots`, and both branches of `seed_iov_events`.
-    // Measured vs reconverged FD (Richardson, EBE re-solved per point) 6.5e-7, 3.3e-9,
-    // 4.3e-8 and 5.2e-8 (macOS arm64); 5× headroom. Without the copy the closed-form
-    // walk's gap is 3.0.
+    // Measured vs reconverged FD (Richardson, EBE re-solved per point) at 5998edf2 on
+    // Linux x86_64: 9.0e-8, 3.3e-9, 4.3e-8 and 5.2e-8. macOS arm64 agrees on the three ODE
+    // rows and gives 6.5e-7 on the closed-form walk. Each bound is 5×
+    // the larger of the two, so 37× the Linux value on the first row. Without the copy the
+    // closed-form walk's gap is 3.0.
     let cases = [
         (false, false, true, 3.3e-6),
         (true, false, true, 1.7e-8),
