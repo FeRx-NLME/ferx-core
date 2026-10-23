@@ -157,15 +157,7 @@ fn d2_a_profiled_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
     ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn a2_a_profiled_fit_reaches_nonmems_optimum() {
-    let text =
-        std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma.ext")).unwrap();
-    let obj: f64 = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("-1000000000"))
-        .and_then(|l| l.split_whitespace().last())
-        .unwrap()
-        .parse()
-        .unwrap();
+    let obj = a2_nonmem_ofv();
     let p = prep(
         "nonmem_anchor/profile_mbma_fit.ferx",
         "nonmem_anchor/profile_mbma.csv",
@@ -179,6 +171,64 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     );
     assert!(f.converged && f.ofv.is_finite());
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
+}
+
+/// NONMEM's minimum on the F2 anchor, from the `.ext` final row.
+fn a2_nonmem_ofv() -> f64 {
+    let text =
+        std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma.ext")).unwrap();
+    text.lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// #2285: A2 from starts near the file's own, where a fit that says `converged: true`
+/// must be on NONMEM's optimum. Before #2285 the profiled L-BFGS stopped on the
+/// unprofiled `ftol_rel = 1e-6` (≈ 1e-4 absolute at this OFV) while still descending:
+/// (45, 7.5, 2) reported `converged: true` 3.88e-4 above the optimum on `main`, and
+/// (45, 8, 2.2) 1.49e-4 above it on #2280's inner solver. Those are the two starts here;
+/// the other five of the issue's seven landed either way, and each fit costs as much
+/// as A2. The issue would accept `converged: false` here; this asks for the optimum,
+/// which every one of the seven now reaches. Realised on macOS arm64 at #2285's head:
+/// Δ 3.5e-8 (29 evaluations) and 3.8e-8 (31), against 3.7e-8 from the file's own start.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a2_a_nearby_start_reaches_nonmems_optimum() {
+    let obj = a2_nonmem_ofv();
+    let p = prep(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        None,
+    );
+    assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
+    for start in [[45.0, 7.5, 2.0], [45.0, 8.0, 2.2]] {
+        let mut params = p.init_params.clone();
+        params.theta[..3].copy_from_slice(&start);
+        let (f, t) = fit(&p, &params, false);
+        eprintln!(
+            "A2 from {start:?}: ferx {:.9} (Δ {:.3e}), converged {}, {} evals, {t:.1}s",
+            f.ofv,
+            f.ofv - obj,
+            f.converged,
+            f.n_iterations
+        );
+        assert!(
+            f.converged && f.ofv.is_finite(),
+            "{start:?}: {:?}",
+            f.warnings
+        );
+        assert!(
+            (f.ofv - obj).abs() < A2_FIT_OFV,
+            "{start:?}: converged at {} vs NONMEM {obj}",
+            f.ofv
+        );
+    }
 }
 
 /// Realised 2.4e-8 on Linux aarch64 (24 evaluations; 1.5e-8 macOS arm64), from the
