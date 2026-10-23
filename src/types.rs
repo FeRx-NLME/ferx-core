@@ -5621,6 +5621,41 @@ impl CompiledModel {
         }
     }
 
+    /// The mu-reference individual parameter `indiv_pos` **ends up with**, as
+    /// `(eta_name, theta_name)`: its last write is a top-level assignment of a
+    /// mu-referenced form, or an η-free rewrite of its own previous value
+    /// (`CL = CL * (WT/70)^0.75`). `None` when the parameter reads no η, or when a
+    /// later independent or `if`-wrapped assignment supersedes the mu-referenced one.
+    ///
+    /// The association [`mu_refs`](Self::mu_refs) cannot give — it is keyed by η
+    /// and keeps whatever assignment last used each one (#1930).
+    ///
+    /// A hand-built model has no parsed statements to analyse, so for it this falls
+    /// back to the η-name rule — the `mu_refs` entry named exactly the parameter or
+    /// ending in `_<PARAM>`, case-insensitively — and answers only when **exactly
+    /// one** η qualifies. Two qualifying names give `None` rather than whichever a
+    /// `HashMap` yields first, so the answer never depends on iteration order.
+    pub(crate) fn mu_ref_owner(&self, indiv_pos: usize) -> Option<(&str, &str)> {
+        let name = self.indiv_param_names.get(indiv_pos)?;
+        if let Some(owners) = &self.indiv_param_partials.mu_ref_owners {
+            return owners
+                .get(name)?
+                .as_ref()
+                .map(|(e, t)| (e.as_str(), t.as_str()));
+        }
+        let upper = name.to_ascii_uppercase();
+        let suffix = format!("_{upper}");
+        let mut hits = self.mu_refs.iter().filter(|(eta, _)| {
+            let u = eta.to_ascii_uppercase();
+            u == upper || u.ends_with(&suffix)
+        });
+        let (eta, mu_ref) = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        Some((eta.as_str(), mu_ref.theta_name.as_str()))
+    }
+
     /// The [`indiv_param_names`](Self::indiv_param_names) index whose **own** PK slot
     /// is `pk_slot`, or `None` when no parameter owns that slot.
     ///

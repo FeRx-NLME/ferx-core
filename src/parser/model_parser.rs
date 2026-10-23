@@ -590,12 +590,66 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
 /// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
 /// entries because the structured name doesn't appear in `theta_names`;
 /// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
+///
+/// Test-only since #1930: the parser calls [`detect_mu_refs_with_owners`], which
+/// returns this map alongside the per-parameter owner record.
+#[cfg(test)]
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
+    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs).0
+}
+
+/// [`detect_mu_refs`], plus which mu-reference each assigned name **ends up
+/// with**: `owners[name]` is `Some((eta_name, theta_name))` when the *last*
+/// write to `name` is a top-level assignment classified as a mu-reference — for
+/// a self-dependent rewrite (`CL = CL * (WT/70)^0.75`), classified with the
+/// name's previous value substituted in — and `None` when the last write is
+/// anything else: an independent overwrite, a rewrite that no longer has a single
+/// θ anchor and `exp(η)`, or an assignment anywhere inside an `if`, whose value is
+/// conditional.
+///
+/// `mu_refs` cannot answer this: it is keyed by η, so it says nothing about
+/// which parameter an η's θ belongs to, keeps only the last assignment that
+/// used an η, and keeps an η a later reassignment has superseded
+/// (`CL = TVOLD * exp(ETA_OLD)` then `CL = TVCL * exp(IIV_CL)` leaves
+/// `ETA_OLD -> TVOLD` in it). Neither can `eta_map`, which keeps the *first* η
+/// any assignment to a name reads. The owner is what NCA start values route
+/// through (#1930).
+fn detect_mu_refs_with_owners(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> (
+    HashMap<String, MuRef>,
+    HashMap<String, Option<(String, String)>>,
+) {
+    fn assigned_in(stmts: &[Statement], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(n, _) => out.push(n.clone()),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        assigned_in(body, out);
+                    }
+                    if let Some(eb) = else_body {
+                        assigned_in(eb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut owners: HashMap<String, Option<(String, String)>> = HashMap::new();
+    let mut last_value: HashMap<&str, Expression> = HashMap::new();
+    let mut eta_carrying: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
     // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
@@ -618,13 +672,109 @@ fn detect_mu_refs(
                 let inlined = scope.view(at, raw_expr);
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
+            // The value this line gives `name`, with every earlier definition the
+            // scope can inline resolved — and, for a self-dependent rewrite, the
+            // name's own previous value substituted in. Materialised only for a
+            // name assigned more than once, the only kind a later line can
+            // rewrite: materialising every right-hand side would undo the
+            // inliner's sharing and go exponential on a diamond of definitions.
+            let self_rewrite = reads_variable(raw_expr, name);
+            let reassigned = scope.assign_counts.get(name.as_str()).copied().unwrap_or(0) > 1;
+            // `false` when a self-rewrite has no single previous value to
+            // substitute (the name was last written inside an `if`).
+            let resolved = !self_rewrite || last_value.contains_key(name.as_str());
+            let value = (reassigned && resolved).then(|| {
+                let mut value = scope.view(at, raw_expr).materialise();
+                if let (true, Some(prev)) = (self_rewrite, last_value.get(name.as_str())) {
+                    visit_expr_nodes_mut(&mut value, &mut |e: &mut Expression| {
+                        if matches!(e, Expression::Variable(v) if v == name) {
+                            *e = prev.clone();
+                        }
+                    });
+                }
+                value
+            });
+            // Names the scope inlines are η-free by construction, so reading an
+            // η-carrying name is visible on the raw right-hand side — or, for a
+            // self-rewrite, on the substituted value.
+            let mut reads_eta_name = false;
+            visit_expr_nodes(value.as_ref().unwrap_or(raw_expr), &mut |e: &Expression| {
+                if let Expression::Variable(v) = e {
+                    reads_eta_name |= v != name && eta_carrying.contains(v.as_str());
+                }
+            });
+            let carries_eta = expr_contains_eta(raw_expr)
+                || reads_eta_name
+                || (self_rewrite && eta_carrying.contains(name.as_str()));
+            // A self-dependent rewrite (#1930 review r3–r5) is classified on its
+            // **effective** value — the previous value substituted in — and never
+            // on the raw line. `InlineScope` does not inline a multiply-assigned
+            // name, so the raw `CL` reference is opaque in both directions: `CL = CL`
+            // or `CL = CL * (WT/70)^0.75` classifies as nothing on its own, and
+            // `CL = CL * TVNEW * exp(IIV_CL)` as a clean `(IIV_CL, TVNEW)` although
+            // its value carries two θ anchors and two η. With the previous value
+            // substituted the classifier decides as for a one-line model, so
+            // `CL = 1.0 / CL` and `CL = CL * FACTOR` retire the owner. A value that
+            // reads another η-carrying name, or a second η of its own
+            // (`CL = CL * exp(IIV_CL)`, which the classifier would accept on its
+            // first `exp(η)`), is declined: the variance NCA would write is no
+            // longer one η's.
+            let owner = if self_rewrite {
+                match &value {
+                    Some(v) if !reads_eta_name && extract_eta_indices(v).len() == 1 => {
+                        classify_mu_ref(v, theta_names, eta_names, nn_specs).map(
+                            |(eta_idx, mu_ref)| (eta_names[eta_idx].clone(), mu_ref.theta_name),
+                        )
+                    }
+                    _ => None,
+                }
+            } else {
+                found.as_ref().map(|(eta_idx, mu_ref)| {
+                    (eta_names[*eta_idx].clone(), mu_ref.theta_name.clone())
+                })
+            };
+            owners.insert(name.clone(), owner);
+            if carries_eta {
+                eta_carrying.insert(name.clone());
+            } else {
+                eta_carrying.remove(name.as_str());
+            }
+            match value {
+                Some(v) => {
+                    last_value.insert(name.as_str(), v);
+                }
+                None => {
+                    last_value.remove(name.as_str());
+                }
+            }
             if let Some((eta_idx, mu_ref)) = found {
                 result.insert(eta_names[eta_idx].clone(), mu_ref);
             }
             scope.record(at, name, raw_expr);
+        } else if let Statement::If { .. } = s {
+            let mut names = Vec::new();
+            assigned_in(std::slice::from_ref(s), &mut names);
+            for n in names {
+                // Conditional: no single value to substitute or classify, and
+                // conservatively η-carrying.
+                last_value.remove(n.as_str());
+                eta_carrying.insert(n.clone());
+                owners.insert(n, None);
+            }
         }
     }
-    result
+    (result, owners)
+}
+
+/// Whether `expr` reads the `[individual_parameters]` name `name`.
+fn reads_variable(expr: &Expression, name: &str) -> bool {
+    let mut hit = false;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if matches!(e, Expression::Variable(v) if v == name) {
+            hit = true;
+        }
+    });
+    hit
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -5245,12 +5395,13 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs = detect_mu_refs(
+    let (all_mu_refs, mu_ref_owners) = detect_mu_refs_with_owners(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
     );
+    indiv_param_partials.mu_ref_owners = Some(mu_ref_owners);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -31097,6 +31248,14 @@ pub struct IndivParamPartials {
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
     pub(crate) nested_levels: Option<crate::types::NestedLevels>,
+    /// The mu-reference each `[individual_parameters]` name ends up with —
+    /// `Some((eta_name, theta_name))` when its last write is a top-level
+    /// mu-referenced assignment, `None` otherwise — from
+    /// `detect_mu_refs_with_owners`. Read through
+    /// [`crate::CompiledModel::mu_ref_owner`]. `None` — not empty — for
+    /// hand-built fixtures, which have no statements to analyse; the accessor then
+    /// falls back to a unique η-name match.
+    pub(crate) mu_ref_owners: Option<HashMap<String, Option<(String, String)>>>,
 }
 
 impl IndivParamPartials {
@@ -31119,6 +31278,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
+            mu_ref_owners: None,
         }
     }
 
@@ -31257,6 +31417,7 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
+        mu_ref_owners: None,
     }
 }
 
