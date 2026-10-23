@@ -1543,3 +1543,104 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
     }
     assert_eq!(remediable, 2, "a remediable clause was added or lost");
 }
+
+// ── #520: the FD stencil integrates at the covariance plateau, not at the fit's tolerance ──
+
+/// A one-state ODE model with saturable elimination — nonlinear, so `ode_method = auto`
+/// integrates it rather than solving it by matrix exponential — with its tolerances baked by
+/// `[fit_options]`, or left at the default when `tol` is `None`.
+fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
+    let fit_options = tol.map_or(String::new(), |(r, a)| {
+        format!("[fit_options]\n  ode_reltol = {r:e}\n  ode_abstol = {a:e}\n")
+    });
+    crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
+         omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.15\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = -(CL/V) * central / (1 + central / (5 * V))\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit_options}"
+    ))
+    .unwrap()
+}
+
+/// #520: with the analytic R-matrix off, the covariance stencil of an ODE model at the default
+/// `1e-4` / `1e-6` runs at the `1e-6` / `1e-8` plateau — base point, step probe and every
+/// stencil point. Asserted as bit-identity with the same step on a model that *pins* the
+/// plateau (where nothing is tightened), from the same modes. The third cell pins `1e-9` /
+/// `1e-11` and must differ from both, so the identity is a statement about the tolerance the
+/// stencil ran at and not a stencil that ignores tolerance. Deleting the tight scope (or
+/// leaving the whole-population base at the fit's tolerance) reddens the first assertion.
+///
+/// The override itself: `None` once the fit is on the plateau or tighter, and on a linear
+/// model `auto` solves by matrix exponential; each of `reltol` / `abstol` tightened only where
+/// it is looser, so a tight `reltol` with a loose `abstol` moves `abstol` alone.
+#[test]
+fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
+    use crate::types::FitOptions;
+    let mut population = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/two_cpt_oral_cov.csv"),
+        None,
+        None,
+    )
+    .expect("two_cpt_oral_cov.csv loads");
+    population.subjects.truncate(6);
+    let options = FitOptions {
+        analytic_cov_hessian: false,
+        ..FitOptions::default()
+    };
+
+    let default = ode_model_at(None);
+    let ov = super::fd_stencil_ode_override(&default, &population, &options)
+        .expect("a default-tolerance ODE model is tightened");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
+    let plateau = ode_model_at(Some((1e-6, 1e-8)));
+    assert!(super::fd_stencil_ode_override(&plateau, &population, &options).is_none());
+    let mixed = ode_model_at(Some((1e-9, 1e-6)));
+    let ov = super::fd_stencil_ode_override(&mixed, &population, &options).expect("abstol");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-9), Some(1e-8)));
+    assert!(
+        super::fd_stencil_ode_override(&padded_ode_model(0), &population, &options).is_none(),
+        "a linear model solved by matrix exponential carries no integration noise"
+    );
+
+    // One set of modes for every cell, so the warm starts cannot differ between them.
+    let p = default.default_params.clone();
+    let x = crate::estimation::parameterization::pack_params(&p);
+    let (etas, hs): (Vec<_>, Vec<_>) = population
+        .subjects
+        .iter()
+        .map(|s| {
+            let e = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                &plateau, s, &p, 200, 1e-8, None, None, 0, &options,
+            );
+            (e.eta, e.h_matrix)
+        })
+        .unzip();
+    let kappas = vec![Vec::new(); population.subjects.len()];
+    let cov = |m: &crate::types::CompiledModel| match super::compute_covariance(
+        &x,
+        &p,
+        m,
+        &population,
+        &etas,
+        &hs,
+        &kappas,
+        &options,
+    ) {
+        super::CovarianceStepResult::Success(out) => out.matrix,
+        _ => panic!("the stencil step succeeds"),
+    };
+    let at_default = cov(&default);
+    let at_plateau = cov(&plateau);
+    let at_tight = cov(&ode_model_at(Some((1e-9, 1e-11))));
+    assert!(at_default.iter().all(|v| v.is_finite()));
+    assert_eq!(
+        at_default, at_plateau,
+        "the default-tolerance stencil must run at the 1e-6 / 1e-8 plateau"
+    );
+    assert_ne!(
+        at_plateau, at_tight,
+        "control: the stencil must read the tolerance at all"
+    );
+}

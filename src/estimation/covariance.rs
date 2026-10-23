@@ -863,6 +863,64 @@ fn analytic_cov_declines(
     out
 }
 
+/// How much the step budget grows for a stencil tightened by [`fd_stencil_ode_override`].
+/// Tightening the default `ode_reltol` 100× costs an order-`p` stepper ~100^(1/p) more steps:
+/// ~2.5× for rk45, ~4.6× for rosenbrock23, whose step control runs on an O(h³) local error.
+/// 10 covers both with 2× headroom; it is a cap, paid only by a solve that needs it.
+const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
+
+/// The ODE solver override the covariance step's finite-difference stencil runs under (#520),
+/// or `None` to run it at the fit's own tolerance.
+///
+/// The stencil divides by `h²`, so it amplifies integration noise the fit's optimizer averages
+/// over: on the 3-cpt IV ODE fixture (180 subjects, `analytic_cov_hessian = false`) the default
+/// `1e-4` / `1e-6` left the SEs 2–7× too large, silently, and once regularized an SE 4400× too
+/// large; `1e-6` / `1e-8` put them on the plateau, unchanged to three figures out to `1e-10`,
+/// for 0.95–1.17× the stencil's wall time. So `reltol` / `abstol` drop to
+/// [`COV_FD_PLATEAU_RELTOL`] / [`COV_FD_PLATEAU_ABSTOL`] each, where they are looser — a fit
+/// already tighter keeps its own — and the step budget grows by
+/// [`COV_STENCIL_ODE_MAX_STEPS_FACTOR`]. Every other field is the fit's own override, so a
+/// caller's `ode_method` reaches the stencil.
+///
+/// The SEs then come from a marginally different objective than the one the fit converged on,
+/// as NONMEM's `$COVARIANCE` re-evaluation also allows: a central second difference needs no
+/// stationarity, only a smooth objective, and the tighter one is the smoother.
+///
+/// `None` when nothing in the population integrates ([`OdeToleranceFacts::from_route`]), when
+/// the tolerance already sits on the plateau, or when the model is solved exactly by matrix
+/// exponential (#852), whose objective carries no integration noise. Read on the thread the
+/// step runs on, where the fit's override is armed, so the tolerance compared is the one the
+/// fit actually integrates at.
+fn fd_stencil_ode_override(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> Option<crate::ode::solver::OdeSolverOverride> {
+    use crate::estimation::cov_diagnostics::{COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL};
+    if !OdeToleranceFacts::from_route(model, population)?.looser_than_cov_plateau() {
+        return None;
+    }
+    let spec = model.ode_spec.as_ref().or_else(|| {
+        model
+            .absorption_ode_equivalent
+            .as_ref()
+            .and_then(|eq| eq.built().ode_spec.as_ref())
+    })?;
+    let eff = spec.effective_solver_opts();
+    if eff.method == crate::ode::OdeMethod::Linear {
+        return None;
+    }
+    Some(crate::ode::solver::OdeSolverOverride {
+        reltol: Some(eff.reltol.min(COV_FD_PLATEAU_RELTOL)),
+        abstol: Some(eff.abstol.min(COV_FD_PLATEAU_ABSTOL)),
+        max_steps: Some(
+            eff.max_steps
+                .saturating_mul(COV_STENCIL_ODE_MAX_STEPS_FACTOR),
+        ),
+        ..options.ode_solver_override()
+    })
+}
+
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
 /// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates, then
 /// `cov_width_declines` per subject, then the salvage cut [`salvages_declined`] the assembly
@@ -2186,6 +2244,9 @@ pub(crate) fn compute_covariance_for(
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
+    // The tolerances the stencil below integrated at, for the regularization message: the
+    // fit's own, or the plateau the stencil was tightened to (#520). Read where it ran.
+    let mut stencil_ode: Option<OdeToleranceFacts> = None;
 
     if let Some(scope) = fd_scope.as_ref() {
         // Test-only: every objective the probe and the stencil evaluate, counted across the
@@ -2208,22 +2269,42 @@ pub(crate) fn compute_covariance_for(
         // over those subjects — `find_ebe` is deterministic, so the value is exactly their
         // share of `base_ofv`, recomputed rather than carried because `pop_nll` keeps no
         // per-subject breakdown.
-        let f0_fd = match scope {
-            FdScope::Whole => base_ofv,
-            FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
+        //
+        // On an integrated model looser than the stencil's accuracy plateau, the base point,
+        // the step probe and every stencil point are solved at that plateau instead (#520):
+        // `1/h²` amplifies integration noise, and on the 3-cpt IV ODE fixture the default
+        // tolerance left the SEs 2–7× too large with no warning. All of them, or the base is
+        // differenced against points from a different objective — so the whole-population
+        // base is re-evaluated here rather than taken from `base_ofv`.
+        let tight = fd_stencil_ode_override(model, population, options);
+        let run_stencil = || {
+            let f0_fd = match scope {
+                FdScope::Whole if tight.is_none() => base_ofv,
+                FdScope::Whole if is_mixture => cov_ofv(x_hat),
+                FdScope::Whole => subset_cov_ofv(x_hat, population, eta_hats, true),
+                FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
+            };
+            let fd_floor = fd_step_floors(template, &model.default_params);
+            let stencil = fd_ofv_hessian(
+                n,
+                x_hat,
+                &free_idx,
+                &fd_floor,
+                initial_eps,
+                f0_fd,
+                &fd_ofv,
+                options,
+            );
+            (stencil, OdeToleranceFacts::from_route(model, population))
         };
-
-        let fd_floor = fd_step_floors(template, &model.default_params);
-        let stencil = fd_ofv_hessian(
-            n,
-            x_hat,
-            &free_idx,
-            &fd_floor,
-            initial_eps,
-            f0_fd,
-            &fd_ofv,
-            options,
-        );
+        let (stencil, ode_seen) = match tight {
+            // A scope that cannot be built leaves the stencil at the fit's tolerance, as
+            // before #520 — never without a covariance step.
+            Some(ov) => crate::api::with_fit_scope_ode(options, ov, &run_stencil)
+                .unwrap_or_else(|_| run_stencil()),
+            None => run_stencil(),
+        };
+        stencil_ode = ode_seen;
         #[cfg(test)]
         FD_OBJECTIVE_EVALS
             .with(|c| c.set(c.get() + fd_evals.load(std::sync::atomic::Ordering::Relaxed)));
@@ -2556,7 +2637,7 @@ pub(crate) fn compute_covariance_for(
                 template,
             ),
             declines: &declines,
-            ode: OdeToleranceFacts::from_route(model, population),
+            ode: stencil_ode,
         };
         let msg = format_regularized_warning(&facts);
         if options.verbose {
