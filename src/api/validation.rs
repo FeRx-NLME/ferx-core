@@ -2205,6 +2205,116 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
     Vec::new()
 }
 
+/// `W_LEVEL_SUMMARY` (#2035): one informational row per level of a model with nested
+/// levels, outermost first. It gives the level's group count, the groups per parent
+/// (min / median / max), how many parents hold a single group, and the kappas at the
+/// level. `E_LEVEL_SINGLE_MEMBER` refuses only the case where every parent holds a
+/// single group and a kappa has a twin, so this row is what shows the partial
+/// singletons, which are identified and fit.
+///
+/// Counted on the observation records, as `check_nested_levels` counts them, so the
+/// row and the refusal agree on which parents hold one group. A parent with no
+/// observation record is not counted. Nothing is reported while a label is missing
+/// (`E_LEVEL_MISSING_LABEL`), since the groups are not defined. `ferx check --data`
+/// only: `fit()` does not record it.
+pub(crate) fn check_level_summary(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::label_path;
+    use std::collections::{HashMap, HashSet};
+    let Some(levels) = model.nested_levels() else {
+        return Vec::new();
+    };
+    if !check_level_labels(model, population).is_empty() {
+        return Vec::new();
+    }
+    let count = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut diags = Vec::new();
+    for (l, level) in levels.levels.iter().enumerate() {
+        // A group's key is its label path, the parent's the path one level shorter
+        // (the subject itself at level 0).
+        let mut children: HashMap<(usize, Vec<u64>), HashSet<Vec<u64>>> = HashMap::new();
+        for (s, subj) in population.subjects.iter().enumerate() {
+            for j in 0..subj.obs_times.len() {
+                if let Some(path) = label_path(levels, subj.obs_cov(j)) {
+                    children
+                        .entry((s, path[..l].to_vec()))
+                        .or_default()
+                        .insert(path[..=l].to_vec());
+                }
+            }
+        }
+        let mut per_parent: Vec<usize> = children.values().map(HashSet::len).collect();
+        if per_parent.is_empty() {
+            continue;
+        }
+        per_parent.sort_unstable();
+        let n_parents = per_parent.len();
+        let n_groups: usize = per_parent.iter().sum();
+        let median = if n_parents % 2 == 1 {
+            per_parent[n_parents / 2] as f64
+        } else {
+            (per_parent[n_parents / 2 - 1] + per_parent[n_parents / 2]) as f64 / 2.0
+        };
+        let singles = per_parent.iter().filter(|&&n| n == 1).count();
+
+        let (parent_one, parent_many) = if l == 0 {
+            ("subject".to_string(), "subjects".to_string())
+        } else {
+            let p = &levels.levels[l - 1].name;
+            (format!("`{p}` group"), format!("`{p}` groups"))
+        };
+        let single = if singles == 0 {
+            format!("no {parent_one} holds a single `{}` group", level.name)
+        } else if singles == n_parents {
+            format!("every {parent_one} holds a single `{}` group", level.name)
+        } else {
+            let verb = if singles == 1 { "holds" } else { "hold" };
+            format!(
+                "{singles} of {n_parents} {parent_many} {verb} a single `{}` group",
+                level.name
+            )
+        };
+        let kappas: Vec<&str> = (0..model.n_kappa)
+            .filter(|&k| levels.kappa_level[k] == l)
+            .map(|k| model.kappa_names[k].as_str())
+            .collect();
+        let kappa = if kappas.is_empty() {
+            format!("no kappa at `{}`", level.name)
+        } else {
+            format!(
+                "{} at `{}` ({})",
+                count(kappas.len(), "kappa", "kappas"),
+                level.name,
+                kappas.join(", ")
+            )
+        };
+        diags.push(
+            Diagnostic::warning(
+                "W_LEVEL_SUMMARY",
+                format!(
+                    "level `{}`: {} in {} (per {parent_one}: min {}, median {median}, max {}); \
+                     {single}; {kappa}. Counted on the observation records.",
+                    level.name,
+                    count(n_groups, "group", "groups"),
+                    count(n_parents, &parent_one, &parent_many),
+                    per_parent[0],
+                    per_parent[n_parents - 1],
+                ),
+            )
+            .with_block("parameters"),
+        );
+    }
+    diags
+}
+
 /// `E_IOV_MISSING_OCC` for the template population `run_model_simulate` builds from
 /// the `[simulation]` block (#2005), checked before anything is simulated.
 ///
@@ -10058,6 +10168,9 @@ pub fn validate_model_file_with(
                         &init_params,
                         &parsed.fit_options.iov_occasion,
                     ));
+                    // One informational row per nested level (#2035); `fit()` does not
+                    // record it.
+                    diags.extend(check_level_summary(&parsed.model, &population));
                     // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
                     // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
                     // IG models — previously only `fit()` reported these (#776 review, IG #790).
