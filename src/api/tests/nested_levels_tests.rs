@@ -468,56 +468,25 @@ fn a_single_study_per_subject_twins_the_study_kappa_with_the_subject_eta() {
     .is_none());
 }
 
-/// A θ level block whose levels each sit inside one arm could absorb κ_ARM, which the
-/// binder cannot yet certify under nested levels; one keyed on `TIME` crosses the arms
-/// and is left to the binder as before.
+/// A θ level block whose levels each sit inside one arm or one study is no longer
+/// refused by the data check (#2034): the binder measures the kappas on their own
+/// levels' groups (`api::levels`' `nested_units` tests). Mutation — restore the
+/// refusal: the nested cells carry it.
 #[test]
-fn a_theta_block_nested_in_a_kappa_level_is_refused_and_one_crossing_it_is_not() {
-    let with_block = |cols: &str| {
-        parse_model_string(&src_with(
+fn a_theta_block_nested_in_a_kappa_level_is_left_to_the_binder() {
+    for cols in ["ARMID", "STUDYID", "STUDY, TIME", "TIME"] {
+        let m = parse_model_string(&src_with(
             &format!("  theta PL[{cols}](0.0, -50.0, 50.0)\n"),
             "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM) + PL",
             "",
         ))
-        .unwrap()
-    };
-    let nested = with_block("ARMID");
-    let msg = code_in(
-        &check_model_data(&nested, &full_design()),
-        "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
-    )
-    .expect("refused");
-    assert!(
-        msg.contains("theta PL[ARMID]: each of its levels lies within one `ARM` group"),
-        "{msg}"
-    );
-    assert!(msg.contains("so it could absorb a kappa at `ARM`"), "{msg}");
-    assert!(
-        msg.contains("refused rather than fitted unchecked"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("Key the block on columns whose levels cross the `ARM` groups"),
-        "{msg}"
-    );
-    // A block nested in the studies but crossing their arms names the study level.
-    let by_study = with_block("STUDYID");
-    let msg = code_in(
-        &check_model_data(&by_study, &full_design()),
-        "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
-    )
-    .expect("refused");
-    assert!(
-        msg.contains("theta PL[STUDYID]: each of its levels lies within one `STUDY` group"),
-        "{msg}"
-    );
-    assert!(msg.contains("could absorb a kappa at `STUDY`"), "{msg}");
-    let crossing = with_block("TIME");
-    assert!(code_in(
-        &check_model_data(&crossing, &full_design()),
-        "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED"
-    )
-    .is_none());
+        .unwrap();
+        let diags = check_model_data(&m, &full_design());
+        assert!(
+            diags.iter().all(|d| !d.code.starts_with("E_NESTED_LEVEL")),
+            "[{cols}]: {diags:?}"
+        );
+    }
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────────────

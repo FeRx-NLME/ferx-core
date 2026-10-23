@@ -46,6 +46,12 @@ pub enum FitrxError {
     UnsupportedVersion(String),
     #[error("corrupt or missing entry: {0}")]
     Corrupt(String),
+    /// [`save_fit`] refused a fit whose recorded settings [`load_fit`] would reject as
+    /// `Corrupt` (#1770): a `scoring_settings` or `sir_settings` value outside the
+    /// `[fit_options]` domain, which only a `FitResult` edited after the fit can hold.
+    /// Nothing is written.
+    #[error("refusing to write .fitrx: {0}")]
+    Unwritable(String),
 }
 
 /// Options for [`save_fit`].
@@ -592,7 +598,11 @@ struct SirSettingsWire {
     samples: usize,
     resamples: usize,
     seed: u64,
-    df: f64,
+    /// A finite `df` is a JSON number; the multivariate-normal proposal (`df = ∞`),
+    /// which JSON has no number for, is the `[fit_options]` token `"normal"` (#1819).
+    /// Held as a raw value and decoded in `into_settings`, so `null` or an unknown
+    /// token is `Corrupt` naming the field rather than a bare JSON error.
+    df: serde_json::Value,
     scale: String,
     keep_samples: bool,
     /// Flattened (#426): the record is nested in memory (`SirSettings::scoring`) but
@@ -632,6 +642,12 @@ struct ScoringSettingsWire {
     /// route as it did before.
     #[serde(default = "default_gradient_method")]
     gradient_method: String,
+    /// Absent from a bundle written before #1352, which did not record the covariate-NN
+    /// strengths: `None` stands in, and a post-hoc step takes the caller's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_l2_lambda: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_smooth_lambda: Option<f64>,
 }
 
 fn default_inner_restarts() -> usize {
@@ -660,13 +676,22 @@ fn enum_from_token<T: serde::de::DeserializeOwned>(
         .map_err(|_| FitrxError::Corrupt(format!("unknown {block}.{field} {token:?}")))
 }
 
+/// `sir.settings.df` for the multivariate-normal proposal: the `[fit_options] sir_df`
+/// token for `df = ∞` (#1819). `"mvn"` is also read, as the parser reads it.
+const SIR_DF_NORMAL: &str = "normal";
+
 impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
     fn from(s: &crate::estimation::sir::SirSettings) -> Self {
         Self {
             samples: s.samples,
             resamples: s.resamples,
             seed: s.seed,
-            df: s.df,
+            df: if s.df == f64::INFINITY {
+                serde_json::Value::String(SIR_DF_NORMAL.to_string())
+            } else {
+                // `From<f64>` writes a non-finite value as `null`, which the reader refuses.
+                serde_json::Value::from(s.df)
+            },
             scale: enum_token(&s.scale),
             keep_samples: s.keep_samples,
             scoring: ScoringSettingsWire::from(&s.scoring),
@@ -692,6 +717,8 @@ impl From<&crate::ScoringSettings> for ScoringSettingsWire {
             ode_stiff_abort_after: s.ode_stiff_abort_after,
             ode_auto_switch: s.ode_auto_switch,
             gradient_method: enum_token(&s.gradient_method),
+            nn_l2_lambda: s.nn_l2_lambda,
+            nn_smooth_lambda: s.nn_smooth_lambda,
         }
     }
 }
@@ -700,70 +727,50 @@ impl SirSettingsWire {
     /// Decoded and held to the domain `[fit_options]` enforces for the same keys
     /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
     /// default, so a value the parser would reject must not enter through the bundle.
+    /// The domain is `SirSettings::check_domain`, the one `save_fit` writes under (#1770).
     fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
-        if !(self.df >= 1.0) {
-            return Err(FitrxError::Corrupt(format!(
-                "sir.settings.df must be >= 1, got {}",
-                self.df
-            )));
-        }
-        Ok(crate::estimation::sir::SirSettings {
+        let not_a_df = |got: &dyn std::fmt::Display| {
+            FitrxError::Corrupt(format!(
+                "sir.settings.df must be >= 1 or \"normal\", got {got}"
+            ))
+        };
+        let df = match &self.df {
+            serde_json::Value::String(tok)
+                if tok.eq_ignore_ascii_case(SIR_DF_NORMAL) || tok.eq_ignore_ascii_case("mvn") =>
+            {
+                f64::INFINITY
+            }
+            serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| not_a_df(n))?,
+            other => return Err(not_a_df(other)),
+        };
+        let settings = crate::estimation::sir::SirSettings {
             samples: self.samples,
             resamples: self.resamples,
             seed: self.seed,
-            df: self.df,
+            df,
             scale: enum_from_token("sir.settings", "scale", self.scale)?,
             keep_samples: self.keep_samples,
             scoring: self.scoring.into_settings("sir.settings")?,
-        })
+        };
+        settings
+            .check_domain()
+            .map_err(|e| FitrxError::Corrupt(e.in_block("sir.settings")))?;
+        Ok(settings)
     }
 }
 
 impl ScoringSettingsWire {
     /// Decoded and held to the `[fit_options]` domain, as [`SirSettingsWire`] is:
-    /// `run_covariance` and `run_sir` adopt a recorded value wherever the caller left
-    /// the default. `block` names the key the record was read from in a `Corrupt`.
+    /// `run_covariance` and `run_sir` adopt a recorded value wherever the caller left the
+    /// default. `block` names the key the record was read from in a `Corrupt`.
+    ///
+    /// The domain is `ScoringSettings::check_domain`, shared with `save_fit` and `fit()`
+    /// (#1770). It refuses `gradient_method = ad` too: `ad` parses as a token but no run
+    /// records it — `fit()` refuses it (`E_AD_RETIRED`) and `ScoringSettings::of_run`
+    /// records a post-hoc step's retired `ad` as the `auto` it ran — and a recorded value
+    /// is adopted wherever the caller left `auto`, so a hand-edited `ad` is refused here.
     fn into_settings(self, block: &str) -> Result<crate::ScoringSettings, FitrxError> {
-        let bad = |field: &str, why: &str, got: String| {
-            Err(FitrxError::Corrupt(format!(
-                "{block}.{field} must be {why}, got {got}"
-            )))
-        };
-        for (field, v) in [
-            ("ode_reltol", self.ode_reltol),
-            ("ode_abstol", self.ode_abstol),
-        ] {
-            if !(v > 0.0 && v.is_finite()) {
-                return bad(field, "a positive finite value", v.to_string());
-            }
-        }
-        if self.ode_max_steps == 0 {
-            return bad("ode_max_steps", "a positive integer", "0".to_string());
-        }
-        if !(1..=crate::estimation::agq::MAX_AGQ_NODES).contains(&self.n_agq) {
-            return bad(
-                "n_agq",
-                &format!("in 1..={}", crate::estimation::agq::MAX_AGQ_NODES),
-                self.n_agq.to_string(),
-            );
-        }
-        if self.ode_stiff_abort_after == Some(0) {
-            return bad(
-                "ode_stiff_abort_after",
-                "positive or absent",
-                "0".to_string(),
-            );
-        }
-        // `ad` parses as a token but no run records it: `fit()` refuses it (`E_AD_RETIRED`)
-        // and `ScoringSettings::of_run` records a post-hoc step's retired `ad` as the `auto`
-        // it ran. A recorded value is adopted wherever the caller left `auto`, so a
-        // hand-edited `ad` is refused here.
-        let gradient_method: crate::types::GradientMethod =
-            enum_from_token(block, "gradient_method", self.gradient_method)?;
-        if gradient_method == crate::types::GradientMethod::Ad {
-            return bad("gradient_method", "auto or fd", "\"ad\"".to_string());
-        }
-        Ok(crate::ScoringSettings {
+        let settings = crate::ScoringSettings {
             inner_maxiter: self.inner_maxiter,
             inner_tol: self.inner_tol,
             inner_restarts: self.inner_restarts,
@@ -778,8 +785,14 @@ impl ScoringSettingsWire {
             ode_method: enum_from_token(block, "ode_method", self.ode_method)?,
             ode_stiff_abort_after: self.ode_stiff_abort_after,
             ode_auto_switch: self.ode_auto_switch,
-            gradient_method,
-        })
+            gradient_method: enum_from_token(block, "gradient_method", self.gradient_method)?,
+            nn_l2_lambda: self.nn_l2_lambda,
+            nn_smooth_lambda: self.nn_smooth_lambda,
+        };
+        settings
+            .check_domain()
+            .map_err(|e| FitrxError::Corrupt(e.in_block(block)))?;
+        Ok(settings)
     }
 }
 
@@ -1005,6 +1018,27 @@ str_enum_map!(
 // Save
 // ---------------------------------------------------------------------------
 
+/// Refuse a fit whose recorded settings the reader would reject (#1770), with the reader's
+/// own domain check and field naming, so a bundle that cannot load is never written: the
+/// failure is reported where the bad value is, not at a later `load_fit`.
+///
+/// `fit()` holds every value it records to that domain, so only a `FitResult` edited after
+/// the fit reaches this. The SIR seed is not checked: the writer derives `sir_seed` from
+/// `sir_settings.seed` (see `build_fit_wire`).
+fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
+    let refuse = |block: &str, e: crate::estimation::fit_inputs::OutOfDomain| {
+        FitrxError::Unwritable(e.in_block(block))
+    };
+    if let Some(s) = &r.scoring_settings {
+        s.check_domain()
+            .map_err(|e| refuse("scoring_settings", e))?;
+    }
+    if let Some(s) = &r.sir_settings {
+        s.check_domain().map_err(|e| refuse("sir.settings", e))?;
+    }
+    Ok(())
+}
+
 /// Write a fit bundle to `path`.
 ///
 /// `model_source` is the verbatim text of the `.ferx` model; it is embedded so
@@ -1017,6 +1051,8 @@ pub fn save_fit(
     path: &Path,
     opts: SaveFitOptions,
 ) -> Result<(), FitrxError> {
+    // Before the file is created, so a refused fit leaves nothing behind.
+    check_writable(result)?;
     let file = File::create(path)?;
     let mut zip = ZipWriter::new(file);
     let zopts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -1278,7 +1314,10 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
         saem_seed: r.saem_seed,
-        sir_seed: r.sir_seed,
+        // `sir_settings.seed` is canonical when SIR ran (#1770): it is the seed the draws
+        // used and the one `run_sir` repeats, and the field a caller edits to change a
+        // re-run. `sir_seed` is derived from it, so the pair the reader checks agrees.
+        sir_seed: r.sir_settings.as_ref().map_or(r.sir_seed, |s| Some(s.seed)),
         scoring_settings: r.scoring_settings.as_ref().map(ScoringSettingsWire::from),
         imp_seed: r.imp_seed,
         npde_seed: r.npde_seed,
@@ -4162,6 +4201,8 @@ mod tests {
             ode_stiff_abort_after: Some(9),
             ode_auto_switch: false,
             gradient_method: crate::types::GradientMethod::Fd,
+            nn_l2_lambda: Some(0.25),
+            nn_smooth_lambda: Some(0.5),
         }
     }
 
@@ -4345,6 +4386,180 @@ mod tests {
             let loaded = load_edited_sir_wire(|v| v["sir"]["settings"][field] = accept.clone())
                 .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
             assert!(loaded.sir_settings.is_some(), "{field}");
+        }
+    }
+
+    /// #1770: `save_fit` refuses a fit whose recorded settings `load_fit` would refuse,
+    /// before creating the file, and a fit at each boundary value writes and loads. So a
+    /// bundle is never "written, then load fails". Each row runs on both records: `sir.settings`
+    /// and the top-level `scoring_settings` every fit carries. Mutations: drop
+    /// `check_writable` (the reject half writes, then the reload is `Corrupt`); drop either
+    /// record's check (that record's rows write); move the check after `File::create` (the
+    /// file exists).
+    #[test]
+    fn save_fit_refuses_settings_the_reader_would_reject() {
+        type Edit = fn(&mut crate::estimation::sir::SirSettings, bool);
+        let rows: [(&str, Edit, &str); 7] = [
+            ("df", |s, bad| s.df = if bad { 0.5 } else { 1.0 }, "got 0.5"),
+            (
+                "n_agq",
+                |s, bad| s.scoring.n_agq = if bad { 0 } else { 1 },
+                "got 0",
+            ),
+            (
+                "ode_max_steps",
+                |s, bad| s.scoring.ode_max_steps = if bad { 0 } else { 1 },
+                "got 0",
+            ),
+            (
+                "ode_stiff_abort_after",
+                |s, bad| s.scoring.ode_stiff_abort_after = Some(if bad { 0 } else { 1 }),
+                "got 0",
+            ),
+            (
+                "ode_reltol",
+                |s, bad| s.scoring.ode_reltol = if bad { f64::NAN } else { 1e-300 },
+                "got NaN",
+            ),
+            (
+                "ode_abstol",
+                |s, bad| s.scoring.ode_abstol = if bad { 0.0 } else { f64::MIN_POSITIVE },
+                "got 0",
+            ),
+            (
+                "gradient_method",
+                |s, bad| {
+                    s.scoring.gradient_method = if bad {
+                        crate::types::GradientMethod::Ad
+                    } else {
+                        crate::types::GradientMethod::Auto
+                    }
+                },
+                "got \"ad\"",
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        for (field, edit, shows) in rows {
+            for block in ["sir.settings", "scoring_settings"] {
+                // `df` is SIR's alone.
+                if field == "df" && block == "scoring_settings" {
+                    continue;
+                }
+                let with = |bad: bool| {
+                    let mut r = sir_fit_with_settings();
+                    let mut st = off_default_sir_settings();
+                    edit(&mut st, bad);
+                    if block == "sir.settings" {
+                        r.sir_settings = Some(st);
+                    } else {
+                        r.scoring_settings = Some(st.scoring);
+                    }
+                    r
+                };
+                let path = dir.path().join(format!("{block}-{field}.fitrx"));
+                match save_fit(&with(true), &p, "src\n", &path, SaveFitOptions::default()) {
+                    Err(FitrxError::Unwritable(msg)) => {
+                        assert!(msg.contains(&format!("{block}.{field} ")), "{msg}");
+                        assert!(msg.contains(shows), "{block}.{field}: {msg}");
+                    }
+                    other => panic!("{block}.{field}: expected Unwritable, got {other:?}"),
+                }
+                assert!(
+                    !path.exists(),
+                    "{block}.{field}: a refused fit wrote a file"
+                );
+
+                let good = with(false);
+                save_fit(&good, &p, "src\n", &path, SaveFitOptions::default())
+                    .unwrap_or_else(|e| panic!("{block}.{field}: boundary must write: {e}"));
+                let loaded = load_fit(&path)
+                    .unwrap_or_else(|e| panic!("{block}.{field}: boundary must load: {e}"))
+                    .fit;
+                assert_eq!(loaded.sir_settings, good.sir_settings, "{block}.{field}");
+                assert_eq!(
+                    loaded.scoring_settings, good.scoring_settings,
+                    "{block}.{field}"
+                );
+            }
+        }
+    }
+
+    /// #1770: `sir_settings.seed` is canonical. A caller who edits it after the fit (as
+    /// the SIR docs suggest, to change a re-run) and saves gets a bundle that loads, with
+    /// `sir_seed` following the record — the reader refuses the pair when they disagree.
+    /// The control: with no record, `sir_seed` is written as held (a pre-#1758 fit).
+    /// Mutation: write `sir_seed: r.sir_seed` again (the load is `Corrupt`).
+    #[test]
+    fn an_edited_sir_settings_seed_writes_a_bundle_that_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let path = dir.path().join("seed.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.sir_settings.as_mut().unwrap().seed = 99;
+        assert_eq!(
+            r.sir_seed,
+            Some(4242),
+            "premise: the pair disagrees in memory"
+        );
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap().fit;
+        assert_eq!(loaded.sir_seed, Some(99));
+        assert_eq!(loaded.sir_settings.unwrap().seed, 99);
+
+        let mut legacy = sir_fit_with_settings();
+        legacy.sir_settings = None;
+        legacy.sir_seed = Some(7);
+        save_fit(&legacy, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&path).unwrap().fit.sir_seed, Some(7));
+    }
+
+    /// #1819: the multivariate-normal proposal (`df = ∞`) travels as the `[fit_options]`
+    /// token `"normal"` — JSON has no number for it, and serde_json would write `null`,
+    /// which no reader accepts. Mutation: write `df` as a plain number again (the token
+    /// assertion dies, and the reload is `Corrupt` on the `null`).
+    #[test]
+    fn a_normal_sir_proposal_round_trips_as_its_fit_options_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_normal.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.sir_settings.as_mut().unwrap().df = f64::INFINITY;
+        let value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["sir"]["settings"]["df"], "normal");
+        // The control: a finite df stays a JSON number, so the change is additive.
+        let finite = serde_json::to_value(build_fit_wire(&sir_fit_with_settings())).unwrap();
+        assert_eq!(finite["sir"]["settings"]["df"], serde_json::json!(3.0));
+
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+        assert_eq!(loaded.fit.sir_settings.unwrap().df, f64::INFINITY);
+    }
+
+    /// #1819: on read, `"normal"` and `"mvn"` (any case, as `[fit_options]` reads them)
+    /// are `df = ∞`; `null`, an unknown token and a df below 1 are `Corrupt` naming
+    /// `sir.settings.df`. Mutations: drop the `mvn` arm (its row fails to load); accept
+    /// any string as ∞ (`"gaussian"` loads); map `null` to ∞ (it loads).
+    #[test]
+    fn sir_settings_df_tokens_and_their_refusals() {
+        for tok in ["normal", "mvn", "NORMAL"] {
+            let loaded = load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = tok.into())
+                .unwrap_or_else(|e| panic!("{tok} must load: {e:?}"));
+            assert_eq!(loaded.sir_settings.unwrap().df, f64::INFINITY, "{tok}");
+        }
+        for (bad, shows) in [
+            (serde_json::Value::Null, "got null"),
+            (serde_json::json!("gaussian"), "got \"gaussian\""),
+            (serde_json::json!(0.5), "got 0.5"),
+        ] {
+            match load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = bad.clone()) {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(msg.contains("sir.settings.df "), "{bad}: {msg}");
+                    assert!(msg.contains(shows), "{bad}: {msg}");
+                }
+                other => panic!("{bad}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
         }
     }
 
@@ -5840,9 +6055,10 @@ mod tests {
     /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
     /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
     /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
-    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835) and
-    /// `inner_screen` (#2013), still flat; the unrecorded `gradient_method` loads as `auto`
-    /// and the unrecorded `inner_screen` as `0`, the screen such a fit did not run.
+    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835),
+    /// `inner_screen` (#2013) and the covariate-NN strengths (#1352), still flat; the
+    /// unrecorded `gradient_method` loads as `auto`, the unrecorded `inner_screen` as `0`, the
+    /// screen such a fit did not run, and the unrecorded NN strengths as `None`.
     /// Mutations: drop `#[serde(flatten)]` (the frozen object fails to load, and the writer
     /// nests a `scoring` key); drop the `inner_restarts` or `inner_screen` default (the
     /// frozen object fails to load).
@@ -5863,6 +6079,8 @@ mod tests {
                 inner_restarts: crate::types::FitOptions::default().inner_restarts,
                 inner_screen: 0,
                 gradient_method: crate::types::GradientMethod::Auto,
+                nn_l2_lambda: None,
+                nn_smooth_lambda: None,
                 ..off_default_scoring_settings()
             },
             ..off_default_sir_settings()
@@ -5883,6 +6101,9 @@ mod tests {
         want_keys.push(&gradient);
         let screen = "inner_screen".to_string();
         want_keys.push(&screen);
+        let (nn_l2, nn_smooth) = ("nn_l2_lambda".to_string(), "nn_smooth_lambda".to_string());
+        want_keys.push(&nn_l2);
+        want_keys.push(&nn_smooth);
         want_keys.sort();
         assert_eq!(keys, want_keys);
     }
@@ -5933,6 +6154,16 @@ mod tests {
                 "gradient_method",
                 serde_json::json!("ad"),
                 serde_json::json!("auto"),
+            ),
+            (
+                "nn_l2_lambda",
+                serde_json::json!(-1.0),
+                serde_json::json!(0.0),
+            ),
+            (
+                "nn_smooth_lambda",
+                serde_json::json!(-0.5),
+                serde_json::json!(0.0),
             ),
         ] {
             match load(field, reject) {

@@ -109,6 +109,13 @@ impl SirSettings {
             scoring: crate::ScoringSettings::from_options(options),
         }
     }
+
+    /// The first field outside the `[fit_options]` domain, if any (#1770): `df`, then the
+    /// scoring half. Fields are named as the record names them (`df`, not `sir_df`).
+    pub(crate) fn check_domain(&self) -> Result<(), crate::estimation::fit_inputs::OutOfDomain> {
+        crate::estimation::fit_inputs::sir_df_in_domain("df", self.df)?;
+        self.scoring.check_domain()
+    }
 }
 
 impl Default for SirSettings {
@@ -603,6 +610,27 @@ fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String])
         .join(", ")
 }
 
+/// Log-density of SIR's proposal at a draw whose standardised quadratic form is
+/// `quad_form`, for a `d`-dimensional scale matrix with log-determinant `log_det`:
+/// multivariate Student-t with `nu` degrees of freedom, and at `nu = ∞`
+/// (`sir_df = normal`) the multivariate normal, whose t formulas are `∞ / ∞` (#1819).
+fn proposal_log_density(nu: f64, d: f64, log_det: f64, quad_form: f64) -> f64 {
+    let (log_norm, log_kernel) = if nu.is_infinite() {
+        (
+            -(d / 2.0) * (2.0 * std::f64::consts::PI).ln(),
+            -0.5 * quad_form,
+        )
+    } else {
+        (
+            lgamma((nu + d) / 2.0)
+                - lgamma(nu / 2.0)
+                - (d / 2.0) * (nu * std::f64::consts::PI).ln(),
+            -((nu + d) / 2.0) * (1.0 + quad_form / nu).ln(),
+        )
+    };
+    log_norm - 0.5 * log_det + log_kernel
+}
+
 /// Largest proposal standard deviation each free coordinate can carry.
 ///
 /// The bound cap used to derive this from the *width* of the packed box,
@@ -632,8 +660,11 @@ fn proposal_sd_caps(
     sir_df: f64,
 ) -> Vec<f64> {
     // Var(t_nu) = nu / (nu - 2), undefined at or below 2 df — there the raw
-    // Cholesky scale is the only finite proxy available.
-    let t_inflation = if sir_df > 2.0 {
+    // Cholesky scale is the only finite proxy available. The normal proposal
+    // (`nu = ∞`) has none, and `∞ / ∞` would make every cap NaN (#1819).
+    let t_inflation = if sir_df.is_infinite() {
+        1.0
+    } else if sir_df > 2.0 {
         (sir_df / (sir_df - 2.0)).sqrt()
     } else {
         1.0
@@ -1097,6 +1128,10 @@ fn run_sir_in_box(
             "sir_resamples must be <= sir_samples",
         ));
     }
+    // `[fit_options]`' domain, not `ChiSquared`'s (`nu > 0`): a df in (0, 1) would run, and
+    // be recorded in a `sir.settings` the `.fitrx` reader refuses (#1770).
+    crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df)
+        .map_err(|e| crate::api::sir_options(e.to_string()))?;
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
     // out of the same walk (#1252) — both are consulted below, and building the
@@ -1260,23 +1295,33 @@ fn run_sir_in_box(
     // Use a multivariate Student-t proposal with nu degrees of freedom.
     // Sampling: draw z ~ N(0,I), chi2 ~ chi2(nu), then scale z by sqrt(nu/chi2).
     // Heavier tails than MVN improve ESS for parameters near boundaries (e.g. omega variances).
+    // `nu = ∞` (`sir_df = normal`) is the multivariate normal itself: no chi² draw, unit
+    // scale, and the Gaussian density — the t formulas are `∞ / ∞` there (#1819).
     let nu = options.sir_df;
-    let chi2_dist =
-        ChiSquared::new(nu).map_err(|e| crate::api::sir_options(format!("sir_df invalid: {e}")))?;
+    let mvn = nu.is_infinite();
+    let chi2_dist = if mvn {
+        None
+    } else {
+        Some(
+            ChiSquared::new(nu)
+                .map_err(|e| crate::api::sir_options(format!("sir_df invalid: {e}")))?,
+        )
+    };
 
     let d = n_free as f64;
-    // Cache lgamma terms that are constant across all samples.
-    let log_norm =
-        lgamma((nu + d) / 2.0) - lgamma(nu / 2.0) - (d / 2.0) * (nu * std::f64::consts::PI).ln();
-    // At the centre the quadratic form is 0, so log_q_hat = log_norm - 0.5*log_det.
-    let log_q_hat = log_norm - 0.5 * log_det_proposal;
+    let log_q_hat = proposal_log_density(nu, d, log_det_proposal, 0.0);
 
     let mut z_vectors: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut samples: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
         let z_free: Vec<f64> = (0..n_free).map(|_| rng.sample(StandardNormal)).collect();
-        let chi2: f64 = chi2_dist.sample(&mut rng);
-        let scale = (nu / chi2).sqrt();
+        let scale = match &chi2_dist {
+            Some(chi2_dist) => {
+                let chi2: f64 = chi2_dist.sample(&mut rng);
+                (nu / chi2).sqrt()
+            }
+            None => 1.0,
+        };
         let z_vec_free = DVector::from_column_slice(&z_free);
         let delta_free = &proposal_chol * &z_vec_free * scale;
         // Build the full packed sample: free indices get centre + delta_free,
@@ -1328,8 +1373,7 @@ fn run_sir_in_box(
             // z holds the scaled standardised residual L^{-1}(x_k - x_hat), so
             // the quadratic form is z^T z (already in the scaled space).
             let quad_form: f64 = z.iter().map(|zi| zi * zi).sum();
-            let log_q_k =
-                log_norm - 0.5 * log_det_proposal - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
+            let log_q_k = proposal_log_density(nu, d, log_det_proposal, quad_form);
 
             // The proposal density is on the draw scale, the target on the
             // packed scale: `π_y(y) = π_x(x(y)) |dx/dy|`. Taken relative to the
@@ -2473,6 +2517,109 @@ mod tests {
             - 0.5 * log_det
             - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
         assert!((log_q_k - log_q_hat).abs() < 1e-12);
+    }
+
+    /// #1819: `sir_df = normal` (`nu = ∞`) runs the multivariate-normal proposal.
+    /// Before, the Student-t formulas were `∞ / ∞` there and every draw was rejected
+    /// as non-finite (measured: "All 500 SIR samples had invalid weights"). The density
+    /// itself is pinned by `proposal_log_density_at_infinite_df_is_the_normal_density`
+    /// and the caps by `proposal_sd_caps_treat_an_infinite_df_as_uninflated`; this pins
+    /// that the run reaches them. Mutation: draw the χ² at `nu = ∞` again (every draw's
+    /// scale is `∞ / ∞`, and the run is refused).
+    #[test]
+    fn sir_runs_the_normal_proposal_at_infinite_df() {
+        let model_src = "
+[parameters]
+  theta TVCL(5.0, 0.01, 100)
+  theta TVV(50.0, FIX)
+  theta TVKA(1.5, FIX)
+  omega ETA_CL ~ 0.09 FIX
+  sigma PROP_ERR ~ 0.15 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d.csv");
+        std::fs::write(
+            &data,
+            "ID,TIME,AMT,EVID,CMT,DV,MDV\n\
+             1,0,100,1,1,.,1\n1,1,0,0,1,1.2,0\n1,4,0,0,1,1.4,0\n\
+             2,0,100,1,1,.,1\n2,1,0,0,1,1.0,0\n2,4,0,0,1,1.6,0\n",
+        )
+        .unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(&data, None, None).unwrap();
+        let model = crate::parser::model_parser::parse_model_string(model_src).expect("parse");
+        let params = model.default_params.clone();
+        let n_packed = crate::estimation::parameterization::packed_len(&params);
+        let mut cov = DMatrix::zeros(n_packed, n_packed);
+        cov[(0, 0)] = 0.04;
+        let etas = vec![DVector::zeros(1); pop.subjects.len()];
+        let run = |df: f64| {
+            let opts = FitOptions {
+                sir_samples: 4000,
+                sir_resamples: 2000,
+                sir_keep_samples: true,
+                sir_seed: Some(7),
+                sir_df: df,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let r = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)
+                .unwrap_or_else(|e| panic!("df = {df}: {e}"));
+            let x: Vec<f64> = r
+                .resamples_packed
+                .expect("kept")
+                .iter()
+                .map(|x| x[0])
+                .collect();
+            let mean = x.iter().sum::<f64>() / x.len() as f64;
+            let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / x.len() as f64;
+            (r.effective_sample_size, mean, var.sqrt())
+        };
+        let (ess, mean, sd) = run(f64::INFINITY);
+        assert!(ess.is_finite() && ess > 1.0, "ESS {ess}");
+        assert!(
+            mean.is_finite() && sd.is_finite() && sd > 0.0,
+            "{mean} {sd}"
+        );
+    }
+
+    /// #1819: at `nu = ∞` the proposal density is the multivariate normal's, the
+    /// limit of the Student-t one. Mutations: drop the `0.5` on the kernel, or the
+    /// `2π` normaliser (the closed-form check dies); route `∞` through the t
+    /// formulas (NaN).
+    #[test]
+    fn proposal_log_density_at_infinite_df_is_the_normal_density() {
+        let (d, log_det, q) = (3.0_f64, 0.7_f64, 2.3_f64);
+        let want = -0.5 * (d * (2.0 * std::f64::consts::PI).ln() + log_det + q);
+        let got = proposal_log_density(f64::INFINITY, d, log_det, q);
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        let t = proposal_log_density(1e8, d, log_det, q);
+        assert!((t - got).abs() < 1e-6, "t(1e8) {t} vs normal {got}");
+    }
+
+    /// #1819: at `nu = ∞` the proposal's draws are exactly its Cholesky scale wide, so
+    /// the caps carry no t inflation — the same caps as the uninflated `nu <= 2` branch.
+    /// Mutation: let `∞` reach `nu / (nu - 2)` (NaN caps).
+    #[test]
+    fn proposal_sd_caps_treat_an_infinite_df_as_uninflated() {
+        let bounds = PackedBounds {
+            lower: vec![-1.0],
+            upper: vec![3.0],
+        };
+        let inf = proposal_sd_caps(&[0.5], &bounds, &[0], f64::INFINITY);
+        let raw = proposal_sd_caps(&[0.5], &bounds, &[0], 2.0);
+        assert!(inf[0].is_finite(), "{}", inf[0]);
+        assert_eq!(inf[0].to_bits(), raw[0].to_bits());
     }
 
     /// Large nu should recover near-normal proposal (lgamma ratio converges).

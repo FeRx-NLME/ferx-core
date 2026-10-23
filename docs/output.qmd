@@ -335,7 +335,11 @@ absent when there is nothing to list.
   `(SD = … at weight 1, logit scale)` (#1666) — the figure of a one-subject arm,
   followed by a line with the same note at the typical arm size, worded alike:
   `CV% = … at NARM = …`, `SD = … at NARM = …` or `SD = … at NARM = …, logit scale`
-  (#1683, #1697). That line's figure is printed exactly when the row's note is
+  (#1683, #1697). A console CV% of 1e6 or more prints to three significant
+  figures in scientific notation (`CV% = 7.64e35`) rather than every integer
+  digit of the double (#1883); a CV% that size usually means the variance is on
+  another scale, e.g. an additive kappa read as log-normal from a bundle saved
+  before `kappa_param_types`. The YAML's `cv_pct` keeps its full figure. That line's figure is printed exactly when the row's note is
   (#1698): a custom kappa, or a covariance step that failed or fell back to SIR,
   leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
 - **weight** / **weight_typical** / **sd_at_typical_weight** /

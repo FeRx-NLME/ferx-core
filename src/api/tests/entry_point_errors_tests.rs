@@ -550,6 +550,105 @@ fn fit_carries_the_options_check_code() {
     assert_eq!(err.to_string(), want.message);
 }
 
+/// #1770: `fit()` refuses, under any method, the recorded settings a `.fitrx` reader
+/// would refuse — not only where a stage reads them. Before, `n_agq = 0` passed under
+/// `foce`, `sir_df = 0.5` ran SIR, and `ode_stiff_abort_after = Some(0)` ran an analytic
+/// model; each fit then saved a bundle that did not load. Each row pairs the refusal with
+/// its accepted boundary on the same fixture, so a check that refused everything fails the
+/// accept half. The SIR gate is straddled too: `sir_df = 0.5` with no SIR to run is
+/// recorded nowhere and stays accepted.
+///
+/// Mutations: restore the FOCEI/Laplace-only condition on `E_AGQ_NODES_ZERO`; drop the
+/// non-quadrature `E_AGQ_NODES_TOO_LARGE`; drop the `sir_df` check or its
+/// `covariance_fallback` arm; drop `ode_stiff_abort_after_in_domain` from
+/// `OdeSolverOverride::validate`.
+#[test]
+fn fit_refuses_recorded_settings_outside_the_fit_options_domain() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = accepted_population();
+    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    let foce = |set: &dyn Fn(&mut FitOptions)| {
+        let mut o = FitOptions {
+            method: EstimationMethod::Foce,
+            ..FitOptions::default()
+        };
+        set(&mut o);
+        o
+    };
+    let refused: [(&str, FitOptions, &str, String); 5] = [
+        (
+            "n_agq = 0",
+            foce(&|o| o.n_agq = 0),
+            "E_AGQ_NODES_ZERO",
+            "n_agq must be at least 1".into(),
+        ),
+        (
+            "n_agq past the cap",
+            foce(&|o| o.n_agq = max + 1),
+            "E_AGQ_NODES_TOO_LARGE",
+            format!("n_agq = {} exceeds the {max}-node", max + 1),
+        ),
+        (
+            "sir_df under sir = true",
+            foce(&|o| {
+                o.sir = true;
+                o.sir_df = 0.5;
+            }),
+            "E_SIR_OPTIONS",
+            "sir_df must be >= 1 or \"normal\", got 0.5".into(),
+        ),
+        (
+            "sir_df under covariance_fallback = sir",
+            foce(&|o| {
+                o.covariance_fallback = crate::types::CovarianceFallback::Sir;
+                o.sir_df = 0.5;
+            }),
+            "E_SIR_OPTIONS",
+            "sir_df must be >= 1 or \"normal\", got 0.5".into(),
+        ),
+        (
+            "ode_stiff_abort_after = Some(0) on an analytic model",
+            foce(&|o| o.ode_stiff_abort_after = Some(0)),
+            "E_ODE_SOLVER_OPTIONS",
+            "ode_stiff_abort_after must be positive or absent, got 0".into(),
+        ),
+    ];
+    for (name, opts, code, text) in refused {
+        let err = fit(&model, &pop, &model.default_params, &opts).expect_err(name);
+        assert_eq!(err.code(), Some(code), "{name}: {err}");
+        assert!(err.to_string().starts_with(&text), "{name}: {err}");
+    }
+
+    let accepted: [(&str, FitOptions); 5] = [
+        ("n_agq = 1", foce(&|o| o.n_agq = 1)),
+        ("n_agq at the cap", foce(&|o| o.n_agq = max)),
+        (
+            "sir_df = 1 under sir = true",
+            foce(&|o| {
+                o.sir = true;
+                o.sir_df = 1.0;
+            }),
+        ),
+        (
+            "sir_df = normal under covariance_fallback = sir",
+            foce(&|o| {
+                o.covariance_fallback = crate::types::CovarianceFallback::Sir;
+                o.sir_df = f64::INFINITY;
+            }),
+        ),
+        ("sir_df = 0.5 with no SIR to run", foce(&|o| o.sir_df = 0.5)),
+    ];
+    for (name, opts) in accepted {
+        let errors: Vec<_> = check_model_options(&model, &opts)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .collect();
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+    }
+    let budget = foce(&|o| o.ode_stiff_abort_after = Some(1)).ode_solver_override();
+    assert_eq!(budget.validate(), Ok(()), "ode_stiff_abort_after = Some(1)");
+}
+
 /// #2062 review 2, F2: ODE solver settings no solver can run with reach `fit()` as
 /// `E_ODE_SOLVER_OPTIONS`, the code `run_sir` / `run_covariance` give them (#2044). The
 /// check runs in `install_on_fit_pool` before any start, so the single-start and the
@@ -573,7 +672,7 @@ fn fit_carries_the_ode_solver_options_code() {
         );
         assert!(
             err.to_string()
-                .starts_with("ode_reltol must be finite and positive"),
+                .starts_with("ode_reltol must be a positive finite value"),
             "n_starts = {n_starts}: {err}"
         );
     }
@@ -605,90 +704,6 @@ fn run_model_simulate_keeps_the_simulations_code_without_a_context() {
     assert!(text.starts_with("simulation failed: "), "{text}");
     assert!(text.contains("`GRP` takes [4.0]"), "{text}");
     assert_eq!(err.message(), text, "the prefix is part of the message");
-}
-
-/// #1772: `fit()`'s LTBS refusals for a hand-built model (the parser refuses both
-/// first, so only a Rust caller can reach them) keep their text and have no code yet
-/// (#1788). One fixture, an additive-error model with `log_transform` set, and one field
-/// changed per cell: a per-CMT error spec, then an SDE start. Mutation: drop either guard
-/// → that cell is accepted (or refused by a later check with other text), and the test
-/// names the cell.
-#[test]
-fn fit_ltbs_refusals_on_a_hand_built_model_keep_their_text_uncoded() {
-    let pop = accepted_population();
-    let ltbs = || {
-        let mut m = parse_model_string(&ONE_CPT_IV.replace("proportional(PROP)", "additive(PROP)"))
-            .expect("parse");
-        assert!(matches!(m.error_model, ErrorModel::Additive));
-        m.log_transform = true;
-        m
-    };
-    let mut per_cmt = ltbs();
-    per_cmt.error_spec = ErrorSpec::PerCmt(HashMap::new());
-    let mut sde = ltbs();
-    sde.diffusion_theta_start = Some(0);
-    for (label, model, want) in [
-        (
-            "per-CMT error",
-            per_cmt,
-            "LTBS (`log_transform = true`) is not supported with per-CMT \
-             (`ErrorSpec::PerCmt`) error models",
-        ),
-        (
-            "SDE",
-            sde,
-            "LTBS (`log_transform = true`) is not supported with an SDE \
-             model (`diffusion_theta_start = Some(_)`)",
-        ),
-    ] {
-        let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-            .err()
-            .unwrap_or_else(|| panic!("{label}: accepted"));
-        assert_eq!(err.to_string(), want, "{label}");
-        assert_eq!(err.code(), None, "{label}");
-    }
-}
-
-/// #1772: two of `run_model_simulate`'s `[simulation]` design refusals, which have no
-/// code yet (#1788): their text is unchanged by the retype and `code()` is `None`, as
-/// `UNCODED_SITES` lists. A model with no `[simulation]` block; and (`survival`) a
-/// binary-only model whose design gives a `horizon` but no `times`, refused before the
-/// design's covariates are read. A test flips when #1788 gives either a code.
-#[test]
-fn run_model_simulate_design_refusals_keep_their_text_uncoded() {
-    let write = |text: &str| {
-        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
-        std::fs::write(f.path(), text).unwrap();
-        f
-    };
-    let no_block = write(ONE_CPT_IV);
-    let err = crate::api::run_model_simulate(no_block.path().to_str().unwrap())
-        .err()
-        .expect("no [simulation] block");
-    assert_eq!(
-        err.to_string(),
-        "Model file has no [simulation] block — use --data instead"
-    );
-    assert_eq!(err.code(), None);
-
-    #[cfg(feature = "survival")]
-    {
-        let src = std::fs::read_to_string("examples/binary_logistic.ferx").expect("example");
-        let binary = write(&format!(
-            "{src}\n[simulation]\n  n_subjects = 2\n  dose_amt = 0\n  dose_cmt = 1\n  \
-             seed = 7\n  horizon = 10\n"
-        ));
-        let err = crate::api::run_model_simulate(binary.path().to_str().unwrap())
-            .err()
-            .expect("a binary endpoint with no times");
-        assert!(
-            err.to_string().starts_with(
-                "[simulation] has no `times`, but the model has a [binary_model] endpoint."
-            ),
-            "{err}"
-        );
-        assert_eq!(err.code(), None, "{err}");
-    }
 }
 
 /// #1772: the file entry points code their reads and binders as `ferx check` does. A

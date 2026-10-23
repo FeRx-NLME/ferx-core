@@ -3916,8 +3916,9 @@ pub struct CovariateMuRef {
     /// of declining the group. Empty on the entries themselves.
     pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
-    /// `[individual_parameters]` definition it referenced already inlined.
-    pub(crate) typical: crate::parser::model_parser::Expression,
+    /// `[individual_parameters]` definition it referenced resolved: each one
+    /// emitted once as a line of the program and read by reference (#1699).
+    pub(crate) typical: crate::parser::model_parser::TypicalProgram,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7211,6 +7212,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_nn_penalty") {
+        // #1352: what a regularized DCM fit's standard errors are. A route note on the
+        // covariance step, so `run_covariance` replaces it with the step it reruns. Info
+        // where `R` carries the penalty (`r` / `rsr`: penalized-ML SEs, as asked); Warning
+        // under `s`, whose SEs ignore it. Its own token, ahead of the prose arms: the
+        // message says "covariance" and "penalized" in words other arms could claim.
+        if lower.contains("not represented") {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
+        } else {
+            (WarningSeverity::Info, WarningCode::CovarianceStep)
+        }
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -7996,7 +8008,10 @@ pub struct FitResult {
     /// The seed the SIR draws actually used: `sir_seed` when it was set, the
     /// built-in default otherwise, so the run is reproducible from this field
     /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
-    /// Equal to `sir_settings.seed` whenever SIR ran.
+    /// Equal to `sir_settings.seed` whenever SIR ran. Where the two disagree — a
+    /// `sir_settings.seed` edited after the fit — `sir_settings.seed` is canonical:
+    /// [`run_sir`](crate::run_sir) draws with it, and `save_fit` writes this field from
+    /// it (#1770).
     ///
     /// Except on a fit produced before #1758 (a `.fitrx` with no `sir.settings`),
     /// where the field echoes the seed the fit was *given*: `None` for a SIR run
@@ -8482,8 +8497,10 @@ pub struct FitOptions {
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
     /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
-    /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
-    /// smoother OFV surfaces where FD noise is the main concern.
+    /// manual tuning is rarely needed for overflow. Decrease it (e.g. `1e-3`) on a smooth,
+    /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
+    /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
+    /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
     /// When `true` (the default) and the model is in analytic-covariance scope, the
     /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
     /// (#436), assembled from third-order sensitivities instead of second-differencing the
@@ -8754,7 +8771,8 @@ pub struct FitOptions {
     /// Degrees of freedom for the Student-t SIR proposal distribution.
     /// Heavier tails than the normal improve ESS for parameters near boundaries
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
-    /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
+    /// `f64::INFINITY` (`sir_df = normal` / `mvn` in `[fit_options]`) selects the
+    /// multivariate-normal proposal itself (#1819).
     pub sir_df: f64,
     /// The scale SIR's target is flat on — see [`SirScale`]. Default
     /// [`SirScale::Packed`] (#1723). Set via `[fit_options]` key `sir_scale`.

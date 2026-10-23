@@ -8049,8 +8049,9 @@ pub fn ode_predictions_with_states(
 /// `dur`, compartment lag, `F`, `D{n}`/`R{n}` and the SS run-in — is read at its own
 /// dose record (`pk_at_dose`), as `ipred` reads it (#1575). For subjects whose
 /// disposition genuinely varies between observations the states will be approximate.
-/// `fit()` emits `W_DERIVED_CMT_TV_ODE` to alert users to this limitation. For
-/// reset-only subjects (no TV covariates) `pk_at_obs` is uniformly filled, so using the
+/// `fit()` emits `W_DERIVED_CMT_TV_ODE` to alert users to this limitation (gated on
+/// `pk::ode_cmt_states_approximate`: TV covariates or a `TIME`-reading `$PK`, #1855). For
+/// reset-only subjects (no TV covariates, no `TIME` in `$PK`) `pk_at_obs` is uniformly filled, so using the
 /// first entry is exact.
 pub fn ode_predictions_event_driven_with_states(
     ode: &OdeSpec,
@@ -8088,15 +8089,17 @@ pub fn ode_predictions_event_driven_with_states(
     // each EVID=3/4 reset from that reset's own row, as the event-driven pass does (#2133).
     // Only the disposition (CL/V/etc.) comes from the first-observation snapshot.
     //
-    // For subjects with EVID=3/4 resets but *no* TV covariates, `pk_at_obs` is
-    // uniformly filled (every entry identical), so using `first()` is exact.
+    // For subjects with EVID=3/4 resets but *no* TV covariates (and a `$PK` that does
+    // not read `TIME`), `pk_at_obs` is uniformly filled (every entry identical), so using `first()` is exact.
     //
-    // For subjects with genuine TV covariates, `pk_at_obs` varies per timepoint.
+    // For subjects with genuine TV covariates, or under a `TIME`-reading `$PK`,
+    // `pk_at_obs` varies per timepoint.
     // Holding the disposition at `first()` is an approximation: the compartment state
     // trajectory eliminates under the first-observation snapshot, while `ipreds`
     // correctly reflect per-event covariate snapshots. The caller
     // (`compute_predictions_with_states`) is the approximate path; `fit()` emits
-    // W_DERIVED_CMT_TV_ODE when TV covariates are present so users know.
+    // W_DERIVED_CMT_TV_ODE when TV covariates are present, or when the individual
+    // parameters read `TIME` — the same frozen snapshot (#1855).
     //
     // A future improvement: duplicate the event-driven loop to capture `u` at each
     // obs time directly — exact states, but ~2× the integration work post-fit.

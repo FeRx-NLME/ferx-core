@@ -217,6 +217,10 @@ pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Su
         )
 }
 
+/// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
+/// all-FD guard on it (#1861).
+const IOV_SURVIVAL_REASON: &str = "survival/TTE observations";
+
 fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
@@ -231,7 +235,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         return "missing omega_iov";
     }
     if subject_has_survival_records(subject) {
-        return "survival/TTE observations";
+        return IOV_SURVIVAL_REASON;
     }
     if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
@@ -279,11 +283,15 @@ pub(crate) fn fd_fallback_warning(
     }
     let zeros = vec![0.0; model.n_eta];
     let n_total = population.subjects.len();
-    let n_fd = population
-        .subjects
-        .iter()
-        .filter(|s| subject_inner_runs_fd(model, s, theta, &zeros))
-        .count();
+    let (mut n_survival, mut n_shape) = (0usize, 0usize);
+    for s in &population.subjects {
+        match subject_inner_fd_reason(model, s, theta, &zeros) {
+            Some(InnerFdReason::Survival) => n_survival += 1,
+            Some(InnerFdReason::Shape) => n_shape += 1,
+            None => {}
+        }
+    }
+    let n_fd = n_survival + n_shape;
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
     // — e.g. TV-cov + LTBS on a closed-form model, or an in-scope ODE model whose every
@@ -294,9 +302,12 @@ pub(crate) fn fd_fallback_warning(
     // the report through the SAME `inner_reports_analytic_model` predicate
     // `build_info::gradient_method_inner` uses, so the label and this warning cannot drift
     // (the ODE route was missing from the old `analytic_inner_grad_supported_model` read).
-    // A model that already reports FD and runs FD everywhere needs no warning.
+    // A model that already reports FD and runs FD everywhere needs no warning — except
+    // when subjects fall back on a survival record (#1861): the label reads FD on any TTE
+    // model, but neither it nor the banner says *why*, and a joint PK-TTE user whose PK
+    // rows the recorder serves has no other way to learn that the hazard term is the cause.
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
+    if n_fd > 0 && (n_fd < n_total || model_reports_analytic || n_survival > 0) {
         // #520 C2: on an `[odes]` model the FD inner gradient differences a numerically
         // integrated trajectory, so the integrator's tolerance is part of the gradient's
         // accuracy — measured at 25-120 OFV of stall on TMDD at the default. The note is
@@ -304,15 +315,55 @@ pub(crate) fn fd_fallback_warning(
         let tolerance_note =
             crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model, population)
                 .unwrap_or_default();
+        // Name each cause with its own count (#1861): a TTE subject is not "a shape no
+        // recorder serves", and the old single parenthetical sent a joint PK-TTE user
+        // looking for an SDE or an `obs_scale` they did not have.
+        let mut reasons: Vec<String> = Vec::new();
+        if n_survival > 0 {
+            reasons.push(format!(
+                "{n_survival} carry a time-to-event (or other non-Gaussian) record whose \
+                 likelihood term has no analytic η-gradient"
+            ));
+        }
+        if n_shape > 0 {
+            reasons.push(format!(
+                "{n_shape} have a shape no analytic recorder serves, e.g. an SDE, a \
+                 per-CMT `obs_scale`, or more than 48 random effects"
+            ));
+        }
+        let reason_text = reasons.join("; ");
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
-             (a shape no analytic recorder serves, e.g. an SDE, a per-CMT \
-             `obs_scale`, or more than 48 random effects); their results are correct \
-             but slower.{tolerance_note}"
+             ({reason_text}); their results are correct but slower.{tolerance_note}"
         ))
     } else {
         None
     }
+}
+
+/// Why [`subject_inner_fd_reason`] puts a subject on the FD inner gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerFdReason {
+    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE / count
+    /// term, or an endpoint without a dual program.
+    Survival,
+    /// A data or model shape the Gaussian recorder declines.
+    Shape,
+}
+
+/// [`subject_inner_runs_fd`] with the cause, for [`fd_fallback_warning`]'s message.
+fn subject_inner_fd_reason(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<InnerFdReason> {
+    // `non_gaussian_eta_grad_served`, not `analytic_inner_grad_supported`: a subject whose
+    // records are all served but whose model bails for another reason is a shape decline.
+    if !non_gaussian_eta_grad_served(model, subject) {
+        return Some(InnerFdReason::Survival);
+    }
+    subject_inner_runs_fd(model, subject, theta, eta).then_some(InnerFdReason::Shape)
 }
 
 /// Whether `subject`'s non-IOV inner EBE gradient runs on finite differences at `eta`, as
@@ -361,9 +412,12 @@ fn iov_fd_fallback_warning(
     // (`gradient_method_inner` reads the same `inner_reports_analytic_model`), since
     // nothing else would correct that label. An all-analytic (`n_fd == 0`) population
     // needs no warning, and an all-FD one that also *reports* FD (e.g. `gradient = fd`)
-    // is already obvious from the banner and the label (#590 review, #1907).
+    // is already obvious from the banner and the label (#590 review, #1907) — unless a
+    // survival record is a cause, which the FD label on a TTE model does not explain
+    // (#1861, the same exception as the non-IOV twin).
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic) {
+    let survival_cause = reasons.contains_key(IOV_SURVIVAL_REASON);
+    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic && !survival_cause) {
         return None;
     }
     let reason_text = reasons
@@ -3566,6 +3620,13 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     // dual-evaluable program declines every subject carrying its records.
     #[cfg(feature = "survival")]
     if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+        return false;
+    }
+    // TTE (#1861): a hazard term has no analytic η-channel at all, so every subject carrying
+    // a survival record declines at the guard in `analytic_inner_grad_supported`, whatever
+    // engine its hazard runs on. Reporting "analytic" here labelled a joint PK-TTE fit whose
+    // every subject ran FD as `analytic (Dual2)`.
+    if model.has_tte() {
         return false;
     }
     // The unified recorder's scope, or an endpoint-only model (no structural model, no

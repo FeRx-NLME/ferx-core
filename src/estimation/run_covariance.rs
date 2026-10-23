@@ -346,6 +346,7 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and

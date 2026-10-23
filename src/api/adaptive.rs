@@ -1805,19 +1805,16 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     super::check_param_shape(model, &super::ParamBlock::all_of(params))?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
-    // Apply the same loud check fits use for model covariates (`check_covariates`).
+    // Apply the same loud check fits use for model covariates (`check_covariates`),
+    // through the same per-subject predicate (#2181).
     let missing: Vec<&str> = compiled
         .observe_covariates
         .iter()
-        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .filter(|name| !super::validation::population_carries(population, name))
         .map(|s| s.as_str())
         .collect();
     if !missing.is_empty() {
-        let available = if population.covariate_names.is_empty() {
-            "(none)".to_string()
-        } else {
-            population.covariate_names.join(", ")
-        };
+        let available = super::validation::available_covariate_columns(population);
         // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
         return Err(super::entry_refusals::observe_covariate_missing(format!(
             "[adaptive_dosing] `observe` references covariate(s) not found in data \

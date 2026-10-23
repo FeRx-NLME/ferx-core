@@ -10,9 +10,16 @@ use super::*;
 
 /// A `Population` carrying exactly the named covariate columns and no subjects.
 /// `check_covariates` only reads `covariate_names`, so nothing else matters here.
+/// One subject carrying every name: a covariate is present only when every subject
+/// carries it (#2181), so an empty population would carry none of them.
 fn population_with_covariates(names: &[&str]) -> Population {
+    let subject = crate::types::Subject {
+        id: "1".to_string(),
+        covariates: names.iter().map(|s| (s.to_string(), 1.0)).collect(),
+        ..Default::default()
+    };
     Population {
-        subjects: Vec::new(),
+        subjects: vec![subject],
         covariate_names: names.iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
