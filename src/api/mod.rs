@@ -42,7 +42,7 @@ pub use validation::{
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
-    check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
+    check_rtte_records_diags, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
 pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
@@ -429,6 +429,11 @@ mod entry_point_errors_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
+// #1788: the codes of the refusals only `fit()` and the file entry points raised uncoded.
+#[cfg(test)]
+#[path = "tests/fit_refusal_codes_tests.rs"]
+mod fit_refusal_codes_tests;
+
 // #2181: a covariate is present when every subject carries it, not when it is listed.
 #[cfg(test)]
 #[path = "tests/covariate_presence_tests.rs"]
