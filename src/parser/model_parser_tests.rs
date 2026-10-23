@@ -29695,6 +29695,16 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "an exp intermediate through a second product, was LogNormal",
             "  EV = exp(RE)\n  E2 = EV * 2\n  CL = TVCL * E2 / EV",
         ),
+        // Dies under: an inline `if`'s branches walked without the product
+        // chain they are a factor of (#1724 review round 3).
+        (
+            "an inline if of exps beside an exp, was LogNormal",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE)) * exp(RE)",
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in twice, was LogNormal",
+            "  EV = if (WT > 70) exp(RE) else exp(RE)\n  CL = TVCL * EV * EV",
+        ),
         // The other side of `origin_scope`: an overwrite that reads the
         // variable — on `WT > 70` `A` holds `2·RE`. (Custom through the
         // original definition's own two routes, through the overwrite and
@@ -29717,7 +29727,7 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
 #[test]
 fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, EtaParamType); 10] = [
+    let rows: [(&str, &str, EtaParamType); 12] = [
         // Dies under: an inline `if`'s branches summed, not maxed (`max` is
         // desugared to `if (RE >= 0) RE else 0`, and the condition read is
         // not a scale position at all).
@@ -29771,6 +29781,19 @@ fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
         (
             "an exp intermediate multiplied in once",
             "  V = TVV * exp(ETA_V)\n  EV = exp(RE)\n  CL = TVCL / EV",
+            LogNormal,
+        ),
+        // Dies under: an inline `if`'s branches summed once they share the
+        // product's terminal.
+        (
+            "an inline if of exps in a product",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE))",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in once",
+            "  V = TVV * exp(ETA_V)\n  EV = if (WT > 70) exp(RE) else exp(RE)\n  \
+             CL = TVCL * EV",
             LogNormal,
         ),
         // Dies under: `origin_scope` deleted — the definition the `if`

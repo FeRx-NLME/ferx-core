@@ -2994,7 +2994,8 @@ impl<'a> ScaleWalk<'a> {
 }
 
 /// The address [`leaf_scales`] keys an `exp` factor of `expr`'s root product
-/// on: the root, past any unary minus (`0 - x`).
+/// on: the root, past any unary minus (`0 - x`). An inline `if` at the root
+/// is its own key, and an `exp` in either branch is a factor of it.
 fn root_product_key(expr: &Expression) -> usize {
     let mut e = expr;
     while let Expression::BinOp(l, BinOp::Sub, r) = e {
@@ -3337,12 +3338,17 @@ fn leaf_scales(
             }
             // Transparent, like a statement-level `if`: each value branch keeps
             // the scale above it, and a leaf read only in the condition is not
-            // a scale position at all.
+            // a scale position at all. A branch is a factor of the product the
+            // `if` is a factor of (or of the `if` itself, which is the root
+            // product key when it is the root), so
+            // `TVCL * (if (c) exp(η) else exp(η)) * exp(η)` reaches one
+            // terminal twice on either path.
             Expression::Conditional(_, t, f) => {
+                let top = Some(chain.unwrap_or(at));
                 let mut branch = Vec::new();
-                walk(t, is_leaf, end, None, &mut branch);
+                walk(t, is_leaf, end, top, &mut branch);
                 let mut other = Vec::new();
-                walk(f, is_leaf, end, None, &mut other);
+                walk(f, is_leaf, end, top, &mut other);
                 reach_max(&mut branch, &other);
                 reach_sum(out, &branch);
             }
