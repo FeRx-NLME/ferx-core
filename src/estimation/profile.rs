@@ -806,6 +806,11 @@ pub(crate) const PROFILED_GRADIENT_XTOL_REL: f64 = 1e-6;
 /// that gained under 1e-6 while 1.03e-5 short, and was reported converged (#2340). A
 /// leg that gains more is followed by another, up to `MAX_POLISH_LEGS`, the cap the
 /// #1782 BOBYQA polish uses.
+///
+/// The threshold is absolute while the profile solve's noise ([`OFV_NOISE`]) is
+/// relative, so a large |OFV| eats into the margin. Measured on the largest fixture,
+/// S1 (|OFV| 4236, Linux aarch64 at #2338's head): one leg from its optimum, gaining
+/// 5.5e-9, 182× under the threshold.
 pub(crate) const PROFILED_VERIFY_GAIN: f64 = 1e-6;
 
 /// The `xtol_rel` [`optimize_profiled`] sets for `algo`: `outer_xtol` capped at
