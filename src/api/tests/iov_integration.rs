@@ -2291,18 +2291,21 @@ fn test_check_model_options_block_sigma_rejects_iov() {
     assert_eq!(d.block.as_deref(), Some("fit_options"));
 }
 
-// IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
-// than letting the fit fail at runtime (review finding #3).
+// IMP and IMPMAP estimate IOV models since #2301, so `ferx check` must not
+// refuse the combination (it used to, with E_IMPMAP_IOV_UNSUPPORTED).
 #[test]
-fn test_check_model_options_flags_impmap_iov() {
+fn test_check_model_options_accepts_imp_and_impmap_with_iov() {
     let model = make_iov_model();
-    let opts = fast_opts(EstimationMethod::Impmap, Optimizer::Bobyqa, false);
-    let diags = super::check_model_options(&model, &opts);
-    let d = diags
-        .iter()
-        .find(|d| d.code == "E_IMPMAP_IOV_UNSUPPORTED")
-        .expect("expected E_IMPMAP_IOV_UNSUPPORTED diagnostic");
-    assert!(d.is_error() && d.message.contains("inter-occasion"));
+    for method in [EstimationMethod::Impmap, EstimationMethod::Imp] {
+        let opts = fast_opts(method, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let errors: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.code.as_str())
+            .collect();
+        assert!(errors.is_empty(), "{method:?} + IOV refused: {errors:?}");
+    }
 }
 
 // The Enzyme AD path was retired, so explicitly requesting AD must error

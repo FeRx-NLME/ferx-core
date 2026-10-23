@@ -137,6 +137,39 @@ NONMEM's reported IMPMAP objective.
 > shift has no single well-defined value for it — so it is estimated by the
 > weighted M-step alone, with an advisory naming it.
 
+## Inter-occasion variability {#impmap-iov}
+
+A model with `kappa` / `block_kappa` declarations is estimated the way NONMEM's
+IMPMAP treats IOV — as extra random effects, one block per occasion
+([#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301)):
+
+- **E-step.** The MAP step solves each subject's stacked
+  $b_i = [\eta_i, \kappa_{i1}, \ldots, \kappa_{iK_i}]$ jointly (the IOV inner
+  loop), and the importance samples are drawn for the whole of $b_i$ from one
+  proposal around that mode, against the block-diagonal prior
+  $\Omega \oplus I_{K_i} \otimes \Omega_\text{IOV}$. Each sample is scored
+  with per-occasion predictions, so a dose from an earlier occasion is eliminated
+  with the later occasion's κ. This is the same joint proposal the final IS
+  objective uses.
+- **M-step.** Ω is the weighted second moment of the η block, as before.
+  Ω~IOV~ is the weighted second moment of κ pooled over **every occasion of every
+  subject**,
+  $\Omega_\text{IOV} = \sum_i \sum_{g=1}^{K_i} \sum_k \tilde w_{ik}\,
+  \kappa_{ikg}\kappa_{ikg}^\top \big/ \sum_i K_i$, with the same structural
+  zeros, `FIX` handling and diagonal floor. θ and σ are fitted to the weighted
+  observation likelihood with each sample's κ in place.
+- **Output.** The fit reports Ω~IOV~ and per-occasion κ̂, and the final IS
+  objective marginalises κ (`kappa_treatment: marginalized`). `imp` (sample-moment
+  recentring) runs the same E- and M-steps. `impmap_trace` does not yet carry
+  Ω~IOV~ columns.
+
+Against NONMEM 7.6.0 `METHOD=IMPMAP` on warfarin with IOV on CL (same data,
+model and starting values, 200 iterations, 300 samples), ferx's averaged
+estimates fall within 0.9 of NONMEM's own iteration-to-iteration SD of NONMEM's
+last-50-iteration mean for every parameter: Ω~IOV~ 0.035446 vs 0.035404, IS
+−2 log L 309.65 vs 310.32. See `tests/warfarin_iov_impmap_nonmem.rs` and
+`nonmem_anchor/warfarin_iov_impmap.ctl`.
+
 ## Validation against NONMEM
 
 On the bundled warfarin example (1-cpt oral, proportional error, 3 mu-referenced
@@ -322,8 +355,8 @@ when it applies, the measured effect, and the warnings it carries.
 
 ## Not yet supported
 
-- **IOV (`[iov]` / `kappa`)** — the κ sufficient statistics and Ω_iov update are
-  a planned follow-up. IOV models are refused; use SAEM or FOCEI.
+- **IOV together with a `[mixture]` block**, and **nested variability levels**
+  (`level … by … in …`) — refused; use FOCE / FOCEI.
 - **SDE / `[diffusion]`** — refused for the same reason `imp` refuses them (the
   EKF process-noise variance is not threaded through the IS observation
   likelihood). Use FOCE / FOCEI.

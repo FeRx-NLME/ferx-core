@@ -530,6 +530,13 @@ The exact outer gradient is the adjoint's, for the same engines as the inner loo
 
 In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a *pure* FOCEI/SLSQP fit moves the variance components off their initial values and descends toward the marginal minimum from a cold start. It does not always *reach* it: the final descent is driven by a noisy re-converged FD gradient on a weakly-identified variance surface, and SLSQP can terminate a few OFV units high in a platform-dependent way (see [Limitations](#limitations)). An explicit `optimizer = bobyqa` and the `methods = [saem, focei]` chain reach the true minimum platform-independently. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global `scale_params` default stays off to preserve the issue-#99 non-IOV behaviour.)
 
+### Importance sampling (`imp` / `impmap`)
+
+IMP and IMPMAP sample each subject's stacked `[η, κ₁…κ_K]` from one joint proposal
+and update Ω~IOV~ in closed form from the importance-weighted κ second moments pooled
+over all occasions (#2301). See [IMPMAP: inter-occasion
+variability](../estimation/impmap.qmd#impmap-iov).
+
 ### Covariance step
 
 When `covariance = true`, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.

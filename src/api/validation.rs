@@ -5658,21 +5658,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
-    // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
-    // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
-    // at check time so `ferx check` rejects it rather than the fit failing at
-    // runtime (possibly after a chained warm-up stage has already run).
-    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Impmap) {
-        diags.push(
-            Diagnostic::error(
-                "E_IMPMAP_IOV_UNSUPPORTED",
-                "method = impmap does not yet support inter-occasion variability \
-                 (κ / [iov]). Use method = saem or method = focei for IOV models.",
-            )
-            .with_block("fit_options"),
-        );
-    }
-
     // Nested levels (#1082) are integrated by the FOCE / FOCEI marginal alone for now;
     // every other estimator (and FOCEI's quadrature refinement) is enabled later, each
     // with its own anchor. A residual `correlation` line is composed with them in a

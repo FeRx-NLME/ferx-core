@@ -301,12 +301,12 @@ Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
 
 ## IOV (inter-occasion variability)
 
-> IOV is supported only in **evaluation-only** mode (`imp_eval_only = true`). The
-> estimating `imp` (like `impmap`) refuses IOV models for now — the κ M-step is
-> a planned follow-up. Use SAEM or FOCEI to *estimate* IOV models, then score
-> with an evaluation-only `imp`.
+> Both the estimating `imp` and evaluation-only `imp` support IOV. The
+> estimating method samples the same joint (η, κ) vector each iteration and
+> updates Ω~IOV~ in closed form — see [IMPMAP: inter-occasion
+> variability](impmap.qmd#impmap-iov), whose E- and M-steps it shares (#2301).
 
-For models with `kappa` declarations, evaluation-only IMP performs
+For models with `kappa` declarations, IMP performs
 **joint sampling** of
 both η (between-subject variability) and κ (between-occasion variability).
 The proposal is built from the full (n_eta + n_kappa × n_occasions)
