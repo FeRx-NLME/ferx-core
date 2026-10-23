@@ -2639,23 +2639,32 @@ pub(crate) fn cov_nn_regularizer(
 /// penalized-ML SEs; `S` is a sum of per-subject scores and the penalty has no per-subject
 /// part, so `s` — requested, or the #1781 fallback — cannot represent it.
 pub(crate) fn format_nn_penalty_cov_note(estimator: CovarianceMethod) -> String {
-    match estimator {
-        CovarianceMethod::Hessian => "Covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+    let body = match estimator {
+        CovarianceMethod::Hessian => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
              the minimised objective, so the R matrix includes the penalty's curvature: these are \
              penalized-ML standard errors, not the data-only curvature of the reported \
              (unpenalized) OFV."
-            .to_string(),
-        CovarianceMethod::Sandwich => "Covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+        }
+        CovarianceMethod::Sandwich => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
              the minimised objective: the sandwich's R includes the penalty's curvature, while S \
              (per-subject scores) has no penalty term — penalized-ML sandwich standard errors."
-            .to_string(),
-        CovarianceMethod::CrossProduct => "Covariate-NN regularization (nn_l2 / nn_smooth) is not \
+        }
+        CovarianceMethod::CrossProduct => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is not \
              represented in these standard errors: S⁻¹ is built from per-subject scores and the \
              penalty has no per-subject part, so they ignore it. Use covariance_method = r for \
              penalized-ML standard errors."
-            .to_string(),
-    }
+        }
+    };
+    format!("{NN_PENALTY_COV_TOKEN}: {body}")
 }
+
+/// The token every [`format_nn_penalty_cov_note`] starts with (#1352), so
+/// [`crate::types::classify_warning`] files it as a covariance-step note and `run_covariance`
+/// replaces it with the step it reruns, instead of keeping an `r` note beside an `s` one.
+pub(crate) const NN_PENALTY_COV_TOKEN: &str = "W_COV_NN_PENALTY";
 
 /// The soft warning for cross-partial stencils that came back non-finite, naming their
 /// parameters in packed order (deterministic whatever the `HashSet` iteration order) — or

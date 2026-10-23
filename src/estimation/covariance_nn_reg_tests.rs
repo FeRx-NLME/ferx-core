@@ -185,7 +185,7 @@ fn the_l2_penalty_adds_exactly_two_lambda_to_the_weight_curvature_on_both_routes
             "{route}: the unpenalized Hessian must be indefinite here: {w0:?}"
         );
         assert!(
-            !w0.iter().any(|w| w.contains("Covariate-NN")),
+            !w0.iter().any(|w| w.contains("W_COV_NN_PENALTY")),
             "{route}: λ = 0 gets no penalty note: {w0:?}"
         );
         let (cov_a, wa) = run(lambda_a);
@@ -198,7 +198,8 @@ fn the_l2_penalty_adds_exactly_two_lambda_to_the_weight_curvature_on_both_routes
         }
         assert!(
             wb.iter()
-                .any(|w| w.contains("penalized-ML standard errors")),
+                .any(|w| w.starts_with("W_COV_NN_PENALTY")
+                    && w.contains("penalized-ML standard errors")),
             "{route}: the SEs must be named as penalized: {wb:?}"
         );
         let (ha, hb) = (ofv_hessian(&cov_a, &free), ofv_hessian(&cov_b, &free));
@@ -322,7 +323,7 @@ fn the_penalty_curvature_is_gated_on_the_estimator_that_applied_it() {
         "SAEM never applied the penalty, so R must not carry it"
     );
     assert!(
-        !w_saem.iter().any(|w| w.contains("Covariate-NN")),
+        !w_saem.iter().any(|w| w.contains("W_COV_NN_PENALTY")),
         "no penalty note on an unregularized estimate: {w_saem:?}"
     );
     assert_ne!(focei, cov0, "FOCEI applied the penalty, so R must carry it");
@@ -359,5 +360,129 @@ fn the_score_estimators_say_what_they_do_with_the_penalty() {
     assert!(
         ws.iter().any(|w| w.contains("penalized-ML sandwich")),
         "{ws:?}"
+    );
+}
+
+/// A regularized fit, run briefly with its inline covariance step.
+fn regularized_fit(
+    fx: &(CompiledModel, ModelParameters, Population),
+    l2: f64,
+) -> crate::types::FitResult {
+    let (model, params, population) = fx;
+    let o = FitOptions {
+        outer_maxiter: 3,
+        run_covariance_step: true,
+        optimizer: crate::types::Optimizer::Bobyqa,
+        ..options(l2, 0.0, false, CovarianceMethod::Hessian)
+    };
+    crate::fit(model, population, params, &o).expect("fit runs")
+}
+
+/// `run_covariance` on a regularized fit, with the caller's default options, differentiates
+/// the objective the fit minimised (#1352 review): the stage record carries `nn_l2`, so the
+/// post-hoc matrix is the inline one. The straddle is a record written before the strengths
+/// were recorded (`None`): the same call then takes the caller's λ = 0 and the matrix moves —
+/// so the parity is the record's doing, not a coincidence of the fixture. And a caller's
+/// non-zero λ on that regularized fit does not change it: a recorded strength wins.
+#[test]
+fn run_covariance_restores_the_fitted_penalty_strengths() {
+    let fx = fixture();
+    let (model, _, population) = &fx;
+    let fit = regularized_fit(&fx, 5.0);
+    let rec = fit
+        .scoring_settings
+        .as_ref()
+        .expect("a fit records its scoring settings");
+    assert_eq!(rec.nn_l2_lambda, Some(5.0));
+    assert_eq!(rec.nn_smooth_lambda, Some(0.0));
+    let inline = fit.covariance_matrix.clone().expect("inline covariance");
+    let post = |fit: &crate::types::FitResult, o: &FitOptions| {
+        crate::run_covariance(fit, Some(model), Some(population), o)
+            .expect("run_covariance succeeds")
+    };
+
+    // `analytic_cov_hessian` says how the caller asks the step to be computed — not recorded,
+    // so passed as the inline step ran it; everything else is the default.
+    let step_opts = FitOptions {
+        analytic_cov_hessian: false,
+        ..FitOptions::default()
+    };
+    let out = post(&fit, &step_opts);
+    assert_eq!(
+        out.covariance_matrix.as_ref(),
+        Some(&inline),
+        "default options must reproduce the inline penalized covariance"
+    );
+    let caller_l2 = FitOptions {
+        nn_l2_lambda: 0.5,
+        ..step_opts.clone()
+    };
+    assert_eq!(
+        post(&fit, &caller_l2).covariance_matrix.as_ref(),
+        Some(&inline),
+        "a recorded strength wins over the caller's"
+    );
+
+    let mut legacy = fit.clone();
+    let rec = legacy.scoring_settings.as_mut().unwrap();
+    rec.nn_l2_lambda = None;
+    rec.nn_smooth_lambda = None;
+    let unrecorded = post(&legacy, &step_opts);
+    assert_ne!(
+        unrecorded.covariance_matrix.as_ref(),
+        Some(&inline),
+        "with no recorded strength the caller's λ = 0 applies"
+    );
+}
+
+/// The penalty notes classify as covariance-step notes, so `run_covariance` replaces them
+/// rather than keeping an `r` note beside the `s` one of the step it reran (#1352 review).
+/// Severity follows the sentence: Info where the SEs carry the penalty, Warning where not.
+#[test]
+fn the_penalty_notes_are_covariance_step_warnings_and_are_replaced() {
+    use crate::types::{classify_warning, WarningCode, WarningSeverity};
+    for (method, severity) in [
+        (CovarianceMethod::Hessian, WarningSeverity::Info),
+        (CovarianceMethod::Sandwich, WarningSeverity::Info),
+        (CovarianceMethod::CrossProduct, WarningSeverity::Warning),
+    ] {
+        let w = classify_warning(&super::format_nn_penalty_cov_note(method));
+        assert_eq!(w.category, WarningCode::CovarianceStep, "{method:?}");
+        assert_eq!(w.severity, severity, "{method:?}");
+    }
+
+    let fx = fixture();
+    let (model, _, population) = &fx;
+    let fit = regularized_fit(&fx, 5.0);
+    let count = |ws: &[String], needle: &str| {
+        ws.iter()
+            .filter(|w| w.starts_with("W_COV_NN_PENALTY") && w.contains(needle))
+            .count()
+    };
+    assert_eq!(count(&fit.warnings, "includes the penalty"), 1);
+    let s = FitOptions {
+        covariance_method: CovarianceMethod::CrossProduct,
+        ..FitOptions::default()
+    };
+    let out = crate::run_covariance(&fit, Some(model), Some(population), &s).unwrap();
+    assert_eq!(
+        count(&out.warnings, "includes the penalty"),
+        0,
+        "the inline r note must not survive a rerun under s: {:?}",
+        out.warnings
+    );
+    assert_eq!(
+        count(&out.warnings, "not represented"),
+        1,
+        "{:?}",
+        out.warnings
+    );
+    let again =
+        crate::run_covariance(&fit, Some(model), Some(population), &FitOptions::default()).unwrap();
+    assert_eq!(
+        count(&again.warnings, "includes the penalty"),
+        1,
+        "a rerun under r must not duplicate the note: {:?}",
+        again.warnings
     );
 }
