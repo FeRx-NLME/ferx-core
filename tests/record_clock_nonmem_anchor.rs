@@ -41,6 +41,12 @@
 //!   row's. Under the parent-row rule ferx was off by 11.8 on `addl_f` and 4.05 on
 //!   `addl_ftime`. Under a governing-record lag it is off by 1.67 on `addl_lag` (13 %, ID 1
 //!   at `TIME 14`). Analytic and ODE twins, NONMEM 7.5.1, `.tab` at 17 significant figures.
+//! * `addl_lagt`, `addl_dx`, `addl_dt` (#1909): the `TIME` each attribute sees.
+//!   `ALAG1 = 0.25 + 0.05·TIME` on the same data reads the parent row's `TIME`; reading
+//!   the governing `TIME` instead is 3.78 off. On `addl_inf`, an implied `RATE=-2` dose
+//!   takes `D1 = X` and `D1 = 0.5 + 0.1·TIME` from the governing record, where the
+//!   parent-row rule is 6.50 and 6.97 off. Its `RATE=-1` subjects are left out (see the
+//!   test).
 //!
 //! Tier 2: one `predict()` per anchor.
 
@@ -87,6 +93,18 @@ fn nonmem_preds(name: &str) -> Vec<(String, f64, f64)> {
 /// subject's expected pk-only record times: the rows must reach the engine, or the anchor
 /// would pass on a reader that drops them only where `PRED` cannot see it.
 fn worst_pred_error(anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 {
+    worst_pred_error_on(anchor, twin, csv, pk_only, None)
+}
+
+/// [`worst_pred_error`] restricted to the subjects in `only` when it is `Some`.
+fn worst_pred_error_on(
+    anchor: &str,
+    twin: &str,
+    csv: &str,
+    pk_only: &[(&str, &[f64])],
+    only: Option<&[&str]>,
+) -> f64 {
+    let keep = |id: &str| only.is_none_or(|ids| ids.contains(&id));
     let model_path = format!("nonmem_anchor/{twin}_fit.ferx");
     let model = parse_model_file(Path::new(&model_path)).unwrap_or_else(|e| panic!("{e}"));
     let csv = format!("nonmem_anchor/{csv}.csv");
@@ -99,8 +117,11 @@ fn worst_pred_error(anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64
             "{anchor} subject {id}: pk-only records at {got:?}, the file has them at {want:?}"
         );
     }
-    let ferx = predict(&model, &pop, &model.default_params).expect("predict");
-    let nm = nonmem_preds(anchor);
+    let mut ferx = predict(&model, &pop, &model.default_params).expect("predict");
+    ferx.retain(|r| keep(&r.id));
+    let mut nm = nonmem_preds(anchor);
+    nm.retain(|(id, _, _)| keep(id));
+    assert!(!nm.is_empty(), "{anchor}: no observations kept");
     assert_eq!(ferx.len(), nm.len(), "{anchor}: observation count");
     let mut worst = 0.0_f64;
     for (r, (id, t, want)) in ferx.iter().zip(&nm) {
@@ -198,9 +219,29 @@ fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_non
 fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_its_parent_matches_nonmem(
 ) {
     let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", &[12.0]), ("3", &[]), ("4", &[])];
-    for anchor in ["addl_f", "addl_lag", "addl_ftime"] {
+    for anchor in ["addl_f", "addl_lag", "addl_ftime", "addl_lagt"] {
         worst_pred_error(anchor, anchor, "addl_dose", pk_only);
         worst_pred_error(anchor, &format!("{anchor}_ode"), "addl_dose", pk_only);
+    }
+}
+
+#[test]
+fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_record_matches_nonmem() {
+    // IDs 3, 4 and 6 code RATE=-1. NONMEM re-reads R1 on every advance, which ferx does
+    // not do for any modelled-rate infusion, implied or not. That defect predates #1909
+    // and is tracked on its own, so only the D1 subjects are compared here.
+    let at12_24: &[f64] = &[12.0, 24.0];
+    let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", at12_24), ("5", &[])];
+    let d1: &[&str] = &["1", "2", "5"];
+    for anchor in ["addl_dx", "addl_dt"] {
+        worst_pred_error_on(anchor, anchor, "addl_inf", pk_only, Some(d1));
+        worst_pred_error_on(
+            anchor,
+            &format!("{anchor}_ode"),
+            "addl_inf",
+            pk_only,
+            Some(d1),
+        );
     }
 }
 
