@@ -12388,6 +12388,10 @@ mod level_uncertainty {
 #[path = "theta_levels_written_time_tests.rs"]
 mod written_time_keys;
 
+/// A level block against kappas at nested levels (#2034).
+#[path = "theta_levels_nested_units_tests.rs"]
+mod nested_units;
+
 mod carried_scale {
     use super::*;
 

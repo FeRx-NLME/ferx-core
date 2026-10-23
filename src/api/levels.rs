@@ -31,7 +31,10 @@ use crate::parser::model_parser::{
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
     ScaleShare,
 };
-use crate::types::{CompiledModel, IovOccasionRule, ParsedModel, Population, Subject};
+use crate::stats::nested_levels::{label_path, NestedLayout};
+use crate::types::{
+    CompiledModel, IovOccasionRule, NestedLevels, ParsedModel, Population, Subject,
+};
 
 /// The record time, addressable as a level column even though it is not a
 /// covariate.
@@ -131,22 +134,31 @@ fn bind_levels_on_data(
 
     // A kappa's unit is a subject-occasion, so the binder needs the occasions
     // `fit()` will use: a derived `iov_occasion` rule is applied on a copy, by
-    // the same call `fit()` makes.
+    // the same call `fit()` makes. Under nested levels (#1082) those are the
+    // level cells, written by the call `fit()` makes when it prepares the
+    // population, which a derived rule never overwrites.
     let derived;
-    let with_occasions: &Population =
-        if parsed.model.n_kappa > 0 && parsed.fit_options.iov_occasion != IovOccasionRule::Column {
-            let mut p = bound.clone();
-            apply_iov_occasion_rule(
-                &mut p,
-                &parsed.fit_options.iov_occasion,
-                parsed.fit_options.iov_column.is_some(),
-                &mut Vec::new(),
-            );
-            derived = p;
-            &derived
-        } else {
-            &bound
-        };
+    let with_occasions: &Population = if parsed.model.n_kappa > 0
+        && parsed.model.has_nested_levels()
+    {
+        let mut p = bound.clone();
+        crate::stats::nested_levels::assign_level_cells(&parsed.model, &mut p);
+        derived = p;
+        &derived
+    } else if parsed.model.n_kappa > 0 && parsed.fit_options.iov_occasion != IovOccasionRule::Column
+    {
+        let mut p = bound.clone();
+        apply_iov_occasion_rule(
+            &mut p,
+            &parsed.fit_options.iov_occasion,
+            parsed.fit_options.iov_column.is_some(),
+            &mut Vec::new(),
+        );
+        derived = p;
+        &derived
+    } else {
+        &bound
+    };
 
     // Rule 1 (#1679): measure which levels the likelihood never reads, and
     // (#1834) which random effects the block absorbs where the walk names no
@@ -1225,26 +1237,43 @@ fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
 }
 
 /// The unit a random effect varies over: a subject for an η, an occasion of
-/// one subject for a kappa.
+/// one subject for a kappa, or under nested levels (#1082) a group of the
+/// kappa's own level within one subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unit {
     Subject,
     Occasion,
+    /// A group of nested level `L` (outermost 0): the records whose label path
+    /// starts with the group's, as `stats::nested_levels` keys a group, so `ARM 1`
+    /// of two studies is two units.
+    Level(usize),
 }
 
-/// The unit observation row `j` of `subject` lies in, within that subject:
-/// the subject itself for [`Unit::Subject`], the row's occasion for
-/// [`Unit::Occasion`] — `None` when the subject carries no occasions, so a
-/// kappa counts nowhere (`fit()` reports the missing occasions later).
-fn unit_of(subject: &Subject, unit: Unit, j: usize) -> Option<u32> {
+/// The key of the unit observation row `j` of `subject` lies in, within that
+/// subject: empty for [`Unit::Subject`], the row's occasion for
+/// [`Unit::Occasion`], the row's label path down to the level for
+/// [`Unit::Level`]. `None` when the row has none — no occasions, or a missing
+/// label — so a kappa counts nowhere there (`fit()` reports the missing
+/// occasions or labels later).
+fn unit_of(
+    subject: &Subject,
+    unit: Unit,
+    j: usize,
+    nested: Option<&NestedLevels>,
+) -> Option<Vec<u64>> {
     match unit {
-        Unit::Subject => Some(0),
-        Unit::Occasion => subject.occasions.get(j).copied(),
+        Unit::Subject => Some(Vec::new()),
+        Unit::Occasion => subject.occasions.get(j).map(|&o| vec![u64::from(o)]),
+        Unit::Level(l) => {
+            let path = label_path(nested?, subject.obs_cov(j))?;
+            path.get(..=l).map(<[u64]>::to_vec)
+        }
     }
 }
 
 /// Whether every level's observation records lie in a single unit (#1678,
-/// #1696): one subject for an η, one occasion of one subject for a kappa.
+/// #1696): one subject for an η, one occasion of one subject for a kappa, one
+/// group of the kappa's level of one subject under nested levels.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
 /// coarser than or equal to the block's": only then can a unit's random effect
@@ -1252,8 +1281,13 @@ fn unit_of(subject: &Subject, unit: Unit, j: usize) -> Option<u32> {
 /// unit's (#1649). It does not ask the leading columns to identify subjects:
 /// two subjects of one study on disjoint times nest a `[STUDY, TIME]` block in
 /// subjects while sharing its `STUDY` key.
-fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Unit) -> bool {
-    let mut owner: HashMap<Vec<u64>, (usize, u32)> = HashMap::new();
+fn levels_nest_in_units(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    unit: Unit,
+    nested: Option<&NestedLevels>,
+) -> bool {
+    let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
     for (s, subject) in population.subjects.iter().enumerate() {
         for j in 0..subject.obs_times.len() {
             let level: Option<Vec<u64>> = decl
@@ -1261,10 +1295,11 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
                 .iter()
                 .map(|c| column_value(subject, c, j).map(f64::to_bits))
                 .collect();
-            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j)) else {
+            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j, nested)) else {
                 return false;
             };
-            if *owner.entry(level).or_insert((s, u)) != (s, u) {
+            let u = (s, u);
+            if *owner.entry(level).or_insert_with(|| u.clone()) != u {
                 return false;
             }
         }
@@ -1349,15 +1384,21 @@ fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
 /// Whether every covariate in `covariates` is constant within every unit's
 /// observation records — the data-side condition of a funnel
 /// (`EtaCoupling::funnels`): within each subject for an η, within each
-/// occasion of a subject for a kappa.
-fn constant_within_units(covariates: &[String], population: &Population, unit: Unit) -> bool {
+/// occasion of a subject for a kappa, and within each group of its level for a
+/// kappa of a nested model.
+fn constant_within_units(
+    covariates: &[String],
+    population: &Population,
+    unit: Unit,
+    nested: Option<&NestedLevels>,
+) -> bool {
     population.subjects.iter().all(|subject| {
         covariates.iter().all(|c| {
             // Missing compares like any other value: a column absent from every
             // record is constant, one present on only some records changes.
-            let mut first: Vec<(u32, Option<f64>)> = Vec::new();
+            let mut first: Vec<(Vec<u64>, Option<f64>)> = Vec::new();
             (0..subject.obs_times.len()).all(|j| {
-                let Some(u) = unit_of(subject, unit, j) else {
+                let Some(u) = unit_of(subject, unit, j, nested) else {
                     return false;
                 };
                 let v = column_value(subject, c, j);
@@ -1381,6 +1422,8 @@ struct Absorbed<'a> {
     /// (`LevelBlockDecl::eta_readers`).
     readers: &'a [String],
     how: How<'a>,
+    /// What one of the random effect's units is called ([`unit_noun`]).
+    unit: String,
 }
 
 enum How<'a> {
@@ -1432,7 +1475,7 @@ impl Absorbed<'_> {
                  combination of this block's levels does{} (measured at the initial estimates and \
                  at a point near them)",
                 self.name(),
-                if self.kappa() { "occasion" } else { "subject" },
+                self.unit,
                 match span {
                     Span::Levels => "",
                     Span::Within => ", one that sums to zero within each group",
@@ -1442,18 +1485,59 @@ impl Absorbed<'_> {
     }
 }
 
+/// What one unit is called in a refusal: `subject`, `occasion`, or under
+/// nested levels the level's group (`` `STUDY` group ``).
+fn unit_noun(unit: Unit, nested: Option<&NestedLevels>) -> String {
+    match unit {
+        Unit::Subject => "subject".to_string(),
+        Unit::Occasion => "occasion".to_string(),
+        Unit::Level(l) => match nested.and_then(|n| n.levels.get(l)) {
+            Some(level) => format!("`{}` group", level.name),
+            None => "group".to_string(),
+        },
+    }
+}
+
+/// The unit of random effect `k` of `decl` (an index into `eta_couplings`, η
+/// first): a subject for an η; for a kappa, an occasion, or under nested levels
+/// (#1082) a group of the level the kappa is declared `at`
+/// (`NestedLevels::kappa_level`).
+fn unit_of_random_effect(decl: &LevelBlockDecl, k: usize, nested: Option<&NestedLevels>) -> Unit {
+    if !decl.eta_couplings[k].kappa {
+        return Unit::Subject;
+    }
+    let Some(nested) = nested else {
+        return Unit::Occasion;
+    };
+    let n_eta = decl.eta_couplings.iter().filter(|c| !c.kappa).count();
+    match nested.kappa_level.get(k - n_eta) {
+        Some(&l) => Unit::Level(l),
+        None => Unit::Occasion,
+    }
+}
+
 /// Per random effect of `decl`, parallel to `eta_couplings`: the unit its
 /// levels nest in ([`levels_nest_in_units`]) — a subject for an η, an occasion
-/// for a kappa — or `None` when they do not, and the block cannot absorb it.
-fn nesting_units(decl: &LevelBlockDecl, population: &Population) -> Vec<Option<Unit>> {
-    let has = |kappa: bool| decl.eta_couplings.iter().any(|c| c.kappa == kappa);
-    let by_subject = has(false) && levels_nest_in_units(decl, population, Unit::Subject);
-    let by_occasion = has(true) && levels_nest_in_units(decl, population, Unit::Occasion);
-    decl.eta_couplings
-        .iter()
-        .map(|c| match c.kappa {
-            true => by_occasion.then_some(Unit::Occasion),
-            false => by_subject.then_some(Unit::Subject),
+/// for a kappa, a group of its level for a kappa of a nested model — or `None`
+/// when they do not, and the block cannot absorb it.
+fn nesting_units(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    nested: Option<&NestedLevels>,
+) -> Vec<Option<Unit>> {
+    let mut verdicts: Vec<(Unit, bool)> = Vec::new();
+    (0..decl.eta_couplings.len())
+        .map(|k| {
+            let unit = unit_of_random_effect(decl, k, nested);
+            let nests = match verdicts.iter().find(|(u, _)| *u == unit) {
+                Some(&(_, v)) => v,
+                None => {
+                    let v = levels_nest_in_units(decl, population, unit, nested);
+                    verdicts.push((unit, v));
+                    v
+                }
+            };
+            nests.then_some(unit)
         })
         .collect()
 }
@@ -1467,12 +1551,13 @@ fn structural_site<'a>(
     c: &'a EtaCoupling,
     population: &Population,
     unit: Unit,
+    nested: Option<&NestedLevels>,
     resolving: bool,
 ) -> Option<How<'a>> {
     let funnel = c
         .funnels
         .iter()
-        .find(|f| constant_within_units(&f.covariates, population, unit));
+        .find(|f| constant_within_units(&f.covariates, population, unit, nested));
     if let Some(f) = funnel {
         return Some(How::Site(&f.site));
     }
@@ -1487,8 +1572,8 @@ fn structural_site<'a>(
 enum Placement<'a> {
     /// The block's levels do not nest in its units: the block cannot absorb it.
     Unnested,
-    /// Nested, and the walk names the site ([`structural_site`]).
-    Site(How<'a>),
+    /// Nested, and the walk names the site ([`structural_site`]) on this unit.
+    Site(How<'a>, Unit),
     /// Nested, and the walk names no site: the span certificate measures it
     /// ([`spanned`]) on this unit.
     Silent(Unit),
@@ -1503,16 +1588,17 @@ fn placements<'a>(
     decl: &'a LevelBlockDecl,
     population: &Population,
     lagged: bool,
+    nested: Option<&NestedLevels>,
 ) -> Vec<Placement<'a>> {
-    let units = nesting_units(decl, population);
+    let units = nesting_units(decl, population, nested);
     let resolving = resolves_observations(decl, population, lagged);
     decl.eta_couplings
         .iter()
         .zip(units)
         .map(|(c, unit)| match unit {
             None => Placement::Unnested,
-            Some(unit) => match structural_site(c, population, unit, resolving) {
-                Some(how) => Placement::Site(how),
+            Some(unit) => match structural_site(c, population, unit, nested, resolving) {
+                Some(how) => Placement::Site(how, unit),
                 None => Placement::Silent(unit),
             },
         })
@@ -1531,20 +1617,24 @@ fn absorbed<'a>(
     measured: &Measured,
 ) -> Vec<Absorbed<'a>> {
     let spanned = &measured.spanned;
-    placements(decl, population, measured.lagged)
+    let nested = measured.nested.as_ref();
+    placements(decl, population, measured.lagged, nested)
         .into_iter()
         .enumerate()
         .filter_map(|(k, placement)| {
-            let how = match placement {
+            let (how, unit) = match placement {
                 Placement::Unnested => return None,
-                Placement::Site(how) => how,
-                Placement::Silent(_) => How::Measured(spanned.get(k).copied().flatten()?),
+                Placement::Site(how, unit) => (how, unit),
+                Placement::Silent(unit) => {
+                    (How::Measured(spanned.get(k).copied().flatten()?), unit)
+                }
             };
             let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
             Some(Absorbed {
                 coupling: &decl.eta_couplings[k],
                 readers,
                 how,
+                unit: unit_noun(unit, nested),
             })
         })
         .collect()
@@ -1973,6 +2063,7 @@ fn spanned(
     population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Span>> {
+    let tree = model.nested_levels();
     let mut out = vec![None; decl.eta_couplings.len()];
     if silent.is_empty() {
         return out;
@@ -2000,7 +2091,8 @@ fn spanned(
                 break;
             }
             let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
-            let (eta, kappa) = probe_res(re, model, layout.n_groups().max(1));
+            let cells = NestedLayout::of(model, subject);
+            let (eta, kappa) = subject_probe_res(re, model, cells.as_ref(), layout.n_groups());
             let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| {
                 predictions_at(model, subject, th, et, ka)
             };
@@ -2033,9 +2125,9 @@ fn spanned(
                     continue;
                 }
                 // The records of each unit of this subject.
-                let mut units: Vec<(u32, Vec<usize>)> = Vec::new();
+                let mut units: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
                 for j in 0..n_obs {
-                    let Some(u) = unit_of(subject, unit, j) else {
+                    let Some(u) = unit_of(subject, unit, j, tree) else {
                         continue;
                     };
                     match units.iter_mut().find(|(u0, _)| *u0 == u) {
@@ -2050,13 +2142,17 @@ fn spanned(
                         eta_up[k] += SPAN_STEP;
                         eta_down[k] -= SPAN_STEP;
                     } else {
-                        // A kappa moves its own occasion only.
-                        let Some(g) = layout.group_of(u) else {
+                        // A kappa moves its own occasion only; under nested levels,
+                        // every cell of its group (#1082).
+                        let groups = unit_groups(&layout, cells.as_ref(), unit, &u);
+                        if groups.is_empty() {
                             holds[s] = false;
                             break;
-                        };
-                        ka_up[g][k - model.n_eta] += SPAN_STEP;
-                        ka_down[g][k - model.n_eta] -= SPAN_STEP;
+                        }
+                        for g in groups {
+                            ka_up[g][k - model.n_eta] += SPAN_STEP;
+                            ka_down[g][k - model.n_eta] -= SPAN_STEP;
+                        }
                     }
                     let Some(re_col) = record_diffs(
                         &at(&theta, &eta_up, &ka_up),
@@ -2142,6 +2238,90 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
         })
         .collect();
     (eta, kappa)
+}
+
+/// [`probe_res`] for one subject with `n_groups` occasion groups. Under nested
+/// levels (#1082) the κ are spread by the group of each κ's own level, not by
+/// cell, so every cell of one group reads the same value: the probe is a point
+/// the model can take, where a study's κ is one number shared by its arms.
+fn subject_probe_res(
+    re: f64,
+    model: &CompiledModel,
+    cells: Option<&NestedLayout>,
+    n_groups: usize,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let (eta, mut kappa) = probe_res(re, model, n_groups.max(1));
+    let (Some(levels), Some(cells)) = (model.nested_levels(), cells) else {
+        return (eta, kappa);
+    };
+    let widest = (0..levels.levels.len())
+        .map(|l| cells.level_count(l))
+        .max()
+        .unwrap_or(1);
+    let (_, by_group) = probe_res(re, model, widest.max(1));
+    for (g, row) in kappa.iter_mut().enumerate().take(cells.n_cells()) {
+        for (q, v) in row.iter_mut().enumerate() {
+            if let Some(&l) = levels.kappa_level.get(q) {
+                *v = by_group[cells.cell_group(g, l)][q];
+            }
+        }
+    }
+    (eta, kappa)
+}
+
+/// The κ groups — positions in the `kappas` [`predict_iov`](crate::pk::predict_iov)
+/// reads — that a kappa of unit `key` (of `unit`, [`unit_of`]) moves: the
+/// occasion's own group, or under nested levels every cell of the level's group
+/// (#1082), a cell with no observation in it too. Empty when the key names no
+/// group.
+fn unit_groups(
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    cells: Option<&NestedLayout>,
+    unit: Unit,
+    key: &[u64],
+) -> Vec<usize> {
+    match unit {
+        Unit::Subject => Vec::new(),
+        Unit::Occasion => key
+            .first()
+            .and_then(|&o| u32::try_from(o).ok())
+            .and_then(|o| layout.group_of(o))
+            .into_iter()
+            .collect(),
+        Unit::Level(l) => cells.map_or_else(Vec::new, |cells| {
+            (0..cells.n_cells())
+                .filter(|&g| {
+                    let path: Vec<u64> = cells.labels(g, l).iter().map(|v| v.to_bits()).collect();
+                    path == key
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Per unit of kappa `q` in one subject with `n_groups` occasion groups, the κ
+/// groups it moves ([`unit_groups`]): each occasion group on its own, or under
+/// nested levels the cells of each group of the kappa's level. `None` for a
+/// nested model whose subject has no cells, which measures nothing.
+fn kappa_units(
+    model: &CompiledModel,
+    cells: Option<&NestedLayout>,
+    n_groups: usize,
+    q: usize,
+) -> Option<Vec<Vec<usize>>> {
+    let Some(levels) = model.nested_levels() else {
+        return Some((0..n_groups.max(1)).map(|g| vec![g]).collect());
+    };
+    let (cells, &l) = (cells?, levels.kappa_level.get(q)?);
+    Some(
+        (0..cells.level_count(l))
+            .map(|group| {
+                (0..cells.n_cells())
+                    .filter(|&g| cells.cell_group(g, l) == group)
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// An orthonormal basis of the span of `cols` by modified Gram–Schmidt with one
@@ -2856,9 +3036,15 @@ fn carried(
             .iter()
             .map(|s| crate::stats::stacked_layout::StackedLayout::of(model, s))
             .collect();
+        let cells: Vec<Option<NestedLayout>> = population
+            .subjects
+            .iter()
+            .map(|s| NestedLayout::of(model, s))
+            .collect();
         let res: Vec<(Vec<f64>, Vec<Vec<f64>>)> = layouts
             .iter()
-            .map(|l| probe_res(re, model, l.n_groups().max(1)))
+            .zip(&cells)
+            .map(|(l, c)| subject_probe_res(re, model, c.as_ref(), l.n_groups()))
             .collect();
         // One population-wide column: per subject, the central difference of
         // its predictions under `perturb`, which moves θ or that subject's
@@ -2977,21 +3163,23 @@ fn carried(
         push_coded(own_coded, &mut cols, &mut tags);
 
         // Per unit of each random effect: its column. A unit is a subject for
-        // an η, an occasion group of a subject for a κ.
+        // an η, an occasion group of a subject for a κ, and under nested levels
+        // every cell of one group of the κ's level (#1082).
         let unit_cols = |r: usize, is_kappa: bool| -> Option<Vec<Pieces>> {
             let mut out = Vec::new();
             for s in 0..population.subjects.len() {
-                let units = if is_kappa {
-                    layouts[s].n_groups().max(1)
-                } else {
-                    1
+                let units = match is_kappa {
+                    true => kappa_units(model, cells[s].as_ref(), layouts[s].n_groups(), r)?,
+                    false => vec![Vec::new()],
                 };
-                for g in 0..units {
+                for groups in units {
                     let col = diff_col(&[s], SPAN_STEP, &|d, _, et, ka| match is_kappa {
                         false => et[r] += d,
                         true => {
-                            if let Some(row) = ka.get_mut(g) {
-                                row[r] += d;
+                            for &g in &groups {
+                                if let Some(row) = ka.get_mut(g) {
+                                    row[r] += d;
+                                }
                             }
                         }
                     })?;
@@ -3043,13 +3231,15 @@ fn carried(
             return Carried::Held;
         }
         // The random effects at a coarser-or-equal unit: the other η for an η,
-        // every η and the other κ for a κ.
+        // every η and the other κ for a κ — under nested levels the other κ at
+        // its own level or an outer one (#1082).
+        let level_of = |q: usize| model.nested_levels().and_then(|n| n.kappa_level.get(q));
         let coarser: Vec<(usize, bool)> = (0..model.n_eta)
             .filter(|&e| kappa || e != index)
             .map(|e| (e, false))
             .chain(
                 (0..model.n_kappa)
-                    .filter(|&q| kappa && q != index)
+                    .filter(|&q| kappa && q != index && level_of(q) <= level_of(index))
                     .map(|q| (q, true)),
             )
             .collect();
@@ -3125,6 +3315,9 @@ struct Measured {
     /// Whether a dose of the model can arrive after its record
     /// ([`lagged_arrivals`]), measured or not: [`replicates`] reads it.
     lagged: bool,
+    /// The model's nested levels (#1082), measured or not: a kappa's unit is a
+    /// group of its own level ([`Unit::Level`]).
+    nested: Option<NestedLevels>,
 }
 
 /// Whether a dose of `model` can change the state at a time the data does not
@@ -3170,6 +3363,7 @@ fn measure_levels(
         .collect();
     let model = parse_full_model_with(model_text, &none)?.model;
     let lagged = lagged_arrivals(&model);
+    let nested = model.nested_levels().cloned();
     if !dead_check_reads_every_channel(&model) {
         return Ok(decls
             .iter()
@@ -3178,6 +3372,7 @@ fn measure_levels(
                 spanned: vec![None; decl.eta_couplings.len()],
                 model: None,
                 lagged,
+                nested: nested.clone(),
             })
             .collect());
     }
@@ -3186,7 +3381,7 @@ fn measure_levels(
         .iter()
         .zip(discovered)
         .map(|(decl, levels)| {
-            let silent: Vec<(usize, Unit)> = placements(decl, population, lagged)
+            let silent: Vec<(usize, Unit)> = placements(decl, population, lagged, nested.as_ref())
                 .into_iter()
                 .enumerate()
                 .filter_map(|(k, placement)| match placement {
@@ -3199,6 +3394,7 @@ fn measure_levels(
                 spanned: spanned(&model, decl, levels, population, &silent),
                 model: Some(model.clone()),
                 lagged,
+                nested: nested.clone(),
             }
         })
         .collect())
@@ -3535,10 +3731,11 @@ fn resolve_contrast(
             // occasion, which the within-group contrast removes as it does an η.
             if found.kappa() {
                 return Err(format!(
-                    "{block}: `contrast = {}` lets the levels reproduce `{}` at every occasion: \
+                    "{block}: `contrast = {}` lets the levels reproduce `{}` at every {}: \
                      {why} — the two are the same quantity, so the model is not identified.{fix}",
                     contrast_token(resolved),
                     found.name(),
+                    found.unit,
                 ));
             }
             return Err(format!(
@@ -3625,11 +3822,14 @@ fn one_column_message(
 ) -> String {
     let (unit, whose) = if found.kappa() {
         (
-            "lies within a single occasion of one subject",
-            "that occasion's",
+            format!("lies within a single {} of one subject", found.unit),
+            format!("that {}'s", found.unit),
         )
     } else {
-        ("belongs to a single subject", "that subject's")
+        (
+            "belongs to a single subject".to_string(),
+            "that subject's".to_string(),
+        )
     };
     let column = &decl.columns()[0];
     let Some(alt) = alt else {
@@ -3728,19 +3928,23 @@ fn jointly_absorbed_message(
     }
     // Within leaves each unit's mean to one of them: a subject's when an η is
     // among them, an occasion's when they are all kappas (F6).
+    // Kappas at two nested levels (#1082) share no one unit name: a group.
     let unit = if absorbed.iter().all(|a| a.kappa()) {
-        "occasion"
+        match absorbed.split_first() {
+            Some((a, rest)) if rest.iter().all(|b| b.unit == a.unit) => a.unit.clone(),
+            _ => "group".to_string(),
+        }
     } else {
-        "subject"
+        "subject".to_string()
     };
     // A one-column block has no within rescue and dropping one random effect
     // does not help: each level lies within one unit, so the block absorbs
     // every one of them on its own (#1880).
     if decl.columns().len() == 1 {
-        let within = if unit == "occasion" {
-            "a single occasion of one subject"
+        let within = if unit == "subject" {
+            "a single subject".to_string()
         } else {
-            "a single subject"
+            format!("a single {unit} of one subject")
         };
         return format!(
             "{block}: each `{}` level lies within {within}, and the levels absorb {} and {last} \
