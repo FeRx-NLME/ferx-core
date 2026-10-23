@@ -141,6 +141,10 @@ pub enum MatchMethod {
 }
 ```
 
+Propensity-score matching is refused on a `[mixture]` model
+(`E_PROPENSITY_INPUT`): each subject's posthoc η would be estimated under class 1
+rather than under its own class. Simulate without `match_method` instead.
+
 With `match_method`, `horizon` and `iov_occasion` all `None` this is identical
 to `simulate_with_seed()` (or `simulate()` when `seed` is `None`).
 
@@ -497,6 +501,10 @@ pub struct PredictionResult {
 
 For each replicate and each subject:
 
+1. Under a `[mixture]` model, draw the subject's class $k$ from its mixing
+   probabilities, evaluated at its own covariates, and run the steps below with
+   `MIXNUM = k` and class $k$'s Ω and Σ. See
+   [Mixture models: simulation](../estimation/mixture.qmd#simulation-under-a-mixture).
 1. Sample random effects: $\eta_i \sim N(0, \Omega)$ using the Cholesky factor $L$: $\eta = L \cdot z$, where $z \sim N(0, I)$
 2. Generate predictions through the same time-varying-covariate-aware dispatcher
    used by estimation and `predict()` (`compute_predictions_with_tv`). PK

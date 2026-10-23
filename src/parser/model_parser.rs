@@ -16960,6 +16960,7 @@ fn build_mixture_params(
 
     let mut omega_override_addr: Vec<(usize, usize)> = Vec::new();
     let mut omega_override_fixed: Vec<bool> = Vec::new();
+    let mut omega_override_var: Vec<f64> = Vec::new();
     for ov in &spec.omega_overrides {
         let e = base_omega
             .eta_names
@@ -16969,6 +16970,7 @@ fn build_mixture_params(
         let c = ov.class - 1; // class is 1-based, validated >= 2 in Phase 1
         let variance = if ov.as_sd { ov.init * ov.init } else { ov.init };
         work_omega[c][(e, e)] = variance;
+        omega_override_var.push(variance);
         omega_override_addr.push((c, e));
         omega_override_fixed.push(ov.fixed);
     }
@@ -16991,13 +16993,37 @@ fn build_mixture_params(
 
     let omega = (0..k)
         .map(|c| {
-            OmegaMatrix::from_matrix_with_mask(
+            let mut om = OmegaMatrix::from_matrix_with_mask(
                 work_omega[c].clone(),
                 base_omega.eta_names.clone(),
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
-            .with_block_declared(base_omega.block_declared.clone())
+            .with_block_declared(base_omega.block_declared.clone());
+            // A class seeds from the base's regularised `matrix`, which has lost a declared
+            // `~ 0.0`. Carry the base's simulation factor over instead (#1605, #2163): as is
+            // when no `omega(k)` touches the class, otherwise rebuilt on the diagonal that
+            // overrides require, from each override's own declared variance.
+            if let Some(base_l) = &base_omega.sim_chol {
+                let overrides: Vec<(usize, f64)> = omega_override_addr
+                    .iter()
+                    .zip(&omega_override_var)
+                    .filter(|((oc, _), _)| *oc == c)
+                    .map(|(&(_, e), &variance)| (e, variance))
+                    .collect();
+                if overrides.is_empty() {
+                    om.sim_chol = Some(base_l.clone());
+                } else {
+                    let mut l = base_l.clone();
+                    for &(e, variance) in &overrides {
+                        l[(e, e)] = variance.sqrt();
+                    }
+                    if (0..l.nrows()).any(|e| l[(e, e)] == 0.0) {
+                        om.sim_chol = Some(l);
+                    }
+                }
+            }
+            om
         })
         .collect();
     let sigma = (0..k)

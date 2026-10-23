@@ -112,8 +112,9 @@ pub(crate) fn simulate_horizon(message: impl Into<String>) -> EngineError {
 }
 
 /// `E_PROPENSITY_INPUT`: propensity-score matching was requested on a population it
-/// cannot compute posthoc etas from — empty, a subject with no observations, or a
-/// subject with a non-finite `DV`.
+/// cannot compute posthoc etas from — empty, a subject with no observations, a
+/// subject with a non-finite `DV`, or a `[mixture]` model, whose posthoc etas would be
+/// estimated under class 1 rather than each subject's own class (#2163).
 pub(crate) fn propensity_input(message: impl Into<String>) -> EngineError {
     coded("E_PROPENSITY_INPUT", None, message.into())
 }
