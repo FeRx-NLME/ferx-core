@@ -273,6 +273,21 @@ const DATA_BASELINE_FROM_STATE_ROW: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,
                                             1,8,1,0,.,5,0,0,0,0,0\n\
                                             1,20,0,0,.,5,0,0,0,0,0\n";
 
+/// The round-3 review's shape: the `WT = 1` state row comes first but has a missing DV,
+/// so the reader skips it and keeps no snapshot of it — yet it still sets the subject's
+/// baseline (`Subject::covariates`, the first finite value on any row), which is what the
+/// CTMM solve reads. Every retained snapshot carries `WT = 0`, so only a comparison
+/// against that baseline sees the change.
+const DATA_BASELINE_FROM_A_SKIPPED_ROW: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n\
+                                                1,0,.,0,.,5,0,0,0,0,1\n\
+                                                1,0,.,1,100,1,0,1,0,0,0\n\
+                                                1,1,9,0,.,1,0,0,0,0,0\n\
+                                                1,1.3,1,0,.,5,0,0,0,0,0\n\
+                                                1,2.6,0,0,.,5,0,0,0,0,0\n\
+                                                1,6,.,1,100,1,0,1,0,0,0\n\
+                                                1,8,1,0,.,5,0,0,0,0,0\n\
+                                                1,20,0,0,.,5,0,0,0,0,0\n";
+
 const WT_CL: &str = "TVCL * (1.0 + WT / 70)";
 
 /// `fit()` refuses a TV covariate on `CL` on both fixtures, though no dose or PK record
@@ -285,6 +300,10 @@ fn fit_refuses_a_tv_covariate_seen_only_on_ctmm_rows() {
     for (name, csv) in [
         ("change on state rows", DATA_WT_ON_STATE_ROWS),
         ("baseline from a state row", DATA_BASELINE_FROM_STATE_ROW),
+        (
+            "baseline from a skipped row",
+            DATA_BASELINE_FROM_A_SKIPPED_ROW,
+        ),
     ] {
         let pop = population_from(&refusing, csv);
         assert_eq!(

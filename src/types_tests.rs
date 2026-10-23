@@ -4256,3 +4256,20 @@ fn time_varying_covariate_names_inspects_endpoint_rows() {
     s.endpoint_covariates = vec![HashMap::from([("WT".to_string(), 1.0)])];
     assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
 }
+
+#[test]
+fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
+    // #1854 round 3: the baseline the CTMM solve reads is `covariates`, the first finite
+    // value on any row — including a row dropped before any snapshot was kept. When every
+    // retained snapshot agrees with each other but not with that baseline, the covariate
+    // is time-varying for the baseline-only paths.
+    let mut s = bare_subject("1");
+    s.covariates = HashMap::from([("WT".to_string(), 1.0), ("AGE".to_string(), 40.0)]);
+    let at = |wt: f64| HashMap::from([("WT".to_string(), wt), ("AGE".to_string(), 40.0)]);
+    s.dose_covariates = vec![at(0.0), at(0.0)];
+    s.endpoint_covariates = vec![at(0.0)];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    // Control: snapshots equal to the baseline are not time-varying.
+    s.covariates.insert("WT".to_string(), 0.0);
+    assert!(s.time_varying_covariate_names().is_empty());
+}

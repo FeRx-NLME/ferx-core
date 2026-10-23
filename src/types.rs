@@ -1442,7 +1442,8 @@ impl Subject {
     }
 
     /// Names of covariates whose value **varies within this subject**, i.e. is
-    /// not constant across the per-observation / per-dose / per-EVID2 LOCF
+    /// not constant across the subject-static baseline (`covariates`) and the
+    /// per-observation / per-dose / per-EVID2 / reset / endpoint LOCF
     /// snapshots. Returns an empty vector when the subject has no time-varying
     /// covariates (the common case — snapshots are empty or all equal).
     ///
@@ -1458,9 +1459,14 @@ impl Subject {
         // First value seen per covariate; a later differing value marks it varying.
         let mut first_seen: HashMap<&str, f64> = HashMap::new();
         let mut varying: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let snapshots = self
-            .obs_covariates
-            .iter()
+        // Seeded with the subject-static map (#1854): it is the baseline every
+        // "evaluate `$PK` once at the start" path reads (the inhomogeneous CTMM solve,
+        // the survival hazards), and the reader takes it from the first finite value on
+        // *any* row — including one later dropped by `[data_selection]` or skipped for a
+        // missing DV, which leaves no snapshot behind. A covariate whose every retained
+        // snapshot differs from that baseline is therefore time-varying for those paths.
+        let snapshots = std::iter::once(&self.covariates)
+            .chain(self.obs_covariates.iter())
             .chain(self.dose_covariates.iter())
             .chain(self.pk_only_covariates.iter())
             // EVID=3/4 rows too (#1133): a reset row's `$PK` seeds `[odes] init(...)`, so a
