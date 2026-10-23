@@ -7193,6 +7193,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_ode_tolerance_not_tightened") {
+        // #520: the covariance step's finite-difference matrices were meant to integrate at the
+        // `1e-6` / `1e-8` plateau and ran at the fit's own tolerance instead, because the scope
+        // carrying it could not be built. Present but possibly inflated SEs — a warning on the
+        // covariance route, not `CovarianceRegularized`, which asserts the eigenvalue floor
+        // fired. Its own token, ahead of the prose arms, so `run_covariance` (which replaces
+        // `CovarianceStep` warnings) cannot leave a stale copy behind after a clean re-run.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the

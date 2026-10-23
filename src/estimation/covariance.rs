@@ -863,14 +863,17 @@ fn analytic_cov_declines(
     out
 }
 
-/// How much the step budget grows for a stencil tightened by [`fd_stencil_ode_override`].
+/// How much the step budget grows for a step tightened by [`cov_ode_override`].
 /// Tightening the default `ode_reltol` 100× costs an order-`p` stepper ~100^(1/p) more steps:
 /// ~2.5× for rk45, ~4.6× for rosenbrock23, whose step control runs on an O(h³) local error.
 /// 10 covers both with 2× headroom; it is a cap, paid only by a solve that needs it.
 const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 
-/// The ODE solver override the covariance step's finite-difference stencil runs under (#520),
-/// or `None` to run it at the fit's own tolerance.
+/// The ODE solver override the covariance step's finite-difference matrices run under (#520),
+/// or `None` to run them at the fit's own tolerance: `R`'s objective stencil, and the score
+/// cross-product `S` — whose per-subject θ scores are differenced too, forward or central,
+/// even on the closed-form gradient paths — so `s` and `rsr` are not left at the loose
+/// tolerance an `r` no longer uses (#520 review round 2).
 ///
 /// The stencil divides by `h²`, so it amplifies integration noise the fit's optimizer averages
 /// over: on the 3-cpt IV ODE fixture (180 subjects, `analytic_cov_hessian = false`) the default
@@ -897,7 +900,7 @@ const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 /// `(θ, η)`, so a transit / inverse-Gaussian subject can reach its twin at a perturbed stencil
 /// point only, which no per-subject prediction sees (#520 review). Arming the override on a
 /// model whose subjects never integrate changes no number; it costs a pool lease.
-fn fd_stencil_ode_override(
+fn cov_ode_override(
     model: &CompiledModel,
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
@@ -925,17 +928,39 @@ fn fd_stencil_ode_override(
     })
 }
 
-/// The warning for a stencil [`fd_stencil_ode_override`] meant to tighten but could not, because
-/// the scope carrying the tighter tolerance could not be built (`reason`).
-fn stencil_scope_failure_warning(reason: &str) -> String {
-    use crate::estimation::cov_diagnostics::{COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL};
+/// The warning for a covariance step [`cov_ode_override`] meant to tighten but could not,
+/// because the scope carrying the tighter tolerance could not be built (`reason`).
+pub(crate) fn stencil_scope_failure_warning(reason: &str) -> String {
+    use crate::estimation::cov_diagnostics::{
+        COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL, ODE_TOLERANCE_NOT_TIGHTENED_TOKEN,
+    };
     format!(
-        "Covariance step: the finite-difference stencil could not be run at ode_reltol = \
-         {COV_FD_PLATEAU_RELTOL:.0e} / ode_abstol = {COV_FD_PLATEAU_ABSTOL:.0e} ({reason}) and \
-         ran at the fit's own ODE tolerance instead; it amplifies integration noise by 1/h², so \
-         these standard errors may be inflated. Set ode_reltol / ode_abstol to at most those \
-         values to compute them at the plateau (#520)."
+        "{ODE_TOLERANCE_NOT_TIGHTENED_TOKEN}: Covariance step: the finite-difference matrices \
+         could not be run at ode_reltol = {COV_FD_PLATEAU_RELTOL:.0e} / ode_abstol = \
+         {COV_FD_PLATEAU_ABSTOL:.0e} ({reason}) and ran at the fit's own ODE tolerance instead; \
+         finite differences amplify integration noise, so these standard errors may be \
+         inflated. Set ode_reltol / ode_abstol to at most those values to compute them at the \
+         plateau (#520)."
     )
+}
+
+/// Run `f` under the covariance ODE override `tight` ([`cov_ode_override`]), or as it is when
+/// there is none. A scope that cannot be built (a pool that cannot be leased) runs `f` at the
+/// fit's tolerance — never without a covariance step, and never silently: the warning is
+/// recorded in `failure`.
+fn in_cov_ode_scope<R: Send>(
+    options: &FitOptions,
+    tight: Option<crate::ode::solver::OdeSolverOverride>,
+    failure: &std::cell::RefCell<Option<String>>,
+    f: impl Fn() -> R + Sync,
+) -> R {
+    match tight {
+        Some(ov) => crate::api::with_fit_scope_ode(options, ov, &f).unwrap_or_else(|e| {
+            *failure.borrow_mut() = Some(stencil_scope_failure_warning(&e.to_string()));
+            f()
+        }),
+        None => f(),
+    }
 }
 
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
@@ -2098,11 +2123,17 @@ pub(crate) fn compute_covariance_for(
     // The score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free block, at the fit's own modes.
     // `None` when a cancel landed during the per-subject loop, whose placeholder rows are then
     // never trusted.
+    //
+    // Under the covariance ODE override, like `R`'s stencil below (#520 review round 2).
+    let tight = cov_ode_override(model, options);
+    let scope_failure = std::cell::RefCell::new(None);
     let score_cross_product = || {
-        let s = assemble_score_cross_product(
-            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
-            &free_idx,
-        );
+        let s = in_cov_ode_scope(options, tight, &scope_failure, || {
+            assemble_score_cross_product(
+                x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
+                &free_idx,
+            )
+        });
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
 
@@ -2130,7 +2161,7 @@ pub(crate) fn compute_covariance_for(
         }
         return CovarianceStepResult::Success(CovarianceOutput {
             matrix: embed_free(&cov_free, &free_idx, n),
-            warnings: Vec::new(),
+            warnings: scope_failure.borrow_mut().take().into_iter().collect(),
             method: CovarianceMethod::CrossProduct,
         });
     }
@@ -2264,7 +2295,6 @@ pub(crate) fn compute_covariance_for(
     // The tolerances the stencil below integrated at, for the regularization message: the
     // fit's own, or the plateau the stencil was tightened to (#520). Read where it ran.
     let mut stencil_ode: Option<OdeToleranceFacts> = None;
-    let mut stencil_scope_failure: Option<String> = None;
 
     if let Some(scope) = fd_scope.as_ref() {
         // Test-only: every objective the probe and the stencil evaluate, counted across the
@@ -2294,7 +2324,6 @@ pub(crate) fn compute_covariance_for(
         // tolerance left the SEs 2–7× too large with no warning. All of them, or the base is
         // differenced against points from a different objective — so the whole-population
         // base is re-evaluated here rather than taken from `base_ofv`.
-        let tight = fd_stencil_ode_override(model, options);
         let run_stencil = || {
             let f0_fd = match scope {
                 FdScope::Whole if tight.is_none() => base_ofv,
@@ -2315,18 +2344,7 @@ pub(crate) fn compute_covariance_for(
             );
             (stencil, OdeToleranceFacts::from_route(model, population))
         };
-        let (stencil, ode_seen) = match tight {
-            // A scope that cannot be built (a pool that cannot be leased) leaves the stencil at
-            // the fit's tolerance, as before #520 — never without a covariance step, and never
-            // silently: the warning says the SEs were not computed at the plateau.
-            Some(ov) => {
-                crate::api::with_fit_scope_ode(options, ov, &run_stencil).unwrap_or_else(|e| {
-                    stencil_scope_failure = Some(stencil_scope_failure_warning(&e.to_string()));
-                    run_stencil()
-                })
-            }
-            None => run_stencil(),
-        };
+        let (stencil, ode_seen) = in_cov_ode_scope(options, tight, &scope_failure, run_stencil);
         stencil_ode = ode_seen;
         #[cfg(test)]
         FD_OBJECTIVE_EVALS
@@ -2572,7 +2590,7 @@ pub(crate) fn compute_covariance_for(
 
     let cov = embed_free(&cov_free, &free_idx, n);
 
-    let mut cov_warnings: Vec<String> = stencil_scope_failure.into_iter().collect();
+    let mut cov_warnings: Vec<String> = scope_failure.borrow_mut().take().into_iter().collect();
 
     // #1514: name the salvaged subjects, unconditionally — not only when the eigenvalue floor
     // fired. The route is a property of the numbers on the page, and a user comparing two runs

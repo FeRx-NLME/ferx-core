@@ -1577,30 +1577,33 @@ fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
 /// it is looser, so a tight `reltol` with a loose `abstol` moves `abstol` alone.
 #[test]
 fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
-    use crate::types::FitOptions;
+    use crate::types::{CovarianceMethod, FitOptions};
     let mut population = crate::io::datareader::read_nonmem_csv(
         std::path::Path::new("data/two_cpt_oral_cov.csv"),
         None,
         None,
     )
     .expect("two_cpt_oral_cov.csv loads");
-    population.subjects.truncate(6);
+    // Twelve for the estimators that read `S`: it is a sum of per-subject rank-1 terms, and six
+    // subjects over five free coordinates leave it rank-deficient, so `s` would be refused before
+    // any tolerance is compared. `r` keeps the first six, the cost of its stencil.
+    population.subjects.truncate(12);
     let options = FitOptions {
         analytic_cov_hessian: false,
         ..FitOptions::default()
     };
 
     let default = ode_model_at(None);
-    let ov = super::fd_stencil_ode_override(&default, &options)
+    let ov = super::cov_ode_override(&default, &options)
         .expect("a default-tolerance ODE model is tightened");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
     let plateau = ode_model_at(Some((1e-6, 1e-8)));
-    assert!(super::fd_stencil_ode_override(&plateau, &options).is_none());
+    assert!(super::cov_ode_override(&plateau, &options).is_none());
     let mixed = ode_model_at(Some((1e-9, 1e-6)));
-    let ov = super::fd_stencil_ode_override(&mixed, &options).expect("abstol");
+    let ov = super::cov_ode_override(&mixed, &options).expect("abstol");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-9), Some(1e-8)));
     assert!(
-        super::fd_stencil_ode_override(&padded_ode_model(0), &options).is_none(),
+        super::cov_ode_override(&padded_ode_model(0), &options).is_none(),
         "a linear model solved by matrix exponential carries no integration noise"
     );
 
@@ -1618,31 +1621,59 @@ fn the_fd_covariance_stencil_integrates_at_the_plateau_tolerance() {
         })
         .unzip();
     let kappas = vec![Vec::new(); population.subjects.len()];
-    let cov = |m: &crate::types::CompiledModel| match super::compute_covariance(
-        &x,
-        &p,
-        m,
-        &population,
-        &etas,
-        &hs,
-        &kappas,
-        &options,
-    ) {
-        super::CovarianceStepResult::Success(out) => out.matrix,
-        _ => panic!("the stencil step succeeds"),
-    };
-    let at_default = cov(&default);
-    let at_plateau = cov(&plateau);
-    let at_tight = cov(&ode_model_at(Some((1e-9, 1e-11))));
-    assert!(at_default.iter().all(|v| v.is_finite()));
-    assert_eq!(
-        at_default, at_plateau,
-        "the default-tolerance stencil must run at the 1e-6 / 1e-8 plateau"
-    );
-    assert_ne!(
-        at_plateau, at_tight,
-        "control: the stencil must read the tolerance at all"
-    );
+    // `r` (the stencil alone), `s` (the score matrix alone) and `rsr` (both): each finite-
+    // differenced matrix runs under the override, so each estimator is checked on its own
+    // (#520 review round 2 — `S` was first left at the fit's tolerance).
+    for (method, n_subj) in [
+        (CovarianceMethod::Hessian, 6),
+        (CovarianceMethod::CrossProduct, 12),
+        (CovarianceMethod::Sandwich, 12),
+    ] {
+        let mut population = population.clone();
+        population.subjects.truncate(n_subj);
+        let (etas, hs, kappas) = (&etas[..n_subj], &hs[..n_subj], &kappas[..n_subj]);
+        let options = FitOptions {
+            covariance_method: method,
+            ..options.clone()
+        };
+        let cov = |m: &crate::types::CompiledModel| match super::compute_covariance(
+            &x,
+            &p,
+            m,
+            &population,
+            etas,
+            hs,
+            kappas,
+            &options,
+        ) {
+            super::CovarianceStepResult::Success(out) => {
+                assert!(
+                    !out.warnings
+                        .iter()
+                        .any(|w| w.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED")),
+                    "{method:?}: the tight scope was built, so nothing fell back: {:?}",
+                    out.warnings
+                );
+                out.matrix
+            }
+            super::CovarianceStepResult::Unusable(r) => panic!("{method:?}: {r}"),
+            super::CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("{method:?}: {reason}")
+            }
+        };
+        let at_default = cov(&default);
+        let at_plateau = cov(&plateau);
+        let at_tight = cov(&ode_model_at(Some((1e-9, 1e-11))));
+        assert!(at_default.iter().all(|v| v.is_finite()), "{method:?}");
+        assert_eq!(
+            at_default, at_plateau,
+            "{method:?}: the default-tolerance step must run at the 1e-6 / 1e-8 plateau"
+        );
+        assert_ne!(
+            at_plateau, at_tight,
+            "{method:?}: control — the step must read the tolerance at all"
+        );
+    }
 }
 
 /// #520 review: the override keys on the model *having* an integrator, not on the per-subject
@@ -1683,10 +1714,10 @@ fn the_fd_stencil_override_covers_a_transit_twin_the_route_walk_cannot_see() {
         "control: the route walk sees no integration on this population"
     );
     let options = FitOptions::default();
-    let ov = super::fd_stencil_ode_override(&transit, &options)
+    let ov = super::cov_ode_override(&transit, &options)
         .expect("a transit model's twin is tightened whatever the route walk says");
     assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
-    assert!(super::fd_stencil_ode_override(&closed, &options).is_none());
+    assert!(super::cov_ode_override(&closed, &options).is_none());
 }
 
 /// #520 review: a stencil that could not be tightened says so, naming the reason, what it ran
@@ -1694,7 +1725,21 @@ fn the_fd_stencil_override_covers_a_transit_twin_the_route_walk_cannot_see() {
 #[test]
 fn the_stencil_scope_failure_warning_names_the_fallback_and_the_remedy() {
     let msg = super::stencil_scope_failure_warning("pool could not be built");
+    // Its own token, classified as a covariance-step warning, so a `run_covariance` re-run
+    // replaces it rather than leaving a stale copy beside a clean step (#520 review round 2).
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(
+        entry.category,
+        crate::types::WarningCode::CovarianceStep,
+        "{msg}"
+    );
+    assert_eq!(
+        entry.severity,
+        crate::types::WarningSeverity::Warning,
+        "{msg}"
+    );
     for part in [
+        "W_COV_ODE_TOLERANCE_NOT_TIGHTENED:",
         "ode_reltol = 1e-6 / ode_abstol = 1e-8",
         "(pool could not be built)",
         "ran at the fit's own ODE tolerance",

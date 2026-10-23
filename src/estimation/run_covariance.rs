@@ -547,6 +547,16 @@ mod tests {
         assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
     }
 
+    /// #520 review round 2: a covariance step whose ODE tolerance could not be tightened warns
+    /// about *that* step, so a re-run must replace the warning — a stale "could not be run at
+    /// the plateau" beside a clean re-run would misreport the SEs it now carries.
+    #[test]
+    fn the_ode_tolerance_not_tightened_warning_is_superseded_by_a_rerun() {
+        let msg = crate::estimation::covariance::stencil_scope_failure_warning("no pool");
+        assert!(is_covariance_step_warning(&msg), "{msg}");
+        assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
+    }
+
     fn copy_example_to_tempdir(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         // Hash-mismatch tests mutate the source files; copy them so the
         // checked-in examples are never touched.
