@@ -734,10 +734,11 @@ sparsely-sampled PK).
   imp_eval_only  = true
 ```
 
-> On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
-> warm-start with `[focei, imp]`; plain `imp`'s one-iteration-lagged proposal
-> can collapse the ESS on a sharp posterior. See the
-> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-prefer-impmap-or-warm-start).
+> Plain `imp` runs from a cold start on rich data since #1365. If the low-ESS
+> count stays high, warm-start with `[focei, imp]` or switch to
+> [`impmap`](#impmap-importance_sampling_map), which re-centres on the mode every
+> iteration. See the
+> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-and-cold-starts).
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -761,7 +762,7 @@ Like the estimating `imp`, `impmap` is a Monte-Carlo EM **estimator** —
 equivalent to NONMEM `METHOD=IMPMAP`. The difference is the proposal: `impmap`
 re-centers at the freshly-computed conditional mode (MAP) **every** iteration
 (robust on rich data), whereas `imp` re-centers from the previous iteration's
-sample moments (cheaper, but fragile on rich data). Both update θ/Ω/σ from the
+sample moments (cheaper; see the note above on sharp posteriors). Both update θ/Ω/σ from the
 importance-weighted posterior moments. It runs standalone or as a chain stage:
 
 ```

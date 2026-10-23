@@ -196,6 +196,26 @@ fn covariance_to_proposal_hessian(
     }
 }
 
+/// Move one subject's stored IMP proposal moments by `−shift` in η-space,
+/// keeping the weighted covariance `S − m mᵀ` unchanged.
+///
+/// The closed-form mu-ref step adds `δ_e` to the packed θ (= mu) anchoring η_e,
+/// so the individual parameter `φ = mu + η` is unchanged only if the posterior of
+/// η_e moves by `−δ_e`. IMP (`SampleMoments`) centres the next iteration's
+/// proposal on the stored weighted mean, so leaving it stale puts the proposal
+/// `δ_e` off the posterior it is meant to sample — from a cold start several
+/// posterior SDs on the first iteration, which is what collapsed every subject's
+/// ESS on iteration 2 (#1365). This is the plain-pair twin of the #619 group
+/// step's `recentre_eta` bookkeeping.
+fn shift_proposal_moments(d: &mut SubjectDraws, shift: &[f64]) {
+    let m_old = DVector::from_column_slice(&d.mean);
+    for (m, &s) in d.mean.iter_mut().zip(shift.iter()) {
+        *m -= s;
+    }
+    let m_new = DVector::from_column_slice(&d.mean);
+    d.second_moment = &d.second_moment - &m_old * m_old.transpose() + &m_new * m_new.transpose();
+}
+
 /// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
 /// position — the proxy both the #406 IMP/IMPMAP advisory
 /// ([`non_fixed_unanchored_thetas`]) and the #1011 SAEM M-step damping gate use
@@ -1461,14 +1481,26 @@ fn run_mcem(
             for acc in eta_bar.iter_mut() {
                 *acc /= n_subjects as f64;
             }
+            // The shift actually applied per η (after the bound clamp), for the
+            // IMP proposal recentre below.
+            let mut applied = vec![0.0f64; n_eta];
             for &(t, e) in &mu_ref_pairs {
                 // Weak-IIV mu-ref θ were already updated by the weighted M-step;
                 // their η-mean shift is ≈ 0 and uninformative — skip it.
                 if weak_mu_ref.contains(&t) {
                     continue;
                 }
+                let before = log_theta[t];
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
+                applied[e] = log_theta[t] - before;
+            }
+            // Keep φ fixed across the shift for the next IMP proposal (#1365);
+            // see `shift_proposal_moments`. IMPMAP re-solves the mode instead.
+            if recenter == ProposalRecenter::SampleMoments && applied.iter().any(|&a| a != 0.0) {
+                for d in draws.iter_mut() {
+                    shift_proposal_moments(d, &applied);
+                }
             }
         }
 
@@ -2631,13 +2663,15 @@ fn run_mcem_mixture(
 
         // (a2) Apply the class-aware closed-form mu-ref θ shift computed above:
         //      log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic) over the classes θ_k serves.
-        // The draws are not re-centred: Ω below is the weighted second moment
-        // about zero of these same draws, which is what the single-population
-        // `run_mcem` also uses (its shift likewise leaves the draws alone), and
-        // the next E-step re-solves at the updated θ.
+        // Ω below is the weighted second moment about zero of these same draws,
+        // which is what the single-population `run_mcem` also uses, so the
+        // draws are re-centred only after it, for the next IMP proposal.
+        let mut applied_shift = vec![0.0f64; n_theta];
         for (t, shift) in mu_ref_shift.iter().enumerate() {
             let Some(mean_eta) = shift else { continue };
+            let before = log_theta[t];
             log_theta[t] = (log_theta[t] + mean_eta).clamp(log_theta_lower[t], log_theta_upper[t]);
+            applied_shift[t] = log_theta[t] - before;
         }
 
         theta_cur = (0..n_theta)
@@ -2706,6 +2740,26 @@ fn run_mcem_mixture(
                 .collect(),
         );
         prev_draws = if recenter == ProposalRecenter::SampleMoments {
+            // Keep φ fixed across the class-aware shift (#1365): class `c`'s
+            // posterior of η moved by minus the shift of the θ serving `c`.
+            // (`prev_means` above only warm-starts the inner solve, which IMP
+            // runs on iteration 1 alone.)
+            let mut draws_by_class = draws_by_class;
+            for (c, class) in draws_by_class.iter_mut().enumerate() {
+                let mut shift = vec![0.0f64; n_eta];
+                for pair in &mix_mu_ref_pairs {
+                    if let Some(&t) = pair.theta_idx.get(c) {
+                        if t < n_theta {
+                            shift[pair.eta_idx] = applied_shift[t];
+                        }
+                    }
+                }
+                if shift.iter().any(|&a| a != 0.0) {
+                    for d in class.iter_mut() {
+                        shift_proposal_moments(d, &shift);
+                    }
+                }
+            }
             Some(draws_by_class)
         } else {
             None
@@ -4255,6 +4309,38 @@ mod tests {
             &[],
         );
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
+
+    #[test]
+    fn shift_proposal_moments_moves_the_mean_and_keeps_the_covariance() {
+        // #1365: after the closed-form mu-ref step adds δ to the packed θ, the
+        // stored IMP proposal moments must move by −δ on that η and leave the
+        // weighted covariance S − m mᵀ untouched — including its cross terms
+        // with an η that did not move. Before the fix the moments were left
+        // stale, so the next proposal sat δ off the posterior.
+        let mean = vec![0.4, -0.2];
+        let cov = DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.05]);
+        let m = DVector::from_column_slice(&mean);
+        let mut d = SubjectDraws::cancelled(2);
+        d.mean = mean.clone();
+        d.second_moment = &cov + &m * m.transpose();
+
+        shift_proposal_moments(&mut d, &[0.35, 0.0]);
+
+        assert!((d.mean[0] - 0.05).abs() < 1e-15, "mean[0] = {}", d.mean[0]);
+        assert_eq!(d.mean[1], -0.2, "an unshifted η keeps its mean");
+        let m_new = DVector::from_column_slice(&d.mean);
+        let cov_new = &d.second_moment - &m_new * m_new.transpose();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (cov_new[(i, j)] - cov[(i, j)]).abs() < 1e-15,
+                    "covariance must be preserved at ({i},{j}): {} vs {}",
+                    cov_new[(i, j)],
+                    cov[(i, j)]
+                );
+            }
+        }
     }
 
     #[test]
