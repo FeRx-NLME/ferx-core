@@ -3659,6 +3659,16 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// How many legs the mid-leg basin probe has ended in this process (#2093), so a test can
+/// see the probe itself fire rather than infer it from where a multimodal fit lands. A
+/// process-wide counter, not a thread-local: `fit` runs the optimizer on its own pool's
+/// worker, not the caller's thread. Concurrent tests can only add to it, so an assertion
+/// that it moved is sound; one that it stayed still would not be.
+// Read only by the `nn`-gated end-to-end test, so built only with it (else dead code).
+#[cfg(all(test, feature = "nn"))]
+pub(crate) static BASIN_PROBE_STOPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The best point an optimizer has seen so far — a run's single source of truth
 /// for "where the fit actually is".
 ///
@@ -5125,6 +5135,8 @@ fn optimize_nlopt_once(
                     if let Some(gap) = cold_solve_beats_best_seen(Some(cold), best) {
                         state.stagnation_stopped = true;
                         basin_probe_stopped = true;
+                        #[cfg(all(test, feature = "nn"))]
+                        BASIN_PROBE_STOPS.fetch_add(1, Ordering::Relaxed);
                         if verbose {
                             eprintln!(
                                 "Eval {:>4}: basin probe — a cold re-solve at the best point \
