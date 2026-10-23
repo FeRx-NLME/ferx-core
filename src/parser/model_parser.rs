@@ -3156,6 +3156,12 @@ fn leaf_scales(
         }
         let at = e as *const Expression as usize;
         match e {
+            // Unary minus (`0 - x`) is a sign, not a term: a negated factor
+            // stays a factor of its product, so `TVCL * -exp(η) * -exp(η)`
+            // still reaches one terminal twice.
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                walk(r, is_leaf, end, chain, out);
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
                 walk(l, is_leaf, end, None, out);
                 walk(r, is_leaf, end, None, out);

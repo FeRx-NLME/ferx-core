@@ -29635,6 +29635,16 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "two exp factors, was LogNormal",
             "  CL = TVCL * exp(RE) * exp(RE)",
         ),
+        // Dies under: unary minus (`0 - x`) resetting the product chain, so
+        // each negated `exp` is its own terminal (#1724 review).
+        (
+            "two negated exp factors, was LogNormal",
+            "  CL = TVCL * -exp(RE) * -exp(RE)",
+        ),
+        (
+            "a negated product times an exp, was LogNormal",
+            "  CL = -(TVCL * exp(RE)) * exp(RE)",
+        ),
         // Dies under: `reach_add` not adding (the count stays 1 per call).
         (
             "one exp, read twice, was LogNormal",
