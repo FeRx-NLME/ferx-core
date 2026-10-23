@@ -1424,6 +1424,8 @@ struct Absorbed<'a> {
     how: How<'a>,
     /// What one of the random effect's units is called ([`unit_noun`]).
     unit: String,
+    /// The unit itself, for [`within_parts_them`].
+    unit_kind: Unit,
 }
 
 enum How<'a> {
@@ -1635,6 +1637,7 @@ fn absorbed<'a>(
                 readers,
                 how,
                 unit: unit_noun(unit, nested),
+                unit_kind: unit,
             })
         })
         .collect()
@@ -3566,7 +3569,12 @@ fn dead_levels_message(
 /// the reference level — another θ of the model carries ([`carried`], #1840);
 /// the nested block's explicit global contrasts follow the same certificate.
 /// Two absorbed random effects have no rescue either: within leaves each unit's
-/// mean to one of them, and the levels reproduce the other.
+/// mean to one of them, and the levels reproduce the other — unless the
+/// within-group contrast parts them ([`within_parts_them`]): each within-group
+/// lies inside one unit of every one of them, and no two group the records
+/// alike. Within then leaves each its own groups' means, as a nested model
+/// tells a study kappa from an arm kappa (#2034), and each is resolved as if it
+/// were the only one, the first refusal winning.
 ///
 /// `others` is `None` for a block that absorbs nothing, which
 /// [`bind_levels_on_data`] resolves first and which never reads the
@@ -3578,16 +3586,110 @@ fn resolve_contrast(
     population: &Population,
     others: Option<&[Coded]>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
-    let nested = decl.columns().len() >= 2;
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
-    let dead = &measured.dead;
     let absorbed = absorbed(decl, population, measured);
-    if absorbed.len() >= 2 {
+    if absorbed.len() < 2 {
+        let one = absorbed.into_iter().next();
+        return resolve_absorbing(decl, levels, measured, population, others, one);
+    }
+    if !within_parts_them(
+        decl,
+        levels,
+        &absorbed,
+        population,
+        measured.nested.as_ref(),
+    ) {
         return Err(jointly_absorbed_message(
             &block, decl, &absorbed, population,
         ));
     }
-    let absorbed = absorbed.into_iter().next();
+    let mut resolved = None;
+    for one in absorbed {
+        let r = resolve_absorbing(decl, levels, measured, population, others, Some(one))?;
+        resolved.get_or_insert(r);
+    }
+    Ok(resolved.expect("two or more"))
+}
+
+/// Whether the within-group contrast of a nested block parts the random effects
+/// `absorbed` (#2034): every within-group's records lie in one unit of each of
+/// them, and no two of them group the records into the same units. The first
+/// keeps each random effect constant across a group, so within leaves it the
+/// group means; the second keeps two of them from competing for the same means,
+/// which a kappa does with an η on one occasion per subject (K3′), or with the
+/// kappa of an outer level whose groups each hold one group of its level.
+fn within_parts_them(
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    absorbed: &[Absorbed],
+    population: &Population,
+    nested: Option<&NestedLevels>,
+) -> bool {
+    if decl.columns().len() < 2 {
+        return false;
+    }
+    let groups = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
+    let column = level_index_column(decl.name());
+    // Per record of every subject: its within-group, and its unit under each
+    // random effect.
+    let mut records: Vec<(usize, Vec<(usize, Vec<u64>)>)> = Vec::new();
+    for (s, subject) in population.subjects.iter().enumerate() {
+        for j in 0..subject.obs_times.len() {
+            let Some(index) = column_value(subject, &column, j) else {
+                return false;
+            };
+            let Some(&group) = (index as usize).checked_sub(1).and_then(|i| groups.get(i)) else {
+                return false;
+            };
+            let units: Option<Vec<(usize, Vec<u64>)>> = absorbed
+                .iter()
+                .map(|a| unit_of(subject, a.unit_kind, j, nested).map(|u| (s, u)))
+                .collect();
+            let Some(units) = units else {
+                return false;
+            };
+            records.push((group, units));
+        }
+    }
+    // `a` determines `b`: every key of `a` meets a single key of `b`.
+    fn determines<A: Eq + std::hash::Hash, B: Eq + Clone>(pairs: &[(A, B)]) -> bool {
+        let mut seen: HashMap<&A, &B> = HashMap::new();
+        pairs.iter().all(|(a, b)| *seen.entry(a).or_insert(b) == b)
+    }
+    let nests = (0..absorbed.len()).all(|r| {
+        let pairs: Vec<(usize, (usize, Vec<u64>))> =
+            records.iter().map(|(g, u)| (*g, u[r].clone())).collect();
+        determines(&pairs)
+    });
+    let apart = (0..absorbed.len()).all(|a| {
+        (0..a).all(|b| {
+            let ab: Vec<_> = records
+                .iter()
+                .map(|(_, u)| (u[a].clone(), u[b].clone()))
+                .collect();
+            let ba: Vec<_> = records
+                .iter()
+                .map(|(_, u)| (u[b].clone(), u[a].clone()))
+                .collect();
+            !(determines(&ab) && determines(&ba))
+        })
+    });
+    nests && apart
+}
+
+/// [`resolve_contrast`] for a block that absorbs at most the one random effect
+/// `absorbed`.
+fn resolve_absorbing(
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    measured: &Measured,
+    population: &Population,
+    others: Option<&[Coded]>,
+    absorbed: Option<Absorbed>,
+) -> Result<(LevelContrast, Vec<usize>), String> {
+    let nested = decl.columns().len() >= 2;
+    let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
+    let dead = &measured.dead;
     // A random effect the levels reproduce through within-group differences
     // has no rescue: `sum_to_zero_within` leaves exactly those directions free
     // (#1874 review, F1).

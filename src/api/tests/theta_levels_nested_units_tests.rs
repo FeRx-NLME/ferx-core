@@ -268,3 +268,52 @@ fn a_one_level_model_and_its_two_level_spelling_bind_alike() {
         cells.len() * 5
     );
 }
+
+/// Two kappas at two nested levels absorbed together (#2034 review r1). On
+/// `[ARMID, TIME]` both `K_ST` and `K_ARM` on `E0` are absorbed, and the within-arm
+/// contrast parts them: each arm lies inside one study and is its own arm, so within
+/// leaves every arm's mean to the kappas, which the replication of arms in studies
+/// and of studies in sponsors tells apart. Auto goes within, and an explicit global
+/// contrast is refused, naming a kappa it lets the levels reproduce.
+///
+/// The two sides of the gate, each a refusal of the joint clause:
+/// - `[STUDY, ARMID]` groups by study, and the arm kappa varies inside a study.
+///   Mutation — drop the nesting condition of `within_parts_them`: it binds.
+/// - one arm per study: the two kappas group the records alike, so within leaves the
+///   two one mean per study. Mutation — drop the apartness condition: it binds.
+///
+/// Mutation — `within_parts_them` always false: `[ARMID, TIME]` is refused.
+#[test]
+fn kappas_at_two_levels_absorbed_together_are_parted_by_the_within_contrast() {
+    let pop = sponsor_pop();
+    let e0 = "  E0 = TVE0 + PLACEBO + K_ST + K_ARM";
+    let text = |cols: &str, c: &str| nested_model(e0, cols, c);
+    assert_eq!(
+        try_bind(&text("ARMID, TIME", ""), &pop).map(|(c, _)| c),
+        Ok(LevelContrast::SumToZeroWithin),
+        "[ARMID, TIME] auto"
+    );
+    let err = try_bind(&text("ARMID, TIME", "sum_to_zero"), &pop).expect_err("global");
+    assert!(
+        err.contains(
+            "`contrast = sum_to_zero` lets the levels reproduce `K_ST` at every `STUDY` group"
+        ),
+        "{err}"
+    );
+    let joint = "the levels absorb `K_ST` and `K_ARM` together";
+    let err = try_bind(&text("STUDY, ARMID", ""), &pop).expect_err("[STUDY, ARMID]");
+    assert!(err.contains(joint), "[STUDY, ARMID]: {err}");
+    let mut one_arm = pop.clone();
+    for s in one_arm.subjects.iter_mut() {
+        let keep: Vec<usize> = (0..s.obs_times.len())
+            .filter(|&j| s.obs_covariates[j]["ARM"] == 1.0)
+            .collect();
+        s.obs_times = keep.iter().map(|&j| s.obs_times[j]).collect();
+        s.obs_covariates = keep.iter().map(|&j| s.obs_covariates[j].clone()).collect();
+        s.observations = vec![1.0; keep.len()];
+        s.obs_cmts = vec![1; keep.len()];
+        s.cens = vec![0; keep.len()];
+    }
+    let err = try_bind(&text("ARMID, TIME", ""), &one_arm).expect_err("one arm per study");
+    assert!(err.contains(joint), "one arm per study: {err}");
+}
