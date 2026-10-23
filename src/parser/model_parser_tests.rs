@@ -29360,7 +29360,7 @@ fn re_scale_twins(
 fn a_reassignment_is_followed_before_the_consumer_check() {
     use crate::types::EtaParamType::{self, *};
     let head = "  V = TVV * exp(ETA_V)\n  CL = TVCL + RE\n";
-    let rows: [(&str, &str, EtaParamType); 12] = [
+    let rows: [(&str, &str, EtaParamType); 17] = [
         // Dies under: the consumer check before the reassignment (the bug).
         ("one *, was Additive", "  CL = CL * TVV", Custom),
         // Dies under: every replaced definition pushing `Custom`.
@@ -29410,6 +29410,41 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  if (WT > 70) {\n    CL = exp(CL)\n  }",
             Custom,
         ),
+        // Dies under: an `if` whose every branch reassigns not replacing the
+        // definition (#1689: the fall-through `Additive` was pushed). Was Custom.
+        (
+            "exhaustive if/else exp",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    CL = exp(CL)\n  }",
+            LogNormal,
+        ),
+        // Dies under: the exhaustiveness check stopping at the outer `if`
+        // instead of recursing into a nested one. Was Custom.
+        (
+            "exhaustive nested if/else exp",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    \
+             if (WT > 70) {\n      CL = exp(CL)\n    } else {\n      CL = exp(CL)\n    }\n  }",
+            LogNormal,
+        ),
+        // Dies under: an `if` without an `else` counted as exhaustive.
+        (
+            "if/else if, no else, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else if (WT > 70) {\n    CL = exp(CL)\n  }",
+            Custom,
+        ),
+        // Dies under: one reassigning branch counted as covering the `if`.
+        (
+            "if/else, only one branch reassigns, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    V2 = TVV\n  }",
+            Custom,
+        ),
+        // Dies under: the exhaustiveness check counting a nested `if` without
+        // an `else` as covering its branch.
+        (
+            "exhaustive outer, non-exhaustive nested, unchanged",
+            "  if (SEX > 0) {\n    CL = exp(CL)\n  } else {\n    \
+             if (WT > 70) {\n      CL = exp(CL)\n    }\n  }",
+            Custom,
+        ),
     ];
     let mut wrong = Vec::new();
     for (label, tail, want) in rows {
@@ -29431,7 +29466,7 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
 #[test]
 fn a_definition_is_read_only_while_it_is_in_force() {
     use crate::types::EtaParamType::{self, *};
-    let rows: [(&str, &str, &str, EtaParamType); 5] = [
+    let rows: [(&str, &str, &str, EtaParamType); 7] = [
         (
             // Dies under: readers scanned from the first statement, not from
             // the one after the definition (`CLX` reads the earlier `ECL`).
@@ -29482,6 +29517,27 @@ fn a_definition_is_read_only_while_it_is_in_force() {
              if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = TVCL\n  }\n  \
              if (SEX > 0) {\n    CL = CL * TVV\n  }",
             "CL",
+            Custom,
+        ),
+        (
+            // Dies under: a reassignment in a branch not ending the outer
+            // definition for later readers in that branch (#1689 comment: the
+            // first branch's `CL` reads the local `ECL = 0`). Was Custom.
+            "reassigned in a branch, read later in that branch",
+            "  V = TVV * exp(ETA_V)\n  ECL = RE\n  \
+             if (WT > 70) {\n    ECL = 0\n    CL = TVCL + ECL\n  } else {\n    \
+             CL = TVCL * exp(ECL)\n  }",
+            "ECL",
+            LogNormal,
+        ),
+        (
+            // Dies under: a branch's reassignment ending the definition after
+            // the `if` too (the `else` leaves it live, so `CL2` still reads it).
+            "reassigned in one branch, read after the if",
+            "  V = TVV * exp(ETA_V)\n  ECL = RE\n  \
+             if (WT > 70) {\n    ECL = 0\n  } else {\n    V2 = TVV\n  }\n  \
+             CL = TVCL * exp(ECL)\n  CL2 = TVCL + ECL",
+            "ECL",
             Custom,
         ),
     ];
@@ -34750,6 +34806,22 @@ fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definitio
             "eta-free definition inside an if, replaced at top level",
             "  if (WT > 70) {\n    CL = TVCL\n  }\n  CL = TVCL * exp(ETA_CL)",
             true,
+        ),
+        // Replaced on both paths of an `if` with an `else` (#1689). Dies under:
+        // `InForce::end` no longer lifting an exhaustive `if` to its parent.
+        (
+            "eta-free definition replaced in every branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             CL = TVCL * 2 * exp(ETA_CL)\n  }",
+            true,
+        ),
+        // Inexact on the WT ≤ 70 path: the `else` keeps the η-free value. Dies
+        // under: `end` lifting an `if` whose branches are not all ended.
+        (
+            "eta-free definition replaced in one branch of an if-else",
+            "  CL = TVCL\n  if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    \
+             Z = TVV\n  }",
+            false,
         ),
         // Exact (∂CL/∂η = CL) but `CL` reads a carrying variable: conservative.
         (
