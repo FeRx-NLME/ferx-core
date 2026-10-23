@@ -280,6 +280,7 @@ fn run_sir_scoped(
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
     replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);

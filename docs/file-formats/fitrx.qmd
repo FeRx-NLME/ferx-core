@@ -286,7 +286,15 @@ The key is additive: a bundle saved before #426 has none and loads
 `scoring_settings = None`. A `sir.settings` saved before #426 has no
 `inner_restarts` and loads with the default. A block saved before
 [#1835](https://github.com/FeRx-NLME/ferx-core/issues/1835) has no
-`gradient_method` and loads `auto`; a recorded `ad` is corrupt.
+`gradient_method` and loads `auto`; a recorded `ad` is corrupt. Such a bundle of a
+fit that ran `gradient = fd` is scored on the analytic route by a post-hoc step with
+default options. The route is not inferred from `gradient_method_inner`, which is a
+model-level label: an `auto` fit outside the analytic scope reads `finite differences`
+too. Instead, when that label reads `finite differences`, `gradient_method_outer` is
+not `analytic (Dual2)`, and the step itself runs the analytic inner route,
+`run_covariance` and `run_sir` add a warning to the result. Pass
+`gradient_method = fd` to score such a fit as it ran
+([#1862](https://github.com/FeRx-NLME/ferx-core/issues/1862)).
 
 `environment` is absent (the key is omitted) on bundles saved before #704
 added this field; loaders default it to an `"unknown"` placeholder rather
