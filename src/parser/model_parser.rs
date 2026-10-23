@@ -30823,6 +30823,24 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The partials are a **derivative program**, not closed-form trees (#1699):
+    /// a partial reaches an upstream row's partial along the *same* axis
+    /// through the tangent slot `VariableIdx(tangent_base + j)`, `j` that
+    /// row's index here, rather than through an inlined copy of it. So
+    /// `d_d_theta[i][k]` is evaluated after `d_d_theta[j][k]` for every
+    /// `j < i`, with each result written to `vars[tangent_base + j]`
+    /// (`dX' = dB + dC`, one line per intermediate) and the primal slots
+    /// holding the values the rows compute. Inlined, a value reached along
+    /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
+    /// parse ran out of memory at depth 30. An upstream partial that simplified
+    /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
+    /// partials still fold away. Equal to `vars.len()` of the primal program.
+    pub(crate) tangent_base: usize,
+    /// The primal variable slot each row assigns, parallel to `names`.
+    pub(crate) slots: Vec<usize>,
+    /// Each row's right-hand side in resolved form, parallel to
+    /// `names`: the primal program the tangent program reads.
+    pub(crate) values: Vec<Expression>,
     /// The compiled individual-parameter program, so the analytic (adjoint)
     /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
     /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
@@ -30878,6 +30896,9 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            tangent_base: 0,
+            slots: Vec::new(),
+            values: Vec::new(),
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
@@ -30902,6 +30923,11 @@ impl IndivParamPartials {
 /// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
 /// intermediate references get chain-ruled correctly.
 ///
+/// The chain context maps an upstream row's slot to its *tangent slot*, not to
+/// its partial (see `IndivParamPartials::tangent_base`), so each partial is
+/// the size of its own right-hand side's derivative and the whole program is
+/// linear in the block (#1699).
+///
 /// Top-level `If` and any non-`Assign` variant is skipped. Returns
 /// `IndivParamPartials::empty()` if there are no top-level Assigns.
 fn build_indiv_param_partials(
@@ -30911,17 +30937,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Per-axis chain context: variable slot → precomputed partial Expression
-    // for THIS axis. Indexed by axis index, populated incrementally as we
-    // walk the assignments in source order.
+    // Past every primal slot, so a tangent slot never aliases a variable.
+    let tangent_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    // Per-axis chain context: variable slot → what a read of it differentiates
+    // to along THIS axis (its tangent slot, or the partial itself when that is
+    // a leaf). Indexed by axis index, populated incrementally as we walk the
+    // assignments in source order.
     let mut chain_theta: Vec<HashMap<usize, Expression>> =
         (0..n_theta_base).map(|_| HashMap::new()).collect();
     let mut chain_eta: Vec<HashMap<usize, Expression>> =
         (0..n_eta_extended).map(|_| HashMap::new()).collect();
 
     let mut names: Vec<String> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut values: Vec<Expression> = Vec::new();
     let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
     let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
+
+    // A leaf partial is copied into its readers — constant size, and it keeps
+    // `0` foldable by `simplify_expr` — anything larger is read by reference.
+    let chain_entry = |s: &Expression, row: usize| -> Expression {
+        match s {
+            Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..)
+            | Expression::Conditional(..)
+            | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent_base + row),
+            _ => s.clone(),
+        }
+    };
 
     for stmt in stmts {
         let Statement::Assign(name, raw_expr) = stmt else {
@@ -30950,18 +30994,19 @@ fn build_indiv_param_partials(
              parser pipeline bug (var_idx must be built from the same name list before \
              differentiation)",
         );
+        let row = names.len();
 
         let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
         for k in 0..n_theta_base {
             let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
             let s = simplify_expr(&d);
-            // Store the simplified partial into the chain context BEFORE
-            // pushing — any later assignment that references slot `k` will
-            // chain-rule through this expression. Always insert (even
-            // Literal(0)) so the chain map's "key present ⇔ slot is an
-            // upstream indiv-param" invariant is robust to zero partials.
+            // Record this row in the chain context BEFORE pushing — any later
+            // assignment that references slot `k` will chain-rule through it.
+            // Always insert (even Literal(0)) so the chain map's "key present
+            // ⇔ slot is an upstream indiv-param" invariant is robust to zero
+            // partials.
             if slot != usize::MAX {
-                chain_theta[k].insert(slot, s.clone());
+                chain_theta[k].insert(slot, chain_entry(&s, row));
             }
             row_theta.push(s);
         }
@@ -30971,12 +31016,14 @@ fn build_indiv_param_partials(
             let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
             let s = simplify_expr(&d);
             if slot != usize::MAX {
-                chain_eta[k].insert(slot, s.clone());
+                chain_eta[k].insert(slot, chain_entry(&s, row));
             }
             row_eta.push(s);
         }
 
         names.push(name.clone());
+        slots.push(slot);
+        values.push(resolved);
         d_d_theta.push(row_theta);
         d_d_eta.push(row_eta);
     }
@@ -30985,6 +31032,9 @@ fn build_indiv_param_partials(
         names,
         d_d_theta,
         d_d_eta,
+        tangent_base,
+        slots,
+        values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,

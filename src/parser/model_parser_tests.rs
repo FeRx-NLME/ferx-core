@@ -18489,30 +18489,60 @@ fn simplify_collapses_zero_and_one() {
 // exercises the full pipeline: parsing → resolve → differentiate →
 // simplify → store on CompiledModel.
 
-/// Numerically evaluate a stored partial Expression with the same inputs
-/// the pk_param_fn closure sees. Returns the partial's value at
-/// (theta, eta, covariates), with `vars` cleared to zero (intermediates
-/// aren't realized — they show up in the partial expression through
-/// chain-rule substitution at differentiation time, so the eval here
-/// doesn't need to recompute them).
+/// Numerically evaluate one stored partial, ∂(row `row`)/∂`axis`, with the
+/// same inputs the pk_param_fn closure sees. The partials are a derivative
+/// program (#1699, `IndivParamPartials::tangent_base`): the rows' primal
+/// values fill their slots and every earlier row's partial along `axis` fills
+/// its tangent slot, in declaration order, before row `row` is read.
 fn eval_partial(
-    partial: &Expression,
+    partials: &IndivParamPartials,
+    row: usize,
+    axis: DiffAxis,
     theta: &[f64],
     eta: &[f64],
     cov: &HashMap<String, f64>,
-    var_count: usize,
 ) -> f64 {
-    let mut cov_vec = vec![0.0_f64; cov.len()];
+    eval_partials_along(partials, axis, theta, eta, cov)[row]
+}
+
+/// Every row's partial along `axis`, by running the derivative program
+/// (`eval_partial`).
+fn eval_partials_along(
+    partials: &IndivParamPartials,
+    axis: DiffAxis,
+    theta: &[f64],
+    eta: &[f64],
+    cov: &HashMap<String, f64>,
+) -> Vec<f64> {
     // Build a deterministic cov ordering matching the partial's
     // CovariateIdx references. For these tests we use NO covariates.
     let mut keys: Vec<&String> = cov.keys().collect();
     keys.sort();
-    for (i, k) in keys.iter().enumerate() {
-        cov_vec[i] = cov[k.as_str()];
-    }
-    let mut vars = vec![0.0_f64; var_count];
+    let cov_vec: Vec<f64> = keys.iter().map(|k| cov[k.as_str()]).collect();
     let nn_outputs: Vec<Vec<f64>> = Vec::new();
-    eval_expression_indexed(partial, theta, eta, &cov_vec, &mut vars, &nn_outputs)
+    let n = partials.names.len();
+    let mut vars = vec![0.0_f64; partials.tangent_base + n];
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = eval_expression_indexed(
+            &partials.values[i],
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            &nn_outputs,
+        );
+        let d = match axis {
+            DiffAxis::Theta(k) => &partials.d_d_theta[i][k],
+            DiffAxis::Eta(k) => &partials.d_d_eta[i][k],
+            DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
+        };
+        let dv = eval_expression_indexed(d, theta, eta, &cov_vec, &mut vars, &nn_outputs);
+        vars[partials.slots[i]] = v;
+        vars[partials.tangent_base + i] = dv;
+        out.push(dv);
+    }
+    out
 }
 
 /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂θ_k.
@@ -18601,7 +18631,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
     let cov: HashMap<String, f64> = HashMap::new();
     for i in 0..3 {
         for k in 0..3 {
-            let sym = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+            let sym = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
             let fd = fd_d_theta(m, i, k, theta, eta, &cov);
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18609,7 +18639,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
                 partials.names[i],
                 k,
             );
-            let sym = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+            let sym = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
             let fd = fd_d_eta(m, i, k, theta, eta, &cov);
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18655,7 +18685,7 @@ fn indiv_partials_zero_for_cross_axis() {
     let cov: HashMap<String, f64> = HashMap::new();
     // Cross-η partials (indiv i, η k ≠ i).
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
-        let v = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
         assert!(
             v.abs() < 1e-12,
             "∂{}/∂η_{} should be 0, got {v}",
@@ -18665,7 +18695,7 @@ fn indiv_partials_zero_for_cross_axis() {
     }
     // Cross-θ partials.
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
-        let v = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
         assert!(
             v.abs() < 1e-12,
             "∂{}/∂θ_{} should be 0, got {v}",
@@ -18711,13 +18741,13 @@ fn indiv_partials_logit_inv_logit_chain() {
     let eta = &[0.05, -0.1, 0.15, 0.2];
     let cov: HashMap<String, f64> = HashMap::new();
     // F's row: position 3. Verify ∂F/∂η_F (index 3) and ∂F/∂THETA_F (index 3).
-    let sym = eval_partial(&partials.d_d_eta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Eta(3), theta, eta, &cov);
     let fd = fd_d_eta(m, 3, 3, theta, eta, &cov);
     assert!(
         (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
         "∂F/∂η_F: sym={sym}, fd={fd}",
     );
-    let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Theta(3), theta, eta, &cov);
     let fd = fd_d_theta(m, 3, 3, theta, eta, &cov);
     assert!(
         (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
@@ -18725,7 +18755,7 @@ fn indiv_partials_logit_inv_logit_chain() {
     );
     // F doesn't depend on ETA_CL/V/KA — those partials must evaluate to 0.
     for k in 0..3 {
-        let v = eval_partial(&partials.d_d_eta[3][k], theta, eta, &cov, 8);
+        let v = eval_partial(partials, 3, DiffAxis::Eta(k), theta, eta, &cov);
         assert!(v.abs() < 1e-12, "∂F/∂η_{k} should be 0, got {v}");
     }
 }
@@ -18776,7 +18806,7 @@ fn indiv_partials_chain_rule_through_intermediate() {
     let eta = &[0.0, 0.0, 0.3]; // η_CL=0, η_V=0, η_KAM=0.3
     let cov: HashMap<String, f64> = HashMap::new();
     // KA is at indiv-param index 3, η_KAM is at eta index 2.
-    let sym = eval_partial(&partials.d_d_eta[3][2], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Eta(2), theta, eta, &cov);
     let expected = theta[2] * theta[3] * eta[2].exp(); // TVKA * TVKAM * exp(ETA_KAM)
     assert!(
         (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
@@ -18789,10 +18819,10 @@ fn indiv_partials_chain_rule_through_intermediate() {
         "∂KA/∂η_KAM: sym={sym}, fd={fd}",
     );
     // ∂KA/∂η_CL = 0 (no chain to ETA_CL).
-    let v = eval_partial(&partials.d_d_eta[3][0], theta, eta, &cov, 8);
+    let v = eval_partial(partials, 3, DiffAxis::Eta(0), theta, eta, &cov);
     assert!(v.abs() < 1e-12, "∂KA/∂η_CL should be 0, got {v}");
     // ∂KA/∂TVKAM (θ index 3): TVKA * exp(ETA_KAM).
-    let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+    let sym = eval_partial(partials, 3, DiffAxis::Theta(3), theta, eta, &cov);
     let expected = theta[2] * eta[2].exp();
     assert!(
         (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
@@ -29787,6 +29817,158 @@ fn the_inliner_is_linear_on_a_diamond() {
                 "inliner, {label}: depth {d} is linear"
             );
         }
+    }
+}
+
+/// Nodes in `e`, conditions included.
+fn expr_nodes(e: &Expression) -> usize {
+    fn cond_nodes(c: &Condition) -> usize {
+        1 + match c {
+            Condition::Compare(l, _, r) => expr_nodes(l) + expr_nodes(r),
+            Condition::And(l, r) | Condition::Or(l, r) => cond_nodes(l) + cond_nodes(r),
+            Condition::Not(c) => cond_nodes(c),
+            Condition::Present(e) => expr_nodes(e),
+        }
+    }
+    1 + match e {
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => expr_nodes(l) + expr_nodes(r),
+        Expression::UnaryFn(_, a) => expr_nodes(a),
+        Expression::ThetaGather { idx, .. } => expr_nodes(idx),
+        Expression::Conditional(c, t, f) => cond_nodes(c) + expr_nodes(t) + expr_nodes(f),
+        _ => 0,
+    }
+}
+
+/// The symbolic partials of `src` (thetas `TVCL`, `TVV`; etas `ETA_CL`,
+/// `ETA_V`), built from its statements alone.
+fn diamond_partials(src: &str) -> IndivParamPartials {
+    let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
+    let stmts = stmts_of(src, &tn, &en);
+    let names = assigned_vars_in_order(&stmts);
+    let var_idx: HashMap<String, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    build_indiv_param_partials(&stmts, &var_idx, &HashMap::new(), 2, 2)
+}
+
+/// #1699: the `[individual_parameters]` partials are a derivative program — a
+/// row reads an upstream row's partial through its tangent slot — so on a
+/// diamond of intermediates they hold a fixed number of nodes per level,
+/// linear in the depth. Inlining each upstream partial into its readers copied
+/// a value reached along `2^d` paths `2^d` times: measured with the partial inlined, the
+/// `+` diamond's partials held 10 238 nodes at depth 8 and 163 838 at depth 12
+/// (78 at depth 1, 158 at depth 2), and a parse at depth 30 ran out of memory. The depths are checked in
+/// increasing order, so a regression fails at depth 10 instead of running
+/// depth 30.
+///
+/// Dies under: `chain_entry` in `build_indiv_param_partials` returning the
+/// partial itself (`s.clone()`) for every shape, i.e. inlining it.
+#[test]
+fn the_symbolic_partials_are_linear_on_a_diamond() {
+    let cases: [(&str, &str); 2] = [
+        ("+", "CL = TVCL * exp(ETA_CL + X{d})\n"),
+        ("*", "CL = TVCL * X{d} * exp(ETA_CL)\n"),
+    ];
+    for (op, tail) in cases {
+        let count = |d: usize| {
+            let src = op_diamond(d, "TVV * exp(ETA_V)", op) + &tail.replace("{d}", &d.to_string());
+            let p = diamond_partials(&src);
+            assert_eq!(
+                p.names.len(),
+                3 * d + 2,
+                "{op} diamond, depth {d}: one row per line"
+            );
+            p.d_d_theta
+                .iter()
+                .chain(&p.d_d_eta)
+                .flatten()
+                .map(expr_nodes)
+                .sum::<usize>()
+        };
+        // From depth 1: level 0 reads `X0`, whose partials are leaves.
+        let c1 = count(1);
+        let per_level = count(2) - c1;
+        assert!(per_level > 0, "{op} diamond: the levels carry partials");
+        for d in [10, 20, 30] {
+            assert_eq!(
+                count(d) - c1,
+                (d - 1) * per_level,
+                "{op} diamond: depth {d} is linear"
+            );
+        }
+    }
+}
+
+/// The derivative program on a diamond computes the derivative of the value
+/// path: every row, every θ and η axis, against central finite differences of
+/// the rows' own primal values. The `*` diamond keeps both the product rule's
+/// primal factor (read from a primal slot) and its tangent factor (read from a
+/// tangent slot) live at every level, and `X0 = TVV * exp(ETA_V)` makes each
+/// level depend on a θ and an η. Measured worst relative error 4.2e-10 (`+`) and
+/// 1.0e-10 (`*`) against a `1e-6` bound.
+///
+/// Dies under: writing a row's partial to a tangent slot other than
+/// `tangent_base + row` (or a reader naming one), and the primal factor read
+/// as `0` — the zero-filled `vars` the pre-#1699 `eval_partial` passed.
+#[test]
+fn the_symbolic_partials_on_a_diamond_match_fd() {
+    for op in ["+", "*"] {
+        let src =
+            op_diamond(3, "TVV * exp(ETA_V)", op) + "CL = TVCL * X3 * exp(ETA_CL + X1 / 100)\n";
+        let p = diamond_partials(&src);
+        let theta = [1.3, 1.1];
+        let eta = [0.2, -0.15];
+        let cov: HashMap<String, f64> = HashMap::new();
+        let primal = |theta: &[f64], eta: &[f64]| -> Vec<f64> {
+            let mut vars = vec![0.0_f64; p.tangent_base];
+            p.values
+                .iter()
+                .zip(&p.slots)
+                .map(|(e, &slot)| {
+                    let v = eval_expression_indexed(e, theta, eta, &[], &mut vars, &[]);
+                    vars[slot] = v;
+                    v
+                })
+                .collect()
+        };
+        let mut worst = 0.0_f64;
+        for axis in [
+            DiffAxis::Theta(0),
+            DiffAxis::Theta(1),
+            DiffAxis::Eta(0),
+            DiffAxis::Eta(1),
+        ] {
+            let sym = eval_partials_along(&p, axis, &theta, &eta, &cov);
+            let (mut tp, mut tm, mut ep, mut em) = (theta, theta, eta, eta);
+            let h = 1e-6;
+            match axis {
+                DiffAxis::Theta(k) => {
+                    tp[k] += h;
+                    tm[k] -= h;
+                }
+                DiffAxis::Eta(k) => {
+                    ep[k] += h;
+                    em[k] -= h;
+                }
+                DiffAxis::Variable(_) => unreachable!(),
+            }
+            let (plus, minus) = (primal(&tp, &ep), primal(&tm, &em));
+            for (i, s) in sym.iter().enumerate() {
+                let fd = (plus[i] - minus[i]) / (2.0 * h);
+                assert!(s.is_finite() && fd.is_finite(), "{op}: row {i} {axis:?}");
+                let rel = (s - fd).abs() / s.abs().max(fd.abs()).max(1e-8);
+                assert!(
+                    rel < 1e-6,
+                    "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}",
+                    p.names[i]
+                );
+                worst = worst.max(rel);
+            }
+        }
+        eprintln!("{op} diamond: worst relative error {worst:e}");
     }
 }
 
