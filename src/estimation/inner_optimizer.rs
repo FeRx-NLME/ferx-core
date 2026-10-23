@@ -952,8 +952,10 @@ fn cold_eta_seed(
 ///    (`stall_at`, #555 / #1521), so a subject whose objective is numerical (an ODE, or a
 ///    transit/IG closed form rerouted to its ODE twin) is certified by the stall stop at its
 ///    noise floor rather than held to a `tol` below it. The polished point replaces η̂ only
-///    when the polish certifies it (it is never worse: every accepted step is an Armijo
-///    decrease), so the flag always belongs to the returned point (the #1337 rule).
+///    when the polish certifies it (it is no worse beyond the objective's resolution: every
+///    accepted step is an Armijo decrease, or a gradient-verified step whose objective rises by
+///    at most `INNER_FTOL_REL·(1 + |f|)` while the gradient norm at least halves, #2270), so the
+///    flag always belongs to the returned point (the #1337 rule).
 ///
 /// A point that passes none of them is returned unchanged and reported **unconverged**.
 pub(crate) struct FallbackCertifier<'a> {
@@ -1056,9 +1058,12 @@ impl FallbackCertifier<'_> {
             return false;
         }
         // No objective comparison against the handed-in point: both drivers take only steps
-        // that pass the Armijo test along a descent direction (`backtracking_line_search`), so
-        // a polished point is never worse than its start. A gate re-checking that could not
-        // fail, and no test could pin it (#1527 mutation sweep).
+        // that pass the Armijo test along a descent direction (`backtracking_line_search`), or
+        // gradient-verified steps whose objective rises by at most `INNER_FTOL_REL·(1 + |f|)`
+        // while the gradient norm at least halves (`exact_step_verified_by_gradient`, #2270).
+        // So a polished point is no worse than its start beyond the objective's resolution.
+        // An exact comparison would undo exactly those verified steps; a comparison with that
+        // slack could not fail, and no test could pin it (#1527 mutation sweep).
         *x = polished;
         true
     }
@@ -1994,7 +1999,8 @@ fn find_ebe_solve(
     // RK45 gradient-noise floor that can sit above `tol` (#555) — i.e. when the *effective*
     // model for this subject is ODE, which includes a closed-form transit/IG subject rerouted to
     // its ODE twin (TV-cov / `TIME`; #719/#814). Analytical/event-driven objectives are exact, so
-    // they keep the pure `gnorm < tol` criterion and stay bit-identical to prior releases.
+    // they keep the pure `gnorm < tol` criterion (since #2270 with a relative BFGS pair gate and
+    // gradient-verified sub-resolution steps, which ODE objectives do not take).
     // Evaluated at whatever iterate the search is standing on — see the latch in
     // [`dense_bfgs_core`] / [`lbfgs_core`]. The value at the *start* point still drives the
     // two pre-solve policies below (`short_line_search`, `certify_partial`), which have to
@@ -4769,8 +4775,8 @@ fn dense_bfgs_core(
     // the full-gradient step again.
     let mut h_unshaped = true;
     // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): gated on
-    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so
-    // smooth analytical/FD fits stay bit-identical and a non-stationary mid-descent iterate
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so the
+    // stall never stops a smooth analytical/FD fit and a non-stationary mid-descent iterate
     // can't be accepted.
     let mut stall = 0u32;
     let mut best_gnorm = f64::INFINITY;
@@ -5150,8 +5156,8 @@ fn inner_line_search_trials(short_line_search: bool) -> usize {
 /// guards keep it from accepting a non-stationary iterate:
 ///
 /// 1. **ODE-only** (`enable_stall`, set by `find_ebe`/`find_ebe_iov` for `[odes]` models).
-///    Analytical / event-driven objectives are exact, reach `gnorm < tol` normally, and
-///    stay bit-identical to prior releases — the stall never touches them.
+///    Analytical / event-driven objectives are exact and reach `gnorm < tol` normally — the
+///    stall never touches them.
 /// 2. **Gradient-plateau.** The stall fires only once the gradient has *stopped
 ///    decreasing* — the current `gnorm` no longer improves the best seen by more than
 ///    [`INNER_FTOL_GNORM_PLATEAU`]. Mid-descent (including a heavily-backtracked
@@ -5351,6 +5357,14 @@ fn step_below_resolution(d: &[f64], g: &[f64], f: f64) -> bool {
 /// same non-move repeated to `max_iter`, so the subject went to the Nelder–Mead fallback. The
 /// gradient is exact and still resolves the mode. This never declares convergence: a verified step
 /// is an accepted step, and the solve still stops only on `gnorm < tol` (#1527).
+///
+/// "Exact" is the objective, not the gradient: `!enable_stall` means the effective model is not an
+/// ODE, and the gradient may still be finite differences (`gradient = fd`, a subject out of the
+/// analytic scope, the per-point FD fallback, the IOV FD route). Measured harmless at the default
+/// `inner_tol` on PR #2280's review (base → this rule, macOS arm64): `warfarin` with
+/// `gradient = fd` −280.359506 → −280.359505, `warfarin_iov` with `gradient = fd` 205.091863 →
+/// 205.090347. An FD gradient at a tight `inner_tol` is not measured. The same holds for
+/// [`curvature_pair_accepted`].
 #[allow(clippy::too_many_arguments)]
 fn exact_step_verified_by_gradient(
     obj: &dyn Fn(&[f64]) -> f64,
@@ -5387,7 +5401,9 @@ const CURVATURE_PAIR_REL: f64 = 1e-8;
 /// Not on an ODE objective: there a short step's `y` is the solver's gradient noise, and the
 /// relative test admits it as curvature. Measured on `per_route_lag_matches_reconverged_fd`
 /// (`reltol = 1e-12`): the reconverged-FD reference's EBE re-solves fell from 5.4e-8 to 1.04e-6
-/// in stationarity with the relative arm on there.
+/// in stationarity with the relative arm on there. On an exact objective with a finite-difference
+/// gradient the relative arm stays on; see [`exact_step_verified_by_gradient`] for what was
+/// measured there.
 fn curvature_pair_accepted(sy: f64, s_norm: f64, y_norm: f64, enable_stall: bool) -> bool {
     sy > 1e-12 || (!enable_stall && sy > CURVATURE_PAIR_REL * s_norm * y_norm)
 }
