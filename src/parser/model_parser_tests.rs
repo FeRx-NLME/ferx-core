@@ -24814,25 +24814,106 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         "`TAD` in the PK RHS likewise"
     );
 
-    // Documented over-decline: an intermediate that reads time and is consumed
-    // *only* by the hazard is a top-level `AssignBc`, not one of the excluded
-    // derivative lines, so it still reads wide. Conservative in the safe
-    // direction — pinned so a later dataflow cut is a deliberate change.
-    //
-    // `pk_reads_absolute_time` inherits it, and there it is no longer free: #1166's consumer
-    // is a gradient-routing gate, where over-declining costs speed, while #1139 T3's is a
-    // user-facing warning, where it is a false positive on a legitimate joint model.
-    // Accepted rather than narrowed here — the dataflow cut is #1166's deferred change — and
-    // the *consequence* is pinned end-to-end by
-    // `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    // #1279: factoring the hazard's time read out into an `[odes]` intermediate is not a
+    // property of the model, so the intermediate spelling must agree with the inline one
+    // row-for-row — narrow flags off, wide flags on. Before the dataflow cut the intermediate
+    // was a top-level `AssignBc` the kind filter kept, and this read `(.., true, true)`.
+    const HAZ_TT: &str = "H0 * exp(0.05*TT) * exp(BETA * (central / V))";
+    let inline = joint_flags("", "", "H0 * exp(0.05*TIME) * exp(BETA * (central / V))");
+    assert_eq!(
+        inline,
+        (false, true, true, false, false),
+        "inline `TIME` in the hazard"
+    );
+    assert_eq!(
+        joint_flags("", "TT = TIME", HAZ_TT),
+        inline,
+        "a time-reading intermediate used only by the hazard reads as the inline spelling"
+    );
+    // Transitive, not one-hop: `UU` is what the hazard reads, `TT` only `UU` does.
     assert_eq!(
         joint_flags(
             "",
-            "TT = TIME",
-            "H0 * exp(0.05*TT) * exp(BETA * (central / V))"
+            "TT = TIME\n  UU = TT",
+            "H0 * exp(0.05*UU) * exp(BETA * (central / V))"
+        ),
+        inline,
+        "a chain of intermediates read only by the hazard is cut as a whole"
+    );
+    // The arm a naive "drop every intermediate" fix breaks: the same intermediate, read by a
+    // *retained* derivative line, is a genuinely non-autonomous PK block — under each
+    // spelling, including the `TAD` one that leaves the absolute-clock flag off.
+    for (pre, want) in [
+        ("TT = TIME", (false, true, true, true, true)),
+        ("TT = TIME\n  UU = TT", (false, true, true, true, true)),
+        ("TT = TAFD", (true, false, true, true, true)),
+        ("TT = TAD", (true, false, true, true, false)),
+    ] {
+        let pk = if pre.contains("UU") {
+            " * (1.0 + 0.01*UU)"
+        } else {
+            " * (1.0 + 0.01*TT)"
+        };
+        assert_eq!(
+            joint_flags(pk, pre, AUTO),
+            want,
+            "`{pre}` read by the PK RHS must keep the PK block non-autonomous"
+        );
+    }
+    // An `if` guarding a retained derivative keeps its condition, so a time-reading
+    // intermediate read only *there* still counts.
+    assert_eq!(
+        joint_flags(
+            " * K",
+            "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }",
+            AUTO
         ),
         (false, true, true, true, true),
-        "a time-reading intermediate used only by the hazard over-declines, by design"
+        "a time-reading intermediate in an `if` condition the PK RHS depends on"
+    );
+    // ...and the same `if` feeding only the hazard is cut with it.
+    assert_eq!(
+        joint_flags(
+            "",
+            "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }",
+            "H0 * K * exp(BETA * (central / V))"
+        ),
+        inline,
+        "an `if` whose only consumer is the hazard is not part of the PK block"
+    );
+    // A later `else if` cannot govern an earlier arm, so its condition is cut with the
+    // hazard-only arm it guards — keeping it made `TT` live through the condition alone.
+    // The straddle: the same `TT` condition *before* the PK arm does govern it, as does an
+    // `else` that keeps a PK statement, which needs every condition ahead of it.
+    let ladder = |c1: &str, c2: &str, els: &str| {
+        format!(
+            "TT = TIME\n  K = 1.0\n  G = 1.0\n  if ({c1}) {{\n    K = 2.0\n  }} else if \
+             ({c2}) {{\n    G = 2.0\n  }}{els}"
+        )
+    };
+    const HAZ_G: &str = "H0 * G * exp(BETA * (central / V))";
+    assert_eq!(
+        joint_flags(" * K", &ladder("CL > 5.0", "TT > 5.0", ""), HAZ_G),
+        (false, true, true, false, false),
+        "a trailing `else if` condition read only on the way to a hazard-only arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * G",
+            &ladder("TT > 5.0", "CL > 5.0", ""),
+            "H0 * K * exp(BETA * (central / V))"
+        ),
+        (false, true, true, true, true),
+        "an earlier condition governs a later PK arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * K",
+            &ladder("CL > 5.0", "TT > 5.0", " else {\n    K = 3.0\n  }"),
+            HAZ_G
+        ),
+        (false, true, true, true, true),
+        "an `else` keeping a PK statement depends on every condition before it"
     );
 }
 
