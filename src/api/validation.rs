@@ -213,21 +213,21 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 /// per-subject maps, so a name that is listed but missing from some subject is read
 /// as 0 for that subject. An empty population carries nothing.
 ///
+/// The subject-static map decides, not the per-record snapshots: every lookup
+/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
+/// such snapshots, an adaptive decision before the first record — falls back to it,
+/// so a name the static map lacks is read as 0 there even when every observation
+/// snapshot has it. The CSV reader fills the static map with each subject's first
+/// value.
+///
 /// Shared with the `[adaptive_dosing]` `observe` check in
 /// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
 pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
-    !population.subjects.is_empty() && population.subjects.iter().all(|s| subject_carries(s, name))
-}
-
-/// A subject carries `name` when its subject-static map has it, or when it has
-/// per-observation snapshots and every one has it: `Subject::obs_cov` reads the
-/// snapshot, falling back to the static map only where there is none. The second
-/// arm is an in-memory time-varying subject that leaves the static map empty, which
-/// the predictors resolve at every observation.
-fn subject_carries(subject: &crate::types::Subject, name: &str) -> bool {
-    subject.covariates.contains_key(name)
-        || (!subject.obs_covariates.is_empty()
-            && subject.obs_covariates.iter().all(|m| m.contains_key(name)))
+    !population.subjects.is_empty()
+        && population
+            .subjects
+            .iter()
+            .all(|s| s.covariates.contains_key(name))
 }
 
 /// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed

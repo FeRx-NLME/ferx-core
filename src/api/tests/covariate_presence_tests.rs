@@ -155,30 +155,45 @@ fn check_covariates_decides_presence_from_the_subjects() {
     }
 }
 
-/// A subject carrying the covariate only in its per-observation snapshots carries it
-/// (`Subject::obs_cov` reads the snapshot), unless one snapshot lacks it.
+/// The subject-static map decides presence, not the per-observation snapshots: a
+/// dose, reset or PK-only row without a snapshot of its own, and an adaptive decision
+/// before the first record, fall back to the static map, so a name only the
+/// observation snapshots carry is read as 0 there (review of #2181). Both checks
+/// refuse it; the same snapshots beside a static value pass.
 #[test]
-fn per_observation_snapshots_carry_a_covariate() {
+fn per_observation_snapshots_alone_do_not_carry_a_covariate() {
     let model = parse_model_string(ONE_CPT_IV_WTX).expect("parse");
     let mut pop = cells().pop().expect("cells").population;
     for s in &mut pop.subjects {
-        let w = s.covariates.remove("WTX").expect("carried");
+        let w = s.covariates["WTX"];
         s.obs_covariates = vec![HashMap::from([("WTX".to_string(), w)]); 3];
     }
     assert!(
         check_covariates(&model, &pop).is_empty(),
-        "every snapshot carries WTX"
+        "control: static + snapshots"
     );
-    let p = predict_diag(&model, &pop, &model.default_params).expect("predict_diag");
-    assert!(p
-        .results
-        .iter()
-        .all(|r| r.pred.is_finite() && r.pred != 0.0));
 
-    pop.subjects[1].obs_covariates[2].clear();
+    for s in &mut pop.subjects {
+        s.covariates.clear();
+    }
     let diags = check_covariates(&model, &pop);
-    assert_eq!(diags.len(), 1, "one snapshot lacks WTX: {diags:?}");
+    assert_eq!(diags.len(), 1, "snapshots only: {diags:?}");
     assert_eq!(diags[0].message, MISSING);
+    let cell = Cell {
+        label: "WTX on the observation snapshots only",
+        population: pop,
+        accepted: false,
+    };
+    let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let got = simulate_adaptive_from_spec(
+        &ode,
+        &cell.population,
+        &ode.default_params,
+        1,
+        &observe_wtx_spec(),
+        &adaptive_options(),
+    );
+    assert_refused("simulate_adaptive_from_spec", &cell, got, OBSERVE_MISSING);
 }
 
 #[test]
@@ -221,11 +236,8 @@ fn fit_refuses_an_uncarried_covariate() {
     }
 }
 
-/// The `observe` covariate check routes through the same predicate, so it refuses the
-/// listed cells and accepts a covariate every subject carries but nobody listed.
-#[test]
-fn adaptive_observe_covariate_decides_presence_from_the_subjects() {
-    let model = parse_model_string(ODE_ADAPTIVE).expect("parse");
+/// The TDM example's spec, observing `central / WTX` with no assay error.
+fn observe_wtx_spec() -> crate::sim::adaptive::AdaptiveDosingSpec {
     let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
     let mut spec = parse_full_model(&tdm)
         .expect("parse")
@@ -235,10 +247,22 @@ fn adaptive_observe_covariate_decides_presence_from_the_subjects() {
     spec.assay_cmt = None;
     spec.observe = Some("central / WTX".to_string());
     spec.observe_declared_covariates = vec!["WTX".to_string()];
-    let options = AdaptiveSimulateOptions {
+    spec
+}
+
+fn adaptive_options() -> AdaptiveSimulateOptions {
+    AdaptiveSimulateOptions {
         seed: Some(1),
         ..Default::default()
-    };
+    }
+}
+
+/// The `observe` covariate check routes through the same predicate, so it refuses the
+/// listed cells and accepts a covariate every subject carries but nobody listed.
+#[test]
+fn adaptive_observe_covariate_decides_presence_from_the_subjects() {
+    let model = parse_model_string(ODE_ADAPTIVE).expect("parse");
+    let (spec, options) = (observe_wtx_spec(), adaptive_options());
     for cell in cells() {
         let got = simulate_adaptive_from_spec(
             &model,
