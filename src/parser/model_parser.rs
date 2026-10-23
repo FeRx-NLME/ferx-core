@@ -2679,7 +2679,13 @@ fn emit_eta_infos(
 
 /// Every assignment, top level and inside `if` branches, in statement order.
 fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
+    flatten_assigns_scoped(
+        stmts,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        out,
+        &mut Vec::new(),
+    );
 }
 
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
@@ -2687,11 +2693,16 @@ fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expre
 /// flattening order and the branch by position, `else` last.
 type Scope = Vec<(usize, usize)>;
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`].
+/// The shape of one `if` statement, indexed by its [`Scope`] number less one:
+/// `(number of bodies, else included; whether there is an else)`.
+type IfShape = (usize, bool);
+
+/// [`flatten_assigns`], also recording each assignment's [`Scope`] and each
+/// `if` statement's [`IfShape`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
-    next_if: &mut usize,
+    ifs: &mut Vec<IfShape>,
     out: &mut Vec<(&'a str, &'a Expression)>,
     scopes: &mut Vec<Scope>,
 ) {
@@ -2705,12 +2716,15 @@ fn flatten_assigns_scoped<'a>(
                 branches,
                 else_body,
             } => {
-                *next_if += 1;
-                let id = *next_if;
+                ifs.push((
+                    branches.len() + usize::from(else_body.is_some()),
+                    else_body.is_some(),
+                ));
+                let id = ifs.len();
                 let bodies = branches.iter().map(|(_, b)| b).chain(else_body);
                 for (branch, body) in bodies.enumerate() {
                     scope.push((id, branch));
-                    flatten_assigns_scoped(body, scope, next_if, out, scopes);
+                    flatten_assigns_scoped(body, scope, ifs, out, scopes);
                     scope.pop();
                 }
             }
@@ -2750,18 +2764,20 @@ thread_local! {
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
     scopes: Vec<Scope>,
+    ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
     memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
 }
 
 impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
-        let (mut assigns, mut scopes) = (Vec::new(), Vec::new());
-        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, &mut assigns, &mut scopes);
+        let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
         let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
         Self {
             assigns,
             scopes,
+            ifs,
             consumers,
             memo,
         }
@@ -2793,13 +2809,18 @@ impl<'a> ScaleWalk<'a> {
 
     /// The distinct scale(s) of a leaf that reached the root of definition `def`.
     ///
-    /// The definition is **in force** from the next assignment up to and
-    /// including the first later assignment to the same variable in the same or
-    /// an enclosing scope (a reassignment inside an `if`, including a later
-    /// `if`, leaves it live on the other path); an assignment in the other
-    /// branch of the `if` that holds the definition never sees it
-    /// ([`in_sibling_branches`]). Its **readers** are the assignments in that
-    /// range that read the variable.
+    /// The definition is **in force** from the next assignment on, per branch
+    /// path: a later assignment to the same variable ends it for every later
+    /// assignment whose scope has the reassignment's scope as a prefix (the
+    /// rest of that branch, and whatever it nests), and an `if` with an `else`
+    /// whose every branch ends it, recursively, ends it for the rest of the
+    /// scope that holds the `if` (#1689). It is **replaced** once it ends in
+    /// the definition's own scope or an enclosing one; a reassignment inside
+    /// an `if` without an `else`, or in only some branches, leaves it live on
+    /// the other path. An assignment in the other branch of the `if` that
+    /// holds the definition never sees it ([`in_sibling_branches`]). Its
+    /// **readers** are the assignments where it is in force that read the
+    /// variable (a reassignment reads it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
     /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
@@ -2826,10 +2847,17 @@ impl<'a> ScaleWalk<'a> {
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         let mut out = Vec::new();
         let (mut read, mut replaced) = (false, false);
+        // Scopes where a reassignment has ended the definition.
+        let mut ended: Vec<Scope> = Vec::new();
+        let is_ended =
+            |ended: &[Scope], s: &[(usize, usize)]| ended.iter().any(|k| s.starts_with(k));
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
             if in_sibling_branches(scope, other) {
                 continue; // the other branch of an `if` never sees this definition
+            }
+            if is_ended(&ended, other) {
+                continue; // a reassignment earlier on this path replaced it
             }
             if !consumed || *lhs == var {
                 for s in leaf_scales(e, &is_var) {
@@ -2840,9 +2868,33 @@ impl<'a> ScaleWalk<'a> {
                     }
                 }
             }
-            if *lhs == var && scope.starts_with(other) {
-                replaced = true;
-                break;
+            if *lhs == var {
+                // End it in this scope, then in each enclosing scope whose `if`
+                // now has every branch, `else` included, ended.
+                let mut k = other.clone();
+                loop {
+                    if scope.starts_with(&k) {
+                        replaced = true;
+                        break;
+                    }
+                    ended.push(k.clone());
+                    let Some(&(id, _)) = k.last() else { break };
+                    let (n_branches, has_else) = self.ifs[id - 1];
+                    let parent = &k[..k.len() - 1];
+                    let exhaustive = has_else
+                        && (0..n_branches).all(|b| {
+                            let mut s = parent.to_vec();
+                            s.push((id, b));
+                            is_ended(&ended, &s)
+                        });
+                    if !exhaustive {
+                        break;
+                    }
+                    k.pop();
+                }
+                if replaced {
+                    break;
+                }
             }
         }
         if !read || (consumed && !replaced) {
