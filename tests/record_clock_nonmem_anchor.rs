@@ -33,6 +33,14 @@
 //!   closed form outside both engines, a sum of exponentials over the records,
 //!   reproduces the `.tab` to rounding under this rule. Under the parent-row rule it
 //!   reproduces ferx before the fix: a worst error of 2.34 (30 %, ID 9 at `TIME 30`).
+//! * `addl_f`, `addl_lag`, `addl_ftime` (#1909): which of an implied dose's attributes
+//!   follow the governing record. `ADVAN2` on one dataset of four subjects, X stepping
+//!   1 → 2 → 4: the implied dose at 12 falls between records (ID 1), ties with an `EVID=2`
+//!   row (2) or with an observation (3), and ID 4 holds X constant. `F1 = 1/X` and
+//!   `F1 = 0.5 from TIME 13` follow the governing record; `ALAG1 = 0.25·X` stays the parent
+//!   row's. Under the parent-row rule ferx was off by 11.8 on `addl_f` and 4.05 on
+//!   `addl_ftime`. Under a governing-record lag it is off by 1.67 on `addl_lag` (13 %, ID 1
+//!   at `TIME 14`). Analytic and ODE twins, NONMEM 7.5.1, `.tab` at 17 significant figures.
 //!
 //! Tier 2: one `predict()` per anchor.
 
@@ -184,6 +192,16 @@ fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_non
     ];
     worst_pred_error("addl_tie", "addl_tie", "addl_tie", pk_only);
     worst_pred_error("addl_tie", "addl_tie_ode", "addl_tie", pk_only);
+}
+
+#[test]
+fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_its_parent_matches_nonmem(
+) {
+    let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", &[12.0]), ("3", &[]), ("4", &[])];
+    for anchor in ["addl_f", "addl_lag", "addl_ftime"] {
+        worst_pred_error(anchor, anchor, "addl_dose", pk_only);
+        worst_pred_error(anchor, &format!("{anchor}_ode"), "addl_dose", pk_only);
+    }
 }
 
 // Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |PRED − NONMEM| 2.79e-9

@@ -1161,6 +1161,75 @@ fn an_implied_dose_after_the_last_record_keeps_its_parents_snapshot() {
     );
 }
 
+/// `(parent, TIME $PK reads)` of each dose; `None` for a dose record. Every parent the
+/// reader writes passes `implied_dose_parent`'s check.
+fn implied(s: &crate::types::Subject) -> Vec<Option<(usize, f64)>> {
+    let out: Vec<_> = s
+        .doses
+        .iter()
+        .map(|d| d.implied.map(|i| (i.parent, i.param_time)))
+        .collect();
+    for (k, i) in out.iter().enumerate() {
+        assert_eq!(s.implied_dose_parent(k), i.map(|i| i.0), "dose {k}");
+    }
+    out
+}
+
+#[test]
+fn an_implied_dose_reads_the_governing_records_time_and_names_its_parent() {
+    // The case-4 subject above, with a second dose row whose own train follows it: each
+    // implied dose names its own row's explicit dose, and reads the TIME of the record that
+    // governs it (18, 30, 40), not its own.
+    let s = addl_subject(
+        "1,0,.,1,1,100,2,12,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
+         1,31,.,1,1,50,1,6,3\n1,40,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(
+        implied(&s),
+        vec![
+            None,
+            Some((0, 18.0)),
+            Some((0, 30.0)),
+            None,
+            Some((3, 40.0))
+        ]
+    );
+    for (k, want) in [(0, 0.0), (1, 18.0), (2, 30.0), (3, 31.0), (4, 40.0)] {
+        assert_eq!(s.dose_param_time(k), want, "dose {k}");
+    }
+    // Nothing at or after 36: the TIME is the parent row's, like its covariates.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
+    assert_eq!(
+        implied(&s),
+        vec![None, Some((0, 18.0)), Some((0, 0.0)), Some((0, 0.0))]
+    );
+}
+
+#[test]
+fn an_implied_dose_is_marked_without_a_time_varying_covariate() {
+    // `X` constant: the covariate copy is skipped, but a `TIME`-dependent `$PK` still reads
+    // the governing record's TIME and the lag still comes from the parent.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,18,5,0,0,.,.,.,1\n");
+    assert_eq!(implied(&s), vec![None, Some((0, 18.0))]);
+}
+
+#[test]
+fn an_implied_dose_takes_the_governing_records_occasion() {
+    // OCC is a covariate of the governing record in NONMEM. The implied dose at 12 runs
+    // under the observation at 18 (OCC 2); the one at 36 has no record after it and keeps
+    // its parent's OCC 1.
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n\
+         1,18,5,0,0,.,.,.,2\n1,24,5,0,0,.,.,.,3\n",
+    );
+    let s = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    // The observation at 24 ties with the implied dose there and governs it.
+    assert_eq!(s.dose_occasions, vec![1, 2, 3, 1]);
+}
+
 #[test]
 fn test_no_resets_leaves_reset_times_empty() {
     let csv = "ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n";
@@ -5144,6 +5213,12 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
     assert_eq!(doses, vec![0.0, 0.1, 24.3, 24.3 + 12.1, 5.2]);
     let resets: Vec<f64> = s.reset_times.iter().map(|&t| s.param_time_at(t)).collect();
     assert_eq!(resets, vec![0.1, 2.0]);
+    // #1909: the train's implied dose runs under the next record, the reset at written 2.
+    assert_eq!(
+        s.doses[3].implied.map(|i| (i.parent, i.param_time)),
+        Some((2, 2.0))
+    );
+    assert_eq!(s.dose_param_time(3), 2.0);
     assert_eq!(s.pk_only_raw_times, vec![10.7]);
     assert_eq!(s.param_time_pk_only(0), 10.7);
     assert_eq!(s.obs_raw_times, vec![72.1, 30.7, 6.9]);

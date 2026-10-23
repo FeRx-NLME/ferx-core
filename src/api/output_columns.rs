@@ -181,7 +181,7 @@ pub(crate) fn compute_extra_output_columns(
         // subject (dose-indexed). Skipped entirely when the model declares no lag:
         // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
         // so the common no-lag case pays nothing for this per-dose pass.
-        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+        let mut dose_lagtimes: Vec<f64> = if model.has_lagtime() {
             (0..subject.doses.len())
                 .map(|d| {
                     let occ = crate::pk::dose_row_occasion(subject, d);
@@ -193,7 +193,7 @@ pub(crate) fn compute_extra_output_columns(
                         theta,
                         &eta_d,
                         subject.dose_cov(d),
-                        subject.param_time_at(subject.doses[d].time),
+                        subject.dose_param_time(d),
                     );
                     // On ODE models the lag is keyed by dose compartment (`ALAGn`;
                     // issue #369), so resolve through `dose_attr_map` — the same
@@ -212,6 +212,13 @@ pub(crate) fn compute_extra_output_columns(
         } else {
             Vec::new()
         };
+        // An `ADDL`-implied dose is shifted by its parent row's lag (#1909), as the
+        // prediction shifts it.
+        for d in 0..dose_lagtimes.len() {
+            if let Some(p) = subject.implied_dose_parent(d) {
+                dose_lagtimes[d] = dose_lagtimes[p];
+            }
+        }
 
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);

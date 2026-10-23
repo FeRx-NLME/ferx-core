@@ -1390,6 +1390,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
 /// deterministic in the snapshot, so sharing one bit-identical result is exactly a
 /// re-seed (#460 review).
 fn seed_tvcov_snapshots<T: Clone>(
+    model: &CompiledModel,
     subject: &Subject,
     key_time: bool,
     mut seed: impl FnMut(&std::collections::HashMap<String, f64>, f64) -> Option<Vec<T>>,
@@ -1422,14 +1423,10 @@ fn seed_tvcov_snapshots<T: Clone>(
         cache.insert(key, v.clone());
         Some(v)
     };
-    let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
-        .map(|k| {
-            seed_for(
-                subject.dose_cov(k),
-                subject.param_time_at(subject.doses[k].time),
-            )
-        })
+    let mut pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
+        .map(|k| seed_for(subject.dose_cov(k), subject.dose_param_time(k)))
         .collect::<Option<_>>()?;
+    crate::pk::inherit_parent_dose_attrs_g(model, subject, &mut pk_at_dose);
     let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
         .map(|j| seed_for(subject.obs_cov(j), subject.param_time_obs(j)))
         .collect::<Option<_>>()?;
@@ -1562,6 +1559,7 @@ fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
 /// seeder, for every dose or pk-only row whose occasion has no group (#1876, #2065).
 #[allow(clippy::too_many_arguments)]
 fn seed_iov_events<T: Clone>(
+    model: &CompiledModel,
     subject: &Subject,
     occ_to_k: &std::collections::HashMap<u32, usize>,
     k_groups: usize,
@@ -1585,9 +1583,9 @@ fn seed_iov_events<T: Clone>(
         // A dose under its occasion's group; one whose occasion has no group (an
         // unlabelled dose, #2065) falls to the κ = 0 seeder, which is production's
         // `combined_for` miss there too.
-        let pk_at_dose = (0..subject.doses.len())
+        let mut pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
             .map(|d| {
-                let t = subject.param_time_at(subject.doses[d].time);
+                let t = subject.dose_param_time(d);
                 match crate::pk::dose_row_group(subject, d, occ_to_k) {
                     Some(g) => seed_group_cov(g, subject.dose_cov(d), t),
                     None => seed_pk_only_cov(subject.dose_cov(d), t),
@@ -1631,6 +1629,7 @@ fn seed_iov_events<T: Clone>(
                 }
             })
             .collect::<Option<_>>()?;
+        crate::pk::inherit_parent_dose_attrs_g(model, subject, &mut pk_at_dose);
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     } else {
         // Reuse the caller's per-group seeding when supplied (the scale path already built
@@ -1685,6 +1684,7 @@ fn seed_iov_events<T: Clone>(
                 Some(group_dual[*occ_to_k.get(&occ)?].clone())
             })
             .collect::<Option<_>>()?;
+        crate::pk::inherit_parent_dose_attrs_g(model, subject, &mut pk_at_dose);
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     }
 }
