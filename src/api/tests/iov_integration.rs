@@ -896,7 +896,11 @@ fn simulation_single_occasion_check_has_the_fit_gate() {
     // `make_iov_population` doses at 0.0 and 3.5 with observations at 1..6.
     assert!(check(&model, &pop, &IovOccasionRule::PerDose).is_none());
     assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![3.5])).is_none());
-    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_some());
+    // #1788: the code `fit()` gives the same refusal, on the same block.
+    let d = check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0]))
+        .expect("a breakpoint after every record derives one occasion");
+    assert_eq!(d.code, "E_IOV_SINGLE_OCCASION");
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
     // No derived rule, or no kappa: not this check's refusal.
     assert!(check(&model, &pop, &IovOccasionRule::Column).is_none());
     let mut no_kappa = make_iov_model();
