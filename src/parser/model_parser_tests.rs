@@ -29385,10 +29385,11 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  CL = CL + CL * TVV",
             Custom,
         ),
+        // #1724: `2·(TVCL + RE)` — two arrivals at one root.
         (
-            "reads itself twice, both +, unchanged",
+            "reads itself twice, both +, was Additive",
             "  CL = CL + CL",
-            Additive,
+            Custom,
         ),
         // Dies under: a consumed variable following its other readers once a
         // reassignment replaces it — `K10` is not the parameter either way.
@@ -29558,15 +29559,18 @@ fn diamond(depth: usize, re: &str) -> String {
 /// Dies under: removing the memo lookup in `root_scale`.
 #[test]
 fn the_scale_walk_is_linear_on_a_diamond() {
-    use crate::types::EtaParamType::LogNormal;
+    use crate::types::EtaParamType::{Custom, LogNormal};
     for re in ["ETA_CL", "K"] {
         let count = |d: usize| {
             let (eta, kappa, calls) = walk_counted(&diamond(d, re));
-            // The answer, not just the cost: `+` all the way down to an `exp`.
+            // The answer, not just the cost: `+` all the way down to an `exp`,
+            // but from depth 1 `X{d}` holds `2^d` copies of the random effect,
+            // so the `exp` is reached more than once (#1724).
+            let want = if d == 0 { LogNormal } else { Custom };
             if re == "K" {
-                assert_eq!(kappa, LogNormal, "{re} depth {d}");
+                assert_eq!(kappa, want, "{re} depth {d}");
             } else {
-                assert_eq!(eta, [LogNormal], "{re} depth {d}");
+                assert_eq!(eta, [want], "{re} depth {d}");
             }
             calls
         };
@@ -29593,6 +29597,219 @@ fn a_self_reassignment_terminates() {
     assert_eq!(calls, 3, "one call per definition");
     let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
     assert_eq!(kappa, LogNormal);
+}
+
+// ── #1724: a random effect that reaches one scale more than once ─────────────
+
+/// Every row's ETA entries (each must carry `want`, and there must be some) and
+/// its kappa type, for the random effect `RE` in `indiv` — as in
+/// [`re_scale_twins`], which this checks every entry of.
+fn check_re_rows(rows: &[(&str, &str, crate::types::EtaParamType)]) {
+    let mut wrong = Vec::new();
+    for &(label, indiv, want) in rows {
+        let (eta, kappa) = re_scale_twins(indiv);
+        if eta.is_empty() || eta.iter().any(|(_, t)| *t != want) {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// #1724: the scale label assumes the random effect enters its scale once, with
+/// a unit coefficient. Reaching the same `exp`, `inv_logit` or parameter root
+/// twice is `2η` there (`log V = log TVV + 2η`: true CV `√(e^{4ω} − 1)` = 70.1%
+/// at ω = 0.1 against the printed `100·√ω` = 31.6%), so the label is `Custom`
+/// and no CV% or SD is printed. Every row was the label in its name before.
+/// Each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_reaching_one_scale_twice_is_custom() {
+    use crate::types::EtaParamType::Custom;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str)> = [
+        // Dies under: `reach_scale` ignoring the count (every row), and the
+        // `exp` terminal keyed on the call instead of its product (this row).
+        (
+            "two exp factors, was LogNormal",
+            "  CL = TVCL * exp(RE) * exp(RE)",
+        ),
+        // Dies under: `reach_add` not adding (the count stays 1 per call).
+        (
+            "one exp, read twice, was LogNormal",
+            "  CL = exp(RE + RE) * TVCL",
+        ),
+        (
+            "one exp, read with both signs, was LogNormal",
+            "  CL = TVCL * exp(RE - RE)",
+        ),
+        ("one root, was Additive", "  CL = TVCL + RE + RE"),
+        (
+            "one inv_logit, was Logit",
+            "  CL = inv_logit(TVCL + RE + RE)",
+        ),
+        // Dies under: `def_reach` resolving a root read once, not `n` times.
+        (
+            "an alias read twice, was LogNormal",
+            "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)",
+        ),
+        // Dies under: `root_scale` taking the readers' distinct terminals
+        // instead of summing them.
+        (
+            "a diamond, was LogNormal",
+            "  A = RE\n  B = A + 1\n  C = A + 2\n  CL = TVCL * exp(B + C)",
+        ),
+        // Dies under: `emit_eta_infos` counting only its own statement, not
+        // every statement that reads the ETA.
+        (
+            "two statements reach one exp, was LogNormal",
+            "  A = TVCL + RE\n  CL = exp(A + RE)",
+        ),
+        (
+            "a reassignment adds it again, was Additive",
+            "  CL = TVCL + RE\n  CL = CL + RE",
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t)| (format!("{v}{t}"), l))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l)| (*l, i.as_str(), Custom)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724, the other side of every gate above: the random effect reaches each
+/// terminal at most once **per evaluation**, so the label stands. Each row
+/// names the mutation it dies under; each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
+    use crate::types::EtaParamType::{self, *};
+    let rows: [(&str, &str, EtaParamType); 7] = [
+        // Dies under: an inline `if`'s branches summed, not maxed (`max` is
+        // desugared to `if (RE >= 0) RE else 0`, and the condition read is
+        // not a scale position at all).
+        (
+            "max() reads it in a condition and one branch",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * exp(max(RE, 0))",
+            LogNormal,
+        ),
+        (
+            "an inline if reads it in both branches",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * exp(if (WT > 70) RE else RE + 1)",
+            LogNormal,
+        ),
+        // Dies under: readers in sibling `if` branches summed by `combine_scoped`.
+        (
+            "two readers in sibling branches",
+            "  V = TVV * exp(ETA_V)\n  A = RE\n  \
+             if (WT > 70) {\n    B = A\n  } else {\n    B = A + 1\n  }\n  \
+             CL = TVCL * exp(B)",
+            LogNormal,
+        ),
+        // Dies under: definitions in sibling branches summed by `combine_scoped`
+        // across the origin statements (`reach`).
+        (
+            "two definitions in sibling branches",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    A = RE\n  } else {\n    A = RE + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            LogNormal,
+        ),
+        (
+            "assigned in sibling branches, additive",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = TVCL - RE\n  }",
+            Additive,
+        ),
+        // Dies under: the count kept per random effect instead of per terminal
+        // — two different `exp` calls each reached once.
+        (
+            "one alias into two parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V = TVV * exp(ETA_V) * exp(A)",
+            LogNormal,
+        ),
+        // Dies under: `reach_add` counting a `Custom` arrival as a scale.
+        (
+            "read twice, already custom",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * RE * RE",
+            Custom,
+        ),
+    ];
+    check_re_rows(&rows);
+}
+
+/// #1724 item 2: a sign does not change |CV|, so a negation anywhere above
+/// the `exp` keeps the label. Unary minus parses as `0 - x`, transparent in
+/// the walk like any `-`. Each is asserted for an ETA and a kappa.
+/// Dies under: `leaf_scales` treating `-` as a scale-deciding operation.
+#[test]
+fn a_negation_inside_a_product_keeps_the_label() {
+    use crate::types::EtaParamType::LogNormal;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows = [
+        ("leading minus", format!("{v}  CL = -TVCL * exp(RE)")),
+        (
+            "minus on the exp factor",
+            format!("{v}  CL = TVCL * -exp(RE)"),
+        ),
+        (
+            "subtracted from zero",
+            format!("{v}  CL = 0 - TVCL * exp(RE)"),
+        ),
+        ("negated exp argument", format!("{v}  CL = TVCL * exp(-RE)")),
+    ];
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(l, i)| (*l, i.as_str(), LogNormal))
+        .collect();
+    check_re_rows(&rows);
+}
+
+/// #1724: when the MU-reference pattern matches one occurrence of an ETA that
+/// reaches its product twice (Pattern 1, `TVCL * exp(ETA) * exp(ETA)`: one θ
+/// anchor and an `exp(ETA)` in the chain), the walk overrides the pattern's
+/// `LogNormal`, and the θ link goes with it. The pattern match itself is
+/// asserted, so the row cannot quietly stop reaching the override.
+/// Dies under: the override branch in `emit_eta_infos` deleted.
+#[test]
+fn the_walk_overrides_a_pattern_on_a_doubled_eta() {
+    use crate::types::EtaParamType::*;
+    let exp_eta = || {
+        Box::new(Expression::UnaryFn(
+            "exp".into(),
+            Box::new(Expression::Eta(0)),
+        ))
+    };
+    let twice = Expression::BinOp(
+        Box::new(Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            exp_eta(),
+        )),
+        BinOp::Mul,
+        exp_eta(),
+    );
+    let class = classify_expr(&twice, 4).expect("the pattern must match");
+    assert_eq!((class.param_type, class.theta_idx), (LogNormal, Some(0)));
+    let cl = |indiv: &str| {
+        let m = eta_scale_model(&format!("{indiv}\n  V = TVV * exp(ETA_V)"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        (i.param_type, i.linked_theta.clone())
+    };
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL)"),
+        (LogNormal, Some("TVCL".into())),
+        "read once"
+    );
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"),
+        (Custom, None),
+        "read twice"
+    );
 }
 
 // ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
