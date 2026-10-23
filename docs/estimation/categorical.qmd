@@ -39,9 +39,10 @@ EBEs agree with the FD route to the inner tolerance.
 A subject keeps the FD inner gradient for its whole objective when any record it
 carries has no analytic term: a time-to-event or count record beside the binary ones,
 or a predictor that cannot be compiled exactly (more than 24 θ + η, or an identifier
-the compiler cannot bind). The fit's `gradient_method_inner` label and its
-"*N* of *M* subjects use finite-difference inner gradients" warning report that route
-per subject.
+the compiler cannot bind). The "*N* of *M* subjects use finite-difference inner
+gradients" warning counts those subjects and names the cause. A model that also declares
+an `[event_model]` reports `gradient_method_inner: finite differences`, since every subject
+with a time-to-event record runs FD (#1861).
 
 ## Objective function
 

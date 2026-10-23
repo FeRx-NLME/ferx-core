@@ -19,9 +19,8 @@
 //! resolves its inner η-gradient to finite differences (`subject_has_survival_records`):
 //! there is **no** `Dual2` twin of this path, so there is no parity test to add. That is
 //! pinned at Tier 1 (`inner_optimizer::tests::an_ode_hazard_subject_resolves_its_inner_
-//! gradient_to_fd`) rather than here, because `FitResult::gradient_method_inner` is a
-//! model-level label and reads `analytic (Dual2)` on this model — the run banner's
-//! per-subject route says FD.
+//! gradient_to_fd`) rather than here; since #1861 `FitResult::gradient_method_inner` reads
+//! `finite differences` on this model too, as the run banner's per-subject route does.
 //!
 //! **The fixture.** `DROP` is a literal spliced into `$PK` that only ever acts at
 //! `TIME < 0.5` (a literal, not a theta: a `0 FIX` theta is packed on the log scale and

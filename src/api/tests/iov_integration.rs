@@ -896,7 +896,11 @@ fn simulation_single_occasion_check_has_the_fit_gate() {
     // `make_iov_population` doses at 0.0 and 3.5 with observations at 1..6.
     assert!(check(&model, &pop, &IovOccasionRule::PerDose).is_none());
     assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![3.5])).is_none());
-    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_some());
+    // #1788: the code `fit()` gives the same refusal, on the same block.
+    let d = check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0]))
+        .expect("a breakpoint after every record derives one occasion");
+    assert_eq!(d.code, "E_IOV_SINGLE_OCCASION");
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
     // No derived rule, or no kappa: not this check's refusal.
     assert!(check(&model, &pop, &IovOccasionRule::Column).is_none());
     let mut no_kappa = make_iov_model();
@@ -2066,7 +2070,9 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
+        // The first record's value, as the reader fills it: a covariate is present
+        // only when the subject-static map carries it (#2181).
+        covariates: HashMap::from([("FREE".to_string(), 0.0)]),
         dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),

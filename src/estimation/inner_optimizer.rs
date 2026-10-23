@@ -217,6 +217,10 @@ pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Su
         )
 }
 
+/// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
+/// all-FD guard on it (#1861).
+const IOV_SURVIVAL_REASON: &str = "survival/TTE observations";
+
 fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
@@ -231,7 +235,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         return "missing omega_iov";
     }
     if subject_has_survival_records(subject) {
-        return "survival/TTE observations";
+        return IOV_SURVIVAL_REASON;
     }
     if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
         return "model outside IOV analytic scope";
@@ -279,11 +283,15 @@ pub(crate) fn fd_fallback_warning(
     }
     let zeros = vec![0.0; model.n_eta];
     let n_total = population.subjects.len();
-    let n_fd = population
-        .subjects
-        .iter()
-        .filter(|s| subject_inner_runs_fd(model, s, theta, &zeros))
-        .count();
+    let (mut n_survival, mut n_shape) = (0usize, 0usize);
+    for s in &population.subjects {
+        match subject_inner_fd_reason(model, s, theta, &zeros) {
+            Some(InnerFdReason::Survival) => n_survival += 1,
+            Some(InnerFdReason::Shape) => n_shape += 1,
+            None => {}
+        }
+    }
+    let n_fd = n_survival + n_shape;
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
     // — e.g. TV-cov + LTBS on a closed-form model, or an in-scope ODE model whose every
@@ -294,9 +302,12 @@ pub(crate) fn fd_fallback_warning(
     // the report through the SAME `inner_reports_analytic_model` predicate
     // `build_info::gradient_method_inner` uses, so the label and this warning cannot drift
     // (the ODE route was missing from the old `analytic_inner_grad_supported_model` read).
-    // A model that already reports FD and runs FD everywhere needs no warning.
+    // A model that already reports FD and runs FD everywhere needs no warning — except
+    // when subjects fall back on a survival record (#1861): the label reads FD on any TTE
+    // model, but neither it nor the banner says *why*, and a joint PK-TTE user whose PK
+    // rows the recorder serves has no other way to learn that the hazard term is the cause.
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
+    if n_fd > 0 && (n_fd < n_total || model_reports_analytic || n_survival > 0) {
         // #520 C2: on an `[odes]` model the FD inner gradient differences a numerically
         // integrated trajectory, so the integrator's tolerance is part of the gradient's
         // accuracy — measured at 25-120 OFV of stall on TMDD at the default. The note is
@@ -304,15 +315,55 @@ pub(crate) fn fd_fallback_warning(
         let tolerance_note =
             crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model, population)
                 .unwrap_or_default();
+        // Name each cause with its own count (#1861): a TTE subject is not "a shape no
+        // recorder serves", and the old single parenthetical sent a joint PK-TTE user
+        // looking for an SDE or an `obs_scale` they did not have.
+        let mut reasons: Vec<String> = Vec::new();
+        if n_survival > 0 {
+            reasons.push(format!(
+                "{n_survival} carry a time-to-event (or other non-Gaussian) record whose \
+                 likelihood term has no analytic η-gradient"
+            ));
+        }
+        if n_shape > 0 {
+            reasons.push(format!(
+                "{n_shape} have a shape no analytic recorder serves, e.g. an SDE, a \
+                 per-CMT `obs_scale`, or more than 48 random effects"
+            ));
+        }
+        let reason_text = reasons.join("; ");
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
-             (a shape no analytic recorder serves, e.g. an SDE, a per-CMT \
-             `obs_scale`, or more than 48 random effects); their results are correct \
-             but slower.{tolerance_note}"
+             ({reason_text}); their results are correct but slower.{tolerance_note}"
         ))
     } else {
         None
     }
+}
+
+/// Why [`subject_inner_fd_reason`] puts a subject on the FD inner gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerFdReason {
+    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE / count
+    /// term, or an endpoint without a dual program.
+    Survival,
+    /// A data or model shape the Gaussian recorder declines.
+    Shape,
+}
+
+/// [`subject_inner_runs_fd`] with the cause, for [`fd_fallback_warning`]'s message.
+fn subject_inner_fd_reason(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<InnerFdReason> {
+    // `non_gaussian_eta_grad_served`, not `analytic_inner_grad_supported`: a subject whose
+    // records are all served but whose model bails for another reason is a shape decline.
+    if !non_gaussian_eta_grad_served(model, subject) {
+        return Some(InnerFdReason::Survival);
+    }
+    subject_inner_runs_fd(model, subject, theta, eta).then_some(InnerFdReason::Shape)
 }
 
 /// Whether `subject`'s non-IOV inner EBE gradient runs on finite differences at `eta`, as
@@ -361,9 +412,12 @@ fn iov_fd_fallback_warning(
     // (`gradient_method_inner` reads the same `inner_reports_analytic_model`), since
     // nothing else would correct that label. An all-analytic (`n_fd == 0`) population
     // needs no warning, and an all-FD one that also *reports* FD (e.g. `gradient = fd`)
-    // is already obvious from the banner and the label (#590 review, #1907).
+    // is already obvious from the banner and the label (#590 review, #1907) — unless a
+    // survival record is a cause, which the FD label on a TTE model does not explain
+    // (#1861, the same exception as the non-IOV twin).
     let model_reports_analytic = inner_reports_analytic_model(model);
-    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic) {
+    let survival_cause = reasons.contains_key(IOV_SURVIVAL_REASON);
+    if n_fd == 0 || (n_fd == n_total && !model_reports_analytic && !survival_cause) {
         return None;
     }
     let reason_text = reasons
@@ -835,6 +889,18 @@ pub(crate) struct InnerSolvePolicy {
     /// outer evaluation seeded from the flat-theta pre-flight's EBEs (#2076); `false`, the
     /// `Default`, otherwise.
     pub(crate) init_is_mode: bool,
+    /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
+    /// certifies it, without running the search (#2279). A point the inner solve returned as
+    /// converged passes that certificate, so it is a fixed point of a re-solve under this
+    /// flag on every platform; without it, a fallback-certified η̂ (gradient norm just above
+    /// `tol`, the mode resolved by the Newton or resolution arm) re-enters BFGS, stalls, and
+    /// the Nelder–Mead fallback moves it by a rounding-level amount whose size is libm-
+    /// dependent. Set only by the SIR draw scorer, and only when it scores at the very
+    /// parameters the warm start was certified at (the fit's estimates): elsewhere the start
+    /// is stale, the certificate's resolution arm could keep it with a Newton step above `tol`,
+    /// and its FD Hessian would cost every draw `2·n_eta` gradients per subject. `false`, the
+    /// `Default`, otherwise. The IOV inner solve does not read it.
+    pub(crate) keep_certified_start: bool,
 }
 
 impl InnerSolvePolicy {
@@ -851,6 +917,7 @@ impl InnerSolvePolicy {
             accelerate_exact_outer: false,
             screen: options.inner_screen,
             init_is_mode: false,
+            keep_certified_start: false,
         }
     }
 }
@@ -996,6 +1063,35 @@ impl FallbackCertifier<'_> {
         (x, ok)
     }
 
+    /// Whether [`Self::certify`] would certify `x` **without moving it**: the gradient norm is
+    /// below `tol`, or (off the objective-stall regime, as in `certify`) the Newton step at `x`
+    /// is below `tol` or its predicted gain is below the objective's resolution. The test a
+    /// converged inner solve's own end point passes, so a re-solve that checks it first
+    /// returns that point unchanged (`InnerSolvePolicy::keep_certified_start`, #2279). Unlike
+    /// [`Self::newton_certifies`] it takes no Newton step before the resolution arm, so it is
+    /// sound only at the parameters `x` was certified at — not as a shortcut for a moved one.
+    fn certifies_in_place(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64]) -> bool {
+        if !x.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let g = (self.grad)(x);
+        let gnorm = grad_norm_metric(&g, self.stop_precond);
+        if gnorm.is_finite() && gnorm < self.tol {
+            return true;
+        }
+        !(self.stall_at)(x) && self.newton_certifies_at(obj, x, &g)
+    }
+    /// The Newton-step and resolution arms of the certificate at `x` as it stands: `‖H⁻¹g‖ <
+    /// tol`, or `½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)`. Shared by [`Self::newton_certifies`]'s
+    /// final check and [`Self::certifies_in_place`], so the two cannot drift.
+    fn newton_certifies_at(&self, obj: &dyn Fn(&[f64]) -> f64, x: &[f64], g: &[f64]) -> bool {
+        let Some(newton) = self.pd_newton_step(x, g) else {
+            return false;
+        };
+        let f = obj(x);
+        let decrement = 0.5 * DVector::from_column_slice(g).dot(&newton);
+        newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
+    }
     /// [`Self::certify`], accepting a polished point only when `admissible` holds there. The
     /// runaway-EBE guard (#958) uses it: it recovers with Nelder–Mead precisely because the
     /// gradient there may not be trustworthy, so a gradient polish that marches back past the
@@ -1147,12 +1243,7 @@ impl FallbackCertifier<'_> {
         }
         // Still short of `tol` after the steps: certified by the resolution arm at the point
         // they reached, as before.
-        let Some(newton) = self.pd_newton_step(x, &g) else {
-            return false;
-        };
-        let f = obj(x);
-        let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
-        newton.norm() < self.tol || (f.is_finite() && decrement <= INNER_FTOL_REL * (1.0 + f.abs()))
+        self.newton_certifies_at(obj, x, &g)
     }
 
     /// `H⁻¹g` for the central-difference Hessian of `grad` at `x`, or `None` when `g` or `H`
@@ -2104,23 +2195,40 @@ fn find_ebe_solve(
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
     let warm_start = is_warm_start(eta_init, policy.init_is_mode);
-    let seed =
-        (seed_kind != InnerHessianSeed::None && dense_bfgs_route && (warm_start || cold_seed))
-            .then(|| {
-                analytic_inner_seed_hessian(
-                    model,
-                    subject,
-                    params,
-                    &eta,
-                    schedule,
-                    mult.as_deref(),
-                    err_keys.as_ref(),
-                    &mut obs_grad_recycle.borrow_mut(),
-                    seed_kind == InnerHessianSeed::Exact,
-                    frozen,
-                )
-            })
-            .flatten();
+    // Every Nelder–Mead end point below is certified on stationarity with the gradient,
+    // metric and stall predicate this BFGS used — never on NM's own simplex spread (#1527).
+    let cert = FallbackCertifier {
+        grad: &agrad,
+        precond: precond.as_deref(),
+        stop_precond,
+        stall_at: &stall_at,
+        n: n_eta,
+        max_iter,
+        tol,
+    };
+    // #2279: a warm start the certificate already accepts is returned as it stands, with no
+    // seed pass and no search (`InnerSolvePolicy::keep_certified_start`).
+    let start_certified =
+        policy.keep_certified_start && warm_start && cert.certifies_in_place(&obj, &eta);
+    let seed = (!start_certified
+        && seed_kind != InnerHessianSeed::None
+        && dense_bfgs_route
+        && (warm_start || cold_seed))
+        .then(|| {
+            analytic_inner_seed_hessian(
+                model,
+                subject,
+                params,
+                &eta,
+                schedule,
+                mult.as_deref(),
+                err_keys.as_ref(),
+                &mut obs_grad_recycle.borrow_mut(),
+                seed_kind == InnerHessianSeed::Exact,
+                frozen,
+            )
+        })
+        .flatten();
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2134,19 +2242,20 @@ fn find_ebe_solve(
         && use_analytic
         && !enable_stall
         && model.frem_config.is_none();
-    let result = inner_minimize_with_grad(
-        &obj,
-        &agrad,
-        &mut eta,
-        n_eta,
-        max_iter,
-        tol,
-        precond.as_deref(),
-        initial_hessian.as_ref(),
-        stop_precond,
-        &stall_at,
-        short_line_search,
-    );
+    let result = start_certified
+        || inner_minimize_with_grad(
+            &obj,
+            &agrad,
+            &mut eta,
+            n_eta,
+            max_iter,
+            tol,
+            precond.as_deref(),
+            initial_hessian.as_ref(),
+            stop_precond,
+            &stall_at,
+            short_line_search,
+        );
 
     // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
     // objective carries a gradient-noise floor (ODE) or is exact (analytical / event-driven /
@@ -2161,17 +2270,6 @@ fn find_ebe_solve(
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
     let bfgs_converged = result;
-    // Every Nelder–Mead end point below is certified on stationarity with the gradient,
-    // metric and stall predicate this BFGS used — never on NM's own simplex spread (#1527).
-    let cert = FallbackCertifier {
-        grad: &agrad,
-        precond: precond.as_deref(),
-        stop_precond,
-        stall_at: &stall_at,
-        n: n_eta,
-        max_iter,
-        tol,
-    };
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         // A final BFGS update can meet the requested tolerance exactly as the iteration
@@ -3528,6 +3626,13 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     // dual-evaluable program declines every subject carrying its records.
     #[cfg(feature = "survival")]
     if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+        return false;
+    }
+    // TTE (#1861): a hazard term has no analytic η-channel at all, so every subject carrying
+    // a survival record declines at the guard in `analytic_inner_grad_supported`, whatever
+    // engine its hazard runs on. Reporting "analytic" here labelled a joint PK-TTE fit whose
+    // every subject ran FD as `analytic (Dual2)`.
+    if model.has_tte() {
         return false;
     }
     // The unified recorder's scope, or an endpoint-only model (no structural model, no

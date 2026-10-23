@@ -10,6 +10,27 @@
 //! objective, gradient, and Hessian site plus the `#[allow(unused_mut)]` shims
 //! those need to stay warning-free.
 
+use crate::types::EstimationMethod;
+
+/// Whether an estimation method's outer optimizer applies the covariate-NN
+/// regularization penalties (`nn_l2` / `nn_smooth`). The FOCE family does —
+/// every outer optimizer under `foce` / `focei` / `laplace` (NLopt, built-in
+/// BFGS, trust-region) and both Gauss–Newton variants — and so does VI, which
+/// folds the same penalty gradient into its Adam step (see `run_vi`). SAEM,
+/// IMP/IMPMAP and Bayes do not touch the penalty — so neither does their
+/// covariance step (#1352).
+pub(crate) fn applies_nn_regularization(method: EstimationMethod) -> bool {
+    matches!(
+        method,
+        EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::Laplace
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+            | EstimationMethod::Vi
+    )
+}
+
 #[cfg(feature = "nn")]
 pub(crate) use crate::nn::NnRegularizer;
 
@@ -31,6 +52,10 @@ impl NnRegularizer {
         false
     }
 
+    pub(crate) fn hessian_is_exact(&self) -> bool {
+        true
+    }
+
     pub(crate) fn penalty_value(&self, _theta: &[f64]) -> f64 {
         0.0
     }
@@ -42,6 +67,13 @@ impl NnRegularizer {
     }
 
     pub(crate) fn add_packed_hessian(
+        &self,
+        _theta: &[f64],
+        _add: &mut dyn FnMut(usize, usize, f64),
+    ) {
+    }
+
+    pub(crate) fn add_exact_packed_hessian(
         &self,
         _theta: &[f64],
         _add: &mut dyn FnMut(usize, usize, f64),
@@ -67,6 +99,7 @@ mod tests {
         assert_eq!(grad, [0.5; 3]);
         let mut touched = false;
         reg.add_packed_hessian(&theta, &mut |_, _, _| touched = true);
+        reg.add_exact_packed_hessian(&theta, &mut |_, _, _| touched = true);
         assert!(!touched);
     }
 }

@@ -931,8 +931,10 @@ trait RhsView<'a>: Copy {
     fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
         std::rc::Rc::new(typical_summary_of(self))
     }
-    /// This subtree as an owned expression.
-    fn materialise(self) -> Expression;
+    /// This subtree as an owned expression, each substituted local definition
+    /// it reaches emitted once into `defs` and read by reference
+    /// ([`TypicalProgram`]).
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression;
 }
 
 impl<'a> RhsView<'a> for &'a Expression {
@@ -942,8 +944,146 @@ impl<'a> RhsView<'a> for &'a Expression {
     fn child(self, child: &'a Expression) -> Self {
         child
     }
-    fn materialise(self) -> Expression {
+    fn materialise(self, _: &mut ProgramDefs) -> Expression {
         self.clone()
+    }
+}
+
+/// An eta-free typical value `A(θ, covariates)` as a straight-line program
+/// (#1699): every local `[individual_parameters]` definition it reads is
+/// emitted **once**, into `defs`, and read through `VariableIdx(j)` — by a
+/// later definition or by `root` — instead of being inlined at each use. On a
+/// diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`) the
+/// inlined tree holds `2^d` copies of `X0`; the program holds one line per
+/// definition. A definition whose body is a leaf (`T = TVCL`) is substituted in
+/// place.
+///
+/// Nothing else is a `VariableIdx` here: the typical value is built from the
+/// unresolved statements, whose locals are `Variable` nodes, and every one the
+/// inliner resolved has become a reference.
+#[derive(Debug, Clone)]
+pub(crate) struct TypicalProgram {
+    /// The definitions, in dependency order: `defs[j]` reads only `defs[..j]`.
+    pub(crate) defs: Vec<Expression>,
+    /// The typical value itself.
+    pub(crate) root: Expression,
+}
+
+impl TypicalProgram {
+    /// A program with no definitions.
+    #[cfg(test)]
+    pub(crate) fn of(root: Expression) -> Self {
+        Self {
+            defs: Vec::new(),
+            root,
+        }
+    }
+
+    /// The typical value at `theta` and one subject's covariate snapshot.
+    pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
+        let mut values = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let v = eval_expr(
+                d,
+                theta,
+                &[],
+                &TypicalEnv {
+                    covariates,
+                    defs: &values,
+                },
+                &[],
+            );
+            values.push(v);
+        }
+        eval_expr(
+            &self.root,
+            theta,
+            &[],
+            &TypicalEnv {
+                covariates,
+                defs: &values,
+            },
+            &[],
+        )
+    }
+
+    /// The typical value as one tree, every reference replaced by its
+    /// definition — the `2^d` tree on a diamond, so for small test inputs only.
+    #[cfg(test)]
+    pub(crate) fn inlined(&self) -> Expression {
+        fn sub(e: &Expression, done: &[Expression]) -> Expression {
+            match e {
+                Expression::VariableIdx(j) => done[*j].clone(),
+                Expression::BinOp(l, op, r) => {
+                    Expression::BinOp(Box::new(sub(l, done)), *op, Box::new(sub(r, done)))
+                }
+                Expression::Power(b, x) => {
+                    Expression::Power(Box::new(sub(b, done)), Box::new(sub(x, done)))
+                }
+                Expression::UnaryFn(n, a) => Expression::UnaryFn(n.clone(), Box::new(sub(a, done))),
+                Expression::Conditional(c, t, f) => Expression::Conditional(
+                    Box::new(map_condition_operands(c, &mut |x| sub(x, done))),
+                    Box::new(sub(t, done)),
+                    Box::new(sub(f, done)),
+                ),
+                _ => e.clone(),
+            }
+        }
+        let mut done: Vec<Expression> = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let e = sub(d, &done);
+            done.push(e);
+        }
+        sub(&self.root, &done)
+    }
+
+    /// Nodes in the definitions and the root together (conditions included).
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        fn cond(c: &Condition) -> usize {
+            let mut n = 1;
+            for_each_condition_operand(c, &mut |x| n += nodes(x));
+            n
+        }
+        fn nodes(e: &Expression) -> usize {
+            1 + match e {
+                Expression::BinOp(l, _, r) | Expression::Power(l, r) => nodes(l) + nodes(r),
+                Expression::UnaryFn(_, a) => nodes(a),
+                Expression::ThetaGather { idx, .. } => nodes(idx),
+                Expression::Conditional(c, t, f) => cond(c) + nodes(t) + nodes(f),
+                _ => 0,
+            }
+        }
+        self.defs.iter().map(nodes).sum::<usize>() + nodes(&self.root)
+    }
+}
+
+/// The definitions a [`TypicalProgram`] is being built with, and which
+/// substituted definition (by body address) each one is.
+#[derive(Default)]
+pub(crate) struct ProgramDefs {
+    defs: Vec<Expression>,
+    index: HashMap<*const Expression, usize>,
+}
+
+/// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
+/// the definitions computed so far by index. A stray local name reads `0.0`
+/// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
+/// rather than letting it through.
+struct TypicalEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    defs: &'a [f64],
+}
+
+impl EvalEnv for TypicalEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => f64::EPSILON,
+            Expression::VariableIdx(j) => self.defs.get(*j).copied().unwrap_or(0.0),
+            _ => 0.0,
+        }
     }
 }
 
@@ -1202,34 +1342,50 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
         done
     }
 
-    fn materialise(self) -> Expression {
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression {
         #[cfg(test)]
         INLINED_NODES.with(|c| c.set(c.get() + 1));
+        if let Some(d) = self.def {
+            if !self.rewrites_children() {
+                return self.expr.clone();
+            }
+            if let Some(&j) = defs.index.get(&d) {
+                return Expression::VariableIdx(j);
+            }
+            let body = Inlined { def: None, ..self }.materialise(defs);
+            let j = defs.defs.len();
+            defs.defs.push(body);
+            defs.index.insert(d, j);
+            return Expression::VariableIdx(j);
+        }
         if self.rewrites_children() {
             match self.expr {
                 Expression::BinOp(l, op, r) => {
                     return Expression::BinOp(
-                        Box::new(self.child(l).materialise()),
+                        Box::new(self.child(l).materialise(defs)),
                         *op,
-                        Box::new(self.child(r).materialise()),
+                        Box::new(self.child(r).materialise(defs)),
                     )
                 }
                 Expression::Power(b, e) => {
                     return Expression::Power(
-                        Box::new(self.child(b).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(b).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 Expression::UnaryFn(name, a) => {
-                    return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
+                    return Expression::UnaryFn(
+                        name.clone(),
+                        Box::new(self.child(a).materialise(defs)),
+                    )
                 }
                 Expression::Conditional(c, t, e) => {
                     return Expression::Conditional(
                         Box::new(map_condition_operands(c, &mut |x| {
-                            self.child(x).materialise()
+                            self.child(x).materialise(defs)
                         })),
-                        Box::new(self.child(t).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(t).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 _ => {}
@@ -1901,15 +2057,20 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
         s
     }
 
-    fn build(self) -> Expression {
-        match self {
-            TypicalParts::Whole(v) => v.materialise(),
+    /// The typical value as a [`TypicalProgram`]. A chain is re-associated to
+    /// the left down to its definitions, each of which stays one operand: one
+    /// line of the program, not its own operands flattened in, which on a `*`
+    /// diamond would walk every path (#1699).
+    fn build(self) -> TypicalProgram {
+        let mut defs = ProgramDefs::default();
+        let root = match self {
+            TypicalParts::Whole(v) => v.materialise(&mut defs),
             TypicalParts::Chain(op, parts) => {
                 let mut operands = Vec::new();
                 for p in parts {
-                    flatten_chain(p, op, true, &mut operands);
+                    flatten_chain(p, op, false, &mut operands);
                 }
-                let mut operands = operands.into_iter().map(|o| o.materialise());
+                let mut operands = operands.into_iter().map(|o| o.materialise(&mut defs));
                 let first = operands
                     .next()
                     .expect("a split keeps at least one operand besides the eta");
@@ -1917,6 +2078,10 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                     Expression::BinOp(Box::new(a), op, Box::new(o))
                 })
             }
+        };
+        TypicalProgram {
+            defs: defs.defs,
+            root,
         }
     }
 }
@@ -2055,7 +2220,7 @@ fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize)> {
 /// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
 /// definition is eta-free, so the eta's operand is never inside one, and
 /// flattening it would walk every path of a diamond. [`TypicalParts::build`]
-/// flattens through them, so the built chain is the one the full tree gives.
+/// keeps them whole too, each one line of its [`TypicalProgram`] (#1699).
 fn flatten_chain<'a, V: RhsView<'a>>(v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>) {
     match v.expr() {
         Expression::BinOp(l, o, r) if *o == op && (through_definitions || !v.is_definition()) => {
@@ -2677,21 +2842,21 @@ fn emit_eta_infos(
     }
 }
 
-/// Every assignment, top level and inside `if` branches, in statement order.
-fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, out, &mut Vec::new());
-}
-
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
 /// level): each is `(if statement, branch)`, the statement numbered in
 /// flattening order and the branch by position, `else` last.
 type Scope = Vec<(usize, usize)>;
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`].
+/// The shape of one `if` statement, indexed by its [`Scope`] number less one:
+/// `(number of bodies, else included; whether there is an else)`.
+type IfShape = (usize, bool);
+
+/// Every assignment, top level and inside `if` branches, in statement order,
+/// with its [`Scope`], and each `if` statement's [`IfShape`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
-    next_if: &mut usize,
+    ifs: &mut Vec<IfShape>,
     out: &mut Vec<(&'a str, &'a Expression)>,
     scopes: &mut Vec<Scope>,
 ) {
@@ -2705,12 +2870,15 @@ fn flatten_assigns_scoped<'a>(
                 branches,
                 else_body,
             } => {
-                *next_if += 1;
-                let id = *next_if;
+                ifs.push((
+                    branches.len() + usize::from(else_body.is_some()),
+                    else_body.is_some(),
+                ));
+                let id = ifs.len();
                 let bodies = branches.iter().map(|(_, b)| b).chain(else_body);
                 for (branch, body) in bodies.enumerate() {
                     scope.push((id, branch));
-                    flatten_assigns_scoped(body, scope, next_if, out, scopes);
+                    flatten_assigns_scoped(body, scope, ifs, out, scopes);
                     scope.pop();
                 }
             }
@@ -2750,18 +2918,88 @@ thread_local! {
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
     scopes: Vec<Scope>,
+    ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
     memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
 }
 
+/// Where one definition is **in force**, per branch path, as a walk over the
+/// later assignments in order (#1689): the rule [`ScaleWalk::root_scale`] and
+/// [`unconditionally_replaced`] share, so the two cannot drift apart.
+///
+/// A later assignment to the same variable ends the definition for every later
+/// assignment whose scope has the reassignment's scope as a prefix (the rest of
+/// that branch, and whatever it nests), and an `if` with an `else` whose every
+/// branch ends it, recursively, ends it for the rest of the scope that holds the
+/// `if`. It is **replaced** once it ends in the definition's own scope or an
+/// enclosing one; a reassignment inside an `if` without an `else`, or in only
+/// some branches, leaves it live on the other path. An assignment in the other
+/// branch of the `if` that holds the definition never sees it
+/// ([`in_sibling_branches`]).
+struct InForce<'s> {
+    scope: &'s Scope,
+    /// Scopes where a reassignment has ended the definition.
+    ended: Vec<Scope>,
+}
+
+impl<'s> InForce<'s> {
+    fn new(scope: &'s Scope) -> Self {
+        Self {
+            scope,
+            ended: Vec::new(),
+        }
+    }
+
+    fn is_ended(&self, s: &[(usize, usize)]) -> bool {
+        self.ended.iter().any(|k| s.starts_with(k))
+    }
+
+    /// Whether the definition is in force at an assignment in scope `other`:
+    /// not in the other branch of an `if` that holds it, and not after a
+    /// reassignment earlier on this path.
+    fn reaches(&self, other: &Scope) -> bool {
+        !in_sibling_branches(self.scope, other) && !self.is_ended(other)
+    }
+
+    /// Record a reassignment in scope `other`, which the definition
+    /// [`Self::reaches`]; `true` once that replaces the definition.
+    fn end(&mut self, other: &Scope, ifs: &[IfShape]) -> bool {
+        // End it in this scope, then in each enclosing scope whose `if` now has
+        // every branch, `else` included, ended.
+        let mut k = other.clone();
+        loop {
+            if self.scope.starts_with(&k) {
+                return true;
+            }
+            self.ended.push(k.clone());
+            let Some(&(id, _)) = k.last() else {
+                return false;
+            };
+            let (n_branches, has_else) = ifs[id - 1];
+            let parent = &k[..k.len() - 1];
+            let exhaustive = has_else
+                && (0..n_branches).all(|b| {
+                    let mut s = parent.to_vec();
+                    s.push((id, b));
+                    self.is_ended(&s)
+                });
+            if !exhaustive {
+                return false;
+            }
+            k.pop();
+        }
+    }
+}
+
 impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
-        let (mut assigns, mut scopes) = (Vec::new(), Vec::new());
-        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut 0, &mut assigns, &mut scopes);
+        let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+        flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
         let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
         Self {
             assigns,
             scopes,
+            ifs,
             consumers,
             memo,
         }
@@ -2793,13 +3031,9 @@ impl<'a> ScaleWalk<'a> {
 
     /// The distinct scale(s) of a leaf that reached the root of definition `def`.
     ///
-    /// The definition is **in force** from the next assignment up to and
-    /// including the first later assignment to the same variable in the same or
-    /// an enclosing scope (a reassignment inside an `if`, including a later
-    /// `if`, leaves it live on the other path); an assignment in the other
-    /// branch of the `if` that holds the definition never sees it
-    /// ([`in_sibling_branches`]). Its **readers** are the assignments in that
-    /// range that read the variable.
+    /// Its **readers** are the later assignments where the definition is in
+    /// force ([`InForce`], #1689) that read the variable (a reassignment reads
+    /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
     /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
@@ -2826,10 +3060,11 @@ impl<'a> ScaleWalk<'a> {
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         let mut out = Vec::new();
         let (mut read, mut replaced) = (false, false);
+        let mut in_force = InForce::new(scope);
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
-            if in_sibling_branches(scope, other) {
-                continue; // the other branch of an `if` never sees this definition
+            if !in_force.reaches(other) {
+                continue;
             }
             if !consumed || *lhs == var {
                 for s in leaf_scales(e, &is_var) {
@@ -2840,7 +3075,7 @@ impl<'a> ScaleWalk<'a> {
                     }
                 }
             }
-            if *lhs == var && scope.starts_with(other) {
+            if *lhs == var && in_force.end(other, &self.ifs) {
                 replaced = true;
                 break;
             }
@@ -3061,7 +3296,11 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
-/// - no η-free assignment writes a row whose `eta_map` names an η;
+/// - no η-free assignment writes a row whose `eta_map` names an η, unless a
+///   a later assignment unconditionally replaces it
+///   ([`unconditionally_replaced`]): `CL = TVCL` then `CL = TVCL * exp(ETA_CL)`,
+///   or an `if`-`else` defining `CL` directly in every branch, leaves only the
+///   direct value on the row (#1691);
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -3074,11 +3313,11 @@ fn lognormal_eta_chain_exact(
     eta_map: &[i32],
     n_eta_bsv: usize,
 ) -> bool {
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
     let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
     let mut carrying: Vec<String> = Vec::new();
-    for (lhs, expr) in assigns {
+    for (def, &(lhs, expr)) in assigns.iter().enumerate() {
         if is_synthetic_readout_param(lhs) {
             continue;
         }
@@ -3093,8 +3332,8 @@ fn lognormal_eta_chain_exact(
             // An η-free value on a row whose `eta_map` names an η (an η-free
             // `else` branch, a reassignment): `sel_flat` still names the η, so
             // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
-            // review round 2).
-            if row_eta.is_some() {
+            // review round 2). One that never reaches the row is harmless.
+            if row_eta.is_some() && !unconditionally_replaced(&assigns, &scopes, &ifs, def) {
                 return false;
             }
             continue;
@@ -3110,6 +3349,33 @@ fn lognormal_eta_chain_exact(
         }
     }
     true
+}
+
+/// Whether definition `def` is unconditionally replaced: every evaluation that
+/// runs it runs a later assignment to the same variable after it, by the
+/// in-force rule [`ScaleWalk::root_scale`] uses ([`InForce`], #1687 / #1689) —
+/// a reassignment in the same or an enclosing scope, or an `if` with an `else`
+/// that reassigns in every branch. A reassignment in only some branches leaves
+/// `def` live on the other path, and one in the other branch of the `if`
+/// holding `def` never runs with it; neither counts.
+///
+/// What reads the variable while `def` is in force is not asked: it reads an
+/// η-free value, which is not what the gate tests. The row's own value is the
+/// replacement's, judged when the gate reaches it.
+fn unconditionally_replaced(
+    assigns: &[(&str, &Expression)],
+    scopes: &[Scope],
+    ifs: &[IfShape],
+    def: usize,
+) -> bool {
+    let (var, _) = assigns[def];
+    let mut in_force = InForce::new(&scopes[def]);
+    for ((lhs, _), other) in assigns.iter().zip(scopes).skip(def + 1) {
+        if *lhs == var && in_force.reaches(other) && in_force.end(other, ifs) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and
@@ -10017,7 +10283,15 @@ fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
 
 // ── [fit_options] block parser ──────────────────────────────────────────────
 
-fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
+/// Parse one estimation-method token — `focei`, `saem`, `vi`, an alias such as
+/// `importance_sampling` — the way a `[fit_options]` `method = …` line reads it:
+/// case-insensitive, surrounding quotes stripped. Removed spellings (`agq`) and
+/// unknown tokens are an `Err` carrying the user-facing message.
+///
+/// Public so a front end with its own `method` argument (ferx-r's
+/// `ferx_fit(method = …)`) accepts exactly the engine's tokens instead of keeping
+/// a copy that drifts each time a method is added (ferx-r #506).
+pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     let val = token
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -10310,10 +10584,13 @@ fn reject_fit_option_line(line: &str) -> String {
 
 /// Apply a `method = …` value — one method, or a `[a, b, c]` chain — to `opts`,
 /// the way a `[fit_options]` line does. `method` is the one `[fit_options]` key
-/// [`apply_fit_option`] does not take (a front end with a dedicated method
-/// argument parses it itself), so the parser and `validate_model_file_with`'s
-/// overrides (#2165) share this instead of two spellings of the rule.
-pub(crate) fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
+/// [`apply_fit_option`] does not take, so the parser, `validate_model_file_with`'s
+/// overrides (#2165) and a front end with a dedicated method argument (ferx-r
+/// #506) share this instead of separate spellings of the rule: the tokens go
+/// through [`parse_method_token`], and the final stage sets `interaction` the
+/// same way for all of them. Chain-shape rules that depend on other options (an
+/// evaluate-only stage must come last) are checked when the fit is validated.
+pub fn apply_method_option(opts: &mut FitOptions, value: &str) -> Result<(), String> {
     let raw = value.trim();
     // List form: `method = [a, b, c]` — chain of stages.
     if raw.starts_with('[') {
@@ -10937,7 +11214,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
-        "sir_df" => opts.sir_df = parse_f64_min("sir_df", 1.0)?,
+        "sir_df" => opts.sir_df = parse_proposal_df("sir_df", false)?,
         "sir_scale" => {
             opts.sir_scale = match value.trim().to_lowercase().as_str() {
                 "packed" => SirScale::Packed,
@@ -21898,107 +22175,6 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-thread_local! {
-    /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
-    /// evaluator. Its installer (`ModelNnGuard`) was retired with the forward provider
-    /// (#2093), so it is empty in practice; the adjoint supplies NN outputs on its own
-    /// number type through `ModelNnDualGuard`.
-    static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-thread_local! {
-    /// First dual axis of the `[covariate_nn]` output block for the generic evaluator,
-    /// or `None` (the default) to lift outputs as constants. See [`ModelNnAxisGuard`].
-    static MODEL_NN_AXIS_BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// Current `[covariate_nn]` output axis base, `None` unless a [`ModelNnAxisGuard`] is live.
-#[inline]
-fn current_nn_axis_base() -> Option<usize> {
-    MODEL_NN_AXIS_BASE.with(std::cell::Cell::get)
-}
-
-/// RAII guard that makes the generic evaluator seed every `[covariate_nn]` output as an
-/// **independent dual variable**: output `flat` (networks in `covariate_nns` order, each
-/// network's outputs in declaration order) lands on axis `base + flat`. Pair it with a
-/// source of the outputs' values at the same covariate snapshot (the retired
-/// `ModelNnGuard` before #2093).
-///
-/// This is how the FOCE/FOCEI TV-cov walk gets an exact `∂p/∂z` (and the mixed
-/// `∂²p/∂η∂z`) from one `Dual2` program evaluation, to be chained to the weight thetas
-/// with the network's backprop Jacobian — the per-event, exact form of the
-/// factorization [`crate::estimation::nn_theta_gradient`] uses with a bias finite
-/// difference (#1300). The caller owns the axis budget: every `base + flat` must be
-/// below the dual width `M` it dispatched on, or `T::var` indexes past the jet.
-///
-/// Purely crate-internal bookkeeping on the evaluator's thread-local — it adds nothing
-/// to the public `PkNum` contract, which external implementors must keep compiling
-/// against (PR #1301 review).
-pub(crate) struct ModelNnAxisGuard(Option<usize>);
-
-impl ModelNnAxisGuard {
-    /// Lift NN outputs as constants again for the guard's scope, restoring the previous
-    /// setting on drop. For a value pass that runs *inside* a seeded evaluation over a
-    /// jet-free type — the `Dual2<0>` cov-static fold in `eval_cov_static_f64` — where a
-    /// seed would index past an empty jet. A no-op when nothing is seeded.
-    fn suspend() -> Self {
-        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(None));
-        ModelNnAxisGuard(prev)
-    }
-}
-
-impl Drop for ModelNnAxisGuard {
-    fn drop(&mut self) {
-        MODEL_NN_AXIS_BASE.with(|cell| cell.set(self.0));
-    }
-}
-
-thread_local! {
-    /// `[covariate_nn]` outputs on a dual number type, set by [`ModelNnDualGuard`].
-    static MODEL_NN_DUAL: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Output `out_i` of network `nn_i` from a live [`ModelNnDualGuard`] of type `T`.
-#[inline]
-fn nn_dual_output<T: Copy + 'static>(nn_i: u32, out_i: u32) -> Option<T> {
-    MODEL_NN_DUAL.with(|cell| {
-        cell.borrow()
-            .as_ref()?
-            .downcast_ref::<Vec<Vec<T>>>()?
-            .get(nn_i as usize)?
-            .get(out_i as usize)
-            .copied()
-    })
-}
-
-/// RAII guard installing `[covariate_nn]` outputs computed on the evaluator's own number
-/// type — the network evaluated over taped weights — so the generic evaluator reads them
-/// with their derivatives, in place of the `f64` constants the retired `ModelNnGuard`
-/// installed before #2093.
-#[cfg(feature = "nn")]
-pub(crate) struct ModelNnDualGuard(Option<Box<dyn std::any::Any>>);
-
-#[cfg(feature = "nn")]
-impl ModelNnDualGuard {
-    pub(crate) fn enter<T: 'static>(outputs: Vec<Vec<T>>) -> Self {
-        ModelNnDualGuard(MODEL_NN_DUAL.with(|cell| cell.replace(Some(Box::new(outputs)))))
-    }
-}
-
-#[cfg(feature = "nn")]
-impl Drop for ModelNnDualGuard {
-    fn drop(&mut self) {
-        MODEL_NN_DUAL.with(|cell| *cell.borrow_mut() = self.0.take());
-    }
-}
-
-/// Run `f` with the ambient NN outputs borrowed. Empty unless something has filled
-/// `MODEL_NN_OUTPUTS` on this thread (its installer, `ModelNnGuard`, was retired in #2093).
-fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
-    MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
-}
-
 /// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
 /// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
 /// observe the same value a compiled readout would (the readout closure signature
@@ -23959,19 +24135,84 @@ const NON_READING_BLOCKS: &[&str] = &[
     "priors",
 ];
 
-/// Keys of the endpoint blocks whose value is a word or a list of words (a
-/// family, link, recurrence or clock name, the state labels), never an
-/// expression, so the line reads no name (#1902). `cmt` is absent: its integer
-/// value holds no identifier to drop.
-const LITERAL_VALUED_ENDPOINT_KEYS: &[&str] = &["family", "type", "clock", "states", "link"];
+/// What a [`WORD_VALUED_KEYS`] value may hold besides numbers and punctuation.
+#[derive(Clone, Copy)]
+enum WordValue {
+    /// Only these words, which the scan drops (case-insensitively) from the value.
+    /// Any other identifier on the line still counts as a read, so a parser that
+    /// later accepts an expression there (`at = every DT from …`) keeps `DT` in the
+    /// scan rather than silently dropping it (#1905).
+    Words(&'static [&'static str]),
+    /// Labels the line declares (`states = [awake=0, asleep=1]`): every identifier
+    /// in it is a new name, none a read.
+    Labels,
+}
+
+/// Per block, the keys whose value its parser accepts only as fixed words (and
+/// numbers) or as declared labels, so the line reads no name (#1902, #1905).
+/// Each word list is what that parser matches; a word it does not accept is
+/// harmless here (it was refused anyway), and a word it accepts but this table
+/// omits only over-refuses. `observe` and every key whose value is parsed as an
+/// expression stay scanned whole. The parsers' refusal of an identifier value is
+/// pinned key by key in `word_valued_keys_reject_an_identifier_value`.
+const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
+    (
+        "event_model",
+        "family",
+        WordValue::Words(&["exponential", "weibull", "gompertz"]),
+    ),
+    (
+        "event_model",
+        "type",
+        WordValue::Words(&["tte", "single", "rtte"]),
+    ),
+    (
+        "event_model",
+        "clock",
+        WordValue::Words(&["forward", "reset"]),
+    ),
+    ("binary_model", "link", WordValue::Words(&["logit"])),
+    ("markov_model", "type", WordValue::Words(&["ctmm"])),
+    ("markov_model", "states", WordValue::Labels),
+    // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
+    (
+        "adaptive_dosing",
+        "at",
+        WordValue::Words(&["every", "from", "to"]),
+    ),
+    // `parse_adaptive_route`: `bolus(cmt = N)` or `infuse(cmt = N, over = T)`.
+    (
+        "adaptive_dosing",
+        "route",
+        WordValue::Words(&["bolus", "infuse", "cmt", "over"]),
+    ),
+    (
+        "adaptive_dosing",
+        "with_assay_error",
+        WordValue::Words(&["true", "false"]),
+    ),
+    // `parse_covariate_nn_block`'s `parse_activation`, for both layers.
+    (
+        "covariate_nn",
+        "activation",
+        WordValue::Words(ACTIVATION_WORDS),
+    ),
+    ("covariate_nn", "output", WordValue::Words(ACTIVATION_WORDS)),
+];
+
+/// The activation names `parse_covariate_nn_block` accepts (case-insensitively).
+const ACTIVATION_WORDS: &[&str] = &[
+    "identity", "linear", "relu", "softplus", "tanh", "sigmoid", "exp",
+];
 
 /// The identifiers a reading block's `lines` can read, for the #1857 refusal:
 /// [`collect_referenced_identifiers`] over each line minus its assignment target
 /// (#1902). On a `key = expr` line the target — `key`, `init(x)`, `d/dt(x)`,
 /// `transition A -> B` — is a key, a state or a slot being written, never a read,
 /// and counting it refused a valid model whose helper was named `RATE` or `SHAPE`
-/// because `[event_model]` has keys of those names. In an endpoint block a
-/// [`LITERAL_VALUED_ENDPOINT_KEYS`] line reads nothing at all.
+/// because `[event_model]` has keys of those names. On a [`WORD_VALUED_KEYS`]
+/// line the block's fixed words are dropped from the value too (#1905), and a
+/// label-valued line reads nothing at all.
 ///
 /// A line of any other shape — `pk f(cl=CL)`, `DV ~ …`, `if (A == B) {`, or a
 /// target of another form — is tokenized whole, so
@@ -23981,16 +24222,25 @@ fn collect_read_identifiers(
     lines: &[String],
     out: &mut std::collections::HashSet<String>,
 ) {
-    let endpoint = matches!(block, "event_model" | "markov_model" | "binary_model");
     for line in lines {
-        let rhs = match split_assignment_target(line) {
-            Some((target, _)) if endpoint && LITERAL_VALUED_ENDPOINT_KEYS.contains(&target) => {
-                continue
-            }
-            Some((_, rhs)) => rhs,
-            None => line.as_str(),
+        let Some((target, rhs)) = split_assignment_target(line) else {
+            collect_referenced_identifiers(std::slice::from_ref(line), out);
+            continue;
         };
-        collect_referenced_identifiers(&[rhs.to_string()], out);
+        let value = WORD_VALUED_KEYS
+            .iter()
+            .find(|(b, k, _)| *b == block && *k == target)
+            .map(|(_, _, v)| *v);
+        let mut ids = std::collections::HashSet::new();
+        collect_referenced_identifiers(&[rhs.to_string()], &mut ids);
+        match value {
+            Some(WordValue::Labels) => {}
+            Some(WordValue::Words(words)) => out.extend(
+                ids.into_iter()
+                    .filter(|id| !words.iter().any(|w| w.eq_ignore_ascii_case(id))),
+            ),
+            None => out.extend(ids),
+        }
     }
 }
 
@@ -25535,16 +25785,15 @@ fn eval_expression(
 
 /// Evaluate an eta-free typical value `A(θ, covariates)` — a
 /// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
-/// Local variables were inlined at detection time, so the variable environment
-/// is empty; a stray name would read as `0.0`, which is why detection rejects
-/// them rather than letting one through.
+/// The local definitions it reads were resolved at detection time into the
+/// program's own lines ([`TypicalProgram`]); a stray name would read as `0.0`,
+/// which is why detection rejects them rather than letting one through.
 pub(crate) fn eval_typical_value(
-    expr: &Expression,
+    typical: &TypicalProgram,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let vars: HashMap<String, f64> = HashMap::new();
-    eval_expression(expr, theta, &[], covariates, &vars, &[])
+    typical.eval(theta, covariates)
 }
 
 #[inline]
@@ -27072,7 +27321,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
     eta: &[T],
     covariates: &[f64],
     vars: &[T],
-    nn_outputs: &[Vec<f64>],
+    nn_outputs: &[Vec<T>],
     stack: &mut Vec<T>,
 ) -> T {
     stack.clear();
@@ -27132,47 +27381,19 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::PushMixNum => push!(k(current_mixture_class() as f64)),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
-            // Outputs the caller computed on this number type (`ModelNnDualGuard`: the
-            // adjoint's recordings, the network over taped weights) are read as they are.
-            Op::PushNnOutput(nn_i, out_i) if nn_dual_output::<T>(nn_i, out_i).is_some() => {
-                push!(nn_dual_output::<T>(nn_i, out_i).expect("checked by the guard"));
-            }
+            // `[covariate_nn]` outputs on the evaluator's own number type, as the caller
+            // computed them (the adjoint's recordings: the network over taped weights, or
+            // the outputs as tape leaves), so their derivatives come through as they are.
             Op::PushNnOutput(nn_i, out_i) => {
                 let v = nn_outputs
                     .get(nn_i as usize)
                     .and_then(|v| v.get(out_i as usize))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        debug_assert!(
-                            false,
-                            "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i} out of bounds"
-                        );
-                        0.0
-                    });
-                // A live [`ModelNnAxisGuard`] seeds every network output on its own dual
-                // axis (`base + flat output index`), so `∂p/∂z` comes out of the same walk
-                // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
-                // always was (exact for `∂/∂η`).
-                match current_nn_axis_base() {
-                    Some(base) => {
-                        let flat: usize = nn_outputs
-                            .iter()
-                            .take(nn_i as usize)
-                            .map(Vec::len)
-                            .sum::<usize>()
-                            + out_i as usize;
-                        // The caller owns the width budget (the pre-#2093
-                        // `nn_param_derivatives_at_cov`, retired in #2093, dispatched on exactly
-                        // `n_base + n_eta + n_z`); an axis past the jet
-                        // is a wiring bug, and `var`'s bounds check fails it loudly rather
-                        // than lifting the output to a constant, which would report a zero
-                        // `∂/∂z` as analytic. The zero-width cov-static value pass runs with
-                        // seeding suspended (`ModelNnAxisGuard::suspend` in
-                        // `eval_cov_static_f64`), so it never reaches this arm.
-                        push!(T::var(v, base + flat));
-                    }
-                    None => push!(k(v)),
-                }
+                    .copied();
+                debug_assert!(
+                    v.is_some(),
+                    "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i}: no outputs handed in"
+                );
+                push!(v.unwrap_or_else(|| k(0.0)));
             }
             // The level index is integer-valued data, so its jet is empty and
             // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
@@ -27504,24 +27725,22 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     // skip nothing (every other caller passes `&[]`). Conditions are still
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
+    // `[covariate_nn]` outputs on `T` (empty for a model without a network, and for every
+    // caller whose program cannot read one).
+    nn: &[Vec<T>],
 ) {
-    // `[covariate_nn]` outputs come from the ambient `MODEL_NN_OUTPUTS` thread-local, not
-    // from a parameter, and are lifted as constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
-    // Empty when no guard is live, which is correct for every model without a network.
-    //
-    // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
-    // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
-    // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
-    // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
-    // NN guard may be entered or dropped beneath it; none is (the adjoint installs its
-    // `ModelNnDualGuard` outside this call).
-    with_nn_outputs(|nn| {
-        eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
-    })
+    // `If` conditions are evaluated on `f64` views; the outputs' view is taken once per walk.
+    let nn_val: Vec<Vec<f64>> = nn
+        .iter()
+        .map(|net| net.iter().map(|v| v.val()).collect())
+        .collect();
+    eval_statements_g_inner::<T>(
+        stmts, theta, eta, cov, vars, du, bc_stack, skip, nn, &nn_val,
+    )
 }
 
-/// The recursive body of [`eval_statements_g`], with the ambient `[covariate_nn]` outputs
-/// already resolved and borrowed by the caller.
+/// The recursive body of [`eval_statements_g`], with the `[covariate_nn]` outputs' `f64`
+/// view (`nn_val`, for the conditions) taken once by the caller.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
@@ -27533,7 +27752,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
     du: Option<&mut [T]>,
     bc_stack: &mut Vec<T>,
     skip: &[bool],
-    empty_nn: &[Vec<f64>],
+    nn: &[Vec<T>],
+    nn_val: &[Vec<f64>],
 ) {
     let mut du_opt = du;
     for s in stmts {
@@ -27542,13 +27762,13 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                 if skip.get(*idx).copied().unwrap_or(false) {
                     continue;
                 }
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -27565,8 +27785,7 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
-                    {
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, nn_val) {
                         eval_statements_g_inner::<T>(
                             body,
                             theta,
@@ -27576,7 +27795,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
-                            empty_nn,
+                            nn,
+                            nn_val,
                         );
                         taken = true;
                         break;
@@ -27593,7 +27813,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
-                            empty_nn,
+                            nn,
+                            nn_val,
                         );
                     }
                 }
@@ -29033,7 +29254,7 @@ impl OdeRhsProgram {
             }
             None => &self.stmts,
         };
-        eval_statements_g::<T>(stmts, &[], &[], &[], vars, Some(du), stack, &[]);
+        eval_statements_g::<T>(stmts, &[], &[], &[], vars, Some(du), stack, &[], &[]);
     }
 }
 
@@ -29611,14 +29832,12 @@ fn eval_endpoint_jets<const M: usize>(
         None,
         &mut stack,
         &[],
+        &[],
     );
-    let empty_nn: Vec<Vec<f64>> = Vec::new();
     outputs
         .iter()
         .map(|bc| {
-            eval_bytecode_g::<Dual1<M>>(
-                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
-            )
+            eval_bytecode_g::<Dual1<M>>(bc, &theta_d, &eta_d, &cov_vec, &vars, &[], &mut stack)
         })
         .collect()
 }
@@ -29844,6 +30063,7 @@ impl IndivParamProgram {
         theta: &[T],
         eta: &[T],
         covariates: &HashMap<String, f64>,
+        nn: &[Vec<T>],
     ) -> Vec<T> {
         let cov_vec: Vec<f64> = self
             .cov_names
@@ -29875,6 +30095,7 @@ impl IndivParamProgram {
             None,
             &mut stack,
             skip,
+            nn,
         );
         self.pk_var_slots
             .iter()
@@ -29905,7 +30126,6 @@ impl IndivParamProgram {
         // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
         // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
         // future static read could not seed an axis a `Dual2<0>` does not have.
-        let _no_nn_axes = ModelNnAxisGuard::suspend();
         let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
         let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
         let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
@@ -29919,6 +30139,7 @@ impl IndivParamProgram {
             None,
             &mut stack,
             &dynamic,
+            &[],
         );
         vars.iter().map(|d| d.value).collect()
     }
@@ -30092,8 +30313,7 @@ impl OdeOutputProgram {
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &[], stack)
     }
 }
 
@@ -30144,11 +30364,8 @@ impl ScaleDerivProgram {
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<T> = Vec::new();
-        eval_bytecode_g::<T>(
-            &self.bc, theta, eta, &cov_vec, var_vals, &empty_nn, &mut stack,
-        )
+        eval_bytecode_g::<T>(&self.bc, theta, eta, &cov_vec, var_vals, &[], &mut stack)
     }
 }
 
@@ -30198,18 +30415,9 @@ impl RuvMagDerivProgram {
             T::from_f64(f64::EPSILON),
             T::from_f64(tad),
         ];
-        let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<T> = Vec::new();
         Some(with_model_time(time, || {
-            eval_bytecode_g::<T>(
-                &self.bc,
-                theta,
-                &[],
-                &cov_vec,
-                &prog_vars,
-                &empty_nn,
-                &mut stack,
-            )
+            eval_bytecode_g::<T>(&self.bc, theta, &[], &cov_vec, &prog_vars, &[], &mut stack)
         }))
     }
 }
@@ -30828,6 +31036,24 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The partials are a **derivative program**, not closed-form trees (#1699):
+    /// a partial reaches an upstream row's partial along the *same* axis
+    /// through the tangent slot `VariableIdx(tangent_base + j)`, `j` that
+    /// row's index here, rather than through an inlined copy of it. So
+    /// `d_d_theta[i][k]` is evaluated after `d_d_theta[j][k]` for every
+    /// `j < i`, with each result written to `vars[tangent_base + j]`
+    /// (`dX' = dB + dC`, one line per intermediate) and the primal slots
+    /// holding the values the rows compute. Inlined, a value reached along
+    /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
+    /// parse ran out of memory at depth 30. An upstream partial that simplified
+    /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
+    /// partials still fold away. Equal to `vars.len()` of the primal program.
+    pub(crate) tangent_base: usize,
+    /// The primal variable slot each row assigns, parallel to `names`.
+    pub(crate) slots: Vec<usize>,
+    /// Each row's right-hand side in resolved form, parallel to
+    /// `names`: the primal program the tangent program reads.
+    pub(crate) values: Vec<Expression>,
     /// The compiled individual-parameter program, so the analytic (adjoint)
     /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
     /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
@@ -30883,6 +31109,9 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            tangent_base: 0,
+            slots: Vec::new(),
+            values: Vec::new(),
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
@@ -30907,6 +31136,11 @@ impl IndivParamPartials {
 /// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
 /// intermediate references get chain-ruled correctly.
 ///
+/// The chain context maps an upstream row's slot to its *tangent slot*, not to
+/// its partial (see `IndivParamPartials::tangent_base`), so each partial is
+/// the size of its own right-hand side's derivative and the whole program is
+/// linear in the block (#1699).
+///
 /// Top-level `If` and any non-`Assign` variant is skipped. Returns
 /// `IndivParamPartials::empty()` if there are no top-level Assigns.
 fn build_indiv_param_partials(
@@ -30916,17 +31150,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Per-axis chain context: variable slot → precomputed partial Expression
-    // for THIS axis. Indexed by axis index, populated incrementally as we
-    // walk the assignments in source order.
+    // Past every primal slot, so a tangent slot never aliases a variable.
+    let tangent_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    // Per-axis chain context: variable slot → what a read of it differentiates
+    // to along THIS axis (its tangent slot, or the partial itself when that is
+    // a leaf). Indexed by axis index, populated incrementally as we walk the
+    // assignments in source order.
     let mut chain_theta: Vec<HashMap<usize, Expression>> =
         (0..n_theta_base).map(|_| HashMap::new()).collect();
     let mut chain_eta: Vec<HashMap<usize, Expression>> =
         (0..n_eta_extended).map(|_| HashMap::new()).collect();
 
     let mut names: Vec<String> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut values: Vec<Expression> = Vec::new();
     let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
     let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
+
+    // A leaf partial is copied into its readers — constant size, and it keeps
+    // `0` foldable by `simplify_expr` — anything larger is read by reference.
+    let chain_entry = |s: &Expression, row: usize| -> Expression {
+        match s {
+            Expression::BinOp(..)
+            | Expression::UnaryFn(..)
+            | Expression::Power(..)
+            | Expression::Conditional(..)
+            | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent_base + row),
+            _ => s.clone(),
+        }
+    };
 
     for stmt in stmts {
         let Statement::Assign(name, raw_expr) = stmt else {
@@ -30955,18 +31207,19 @@ fn build_indiv_param_partials(
              parser pipeline bug (var_idx must be built from the same name list before \
              differentiation)",
         );
+        let row = names.len();
 
         let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
         for k in 0..n_theta_base {
             let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
             let s = simplify_expr(&d);
-            // Store the simplified partial into the chain context BEFORE
-            // pushing — any later assignment that references slot `k` will
-            // chain-rule through this expression. Always insert (even
-            // Literal(0)) so the chain map's "key present ⇔ slot is an
-            // upstream indiv-param" invariant is robust to zero partials.
+            // Record this row in the chain context BEFORE pushing — any later
+            // assignment that references slot `k` will chain-rule through it.
+            // Always insert (even Literal(0)) so the chain map's "key present
+            // ⇔ slot is an upstream indiv-param" invariant is robust to zero
+            // partials.
             if slot != usize::MAX {
-                chain_theta[k].insert(slot, s.clone());
+                chain_theta[k].insert(slot, chain_entry(&s, row));
             }
             row_theta.push(s);
         }
@@ -30976,12 +31229,14 @@ fn build_indiv_param_partials(
             let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
             let s = simplify_expr(&d);
             if slot != usize::MAX {
-                chain_eta[k].insert(slot, s.clone());
+                chain_eta[k].insert(slot, chain_entry(&s, row));
             }
             row_eta.push(s);
         }
 
         names.push(name.clone());
+        slots.push(slot);
+        values.push(resolved);
         d_d_theta.push(row_theta);
         d_d_eta.push(row_eta);
     }
@@ -30990,6 +31245,9 @@ fn build_indiv_param_partials(
         names,
         d_d_theta,
         d_d_eta,
+        tangent_base,
+        slots,
+        values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,

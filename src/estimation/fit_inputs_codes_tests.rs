@@ -663,17 +663,17 @@ fn invalid_ode_solver_options_carry_their_code_on_every_entry() {
         (
             "ode_reltol NaN",
             bad(&|o| o.ode_reltol = f64::NAN),
-            "ode_reltol must be finite and positive, got NaN",
+            "ode_reltol must be a positive finite value, got NaN",
         ),
         (
             "ode_abstol zero",
             bad(&|o| o.ode_abstol = 0.0),
-            "ode_abstol must be finite and positive, got 0",
+            "ode_abstol must be a positive finite value, got 0",
         ),
         (
             "ode_max_steps zero",
             bad(&|o| o.ode_max_steps = 0),
-            "ode_max_steps must be positive, got 0",
+            "ode_max_steps must be a positive integer, got 0",
         ),
     ];
     let mut rows = Vec::new();
@@ -732,7 +732,9 @@ fn sirs_own_input_refusals_carry_their_codes() {
     resamples.sir_resamples = 20;
     let mut df = c.opts.clone();
     df.sir_df = 0.0;
-    let chi2 = rand_distr::ChiSquared::<f64>::new(0.0).unwrap_err();
+    // A df `ChiSquared` would run but `[fit_options]` refuses (#1770).
+    let mut half_df = c.opts.clone();
+    half_df.sir_df = 0.5;
     let mut all_fix = c.fit.clone();
     all_fix.theta_fixed.iter_mut().for_each(|b| *b = true);
     all_fix.omega_fixed.iter_mut().for_each(|b| *b = true);
@@ -760,7 +762,13 @@ fn sirs_own_input_refusals_carry_their_codes() {
             "sir_df",
             sir(&c.fit, &df),
             "E_SIR_OPTIONS",
-            format!("sir_df invalid: {chi2}"),
+            "sir_df must be >= 1 or \"normal\", got 0".to_string(),
+        ),
+        plain(
+            "sir_df in (0, 1)",
+            sir(&c.fit, &half_df),
+            "E_SIR_OPTIONS",
+            "sir_df must be >= 1 or \"normal\", got 0.5".to_string(),
         ),
         plain(
             "proposal dimension",

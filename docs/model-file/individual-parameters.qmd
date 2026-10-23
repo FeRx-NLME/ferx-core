@@ -195,10 +195,14 @@ helper that shares its name (case-insensitively) with an identifier on the
 right-hand side of `=` in another block is refused too, even if that identifier
 means something else there. Rename the helper in that case. What is left of `=`
 does not count, because it is written, not read: a key (`rate`, `shape`,
-`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The word
-values of the endpoint blocks (`family = weibull`, `type`, `clock`, `link`, the
-`states` labels) do not count either, so a helper named `RATE`, `SHAPE` or
-`WEIBULL` is fine (#1902). A line that is not of that `target = expr` shape,
+`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The
+fixed words a key accepts as its value do not count either: in the endpoint
+blocks `family = weibull`, `type`, `clock`, `link` and the `states` labels
+(#1902); in `[adaptive_dosing]` the `every`, `from` and `to` of `at`, the words
+of `route` and `with_assay_error = true`/`false`; and in `[covariate_nn]` the
+`activation` and `output` names (#1905). So a helper named `RATE`, `SHAPE`,
+`WEIBULL`, `EVERY` or `TANH` is fine. Any other name on such a line still
+counts, as does every name in `observe` or in `inputs`. A line that is not of that `target = expr` shape,
 such as a `pk one_cpt_oral(cl=CL, …)` call or `DV ~ …`, counts whole, its keys
 and function names included, so a helper named `PK` or `ONE_CPT_ORAL` is still
 refused.
@@ -679,7 +683,17 @@ status (`OmegaRowsInput::from_result` does this for a `FitResult`), then calls
 `format_omega_rows_from`. With `OmegaRowsOptions::default()` the rows are the
 console's: a fixed ETA reads `[FIX]` with `SE = ---`, and a covariance step that
 failed or fell back to SIR prints no `CV%` or `SD` on any row. Block-Ω
-correlations are not part of the rows.
+correlations are not part of the rows; a wrapper reads them from
+`ferx_core::io::output::offdiag_corrs` (#2231), the walk the console's
+`--- Correlations ---` block and `format_summary()` use. Given the matrix, its
+optional parameter-correlation matrix (`omega_param_corr`) and the names, it
+returns one `OffDiagCorr` per reported pair, in row-major lower-triangle order:
+every `(i, j)`, `j < i`, with `|cov| > 1e-15`, its names, covariance and
+correlation. `corr_source` says whether the correlation is the
+parameter-correlation entry (`ParamCorr`) or `cov / (√var_i · √var_j)`
+(`Fallback`, 0 when a variance is not positive), so the wrapper can label it.
+The same call over `omega_iov` and `omega_iov_param_corr` gives a
+`block_kappa`'s pairs.
 
 Three options add what a wrapper's print may want. They are off by default, so
 the CLI and `format_summary()` never print them:

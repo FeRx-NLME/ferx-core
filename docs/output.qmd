@@ -251,6 +251,13 @@ covariance_matrix:
     log_chol_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
     log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
     sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
+warnings:
+  - "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+warning_details:
+  - code: dw_autocorrelation
+    severity: "Warning"
+    message: "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+    details: {"durbin_watson":1.2,"iwres_lag1_autocorr":0.4}
 estimation:
   focei_wall_time_secs: 11.845678
   covariance_wall_time_secs: 0.500000
@@ -274,6 +281,11 @@ where `omega = L Lᵀ` (log of the Cholesky diagonal, **not** the variance).
 Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
 not log-transformed). See [Packed Parameter
 Space](estimation/parameterization.qmd) for the full layout and bounds.
+
+`warnings:` lists the warning messages. `warning_details:` follows it with
+every warning that carries a structured `details` payload — see [Where
+`details` is written](warnings.qmd#where-details-is-written). Both blocks are
+absent when there is nothing to list.
 
 ### Key Fields
 
@@ -323,7 +335,11 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   `(SD = … at weight 1, logit scale)` (#1666) — the figure of a one-subject arm,
   followed by a line with the same note at the typical arm size, worded alike:
   `CV% = … at NARM = …`, `SD = … at NARM = …` or `SD = … at NARM = …, logit scale`
-  (#1683, #1697). That line's figure is printed exactly when the row's note is
+  (#1683, #1697). A console CV% of 1e6 or more prints to three significant
+  figures in scientific notation (`CV% = 7.64e35`) rather than every integer
+  digit of the double (#1883); a CV% that size usually means the variance is on
+  another scale, e.g. an additive kappa read as log-normal from a bundle saved
+  before `kappa_param_types`. The YAML's `cv_pct` keeps its full figure. That line's figure is printed exactly when the row's note is
   (#1698): a custom kappa, or a covariance step that failed or fell back to SIR,
   leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
 - **weight** / **weight_typical** / **sd_at_typical_weight** /

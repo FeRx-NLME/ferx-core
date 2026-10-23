@@ -102,7 +102,7 @@ pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
 }
 
 /// A single dose event (bolus, infusion, or oral)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DoseEvent {
     pub time: f64,
     pub amt: f64,
@@ -126,6 +126,31 @@ pub struct DoseEvent {
     /// reshapes it (see [`InfusionDef`] and `Self::bioavailable_infusion`, #419).
     /// Persistent across `Self::resolve_rate`. Only read for infusions.
     pub infusion_def: InfusionDef,
+    /// Whether this dose came from an `EVID=4` row (reset + dose). The reader stores such
+    /// a row twice — here and as a `Subject::reset_times` entry at the same time — and this
+    /// is what tells it apart from a separate `EVID=3` row co-timed with a dose, which the
+    /// engines treat identically but which is a second data record (#2104's warning counts
+    /// records). Crate-private, like `cmt`, so it widens no public API.
+    pub(crate) evid4: bool,
+}
+
+/// The derived rendering minus `evid4`: ferx-tools' search journal hashes `{doses:?}` into
+/// its data fingerprint, and the flag labels a record for a warning without changing what
+/// any fit sees, so printing it would move every journal's digest and refuse every resume.
+impl std::fmt::Debug for DoseEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoseEvent")
+            .field("time", &self.time)
+            .field("amt", &self.amt)
+            .field("cmt", &self.cmt)
+            .field("rate", &self.rate)
+            .field("duration", &self.duration)
+            .field("ss", &self.ss)
+            .field("ii", &self.ii)
+            .field("rate_mode", &self.rate_mode)
+            .field("infusion_def", &self.infusion_def)
+            .finish()
+    }
 }
 
 impl DoseEvent {
@@ -143,6 +168,7 @@ impl DoseEvent {
             // A data-driven dose is rate-specified (`RATE>0`); a bolus never reads
             // this. Either way `RateDefined` is the correct default (#419).
             infusion_def: InfusionDef::RateDefined,
+            evid4: false,
         }
     }
 
@@ -169,6 +195,7 @@ impl DoseEvent {
             ii,
             rate_mode: mode,
             infusion_def,
+            evid4: false,
         }
     }
 
@@ -3870,8 +3897,9 @@ pub struct CovariateMuRef {
     /// of declining the group. Empty on the entries themselves.
     pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
-    /// `[individual_parameters]` definition it referenced already inlined.
-    pub(crate) typical: crate::parser::model_parser::Expression,
+    /// `[individual_parameters]` definition it referenced resolved: each one
+    /// emitted once as a line of the program and read by reference (#1699).
+    pub(crate) typical: crate::parser::model_parser::TypicalProgram,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5004,6 +5032,22 @@ impl CompiledModel {
         return false;
     }
 
+    /// The θ index range of each `[covariate_nn]` block's weights,
+    /// `weights_offset..weights_offset + n_weights` (empty without the `nn` feature).
+    pub(crate) fn nn_weight_theta_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        #[cfg(feature = "nn")]
+        return self
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                use crate::nn::CovariateMapper;
+                nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()
+            })
+            .collect();
+        #[cfg(not(feature = "nn"))]
+        return Vec::new();
+    }
+
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
     /// This metadata lives behind the existing opaque `indiv_param_partials`
@@ -5628,10 +5672,12 @@ impl CompiledModel {
     ///      so routing it through the lag-aware paths is correct and only
     ///      forgoes the fast path.
     ///
-    /// Known gap, unchanged here: a `lagtime=` binding to a name assigned only
-    /// inside an `if` without `else` resolves in `build_pk_param_fn` (which sees
-    /// every assigned name) but is not in `indiv_param_names`, so route 1 misses
-    /// it.
+    /// A `lagtime=` binding to a name assigned only inside an `if` without
+    /// `else` used to resolve in `build_pk_param_fn` while missing from
+    /// `indiv_param_names`; the parser now refuses such a name ("assigned inside
+    /// an `if`, but not on every path through it"), so no model reaches this
+    /// predicate with it (pinned by
+    /// `a_conditional_lag_separates_records_like_a_plain_one`).
     pub fn has_lagtime(&self) -> bool {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
     }
@@ -6892,6 +6938,12 @@ pub enum WarningCode {
     /// [`WarningCode::FlipFlop`]: the rows returned are a sample of a truncated parameter
     /// distribution, so intervals built from them are biased, not merely fewer.
     UncertaintyDrawsSkipped,
+    /// The final estimates put a non-positive or non-finite `CL` or `V` on at least one
+    /// record of a closed-form (1-/2-/3-cpt IV / oral) model (`W_DEGENERATE_CL_V`, #2104).
+    /// Both closed-form engines serve a non-positive or infinite value a concentration of 0
+    /// — the dose is dropped — and a `NaN` a `NaN`; NONMEM would refuse either record:
+    /// PREDPP treats a non-positive PK parameter as an error.
+    DegenerateClearanceOrVolume,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -6938,6 +6990,7 @@ impl WarningCode {
             WarningCode::FlatParameter => "flat_parameter",
             WarningCode::OdeSolver => "ode_solver",
             WarningCode::UncertaintyDrawsSkipped => "uncertainty_draws_skipped",
+            WarningCode::DegenerateClearanceOrVolume => "degenerate_clearance_or_volume",
             WarningCode::General => "general",
         }
     }
@@ -7033,6 +7086,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
+        )
+    } else if lower.contains("w_degenerate_cl_v") {
+        // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
+        // of the generic "degenerate" → optimizer-health prose arm, which its wording would
+        // otherwise match.
+        (
+            WarningSeverity::Warning,
+            WarningCode::DegenerateClearanceOrVolume,
         )
     } else if lower.contains("w_uncertainty_draws_skipped") {
         // #1485: skipped uncertainty draws, one warning per run. A token arm ahead of the
@@ -7132,6 +7193,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_nn_penalty") {
+        // #1352: what a regularized DCM fit's standard errors are. A route note on the
+        // covariance step, so `run_covariance` replaces it with the step it reruns. Info
+        // where `R` carries the penalty (`r` / `rsr`: penalized-ML SEs, as asked); Warning
+        // under `s`, whose SEs ignore it. Its own token, ahead of the prose arms: the
+        // message says "covariance" and "penalized" in words other arms could claim.
+        if lower.contains("not represented") {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
+        } else {
+            (WarningSeverity::Info, WarningCode::CovarianceStep)
+        }
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -7237,10 +7309,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
-    } else if lower.contains("w_iov_no_occasions") {
+    } else if lower.contains("w_iov_no_occasions") || lower.contains("w_frem_drawn_eta") {
         // #1955: an IOV model simulated subjects that carry no occasion label at κ = 0.
-        // A simulated subject handled specially, like the arm above; matched on its token
-        // so no prose arm has to stay clear of its wording.
+        // #2245: a FREM model simulated subjects at a drawn covariate η.
+        // Simulated subjects handled specially, like the arm above; matched on the token
+        // so no prose arm has to stay clear of the wording.
         (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
@@ -7916,7 +7989,10 @@ pub struct FitResult {
     /// The seed the SIR draws actually used: `sir_seed` when it was set, the
     /// built-in default otherwise, so the run is reproducible from this field
     /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
-    /// Equal to `sir_settings.seed` whenever SIR ran.
+    /// Equal to `sir_settings.seed` whenever SIR ran. Where the two disagree — a
+    /// `sir_settings.seed` edited after the fit — `sir_settings.seed` is canonical:
+    /// [`run_sir`](crate::run_sir) draws with it, and `save_fit` writes this field from
+    /// it (#1770).
     ///
     /// Except on a fit produced before #1758 (a `.fitrx` with no `sir.settings`),
     /// where the field echoes the seed the fit was *given*: `None` for a SIR run
@@ -8402,8 +8478,10 @@ pub struct FitOptions {
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
     /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
-    /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
-    /// smoother OFV surfaces where FD noise is the main concern.
+    /// manual tuning is rarely needed for overflow. Decrease it (e.g. `1e-3`) on a smooth,
+    /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
+    /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
+    /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
     /// When `true` (the default) and the model is in analytic-covariance scope, the
     /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
     /// (#436), assembled from third-order sensitivities instead of second-differencing the
@@ -8674,7 +8752,8 @@ pub struct FitOptions {
     /// Degrees of freedom for the Student-t SIR proposal distribution.
     /// Heavier tails than the normal improve ESS for parameters near boundaries
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
-    /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
+    /// `f64::INFINITY` (`sir_df = normal` / `mvn` in `[fit_options]`) selects the
+    /// multivariate-normal proposal itself (#1819).
     pub sir_df: f64,
     /// The scale SIR's target is flat on — see [`SirScale`]. Default
     /// [`SirScale::Packed`] (#1723). Set via `[fit_options]` key `sir_scale`.

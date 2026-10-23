@@ -286,7 +286,15 @@ counts when either holds:
   study. The block is then a free curve per subject at the observed times, so it
   reproduces any per-subject effect: every random effect that reaches `y`
   counts, whether through an individual parameter, the readout, or a compartment
-  state (`ETA_CL` on `CL`, read as `central / V`).
+  state (`ETA_CL` on `CL`, read as `central / V`). Two records of a subject at
+  one time that share a level count as one observation only when the data
+  cannot tell them apart: the same occasion, compartment and record covariates,
+  and no dose, reset or (on a model with a lag time) lagged arrival between a
+  trough listed first and the sample after it. Two arms of a study at one
+  visit, keyed as occasions or by `TRT`, differ: an η on the drug effect alone
+  (`DRUG = TRT * EMAX * exp(ETA_EM) * ...`) is no shift common to both arms,
+  which is all a level is, so it does not count. ferx then measures the block
+  on the data, as described below.
 - **The block and the random effect reach `y` only together**, through one
   expression that is constant within a subject apart from the block itself. That
   is an individual parameter (`E0 = TVE0 + PLACEBO + ETA_E0`, or
@@ -535,7 +543,9 @@ this engine is, and switch automatically once a block makes the problem large:
   million population objectives at 800 parameters — so above 100 free
   coordinates a *defaulted* covariance method routes to the score cross-product
   (`covariance_method = s`, one pass) with a warning. Setting
-  `covariance_method = r` explicitly forces it, and says what it costs.
+  `covariance_method = r` explicitly forces it, and says what it costs. An
+  explicit `covariance_method = rsr` builds the same `R`, is never routed, and is
+  told the same.
 
 A block of 20 or more coefficients also leaves the main estimate table
 and gets its own compact summary (count, min, median, max) on the console.
@@ -581,7 +591,10 @@ the structural parameters is the ordinary outer gradient with the levels held
 (envelope theorem), and the profile objective is smooth enough for it, where BOBYQA
 stopped early on the test fixture. `bobyqa` and `slsqp` can be chosen explicitly;
 `nlopt_lbfgs`, `lbfgs` and `bfgs` all run the same NLopt L-BFGS (from the model file
-they always do, profiled or not). `trust_region` and `mma` are refused.
+they always do, profiled or not). `trust_region` and `mma` are refused. With no
+`outer_ftol` set, a profiled L-BFGS or SLSQP fit stops on a relative objective change
+of `1e-8`, not the unprofiled `1e-6`. At an OFV near 100, `1e-6` let L-BFGS stop while
+still descending and report `converged: true` up to 1.6e-3 above the optimum (#2285).
 
 Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so the OFV, the structural estimates and their standard errors are the

@@ -36,6 +36,11 @@ use crate::types::{CompiledModel, FitOptions, PkParams, Population};
 /// deviation resolves the wiggles the penalty targets without over-sampling.
 pub(crate) const NN_SMOOTH_GRID_STEP_Z: f64 = 0.25;
 
+/// Relative step for the central difference of the smoothness penalty's analytic gradient in
+/// [`NnRegularizer::add_exact_packed_hessian`] — `≈ ε^{1/3}`, the step that balances the
+/// stencil's `O(h²)` truncation against its `O(ε/h)` rounding on an analytic gradient.
+const NN_PENALTY_HESSIAN_FD_STEP: f64 = 1e-5;
+
 /// Cap on the number of grid nodes swept per NN input, bounding the curvature
 /// penalty's cost for covariates with a very wide observed range.
 pub(crate) const NN_SMOOTH_GRID_MAX_NODES: usize = 65;
@@ -314,6 +319,30 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// A forward pass kept for a backward pass ([`MlpMapper::vjp_at`]): the inputs and every
+/// layer's pre- and post-activations.
+#[derive(Debug, Clone)]
+pub(crate) struct NnForward {
+    x: Vec<f64>,
+    pre: Vec<Vec<f64>>,
+    post: Vec<Vec<f64>>,
+}
+
+impl NnForward {
+    /// The network's output `a_L`.
+    pub(crate) fn output(&self) -> &[f64] {
+        self.post.last().expect("at least one layer activation")
+    }
+}
+
+/// The working vectors of [`MlpMapper::backprop`]: the running adjoint `da_l` (the seed on
+/// entry) and `dz_l`.
+#[derive(Default)]
+struct Backprop {
+    adjoint: Vec<f64>,
+    dz: Vec<f64>,
+}
+
 impl MlpMapper {
     /// Construct an MLP. `layers` must be `[n_input, n_hidden_1, ..., n_output]`
     /// (length ≥ 2).
@@ -525,84 +554,146 @@ impl MlpMapper {
         let n_out = self.n_outputs();
         let mut jac = DMatrix::<f64>::zeros(n_out, self.n_params);
 
-        // Backprop one output at a time. For each output dimension k:
-        //   - seed the adjoint da_L = e_k
-        //   - propagate backward through the activation derivative at each
-        //     layer, accumulating grad_W_l and grad_b_l into `jac` row k.
-        //
-        // Plain slice loops rather than `nalgebra` products (#1300 follow-up): the
-        // hot DCM paths call this once per event per gradient, and the former
-        // `weight_matrix` + `transpose()` built two fresh matrices per layer per
-        // output. The transposed product accumulates over `i` in increasing order,
-        // which is the order `gemv` over the transposed matrix's columns took, so the
-        // adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
-        let mut adjoint: Vec<f64> = vec![0.0; n_out];
-        let mut dz_l: Vec<f64> = Vec::new();
+        // Backprop one output at a time, seeded `da_L = e_k` ([`Self::backprop`]), writing
+        // straight into row `k`; one scratch for every row.
+        let mut scratch = Backprop::default();
         for k in 0..n_out {
-            adjoint.clear();
-            adjoint.resize(n_out, 0.0);
-            adjoint[k] = 1.0;
+            scratch.adjoint.clear();
+            scratch.adjoint.resize(n_out, 0.0);
+            scratch.adjoint[k] = 1.0;
+            self.backprop(
+                x,
+                weights,
+                &pre,
+                &post,
+                preactivation,
+                &mut scratch,
+                |c, v| jac[(k, c)] = v,
+            );
+        }
 
-            // Walk layers L, L-1, ..., 1.
-            for l in (1..self.layers.len()).rev() {
-                let is_output_layer = l == self.layers.len() - 1;
-                let activation = if is_output_layer {
-                    self.output_activation
-                } else {
-                    self.hidden_activation
-                };
+        Ok((output, jac))
+    }
 
-                // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
-                // output layer is seeded directly at z_L, so its activation
-                // derivative is skipped — every deeper layer is unaffected.
-                let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
-                dz_l.clear();
-                if preactivation && is_output_layer {
-                    dz_l.extend_from_slice(&adjoint);
-                } else {
-                    dz_l.extend(
-                        adjoint
-                            .iter()
-                            .zip(z_l.iter())
-                            .map(|(&a, &z)| a * activation.derivative(z)),
-                    );
+    /// The vector–Jacobian product `seedᵀ·∂a_L/∂weights` (post-activation): one backward
+    /// pass, the row [`Self::jacobian`] would return combined by `seed`, at the cost of a
+    /// single output's backprop.
+    /// `None` when `x`, `weights` or `seed` has the wrong length.
+    #[cfg(test)]
+    pub(crate) fn vjp(&self, x: &[f64], weights: &[f64], seed: &[f64]) -> Option<Vec<f64>> {
+        self.vjp_at(&self.forward_kept(x.to_vec(), weights)?, weights, seed)
+    }
+
+    /// The forward pass at `(x, weights)`, kept for a later [`Self::vjp_at`]; `None` when
+    /// either has the wrong length.
+    pub(crate) fn forward_kept(&self, x: Vec<f64>, weights: &[f64]) -> Option<NnForward> {
+        self.check_shapes(&x, weights).ok()?;
+        let (pre, post) = self.forward_cache(&x, weights);
+        Some(NnForward { x, pre, post })
+    }
+
+    /// `seedᵀ·∂a_L/∂weights` at a kept forward pass: one backward pass, no second forward.
+    /// `None` when `seed` or `weights` has the wrong length.
+    pub(crate) fn vjp_at(
+        &self,
+        fwd: &NnForward,
+        weights: &[f64],
+        seed: &[f64],
+    ) -> Option<Vec<f64>> {
+        if weights.len() != self.n_params || seed.len() != self.n_outputs() {
+            return None;
+        }
+        let mut out = vec![0.0; self.n_params];
+        let mut scratch = Backprop {
+            adjoint: seed.to_vec(),
+            dz: Vec::new(),
+        };
+        let (x, pre, post) = (&fwd.x, &fwd.pre, &fwd.post);
+        self.backprop(x, weights, pre, post, false, &mut scratch, |c, v| {
+            out[c] = v
+        });
+        Some(out)
+    }
+
+    /// One backward pass from `da_L = scratch.adjoint` (the caller's seed) at the cached
+    /// forward pass `(pre, post)`, handing `put(c, ∂(seedᵀa_L)/∂w_c)` every weight entry
+    /// once. `scratch` carries the working vectors, so a caller looping over seeds
+    /// allocates them once.
+    ///
+    /// Plain slice loops rather than `nalgebra` products (#1300 follow-up): the
+    /// hot DCM paths call this once per event per gradient, and the former
+    /// `weight_matrix` + `transpose()` built two fresh matrices per layer per
+    /// output. The transposed product accumulates over `i` in increasing order,
+    /// which is the order `gemv` over the transposed matrix's columns took, so the
+    /// adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
+    #[allow(clippy::too_many_arguments)]
+    fn backprop(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+        pre: &[Vec<f64>],
+        post: &[Vec<f64>],
+        preactivation: bool,
+        scratch: &mut Backprop,
+        mut put: impl FnMut(usize, f64),
+    ) {
+        let Backprop { adjoint, dz: dz_l } = scratch;
+        // Walk layers L, L-1, ..., 1.
+        for l in (1..self.layers.len()).rev() {
+            let is_output_layer = l == self.layers.len() - 1;
+            let activation = if is_output_layer {
+                self.output_activation
+            } else {
+                self.hidden_activation
+            };
+
+            // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
+            // output layer is seeded directly at z_L, so its activation
+            // derivative is skipped — every deeper layer is unaffected.
+            let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
+            dz_l.clear();
+            if preactivation && is_output_layer {
+                dz_l.extend_from_slice(adjoint);
+            } else {
+                dz_l.extend(
+                    adjoint
+                        .iter()
+                        .zip(z_l.iter())
+                        .map(|(&a, &z)| a * activation.derivative(z)),
+                );
+            }
+
+            // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j], into the row-major W block.
+            let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
+
+            let w_start = self.offsets[l - 1];
+            let n_l = self.layers[l];
+            let n_lm1 = self.layers[l - 1];
+            for i in 0..n_l {
+                let dz_i = dz_l[i];
+                let row_offset = w_start + i * n_lm1;
+                for j in 0..n_lm1 {
+                    put(row_offset + j, dz_i * a_prev[j]);
                 }
+                // bias gradient
+                put(w_start + n_l * n_lm1 + i, dz_i);
+            }
 
-                // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j].
-                // We unflatten into the row-major W block within `jac` row k.
-                let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
-
-                let w_start = self.offsets[l - 1];
-                let n_l = self.layers[l];
-                let n_lm1 = self.layers[l - 1];
+            // Propagate to layer l-1: da_{l-1} = W_lᵀ · dz_l, read straight off
+            // the row-major weight block: `adj[j] = Σ_i W[i][j]·dz[i]`.
+            if l > 1 {
+                let w = &weights[w_start..w_start + n_l * n_lm1];
+                adjoint.clear();
+                adjoint.resize(n_lm1, 0.0);
                 for i in 0..n_l {
                     let dz_i = dz_l[i];
-                    let row_offset = w_start + i * n_lm1;
-                    for j in 0..n_lm1 {
-                        jac[(k, row_offset + j)] = dz_i * a_prev[j];
-                    }
-                    // bias gradient
-                    jac[(k, w_start + n_l * n_lm1 + i)] = dz_i;
-                }
-
-                // Propagate to layer l-1: da_{l-1} = W_lᵀ · dz_l, read straight off
-                // the row-major weight block: `adj[j] = Σ_i W[i][j]·dz[i]`.
-                if l > 1 {
-                    let w = &weights[w_start..w_start + n_l * n_lm1];
-                    adjoint.clear();
-                    adjoint.resize(n_lm1, 0.0);
-                    for i in 0..n_l {
-                        let dz_i = dz_l[i];
-                        let row = &w[i * n_lm1..(i + 1) * n_lm1];
-                        for (adj_j, &w_ij) in adjoint.iter_mut().zip(row) {
-                            *adj_j += w_ij * dz_i;
-                        }
+                    let row = &w[i * n_lm1..(i + 1) * n_lm1];
+                    for (adj_j, &w_ij) in adjoint.iter_mut().zip(row) {
+                        *adj_j += w_ij * dz_i;
                     }
                 }
             }
         }
-
-        Ok((output, jac))
     }
 
     /// Local flat-vector indices of the **weight-matrix** parameters, excluding
@@ -1289,6 +1380,17 @@ impl NamedMlpMapper {
         self.mlp.jacobian_preactivation(&x, weights)
     }
 
+    /// [`Self::forward_raw`]'s pass (the same zero-fill inputs and outputs) kept for a
+    /// backward pass ([`MlpMapper::vjp_at`]); not memoised, since the caller keeps it.
+    pub(crate) fn forward_kept_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<NnForward> {
+        self.mlp
+            .forward_kept(self.build_input_vec_zero_fill(covariates), weights)
+    }
+
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
     /// out with `MissingCovariate` if any input name is absent.
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
@@ -1689,6 +1791,13 @@ impl NnRegularizer {
         !self.specs.is_empty()
     }
 
+    /// Whether [`Self::add_packed_hessian`] is the penalty's exact Hessian. The L2 term's is;
+    /// the smoothness term's is its Gauss–Newton part only (`2λ Σ ∇C ∇Cᵀ`, without
+    /// `2λ Σ C·∇²C`), so a caller that needs the exact curvature must not use it then.
+    pub(crate) fn hessian_is_exact(&self) -> bool {
+        self.smooth_lambda == 0.0 || self.specs.is_empty()
+    }
+
     /// Additive penalty on the population objective: `Σ_nn (L2 + smoothness)`.
     /// Returns `0.0` when inactive.
     pub(crate) fn penalty_value(&self, theta: &[f64]) -> f64 {
@@ -1716,6 +1825,75 @@ impl NnRegularizer {
     /// from it. No-op when inactive.
     pub(crate) fn add_packed_hessian(&self, theta: &[f64], add: &mut dyn FnMut(usize, usize, f64)) {
         self.accumulate(theta, None, Some(add));
+    }
+
+    /// Add the penalty's **exact** Hessian through `add(i, j, v)` at packed coordinates —
+    /// what the covariance step needs (#1352), where the reported curvature must be that of
+    /// the objective actually minimised. Equal to [`Self::add_packed_hessian`] whenever
+    /// [`Self::hessian_is_exact`]; otherwise the L2 term keeps its analytic `2·λ_l2` diagonal
+    /// and the smoothness term's Hessian is the central difference of its analytic gradient,
+    /// so the `2λ Σ C·∇²C` part the Gauss–Newton form drops is included. That costs
+    /// `2·n_weights` penalty-gradient evaluations per network — forward/backward passes over
+    /// the curvature grid, no model evaluation. The result is symmetrised. No-op when inactive.
+    pub(crate) fn add_exact_packed_hessian(
+        &self,
+        theta: &[f64],
+        add: &mut dyn FnMut(usize, usize, f64),
+    ) {
+        if self.hessian_is_exact() {
+            self.add_packed_hessian(theta, add);
+            return;
+        }
+        for spec in &self.specs {
+            let off = spec.weights_offset;
+            let n_w = spec.mapper.n_weights();
+            let mut w = theta[off..off + n_w].to_vec();
+            let mut l2_add = |i: usize, j: usize, v: f64| add(off + i, off + j, v);
+            spec.mapper.l2_weight_penalty_accum(
+                &w,
+                self.l2_lambda,
+                &mut PenaltySink {
+                    grad: None,
+                    hess: Some(&mut l2_add),
+                },
+            );
+            let smooth_grad = |w: &[f64]| -> Vec<f64> {
+                let mut g = vec![0.0; n_w];
+                spec.mapper.curvature_penalty_accum(
+                    w,
+                    &spec.grid,
+                    self.smooth_lambda,
+                    &mut PenaltySink {
+                        grad: Some(&mut g),
+                        hess: None,
+                    },
+                );
+                g
+            };
+            let mut h = DMatrix::<f64>::zeros(n_w, n_w);
+            for j in 0..n_w {
+                let wj = w[j];
+                let step = NN_PENALTY_HESSIAN_FD_STEP * wj.abs().max(1.0);
+                w[j] = wj + step;
+                let gp = smooth_grad(&w);
+                w[j] = wj - step;
+                let gm = smooth_grad(&w);
+                w[j] = wj;
+                // The realised step, so the quotient divides by the distance actually moved.
+                let span = (wj + step) - (wj - step);
+                for i in 0..n_w {
+                    h[(i, j)] = (gp[i] - gm[i]) / span;
+                }
+            }
+            for i in 0..n_w {
+                for j in 0..n_w {
+                    let v = 0.5 * (h[(i, j)] + h[(j, i)]);
+                    if v != 0.0 {
+                        add(off + i, off + j, v);
+                    }
+                }
+            }
+        }
     }
 
     fn accumulate(
@@ -2055,6 +2233,37 @@ mod tests {
                 assert_relative_eq!(jac[(i, j)], fd, epsilon = 1e-6, max_relative = 1e-5);
             }
         }
+    }
+
+    /// One seeded backward pass is the seed's combination of the Jacobian's rows: on a
+    /// `tanh`/`softplus` network at a non-trivial point, with every output seeded; a
+    /// wrongly sized seed is refused.
+    #[test]
+    fn vjp_is_the_seed_combination_of_the_jacobian_rows() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let n_w = mlp.n_weights();
+        let weights: Vec<f64> = (0..n_w)
+            .map(|i| 0.4 * (i as f64).sin() + 0.2 * ((i * 7) as f64).cos())
+            .collect();
+        let x = vec![0.3, -0.7];
+        let seed = [0.7, -1.3, 2.1];
+        let jac = mlp.jacobian(&x, &weights).unwrap();
+        let vjp = mlp.vjp(&x, &weights, &seed).unwrap();
+        assert_eq!(vjp.len(), n_w);
+        let mut live = 0;
+        let mut worst = 0.0f64;
+        for (c, &v) in vjp.iter().enumerate() {
+            let want: f64 = (0..3).map(|k| seed[k] * jac[(k, c)]).sum();
+            worst = worst.max((v - want).abs() / (1e-300 + want.abs()));
+            // Measured worst relative 3.6e-16 on Linux (one pass vs n_out passes summed: a
+            // rounding-level reorder); ~10× headroom, and an absolute floor for exact zeros.
+            assert_relative_eq!(v, want, epsilon = 1e-15, max_relative = 4e-15);
+            live += usize::from(want.abs() > 1e-3);
+        }
+        eprintln!("vjp vs seedᵀJ: worst relative {worst:.2e}");
+        assert!(live > n_w / 2, "a vanishing product tests nothing");
+        assert!(mlp.vjp(&x, &weights, &seed[..2]).is_none());
+        assert!(mlp.vjp(&x, &weights[1..], &seed).is_none());
     }
 
     /// ReLU has a kink at 0; verify the jacobian matches FD on the smooth
@@ -3224,6 +3433,79 @@ mod regularizer_fit_tests {
                 assert_relative_eq!(h[i][j], expect, epsilon = 1e-15);
             }
         }
+    }
+
+    /// `add_exact_packed_hessian` — the curvature the covariance step reports (#1352) — is
+    /// the penalty's exact Hessian: bit-equal to `add_packed_hessian` under L2 alone, and under
+    /// smoothness equal to the second difference of `penalty_value` itself (an oracle outside
+    /// the analytic gradient it is built from), while the Gauss–Newton `add_packed_hessian`
+    /// is not. The straddle is asserted, so the fixture cannot drift to a point with `C ≈ 0`,
+    /// where the two forms agree and a revert to Gauss–Newton would pass.
+    #[test]
+    fn exact_penalty_hessian_matches_the_second_difference_of_the_penalty() {
+        let (model, mut options, population) = load();
+        let theta = model.default_params.theta.clone();
+        let n = theta.len();
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let dense = |f: &dyn Fn(&mut dyn FnMut(usize, usize, f64))| {
+            let mut h = vec![vec![0.0; n]; n];
+            f(&mut |i, j, v| h[i][j] += v);
+            h
+        };
+
+        options.nn_l2_lambda = 2e-2;
+        options.nn_smooth_lambda = 0.0;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(reg.hessian_is_exact());
+        assert_eq!(
+            dense(&|a| reg.add_exact_packed_hessian(&theta, a)),
+            dense(&|a| reg.add_packed_hessian(&theta, a)),
+            "L2 only: the exact Hessian is the analytic one"
+        );
+
+        options.nn_smooth_lambda = 3e-1;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(!reg.hessian_is_exact());
+        let exact = dense(&|a| reg.add_exact_packed_hessian(&theta, a));
+        let gn = dense(&|a| reg.add_packed_hessian(&theta, a));
+        let eps = 1e-4;
+        let f = |p: &[f64]| reg.penalty_value(p);
+        let mut worst = 0.0f64;
+        let mut gn_gap = 0.0f64;
+        let mut p = theta.clone();
+        for i in 0..n {
+            for j in 0..n {
+                let in_block = (w_lo..w_hi).contains(&i) && (w_lo..w_hi).contains(&j);
+                if !in_block {
+                    assert_eq!(exact[i][j], 0.0, "exact Hessian leaked to ({i}, {j})");
+                    continue;
+                }
+                assert_eq!(exact[i][j], exact[j][i], "not symmetric at ({i}, {j})");
+                let mut at = |di: f64, dj: f64| {
+                    p[i] += di;
+                    p[j] += dj;
+                    let v = f(&p);
+                    p[i] -= di;
+                    p[j] -= dj;
+                    v
+                };
+                let fd = (at(eps, eps) - at(eps, -eps) - at(-eps, eps) + at(-eps, -eps))
+                    / (4.0 * eps * eps);
+                let err = (exact[i][j] - fd).abs();
+                assert!(err.is_finite(), "non-finite Hessian entry at ({i}, {j})");
+                worst = worst.max(err);
+                gn_gap = gn_gap.max((gn[i][j] - fd).abs());
+            }
+        }
+        // Measured on this fixture: worst |exact − FD| = 2.6e-9 (the FD oracle's own
+        // `O(eps²)` + rounding), against a Gauss–Newton gap of 5.9e-3 — the bound sits ~400×
+        // above the first and ~6,000× below the second.
+        assert!(worst < 1e-6, "exact penalty Hessian vs FD: worst {worst:e}");
+        assert!(
+            gn_gap > 100.0 * 1e-6,
+            "the fixture must sit where Gauss–Newton is not exact (gap {gn_gap:e})"
+        );
     }
 
     /// Growing the L2 strength shrinks the NN weights, flattening the learned
