@@ -3897,8 +3897,9 @@ pub struct CovariateMuRef {
     /// of declining the group. Empty on the entries themselves.
     pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
-    /// `[individual_parameters]` definition it referenced already inlined.
-    pub(crate) typical: crate::parser::model_parser::Expression,
+    /// `[individual_parameters]` definition it referenced resolved: each one
+    /// emitted once as a line of the program and read by reference (#1699).
+    pub(crate) typical: crate::parser::model_parser::TypicalProgram,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

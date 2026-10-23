@@ -29820,6 +29820,76 @@ fn the_inliner_is_linear_on_a_diamond() {
     }
 }
 
+/// #1699, the recorded-covariate half: a diamond that feeds a covariate group
+/// (`X0 = TVV * WT`, `CL = TVCL * X_d * exp(ETA_CL)`, two thetas) is recorded,
+/// and its stored typical value is a [`TypicalProgram`] of one line per
+/// definition, so both the nodes the scans handle and the nodes the program
+/// holds are linear in the depth. Materialising the typical value as one tree
+/// expanded every path: measured with the definition inlined at each use
+/// (`Inlined::materialise` without its reference arm), the `+` diamond's scans
+/// handled 409 / 5 281 / 82 153 nodes at depth 4 / 8 / 12 and its typical value
+/// held 125 / 2 045 / 32 765; with the program, 169 / 301 / 433 and 42 / 78 /
+/// 114. Flattening the chain through definitions instead grows the `*`
+/// diamond's program to 2 045 nodes at depth 8.
+///
+/// The value is checked as well as the cost, at a depth small enough for the
+/// closed form: `X_{n+1} = 2 X_n + 5` (`+`), `6 X_n²` (`*`).
+///
+/// Dies under: removing the `defs.index` lookup or the reference return in
+/// `Inlined::materialise` (both counts); `flatten_chain(…, true, …)` in
+/// `TypicalParts::build` (`*` diamond).
+#[test]
+fn a_recorded_covariate_group_is_linear_on_a_diamond() {
+    for op in ["+", "*"] {
+        let measure = |d: usize| {
+            let src = op_diamond(d, "TVV * WT", op) + &format!("CL = TVCL * X{d} * exp(ETA_CL)\n");
+            let (_, groups, nodes) = inline_counted(&src);
+            assert_eq!(groups.len(), 1, "{op} diamond, depth {d}: one group");
+            let g = &groups[0];
+            assert_eq!(g.theta_names, ["TVCL", "TVV"], "{op} diamond, depth {d}");
+            assert_eq!(g.covariate_names, ["WT"], "{op} diamond, depth {d}");
+            (nodes, g.typical.node_count(), groups)
+        };
+        // The value, at depth 3: TVCL = 1.3, TVV = 1.1, WT = 0.9.
+        let (_, _, groups) = measure(3);
+        let mut x: f64 = 1.1 * 0.9;
+        for _ in 0..3 {
+            x = if op == "+" {
+                2.0 * x + 5.0
+            } else {
+                6.0 * x * x
+            };
+        }
+        let got = group_typical(&groups[0], &[1.3, 1.1], &[("WT", 0.9)]);
+        assert!(
+            (got - 1.3 * x).abs() <= 1e-12 * (1.3 * x).abs(),
+            "{op} diamond: typical {got} vs {}",
+            1.3 * x
+        );
+        // From depth 1: level 0 reads `X0`, a different first step.
+        let (s1, p1, _) = measure(1);
+        let (s2, p2, _) = measure(2);
+        let (scan_level, prog_level) = (s2 - s1, p2 - p1);
+        assert!(
+            scan_level > 0 && prog_level > 0,
+            "{op} diamond: the levels are read"
+        );
+        for d in [10, 20, 30] {
+            let (s, p, _) = measure(d);
+            assert_eq!(
+                s - s1,
+                (d - 1) * scan_level,
+                "{op} diamond: depth {d} scans are linear"
+            );
+            assert_eq!(
+                p - p1,
+                (d - 1) * prog_level,
+                "{op} diamond: depth {d} program is linear"
+            );
+        }
+    }
+}
+
 /// Nodes in `e`, conditions included.
 fn expr_nodes(e: &Expression) -> usize {
     fn cond_nodes(c: &Condition) -> usize {
@@ -30380,7 +30450,13 @@ fn assert_inliner_matches_eager(
         };
         let want = eager[at].as_ref().expect("an assignment");
         let view = scope.view(at, raw);
-        let got = view.materialise();
+        let mut defs = ProgramDefs::default();
+        let root = view.materialise(&mut defs);
+        let got = TypicalProgram {
+            defs: defs.defs,
+            root,
+        }
+        .inlined();
         assert_eq!(
             format!("{got:?}"),
             format!("{want:?}"),
@@ -30393,11 +30469,37 @@ fn assert_inliner_matches_eager(
             format!("{:?}", classify_mu_ref(want, tn, en, &[])),
             "{label}: `{name}` mu-ref"
         );
+        // A group's typical value compares by value: the program keeps each
+        // definition one operand of a chain (#1699), so a definition in the
+        // middle of a product associates differently from the eager tree's.
+        let group = |g: Option<(usize, CovariateMuRef)>| {
+            g.map(|(e, mut g)| {
+                let typical =
+                    std::mem::replace(&mut g.typical, TypicalProgram::of(Expression::Literal(0.0)));
+                let covs = g.covariate_names.clone();
+                (format!("{:?}", (e, g)), typical, covs)
+            })
+        };
+        let got_group = group(classify_covariate_mu_ref(view, tn, en, n_bsv));
+        let want_group = group(classify_covariate_mu_ref(want, tn, en, n_bsv));
         assert_eq!(
-            format!("{:?}", classify_covariate_mu_ref(view, tn, en, n_bsv)),
-            format!("{:?}", classify_covariate_mu_ref(want, tn, en, n_bsv)),
+            got_group.as_ref().map(|g| &g.0),
+            want_group.as_ref().map(|g| &g.0),
             "{label}: `{name}` covariate group"
         );
+        if let (Some((_, got_t, names)), Some((_, want_t, _))) = (&got_group, &want_group) {
+            let theta: Vec<f64> = (0..tn.len()).map(|i| 1.1 + 0.07 * i as f64).collect();
+            let covs: HashMap<String, f64> = names
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.clone(), 0.8 + 0.13 * i as f64))
+                .collect();
+            let (g, w) = (got_t.eval(&theta, &covs), want_t.eval(&theta, &covs));
+            assert!(
+                g.is_finite() && (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                "{label}: `{name}` typical value {g} vs {w}"
+            );
+        }
         assert_eq!(
             split_typical_and_eta(view).map(|(_, e, t)| (e, t)),
             split_typical_and_eta(want).map(|(_, e, t)| (e, t)),
@@ -30414,12 +30516,12 @@ fn assert_inliner_matches_eager(
 /// shapes the examples lack: a definition read inside a conditional's arm and
 /// its condition (substituted in both since #1422), a forward reference (it resolves against the definition's
 /// own scope), the written-out logit forms, a chain through a pure alias, and
-/// a product with the definition in the middle (the built typical value
-/// re-associates through it).
+/// a product with the definition in the middle (the built typical value keeps
+/// it one operand, so its value, not its tree, matches the eager one's).
 /// Dies under: no substitution into a conditional (`Conditional` dropped
 /// from `Inlined::rewrites_children`); use-site resolution (`limit` not narrowed to the
-/// definition's index); `flatten_chain` not flattening through definitions in
-/// `TypicalParts::build`.
+/// definition's index); a [`TypicalProgram`] line read by the wrong index
+/// (`defs.len()` taken after the push in `Inlined::materialise`).
 #[test]
 fn the_inliner_matches_the_eager_one() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");

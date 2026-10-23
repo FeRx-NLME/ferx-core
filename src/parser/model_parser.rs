@@ -931,8 +931,10 @@ trait RhsView<'a>: Copy {
     fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
         std::rc::Rc::new(typical_summary_of(self))
     }
-    /// This subtree as an owned expression.
-    fn materialise(self) -> Expression;
+    /// This subtree as an owned expression, each substituted local definition
+    /// it reaches emitted once into `defs` and read by reference
+    /// ([`TypicalProgram`]).
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression;
 }
 
 impl<'a> RhsView<'a> for &'a Expression {
@@ -942,8 +944,146 @@ impl<'a> RhsView<'a> for &'a Expression {
     fn child(self, child: &'a Expression) -> Self {
         child
     }
-    fn materialise(self) -> Expression {
+    fn materialise(self, _: &mut ProgramDefs) -> Expression {
         self.clone()
+    }
+}
+
+/// An eta-free typical value `A(θ, covariates)` as a straight-line program
+/// (#1699): every local `[individual_parameters]` definition it reads is
+/// emitted **once**, into `defs`, and read through `VariableIdx(j)` — by a
+/// later definition or by `root` — instead of being inlined at each use. On a
+/// diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`) the
+/// inlined tree holds `2^d` copies of `X0`; the program holds one line per
+/// definition. A definition whose body is a leaf (`T = TVCL`) is substituted in
+/// place.
+///
+/// Nothing else is a `VariableIdx` here: the typical value is built from the
+/// unresolved statements, whose locals are `Variable` nodes, and every one the
+/// inliner resolved has become a reference.
+#[derive(Debug, Clone)]
+pub(crate) struct TypicalProgram {
+    /// The definitions, in dependency order: `defs[j]` reads only `defs[..j]`.
+    pub(crate) defs: Vec<Expression>,
+    /// The typical value itself.
+    pub(crate) root: Expression,
+}
+
+impl TypicalProgram {
+    /// A program with no definitions.
+    #[cfg(test)]
+    pub(crate) fn of(root: Expression) -> Self {
+        Self {
+            defs: Vec::new(),
+            root,
+        }
+    }
+
+    /// The typical value at `theta` and one subject's covariate snapshot.
+    pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
+        let mut values = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let v = eval_expr(
+                d,
+                theta,
+                &[],
+                &TypicalEnv {
+                    covariates,
+                    defs: &values,
+                },
+                &[],
+            );
+            values.push(v);
+        }
+        eval_expr(
+            &self.root,
+            theta,
+            &[],
+            &TypicalEnv {
+                covariates,
+                defs: &values,
+            },
+            &[],
+        )
+    }
+
+    /// The typical value as one tree, every reference replaced by its
+    /// definition — the `2^d` tree on a diamond, so for small test inputs only.
+    #[cfg(test)]
+    pub(crate) fn inlined(&self) -> Expression {
+        fn sub(e: &Expression, done: &[Expression]) -> Expression {
+            match e {
+                Expression::VariableIdx(j) => done[*j].clone(),
+                Expression::BinOp(l, op, r) => {
+                    Expression::BinOp(Box::new(sub(l, done)), *op, Box::new(sub(r, done)))
+                }
+                Expression::Power(b, x) => {
+                    Expression::Power(Box::new(sub(b, done)), Box::new(sub(x, done)))
+                }
+                Expression::UnaryFn(n, a) => Expression::UnaryFn(n.clone(), Box::new(sub(a, done))),
+                Expression::Conditional(c, t, f) => Expression::Conditional(
+                    Box::new(map_condition_operands(c, &mut |x| sub(x, done))),
+                    Box::new(sub(t, done)),
+                    Box::new(sub(f, done)),
+                ),
+                _ => e.clone(),
+            }
+        }
+        let mut done: Vec<Expression> = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let e = sub(d, &done);
+            done.push(e);
+        }
+        sub(&self.root, &done)
+    }
+
+    /// Nodes in the definitions and the root together (conditions included).
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        fn cond(c: &Condition) -> usize {
+            let mut n = 1;
+            for_each_condition_operand(c, &mut |x| n += nodes(x));
+            n
+        }
+        fn nodes(e: &Expression) -> usize {
+            1 + match e {
+                Expression::BinOp(l, _, r) | Expression::Power(l, r) => nodes(l) + nodes(r),
+                Expression::UnaryFn(_, a) => nodes(a),
+                Expression::ThetaGather { idx, .. } => nodes(idx),
+                Expression::Conditional(c, t, f) => cond(c) + nodes(t) + nodes(f),
+                _ => 0,
+            }
+        }
+        self.defs.iter().map(nodes).sum::<usize>() + nodes(&self.root)
+    }
+}
+
+/// The definitions a [`TypicalProgram`] is being built with, and which
+/// substituted definition (by body address) each one is.
+#[derive(Default)]
+pub(crate) struct ProgramDefs {
+    defs: Vec<Expression>,
+    index: HashMap<*const Expression, usize>,
+}
+
+/// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
+/// the definitions computed so far by index. A stray local name reads `0.0`
+/// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
+/// rather than letting it through.
+struct TypicalEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    defs: &'a [f64],
+}
+
+impl EvalEnv for TypicalEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => f64::EPSILON,
+            Expression::VariableIdx(j) => self.defs.get(*j).copied().unwrap_or(0.0),
+            _ => 0.0,
+        }
     }
 }
 
@@ -1202,34 +1342,50 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
         done
     }
 
-    fn materialise(self) -> Expression {
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression {
         #[cfg(test)]
         INLINED_NODES.with(|c| c.set(c.get() + 1));
+        if let Some(d) = self.def {
+            if !self.rewrites_children() {
+                return self.expr.clone();
+            }
+            if let Some(&j) = defs.index.get(&d) {
+                return Expression::VariableIdx(j);
+            }
+            let body = Inlined { def: None, ..self }.materialise(defs);
+            let j = defs.defs.len();
+            defs.defs.push(body);
+            defs.index.insert(d, j);
+            return Expression::VariableIdx(j);
+        }
         if self.rewrites_children() {
             match self.expr {
                 Expression::BinOp(l, op, r) => {
                     return Expression::BinOp(
-                        Box::new(self.child(l).materialise()),
+                        Box::new(self.child(l).materialise(defs)),
                         *op,
-                        Box::new(self.child(r).materialise()),
+                        Box::new(self.child(r).materialise(defs)),
                     )
                 }
                 Expression::Power(b, e) => {
                     return Expression::Power(
-                        Box::new(self.child(b).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(b).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 Expression::UnaryFn(name, a) => {
-                    return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
+                    return Expression::UnaryFn(
+                        name.clone(),
+                        Box::new(self.child(a).materialise(defs)),
+                    )
                 }
                 Expression::Conditional(c, t, e) => {
                     return Expression::Conditional(
                         Box::new(map_condition_operands(c, &mut |x| {
-                            self.child(x).materialise()
+                            self.child(x).materialise(defs)
                         })),
-                        Box::new(self.child(t).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(t).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 _ => {}
@@ -1901,15 +2057,20 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
         s
     }
 
-    fn build(self) -> Expression {
-        match self {
-            TypicalParts::Whole(v) => v.materialise(),
+    /// The typical value as a [`TypicalProgram`]. A chain is re-associated to
+    /// the left down to its definitions, each of which stays one operand: one
+    /// line of the program, not its own operands flattened in, which on a `*`
+    /// diamond would walk every path (#1699).
+    fn build(self) -> TypicalProgram {
+        let mut defs = ProgramDefs::default();
+        let root = match self {
+            TypicalParts::Whole(v) => v.materialise(&mut defs),
             TypicalParts::Chain(op, parts) => {
                 let mut operands = Vec::new();
                 for p in parts {
-                    flatten_chain(p, op, true, &mut operands);
+                    flatten_chain(p, op, false, &mut operands);
                 }
-                let mut operands = operands.into_iter().map(|o| o.materialise());
+                let mut operands = operands.into_iter().map(|o| o.materialise(&mut defs));
                 let first = operands
                     .next()
                     .expect("a split keeps at least one operand besides the eta");
@@ -1917,6 +2078,10 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                     Expression::BinOp(Box::new(a), op, Box::new(o))
                 })
             }
+        };
+        TypicalProgram {
+            defs: defs.defs,
+            root,
         }
     }
 }
@@ -2055,7 +2220,7 @@ fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize)> {
 /// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
 /// definition is eta-free, so the eta's operand is never inside one, and
 /// flattening it would walk every path of a diamond. [`TypicalParts::build`]
-/// flattens through them, so the built chain is the one the full tree gives.
+/// keeps them whole too, each one line of its [`TypicalProgram`] (#1699).
 fn flatten_chain<'a, V: RhsView<'a>>(v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>) {
     match v.expr() {
         Expression::BinOp(l, o, r) if *o == op && (through_definitions || !v.is_definition()) => {
@@ -25571,16 +25736,15 @@ fn eval_expression(
 
 /// Evaluate an eta-free typical value `A(θ, covariates)` — a
 /// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
-/// Local variables were inlined at detection time, so the variable environment
-/// is empty; a stray name would read as `0.0`, which is why detection rejects
-/// them rather than letting one through.
+/// The local definitions it reads were resolved at detection time into the
+/// program's own lines ([`TypicalProgram`]); a stray name would read as `0.0`,
+/// which is why detection rejects them rather than letting one through.
 pub(crate) fn eval_typical_value(
-    expr: &Expression,
+    typical: &TypicalProgram,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let vars: HashMap<String, f64> = HashMap::new();
-    eval_expression(expr, theta, &[], covariates, &vars, &[])
+    typical.eval(theta, covariates)
 }
 
 #[inline]
