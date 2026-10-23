@@ -229,7 +229,7 @@ fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_
 fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_record_matches_nonmem() {
     // IDs 3, 4 and 6 code RATE=-1. NONMEM re-reads R1 on every advance, which ferx does
     // not do for any modelled-rate infusion, implied or not. That defect predates #1909
-    // and is tracked on its own, so only the D1 subjects are compared here.
+    // and is tracked in #2332, so only the D1 subjects are compared here.
     let at12_24: &[f64] = &[12.0, 24.0];
     let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", at12_24), ("5", &[])];
     let d1: &[&str] = &["1", "2", "5"];
