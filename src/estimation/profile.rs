@@ -84,8 +84,9 @@ pub(crate) const PROFILE_TOL: f64 = 1e-5;
 /// barely move η̂, and the difference would drift toward the frozen-EBE partial the
 /// profile exists to avoid. Measured on F1: at `1e-9` 37% of the re-solves ended in the
 /// Nelder–Mead fallback (the BFGS stop is unreachable there), which was most of the
-/// solve's time; at `1e-7` 0.4% did, with the same gradient floor.
-pub(crate) const PROFILE_INNER_TOL: f64 = 1e-7;
+/// solve's time; at `1e-7` 0.4% did, with the same gradient floor. It is the stencil
+/// tolerance every other reconverged stencil now shares (`STENCIL_INNER_TOL`, #2261).
+pub(crate) const PROFILE_INNER_TOL: f64 = crate::estimation::inner_optimizer::STENCIL_INNER_TOL;
 
 /// The central-difference step of the total gradient, in conditional standard errors.
 const FD_STEP_SE: f64 = 1e-2;

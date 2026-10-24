@@ -467,6 +467,10 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
             "{i}: {fd} / {held} / {}",
             g[i]
         );
+        eprintln!(
+            "DBG {i}: handed {:.9e} fd {:.9e} held {:.9e}",
+            g[i], fd, held
+        );
         worst_handed = worst_handed.max((g[i] - fd).abs() / (1.0 + fd.abs()));
         worst_identity = worst_identity.max((held - fd).abs() / (1.0 + fd.abs()));
     }
@@ -1734,3 +1738,191 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
 /// both FD of one objective at shared steps; ~8× headroom over `B`. Dropping the border's
 /// term from the `B` mapping moves it to 4.1e-1 (measured).
 const LEVEL_BLOCKS_BOUND: f64 = 3e-5;
+
+// ── #2261: every re-solve of the profile starts at the previous (η̂, κ̂) ──────────────
+
+/// The pass-`k` EBEs of a recording, per subject in population order.
+fn pass_modes(
+    rec: &crate::estimation::inner_optimizer::InnerRecording,
+    k: usize,
+    pop: &Population,
+) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+    let pass: Vec<_> = rec.passes.iter().filter(|p| p.pass == k).collect();
+    assert_eq!(pass.len(), pop.subjects.len(), "pass {k}");
+    (
+        pass.iter()
+            .map(|p| DVector::from_column_slice(&p.eta))
+            .collect(),
+        pass.iter()
+            .map(|p| {
+                p.kappas
+                    .iter()
+                    .map(|c| DVector::from_column_slice(c))
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// F1 from the template takes one Newton step, so on its one solve every subject's
+/// re-solves run in a fixed order: `2k` central-difference probes of `total_gradient`, then
+/// the line search's first trial — all from the state the population pass returned — then
+/// the second iteration's probes, from the trial's modes. The first `2k + 1` of them must
+/// start at the pass's (η̂, κ̂): the gradient's warm start, then the line search's.
+#[test]
+fn profile_gradient_and_line_search_start_at_the_pass_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{
+        assert_these_start_at_modes, on_one_thread,
+    };
+    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let (s, rec) = on_one_thread(|| {
+        record_inner_solves(|| {
+            c.solve(
+                &p.init_params,
+                &ProfileWarm::from_template(&layout, &p.init_params),
+            )
+            .expect("the solve converges")
+        })
+    });
+    assert_eq!(
+        s.iterations, 1,
+        "fixture: one Newton step, so one line search"
+    );
+    let (etas, kappas) = pass_modes(&rec, 0, &p.population);
+    let mut first = Vec::new();
+    let mut line_search = Vec::new();
+    for (i, subject) in p.population.subjects.iter().enumerate() {
+        let k = layout.reads[i].len();
+        let mine: Vec<_> = rec
+            .starts
+            .iter()
+            .filter(|s| s.pass.is_none() && s.subject == subject.id)
+            .collect();
+        if k == 0 {
+            assert!(mine.is_empty(), "subject {} reads no level", subject.id);
+            continue;
+        }
+        assert!(
+            mine.len() > 2 * k,
+            "subject {}: {} re-solves",
+            subject.id,
+            mine.len()
+        );
+        first.extend(mine[..2 * k].iter().copied());
+        line_search.push(mine[2 * k]);
+    }
+    assert_these_start_at_modes(
+        "profile total_gradient",
+        first,
+        &p.population,
+        &etas,
+        &kappas,
+    );
+    assert_these_start_at_modes(
+        "profile line search",
+        line_search,
+        &p.population,
+        &etas,
+        &kappas,
+    );
+}
+
+/// A solve warm-started from a previous one (`ProfileWarm::from_solve`, the outer loop's
+/// next evaluation) starts its population pass at that solve's (η̂, κ̂), at moved
+/// structural parameters.
+#[test]
+fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{assert_starts_at_modes, on_one_thread};
+    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let first = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .expect("the solve converges");
+    let mut moved = p.init_params.clone();
+    moved.theta[0] *= 1.01;
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            c.solve(&moved, &ProfileWarm::from_solve(&layout, &first))
+                .expect("the solve converges")
+        })
+        .1
+    });
+    assert_starts_at_modes(
+        "profile ProfileWarm::from_solve",
+        &rec,
+        |s| s.pass == Some(0),
+        &p.population,
+        &first.etas,
+        &first.kappas,
+    );
+}
+
+/// The profiled covariance step handed the fit's (η̂, κ̂) — what `fit()` and `run_covariance`
+/// both hand it — starts its re-profiling pass there. Every later re-solve warm-starts from a
+/// mode an earlier solve of the same subject returned, κ̂ included: the re-profiling solves
+/// at each structural stencil point (`ProfileWarm::from_solve`), their gradient probes and
+/// line searches, and the level stencil.
+#[test]
+fn profiled_covariance_starts_at_the_fit_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{
+        assert_starts_at_modes, assert_starts_at_previous_modes, on_one_thread,
+    };
+    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = FitOptions {
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let c = ctx(&p, &layout, &o);
+    let fit = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .expect("the solve converges");
+    let x = pack_with_bounds(&fit.params).packed;
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            replay_covariance(
+                &p.parsed.model,
+                &p.population,
+                &fit.params,
+                &x,
+                &fit.etas,
+                &fit.kappas,
+                &o,
+            )
+            .expect("F1 profiles a level block")
+        })
+        .1
+    });
+    assert!(
+        rec.passes.iter().all(|p| p.init.is_some()),
+        "every re-profiling solve is warm"
+    );
+    assert_starts_at_modes(
+        "profiled covariance re-profile",
+        &rec,
+        |s| s.pass == Some(0),
+        &p.population,
+        &fit.etas,
+        &fit.kappas,
+    );
+    let n =
+        assert_starts_at_previous_modes("profiled covariance stencil", &rec, |s| s.pass != Some(0));
+    assert!(
+        n > rec.passes.len(),
+        "the per-subject re-solves (level stencil, gradient probes) are among the {n}"
+    );
+}

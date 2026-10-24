@@ -848,6 +848,12 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         "fixture: subject 0 is salvaged"
     );
     let n = assert_starts_at_modes("IOV salvage", &rec, |_| true, &pop, &etas, &kappas);
+    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+        "IOV salvage",
+        &rec,
+        |_| true,
+        opts.inner_tol,
+    );
     assert!(
         rec.starts.iter().all(|s| s.subject == pop.subjects[0].id),
         "only the declined subject is re-solved"
@@ -898,4 +904,54 @@ fn covariance_salvage_points_start_at_the_subject_mode() {
         "fixture: subject 0 must take the subset stencil"
     );
     assert_starts_at_modes("covariance salvage", &rec, |_| true, &pop, &etas, &kappas);
+    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+        "covariance salvage",
+        &rec,
+        |s| s == pop.subjects[0].id,
+        opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+    );
+}
+
+/// #2261: the non-IOV per-subject reconverged salvage (a structural decline, #1536) re-solves
+/// every probe at the stencil tolerance: each starts at the subject's η̂.
+#[test]
+fn non_iov_salvage_probes_resolve_at_the_stencil_tol() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{
+        assert_solves_at_stencil_tol, on_one_thread,
+    };
+    let (model, pop) = fixture(false, true);
+    let params = &model.default_params;
+    let x = pack_params(params);
+    let bounds = compute_bounds(params);
+    let opts = FitOptions::default();
+    let (etas, hms, _, _) = run_inner_loop_warm(&model, &pop, params, 200, 1e-8, None, None, 0, 0);
+    assert!(
+        is_structural_decline(&model, &pop.subjects[0], params, etas[0].as_slice()),
+        "fixture: subject 0 is a structural decline, so its salvage reconverges"
+    );
+    let declines = OuterFdDeclineLog::new(pop.subjects.len());
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            population_gradient_sens_mixed(
+                &x,
+                params,
+                &model,
+                &pop,
+                &etas,
+                &hms,
+                &bounds,
+                &opts,
+                OuterTrial::unknown(),
+                &declines,
+            )
+        })
+        .1
+    });
+    assert_eq!(
+        declines.declined_indices(),
+        vec![0],
+        "fixture: subject 0 is salvaged"
+    );
+    assert_solves_at_stencil_tol("non-IOV salvage", &rec, |_| true, opts.inner_tol);
 }

@@ -1850,7 +1850,12 @@ pub(crate) fn compute_covariance_for(
     // Every reconverged point starts at the fit's joint mode, κ̂ included, so an IOV
     // subject does not re-solve its κ from 0 at each of the stencil's points (#2261).
     // `fit()` and `run_covariance` hand the same η̂ and κ̂, so the repeat stays bit for bit.
+    // A point that starts at the mode re-solves at the stencil tolerance, at most
+    // (`STENCIL_INNER_TOL`): at a loose one its solve could stop where it began. The base
+    // reconvergence takes the same tolerance, so the stencil's centre and its points are
+    // one objective. The mixture objective below solves cold and keeps `cov_inner_tol`.
     let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
+    let stencil_tol = crate::estimation::inner_optimizer::stencil_inner_tol(cov_inner_tol);
 
     // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
     //
@@ -1880,7 +1885,7 @@ pub(crate) fn compute_covariance_for(
                 template,
                 warm,
                 options,
-                cov_inner_tol,
+                stencil_tol,
                 parallel_subjects,
             );
             2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options)
@@ -1957,7 +1962,7 @@ pub(crate) fn compute_covariance_for(
             template,
             &warm,
             options,
-            cov_inner_tol,
+            stencil_tol,
             true,
         );
         let o = 2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options);
@@ -2122,7 +2127,7 @@ pub(crate) fn compute_covariance_for(
     // did not honour. On the salvage route the probe still runs, but over the declined subjects
     // only, which is the same reduction the stencil itself gets.
     let assembly = if options.analytic_cov_hessian && !is_mixture {
-        // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
+        // `base_eta_hats`, not `eta_hats` — the modes reconverged at the stencil tolerance, which
         // is what the stationarity assumption in the assembly needs (see above).
         analytic_cov_assembly(
             model,
@@ -6441,6 +6446,13 @@ mod tests {
             "{label}: the step solves per subject"
         );
         assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
+        // The base reconvergence and every stencil point, at the stencil tolerance.
+        crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+            label,
+            &rec,
+            |_| true,
+            opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        );
     }
 
     #[test]

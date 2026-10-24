@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed,
-    InnerLoopStats, InnerSolvePolicy,
+    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
+    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
@@ -6704,7 +6704,8 @@ fn optimize_bfgs(
 /// Central-FD `d(OFV)/d(x)` that **re-converges the EBEs at every perturbed
 /// point** (warm-started from `warm_etas` with `warm_kappas`, [`joint_warm_starts`], so an
 /// IOV probe starts at the mode's κ̂ rather than κ = 0, #2261), rather than holding them
-/// fixed.
+/// fixed. Every probe starts at the base mode, so it re-solves at the stencil tolerance
+/// ([`stencil_inner_tol`]): at a loose `inner_tol` the solve could stop where it began.
 ///
 /// For IOV models the variance components — especially `omega_iov` — are
 /// weakly identified, and the EBE response dominates their gradient: raising
@@ -6744,7 +6745,7 @@ fn reconverged_fd_gradient(
             population,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            stencil_inner_tol(options.inner_tol),
             Some(&warm),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
@@ -6826,7 +6827,7 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                options.inner_tol,
+                stencil_inner_tol(options.inner_tol),
                 Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
@@ -7186,7 +7187,7 @@ fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            stencil_inner_tol(options.inner_tol),
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
@@ -7235,7 +7236,7 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            stencil_inner_tol(options.inner_tol),
             Some(warm.as_slice()),
             Some(&mu_k),
             0,

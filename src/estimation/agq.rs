@@ -1222,7 +1222,8 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            self.options.inner_tol,
+            // Every probe starts at the subject's mode (#2261).
+            crate::estimation::inner_optimizer::stencil_inner_tol(self.options.inner_tol),
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
@@ -2215,5 +2216,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #2261: the reconverged FD score of an IOV subject (forced here; production reaches it
+    /// when the adjoint declines) starts every probe at the subject's joint mode and
+    /// re-solves at the stencil tolerance.
+    #[test]
+    fn agq_fd_score_probes_start_at_the_iov_mode_at_the_stencil_tol() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_solves_at_stencil_tol, assert_starts_at_modes, on_one_thread,
+            warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..opts
+        };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let subject = &pop.subjects[0];
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                let context = SubjectScoreContext::new(&model, p, &x, &opts, &bounds, true);
+                context
+                    .score(subject, etas[0].as_slice(), &kappas[0])
+                    .expect("the FD score")
+            })
+            .1
+        });
+        assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
+        assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
     }
 }

@@ -10996,6 +10996,12 @@ fn assert_fd_probes_start_at_mode(
     assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
     assert!(!rec.passes.is_empty(), "{label}: no probe pass ran");
     assert_starts_at_modes(label, &rec, |_| true, &pop, &ehs, &kappas);
+    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+        label,
+        &rec,
+        |_| true,
+        opts.inner_tol,
+    );
 }
 
 /// Through the dispatcher, so its own `reconverged_fd_gradient` call is the one under test:

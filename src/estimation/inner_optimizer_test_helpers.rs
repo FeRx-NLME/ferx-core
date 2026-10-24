@@ -132,9 +132,116 @@ pub(crate) fn assert_starts_at_modes(
     etas: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
 ) -> usize {
+    assert_these_start_at_modes(
+        label,
+        rec.starts.iter().filter(|s| select(s)),
+        pop,
+        etas,
+        kappas,
+    )
+}
+
+/// #2261: every inner solve of `rec` for a subject `select` picks ran at the stencil
+/// tolerance `stencil_inner_tol(stage_tol)`, and `stage_tol` is looser than it, so a stencil
+/// that dropped the tightening would show. Returns the number of solves, which must be
+/// positive.
+pub(crate) fn assert_solves_at_stencil_tol(
+    label: &str,
+    rec: &InnerRecording,
+    select: impl Fn(&str) -> bool,
+    stage_tol: f64,
+) -> usize {
+    let want = super::stencil_inner_tol(stage_tol);
+    assert!(
+        want < stage_tol,
+        "{label}: fixture: the stage tolerance {stage_tol:e} is already at the stencil's"
+    );
+    let mut n = 0;
+    for (subject, tol) in rec.solve_tols.iter().filter(|(s, _)| select(s)) {
+        assert_eq!(
+            tol.to_bits(),
+            want.to_bits(),
+            "{label}: subject {subject} re-solved at {tol:e}, not the stencil tolerance {want:e}"
+        );
+        n += 1;
+    }
+    assert!(n > 0, "{label}: no solve was selected");
+    n
+}
+
+/// #2261, for a call whose re-solves warm-start from modes no single list holds (a profile
+/// solve's line-search trials, say): every start `select` picks began, bit for bit, at the
+/// mode some earlier IOV solve of the same subject returned — η̂ + μ and every cell's κ̂.
+/// Returns the number checked, which must be positive. A start whose η block matches an
+/// earlier mode while its κ block matches none is the defect this exists to catch, and the
+/// message says so.
+pub(crate) fn assert_starts_at_previous_modes(
+    label: &str,
+    rec: &InnerRecording,
+    select: impl Fn(&IovStart) -> bool,
+) -> usize {
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let mut checked = 0;
     for s in rec.starts.iter().filter(|s| select(s)) {
+        let earlier: Vec<_> = rec.ends[..s.ends_before]
+            .iter()
+            .filter(|e| e.subject == s.subject)
+            .collect();
+        let eta_matches: Vec<_> = earlier
+            .iter()
+            .filter(|e| {
+                let psi: Vec<u64> = e
+                    .eta
+                    .iter()
+                    .zip(&s.mu)
+                    .map(|(a, m)| (a + m).to_bits())
+                    .collect();
+                psi == bits(&s.psi)
+            })
+            .collect();
+        assert!(
+            !eta_matches.is_empty(),
+            "{label}: subject {}: η block of the start {:?} is no earlier mode's η̂ + μ",
+            s.subject,
+            s.psi
+        );
+        let got: Vec<Vec<u64>> = s.kappas.iter().map(|c| bits(c)).collect();
+        let hit = eta_matches
+            .iter()
+            .find(|e| e.kappas.iter().map(|c| bits(c)).collect::<Vec<_>>() == got);
+        let Some(hit) = hit else {
+            panic!(
+                "{label}: subject {}: κ block of the start {:?} is not the κ̂ of the mode its η \
+                 block came from ({:?})",
+                s.subject,
+                s.kappas,
+                eta_matches.iter().map(|e| &e.kappas).collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            hit.kappas.iter().flatten().any(|&v| v != 0.0),
+            "{label}: subject {}: fixture: the mode's κ̂ are all 0, so a dropped κ block \
+             cannot show",
+            s.subject
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "{label}: no IOV start was selected");
+    checked
+}
+
+/// [`assert_starts_at_modes`] over an explicit list of starts, for a caller that selects
+/// them by position.
+pub(crate) fn assert_these_start_at_modes<'a>(
+    label: &str,
+    starts: impl IntoIterator<Item = &'a IovStart>,
+    pop: &Population,
+    etas: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> usize {
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let mut checked = 0;
+    for s in starts {
         let i = pop
             .subjects
             .iter()
