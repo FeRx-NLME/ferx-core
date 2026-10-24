@@ -384,7 +384,18 @@ That refusal names the θ and the contrast it is aliased under (#1991). For `TVB
 under every contrast, it says that under `contrast = ref` the coded levels move `y`
 exactly as `TVB` does. It adds that dropping the random effect would leave
 `TVB` aliased there, and advises removing `TVB` or the block. The random effect
-is not the cause, so the message does not suggest dropping it.
+is not the cause, so the message does not suggest dropping it. The rank is
+checked even where the other θ already carry the random effect, as in
+`TVB * D1 + TVC * D2` with one subject per study. The θ named are gathered at
+both points the check uses.
+
+A nested block refused under a global contrast keeps its refusal. When its
+coded levels are also aliased with other θ, the refusal names them. It then
+advises `sum_to_zero_within` or removing the block, not dropping the random
+effect. A level at every observation is aliased with almost any θ. A one-column
+block under `none` next to an intercept keeps its refusal too. It adds that a
+model without the random effect needs a global contrast, since under `none` the
+levels are aliased with the intercept.
 
 The binder checks this aliasing only for a block that must rescue an absorbed
 random effect. A block that needs no rescue is not checked. Examples are

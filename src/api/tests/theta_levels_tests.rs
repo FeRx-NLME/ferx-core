@@ -3258,8 +3258,11 @@ mod contrast_refusals {
     }
 
     const NOT_IDENTIFIED: &str = "the two are the same quantity, so the model is not identified.";
+    /// The nested advice when the coded block is aliased with other θ, as an
+    /// `[STUDY, TIME]` block at one subject per study is under every global
+    /// contrast: dropping the random effect would bind it aliased (#1991).
     const USE_WITHIN: &str = "Use `contrast = sum_to_zero_within` (the default for this shape), \
-                              or drop the random effect.";
+                              or remove the block.";
 
     /// T6 (M1, M2). A block read in the readout next to an η on `E0` is
     /// refused under every global contrast, naming the readout and `E0`; the
@@ -3281,7 +3284,10 @@ mod contrast_refusals {
                     USE_WITHIN,
                 ],
             );
-            lacks(&err, &["individual parameter", "remove the block"]);
+            lacks(
+                &err,
+                &["individual parameter", "carries each group's value"],
+            );
         }
 
         // M1: the share is an individual parameter, the η read through `E0`.
@@ -5251,8 +5257,10 @@ mod absorption {
         }
     }
 
+    /// The nested advice when the coded block is aliased with other θ
+    /// (#1991): dropping the random effect would bind it aliased.
     const USE_WITHIN: &str = " Use `contrast = sum_to_zero_within` (the default for this \
-                              shape), or drop the random effect.";
+                              shape), or remove the block.";
     const SAME_QUANTITY: &str = " — the two are the same quantity, so the model is not identified.";
     const EVERY_OBSERVATION: &str = ", and the block takes a level at every observation, so \
                                      it can reproduce any effect that random effect has";
@@ -6441,8 +6449,8 @@ mod absorption {
             &err,
             &[
                 " `contrast = sum_to_zero_within` does not help: some levels have no effect at \
-               any of their records, which that contrast cannot carry either. Drop the random \
-               effect, or key the block so every level acts on its records.",
+               any of their records, which that contrast cannot carry either. Remove the block, \
+               or key the block so every level acts on its records.",
             ],
         );
         lacks(&err, &[USE_WITHIN]);
@@ -8266,13 +8274,21 @@ mod absorption {
     }
 
     /// #1991, the nested block. T2's row `E0 + EMAX * TIME / (TIME + ET50)`
-    /// under an explicit `ref`: `TVEMAX`'s column is zero at the reference
-    /// level `TIME = 0`, so the coded block is aliased with it, and the refusal
-    /// says so for this contrast — not the random-effect text, and not "under
-    /// any contrast", since `sum_to_zero_within` binds.
+    /// keeps the structural refusal — the levels reproduce `ETA_E0` under any
+    /// global contrast — and adds the coded block's alias: under `ref`,
+    /// `TVEMAX`'s and `TVET50`'s columns, zero at the reference level
+    /// `TIME = 0`, are combinations of the coded levels, so dropping `ETA_E0`
+    /// would bind the block aliased. The advice is the within-group contrast or
+    /// removing the block, not dropping the random effect; `none` is measured
+    /// too, and says the same. The whole `ref` refusal is pinned, and the note
+    /// is gated on both sides: H1 on `[STUDY, VISIT]`, two visits per study
+    /// with the Emax term varying within each, keeps its rank against the
+    /// other θ under `sum_to_zero`, and keeps the advice to drop the random
+    /// effect, with no note.
     ///
-    /// Mutation — the nested arm ignores `Aliased` (the random-effect text
-    /// comes back: S1 dies).
+    /// Mutations — the nested arm ignores `Aliased` (no note, the old advice:
+    /// the note's `has` dies); the certificate returns `Held` under `none`
+    /// before the rank (the `none` note dies).
     #[test]
     fn an_aliased_nested_block_names_the_theta() {
         let pop = arms_pop_d();
@@ -8285,27 +8301,165 @@ mod absorption {
                 false,
             ))(c)
         };
+        let head = "theta PLACEBO[STUDY, TIME]: `contrast = ref` leaves each STUDY group's mean \
+                    free, but the individual parameter `E0` reads this block and carries a \
+                    random effect at that grouping — the two are the same quantity, so the model \
+                    is not identified.";
+        let note = " Under `contrast = ref` some combination of the coded levels also moves `y` \
+                    exactly as a combination of `TVEMAX` and `TVET50` does (measured at the \
+                    initial estimates and at a point near them), so dropping `ETA_E0` would leave \
+                    `TVEMAX` and `TVET50` aliased.";
+        let fix = " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
+                   the block.";
         let e = try_bind(&text("ref"), &pop).expect_err("ref");
+        assert_eq!(e, format!("{head}{note}{fix}"));
+        lacks(&e, &[ANY_CONTRAST, "drop the random effect", "`TVE0`"]);
+        let none = try_bind(&text("none"), &pop).expect_err("none");
         has(
-            &e,
+            &none,
             &[
-                "theta PLACEBO[STUDY, TIME]: under `contrast = ref` some combination of the coded \
-                 levels moves `y` exactly as ",
-                "`TVEMAX`",
-                " So the model is not identified under this contrast, and dropping `ETA_E0` \
-                 would leave ",
-                " aliased under it. Remove ",
-                ", or remove the block.",
+                " Under `contrast = none` some combination of the coded levels also moves `y` \
+                 exactly as a combination of `TVEMAX` and `TVET50` does",
+                fix,
             ],
         );
-        lacks(
-            &e,
-            &[ANY_CONTRAST, "the two are the same quantity", "`TVE0`"],
+        let full = try_bind(
+            &shape("H1", "STUDY, VISIT", "sum_to_zero"),
+            &visit_pop(3, 1),
+        )
+        .expect_err("H1 on visits");
+        has(
+            &full,
+            &[
+                "`contrast = sum_to_zero` leaves each STUDY group's mean free",
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or drop the \
+                 random effect.",
+            ],
         );
+        lacks(&full, &["aliased", "remove the block"]);
         assert_eq!(
             try_bind(&text(""), &pop).map(|(c, _)| c),
             Ok(LevelContrast::SumToZeroWithin)
         );
+    }
+
+    /// #1991 review, F1. A model whose other θ carry the random effect can be
+    /// aliased as well, and the rank is taken first. With one subject per
+    /// study, `TVB * D1 + TVC * D2` is study 1's and study 2's subject random
+    /// effect under any contrast; and under `ref` `TVC` is a coded level, under
+    /// sum-to-zero `TVB - TVC` is one. Before the review the span held the
+    /// random effect and the refusal advised dropping it — which would have
+    /// bound the block aliased, unmeasured. Now every contrast names both
+    /// aliases and advises removing `TVB` and `TVC`, which binds. The
+    /// straddle: the oracle absorbs `ETA_E0` under both global contrasts, and
+    /// the coded block is aliased under both.
+    ///
+    /// Mutation — the span checked before the rank (every contrast gets the
+    /// random-effect refusal: the `has` dies).
+    #[test]
+    fn an_alias_is_named_even_where_the_random_effect_is_held() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "held",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D1 + TVC * D2"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        let j = jacobian(&text("none"), &pop);
+        for c in [LevelContrast::SumToZero, LevelContrast::Ref] {
+            let (absorbed, _) = joint_oracle(&j, c);
+            assert!(
+                absorbed == ["ETA_E0"] && block_aliased(&j, c),
+                "{c:?}: the straddle — absorbs {absorbed:?}, aliased {}",
+                block_aliased(&j, c)
+            );
+        }
+        let by_ref = "under `contrast = ref` some combination of the coded levels moves `y` \
+                      exactly as `TVC` does";
+        let by_stz = "under `contrast = sum_to_zero` some combination of the coded levels moves \
+                      `y` exactly as a combination of `TVB` and `TVC` does";
+        for c in ALL {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[by_ref, ANY_CONTRAST, ", or remove the block."]);
+            if c != "sum_to_zero_within" {
+                has(&e, &[by_stz]);
+            }
+            assert!(
+                e.contains("Remove `TVC` and `TVB`") || e.contains("Remove `TVB` and `TVC`"),
+                "{c:?}: {e}"
+            );
+            lacks(
+                &e,
+                &[
+                    "drop the random effect",
+                    "random effect are the same quantity",
+                ],
+            );
+        }
+        let bare = row_1836("bare", format!("  E0 = {NO_INTERCEPT}"), false);
+        assert_eq!(
+            try_bind(&row_text(&bare)("ref"), &pop),
+            Ok((LevelContrast::Ref, 3)),
+            "without TVB and TVC"
+        );
+    }
+
+    /// #1991 review, F2. The members are gathered over both probe points.
+    /// `TVB * TVS * D2` with `TVS` initialised at 0: at the initial estimates
+    /// `TVB`'s column is zero and `TVS` alone duplicates study 2's level under
+    /// `ref`; at the moved point both do, and neither alone is a member. Named
+    /// from the first point, the refusal would advise removing `TVS` while the
+    /// moved point stays aliased; over both, no removal list is complete, and
+    /// it names none.
+    ///
+    /// Mutation — `carried` returns at the first aliased point (`TVS` named).
+    #[test]
+    fn the_alias_members_are_gathered_over_both_points() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "two points",
+            format!("  E0 = {NO_INTERCEPT} + TVB * TVS * D2"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVS", 0.0)]);
+        let e = try_bind(&text("ref"), &pop).expect_err("ref");
+        has(
+            &e,
+            &[
+                "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
+                 some combination of the model's other θ does",
+                " Remove the θ that duplicate the levels, or remove the block.",
+            ],
+        );
+        lacks(&e, &["`TVS`", "`TVB`"]);
+    }
+
+    /// #1991 review. The one-column refusal under `none` next to an intercept
+    /// keeps its text — neither global contrast is aliased, `none` rescues
+    /// nothing — and adds that dropping the random effect would bind the block
+    /// aliased with `TVE0` under `none`, so it must go with a global contrast.
+    /// The note is gated both ways: absent under `sum_to_zero`, whose coded
+    /// levels leave the intercept its own direction.
+    ///
+    /// Mutation — the note never appended (its `has` dies); appended under any
+    /// contrast (the `sum_to_zero` `lacks` dies).
+    #[test]
+    fn dropping_the_random_effect_under_none_is_steered_to_a_global_contrast() {
+        let pop = arms_pop();
+        let r = row_1836("intercept", format!("  E0 = {S}"), false);
+        let note = " Under `contrast = none` some combination of the coded levels also moves `y` \
+                    exactly as `TVE0` does (measured at the initial estimates and at a point near \
+                    them), so dropping `ETA_E0` would leave `TVE0` aliased. Drop `ETA_E0` under \
+                    `contrast = sum_to_zero`, not `none`.";
+        let none = try_bind(&row_text(&r)("none"), &pop).expect_err("none");
+        has(
+            &none,
+            &[ANY_CONTRAST, "Remove the block, or drop the random effect."],
+        );
+        assert!(none.ends_with(note), "none: {none}");
+        let stz = try_bind(&row_text(&r)("sum_to_zero"), &pop).expect_err("sum_to_zero");
+        has(&stz, &[ANY_CONTRAST]);
+        lacks(&stz, &["aliased"]);
     }
 
     /// T3 (#1840). An inconclusive point keeps the refusal. The intercept is
@@ -8938,6 +9092,12 @@ mod absorption {
     const WITHIN: &str = ", one that sums to zero within each group";
     /// The measured clause's caveat: the claim that it was measured, and where.
     const MEASURED_AT: &str = "(measured at the initial estimates and at a point near them)";
+
+    /// A nested refusal up to the coded block's alias note (#1991), which
+    /// carries a measured clause of its own.
+    fn before_alias_note(e: &str) -> &str {
+        e.split(" Under `contrast = ").next().unwrap_or(e)
+    }
 
     /// Refused under every contrast and auto, each refusal carrying the measured
     /// clause over subjects, and none naming a site the walk would name.
@@ -10253,7 +10413,10 @@ mod absorption {
         }
         match try_bind(&text("sum_to_zero"), &replicated) {
             // The walk's own site, not the certificate: the block resolves.
-            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            // The rank's alias note (#1991) is measured; the site clause is not.
+            Err(e)
+                if e.contains("(through `V`) at that grouping")
+                    && !before_alias_note(&e).contains(MEASURED_AT) => {}
             got => wrong.push(format!("replicates, global: {got:?}")),
         }
         agrees_with_joint_oracle("straddle", &text, &straddle, &mut wrong);
@@ -10311,7 +10474,10 @@ mod absorption {
             got => wrong.push(format!("straddle, global: {got:?}")),
         }
         match try_bind(&lagged_s1("sum_to_zero"), &replicated) {
-            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            // The rank's alias note (#1991) is measured; the site clause is not.
+            Err(e)
+                if e.contains("(through `V`) at that grouping")
+                    && !before_alias_note(&e).contains(MEASURED_AT) => {}
             got => wrong.push(format!("replicates, global: {got:?}")),
         }
         agrees_with_joint_oracle("lagged straddle", &lagged_s1, &straddle, &mut wrong);
