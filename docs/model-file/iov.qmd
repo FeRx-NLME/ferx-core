@@ -419,6 +419,8 @@ Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA
 
 A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
 
+`ferx check --data` prints one informational row per level, `W_LEVEL_SUMMARY`, so a level where only some parents hold a single group is visible before the fit: the level's group count, the groups per parent (min, median and max), how many parents hold a single group, and the kappas at the level. It counts on the observation records, as the refusal does.
+
 ### What this release supports {#nested-levels-scope}
 
 Nested levels (more than one `level`) are estimated with `method = foce` or `focei` at `n_agq = 1`. In this release:
