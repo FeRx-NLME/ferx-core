@@ -659,6 +659,7 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
         &params,
         &pack_with_bounds(&params).packed,
         &[],
+        &[],
         &o,
     )
     .expect("F1 profiles a level block");

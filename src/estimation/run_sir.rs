@@ -263,6 +263,20 @@ fn run_sir_scoped(
 
     // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // The draws' warm starts, as the in-fit SIR hands them: each subject's η̂ and κ̂
+    // (#2261). κ̂ that do not line up with this population's cells are left out, and those
+    // subjects start their κ at 0 as before, rather than from a vector of another width.
+    let kappas_line_up = fit.ebe_kappas.len() == pop_ref.subjects.len()
+        && fit.ebe_kappas.iter().zip(&pop_ref.subjects).all(|(k, s)| {
+            k.is_empty()
+                || (k.len() == crate::stats::stacked_layout::group_count(s)
+                    && k.iter().all(|c| c.len() == model_ref.n_kappa))
+        });
+    let warm = if kappas_line_up {
+        crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &fit.ebe_kappas)
+    } else {
+        eta_hats
+    };
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
@@ -278,7 +292,7 @@ fn run_sir_scoped(
         model_ref,
         pop_ref,
         &params,
-        &eta_hats,
+        &warm,
         cov,
         data_ofv(fit),
         options,

@@ -285,7 +285,7 @@ fn run_covariance_scoped(
         sir_fallback_proposal: _,
         method: covariance_method,
     } = crate::estimation::profile::replay_covariance(
-        model_ref, pop_ref, &params, &x_hat, &eta_hats, options,
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
     )
     .unwrap_or_else(|| {
         run_covariance_step_inner(

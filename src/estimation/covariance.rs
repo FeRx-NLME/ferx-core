@@ -1847,6 +1847,11 @@ pub(crate) fn compute_covariance_for(
 
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
 
+    // Every reconverged point starts at the fit's joint mode, κ̂ included, so an IOV
+    // subject does not re-solve its κ from 0 at each of the stencil's points (#2261).
+    // `fit()` and `run_covariance` hand the same η̂ and κ̂, so the repeat stays bit for bit.
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
+
     // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
     //
     // One implementation for both consumers — the whole-population stencil and the per-subject
@@ -1918,7 +1923,7 @@ pub(crate) fn compute_covariance_for(
             )
             .ofv;
         }
-        subset_cov_ofv(xv, population, eta_hats, false)
+        subset_cov_ofv(xv, population, &warm, false)
     };
 
     // Reconverge once at `x_hat` and keep the result. Both consumers need it: the base OFV
@@ -1950,7 +1955,7 @@ pub(crate) fn compute_covariance_for(
             model,
             population,
             template,
-            eta_hats,
+            &warm,
             options,
             cov_inner_tol,
             true,
@@ -2182,7 +2187,7 @@ pub(crate) fn compute_covariance_for(
             // subject is a real thing here — `W_EBE_START_DEPENDENT` exists — and on one of
             // those the salvaged term would otherwise stop being the term the population
             // stencil computes for it.
-            let (pop, warm) = subset_population(population, eta_hats, &declined);
+            let (pop, warm) = subset_population(population, &warm, &declined);
             let scope = FdScope::Subset { pop, warm };
             salvaged = declined;
             (hess, Some(scope))

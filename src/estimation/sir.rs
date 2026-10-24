@@ -994,7 +994,11 @@ fn screen_draw(
 /// * `model` - The compiled model
 /// * `population` - The dataset
 /// * `params` - ML parameter estimates
-/// * `eta_hats` - ML EBE estimates (for warm-starting inner loop)
+/// * `eta_hats` - ML EBE estimates (for warm-starting inner loop). Under IOV a subject's
+///   entry may be its joint mode, `η̂` then each occasion cell's κ̂ (the layout of
+///   [`FitResult::ebe_kappas`](crate::FitResult::ebe_kappas)), which `fit()` and
+///   [`run_sir`](crate::run_sir) hand, so a draw re-solves κ from κ̂ rather than from 0
+///   (#2261). `η̂` alone remains valid.
 /// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
 /// * `ofv_hat` - the **data** OFV (−2 log L) at the estimates, i.e. what every
 ///   optimizer reports as `OuterResult::ofv`. Under parameter priors (#254) the

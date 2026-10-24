@@ -1855,7 +1855,12 @@ fn fit_inner(
             // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
             // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
             // ~1e-11 level, and this stage's OFV should agree with the one a preceding
-            // Laplace/AGQ stage reported at the same parameters.
+            // Laplace/AGQ stage reported at the same parameters. Warm from the preceding
+            // stage's joint mode, κ̂ included, so an IOV subject does not restart κ at 0
+            // (#2261).
+            let warm = result.as_ref().map(|r| {
+                crate::estimation::outer_optimizer::joint_warm_starts(&r.eta_hats, &r.kappas)
+            });
             let (eta_hats, h_matrices, _stats, kappas) =
                 crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
                     model,
@@ -1863,7 +1868,7 @@ fn fit_inner(
                     &stage_params,
                     stage_opts.inner_maxiter,
                     stage_opts.inner_tol,
-                    result.as_ref().map(|r| r.eta_hats.as_slice()),
+                    warm.as_deref(),
                     Some(&mu_k),
                     stage_opts.min_obs_for_convergence_check as usize,
                     stage_opts.inner_restarts,
@@ -2637,6 +2642,10 @@ fn fit_inner(
             .expect("every stage that runs records its scoring settings")
             .overwrite(options),
     );
+    // Both SIR runs re-solve each draw's EBEs from the fit's joint mode, κ̂ included, as
+    // `run_sir` does from the stored fit, so an IOV draw does not restart κ at 0 (#2261).
+    let sir_warm =
+        crate::estimation::outer_optimizer::joint_warm_starts(&result.eta_hats, &result.kappas);
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
             if options.verbose {
@@ -2646,7 +2655,7 @@ fn fit_inner(
                 model,
                 population,
                 &result.params,
-                &result.eta_hats,
+                &sir_warm,
                 cov,
                 result.ofv,
                 &sir_opts,
@@ -2685,7 +2694,7 @@ fn fit_inner(
         model,
         population,
         &result.params,
-        &result.eta_hats,
+        &sir_warm,
         result.ofv,
         &mut warnings,
     );
