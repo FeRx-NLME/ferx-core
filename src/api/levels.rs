@@ -1474,6 +1474,11 @@ impl Absorbed<'_> {
         self.coupling.kappa
     }
 
+    /// Measured only in combination with other random effects (#1878).
+    fn combined(&self) -> bool {
+        matches!(&self.how, How::Measured(_, with) if !with.is_empty())
+    }
+
     fn clause(&self) -> String {
         match &self.how {
             How::Site(share) => share_site(share),
@@ -2107,16 +2112,25 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// block can absorb a combination of them that none reaches alone —
 /// `S + (ETA_E0 - ETA_X)² · OCC` moves `y` with `OCC` under either, while the
 /// two shifted together move it by a constant the level takes up. So each
-/// random effect's column is measured against the level columns and the
-/// columns there of the other silent random effects at its unit or a coarser
-/// one ([`coarser_or_equal`]) — an occasion's kappa against the η too, since
-/// shifting an η and every occasion's kappa against it is a combination as
-/// well — the rank of `[Z_silent | X_levels]` against `X_levels` one column at
-/// a time. The others join only in a unit
-/// where they do not carry the column on their own: a random effect inside
-/// their span is not identified against them, which is no fault of the block
-/// (the joint oracle's baseline rank). One that needed them comes back with
-/// them as its partners ([`Absorption::with`]).
+/// random effect's column is measured, unit by unit, against the level
+/// columns and the other silent random effects' columns of its unit there:
+/// the rank of `[Z_silent | X_levels]` against `X_levels` one column at a
+/// time. The others join only in a unit where they do not carry the column on
+/// their own: a random effect inside their span is not identified against
+/// them, which is no fault of the block (the joint oracle's baseline rank).
+///
+/// A coarser random effect — an η for an occasion's kappa, an outer level's
+/// kappa for a nested one ([`coarser_or_equal`]) — couples the units: an η
+/// and every occasion's kappa shifted against it is a combination too, but
+/// the η takes one value across the occasions, so the units cannot be judged
+/// one by one (#1878 review r1, r2). A random effect some unit keeps outside
+/// is measured over the whole subject instead: whether the levels widen the
+/// combinations of its unit columns the coarser columns match
+/// ([`shared_dim`]). Its within verdict is then left to [`carried`], which
+/// judges each contrast on the same joint rank.
+///
+/// One that needed partners comes back with them as its partners
+/// ([`Absorption::with`]).
 ///
 /// On a nested block a second residual decides whether `sum_to_zero_within`
 /// rescues it (#1874 review, F1): against the differences of the unit's level
@@ -2189,29 +2203,48 @@ fn spanned(
                     record_diffs(&at(&up, &eta, &kappa), &at(&down, &eta, &kappa), h)
                 });
             }
-            // The silent random effects of one unit are measured together with
-            // those at coarser units: a combination of them can lie in the
-            // levels' span where none does alone, as `ETA_E0` and `ETA_X`
-            // shifted together do under `(ETA_E0 - ETA_X)²` (#1878), or an η
-            // and every occasion's kappa shifted against it.
+            // The silent random effects of one unit are measured together
+            // (#1878): a combination of them can lie in the levels' span where
+            // none does alone, as `ETA_E0` and `ETA_X` shifted together do
+            // under `(ETA_E0 - ETA_X)²`. Those at a coarser unit are measured
+            // with them too, but over the whole subject: an η and every
+            // occasion's kappa shifted against it is a combination as well,
+            // and the η takes one value across the occasions.
             let mut kinds: Vec<Unit> = Vec::new();
             for &(_, unit) in silent {
                 if !kinds.contains(&unit) {
                     kinds.push(unit);
                 }
             }
-            for unit in kinds {
-                let members: Vec<usize> =
-                    (0..silent.len()).filter(|&s| silent[s].1 == unit).collect();
-                if members.iter().all(|&s| !holds[s]) {
-                    continue;
+            // The column of silent random effect `s` moved on its unit `key`,
+            // over every record; `None` where it cannot be measured.
+            let re_column = |s: usize, key: &[u64]| -> Option<Vec<f64>> {
+                let (k, own) = silent[s];
+                let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
+                let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
+                if k < model.n_eta {
+                    eta_up[k] += SPAN_STEP;
+                    eta_down[k] -= SPAN_STEP;
+                } else {
+                    // A kappa moves its own occasion only; under nested
+                    // levels, every cell of its group (#1082).
+                    let groups = unit_groups(&layout, cells.as_ref(), own, key);
+                    if groups.is_empty() {
+                        return None;
+                    }
+                    for g in groups {
+                        ka_up[g][k - model.n_eta] += SPAN_STEP;
+                        ka_down[g][k - model.n_eta] -= SPAN_STEP;
+                    }
                 }
-                // Every random effect a member is measured against, the
-                // members included: the joint oracle's coarser-or-equal ones.
-                let partners: Vec<usize> = (0..silent.len())
-                    .filter(|&s| coarser_or_equal(silent[s].1, unit))
-                    .collect();
-                // The records of each unit of this subject.
+                record_diffs(
+                    &at(&theta, &eta_up, &ka_up),
+                    &at(&theta, &eta_down, &ka_down),
+                    SPAN_STEP,
+                )
+            };
+            // The records of each unit of `unit` in this subject.
+            let units_of = |unit: Unit| -> Vec<(Vec<u64>, Vec<usize>)> {
                 let mut units: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
                 for j in 0..n_obs {
                     let Some(u) = unit_of(subject, unit, j, tree) else {
@@ -2222,7 +2255,23 @@ fn spanned(
                         None => units.push((u, vec![j])),
                     }
                 }
-                for (u, rows) in units {
+                units
+            };
+            for unit in kinds {
+                let members: Vec<usize> =
+                    (0..silent.len()).filter(|&s| silent[s].1 == unit).collect();
+                if members.iter().all(|&s| !holds[s]) {
+                    continue;
+                }
+                let coarser: Vec<usize> = (0..silent.len())
+                    .filter(|&s| silent[s].1 != unit && coarser_or_equal(silent[s].1, unit))
+                    .collect();
+                // Per member, its column on each unit, zero off the unit's
+                // records; and whether some unit kept it outside the span of
+                // the levels and the other members there.
+                let mut unit_cols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); members.len()];
+                let mut outside: Vec<bool> = vec![false; members.len()];
+                for (u, rows) in units_of(unit) {
                     let restrict = |col: &[f64]| -> Vec<f64> {
                         rows.iter().filter_map(|&j| col.get(j).copied()).collect()
                     };
@@ -2258,45 +2307,21 @@ fn spanned(
                         members.iter().for_each(|&s| holds[s] = false);
                         break;
                     }
-                    // Each partner's column on the unit's records; `None` where
-                    // it cannot be measured. A coarser partner moves the unit
-                    // of its own that holds these records.
-                    let re_cols: Vec<Option<Vec<f64>>> = partners
-                        .iter()
-                        .map(|&s| {
-                            let (k, own) = silent[s];
-                            let key = if own == unit {
-                                u.clone()
-                            } else {
-                                unit_of(subject, own, *rows.first()?, tree)?
-                            };
-                            let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
-                            let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
-                            if k < model.n_eta {
-                                eta_up[k] += SPAN_STEP;
-                                eta_down[k] -= SPAN_STEP;
-                            } else {
-                                // A kappa moves its own occasion only; under
-                                // nested levels, every cell of its group (#1082).
-                                let groups = unit_groups(&layout, cells.as_ref(), own, &key);
-                                if groups.is_empty() {
-                                    return None;
-                                }
-                                for g in groups {
-                                    ka_up[g][k - model.n_eta] += SPAN_STEP;
-                                    ka_down[g][k - model.n_eta] -= SPAN_STEP;
-                                }
-                            }
-                            record_diffs(
-                                &at(&theta, &eta_up, &ka_up),
-                                &at(&theta, &eta_down, &ka_down),
-                                SPAN_STEP,
-                            )
-                            .map(|c| restrict(&c))
-                        })
-                        .collect();
-                    for (i, &s) in partners.iter().enumerate() {
-                        if silent[s].1 != unit || !holds[s] {
+                    // Each member's column on the unit's records; `None` where
+                    // it cannot be measured.
+                    let full: Vec<Option<Vec<f64>>> =
+                        members.iter().map(|&s| re_column(s, &u)).collect();
+                    let re_cols: Vec<Option<Vec<f64>>> =
+                        full.iter().map(|c| c.as_deref().map(restrict)).collect();
+                    for (i, c) in full.iter().enumerate() {
+                        if let Some(c) = c {
+                            let mut masked = vec![0.0; c.len()];
+                            rows.iter().for_each(|&j| masked[j] = c[j]);
+                            unit_cols[i].push(masked);
+                        }
+                    }
+                    for (i, &s) in members.iter().enumerate() {
+                        if !holds[s] {
                             continue;
                         }
                         let Some(g) = &re_cols[i] else {
@@ -2336,11 +2361,70 @@ fn spanned(
                                     within[s] = false;
                                 }
                             }
+                            // Outside on this unit: the coarser random effects
+                            // may still reach it over the subject, below.
+                            Some(_) if !coarser.is_empty() => outside[i] = true,
                             Some(_) => holds[s] = false,
                         }
                     }
                     if members.iter().all(|&s| !holds[s]) {
                         break;
+                    }
+                }
+                // A member some unit kept outside, against the coarser random
+                // effects over the subject (#1878 review r1, r2): the
+                // dimension of `span K ∩ span C` outside the levels and the
+                // other members — `K` its unit columns, `C` the coarser
+                // columns, one per unit of theirs, so an η's coefficient is
+                // one across the occasions — against the same dimension
+                // outside the other members alone, the joint oracle's
+                // baseline. Where it grows the block absorbs a combination of
+                // them, which the per-unit within residual cannot judge (the
+                // coarser random effect couples the units): it is left to
+                // [`carried`], contrast by contrast.
+                if !outside.iter().any(|o| *o) {
+                    continue;
+                }
+                let mut coarse: Vec<Vec<f64>> = Vec::new();
+                let mut levels: Vec<Vec<f64>> = Vec::new();
+                let mut failed = false;
+                for &p in &coarser {
+                    for (key, _) in units_of(silent[p].1) {
+                        match re_column(p, &key) {
+                            Some(c) => coarse.push(c),
+                            None => failed = true,
+                        }
+                    }
+                }
+                for j in 0..n_obs {
+                    let Some(index) = level_of(j) else { continue };
+                    if let Some(Some(c)) = level_cols.get(&index) {
+                        if !levels.contains(c) {
+                            levels.push(c.clone());
+                        }
+                    }
+                }
+                for (i, &s) in members.iter().enumerate() {
+                    if !outside[i] || !holds[s] {
+                        continue;
+                    }
+                    let same: Vec<Vec<f64>> = unit_cols
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| j != i)
+                        .flat_map(|(_, c)| c.iter().cloned())
+                        .collect();
+                    let k = &unit_cols[i];
+                    let grows = !failed && {
+                        let base: Vec<Vec<f64>> = levels.iter().chain(&same).cloned().collect();
+                        shared_dim(&base, k, &coarse) > shared_dim(&same, k, &coarse)
+                    };
+                    if grows {
+                        measured[s] = true;
+                        partnered[s] = true;
+                        within[s] = false;
+                    } else {
+                        holds[s] = false;
                     }
                 }
             }
@@ -2508,6 +2592,51 @@ fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// The rank of `cols` at [`SPAN_TOL`]: how many keep at least that much of
+/// their own norm against the ones before them, by modified Gram–Schmidt with
+/// one re-orthogonalisation pass. Columns scaled to the norm the tolerance is
+/// relative to — [`carried`]'s remnants, each divided by its column's norm — so
+/// a column nearly inside the span already removed counts as none (#1878).
+fn rank(cols: &[Vec<f64>]) -> usize {
+    let mut basis: Vec<Vec<f64>> = Vec::new();
+    for c in cols {
+        let mut v = c.clone();
+        project_out(&mut v, &basis);
+        let n = dot(&v, &v).sqrt();
+        if n.is_finite() && n >= SPAN_TOL {
+            basis.push(v.into_iter().map(|x| x / n).collect());
+        }
+    }
+    basis.len()
+}
+
+/// `dim(span K ∩ span C)` outside `span B`: the combinations of the columns
+/// `k` that the columns `c` match, up to the columns `b` — counted as
+/// `rank[B|K] + rank[B|C] − rank[B|K|C] − rank B`, each by [`rank`] on the
+/// columns scaled to unit norm. A non-finite column makes the count 0: an
+/// inconclusive measurement binds (#1878).
+fn shared_dim(b: &[Vec<f64>], k: &[Vec<f64>], c: &[Vec<f64>]) -> usize {
+    let unit = |v: &Vec<f64>| -> Option<Vec<f64>> {
+        let n = dot(v, v).sqrt();
+        (n > 0.0).then(|| v.iter().map(|x| x / n).collect())
+    };
+    let all: Vec<&Vec<f64>> = b.iter().chain(k).chain(c).collect();
+    if all.iter().any(|v| v.iter().any(|x| !x.is_finite())) {
+        return 0;
+    }
+    let scaled = |cols: &[&[Vec<f64>]]| -> Vec<Vec<f64>> {
+        cols.iter()
+            .flat_map(|c| c.iter())
+            .filter_map(unit)
+            .collect()
+    };
+    let rb = rank(&scaled(&[b]));
+    let rbk = rank(&scaled(&[b, k]));
+    let rbc = rank(&scaled(&[b, c]));
+    let rbkc = rank(&scaled(&[b, k, c]));
+    (rbk + rbc).saturating_sub(rbkc + rb)
 }
 
 /// `v` minus its projection on the orthonormal `basis`, projected twice (one
@@ -3427,77 +3556,73 @@ fn carried(
                 cols.push(col);
             }
         }
-        let basis = BlockBasis::grouped(&cols, &tags, &lens, &offsets);
-        if outside(&basis) != Some(true) {
+        let with_coarser = BlockBasis::grouped(&cols, &tags, &lens, &offsets);
+        if outside(&with_coarser) != Some(true) {
             return Carried::Held;
         }
-        // A kappa against a coarser random effect restricted to the kappa's
-        // unit too (#1878 review): an η and every occasion's kappa shifted
-        // against it leave the levels a shift, though no one occasion's
-        // column lies in the span of the η's whole column. Each unit's
-        // remnant outside the coded span, against the remnants of the coarser
-        // random effects' columns on the unit's records. An η's own unit is
-        // the subject, which no restriction narrows.
+        // A kappa jointly with the coarser random effects (#1878 review r1,
+        // r2): an η and every occasion's kappa shifted against it leave the
+        // levels a shift, though no one occasion's column lies in the span of
+        // the η's column. So per subject, the kappa's unit columns `K` and the
+        // coarser columns `C` outside the coded span: the dimension of
+        // `span K ∩ span C` there — a combination of the kappa's units the
+        // coarser random effects match, with one coefficient each across the
+        // subject — against the same dimension outside the other θ alone, the
+        // joint oracle's baseline. The block holds the kappa under the
+        // contrast when that dimension grows in every subject it moves. An
+        // η's partners share its unit, which the full columns above already
+        // judge.
         if !kappa {
             continue;
         }
-        let unit = match model.nested_levels() {
-            None => Unit::Occasion,
-            Some(n) => n
-                .kappa_level
-                .get(index)
-                .map_or(Unit::Occasion, |&l| Unit::Level(l)),
-        };
-        let mut outside = false;
-        for (s, groups, z) in &own {
-            let z_norm = z.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
-            if z_norm == 0.0 {
+        let without = BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets);
+        let mut held = false;
+        for (s, subject_cols) in per_subject.iter().enumerate() {
+            let k: Vec<&Pieces> = own
+                .iter()
+                .filter(|(t, ..)| *t == s)
+                .map(|(.., z)| z)
+                .collect();
+            if k.is_empty() {
                 continue;
             }
-            let subject = &population.subjects[*s];
-            let in_unit: Vec<bool> = (0..lens[*s])
-                .map(|j| {
-                    unit_of(subject, unit, j, model.nested_levels()).is_some_and(|key| {
-                        unit_groups(&layouts[*s], cells[*s].as_ref(), unit, &key) == *groups
-                    })
-                })
-                .collect();
-            let restrict = |col: &Pieces| -> Pieces {
-                col.iter()
-                    .map(|(t, v)| {
-                        let v = v
-                            .iter()
-                            .zip(&in_unit)
-                            .map(|(x, keep)| if *keep { *x } else { 0.0 })
-                            .collect();
-                        (*t, v)
-                    })
-                    .collect()
+            // `None` when anything is non-finite: inconclusive, which here
+            // falls to the refusal.
+            let shared = |b: &BlockBasis| -> Option<usize> {
+                let scaled = |c: &&Pieces| -> Option<Option<Vec<f64>>> {
+                    let n = c.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+                    if n == 0.0 {
+                        return Some(None);
+                    }
+                    let r: Vec<f64> = b.complement(c).into_iter().map(|x| x / n).collect();
+                    r.iter().all(|x| x.is_finite()).then_some(Some(r))
+                };
+                let kc: Vec<Vec<f64>> = k
+                    .iter()
+                    .map(scaled)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let cc: Vec<Vec<f64>> = subject_cols
+                    .iter()
+                    .map(|c| scaled(&c))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let both: Vec<Vec<f64>> = cc.iter().chain(&kc).cloned().collect();
+                Some((rank(&kc) + rank(&cc)).saturating_sub(rank(&both)))
             };
-            let restricted: Vec<Pieces> = per_subject[*s].iter().map(restrict).collect();
-            // A unit the restricted columns carry on their own: the kappa
-            // duplicates them there, which is no fault of the block — the
-            // joint oracle's baseline rank, as in [`spanned`]. It keeps the
-            // verdict without them.
-            let flat = |p: &Pieces| -> Vec<f64> {
-                p.iter().flat_map(|(_, v)| v.iter().copied()).collect()
+            let (Some(with), Some(alone)) = (shared(&basis), shared(&without)) else {
+                return Carried::Held;
             };
-            let raw: Vec<Vec<f64>> = restricted.iter().map(flat).collect();
-            let duplicates = !span_residual(&flat(z), &raw).is_some_and(|r| r >= SPAN_TOL);
-            let r = if duplicates {
-                basis.residual(z)
-            } else {
-                let g = basis.complement(z);
-                let rest: Vec<Vec<f64>> = restricted.iter().map(|c| basis.complement(c)).collect();
-                span_residual(&g, &rest).map(|r| r * dot(&g, &g).sqrt() / z_norm)
-            };
-            match r {
-                None => {}
-                Some(r) if !r.is_finite() => return Carried::Held,
-                Some(r) => outside |= r >= SPAN_TOL,
+            if with <= alone {
+                return Carried::Identified;
             }
+            held = true;
         }
-        if !outside {
+        if held {
             return Carried::Held;
         }
     }
@@ -3833,13 +3958,22 @@ fn resolve_contrast(
         let one = absorbed.into_iter().next();
         return resolve_absorbing(decl, levels, measured, population, others, one);
     }
-    if !within_parts_them(
-        decl,
-        levels,
-        &absorbed,
-        population,
-        measured.nested.as_ref(),
-    ) {
+    // Absorbed only in combination, on a nested block (#1878 review r2): the
+    // partition rule below is for random effects each absorbed alone. A
+    // combination's within verdict is already joint — its `Span` measured
+    // against its partners — and each contrast is judged on it by `carried`,
+    // which takes the partners among the random effects at a coarser-or-equal
+    // unit; so each is resolved on its own, as when within parts them.
+    let combined = decl.columns().len() >= 2 && absorbed.iter().all(Absorbed::combined);
+    if !combined
+        && !within_parts_them(
+            decl,
+            levels,
+            &absorbed,
+            population,
+            measured.nested.as_ref(),
+        )
+    {
         return Err(jointly_absorbed_message(
             &block, decl, &absorbed, population,
         ));
@@ -4282,11 +4416,9 @@ fn jointly_absorbed_message(
     };
     // Measured only in combination, none of them alone (#1878): the levels
     // absorb the combination, not each one, so dropping one is the remedy the
-    // one-column refusal below would deny.
-    let combined = absorbed
-        .iter()
-        .all(|a| matches!(&a.how, How::Measured(_, with) if !with.is_empty()));
-    if combined {
+    // one-column refusal below would deny. (On a nested block such random
+    // effects never reach here: `resolve_contrast` resolves each.)
+    if absorbed.iter().all(Absorbed::combined) {
         return format!(
             "{block}: the levels absorb {} and {last} in combination ({}): none of them alone, \
              but moved together they move `y` as the levels do, so the model is not identified \

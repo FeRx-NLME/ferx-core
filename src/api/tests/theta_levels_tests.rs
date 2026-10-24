@@ -9352,6 +9352,146 @@ mod absorption {
         assert!(wrong.is_empty(), "coarser:\n{}", wrong.join("\n"));
     }
 
+    /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
+    /// `ETA_A` and `ETA_B`, and `KAPPA_E0` declared when `kappa`.
+    fn two_eta_model(e0: String, kappa: bool) -> impl Fn(&str) -> String {
+        move |c: &str| {
+            let text = cf_model(
+                c,
+                "STUDY, OCC",
+                &format!("{BASE}  E0 = {e0}"),
+                &format!("E0 + {EMAXY}"),
+            );
+            let k = if kappa {
+                "  kappa KAPPA_E0 ~ 0.1\n"
+            } else {
+                ""
+            };
+            let out = text.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                &format!("  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n{k}"),
+            );
+            assert_ne!(out, text, "the random effects are declared");
+            out
+        }
+    }
+
+    /// #1878 review r2, finding 1. On the nested `[STUDY, OCC]`, `E0 = TVE0 +
+    /// PLACEBO + ETA_A + (ETA_A - ETA_B) · W`: neither η alone moves `y` as an
+    /// occasion's level does (`W` varies inside each), and shifting both by
+    /// `c` moves it by `c` at every record of the subject — a shift common to
+    /// the subject's levels, which `sum_to_zero_within` removes. So the block
+    /// absorbs the pair under the global contrasts and not under within: the
+    /// partition rule for random effects each absorbed alone, which would
+    /// refuse every contrast, must not judge it. Global is refused naming the
+    /// partner, within binds, auto resolves to it, and every cell agrees with
+    /// the joint oracle.
+    ///
+    /// Mutation — the partition rule restored for combinations (the pair is
+    /// refused under within and auto).
+    #[test]
+    fn a_combination_within_rescues_binds_within() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let pair = two_eta_model("TVE0 + PLACEBO + ETA_A + (ETA_A - ETA_B) * W".into(), false);
+        let clause = "the random effect `ETA_A`, moved together with `ETA_B`, moves `y`, at \
+                      every record of each subject, exactly as some combination of this block's \
+                      levels does";
+        let mut wrong = Vec::new();
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&pair(c), &pop) {
+                Err(e) if e.contains(clause) && !e.contains(WITHIN) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}")),
+            }
+        }
+        for c in ["", "sum_to_zero_within"] {
+            match try_bind(&pair(c), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}, want within")),
+            }
+        }
+        agrees_with_joint_oracle("pair", &pair, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("pair moved", &pair, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r2, finding 2. Two ηs and a kappa on `[STUDY, OCC]`:
+    /// `ETA_A · W + ETA_B · W² + KAPPA_E0 · (1 + W + OCC · W²)`. On each
+    /// occasion the kappa's column is the occasion's level plus a combination
+    /// of the ηs there, `A + B` on the first and `A + 2B` on the second; but an
+    /// η moves the whole subject with one value, and no one pair of
+    /// coefficients serves every occasion. So the kappa is identified under
+    /// the global contrast: a test that let the ηs' combination differ by
+    /// occasion refuses it. It binds global and agrees with the oracle.
+    ///
+    /// The twin, `KAPPA_E0 · (1 + W + W²)`, has the same combination on every
+    /// occasion: shifting both ηs by `c` and every kappa by `−c` leaves the
+    /// levels a shift common to the subject, asserted on the Jacobian as
+    /// `Σ Z_A + Σ Z_B − Σ Z_κ + Σ X_block = 0` (the per-column oracle cannot
+    /// see it). Global is refused naming both partners, within binds.
+    ///
+    /// Mutations — every unit the ηs reach counted as absorbed, as judging
+    /// each against the ηs restricted to it does (review r1's version: the
+    /// identified row is refused under `none` and auto goes to within); the
+    /// subject-wide check never finding a combination (the common row binds
+    /// global); the joint check in `carried` taken outside the basis that
+    /// already holds the ηs (the common row binds global).
+    #[test]
+    fn a_kappa_shares_one_eta_combination_across_its_occasions() {
+        let pop = arms_pop();
+        let varied = two_eta_model(
+            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + OCC * W * W)".into(),
+            true,
+        );
+        let common = two_eta_model(
+            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + W * W)".into(),
+            true,
+        );
+        let mut wrong = Vec::new();
+        // `Σ Z_A + Σ Z_B − Σ Z_κ + Σ X_block`, relative to `‖Σ Z_κ‖`.
+        let direction = |text: &dyn Fn(&str) -> String| {
+            let j = jacobian_at(&text("none"), &pop, Point::ZERO);
+            let sum = |name: &str| -> DVector<f64> {
+                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
+                z.column_sum()
+            };
+            let kappa = sum("KAPPA_E0");
+            let v = sum("ETA_A") + sum("ETA_B") - &kappa + j.xb.column_sum();
+            assert!(v.iter().all(|x| x.is_finite()), "non-finite");
+            v.norm() / kappa.norm()
+        };
+        let (dv, dc) = (direction(&varied), direction(&common));
+        eprintln!("direction residual: varied {dv:.3e}, common {dc:.3e}");
+        if dc >= 1e-8 || dv <= 1e-2 {
+            wrong.push(format!("direction: varied {dv:.1e}, common {dc:.1e}"));
+        }
+        for c in ["", "sum_to_zero"] {
+            match try_bind(&varied(c), &pop) {
+                Ok((LevelContrast::SumToZero, _)) => {}
+                got => wrong.push(format!("varied {c:?}: {got:?}, want global")),
+            }
+        }
+        agrees_with_joint_oracle("varied", &varied, &pop, &mut wrong);
+        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_A` and `ETA_B`, \
+                      moves `y`, at every record of each occasion";
+        for c in ["sum_to_zero", "ref"] {
+            match try_bind(&common(c), &pop) {
+                Err(e) if e.contains(clause) => {}
+                got => wrong.push(format!("common {c:?}: {got:?}")),
+            }
+        }
+        for c in ["", "sum_to_zero_within"] {
+            match try_bind(&common(c), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("common {c:?}: {got:?}, want within")),
+            }
+        }
+        assert!(wrong.is_empty(), "shared:\n{}", wrong.join("\n"));
+    }
+
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
     /// a dense basis of every column spans: on three subjects, one-subject
     /// columns, a column across two subjects and a θ-like column across all
