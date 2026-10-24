@@ -426,8 +426,9 @@ subject's one level cannot follow; shifted together they leave the square
 unchanged and move `y` by a constant the level takes up. So each random effect
 is measured against the levels and the other measured random effects together,
 and the refusal names its partners (`` `ETA_E0`, moved together with
-`ETA_X`, ``). On a one-column block it says to drop one of them: unlike two
-random effects each absorbed alone, dropping one breaks the combination. On a
+`ETA_X`, ``). On a one-column block it says to drop one random effect from
+each combination: unlike two random effects each absorbed alone, dropping one
+breaks the combination it is part of. On a
 nested block each contrast is judged on the combination, so
 `sum_to_zero_within` binds when what the combination leaves the levels is a
 shift common to each group, as with `ETA_A + (ETA_A - ETA_B) * W` on

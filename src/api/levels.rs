@@ -3578,9 +3578,13 @@ fn carried(
         let without = BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets);
         let mut held = false;
         for (s, subject_cols) in per_subject.iter().enumerate() {
+            // The units of this subject the kappa moves: a unit whose column
+            // is zero measures nothing, and a subject with none is skipped,
+            // not counted as one where the contrast identifies the kappa
+            // (#1878 review r3).
             let k: Vec<&Pieces> = own
                 .iter()
-                .filter(|(t, ..)| *t == s)
+                .filter(|(t, _, z)| *t == s && z.iter().any(|(_, v)| v.iter().any(|x| *x != 0.0)))
                 .map(|(.., z)| z)
                 .collect();
             if k.is_empty() {
@@ -4416,13 +4420,17 @@ fn jointly_absorbed_message(
     };
     // Measured only in combination, none of them alone (#1878): the levels
     // absorb the combination, not each one, so dropping one is the remedy the
-    // one-column refusal below would deny. (On a nested block such random
-    // effects never reach here: `resolve_contrast` resolves each.)
+    // one-column refusal below would deny — one from each combination, as
+    // there can be several independent ones (`ETA_A`/`ETA_B` and
+    // `ETA_C`/`ETA_D`, #1878 review r3), and the partners do not say which.
+    // (On a nested block such random effects never reach here:
+    // `resolve_contrast` resolves each.)
     if absorbed.iter().all(Absorbed::combined) {
         return format!(
             "{block}: the levels absorb {} and {last} in combination ({}): none of them alone, \
              but moved together they move `y` as the levels do, so the model is not identified \
-             under any contrast. Drop one of the random effects, or remove the block.",
+             under any contrast. Each combination needs every random effect in it: drop one \
+             from each combination, or remove the block.",
             rest.join(", "),
             sites.join("; "),
         );

@@ -9225,7 +9225,8 @@ mod absorption {
                         "the levels absorb `ETA_E0` and `ETA_X` in combination",
                         "none of them alone, but moved together they move `y` as the levels do, \
                          so the model is not identified under any contrast.",
-                        "Drop one of the random effects, or remove the block.",
+                        "Each combination needs every random effect in it: drop one from each \
+                         combination, or remove the block.",
                     ] {
                         if !e.contains(must) {
                             wrong.push(format!("linear {c:?}: lacks {must:?}: {e}"));
@@ -9350,6 +9351,71 @@ mod absorption {
         }
         agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
         assert!(wrong.is_empty(), "coarser:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r3. The η/κ combination of
+    /// `a_kappa_is_measured_jointly_with_a_coarser_eta`, with the kappa scaled
+    /// by a covariate `GATE`, 0 on every record of the first subject and 1 on
+    /// the others': there the kappa
+    /// moves nothing, and that subject must be skipped, not read as one where
+    /// the global contrast identifies the kappa. On the other three the
+    /// combination still leaves the levels a shift, so global is refused and
+    /// within binds, as without the gate. The ungated row is the control: the
+    /// same verdicts with every subject moved. A test of the fixture itself
+    /// pins that the gate holds the first subject's kappa column at zero and
+    /// no other's.
+    ///
+    /// Mutation — a subject whose kappa columns are all zero kept in the
+    /// joint check (the gated row binds global).
+    #[test]
+    fn a_subject_the_kappa_does_not_move_is_skipped() {
+        let mut pop = arms_pop();
+        for (k, s) in pop.subjects.iter_mut().enumerate() {
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("GATE".into(), if k == 0 { 0.0 } else { 1.0 });
+            }
+        }
+        let mut wrong = Vec::new();
+        let row = |tag, gate: &str| -> Row {
+            (
+                tag,
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1) * {gate}"),
+                format!("E0 + {EMAXY}"),
+                true,
+            )
+        };
+        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at \
+                      every record of each occasion";
+        // The gate: the kappa moves no record of the first subject, and some
+        // record of every other.
+        let gated = row("gated", "GATE");
+        let j = jacobian_at(&row_text(&gated)("none"), &pop, Point::ZERO);
+        let (.., z) = j.res.iter().find(|(n, ..)| n == "KAPPA_E0").unwrap();
+        let rows: Vec<usize> = pop.subjects.iter().map(|s| s.obs_times.len()).collect();
+        let mut at = 0;
+        for (k, n) in rows.iter().enumerate() {
+            let moved = (at..at + n).any(|r| z.row(r).iter().any(|v| *v != 0.0));
+            if moved != (k > 0) {
+                wrong.push(format!("subject {k}: the kappa moves it: {moved}"));
+            }
+            at += n;
+        }
+        for r in [gated, row("ungated", "1")] {
+            for c in ["sum_to_zero", "ref"] {
+                match try_bind(&row_text(&r)(c), &pop) {
+                    Err(e) if e.contains(clause) => {}
+                    got => wrong.push(format!("{} {c:?}: {got:?}", r.0)),
+                }
+            }
+            for c in ["", "sum_to_zero_within"] {
+                match try_bind(&row_text(&r)(c), &pop) {
+                    Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                    got => wrong.push(format!("{} {c:?}: {got:?}, want within", r.0)),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "gated:\n{}", wrong.join("\n"));
     }
 
     /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
