@@ -5251,3 +5251,60 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
         "every row round-trips through the subtraction; pick times that do not"
     );
 }
+
+/// #1854: an endpoint row's covariate is kept as an `endpoint_covariates` snapshot — one
+/// per kept row, in reading order — so a covariate that changes **only** on endpoint rows
+/// is time-varying. The dose carries `WT = 70` and the change to `90` is on endpoint rows
+/// alone, for a discrete-state CMT (3) and, under `survival`, a TTE CMT (4). Each arm
+/// asserts its own snapshots, so dropping either reader push reddens the arm that names
+/// it. The constant-`WT` control keeps the field empty, like the other snapshots.
+#[test]
+fn endpoint_rows_keep_their_covariate_snapshot() {
+    let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    // Only the `survival`-gated arm below pushes to it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut arms: Vec<(&str, ObsRouting, &str)> = vec![(
+        "discrete",
+        ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    )];
+    #[cfg(feature = "survival")]
+    arms.push((
+        "tte",
+        ObsRouting {
+            tte: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    ));
+    for (name, routing, csv) in arms {
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.endpoint_covariates,
+            vec![wt(70.0), wt(90.0)],
+            "{name}: one LOCF snapshot per endpoint row"
+        );
+        assert_eq!(
+            subj.time_varying_covariate_names(),
+            vec!["WT".to_string()],
+            "{name}"
+        );
+        let constant = write_csv(&csv.replace(",90\n", ",70\n"));
+        let pop = read_nonmem_csv_filtered_routed(constant.path(), &routing).unwrap();
+        assert!(
+            pop.subjects[0].endpoint_covariates.is_empty(),
+            "{name}: no TV covariate, no snapshots"
+        );
+    }
+}

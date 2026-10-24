@@ -1012,6 +1012,145 @@ fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_for
     assert!(code_in(&check_model_data(&m, &full), "E_LEVEL_MISSING_LABEL").is_none());
 }
 
+/// #2036: the model-blind `read_nonmem_csv` does not know the level columns, so it
+/// carries a blank level cell forward like a covariate's and the record holds the
+/// previous record's label. Its note of the filled cell (`Subject::filled_cells`) is
+/// what `fit()` refuses on. The same blank in an ordinary covariate (`NARM`) is noted
+/// but not refused, and a dataset with no blank level cell is not refused: both sides
+/// of the gate. The model-aware reader reads the label as `NaN` instead and notes only
+/// the covariate.
+#[test]
+fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
+    let m = model();
+    let write = |tag: &str, csv: &str| {
+        let path = std::env::temp_dir().join(format!(
+            "ferx_nested_blind_{}_{tag}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, csv).unwrap();
+        path
+    };
+    // TIME 3 has a blank ARM and a blank NARM.
+    let blank = write(
+        "blank",
+        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,40\n1,3,12,1,,\n\
+         1,4,13,2,1,30\n",
+    );
+    let pop = crate::io::datareader::read_nonmem_csv(&blank, None, None).unwrap();
+    let s = &pop.subjects[0];
+    assert_eq!(
+        s.obs_cov(2)["ARM"],
+        2.0,
+        "the model-blind reader carries it forward"
+    );
+    assert_eq!(
+        s.filled_cells,
+        vec![("ARM".to_string(), 3.0), ("NARM".to_string(), 3.0)]
+    );
+    let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
+    assert!(
+        msg.contains(
+            "level `ARM` reads column `ARM`, which has no numeric value on a record of \
+             subject `1` at TIME 3. The dataset was read without the model, which fills a \
+             blank cell from the record before it (the first value, before any), so the \
+             record would silently join that record's group."
+        ),
+        "{msg}"
+    );
+    let opts = FitOptions {
+        iov_occasion: IovOccasionRule::Column,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let err = crate::api::fit(&m, &pop, &m.default_params, &opts)
+        .err()
+        .expect("refused");
+    assert_eq!(err.code(), Some("E_LEVEL_MISSING_LABEL"), "{err}");
+
+    // A blank before the first value is filled backward, and refused the same way.
+    let first = write(
+        "first",
+        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,.,50\n1,2,11,1,2,50\n",
+    );
+    let pop = crate::io::datareader::read_nonmem_csv(&first, None, None).unwrap();
+    assert_eq!(pop.subjects[0].obs_cov(0)["ARM"], 2.0);
+    let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
+    assert!(
+        msg.contains("at TIME 1. The dataset was read without"),
+        "{msg}"
+    );
+
+    // Only the covariate is blank: noted, not refused.
+    let cov = write(
+        "cov",
+        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,\n",
+    );
+    let pop = crate::io::datareader::read_nonmem_csv(&cov, None, None).unwrap();
+    assert_eq!(
+        pop.subjects[0].filled_cells,
+        vec![("NARM".to_string(), 2.0)]
+    );
+    assert!(code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").is_none());
+
+    // The model-aware reader: the label is `NaN` (refused by the record's path), the
+    // covariate is noted.
+    let (aware, _) =
+        crate::api::read_population_for(&m, &None, blank.to_str().unwrap(), None, None, None, &[])
+            .unwrap();
+    assert!(aware.subjects[0].obs_cov(2)["ARM"].is_nan());
+    assert_eq!(
+        aware.subjects[0].filled_cells,
+        vec![("NARM".to_string(), 3.0)]
+    );
+    for p in [blank, first, cov] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// #2036 review r1: `ARM = 1, 2, 2` and `1, 2, <blank>` read without the model carry
+/// the same values into every snapshot, and only the second is refused. So the
+/// population fingerprint must tell them apart, or a fit of the first would vouch for
+/// the second in `run_covariance` / `run_sir`. The written-out file is the control:
+/// identical snapshots, different fingerprints.
+#[test]
+fn a_filled_level_cell_moves_the_population_fingerprint() {
+    use crate::types::PopulationFingerprint;
+    let read = |tag: &str, csv: &str| {
+        let path =
+            std::env::temp_dir().join(format!("ferx_nested_fp_{}_{tag}.csv", std::process::id()));
+        std::fs::write(&path, csv).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(&path, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        pop
+    };
+    let written = read(
+        "written",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
+    );
+    let blank = read(
+        "blank",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
+    );
+    let (w, b) = (&written.subjects[0], &blank.subjects[0]);
+    assert_eq!(w.covariates, b.covariates);
+    assert_eq!(w.obs_covariates, b.obs_covariates, "the snapshots agree");
+    assert!(w.filled_cells.is_empty());
+    assert_eq!(b.filled_cells, vec![("ARM".to_string(), 3.0)]);
+    let fp = PopulationFingerprint::of(&written);
+    assert_eq!(fp.first_difference(&written), None);
+    assert!(
+        fp.first_difference(&blank).is_some(),
+        "the fit of the written-out file vouches for the blank one"
+    );
+    assert!(code_in(
+        &check_model_data(&model(), &written),
+        "E_LEVEL_MISSING_LABEL"
+    )
+    .is_none());
+    assert!(code_in(&check_model_data(&model(), &blank), "E_LEVEL_MISSING_LABEL").is_some());
+}
+
 /// Review r1 #1: a fit-time occasion rule on a nested model. `[fit_options]` is refused at
 /// parse time, but `FitOptions::iov_occasion` (and R's `settings`) reach `fit()` directly.
 /// Both sides of the gate in one test: `Column` (the default) passes, a derived rule is
@@ -1229,4 +1368,222 @@ fn an_unprepared_nested_subject_is_refused_by_every_estimator_site() {
         assert_eq!(i(s_raw), 1e20);
         assert!(i(s_ok) < 1e10);
     }
+}
+
+/// The `W_LEVEL_SUMMARY` messages of `model` on `pop`, outermost level first.
+fn level_rows(m: &CompiledModel, pop: &Population) -> Vec<String> {
+    crate::api::validation::check_level_summary(m, pop)
+        .into_iter()
+        .inspect(|d| {
+            assert_eq!(d.code, "W_LEVEL_SUMMARY");
+            assert!(!d.is_error(), "the row is informational");
+            assert_eq!(d.block.as_deref(), Some("parameters"));
+        })
+        .map(|d| d.message)
+        .collect()
+}
+
+/// #2035: one row per level, on a design with partial singletons at both levels. Subject
+/// 1 has three studies, one of them with a single arm; subject 2 has one study with one
+/// arm. Each number is a mutation target: the median is even-count at both levels
+/// (2 and 1.5, so a mutation taking the upper middle or dropping the halving reddens),
+/// and both subjects carry `STUDY 1`, so a parent keyed by its labels alone, without the
+/// subject, merges `1/1` and `2/1` into one study with two arms (4 → 3 `STUDY` groups).
+#[test]
+fn check_reports_a_row_per_level_with_its_groups_singletons_and_kappas() {
+    let s1: &[(f64, f64)] = &[(1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0), (3.0, 1.0)];
+    let s2: &[(f64, f64)] = &[(1.0, 1.0), (1.0, 1.0)];
+    let rows = level_rows(&model(), &population(&[s1, s2]));
+    assert_eq!(
+        rows,
+        vec![
+            "level `STUDY`: 4 groups in 2 subjects (per subject: min 1, median 2, max 3); \
+             1 of 2 subjects holds a single `STUDY` group; 1 kappa at `STUDY` (K_ST). \
+             Counted on the observation records."
+                .to_string(),
+            "level `ARM`: 6 groups in 4 `STUDY` groups (per `STUDY` group: min 1, median \
+             1.5, max 2); 2 of 4 `STUDY` groups hold a single `ARM` group; 1 kappa at `ARM` \
+             (K_ARM). Counted on the observation records."
+                .to_string(),
+        ]
+    );
+}
+
+/// #2035: the other cells of the row's text. Singletons: none (the full design), every
+/// parent (one arm per study), and one parent and one group (the singular nouns). Kappas:
+/// none at a level, and two at one level, in declaration order. An odd parent count
+/// takes the middle value.
+#[test]
+fn the_level_row_says_none_or_every_and_counts_zero_or_several_kappas() {
+    let rows = level_rows(&model(), &full_design());
+    assert!(
+        rows[0].contains(
+            "4 groups in 2 subjects (per subject: min 2, median 2, max 2); no subject holds \
+             a single `STUDY` group"
+        ),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        rows[1].contains("no `STUDY` group holds a single `ARM` group"),
+        "{}",
+        rows[1]
+    );
+
+    let one_arm: &[(f64, f64)] = &[(1.0, 1.0), (2.0, 1.0)];
+    let three: &[(f64, f64)] = &[(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)];
+    let rows = level_rows(&model(), &population(&[one_arm, one_arm, three]));
+    assert!(
+        rows[0].contains("7 groups in 3 subjects (per subject: min 2, median 2, max 3)"),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        rows[1].contains("every `STUDY` group holds a single `ARM` group"),
+        "{}",
+        rows[1]
+    );
+
+    let alone: &[(f64, f64)] = &[(1.0, 1.0), (1.0, 1.0)];
+    let rows = level_rows(&model(), &population(&[alone]));
+    assert!(
+        rows[0].starts_with(
+            "level `STUDY`: 1 group in 1 subject (per subject: min 1, median 1, max 1); \
+             every subject holds a single `STUDY` group"
+        ),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        rows[1].starts_with("level `ARM`: 1 group in 1 `STUDY` group (per `STUDY` group:"),
+        "{}",
+        rows[1]
+    );
+
+    let no_study_kappa = parse_model_string(
+        &src_with("", "EMAX = TVEMAX * exp(ETA_SP + K_ARM)", "")
+            .replace("  kappa K_ST ~ 0.04 at STUDY\n", ""),
+    )
+    .expect("a level with no kappa parses");
+    let rows = level_rows(&no_study_kappa, &full_design());
+    assert!(rows[0].contains("; no kappa at `STUDY`."), "{}", rows[0]);
+    assert!(
+        rows[1].contains("; 1 kappa at `ARM` (K_ARM)."),
+        "{}",
+        rows[1]
+    );
+
+    let two_at_arm = parse_model_string(&src_with(
+        "  kappa K_ARM2 ~ 1.0 at ARM\n",
+        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + K_ARM2)",
+        "",
+    ))
+    .expect("parse");
+    let rows = level_rows(&two_at_arm, &full_design());
+    assert!(
+        rows[1].contains("; 2 kappas at `ARM` (K_ARM, K_ARM2)."),
+        "{}",
+        rows[1]
+    );
+}
+
+/// #2035: the groups are counted on the observation records, as `E_LEVEL_SINGLE_MEMBER`
+/// counts them, so the two agree: a dose labelled with a second arm leaves the study a
+/// single-arm one in the row, as it does for the refusal. Both sides of the gate: the
+/// same arm on an observation does count.
+#[test]
+fn the_level_row_counts_observation_records_only() {
+    let mut pop = population(&[&[(1.0, 1.0), (2.0, 1.0)]]);
+    let s = &mut pop.subjects[0];
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    s.dose_covariates = vec![snap_of(1, 1.0, 2.0)];
+    let rows = level_rows(&model(), &pop);
+    assert!(
+        rows[1].contains("2 groups in 2 `STUDY` groups") && rows[1].contains("every `STUDY`"),
+        "{}",
+        rows[1]
+    );
+    let rows = level_rows(
+        &model(),
+        &population(&[&[(1.0, 1.0), (1.0, 2.0), (2.0, 1.0)]]),
+    );
+    assert!(
+        rows[1].contains("3 groups in 2 `STUDY` groups") && rows[1].contains("1 of 2"),
+        "{}",
+        rows[1]
+    );
+}
+
+/// #2035: no row for a model without nested levels, nor while a label is missing (the
+/// groups are not defined; `E_LEVEL_MISSING_LABEL` is the finding then).
+#[test]
+fn the_level_row_needs_nested_levels_and_every_label() {
+    let mut pop = full_design();
+    assert_eq!(level_rows(&model(), &pop).len(), 2);
+    pop.subjects[1].obs_covariates[2].insert("ARM".to_string(), f64::NAN);
+    assert!(code_in(&check_model_data(&model(), &pop), "E_LEVEL_MISSING_LABEL").is_some());
+    assert!(level_rows(&model(), &pop).is_empty());
+
+    let one_level = parse_model_string(
+        "[parameters]\n  theta TVCL(1.0)\n  omega ETA_CL ~ 0.1\n  level OCC by OCC in ID\n  \
+         kappa K ~ 0.01 at OCC\n  sigma P ~ 0.04\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + K)\n  V = 10\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(P)\n",
+    )
+    .expect("parse");
+    assert!(!one_level.has_nested_levels());
+    assert!(level_rows(&one_level, &full_design()).is_empty());
+}
+
+/// #2035, end to end: `ferx check --data` (`validate_model_file`) prints the rows and
+/// stays valid, and `fit()`'s two data lists do not carry them.
+#[test]
+fn ferx_check_with_data_prints_the_level_rows_and_fit_does_not_record_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("nested.ferx");
+    let data_path = dir.path().join("nested.csv");
+    std::fs::write(&model_path, src()).unwrap();
+    std::fs::write(
+        &data_path,
+        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,50\n1,3,12,2,1,50\n\
+         2,1,10,1,1,50\n2,2,11,2,1,50\n2,3,12,2,2,50\n",
+    )
+    .unwrap();
+    let report = validate_model_file(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    );
+    assert!(report.valid, "{:?}", report.diagnostics);
+    let rows: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W_LEVEL_SUMMARY")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(rows.len(), 2, "{:?}", report.diagnostics);
+    assert!(
+        rows[0].starts_with("level `STUDY`: 4 groups in 2 subjects"),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        rows[1].starts_with("level `ARM`: 6 groups in 4 `STUDY` groups")
+            && rows[1].contains("2 of 4 `STUDY` groups hold a single `ARM` group"),
+        "{}",
+        rows[1]
+    );
+    assert!(report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W_LEVEL_SUMMARY")
+        .all(|d| d.line.is_some()));
+
+    let m = model();
+    let pop = full_design();
+    assert!(code_in(&check_model_data(&m, &pop), "W_LEVEL_SUMMARY").is_none());
+    assert!(code_in(
+        &crate::api::check_model_data_warnings(&m, &pop, &m.default_params),
+        "W_LEVEL_SUMMARY"
+    )
+    .is_none());
 }

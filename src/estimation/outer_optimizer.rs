@@ -504,32 +504,10 @@ fn freeze_flat_thetas(
         declines,
     );
     let frozen = 'freeze: {
-        // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
-        // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
-        // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
-        // precision — freeze only that near-zero case, never a merely weakly-identified
-        // param (small-but-nonzero; covariance flags those as high RSE).
-        const FLAT_ABS: f64 = 1e-8;
-        const FLAT_REL: f64 = 1e-6;
         let is_free = |i: usize| !init_params.theta_fixed.get(i).copied().unwrap_or(false);
-        let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
-        // Reference scale for "negligible". If the whole theta gradient is ~0 the
-        // objective is globally flat (no data reaches it) — a different pathology, so
-        // bail rather than freeze every parameter.
-        let g_max = (0..n_theta)
-            .filter(|&i| is_free(i))
-            .map(g_at)
-            .fold(0.0_f64, f64::max);
-        if g_max <= FLAT_ABS {
+        let Some(candidates) = flat_theta_candidates(&grad, n_theta, is_free) else {
             break 'freeze None;
-        }
-
-        let candidates: Vec<usize> = (0..n_theta)
-            .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
-            .collect();
-        if candidates.is_empty() {
-            break 'freeze None;
-        }
+        };
 
         // Confirm structural flatness with a perturbation probe before freezing. A
         // near-zero gradient at the *initial* estimate is necessary but not sufficient
@@ -547,20 +525,11 @@ fn freeze_flat_thetas(
         let moves_objective = |i: usize| -> bool {
             let ti = params.theta[i];
             let (lo, hi) = (init_params.theta_lower[i], init_params.theta_upper[i]);
-            let delta = (ti.abs() * 0.5).max((hi - lo).abs() * 0.1).max(1e-2);
-            let mut probe = ti + delta;
-            if !(probe < hi) {
-                probe = ti - delta;
-            }
-            if !(probe > lo) {
-                probe = 0.5 * (lo + hi);
-            }
             // Could not build a distinct in-bounds probe — do not freeze (safe side).
-            if (probe - ti).abs() <= 1e-12 {
+            let Some(probe) = flat_theta_probe_value(ti, lo, hi) else {
                 return true;
-            }
-            let base = base_ofv();
-            (reconverged_ofv(i, probe) - base).abs() > 1e-6 * (1.0 + base.abs())
+            };
+            flat_theta_probe_moves(base_ofv(), reconverged_ofv(i, probe))
         };
         let flat: Vec<usize> = candidates
             .into_iter()
@@ -584,14 +553,7 @@ fn freeze_flat_thetas(
                 .get(i)
                 .map(|s| s.as_str())
                 .unwrap_or("<theta>");
-            warnings.push(format!(
-                "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
-                 initial estimate) — it is likely computed but never used (unmapped, or dropped \
-                 from the structural / scaling model). Freezing it at its initial value ({val}) \
-                 so the remaining parameters can be estimated; map or remove `{name}` to silence \
-                 this.",
-                val = params.theta[i],
-            ));
+            warnings.push(flat_theta_warning(name, params.theta[i]));
         }
         Some((frozen, warnings))
     };
@@ -683,6 +645,71 @@ fn freeze_flat_thetas(
             .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
     }
+}
+
+/// The flat-θ candidates of the #826 pre-flight: each free θ whose outer gradient
+/// `grad[i]` is negligible, absolutely and against the largest free θ gradient. `None`
+/// when there is none, or when the whole θ gradient is ~0.
+///
+/// Thetas are the first `n_theta` packed coordinates (see `pack_params`), so `grad[i]` is
+/// d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an *identically* zero
+/// analytic sensitivity, so its gradient is ~0 to machine precision — freeze only that
+/// near-zero case, never a merely weakly-identified param (small-but-nonzero; covariance
+/// flags those as high RSE). Shared by [`freeze_flat_thetas`] and the profiled loop
+/// (`estimation::profile`, #2136), so the two cannot disagree on what is flat.
+pub(crate) fn flat_theta_candidates(
+    grad: &[f64],
+    n_theta: usize,
+    is_free: impl Fn(usize) -> bool,
+) -> Option<Vec<usize>> {
+    const FLAT_ABS: f64 = 1e-8;
+    const FLAT_REL: f64 = 1e-6;
+    let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
+    // Reference scale for "negligible". If the whole theta gradient is ~0 the
+    // objective is globally flat (no data reaches it) — a different pathology, so
+    // bail rather than freeze every parameter.
+    let g_max = (0..n_theta)
+        .filter(|&i| is_free(i))
+        .map(g_at)
+        .fold(0.0_f64, f64::max);
+    if g_max <= FLAT_ABS {
+        return None;
+    }
+    let candidates: Vec<usize> = (0..n_theta)
+        .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
+        .collect();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+/// The value the #826 perturbation probe moves a flat-θ candidate at `ti` to, inside
+/// `(lo, hi)`; `None` when no distinct in-bounds probe exists (then the θ is not frozen).
+pub(crate) fn flat_theta_probe_value(ti: f64, lo: f64, hi: f64) -> Option<f64> {
+    let delta = (ti.abs() * 0.5).max((hi - lo).abs() * 0.1).max(1e-2);
+    let mut probe = ti + delta;
+    if !(probe < hi) {
+        probe = ti - delta;
+    }
+    if !(probe > lo) {
+        probe = 0.5 * (lo + hi);
+    }
+    ((probe - ti).abs() > 1e-12).then_some(probe)
+}
+
+/// Whether the probe moved the reconverged objective from `base` to `probed` — i.e. the
+/// candidate is identifiable, not flat.
+pub(crate) fn flat_theta_probe_moves(base: f64, probed: f64) -> bool {
+    (probed - base).abs() > 1e-6 * (1.0 + base.abs())
+}
+
+/// The warning for a θ the #826 pre-flight froze at `val`.
+pub(crate) fn flat_theta_warning(name: &str, val: f64) -> String {
+    format!(
+        "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
+         initial estimate) — it is likely computed but never used (unmapped, or dropped \
+         from the structural / scaling model). Freezing it at its initial value ({val}) \
+         so the remaining parameters can be estimated; map or remove `{name}` to silence \
+         this."
+    )
 }
 
 /// The slope and curvature `(∂f/∂x_i, ∂²f/∂x_i²)` of the penalized objective the #2159
@@ -4218,7 +4245,11 @@ const POLISH_XTOL_REL: f64 = 1e-7;
 const POLISH_MIN_GAIN: f64 = 1e-3;
 /// Polish legs after the first BOBYQA stop, at most. Each costs at least the
 /// `2n + 1` evaluations BOBYQA spends rebuilding its interpolation model.
-const MAX_POLISH_LEGS: usize = 4;
+///
+/// Also the cap on a profiled gradient fit's verification legs (`optimize_profiled`,
+/// #2285), which run through the same [`drive_polish_legs`]; one there costs about 5–20
+/// evaluations. Changing it changes both.
+pub(crate) const MAX_POLISH_LEGS: usize = 4;
 
 /// Does this NLopt return need the #1782 polish leg before it may be called
 /// converged? Only a BOBYQA *tolerance* stop, which it reports three ways:
@@ -4269,20 +4300,24 @@ fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// How the #1782 polish of a BOBYQA tolerance stop ended — see [`drive_polish_legs`].
+/// How a [`drive_polish_legs`] run ended: the #1782 polish of a BOBYQA tolerance stop,
+/// or the #2285 verification legs of a profiled gradient fit (`optimize_profiled`).
+/// `min_gain` below is `POLISH_MIN_GAIN` for the one and `PROFILED_VERIFY_GAIN` for the
+/// other.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PolishEnd {
-    /// The first stop was not a tolerance stop; nothing ran.
+    /// The first stop needed no leg (`needs_polish` was false); nothing ran.
     NotNeeded,
-    /// The last leg ran and settled: either it stopped on something other than a
-    /// tolerance (its own status decides), or it gained no more than `POLISH_MIN_GAIN`.
+    /// The last leg ran and settled: either it stopped on something that needs no leg
+    /// (its own status decides), or it gained no more than `min_gain`. A budget that
+    /// runs out during a leg ends here too, on that leg's `MaxEvalReached`.
     Settled,
-    /// A tolerance stop wanted a leg but the evaluation budget was spent — reachable,
-    /// since BOBYQA checks `maxeval` *before* an evaluation and can return
+    /// A stop wanted a leg but the evaluation budget was already spent before it —
+    /// reachable, since BOBYQA checks `maxeval` *before* an evaluation and can return
     /// `FtolReached` after the last permitted one.
     BudgetSpent,
-    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than
-    /// `POLISH_MIN_GAIN`: the objective was still falling when polishing stopped.
+    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than `min_gain`:
+    /// the objective was still falling when the legs stopped.
     LegCapReached { last_gain: f64 },
     /// A leg was wanted but could not start (no feasible point to polish from, #1617);
     /// the verdict is left to the paths that handle that run.
@@ -4290,9 +4325,12 @@ pub(crate) enum PolishEnd {
 }
 
 /// The #1782 polish loop, with the NLopt run abstracted out so every exit is
-/// unit-testable without driving BOBYQA. `first` is the first leg's NLopt return;
-/// `min_gain` is the gain above which another leg runs (`POLISH_MIN_GAIN` in
-/// production); `needs_polish` classifies a return ([`bobyqa_stop_needs_polish`]); `budget_left`
+/// unit-testable without driving BOBYQA. Shared by two callers: the BOBYQA polish
+/// (`min_gain = POLISH_MIN_GAIN`, `needs_polish` = [`bobyqa_stop_needs_polish`]) and a
+/// profiled gradient fit's verification legs (`PROFILED_VERIFY_GAIN`,
+/// `profiled_stop_needs_verify`, #2285). `first` is the first leg's NLopt return;
+/// `min_gain` is the gain above which another leg runs; `needs_polish` classifies a
+/// return; `budget_left`
 /// reads what remains of the fit's evaluation budget; `leg` runs one polish leg on
 /// that budget and returns its NLopt return and the objective gain it bought, or
 /// `None` if it could not start. Returns the **last** leg's NLopt return — the one
@@ -6931,8 +6969,9 @@ fn is_structural_decline(
 }
 
 /// The salvage a declined non-IOV subject takes in [`population_gradient_sens_mixed`]:
-/// the reconverged [`subject_reconverged_fd_gradient`] for a structural decline
-/// ([`is_structural_decline`], #1536), otherwise [`held_ebe_salvage`] (#1529).
+/// the reconverged [`subject_reconverged_fd_gradient`] when `reconverge` — a structural
+/// decline ([`is_structural_decline`], #1536), or any decline on a log built
+/// [`OuterFdDeclineLog::reconverging`] (#2136) — otherwise [`held_ebe_salvage`] (#1529).
 ///
 /// A structural decline gets the reconverged gradient whatever
 /// `reconverge_gradient_interval` says — the pre-#1529 behaviour, and the correct one:
@@ -6951,7 +6990,7 @@ fn is_structural_decline(
 /// points subjects get repelled (#1537 review).
 #[allow(clippy::too_many_arguments)]
 fn non_iov_declined_salvage(
-    structural: bool,
+    reconverge: bool,
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -6962,7 +7001,7 @@ fn non_iov_declined_salvage(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    if structural {
+    if reconverge {
         let subject = &population.subjects[subj_idx];
         let params = unpack_params(x, init_params);
         let nll = crate::stats::likelihood::foce_subject_nll_cov(
@@ -7592,6 +7631,17 @@ pub(crate) struct OuterFdDeclineLog {
     /// count, not a per-subject flag: the same subject declining at two blown-up trials is
     /// two skipped salvages.
     skipped_salvages: AtomicUsize,
+    /// Every declined subject takes the reconverged salvage, numerical declines included,
+    /// whatever `reconverge_gradient_interval` says. The profiled outer loop sets it
+    /// ([`Self::reconverging`], #2136): its L-BFGS stops short on a gradient that drops
+    /// `dη̂/dθ`, and a subject that declines at runtime on a model the analytic predicate
+    /// admits is exactly such a gradient. Keyed on the route the subject took, not on the
+    /// model-level predicate.
+    reconverge_declined: bool,
+    /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
+    /// test can reach a *numerical* decline on a fixture the adjoint serves.
+    #[cfg(test)]
+    forced: Vec<std::sync::atomic::AtomicBool>,
 }
 
 impl OuterFdDeclineLog {
@@ -7604,7 +7654,31 @@ impl OuterFdDeclineLog {
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
+            reconverge_declined: false,
+            #[cfg(test)]
+            forced: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
         }
+    }
+
+    /// A log whose declined subjects all take the reconverged salvage (#2136).
+    pub(crate) fn reconverging(n_subjects: usize) -> Self {
+        Self {
+            reconverge_declined: true,
+            ..Self::new(n_subjects)
+        }
+    }
+
+    /// Treat subject `i`'s analytic outer gradient as declined (tests only).
+    #[cfg(test)]
+    pub(crate) fn force_decline(&self, i: usize) {
+        self.forced[i].store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn is_forced(&self, i: usize) -> bool {
+        self.forced[i].load(Ordering::Relaxed)
     }
 
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
@@ -7642,7 +7716,7 @@ impl OuterFdDeclineLog {
         self.skipped_salvages.load(Ordering::Relaxed)
     }
 
-    fn declined_indices(&self) -> Vec<usize> {
+    pub(crate) fn declined_indices(&self) -> Vec<usize> {
         self.declined
             .iter()
             .enumerate()
@@ -7785,14 +7859,17 @@ pub(crate) fn population_gradient_sens_mixed(
         .map(|(i, subject)| {
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
-            match subject_analytic_outer_gradient(
+            let analytic = subject_analytic_outer_gradient(
                 model,
                 subject,
                 init_params,
                 x,
                 ehs[i].as_slice(),
                 options.interaction,
-            ) {
+            );
+            #[cfg(test)]
+            let analytic = analytic.filter(|_| !declines.is_forced(i));
+            match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
                 Some(g) => g,
                 // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
@@ -7814,7 +7891,7 @@ pub(crate) fn population_gradient_sens_mixed(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                structural,
+                                structural || declines.reconverge_declined,
                                 x,
                                 init_params,
                                 model,

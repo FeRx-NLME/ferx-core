@@ -26,7 +26,6 @@ use crate::stats::residual_error::{
     compute_iwres_with_correlations, compute_r_matrix_with_correlations,
     compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
 };
-use crate::stats::stacked_layout::stacked_width;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
@@ -230,8 +229,8 @@ pub fn fit_from_files(
         ignore_subjects: reader_settings.ignore_subjects.clone(),
         ..opts
     };
-    let (data_path, data_path_warning) =
-        resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)
+        .map_err(super::entry_refusals::data_path_missing)?;
     let data_path = data_path.as_str();
     // One read of the dataset (#2140): the population and `data_hash` are the same
     // bytes, so a CSV edited while the fit runs is not recorded as the fitted data.
@@ -717,74 +716,17 @@ fn fit_unstamped(
     crate::api::check_theta_length(model, &init_params.theta)?;
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
-    // objective via the derivative-free (BOBYQA) outer optimizer. Other
-    // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
-    // marginalisation are not yet supported — reject them clearly rather than
-    // silently ignoring the mixture structure.
-    if model.mixture.is_some() {
-        // The objective keys the mixture path off `params.mixture` (carried from
-        // `init_params` through `unpack_params`). If a caller passes custom
-        // `init_params` with `mixture: None` — e.g. params rebuilt from a prior
-        // `FitResult` — the fit would silently run the single-population objective
-        // with `MIXNUM` pinned to the class-1 default. Fail loudly instead: the
-        // per-class Omega/Sigma must be present.
-        if init_params.mixture.is_none() {
-            return Err(EngineError::uncoded(
-                "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
-                 `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
-                 them from the model file) rather than params with `mixture: None`",
-            ));
-        }
-        for m in options.method_chain() {
-            if m == EstimationMethod::FoceI && options.n_agq > 1 {
-                return Err(EngineError::uncoded("mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid."));
-            }
-            if !matches!(
-                m,
-                EstimationMethod::Foce
-                    | EstimationMethod::FoceI
-                    | EstimationMethod::Saem
-                    | EstimationMethod::Bayes
-                    // IMP / IMPMAP run a class-partitioned MCEM (per-class IS
-                    // E-step + responsibility-weighted M-steps) when estimating,
-                    // and form the class-marginal `−2 Σ log Σ_k p_ik L_ik` on the
-                    // objective-evaluation (EONLY) path (#985). IOV, FREM, SDE
-                    // and per-class Ω/Σ overrides are refused inside
-                    // `run_mcem_mixture`.
-                    | EstimationMethod::Imp
-                    | EstimationMethod::Impmap
-            ) {
-                return Err(EngineError::uncoded(format!(
-                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
-                     IMPMAP; the {} method is not yet wired for mixtures (#985)",
-                    m.label()
-                )));
-            }
-        }
-        // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
-        // is a single conjugate draw shared across classes, so `omega(k)`/`sigma(k)`
-        // cannot be honoured. `bayes.rs` re-checks this defensively, but reject it
-        // here — before any stage runs — so `method = [focei, bayes]` does not burn a
-        // full FOCEI fit only to fail at the hand-off.
-        if options.method_chain().contains(&EstimationMethod::Bayes) {
-            if let Some(mp) = init_params.mixture.as_ref() {
-                if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
-                    return Err(EngineError::uncoded(
-                        "Bayesian estimation (method = bayes) does not yet support per-class \
-                         Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
-                         shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
-                         overrides (#985).",
-                    ));
-                }
-            }
-        }
-        // Inter-occasion variability under a mixture (#985): the per-class inner
-        // solve carries per-occasion κ for the shared base `omega_iov` (each class's
-        // `class_params` keeps it), and the packed layout already interleaves the κ
-        // segment ahead of the per-class Ω/Σ override tail. The FOCE marginal uses
-        // `foce_subject_nll_iov` per class and the outer gradient routes to FD, so
-        // IOV + mixture now fits (previously rejected here).
-    }
+    // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture
+    // objective is not wired for, FOCEI quadrature and per-class Ω/Σ under Bayes are
+    // refused rather than silently ignoring the mixture structure; so are `init_params`
+    // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
+    // variability under a mixture fits (#985): the per-class inner solve carries the shared
+    // base `omega_iov`, and the outer gradient routes to FD.
+    first_error(&crate::api::validation::check_mixture_options(
+        model,
+        options,
+        init_params,
+    ))?;
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();
@@ -812,10 +754,9 @@ fn fit_unstamped(
     // gap-time — require time-sorted records and do not support interval-censored /
     // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
     // Reject a hand-built model/dataset up front.
+    // `E_RTTE_RECORDS` (#1788).
     #[cfg(feature = "survival")]
-    if let Some(e) = check_rtte_records(model, population) {
-        return Err(EngineError::uncoded(e));
-    }
+    first_error(&check_rtte_records_diags(model, population))?;
     // A survival hazard that references a time-varying covariate would be silently
     // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
     // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
@@ -833,104 +774,28 @@ fn fit_unstamped(
     // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
     // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
-    // fail-loud rather than silently score a non-binary code.
+    // fail-loud rather than silently score a non-binary code. `E_BINARY_STATE` (#1788).
     #[cfg(feature = "survival")]
-    for cmt in model.binary_cmts() {
-        for subject in &population.subjects {
-            crate::categorical::validate_binary_states(cmt, &subject.obs_records)
-                .map_err(EngineError::uncoded)?;
-        }
-    }
-    // CTMM (#759): reject an observed DV code that is not one of the endpoint's declared
-    // `states` up front (the datareader accepts any non-negative integer on a discrete
-    // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
+    first_error(&crate::api::validation::check_binary_states(
+        model, population,
+    ))?;
+    // CTMM (#759): an observed DV code that is not one of the endpoint's declared `states`,
+    // or out-of-order observation times, either of which would otherwise fold into a
+    // silent sentinel. `E_CTMM_RECORDS` (#1788). A time-inhomogeneous Q(t) on a hand-built
+    // model with no ODE system is refused above, fail-closed, by the #1918 check.
     #[cfg(feature = "markov")]
-    for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Ctmm {
-            state_codes,
-            generator_states,
-            ..
-        } = endpoint
-        {
-            // Time-inhomogeneous (drug/PD-driven Q(t), #817): an intensity references a
-            // model ODE state, scored by the per-gap occupancy integration in
-            // `ctmm_endpoint_nll_inhomogeneous`. That requires an ODE model — guaranteed at
-            // parse (`generator_states` indices point into `ode_spec`), asserted here for a
-            // hand-built `CompiledModel`.
-            if !generator_states.is_empty() && model.ode_spec.is_none() {
-                return Err(EngineError::uncoded(format!(
-                    "[markov_model] cmt = {cmt}: a transition intensity references a model state \
-                     (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
-                )));
-            }
-            for subject in &population.subjects {
-                crate::markov::endpoint::validate_ctmm_states(
-                    *cmt,
-                    state_codes,
-                    &subject.obs_records,
-                )
-                .map_err(EngineError::uncoded)?;
-                // Out-of-order observation times would otherwise silently collapse the
-                // subject to the 1e20 sentinel (datareader sorts doses, not obs).
-                crate::markov::endpoint::validate_ctmm_times(*cmt, &subject.obs_records)
-                    .map_err(EngineError::uncoded)?;
-            }
-        }
-    }
-    // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
-    // enforces these for `.ferx` models, but a Rust caller could otherwise set
-    // `log_transform = true` together with a proportional/combined error or a
-    // per-CMT spec, which would make the likelihood inconsistent (predictions
-    // log-wrapped while variance still expects natural-scale `f`). Fail fast.
-    if model.log_transform {
-        if !matches!(model.error_model, ErrorModel::Additive) {
-            return Err(EngineError::uncoded(
-                "LTBS (`log_transform = true`) requires `error_model = Additive`; \
-                 proportional/combined error on the log scale is not supported",
-            ));
-        }
-        if !matches!(model.error_spec, ErrorSpec::Single(_)) {
-            return Err(EngineError::uncoded(
-                "LTBS (`log_transform = true`) is not supported with per-CMT \
-                 (`ErrorSpec::PerCmt`) error models",
-            ));
-        }
-        if model.diffusion_theta_start.is_some() {
-            return Err(EngineError::uncoded(
-                "LTBS (`log_transform = true`) is not supported with an SDE \
-                 model (`diffusion_theta_start = Some(_)`)",
-            ));
-        }
-    }
-    // IIV on residual error (`iiv_on_ruv`, #409) validation.
-    if let Some(k) = model.residual_error_eta {
-        // The residual-error eta must be a dedicated random effect: the FOCEI
-        // `c̃` column assumes its prediction-Jacobian column is zero (it is not a
-        // structural/individual-parameter eta). Reject a dual-use eta.
-        if let Some(name) = model.eta_names.get(k) {
-            if model.eta_param_info.iter().any(|e| &e.eta_name == name) {
-                return Err(EngineError::uncoded(format!(
-                    "[error_model] iiv_on_ruv = {name}: this eta is also used in \
-                     [individual_parameters]; the residual-error random effect must be a \
-                     dedicated omega not shared with a structural parameter"
-                )));
-            }
-        }
-        // IIV-on-RUV is inherently an interaction model (`Y = IPRED + EPS·EXP(ETA)`
-        // makes the residual variance η-dependent). Non-interaction FOCE/GN cannot
-        // represent it — its marginal integrates the residual eta out through a
-        // sensitivity column that is identically zero. Require FOCEI or a
-        // Monte-Carlo estimator (IMP/IMPMAP/SAEM), at every stage of a chain —
-        // the one predicate `ruvsearch` consults before proposing the feature.
-        if let Some(m) = options.non_interaction_stage() {
-            return Err(EngineError::uncoded(format!(
-                "IIV on residual error (iiv_on_ruv) requires an interaction or \
-                 Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
-                 with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
-                 INTERACTION model."
-            )));
-        }
-    }
+    first_error(&crate::api::validation::check_ctmm_records(
+        model, population,
+    ))?;
+    // LTBS sanity checks for hand-built `CompiledModel`s. The parser already enforces
+    // these for `.ferx` models, but a Rust caller could otherwise set `log_transform =
+    // true` together with a proportional/combined error, a per-CMT spec or an SDE, which
+    // would make the likelihood inconsistent. `E_LTBS_UNSUPPORTED` (#1788).
+    first_error(&crate::api::validation::check_ltbs_model(model))?;
+    // IIV on residual error (`iiv_on_ruv`, #409): a dedicated η, and an interaction or
+    // Monte-Carlo method at every stage. `E_IIV_ON_RUV_SHARED_ETA` /
+    // `E_IIV_ON_RUV_METHOD` (#1788).
+    first_error(&crate::api::validation::check_iiv_on_ruv(model, options))?;
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
     // per-CMT error-model coverage). These can't run in the parser — it doesn't
     // see the data. `ferx check` runs the same `check_model_data` to report
@@ -943,50 +808,13 @@ fn fit_unstamped(
         init_params,
     ))?;
     // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
-    // occasion count) is a property of the *data*, not the model — so this cap cannot be
-    // checked in `check_model_options`, which never sees the population. Check it here, once
-    // the occasions are known, against the worst subject.
-    //
-    // `method = laplace` / `focei` at `n_agq = 1` is a single node regardless of `d`, so it
-    // always passes; only `n_agq > 1` (adaptive quadrature) can trip this. `agq_nodes()`
-    // fires for both quadrature methods, so name whichever the user actually wrote (#251
-    // review #4) rather than hardcoding "laplace".
-    // A later stage can request quadrature while options.method names a different
-    // estimator. Inspect the effective chain, just as check_model_options does.
-    let quadrature_stage = options
-        .method_chain()
-        .into_iter()
-        .find_map(|method| FitOptions::agq_nodes_for(method, options.n_agq).map(|n| (method, n)));
-    if let Some((method, n_nodes)) = quadrature_stage {
-        if model.n_kappa > 0 {
-            let max_occ = population
-                .subjects
-                .iter()
-                .map(|s| crate::stats::stacked_layout::group_count(s))
-                .max()
-                .unwrap_or(0);
-            let d = stacked_width(model.n_eta, model.n_kappa, max_occ);
-            let grid = crate::estimation::agq::grid_size(n_nodes, d);
-            if grid > crate::estimation::agq::MAX_AGQ_GRID {
-                let label = if matches!(method, EstimationMethod::Laplace) {
-                    "laplace"
-                } else {
-                    "focei"
-                };
-                return Err(EngineError::uncoded(format!(
-                    "method = {label} with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
-                     tensor grid per subject per iteration — over the {} limit. Under IOV the \
-                     integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
-                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq \
-                     (n_agq = 1 is the single-node method — always tractable), or use \
-                     saem / imp, whose cost does not grow with the random-effect dimension.",
-                    crate::estimation::agq::MAX_AGQ_GRID,
-                    model.n_eta,
-                    model.n_kappa,
-                )));
-            }
-        }
-    }
+    // occasion count) is a property of the *data*, so `check_model_options` cannot check
+    // this cap. `E_AGQ_GRID_TOO_LARGE`, the code it gives the η-only grid (#1788). The
+    // helper counts `K` after a derived `iov_occasion` rule has labelled the population,
+    // as `fitted_population` below labels it.
+    first_error(&crate::api::validation::check_agq_grid_iov(
+        model, population, options,
+    ))?;
     let mut ltbs_warnings: Vec<String> = Vec::new();
     let derive_occ = crate::api::run::occasions_are_derived(model, options);
     let pop_pruned = fitted_population(
@@ -1009,19 +837,13 @@ fn fit_unstamped(
     //   - if the count explodes (e.g. `iov_occasion = dose` on an ADDL train,
     //     where each expanded dose opens an occasion), the inner per-subject
     //     problem balloons; warn so the multiplication isn't silent.
+    // The single-occasion refusal is `check_model_data_rule_at`'s
+    // (`E_IOV_SINGLE_OCCASION`, #1788), so `ferx check --data` reports it too; only the
+    // warning is here.
     if derive_occ {
         // Distinct occasion labels seen across observations and doses, per subject; the
         // `--simulate` pre-check reads the same count on its template (#2052).
         let max_occ = crate::api::max_obs_dose_occasions(pop_ref);
-        if max_occ <= 1 {
-            return Err(EngineError::uncoded(
-                "The `iov_occasion` rule produced only a single occasion for every subject, \
-                 so the per-occasion kappa (IOV) cannot be separated from between-subject \
-                 variability (it is unidentifiable). Use `iov_occasion = time(...)` with \
-                 breakpoints inside the sampling window, `iov_occasion = dose` on a \
-                 multiple-dose design, or supply an `iov_column`.",
-            ));
-        }
         // Above this many occasions per subject the derivation has almost
         // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
         // runs but the inner kappa dimensionality is n_iov * max_occ per subject.
@@ -2774,10 +2596,12 @@ fn fit_inner(
     // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
     // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
     // interaction in most practice, surface the non-interaction choice so a user does not
-    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599). Gated on
+    // `final_method`, not `options.method` (the chain's last stage): under `[foce, imp]` +
+    // `imp_eval_only` the estimates are FOCE-M3 though the last stage is IMP (#1726).
     if matches!(model.bloq_in_force(), BloqMethod::M3)
         && matches!(
-            options.method,
+            final_method,
             EstimationMethod::Foce | EstimationMethod::FoceGn
         )
         && !options.interaction

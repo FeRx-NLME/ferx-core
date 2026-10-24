@@ -2486,6 +2486,30 @@ fn filter_reads_unreadable_cell_error(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
+/// non-finite cell: the cells the LOCF update reads no value from.
+fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
+    row.get(idx)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Record, for each column of `watch` this record has no value in, the record's
+/// `TIME` as written, unless the column already has an entry: see
+/// [`Subject::filled_cells`] (#2036).
+fn note_filled_cells(
+    filled: &mut Vec<(String, f64)>,
+    watch: &[(&str, usize)],
+    row: &[String],
+    raw_time: f64,
+) {
+    for &(name, idx) in watch {
+        if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
+            filled.push((name.to_string(), raw_time));
+        }
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2577,6 +2601,9 @@ fn parse_subject(
     // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
     // (Track D) endpoints share one stream on the default build.
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
+    // only trace those rows leave of their covariates (#1854; see the field's doc).
+    let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
     // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
     //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
@@ -2617,6 +2644,10 @@ fn parse_subject(
     // models with no TV covariates.
     let mut tv_names: Vec<&str> = Vec::new();
     let mut tv_indices: Vec<usize> = Vec::new();
+    // Columns where a record with no value in the cell reads another record's value
+    // instead (#2036): the column holds a value somewhere in this subject and is not
+    // one of `routing.no_carry_forward`, whose missing cells read `NaN`.
+    let mut filled_watch: Vec<(&str, usize)> = Vec::new();
     for (name, idx) in cov_indices {
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
@@ -2649,7 +2680,14 @@ fn parse_subject(
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
+        if first_val.is_some()
+            && !routing.no_carry_forward.contains(name)
+            && rows.iter().any(|row| finite_cell(row, *idx).is_none())
+        {
+            filled_watch.push((name.as_str(), *idx));
+        }
     }
+    let mut filled_cells: Vec<(String, f64)> = Vec::new();
     let any_tv = !tv_names.is_empty();
 
     // LOCF state for the per-event snapshot path. Initialized from the
@@ -3029,6 +3067,7 @@ fn parse_subject(
         if evid == 3 || evid == 4 {
             reset_times.push(time);
             reset_rec.push(row_seq);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
             // reads (#1969). Doses below do the same.
             if time_offset != 0.0 {
@@ -3113,6 +3152,7 @@ fn parse_subject(
             // The reset half of an `EVID=4` row was pushed to `reset_times` above.
             dose.evid4 = evid == 4;
             doses.push(dose);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }
@@ -3275,6 +3315,9 @@ fn parse_subject(
                         continue;
                     }
                     let entry_time = raw_entry;
+                    if any_tv {
+                        endpoint_covariates.push(locf_state.clone());
+                    }
                     // DV must be an integer code (0/1/2).  Reject fractional values
                     // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
                     // misclassifying a censored observation.
@@ -3364,6 +3407,9 @@ fn parse_subject(
                 if skip_missing_dv {
                     continue;
                 }
+                if any_tv {
+                    endpoint_covariates.push(locf_state.clone());
+                }
                 // Design-point row under `KeepAsDesign`: there is no user DV, so
                 // write the endpoint's registered placeholder code (its first
                 // declared state code; `0` for a count or an unregistered CMT).
@@ -3427,6 +3473,7 @@ fn parse_subject(
                     }
                 };
                 obs_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
@@ -3512,6 +3559,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             pk_only_raw_times.push(raw_time);
             pk_only_rec.push(row_seq);
             if any_tv {
@@ -3823,6 +3871,8 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
+            endpoint_covariates,
+            filled_cells,
         },
         occ_parse_failures,
         missing_dv_rows,

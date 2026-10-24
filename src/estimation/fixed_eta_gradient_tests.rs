@@ -47,6 +47,8 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let population = Population {
@@ -272,6 +274,8 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = vec![5.0f64, 50.0];
@@ -420,6 +424,8 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
@@ -568,6 +574,8 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject.clone()],

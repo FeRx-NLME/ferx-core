@@ -1235,3 +1235,223 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );
 }
+
+/// #1365 review: the closed-form shift of a **plain** mu-reference (`TVV`) must
+/// translate the retained importance draws, not only their moments, because a
+/// #619 group on the **numerical** engine (`CL`'s renal group, made time-varying
+/// here so it needs the observation term) scores those same draws in the same
+/// iteration at a θ that already carries the `TVV` shift. With stale samples
+/// every draw's V is off by `exp(δ)`, and the group step fits TVCL/TH_CRCL to
+/// that wrong V.
+///
+/// `TVV` starts at 15 against ≈ 49 so the first shift is ≈ 1.2 log units. The
+/// fixture was confirmed to reach the data-term branch of the group step on
+/// every iteration of both methods. Measured (macOS arm64, `ci-fast`), 5
+/// iterations, K = 300, seed 619:
+///
+/// | | IMP `ofv` / TH_CRCL | IMPMAP `ofv` / TH_CRCL |
+/// |---|---|---|
+/// | samples translated | −1168.14 / 0.0318 | −1168.13 / 0.0318 |
+/// | moments only (the round-1 fix) | −1140.40 / 0.0116 | −1121.32 / 0.0007 |
+///
+/// The −1160 and 0.02 bounds sit between the two rows with ≥ 8 units and
+/// ≥ 0.008 of headroom either side. 30 iterations from the anchor's own start
+/// (`TVV` 40) give −1170.6 with or without the translation, so the bounds are
+/// not a statement about where the fit converges.
+#[test]
+fn a_plain_mu_ref_shift_translates_the_draws_a_numerical_group_step_scores() {
+    let src = std::fs::read_to_string("nonmem_anchor/covmuref_additive_saem_fit.ferx")
+        .expect("anchor model file")
+        .replace("theta TVV(40.0,", "theta TVV(15.0,");
+    let model = parse_full_model(&src).expect("model parses").model;
+    // Make CRCL drift within each subject (+0.5 per hour) so the group must
+    // keep the observation term in its M-step.
+    let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i > 0 {
+            let mut f: Vec<String> = line.split(',').map(String::from).collect();
+            let t: f64 = f[1].parse().unwrap();
+            let c: f64 = f[6].parse().unwrap();
+            f[6] = format!("{}", c + 0.5 * t);
+            out.push_str(&f.join(","));
+        } else {
+            assert!(line.ends_with(",CRCL"), "CRCL must be column 7: {line}");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("covmuref_additive_tvcrcl.csv");
+    std::fs::write(&path, out).unwrap();
+    let pop = read_nonmem_csv(&path, None, None).expect("time-varying data loads");
+
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let opts = FitOptions {
+            method,
+            imp_iterations: 5,
+            impmap_iterations: 5,
+            imp_samples: 300,
+            impmap_samples: 300,
+            imp_auto: false,
+            impmap_auto: false,
+            imp_averaging: 1,
+            impmap_averaging: 1,
+            imp_seed: Some(619),
+            impmap_seed: Some(619),
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+        // `< -1160` is `false` for NaN.
+        assert!(
+            r.ofv < -1160.0,
+            "{method:?}: OFV {} — the group step scored stale draws (#1365)",
+            r.ofv
+        );
+        let th_crcl = theta(&r, "TH_CRCL");
+        assert!(
+            th_crcl > 0.02,
+            "{method:?}: TH_CRCL {th_crcl} collapsed toward its bound (#1365)"
+        );
+    }
+}
+
+/// Two #619 groups in one model — the renal `CL` group (constant CRCL, exact
+/// engine) and an allometric `V` group — started with `TVCL` far from its
+/// value, so the first group's step moves every subject's CL mu a long way
+/// before the second group runs in the same iteration. One IMP/IMPMAP
+/// iteration, K = 300, seed 619.
+fn fit_two_groups(method: EstimationMethod, block_omega: bool, time_varying_wt: bool) -> FitResult {
+    let omega = if block_omega {
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.06, 0.1]"
+    } else {
+        "  omega ETA_CL ~ 0.1\n  omega ETA_V  ~ 0.1"
+    };
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL(1.5, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TH_WT(0.5, -5.0, 5.0)
+{omega}
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * (WT / 70.0)^TH_WT * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+    );
+    let model = parse_full_model(&src)
+        .expect("two-group model parses")
+        .model;
+    let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
+    let mut out = String::new();
+    for (i, line) in csv.lines().enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            out.push_str(",WT\n");
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let id: f64 = f[0].parse().unwrap();
+        let t: f64 = f[1].parse().unwrap();
+        // WT drifts within each subject only when asked, which is what puts
+        // the V group on the numerical (observation-term) engine.
+        let drift = if time_varying_wt { 0.5 * t } else { 0.0 };
+        let wt = 55.0 + 3.0 * (id % 10.0) + drift;
+        out.push_str(&format!("{line},{wt}\n"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("covmuref_two_groups.csv");
+    std::fs::write(&path, out).unwrap();
+    let pop = read_nonmem_csv(&path, None, None).expect("two-group data loads");
+    let opts = FitOptions {
+        method,
+        imp_iterations: 1,
+        impmap_iterations: 1,
+        imp_samples: 300,
+        impmap_samples: 300,
+        imp_auto: false,
+        impmap_auto: false,
+        imp_averaging: 1,
+        impmap_averaging: 1,
+        imp_seed: Some(619),
+        impmap_seed: Some(619),
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    fit(&model, &pop, &model.default_params, &opts).expect("two-group fit runs")
+}
+
+/// #1365 review: after a #619 group step, the draws a **later** group reads
+/// must already be re-centred — the samples, not only their moments, and under
+/// IMPMAP as well as IMP. Here the second (V) group is on the numerical engine,
+/// so it scores every retained sample at a θ that carries the CL group's move.
+/// Confirmed by instrumenting the loop: group 0 (CL) exact, group 1 (V)
+/// numerical.
+///
+/// Measured (macOS arm64, `ci-fast`), `ofv` / TH_WT after one iteration:
+///
+/// | | IMP | IMPMAP |
+/// |---|---|---|
+/// | samples and moments translated | −953.98 / 0.672 | −953.51 / 0.670 |
+/// | moments only, samples stale | −538.34 / 5.0 | −539.87 / 5.0 |
+/// | translation gated on IMP (the old `SampleMoments` check) | −953.98 / 0.672 | −539.87 / 5.0 |
+///
+/// 5.0 is TH_WT's upper bound. The −900 bound sits ~54 above the fixed value and
+/// ~360 below the stale one.
+#[test]
+fn a_later_numerical_group_scores_draws_recentred_by_an_earlier_group() {
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
+        let r = fit_two_groups(method, false, true);
+        assert!(
+            r.ofv < -900.0,
+            "{method:?}: OFV {} — the V group scored draws the CL group left stale",
+            r.ofv
+        );
+        let th_wt = theta(&r, "TH_WT");
+        assert!(
+            th_wt < 2.0,
+            "{method:?}: TH_WT {th_wt} ran to its bound on stale draws (#1365)"
+        );
+    }
+}
+
+/// #1365 review, exact-engine half: a later **exact** group folds every other
+/// eta's posterior mean into its target through Ω's cross terms, so with a
+/// correlated `block_omega` it must read the CL means *after* the CL group
+/// re-centred them, not a snapshot taken before the group loop. Both groups are
+/// exact here (WT constant within subject).
+///
+/// No external reference exists for one M-step's output, so this pins the
+/// measured value (macOS arm64, `ci-fast`) against the mutation: TVV after one
+/// iteration is 45.334 (IMP) / 45.362 (IMPMAP) with per-group means and 40.797
+/// / 40.810 with the pre-loop snapshot; the objective cannot tell the two apart
+/// (−911.08 vs −913.62). The ±1.5 band is a third of that gap. Five iterations
+/// on: −1167.90 vs −1163.93 (IMP), −1180.29 vs −1177.45 (IMPMAP). Gating the
+/// re-centring on IMP, as it was before, fails the IMPMAP arm here too (40.810).
+#[test]
+fn a_later_exact_group_reads_means_recentred_by_an_earlier_group() {
+    for (method, want) in [
+        (EstimationMethod::Imp, 45.334),
+        (EstimationMethod::Impmap, 45.362),
+    ] {
+        let r = fit_two_groups(method, true, false);
+        let tvv = theta(&r, "TVV");
+        assert!(
+            (tvv - want).abs() < 1.5,
+            "{method:?}: TVV {tvv} vs {want} — the V group read CL means from \
+             before the CL group's step (#1365)"
+        );
+    }
+}

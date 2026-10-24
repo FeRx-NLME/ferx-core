@@ -15,7 +15,7 @@ ferx-core separates two orthogonal choices: the **statistical method** (how rand
 
 - **[SAEM](saem.qmd)** — Stochastic Approximation Expectation-Maximization. Uses MCMC sampling for random effects, providing more robust convergence on complex models with many random effects.
 
-- **[Importance Sampling (IMP)](importance-sampling.qmd)** — Monte-Carlo EM estimator (NONMEM `METHOD=IMP`) that maximises the importance-sampled marginal likelihood. Re-centers the proposal from the previous iteration's sample moments (cheaper than IMPMAP, but fragile on rich data — warm-start with `[focei, imp]` or use IMPMAP there). Set `imp_eval_only = true` (NONMEM `EONLY=1`) to evaluate `−2 log L` at fixed parameters instead of estimating.
+- **[Importance Sampling (IMP)](importance-sampling.qmd)** — Monte-Carlo EM estimator (NONMEM `METHOD=IMP`) that maximises the importance-sampled marginal likelihood. Re-centers the proposal from the previous iteration's sample moments (cheaper than IMPMAP; on a sharp posterior a warm start with `[focei, imp]` or IMPMAP is the more robust choice). Set `imp_eval_only = true` (NONMEM `EONLY=1`) to evaluate `−2 log L` at fixed parameters instead of estimating.
 
 - **[IMPMAP](impmap.qmd)** — Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`). A Monte-Carlo EM estimator that re-centers a per-subject importance-sampling proposal on the conditional mode every iteration. Targets high-dimensional, rich-data models where a non-MAP importance-sampling EM stalls. Runs standalone (`method = impmap`) or chained (`methods = [focei, impmap]`).
 

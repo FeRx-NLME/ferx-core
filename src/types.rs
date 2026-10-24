@@ -1120,6 +1120,29 @@ pub struct Subject {
     /// (Track D) endpoints, so it must be present on the default build. Only the
     /// TTE `Event` variant it can hold stays behind the `survival` feature.
     pub obs_records: Vec<ObsRecord>,
+    /// LOCF covariate snapshot of each data row routed to a non-Gaussian endpoint (the
+    /// rows behind [`Self::obs_records`]), in reading order. Empty when no covariate is
+    /// time-varying, like the other per-event snapshots.
+    ///
+    /// **Not** parallel to `obs_records` — one TTE row can yield two records, or none
+    /// until its interval closes — and no engine evaluates `$PK` from it. It exists so
+    /// [`Self::time_varying_covariate_names`] sees a covariate that changes only on an
+    /// endpoint row (a CTMM state, a TTE event): without it such a change reached no
+    /// snapshot at all, and an endpoint that reads the baseline was not refused (#1854).
+    pub endpoint_covariates: Vec<HashMap<String, f64>>,
+    /// `(column, TIME as written)` of the first dose, observation, pk-only or reset
+    /// record with no numeric value in a covariate column whose value the reader took
+    /// from another record instead, one entry per such column, in reading order
+    /// (#2036). A record with a blank cell reads the value before it (the first value,
+    /// before any), which is NONMEM's carry-forward for a covariate but would put a
+    /// record of a nested-level model in the previous record's group: `fit()` refuses
+    /// a level column listed here (`E_LEVEL_MISSING_LABEL`). Filled by every CSV
+    /// reader, including the model-blind `read_nonmem_csv*`; a column the
+    /// model-aware reader reads without carry-forward (a level column) holds `NaN` in
+    /// that record's snapshot instead and is not listed. Hashed into the population
+    /// fingerprint, since the snapshots of a filled cell and of one holding the carried
+    /// value are identical. Empty for an in-memory subject.
+    pub filled_cells: Vec<(String, f64)>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
@@ -1481,7 +1504,8 @@ impl Subject {
     }
 
     /// Names of covariates whose value **varies within this subject**, i.e. is
-    /// not constant across the per-observation / per-dose / per-EVID2 LOCF
+    /// not constant across the subject-static baseline (`covariates`) and the
+    /// per-observation / per-dose / per-EVID2 / reset / endpoint LOCF
     /// snapshots. Returns an empty vector when the subject has no time-varying
     /// covariates (the common case — snapshots are empty or all equal).
     ///
@@ -1497,15 +1521,23 @@ impl Subject {
         // First value seen per covariate; a later differing value marks it varying.
         let mut first_seen: HashMap<&str, f64> = HashMap::new();
         let mut varying: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let snapshots = self
-            .obs_covariates
-            .iter()
+        // Seeded with the subject-static map (#1854): it is the baseline every
+        // "evaluate `$PK` once at the start" path reads (the inhomogeneous CTMM solve,
+        // the survival hazards), and the reader takes it from the first finite value on
+        // *any* row — including one later dropped by `[data_selection]` or skipped for a
+        // missing DV, which leaves no snapshot behind. A covariate whose every retained
+        // snapshot differs from that baseline is therefore time-varying for those paths.
+        let snapshots = std::iter::once(&self.covariates)
+            .chain(self.obs_covariates.iter())
             .chain(self.dose_covariates.iter())
             .chain(self.pk_only_covariates.iter())
             // EVID=3/4 rows too (#1133): a reset row's `$PK` seeds `[odes] init(...)`, so a
             // covariate that steps only on a reset row is load-bearing and must be reported
             // as varying — the same reason `pk_only_covariates` is chained here.
-            .chain(self.reset_covariates.iter());
+            .chain(self.reset_covariates.iter())
+            // Endpoint rows (CTMM states, TTE events; #1854): the subject's baseline can
+            // come from one, and a change there is a change in the data.
+            .chain(self.endpoint_covariates.iter());
         for snap in snapshots {
             for (name, &val) in snap {
                 match first_seen.get(name.as_str()) {
@@ -8561,6 +8593,11 @@ pub struct FitOptions {
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
+    /// The η–ε interaction flag a stage whose method does not fix it inherits
+    /// (Gauss-Newton, Laplace, …); FOCE and FOCEI override it per stage through
+    /// `interaction_for`, so read it through that rather than directly (#1710).
+    /// `tests/interaction_for_is_the_one_resolver.rs` fails on a new production read
+    /// of the field outside its allow-list (#1727).
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
