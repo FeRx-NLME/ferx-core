@@ -1161,3 +1161,103 @@ fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
         assert_sir_identical(&s, &r, &format!("SAEM run_sir {side} vs in-fit"));
     }
 }
+
+/// `MIX_OVERRIDE` with a combined error model and two per-class Σ overrides: a free one
+/// on the proportional term and a fixed **zero** one on the additive term (legal: the
+/// parser accepts any non-negative override). SAEM holds both at their inits.
+const MIX_SIGMA_OVERRIDE: &str = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+  sigma ADD ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.30
+  sigma(2) PROP ~ 0.0625
+  sigma(2) ADD ~ 0 FIX
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP, ADD)
+";
+
+/// T3 (#1765 review). An SAEM fit of a model with per-class **Σ** overrides — one free, one
+/// fixed at zero. SAEM holds both at their inits and marks them `FIX` for its in-fit
+/// covariance and SIR; the rebuilt parameters must do the same, and the zero must
+/// survive the recorded values and a `.fitrx` round trip. `run_covariance` and `run_sir`,
+/// in memory and reloaded, then reproduce the in-fit steps bit for bit.
+///
+/// Mutations — the SAEM gate on `sigma_override_fixed` removed: the free Σ override becomes
+/// a covariance coordinate standalone, and the matrices differ; zero refused by the
+/// recorded-values check: every call errors.
+#[test]
+fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let model =
+        ferx_core::parse_model_string(MIX_SIGMA_OVERRIDE).expect("mixture model must parse");
+    let pop = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("mixture data must load");
+    let opts = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_n_exploration: 60,
+        saem_n_convergence: 60,
+        saem_seed: Some(1765),
+        run_covariance_step: true,
+        sir: true,
+        ..sir_defaults()
+    };
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("SAEM mixture fit must run");
+    let recorded = r
+        .mixture_overrides
+        .clone()
+        .expect("an SAEM override fit records its override values");
+    eprintln!(
+        "MEASURE #1765 T3 SAEM ofv={:?} overrides={:?} ess={:?}",
+        r.ofv, recorded, r.sir_ess
+    );
+    assert_eq!(
+        recorded.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        [recorded[0], 0.25, 0.0]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>(),
+        "Σ overrides held at their inits (sd 0.25 and 0)"
+    );
+    assert!(r.covariance_matrix.is_some(), "in-fit covariance must run");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saem_sigma_mixture.fitrx");
+    save_fit(
+        &r,
+        &pop,
+        MIX_SIGMA_OVERRIDE,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .expect("save_fit");
+    let loaded = load_fit(&path).expect("load_fit").fit;
+    for (side, f) in [("in memory", &r), ("reloaded", &loaded)] {
+        let c = run_covariance(f, Some(&model), Some(&pop), &sir_defaults())
+            .unwrap_or_else(|e| panic!("{side}: run_covariance on an SAEM Σ-override fit: {e}"));
+        assert_cov_identical(&c, &r, &format!("SAEM Σ run_covariance {side} vs in-fit"));
+        let s = run_sir(&cleared(f), Some(&model), Some(&pop), &sir_defaults())
+            .unwrap_or_else(|e| panic!("{side}: run_sir on an SAEM Σ-override fit: {e}"));
+        assert_sir_identical(&s, &r, &format!("SAEM Σ run_sir {side} vs in-fit"));
+    }
+}

@@ -450,14 +450,15 @@ fn same_point_sees_every_scored_value() {
 
 /// #1765: a fit's recorded `mixture_overrides` is read ahead of `packed_estimate`, and
 /// refused — with `E_FIT_INPUT_MODEL`, whole text pinned — when it does not hold one
-/// positive finite value per declared override. Rows:
+/// non-negative finite value per declared override. Rows:
 ///
 /// | `mixture_overrides`          | `packed_estimate` | outcome                         |
 /// |------------------------------|-------------------|---------------------------------|
 /// | the fit's own                | `None`            | `Ok`, class-2 Ω = the recorded value |
 /// | the fit's own, θ edited      | the fit's (stale) | `Ok`: the values do not depend on θ |
+/// | `[0.0]`                      | the fit's         | `Ok`: zero is a legal override (`~ 0 FIX`) |
 /// | one value too many           | the fit's         | `Err`: count                    |
-/// | `[0.0]` / `[NaN]` / `[-1.0]` | the fit's         | `Err`: not a positive finite value |
+/// | `[NaN]` / `[inf]` / `[-1.0]` | the fit's         | `Err`: not a non-negative finite value |
 ///
 /// Mutations — the field's read removed: rows 1–2 refused (no packed vector / stale);
 /// either check removed: its rows `Ok` (or a panic in the Cholesky); a sentence deleted:
@@ -507,13 +508,28 @@ fn mixture_override_values_refusals_carry_their_codes() {
         );
     }
 
+    let mut zero = fit.clone();
+    zero.mixture_overrides = Some(vec![0.0]);
+    let p = fitted_params_from_result(&zero, &model).expect("a zero override is legal");
+    // `OmegaMatrix` construction floors a zero variance; the rebuild lands where the
+    // parser puts a `~ 0 FIX` declaration.
+    let declared = crate::parse_model_string(
+        &MIX_OVERRIDE.replace("omega(2) ETA_CL ~ 0.30", "omega(2) ETA_CL ~ 0 FIX"),
+    )
+    .expect("zero override must parse");
+    assert_eq!(
+        p.mixture.expect("mixture params").omega[1].matrix[(0, 0)].to_bits(),
+        declared.default_params.mixture.expect("mixture").omega[1].matrix[(0, 0)].to_bits(),
+        "a zero override rebuilds the class variance a zero declaration has"
+    );
+
     let count = "the fit records 2 [mixture] override value(s) but this model declares 1 \
                  per-class override(s). Supply the model the fit was estimated with.";
     let bad_value = |v: &str| {
         format!(
             "the fit's recorded [mixture] override values include {v}, which is not a \
-             positive finite variance or sigma, so the per-class Omega/Sigma cannot be \
-             rebuilt from them."
+             non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
+             be rebuilt from them."
         )
     };
     let mut bad = Vec::new();
@@ -523,8 +539,8 @@ fn mixture_override_values_refusals_carry_their_codes() {
             vec![recorded[0], recorded[0]],
             count.to_string(),
         ),
-        ("zero", vec![0.0], bad_value("0")),
         ("NaN", vec![f64::NAN], bad_value("NaN")),
+        ("infinite", vec![f64::INFINITY], bad_value("inf")),
         ("negative", vec![-1.0], bad_value("-1")),
     ] {
         let mut f = fit.clone();
@@ -536,4 +552,62 @@ fn mixture_override_values_refusals_carry_their_codes() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// #1765 review: SAEM holds every per-class Σ override at its initial value and marks it
+/// `FIX` (later stages of the chain inherit the flag), so the parameters rebuilt from a fit
+/// whose chain ran SAEM carry the overrides `FIX`, and the standalone covariance / SIR steps
+/// treat as fixed the coordinates the in-fit ones did. Both sides of the gate on one fit:
+/// with no SAEM in the chain the template's flags (free) stand; with SAEM last, or SAEM
+/// earlier in the chain, every Σ override is `FIX`. The Ω override's flag never moves.
+///
+/// Mutations — the gate removed: the SAEM rows keep `false`; the gate always on: the
+/// FOCEI row turns `true`; the gate reading only `method`: the `[saem, focei]` row.
+#[test]
+fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
+    let src = MIX_OVERRIDE.replace(
+        "  omega(2) ETA_CL ~ 0.30\n",
+        "  omega(2) ETA_CL ~ 0.30\n  sigma(2) EPS ~ 0.09\n",
+    );
+    let model = crate::parse_model_string(&src).expect("sigma-override model must parse");
+    let tmpl = model.default_params.mixture.as_ref().expect("mixture");
+    assert_eq!(
+        (
+            tmpl.omega_override_fixed.clone(),
+            tmpl.sigma_override_fixed.clone()
+        ),
+        (vec![false], vec![false]),
+        "fixture premise: both overrides are declared free"
+    );
+    let (_, pop) = mixture_inputs();
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    assert_eq!(fit.mixture_overrides.as_ref().map(Vec::len), Some(2));
+    let flags = |method: EstimationMethod, chain: Vec<EstimationMethod>| {
+        let mut f = fit.clone();
+        f.method = method;
+        f.method_chain = chain;
+        let mix = fitted_params_from_result(&f, &model)
+            .expect("rebuild")
+            .mixture
+            .expect("mixture");
+        (mix.omega_override_fixed, mix.sigma_override_fixed)
+    };
+    use EstimationMethod::{FoceI, Saem};
+    for (what, method, chain, want) in [
+        ("focei", FoceI, vec![FoceI], false),
+        ("saem", Saem, vec![Saem], true),
+        ("saem then focei", FoceI, vec![Saem, FoceI], true),
+    ] {
+        assert_eq!(
+            flags(method, chain),
+            (vec![false], vec![want]),
+            "{what}: override FIX flags"
+        );
+    }
 }

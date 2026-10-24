@@ -78,7 +78,7 @@ pub enum UncertaintyMethod {
 /// on one without. The model's initial Ω_IOV is never substituted for a missing one.
 ///
 /// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
-/// `mixture_overrides` does not hold one positive finite value per declared override.
+/// `mixture_overrides` does not hold one non-negative finite value per declared override.
 /// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a fit
 /// built in R, a `.fitrx` bundle written by ferx-r or saved before #1765 / #1815), and
 /// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
@@ -244,7 +244,31 @@ pub(crate) fn fit_packed_estimate<'a>(
 /// [`FitResult::mixture_overrides`] when the fit records them, else from the override
 /// segment of a usable `packed_estimate`. See [`fitted_params_from_result`] for when
 /// neither is available.
+///
+/// A fit whose method chain ran SAEM held every Σ override at its initial value (SAEM
+/// does not estimate them, `run_saem` marks them `FIX`, and later stages inherit the
+/// flags), so they come back `FIX` here too: the standalone covariance and SIR steps then
+/// treat as fixed exactly the coordinates the in-fit ones did.
 fn fitted_mixture(
+    fit_result: &FitResult,
+    template: &ModelParameters,
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+) -> Result<crate::types::MixtureParams, EngineError> {
+    let mut mix = fitted_mixture_values(fit_result, template, tmpl, omega, sigma)?;
+    let ran_saem = fit_result.method == crate::types::EstimationMethod::Saem
+        || fit_result
+            .method_chain
+            .contains(&crate::types::EstimationMethod::Saem);
+    if ran_saem {
+        mix.sigma_override_fixed.fill(true);
+    }
+    Ok(mix)
+}
+
+/// [`fitted_mixture`]'s class matrices, with the template's FIX flags.
+fn fitted_mixture_values(
     fit_result: &FitResult,
     template: &ModelParameters,
     tmpl: &crate::types::MixtureParams,
@@ -265,11 +289,13 @@ fn fitted_mixture(
                 n_overrides
             )));
         }
-        if let Some(bad) = values.iter().find(|v| !(v.is_finite() && **v > 0.0)) {
+        // Zero is a legal override (`sigma(2) EPS ~ 0 FIX`, which SAEM holds as is), as
+        // the parser accepts any non-negative declaration.
+        if let Some(bad) = values.iter().find(|v| !(v.is_finite() && **v >= 0.0)) {
             return Err(crate::api::fit_input_model(format!(
                 "the fit's recorded [mixture] override values include {bad}, which is not a \
-                 positive finite variance or sigma, so the per-class Omega/Sigma cannot be \
-                 rebuilt from them."
+                 non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
+                 be rebuilt from them."
             )));
         }
         return Ok(mixture_from_overrides(tmpl, omega, sigma, values));

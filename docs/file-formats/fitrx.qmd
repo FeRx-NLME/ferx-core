@@ -422,7 +422,12 @@ it, `run_sir`, `run_covariance` and `simulate_with_uncertainty` on a reloaded
 fit rebuild the class matrices the fit had, without `packed_estimate` — which
 is how an SAEM mixture fit (no packed vector) reloads and repeats its in-fit SIR
 and covariance step bit for bit. It is read ahead of `packed_estimate`, and
-refused when it does not hold one positive finite value per declared override.
+refused when it does not hold one non-negative finite value per declared override
+(zero is legal: `sigma(2) EPS ~ 0 FIX`). SAEM does not estimate Σ overrides —
+it holds them at their initial values and treats them as fixed — so on a fit
+whose method chain ran SAEM the rebuilt Σ overrides are fixed too, and the
+standalone steps leave them out of the covariance and SIR exactly as the in-fit
+ones did.
 
 It is written by every estimator that fits a `[mixture]` model with at least one
 override, and absent for a model without overrides, on a bundle saved before
