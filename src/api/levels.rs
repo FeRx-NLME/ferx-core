@@ -2144,15 +2144,34 @@ fn spanned(
                 if !holds[s] {
                     continue;
                 }
-                // The units of this subject, in record order.
+                // The units of this subject: those its records lie in, in record
+                // order, then every other κ group of its layout — a dose-only or
+                // pk-only occasion, or a cell with no observation, whose kappa
+                // reaches later records through the state it carries over (#1877).
+                // One that reaches none has a zero column and measures nothing.
                 let mut units: Vec<Vec<u64>> = Vec::new();
-                for j in 0..n_obs {
-                    let Some(u) = unit_of(subject, unit, j, tree) else {
-                        continue;
-                    };
+                let mut add = |u: Vec<u64>| {
                     if !units.contains(&u) {
                         units.push(u);
                     }
+                };
+                for j in 0..n_obs {
+                    if let Some(u) = unit_of(subject, unit, j, tree) {
+                        add(u);
+                    }
+                }
+                match (unit, cells.as_ref()) {
+                    (Unit::Occasion, _) => {
+                        for (o, _) in layout.groups() {
+                            add(vec![u64::from(*o)]);
+                        }
+                    }
+                    (Unit::Level(l), Some(cells)) => {
+                        for g in 0..cells.n_cells() {
+                            add(cells.labels(g, l).iter().map(|v| v.to_bits()).collect());
+                        }
+                    }
+                    _ => {}
                 }
                 for u in units {
                     let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
@@ -2161,8 +2180,8 @@ fn spanned(
                         eta_up[k] += SPAN_STEP;
                         eta_down[k] -= SPAN_STEP;
                     } else {
-                        // A kappa moves its own occasion only; under nested levels,
-                        // every cell of its group (#1082).
+                        // A kappa is bumped on its own occasion's group only; under
+                        // nested levels, on every cell of its group (#1082).
                         let groups = unit_groups(&layout, cells.as_ref(), unit, &u);
                         if groups.is_empty() {
                             holds[s] = false;
