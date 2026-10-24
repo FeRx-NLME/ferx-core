@@ -1865,12 +1865,24 @@ fn free_level_thetas(
     levels: &[Level],
 ) -> Vec<Option<usize>> {
     let p = &model.default_params;
+    level_theta_indices(model, decl, levels)
+        .into_iter()
+        .map(|k| k.filter(|&k| !p.theta_fixed.get(k).copied().unwrap_or(false)))
+        .collect()
+}
+
+/// [`free_level_thetas`] with the `FIX` levels kept: `None` only for a level
+/// with no θ in `model`.
+fn level_theta_indices(
+    model: &CompiledModel,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+) -> Vec<Option<usize>> {
     levels
         .iter()
         .map(|level| {
             let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
-            let k = model.theta_names.iter().position(|n| *n == name)?;
-            (!p.theta_fixed.get(k).copied().unwrap_or(false)).then_some(k)
+            model.theta_names.iter().position(|n| *n == name)
         })
         .collect()
 }
@@ -2038,7 +2050,7 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// The span certificate (#1834): for each random effect in `silent` (an index
 /// into `eta_couplings` and the unit its levels nest in) — one the walk names
 /// no site for — whether, in every unit, its effect on `y` lies in the span of
-/// the block's effect on that unit's records, measured on `model` (every block
+/// the block's effect on that unit's subject, measured on `model` (every block
 /// under `contrast = none`). Parallel to `eta_couplings`.
 ///
 /// Proportionality is a property of the functions, not of how they are
@@ -2046,8 +2058,9 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// distributed over a sum all absorb the random effect with no expression
 /// that reads both, and no syntactic rule is complete for that. So the binder
 /// measures it, on the data, as it measures dead levels: per unit, the relative
-/// residual of the random effect's column against the columns of the levels on
-/// the unit's records, by central differences of the predictions
+/// residual of the random effect's column against the columns of the levels the
+/// subject's records read, both over every record of the subject, by central
+/// differences of the predictions
 /// (`record_diffs` says why not the residual multipliers), at both
 /// [`probe_points`], with the random effects spread by [`probe_res`]. One
 /// point is not enough: at η = 0 an `ETA * ETA * OCC` term has derivative 0
@@ -2056,8 +2069,20 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// point and every unit's residual is under [`SPAN_TOL`]. Anything non-finite
 /// fails the tolerance, so an inconclusive point binds, never refuses.
 ///
+/// Over the whole subject, not the unit's own records, and against every level
+/// of the subject, not the unit's own (#1877): on an ODE model a kappa on one
+/// occasion moves the next occasion's records through the state it carries
+/// over, and so does a level of that occasion. Restricted to its own records, an
+/// occasion sampled once makes the kappa proportional to its level by default,
+/// and the carry-over that identifies it is discarded — a false refusal. Against its
+/// own levels only, a carry-over that the next occasion's level reproduces is
+/// missed — a false bind. Since the block's levels nest in the units, each
+/// level moves one subject's records only, so this is the joint oracle's test
+/// on the one column. On a closed form a kappa and a level move only their own
+/// occasion's records, and the two readings agree.
+///
 /// On a nested block a second residual decides whether `sum_to_zero_within`
-/// rescues it (#1874 review, F1): against the differences of the unit's level
+/// rescues it (#1874 review, F1): against the differences of the subject's level
 /// columns inside each within-group, the directions that contrast leaves free.
 /// A random effect inside those is [`Span::Within`], absorbed under every
 /// contrast; one only inside the full span is [`Span::Levels`].
@@ -2112,12 +2137,14 @@ fn spanned(
             };
             // The level columns this subject's records read, each over every record.
             let mut level_cols: HashMap<u64, Option<Vec<f64>>> = HashMap::new();
+            let mut read: Vec<u64> = Vec::new();
             for j in 0..n_obs {
                 let Some(index) = level_of(j) else { continue };
                 let Some(&(k, _)) = level_theta.get(&index) else {
                     continue;
                 };
                 level_cols.entry(index).or_insert_with(|| {
+                    read.push(index);
                     let h = SPAN_STEP * theta[k].abs().max(1.0);
                     let (mut up, mut down) = (theta.clone(), theta.clone());
                     up[k] += h;
@@ -2129,26 +2156,44 @@ fn spanned(
                 if !holds[s] {
                     continue;
                 }
-                // The records of each unit of this subject.
-                let mut units: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
+                // The units of this subject: those its records lie in, in record
+                // order, then every other κ group of its layout — a dose-only or
+                // pk-only occasion, or a cell with no observation, whose kappa
+                // reaches later records through the state it carries over (#1877).
+                // One that reaches none has a zero column and measures nothing.
+                let mut units: Vec<Vec<u64>> = Vec::new();
+                let mut add = |u: Vec<u64>| {
+                    if !units.contains(&u) {
+                        units.push(u);
+                    }
+                };
                 for j in 0..n_obs {
-                    let Some(u) = unit_of(subject, unit, j, tree) else {
-                        continue;
-                    };
-                    match units.iter_mut().find(|(u0, _)| *u0 == u) {
-                        Some((_, rows)) => rows.push(j),
-                        None => units.push((u, vec![j])),
+                    if let Some(u) = unit_of(subject, unit, j, tree) {
+                        add(u);
                     }
                 }
-                for (u, rows) in units {
+                match (unit, cells.as_ref()) {
+                    (Unit::Occasion, _) => {
+                        for (o, _) in layout.groups() {
+                            add(vec![u64::from(*o)]);
+                        }
+                    }
+                    (Unit::Level(l), Some(cells)) => {
+                        for g in 0..cells.n_cells() {
+                            add(cells.labels(g, l).iter().map(|v| v.to_bits()).collect());
+                        }
+                    }
+                    _ => {}
+                }
+                for u in units {
                     let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
                     let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
                     if k < model.n_eta {
                         eta_up[k] += SPAN_STEP;
                         eta_down[k] -= SPAN_STEP;
                     } else {
-                        // A kappa moves its own occasion only; under nested levels,
-                        // every cell of its group (#1082).
+                        // A kappa is bumped on its own occasion's group only; under
+                        // nested levels, on every cell of its group (#1082).
                         let groups = unit_groups(&layout, cells.as_ref(), unit, &u);
                         if groups.is_empty() {
                             holds[s] = false;
@@ -2167,18 +2212,12 @@ fn spanned(
                         holds[s] = false;
                         break;
                     };
-                    let restrict = |col: &[f64]| -> Vec<f64> {
-                        rows.iter().filter_map(|&j| col.get(j).copied()).collect()
-                    };
-                    let mut read: Vec<u64> = rows.iter().filter_map(|&j| level_of(j)).collect();
-                    read.sort_unstable();
-                    read.dedup();
-                    // The unit's level columns, and per within-group the
-                    // differences from its first level there.
+                    // Every level column of the subject, and per within-group
+                    // the differences from its first level there.
                     let mut cols: Vec<Vec<f64>> = Vec::new();
                     let mut firsts: Vec<(usize, Vec<f64>)> = Vec::new();
                     let mut diffs: Vec<Vec<f64>> = Vec::new();
-                    for index in read {
+                    for &index in &read {
                         let (Some(&(_, group)), Some(col)) =
                             (level_theta.get(&index), level_cols.get(&index))
                         else {
@@ -2188,16 +2227,15 @@ fn spanned(
                             holds[s] = false;
                             continue;
                         };
-                        let col = restrict(col);
                         match firsts.iter().find(|(g, _)| *g == group) {
                             Some((_, first)) => {
                                 diffs.push(col.iter().zip(first).map(|(a, b)| a - b).collect())
                             }
                             None => firsts.push((group, col.clone())),
                         }
-                        cols.push(col);
+                        cols.push(col.clone());
                     }
-                    let g = restrict(&re_col);
+                    let g = re_col;
                     match span_residual(&g, &cols) {
                         None => {}
                         Some(r) if r < SPAN_TOL => {
@@ -3005,10 +3043,15 @@ fn carried(
         return Carried::Held;
     }
     let level_thetas = free_level_thetas(model, decl, levels);
+    let all_level_thetas = level_theta_indices(model, decl, levels);
     // The θ that enter coded: this block's, and every block's in `others`.
     let other_levels: Vec<Vec<Option<usize>>> = others
         .iter()
         .map(|o| free_level_thetas(model, o.decl, o.levels))
+        .collect();
+    let other_all_levels: Vec<Vec<Option<usize>>> = others
+        .iter()
+        .map(|o| level_theta_indices(model, o.decl, o.levels))
         .collect();
     let coded: Vec<usize> = level_thetas
         .iter()
@@ -3084,14 +3127,22 @@ fn carried(
             diff_col(&all, h, &|d, th, _, _| th[k] += d)
         };
 
-        // A block's level columns (a `FIX` level moves nothing), coded by its
-        // contrast over its groups: under `none` every level, under `ref` the
-        // first level of each group dropped. Under sum-to-zero every level,
-        // tagged with its group: the coded span, each level but its group's
-        // last taken against that last one, is what [`BlockBasis::grouped`]
-        // spans on those tags (#1962). `None` when anything is non-finite.
+        // A block's level columns, coded by its contrast over its groups: a
+        // column per free θ of the bound model, so a `FIX` level gives none
+        // (#1992). Under `none` every free level, under `ref` the free levels
+        // but the first of each group. Under sum-to-zero each free level but
+        // its group's last, tagged with its group, followed by that last
+        // level — the dependent one, which has no θ of its own in the bound
+        // model and moves through the free ones, so its column is taken from
+        // `all_thetas` whatever its `FIX` flag in `model` — when the group has
+        // a free level to take against it: the coded span, each free level
+        // minus its group's last, is what [`BlockBasis::grouped`] spans on
+        // those tags (#1962). A fixed level coded as `−last` there would add a
+        // column for a θ that does not exist. `None` when anything is
+        // non-finite.
         let coded_cols = |decl: &LevelBlockDecl,
                           thetas: &[Option<usize>],
+                          all_thetas: &[Option<usize>],
                           groups: &[usize],
                           contrast: LevelContrast|
          -> Option<Vec<(Pieces, Option<usize>)>> {
@@ -3109,25 +3160,38 @@ fn carried(
                     }
                 }
             }
-            let mut level_cols: Vec<Pieces> = Vec::with_capacity(thetas.len());
-            for (i, k) in thetas.iter().enumerate() {
-                let col = match *k {
-                    Some(k) => {
-                        let h = SPAN_STEP * theta[k].abs().max(1.0);
-                        diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)?
-                    }
-                    None => Pieces::new(),
-                };
-                level_cols.push(col);
-            }
+            let level_col = |i: usize, k: usize| {
+                let h = SPAN_STEP * theta[k].abs().max(1.0);
+                diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)
+            };
             let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
+            let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
             let mut out = Vec::new();
-            for (i, col) in level_cols.into_iter().enumerate() {
+            let mut group_free = false;
+            for (i, k) in thetas.iter().enumerate() {
                 match contrast {
-                    LevelContrast::Unconstrained => out.push((col, None)),
-                    LevelContrast::Ref if !first(i) => out.push((col, None)),
-                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
-                        out.push((col, Some(groups[i])))
+                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if last(i) => {
+                        if std::mem::take(&mut group_free) {
+                            let Some(k) = all_thetas[i] else {
+                                return None;
+                            };
+                            out.push((level_col(i, k)?, Some(groups[i])));
+                        }
+                    }
+                    LevelContrast::Ref if first(i) => {}
+                    LevelContrast::Unconstrained
+                    | LevelContrast::Ref
+                    | LevelContrast::SumToZero
+                    | LevelContrast::SumToZeroWithin => {
+                        let Some(k) = *k else { continue };
+                        let tag = match contrast {
+                            LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
+                                group_free = true;
+                                Some(groups[i])
+                            }
+                            _ => None,
+                        };
+                        out.push((level_col(i, k)?, tag));
                     }
                     _ => {}
                 }
@@ -3155,14 +3219,15 @@ fn carried(
             cols.push(c);
             tags.push(None);
         }
-        for (o, thetas) in others.iter().zip(&other_levels) {
-            let Some(c) = coded_cols(o.decl, thetas, &o.groups, o.contrast) else {
+        for ((o, thetas), all_thetas) in others.iter().zip(&other_levels).zip(&other_all_levels) {
+            let Some(c) = coded_cols(o.decl, thetas, all_thetas, &o.groups, o.contrast) else {
                 return Carried::Held;
             };
             push_coded(c, &mut cols, &mut tags);
         }
         let n_other = cols.len();
-        let Some(own_coded) = coded_cols(decl, &level_thetas, &groups, contrast) else {
+        let Some(own_coded) = coded_cols(decl, &level_thetas, &all_level_thetas, &groups, contrast)
+        else {
             return Carried::Held;
         };
         push_coded(own_coded, &mut cols, &mut tags);

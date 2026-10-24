@@ -7310,6 +7310,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
+        // #2341: the outer optimizer's own verdicts that demote `converged` without saying
+        // "did not converge" — the profiled path's "optimizer stopped without converging
+        // (<status>)", and the profiled and BOBYQA verification-leg messages (leg cap, spent
+        // budget), which all say the fit "is not reported as converged". Matched on those
+        // two phrases rather than a bare "without converging", which the SS-equilibration
+        // cycle-cap warning also uses.
+        || lower.contains("optimizer stopped without converging")
+        || lower.contains("not reported as converged")
     {
         (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("covariance step failed")

@@ -1343,11 +1343,23 @@ fn run_sir_in_box(
     // Step 2: Evaluate importance weights in parallel (warm-started inner loop).
     // OFV (prior included) at one admissible packed point. Shared by the draws and the
     // low-ESS floor probe, so the probe's ΔOFV is the very quantity the weights score.
+    // A `[mixture]` draw warm-starts every class from that class's η̂ at the estimate
+    // (#1769), solved here once, cold — so the in-fit SIR and `run_sir` derive the same
+    // starts from the same parameters, and neither needs the fit to carry them.
+    let class_etas = sir_class_etas(model, population, params, options);
     let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
         // The prior half, at this draw. `x_k` is already the packed vector the penalty
         // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
         // bit-identical.
-        sir_draw_ofv(model, population, params_k, params, eta_hats, options) + priors.penalty(x_k)
+        sir_draw_ofv(
+            model,
+            population,
+            params_k,
+            params,
+            eta_hats,
+            class_etas.as_deref(),
+            options,
+        ) + priors.penalty(x_k)
     };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
@@ -1520,11 +1532,13 @@ fn run_sir_in_box(
 /// The **data** objective (−2 log L, no prior) SIR scores one draw with: the objective
 /// the fit minimised, re-evaluated at `params` (#1755).
 ///
-/// * A `[mixture]` model scores the K-class marginal, [`mixture_ofv`], cold
-///   (`warm = None`) — the objective a mixture fit reports, which the one-class
-///   `pop_nll_opts` is not: on `tests/nonmem/mixture_iv.csv` with a class-2 Ω override
-///   that was 937.968 against the fit's 298.328 at the estimates, a gap that moved by
-///   hundreds across draws and left an ESS of 1.09 of 200.
+/// * A `[mixture]` model scores the K-class marginal, [`mixture_ofv`] — the objective a
+///   mixture fit reports, which the one-class `pop_nll_opts` is not: on
+///   `tests/nonmem/mixture_iv.csv` with a class-2 Ω override that was 937.968 against the
+///   fit's 298.328 at the estimates, a gap that moved by hundreds across draws and left an
+///   ESS of 1.09 of 200. A draw away from `eta_params` warm-starts each class from
+///   `class_etas` ([`sir_class_etas`], #1769); at `eta_params` itself it solves cold, the
+///   pass the fit's reported objective comes from.
 /// * Every other model re-solves the EBEs warm from the fit's (`eta_hats`) and takes
 ///   [`pop_nll_opts`] under `options`, whose `method` / `interaction` the callers set to
 ///   the fit's own through `fit_inputs::scoring_options` — so a Laplace fit is scored
@@ -1544,10 +1558,12 @@ pub(crate) fn sir_draw_ofv(
     params: &ModelParameters,
     eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
+    class_etas: Option<&[Vec<DVector<f64>>]>,
     options: &FitOptions,
 ) -> f64 {
     if model.mixture.is_some() {
-        return crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
+        let warm = class_etas.filter(|_| !same_point(params, eta_params));
+        return crate::estimation::mixture::mixture_ofv(model, population, params, options, warm)
             .ofv;
     }
     let (ehs, hms, kappas) =
@@ -1555,6 +1571,29 @@ pub(crate) fn sir_draw_ofv(
     // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
     // marginal it was actually optimised against, not the FOCE one.
     2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+}
+
+/// The per-class η̂ (`[class][subject]`) a `[mixture]` draw is warm-started from: one cold
+/// [`mixture_ofv`] at the estimates `params`. `None` for a non-mixture model.
+///
+/// A cold draw solves K × N inner problems from η = 0; from these starts the same solve
+/// costs about a tenth of that (measured on `tests/nonmem/mixture_iv.csv`, K = 2, N = 30, a
+/// draw 2% off the estimate: 5.3 ms cold, 0.50 ms warm per objective, macOS arm64 release).
+/// The starts are the scorer's own cold pass at the estimate rather than anything the fit
+/// stores, so `run_sir` and the in-fit SIR need no per-class EBEs from the fit (#1769).
+///
+/// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
+pub(crate) fn sir_class_etas(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+) -> Option<Vec<Vec<DVector<f64>>>> {
+    model.mixture.as_ref()?;
+    Some(
+        crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
+            .etas_by_class,
+    )
 }
 
 /// The EBEs [`sir_draw_ofv`] scores a non-mixture draw at: re-solved warm from the fit's
