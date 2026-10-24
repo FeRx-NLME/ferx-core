@@ -247,12 +247,13 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                 for (i, g) in per_subject.clone().into_iter().enumerate() {
                     let g = match g {
                         Some(g) if g.iter().all(|v| v.is_finite()) => g,
+                        // Warm at the subject's joint mode, κ̂ included (#2261).
                         _ if iov => subject_reconverged_fd_gradient_iov(
                             &x,
                             params,
                             &model,
                             &pop.subjects[i],
-                            &etas[i],
+                            &joint_warm_start(&etas[i], &kappas[i]),
                             &bounds,
                             &opts,
                         ),
@@ -806,4 +807,53 @@ fn the_built_in_bfgs_never_cancels_inside_a_pass() {
             );
         }
     }
+}
+
+/// #2261: the per-subject reconverged-FD salvage of an IOV subject the adjoint declines
+/// starts every central-difference probe at that subject's mode, κ̂ included. Subject 0 of
+/// the mixed fixture is the one declined; the others take the analytic gradient and solve
+/// nothing, so every recorded start is a salvage probe.
+#[test]
+fn iov_salvage_probes_start_at_the_subject_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{assert_starts_at_modes, on_one_thread};
+    let (model, pop) = fixture(true, true);
+    let params = &model.default_params;
+    let x = pack_params(params);
+    let bounds = compute_bounds(params);
+    let opts = FitOptions::default();
+    let (etas, _, _, kappas) =
+        run_inner_loop_warm(&model, &pop, params, 200, 1e-8, None, None, 0, 0);
+    let declines = OuterFdDeclineLog::new(pop.subjects.len());
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            population_gradient_sens_iov_mixed(
+                &x,
+                params,
+                &model,
+                &pop,
+                &etas,
+                &kappas,
+                &bounds,
+                &opts,
+                OuterTrial::unknown(),
+                &declines,
+            )
+        })
+        .1
+    });
+    assert_eq!(
+        declines.declined_indices(),
+        vec![0],
+        "fixture: subject 0 is salvaged"
+    );
+    let n = assert_starts_at_modes("IOV salvage", &rec, |_| true, &pop, &etas, &kappas);
+    assert!(
+        rec.starts.iter().all(|s| s.subject == pop.subjects[0].id),
+        "only the declined subject is re-solved"
+    );
+    assert!(
+        n >= 2,
+        "a central difference has two probes per free coordinate, got {n}"
+    );
 }

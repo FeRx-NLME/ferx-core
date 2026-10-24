@@ -1847,6 +1847,10 @@ pub(crate) fn record_inner_solves<R>(f: impl FnOnce() -> R) -> (R, InnerRecordin
 }
 
 #[cfg(test)]
+#[path = "inner_optimizer_test_helpers.rs"]
+pub(crate) mod test_helpers;
+
+#[cfg(test)]
 fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
     INNER_RECORDING.with(|r| {
         if let Some(rec) = r.borrow_mut().as_mut() {
