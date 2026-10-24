@@ -185,7 +185,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820222439373 since #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3856724693695 since #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -226,7 +226,14 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // relative, measured base (fe129ea5) against #2210 (15041af3). The fixed-seed SIR
     // proposal is built from the covariance at that slightly different point. The FOCEI
     // literals above stayed inside `ESS_REL_TOL`.
-    assert_ess(f.sir_ess, 402.381_078_157_567_86, "FOCE packed");
+    // #2280 moved it by +1.1e-5 relative (402.38107815756786 → 402.3856724693695; Linux
+    // aarch64 via `tools/linux-test.sh` and the x86_64 CI slow-tests run 40075963990 agree to
+    // every printed digit; `main` 2b1879b3 still reproduced the old pin): an exact objective's
+    // inner BFGS now updates its metric on a relative curvature gate and takes
+    // gradient-verified sub-resolution steps next to the mode, so the warm-started inner solves
+    // stop at a slightly different point inside `inner_tol` and the fixed-seed SIR proposal is
+    // built from the covariance there. The FOCEI literals above stayed inside `ESS_REL_TOL`.
+    assert_ess(f.sir_ess, 402.385_672_469_369_5, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
