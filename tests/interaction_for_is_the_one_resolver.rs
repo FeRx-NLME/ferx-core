@@ -35,10 +35,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// `(path under src/, read count, why these reads see a resolved flag)`.
+/// `(repo-relative path, read count, why these reads see a resolved flag)`. Written from
+/// the repo root, not `src/`: `slow_test_path_filter.rs` reads every path literal under
+/// `tests/` as a repo-relative input, so an `api/…` entry would name a top-level `api/`.
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
-        "api/fit.rs",
+        "src/api/fit.rs",
         9,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \
          `post_opts` shadow resolves it for the post-fit block, so every later \
@@ -46,81 +48,81 @@ const ALLOWED: &[(&str, usize, &str)] = &[
          through `analytic_outer_gradient_for_interaction` on a stage's options",
     ),
     (
-        "api/postfit.rs",
+        "src/api/postfit.rs",
         3,
         "`ContributionSource::of` takes the post-fit options and compares them to \
          `interaction_for(method, ..)` itself",
     ),
     (
-        "estimation/cov_diagnostics.rs",
+        "src/estimation/cov_diagnostics.rs",
         1,
         "`cov_objective_method` names the covariance step's objective, on the same options \
          as `covariance.rs`",
     ),
     (
-        "estimation/covariance.rs",
+        "src/estimation/covariance.rs",
         2,
         "the covariance step's score and objective, called with `post_opts` from `fit` and \
          with `fitted_marginal_options`'s result from `run_covariance`",
     ),
     (
-        "estimation/fit_inputs.rs",
+        "src/estimation/fit_inputs.rs",
         1,
         "`fitted_marginal_options` reads the stored `fit.interaction` and resolves it \
          against `fit.method` in `scoring_options`",
     ),
     (
-        "estimation/gauss_newton.rs",
+        "src/estimation/gauss_newton.rs",
         11,
         "the GN optimizer and its gradient kernels receive the stage options",
     ),
     (
-        "estimation/impmap.rs",
+        "src/estimation/impmap.rs",
         1,
         "the IMP-MAP inner pass, run on a stage's options",
     ),
     (
-        "estimation/inner_optimizer.rs",
+        "src/estimation/inner_optimizer.rs",
         1,
         "`InnerMode::for_options` is documented as taking a stage's resolved options",
     ),
     (
-        "estimation/mixture.rs",
+        "src/estimation/mixture.rs",
         2,
         "the mixture outer loop, run on a stage's options",
     ),
     (
-        "estimation/outer_optimizer.rs",
+        "src/estimation/outer_optimizer.rs",
         14,
         "the outer optimizer and objective, run on a stage's options",
     ),
     (
-        "estimation/profile.rs",
+        "src/estimation/profile.rs",
         4,
         "the profiled outer loop is a stage of the stage loop, on its stage options",
     ),
     (
-        "estimation/saem.rs",
+        "src/estimation/saem.rs",
         1,
         "the SAEM stage's final objective, on its stage options",
     ),
     (
-        "estimation/vi/run.rs",
+        "src/estimation/vi/run.rs",
         1,
         "the VI stage's objective, on its stage options",
     ),
     (
-        "io/fitrx.rs",
+        "src/io/fitrx.rs",
         2,
         "`FitResult::interaction` round-tripped through the `.fitrx` record, not a `FitOptions`",
     ),
     (
-        "parser/model_parser.rs",
+        "src/parser/model_parser.rs",
         2,
         "both `method =` arms resolve the parsed flag through `interaction_for`",
     ),
     (
-        "types.rs",
+        "src/types.rs",
         1,
         "`FitOptions::non_interaction_stage` applies the same inherit rule to the GN stages \
          of the chain, whose flag `interaction_for` passes through",
@@ -259,7 +261,8 @@ fn the_allow_list_names_each_file_once() {
 
 #[test]
 fn raw_interaction_reads_stay_on_the_allow_list() {
-    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = root.join("src");
     let mut sources = Vec::new();
     rust_sources(&src_dir, &mut sources);
     assert!(
@@ -272,15 +275,15 @@ fn raw_interaction_reads_stay_on_the_allow_list() {
     for path in &sources {
         let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
         let rel = path
-            .strip_prefix(&src_dir)
-            .expect("source under src/")
+            .strip_prefix(&root)
+            .expect("source under the repo root")
             .to_string_lossy()
             .replace('\\', "/");
         for (n, line) in field_reads(&production_part(&src)) {
             found
                 .entry(rel.clone())
                 .or_default()
-                .push(format!("src/{rel}:{n}: {line}"));
+                .push(format!("{rel}:{n}: {line}"));
         }
     }
 
@@ -289,12 +292,12 @@ fn raw_interaction_reads_stay_on_the_allow_list() {
     for (rel, reads) in &found {
         match allowed.get(rel.as_str()) {
             None => problems.push(format!(
-                "src/{rel} is not on the allow-list but reads `.interaction` {} time(s):\n  {}",
+                "{rel} is not on the allow-list but reads `.interaction` {} time(s):\n  {}",
                 reads.len(),
                 reads.join("\n  ")
             )),
             Some(&n) if n != reads.len() => problems.push(format!(
-                "src/{rel} reads `.interaction` {} time(s), the allow-list says {n}:\n  {}",
+                "{rel} reads `.interaction` {} time(s), the allow-list says {n}:\n  {}",
                 reads.len(),
                 reads.join("\n  ")
             )),
@@ -304,7 +307,7 @@ fn raw_interaction_reads_stay_on_the_allow_list() {
     for rel in allowed.keys() {
         if !found.contains_key(*rel) {
             problems.push(format!(
-                "src/{rel} is on the allow-list but no longer reads `.interaction`; delete its entry"
+                "{rel} is on the allow-list but no longer reads `.interaction`; delete its entry"
             ));
         }
     }
