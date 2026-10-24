@@ -1115,7 +1115,9 @@ pub struct Subject {
     /// a level column listed here (`E_LEVEL_MISSING_LABEL`). Filled by every CSV
     /// reader, including the model-blind `read_nonmem_csv*`; a column the
     /// model-aware reader reads without carry-forward (a level column) holds `NaN` in
-    /// that record's snapshot instead and is not listed. Empty for an in-memory subject.
+    /// that record's snapshot instead and is not listed. Hashed into the population
+    /// fingerprint, since the snapshots of a filled cell and of one holding the carried
+    /// value are identical. Empty for an in-memory subject.
     pub filled_cells: Vec<(String, f64)>,
 }
 

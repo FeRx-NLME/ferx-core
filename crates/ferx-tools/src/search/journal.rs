@@ -658,12 +658,7 @@ fn data_fingerprint(data: &Population) -> String {
             fremtype,
             obs_records,
             endpoint_covariates,
-            // Which blank cells the reader filled from another record (#2036): the
-            // filled values are in the snapshots hashed below, and the note only
-            // decides whether `fit()` refuses a level column, which writes no
-            // journal entry. Hashing it would move the digest of every journal
-            // on data with a blank covariate cell.
-            filled_cells: _,
+            filled_cells,
         } = subject;
 
         let _ = writeln!(buf, "id={id}");
@@ -706,6 +701,14 @@ fn data_fingerprint(data: &Population) -> String {
         // Writes nothing when empty (#1854): data with no time-varying covariate on an
         // endpoint row keeps its digest.
         write_covariates(&mut buf, "endpoint_covariates", endpoint_covariates);
+        // Which blank cells the reader filled from another record (#2036). The
+        // snapshots above cannot say — `ARM = 1, 2, 2` and `1, 2, <blank>` carry the
+        // same values — and only the second is refused by `fit()`, so a resume must
+        // not reuse the first's fits for it. Only when present: data with no blank
+        // covariate cell keeps its digest.
+        if !filled_cells.is_empty() {
+            let _ = writeln!(buf, "filled_cells={filled_cells:?}");
+        }
     }
 
     ferx_core::io::hash::sha256_bytes(buf.as_bytes())

@@ -1108,6 +1108,49 @@ fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
     }
 }
 
+/// #2036 review r1: `ARM = 1, 2, 2` and `1, 2, <blank>` read without the model carry
+/// the same values into every snapshot, and only the second is refused. So the
+/// population fingerprint must tell them apart, or a fit of the first would vouch for
+/// the second in `run_covariance` / `run_sir`. The written-out file is the control:
+/// identical snapshots, different fingerprints.
+#[test]
+fn a_filled_level_cell_moves_the_population_fingerprint() {
+    use crate::types::PopulationFingerprint;
+    let read = |tag: &str, csv: &str| {
+        let path =
+            std::env::temp_dir().join(format!("ferx_nested_fp_{}_{tag}.csv", std::process::id()));
+        std::fs::write(&path, csv).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(&path, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        pop
+    };
+    let written = read(
+        "written",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
+    );
+    let blank = read(
+        "blank",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
+    );
+    let (w, b) = (&written.subjects[0], &blank.subjects[0]);
+    assert_eq!(w.covariates, b.covariates);
+    assert_eq!(w.obs_covariates, b.obs_covariates, "the snapshots agree");
+    assert!(w.filled_cells.is_empty());
+    assert_eq!(b.filled_cells, vec![("ARM".to_string(), 3.0)]);
+    let fp = PopulationFingerprint::of(&written);
+    assert_eq!(fp.first_difference(&written), None);
+    assert!(
+        fp.first_difference(&blank).is_some(),
+        "the fit of the written-out file vouches for the blank one"
+    );
+    assert!(code_in(
+        &check_model_data(&model(), &written),
+        "E_LEVEL_MISSING_LABEL"
+    )
+    .is_none());
+    assert!(code_in(&check_model_data(&model(), &blank), "E_LEVEL_MISSING_LABEL").is_some());
+}
+
 /// Review r1 #1: a fit-time occasion rule on a nested model. `[fit_options]` is refused at
 /// parse time, but `FitOptions::iov_occasion` (and R's `settings`) reach `fit()` directly.
 /// Both sides of the gate in one test: `Column` (the default) passes, a derived rule is
