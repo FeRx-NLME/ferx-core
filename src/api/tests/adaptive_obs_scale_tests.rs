@@ -99,6 +99,7 @@ fn population(cmts: [usize; 4], tv_wt: bool) -> Population {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     Population {
         subjects: vec![s],

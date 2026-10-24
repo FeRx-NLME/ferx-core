@@ -64,6 +64,7 @@ fn subject() -> Subject {
             },
         ],
         endpoint_covariates: vec![cov(&[("WT", 76.0)])],
+        filled_cells: vec![("WT".to_string(), 3.0)],
     }
 }
 
@@ -152,6 +153,11 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             |s| {
                 s.endpoint_covariates[0].insert("WT".into(), 77.0);
             },
+            Row::Covariates,
+        ),
+        (
+            "filled_cells",
+            |s| s.filled_cells[0].1 = 4.0,
             Row::Covariates,
         ),
         ("cens", |s| s.cens[1] = -1, Row::Records),
@@ -361,8 +367,8 @@ fn every_field_is_hashed_into_its_own_digest() {
     let fp = PopulationFingerprint::of(&base);
     assert_eq!(fp.first_difference(&base), None, "a population is its own");
     let rows = perturbations();
-    // 22 `Subject` fields + 9 `DoseEvent` + the `ObsRecord` fields (+ `Event`'s).
-    assert_eq!(rows.len(), if cfg!(feature = "survival") { 46 } else { 40 });
+    // 23 `Subject` fields + 9 `DoseEvent` + the `ObsRecord` fields (+ `Event`'s).
+    assert_eq!(rows.len(), if cfg!(feature = "survival") { 47 } else { 41 });
     for (field, perturb, want) in rows {
         let mut s = subject();
         perturb(&mut s);

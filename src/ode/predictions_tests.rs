@@ -61,6 +61,7 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

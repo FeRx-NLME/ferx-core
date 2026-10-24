@@ -123,6 +123,7 @@ fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -581,6 +582,7 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

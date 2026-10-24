@@ -56,6 +56,7 @@ fn population(n: usize) -> Population {
                     fremtype: vec![],
                     obs_records: vec![],
                     endpoint_covariates: Vec::new(),
+                    filled_cells: Vec::new(),
                 }
             })
             .collect(),

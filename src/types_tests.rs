@@ -215,6 +215,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         fremtype: vec![0, 100],
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -272,6 +273,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         fremtype: vec![0],
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -570,9 +572,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         (
-            "Covariance step failed: the Hessian of the profile objective is not positive \
-             definite. SE estimates not available."
-                .into(),
+            crate::estimation::profile::profile_non_pd_msg(&[1.5, -2.0e-3]),
             "not positive definite",
         ),
         (
@@ -2431,6 +2431,7 @@ fn bare_subject(id: &str) -> Subject {
         fremtype: Vec::new(),
         obs_records: Vec::new(),
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

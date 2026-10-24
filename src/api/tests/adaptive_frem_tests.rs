@@ -127,6 +127,7 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
         fremtype: FREMTYPE.to_vec(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
