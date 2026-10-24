@@ -80,6 +80,7 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: covariate_names.iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".into(),

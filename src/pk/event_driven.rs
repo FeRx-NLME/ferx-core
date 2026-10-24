@@ -1473,6 +1473,7 @@ mod tests {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

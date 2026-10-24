@@ -402,6 +402,9 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         fremtype,
         obs_records,
         endpoint_covariates,
+        // Which blank cells the reader filled from another record (#2036): a reading
+        // note `fit()` refuses on, already reflected in the snapshots hashed below.
+        filled_cells: _,
     } = s;
 
     let mut r = Encoder::default();

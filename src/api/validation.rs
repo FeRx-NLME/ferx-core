@@ -2109,6 +2109,29 @@ pub(crate) fn check_level_labels(
             )
             .with_block("parameters")];
         }
+        // A blank cell the reader filled from another record (#2036): the model-blind
+        // `read_nonmem_csv*`, which does not know the level columns, carries it
+        // forward like a covariate's, so the record holds a label — the previous
+        // record's — and only the reader's note says it was never written.
+        for level in &levels.levels {
+            let Some((_, time)) = subj.filled_cells.iter().find(|(c, _)| *c == level.column) else {
+                continue;
+            };
+            return vec![Diagnostic::error(
+                "E_LEVEL_MISSING_LABEL",
+                format!(
+                    "level `{}` reads column `{}`, which has no numeric value on a record of \
+                     subject `{}` at TIME {time}. The dataset was read without the model, \
+                     which fills a blank cell from the record before it (the first value, \
+                     before any), so the record would silently join that record's group. \
+                     Every record needs a label at every level, since its group is identified \
+                     by its labels from the outermost level down, and a label is a numeric \
+                     code: write a text id such as `NCT01` as a number.",
+                    level.name, level.column, subj.id
+                ),
+            )
+            .with_block("parameters")];
+        }
     }
     Vec::new()
 }
@@ -2116,8 +2139,9 @@ pub(crate) fn check_level_labels(
 /// The data checks of a model with nested levels (#1082), in this order:
 ///
 /// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
-///   column. Every record needs its full label path, since its group at each level is
-///   identified by that path.
+///   column, or with a blank level cell the reader filled from another record
+///   (`Subject::filled_cells`, #2036). Every record needs its full label path, since
+///   its group at each level is identified by that path.
 /// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
 ///   its parent, with a κ that has the same readers as a random effect of the parent
 ///   level. That κ is then the parent's random effect by another name, and the two

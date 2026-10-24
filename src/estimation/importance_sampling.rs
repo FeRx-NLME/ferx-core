@@ -2487,6 +2487,7 @@ mod tests {
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ipreds = vec![9.0, 7.0, 99.0];
         let r_diag = vec![4.0, 2.0, 1.0];
@@ -2823,6 +2824,7 @@ mod tests {
             fremtype,
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -3641,6 +3643,7 @@ mod tests {
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

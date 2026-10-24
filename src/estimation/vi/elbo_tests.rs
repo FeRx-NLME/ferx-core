@@ -75,6 +75,7 @@ fn subject(id: &str, scale: f64) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -1465,6 +1466,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let population = Population {
@@ -1928,6 +1930,7 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     };
 

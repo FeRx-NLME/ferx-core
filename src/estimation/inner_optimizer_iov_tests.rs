@@ -92,6 +92,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -226,6 +227,7 @@ fn tvcov_ltbs_reports_analytic_inner() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let subject = tvcov_subj();
     assert!(subject.has_tv_covariates(), "fixture must be TV-cov");
@@ -298,6 +300,7 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![wide_subject("1"), wide_subject("2")],
@@ -375,6 +378,7 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -425,6 +429,7 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -525,6 +530,7 @@ fn transit_twin_ss_forcing_is_analytic_under_iov() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -659,6 +665,7 @@ fn make_iov_subject() -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -740,6 +747,7 @@ fn repro555_subject22() -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -1040,6 +1048,7 @@ fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     // η-only, `[η_CL, η_V]`: the shape the pre-flight hands the first evaluation (it drops
@@ -1137,6 +1146,7 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     // Plain closed-form IOV (no twin): objective is exact → no stall (bit-identical path).
@@ -1240,6 +1250,7 @@ fn inner_optimizer_pin_reaches_same_ebe() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
 
@@ -1319,6 +1330,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     // A genuinely non-zero η, including the residual-error component.
     check_inner_ruv_grad(&model, &subject, &[0.20, -0.15, 0.30, 0.25]);
@@ -1363,6 +1375,7 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.25]);
 }
@@ -1453,6 +1466,7 @@ fn dense_residual_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     // Nonzero residuals: predictions at η=0.1 nudged, scored at a different η.
     let preds = crate::pk::compute_predictions_with_tv(
@@ -1504,6 +1518,7 @@ fn dense_residual_ode_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         analytic_inner_grad_supported(&model, &subject),
@@ -1562,6 +1577,7 @@ fn dense_expression_scale_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -1611,6 +1627,7 @@ fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -1701,6 +1718,7 @@ fn ode_custom_magnitude_takes_analytic_inner_gradient() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     // Control: plain proportional ODE → analytic inner gradient.
@@ -1770,6 +1788,7 @@ fn magnitude_inner_eta_gradient_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let theta = vec![0.22, 11.0, 1.4, 1.6];
     let preds =
@@ -1869,6 +1888,7 @@ fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -1952,6 +1972,7 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -2156,6 +2177,7 @@ fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -2317,6 +2339,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         pk_only_occasions: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
@@ -2626,6 +2649,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let cold_nll = individual_nll_iov(
@@ -3197,6 +3221,7 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let solve = |tol: f64| {
@@ -3849,6 +3874,7 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let params = model.default_params.clone();
         let preds = crate::pk::predict_iov(
@@ -3969,6 +3995,7 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let params = model.default_params.clone();
         // Carry the censoring limit at 0.85·f so z = (f − LIMIT)/√v sits in the
@@ -4076,6 +4103,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4169,6 +4197,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4309,6 +4338,7 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
@@ -4410,6 +4440,7 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4512,6 +4543,7 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     // Shallow censoring (≈ 0.85·f → z ≈ −0.75), the regime where the A&S CDF and the
@@ -4633,6 +4665,7 @@ fn iov_m3_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     // Synthesize observations from the model at a reference (η, κ), scaled to 0.85·f
@@ -4750,6 +4783,7 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let params = model.default_params.clone();
     // Carry ULOQ at 0.85·f for the censored rows, so z = (f − ULOQ)/√v ≈ +0.15·f/√v

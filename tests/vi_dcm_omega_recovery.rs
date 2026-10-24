@@ -319,6 +319,7 @@ fn design(cov: CovariateDesign) -> Population {
                 fremtype: Vec::new(),
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();

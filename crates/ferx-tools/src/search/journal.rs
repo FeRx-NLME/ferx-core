@@ -658,6 +658,12 @@ fn data_fingerprint(data: &Population) -> String {
             fremtype,
             obs_records,
             endpoint_covariates,
+            // Which blank cells the reader filled from another record (#2036): the
+            // filled values are in the snapshots hashed below, and the note only
+            // decides whether `fit()` refuses a level column, which writes no
+            // journal entry. Hashing it would move the digest of every journal
+            // on data with a blank covariate cell.
+            filled_cells: _,
         } = subject;
 
         let _ = writeln!(buf, "id={id}");

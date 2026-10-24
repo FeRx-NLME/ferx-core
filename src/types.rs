@@ -1106,6 +1106,17 @@ pub struct Subject {
     /// endpoint row (a CTMM state, a TTE event): without it such a change reached no
     /// snapshot at all, and an endpoint that reads the baseline was not refused (#1854).
     pub endpoint_covariates: Vec<HashMap<String, f64>>,
+    /// `(column, TIME as written)` of the first dose, observation, pk-only or reset
+    /// record with no numeric value in a covariate column whose value the reader took
+    /// from another record instead, one entry per such column, in reading order
+    /// (#2036). A record with a blank cell reads the value before it (the first value,
+    /// before any), which is NONMEM's carry-forward for a covariate but would put a
+    /// record of a nested-level model in the previous record's group: `fit()` refuses
+    /// a level column listed here (`E_LEVEL_MISSING_LABEL`). Filled by every CSV
+    /// reader, including the model-blind `read_nonmem_csv*`; a column the
+    /// model-aware reader reads without carry-forward (a level column) holds `NaN` in
+    /// that record's snapshot instead and is not listed. Empty for an in-memory subject.
+    pub filled_cells: Vec<(String, f64)>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
