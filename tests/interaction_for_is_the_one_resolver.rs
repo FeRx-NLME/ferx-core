@@ -22,7 +22,8 @@
 //! Scope: production code under `src/` — `*_tests.rs` siblings, `tests/` folders,
 //! `test_helpers` files and the bodies of inline `#[cfg(test)] mod … { }` modules are
 //! skipped (the same scope as `bloq_in_force_is_the_one_reader.rs`). A read is any
-//! `<receiver>.interaction` not followed by an identifier character or an assignment
+//! `<receiver>.interaction` — the receiver may sit on an earlier line, as rustfmt
+//! splits a long chain — not followed by an identifier character or an assignment
 //! `=` (`==` and a match guard's `=>` are reads), whatever the receiver: the field is also on `FitResult`, and those reads count
 //! too, because the scanner cannot tell the two types apart — a per-file reason says
 //! which they are. Remaining gaps: a granularity of one file, so a raw read can trade
@@ -168,27 +169,42 @@ fn production_part(src: &str) -> String {
 }
 
 /// Every `.interaction` read in `src` as `(line number, line)`.
+///
+/// Scans the whole text, not line by line: rustfmt breaks a long chain as
+/// `options\n    .interaction`, where the receiver is on the line above (review r1). So
+/// the receiver is the last non-whitespace character before the `.`, across newlines,
+/// and the assignment test looks past newlines too. Whole-line `//` comments are blanked
+/// first; a trailing comment is still scanned, which can only over-count.
 fn field_reads(src: &str) -> Vec<(usize, String)> {
     const NEEDLE: &str = ".interaction";
-    let mut out = Vec::new();
-    for (i, line) in src.lines().enumerate() {
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-        let mut rest = line;
-        while let Some(at) = rest.find(NEEDLE) {
-            let before = rest[..at].chars().next_back();
-            let after = &rest[at + NEEDLE.len()..];
-            let next = after.chars().next();
-            let has_receiver = before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ')');
-            let is_ident_tail = next.is_some_and(|c| c.is_alphanumeric() || c == '_');
-            let a = after.trim_start();
-            let is_assignment = a.starts_with('=') && !a.starts_with("==") && !a.starts_with("=>");
-            if has_receiver && !is_ident_tail && !is_assignment {
-                out.push((i + 1, line.trim().to_string()));
+    let code: String = src
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                "\n"
+            } else {
+                line
             }
-            rest = after;
+        })
+        .collect();
+    let lines: Vec<&str> = code.lines().collect();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = code[from..].find(NEEDLE) {
+        let at = from + rel;
+        let before = code[..at].trim_end().chars().next_back();
+        let after = &code[at + NEEDLE.len()..];
+        let next = after.chars().next();
+        let has_receiver =
+            before.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '?'));
+        let is_ident_tail = next.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let a = after.trim_start();
+        let is_assignment = a.starts_with('=') && !a.starts_with("==") && !a.starts_with("=>");
+        if has_receiver && !is_ident_tail && !is_assignment {
+            let n = code[..at].matches('\n').count();
+            out.push((n + 1, lines[n].trim().to_string()));
         }
+        from = at + NEEDLE.len();
     }
     out
 }
@@ -207,18 +223,24 @@ fn the_classifier_sees_reads_and_skips_assignments_and_test_modules() {
                #[cfg(test)]\nmod tests {\n  fn g(o: &O) -> bool { o.interaction }\n  \
                mod inner {\n    fn h(o: &O) -> bool { o.interaction }\n  }\n}\n\
                fn k(o: &O) -> bool { !o.interaction }\n\
-               fn l(o: &O) -> u8 { match 0 { _ if o.interaction => 1, _ => 0 } }\n";
+               fn l(o: &O) -> u8 { match 0 { _ if o.interaction => 1, _ => 0 } }\n\
+               fn m(o: &O) -> bool {\n    o\n        // a comment between\n        .interaction\n}\n\
+               fn n(o: &mut O) {\n    o\n        .interaction = true;\n}\n\
+               fn p(o: &[O]) -> bool { o[0].interaction && get()?.interaction }\n";
     let lines: Vec<usize> = field_reads(&production_part(src))
         .into_iter()
         .map(|(n, _)| n)
         .collect();
     // 1; 2 (the right-hand side only, not the assignment); 3; 9 (a call receiver);
     // 17: production code *after* an inline test module (with a nested module inside
-    // it), which must still be scanned; 18: a match guard, whose `=>` is not an `=`.
+    // it), which must still be scanned; 18: a match guard, whose `=>` is not an `=`;
+    // 22: a rustfmt-split chain whose receiver is two lines up, past a comment (review
+    // r1) — while the split *assignment* on line 26 is not a read; 28 twice: an index
+    // and a `?` receiver.
     assert_eq!(
         lines,
-        vec![1, 2, 3, 9, 17, 18],
-        "reads on lines 1, 2, 3, 9, 17 and 18 only"
+        vec![1, 2, 3, 9, 17, 18, 22, 28, 28],
+        "reads on lines 1, 2, 3, 9, 17, 18, 22 and 28 (twice) only"
     );
 }
 
