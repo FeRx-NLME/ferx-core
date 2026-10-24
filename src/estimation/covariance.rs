@@ -869,11 +869,12 @@ fn analytic_cov_declines(
 /// 10 covers both with 2× headroom; it is a cap, paid only by a solve that needs it.
 const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 
-/// The ODE solver override the covariance step's finite-difference matrices run under (#520),
-/// or `None` to run them at the fit's own tolerance: `R`'s objective stencil, and the score
-/// cross-product `S` — whose per-subject θ scores are differenced too, forward or central,
-/// even on the closed-form gradient paths — so `s` and `rsr` are not left at the loose
-/// tolerance an `r` no longer uses (#520 review round 2).
+/// The ODE solver override a covariance step whose matrices are finite-differenced runs under
+/// (#520), or `None` to run every step at the fit's own tolerance. Which steps take it is
+/// [`compute_covariance_for`]'s call: one that differences `R`'s objective, and one that reads
+/// the score cross-product `S` alone — whose per-subject θ scores are differenced too, forward
+/// or central, even on the closed-form gradient paths (#520 review round 2). The whole step,
+/// not those matrices alone, so no estimate mixes tolerances (round 6).
 ///
 /// The stencil divides by `h²`, so it amplifies integration noise the fit's optimizer averages
 /// over: on the 3-cpt IV ODE fixture (180 subjects, `analytic_cov_hessian = false`) the default
@@ -944,25 +945,6 @@ pub(crate) fn stencil_scope_failure_warning(reason: &str) -> String {
          inflated. Set ode_reltol / ode_abstol to at most those values to compute them at the \
          plateau (#520)."
     )
-}
-
-/// Run `f` under the covariance ODE override `tight` ([`cov_ode_override`]), or as it is when
-/// there is none. A scope that cannot be built (a pool that cannot be leased) runs `f` at the
-/// fit's tolerance — never without a covariance step, and never silently: the warning is
-/// recorded in `failure`.
-fn in_cov_ode_scope<R: Send>(
-    options: &FitOptions,
-    tight: Option<crate::ode::solver::OdeSolverOverride>,
-    failure: &std::cell::RefCell<Option<String>>,
-    f: impl Fn() -> R + Sync,
-) -> R {
-    match tight {
-        Some(ov) => crate::api::with_fit_scope_ode(options, ov, &f).unwrap_or_else(|e| {
-            *failure.borrow_mut() = Some(stencil_scope_failure_warning(&e.to_string()));
-            f()
-        }),
-        None => f(),
-    }
 }
 
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
@@ -1904,6 +1886,22 @@ pub(crate) fn compute_covariance(
 /// on the #1781 quadrature route, where a SAEM / IMP / IMPMAP estimate is scored on the
 /// `method = laplace, n_agq = n` marginal; `fit_method` is what decides whether that estimate
 /// minimised the objective ([`r_falls_back_to_s`]).
+///
+/// Every matrix of one step runs at **one** ODE tolerance (#520 review round 6): `S`, each
+/// analytic and each finite-differenced term of `R`, and the modes, `H` and κ̂ they are built
+/// at. Mixing tolerances would combine the derivatives of two different objectives into a
+/// matrix that is the derivative of neither. Which tolerance:
+/// - the fit's own, when [`cov_ode_override`] has nothing to tighten (no integrator, or one
+///   already on the plateau), and when `R` is the exact analytic R-matrix for every subject
+///   and the estimator reads `R` — no finite difference of the objective carries the
+///   curvature, so `rsr`'s `S` stays with the `R` it is paired with;
+/// - otherwise the plateau, for the whole step ([`tightened_covariance_step`]): the FD and
+///   hybrid `R` routes, under `r` and `rsr` alike, and `s`, whose `S` is finite-differenced on
+///   its own.
+///
+/// `R`'s route is known only once the analytic assembly has run, so a step expected to be
+/// fully analytic ([`predicted_r_route`]) runs at the fit's tolerance first and is abandoned
+/// right after the assembly — before `S` or any stencil — if a subject declines at run time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_covariance_for(
     fit_method: crate::types::EstimationMethod,
@@ -1916,14 +1914,138 @@ pub(crate) fn compute_covariance_for(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> CovarianceStepResult {
+    let at_fit_tolerance = |require_analytic_r| {
+        covariance_step(
+            fit_method,
+            x_hat,
+            template,
+            model,
+            population,
+            eta_hats,
+            h_matrices,
+            kappas,
+            options,
+            require_analytic_r,
+        )
+    };
+    let Some(tight) = cov_ode_override(model, options) else {
+        return at_fit_tolerance(false).expect("a step that may take any route always completes");
+    };
+    if needs_r(options.covariance_method)
+        && predicted_r_route(model, population, options, template.mixture.is_some())
+            == PredictedRRoute::Analytic
+    {
+        if let Some(out) = at_fit_tolerance(true) {
+            return out;
+        }
+    }
+    tightened_covariance_step(
+        fit_method, x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
+        tight,
+    )
+}
+
+/// [`compute_covariance_for`]'s step run whole under the covariance ODE override `tight`
+/// (#520): one scope around everything the step solves, so no part of it can run at the fit's
+/// tolerance. Its first solve re-finds the modes, `H` and κ̂ from the fit's modes at the
+/// tighter tolerance, and those replace the fit's everywhere the step reads them — `S` is
+/// built at them, the stencil warm-starts from them — so the step is exactly the one a fit
+/// pinned to the plateau would run from those modes. A mixture's step reads no single-
+/// population mode (`S` and the K-fold objective re-find their own per class), so it keeps
+/// the fit's.
+///
+/// A scope that cannot be built (a pool that cannot be leased) runs the step at the fit's
+/// tolerance with the fit's modes — never without a covariance step, and never silently:
+/// [`stencil_scope_failure_warning`] leads a successful step's warnings.
+#[allow(clippy::too_many_arguments)]
+fn tightened_covariance_step(
+    fit_method: crate::types::EstimationMethod,
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    tight: crate::ode::solver::OdeSolverOverride,
+) -> CovarianceStepResult {
+    let step =
+        |eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>], kappas: &[Vec<DVector<f64>>]| {
+            covariance_step(
+                fit_method, x_hat, template, model, population, eta_hats, h_matrices, kappas,
+                options, false,
+            )
+            .expect("a step that may take any route always completes")
+        };
+    let run = || {
+        // Test-only: the stencil counts its objectives on the thread it runs on, which is a
+        // worker of the scope's pool; hand the count back to the caller's.
+        #[cfg(test)]
+        let evals_before = FD_OBJECTIVE_EVALS.with(|c| c.get());
+        let out = if template.mixture.is_some() {
+            step(eta_hats, h_matrices, kappas)
+        } else {
+            let (_, e, h, k) = reconverge_population(
+                x_hat,
+                model,
+                population,
+                template,
+                eta_hats,
+                options,
+                options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+                true,
+            );
+            step(&e, &h, &k)
+        };
+        #[cfg(test)]
+        let out = (out, FD_OBJECTIVE_EVALS.with(|c| c.get()) - evals_before);
+        out
+    };
+    match crate::api::with_fit_scope_ode(options, tight, run) {
+        #[cfg(test)]
+        Ok((out, evals)) => {
+            FD_OBJECTIVE_EVALS.with(|c| c.set(c.get() + evals));
+            out
+        }
+        #[cfg(not(test))]
+        Ok(out) => out,
+        Err(e) => {
+            let mut out = step(eta_hats, h_matrices, kappas);
+            if let CovarianceStepResult::Success(o) = &mut out {
+                o.warnings
+                    .insert(0, stencil_scope_failure_warning(&e.to_string()));
+            }
+            out
+        }
+    }
+}
+
+/// One covariance step at the ODE tolerance armed on the calling thread — see
+/// [`compute_covariance_for`], which chooses it. `None` only under `require_analytic_r`, when
+/// the analytic assembly did not cover every subject: the step stops right after it, before
+/// `S` or any stencil is built.
+#[allow(clippy::too_many_arguments)]
+fn covariance_step(
+    fit_method: crate::types::EstimationMethod,
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    require_analytic_r: bool,
+) -> Option<CovarianceStepResult> {
     let n = x_hat.len();
     let initial_eps = options.fd_hessian_step;
     if initial_eps <= 0.0 || !initial_eps.is_finite() {
-        return CovarianceStepResult::Unusable(format!(
+        return Some(CovarianceStepResult::Unusable(format!(
             "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
              SE estimates not available.",
             initial_eps
-        ));
+        )));
     }
     // One walk for the box and the FIX mask (#1252) — `compute_bounds` builds
     // the mask internally to pin FIX-ed coordinates, so taking it here costs
@@ -2097,7 +2219,7 @@ pub(crate) fn compute_covariance_for(
         if options.verbose {
             eprintln!("  {}", reason);
         }
-        return CovarianceStepResult::Unusable(reason);
+        return Some(CovarianceStepResult::Unusable(reason));
     }
 
     // FIX parameters contribute no information — skip their FD stencils and,
@@ -2119,27 +2241,22 @@ pub(crate) fn compute_covariance_for(
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
         // has a coordinate to assemble.
-        return CovarianceStepResult::Success(CovarianceOutput {
+        return Some(CovarianceStepResult::Success(CovarianceOutput {
             matrix: DMatrix::zeros(n, n),
             warnings: vec![],
             method: options.covariance_method,
-        });
+        }));
     }
 
-    // The score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free block, at the fit's own modes.
-    // `None` when a cancel landed during the per-subject loop, whose placeholder rows are then
-    // never trusted.
-    //
-    // Under the covariance ODE override, like `R`'s stencil below (#520 review round 2).
-    let tight = cov_ode_override(model, options);
-    let scope_failure = std::cell::RefCell::new(None);
+    // The score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free block, at the step's modes — the
+    // fit's own, or on a tightened step the modes reconverged at its tolerance
+    // ([`tightened_covariance_step`]). `None` when a cancel landed during the per-subject loop,
+    // whose placeholder rows are then never trusted.
     let score_cross_product = || {
-        let s = in_cov_ode_scope(options, tight, &scope_failure, || {
-            assemble_score_cross_product(
-                x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
-                &free_idx,
-            )
-        });
+        let s = assemble_score_cross_product(
+            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
+            &free_idx,
+        );
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
 
@@ -2153,60 +2270,30 @@ pub(crate) fn compute_covariance_for(
     // its score column is zero, which `invert_cross_product` rejects.
     if !needs_r(options.covariance_method) {
         let Some(s_free) = score_cross_product() else {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+            return Some(CovarianceStepResult::Unusable(
+                COV_CANCELLED_MSG.to_string(),
+            ));
         };
         let s_free = match s_free {
             Ok(s) => s,
-            Err(reason) => return CovarianceStepResult::Unusable(reason),
+            Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
         };
         let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
-            return CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string());
+            return Some(CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string()));
         };
         if options.verbose {
             eprintln!("  Covariance step successful");
         }
-        return CovarianceStepResult::Success(CovarianceOutput {
+        return Some(CovarianceStepResult::Success(CovarianceOutput {
             matrix: embed_free(&cov_free, &free_idx, n),
-            warnings: scope_failure
-                .borrow_mut()
-                .take()
+            warnings: nn_reg
+                .is_some()
+                .then(|| format_nn_penalty_cov_note(CovarianceMethod::CrossProduct))
                 .into_iter()
-                .chain(
-                    nn_reg
-                        .is_some()
-                        .then(|| format_nn_penalty_cov_note(CovarianceMethod::CrossProduct)),
-                )
                 .collect(),
             method: CovarianceMethod::CrossProduct,
-        });
+        }));
     }
-
-    // `rsr` reads `S` too, and `S` costs one pass where `R`'s stencil costs `2·n²` objectives,
-    // so `S` is assembled first and a failed one stops the step before the stencil starts. A
-    // singular `S` does not stop `rsr` — `R⁻¹SR⁻¹` never inverts it — so this changes what fails
-    // first, never whether the step succeeds, except where a failed `R` carries a SIR proposal.
-    // Two gates keep `S` after `R` there:
-    // - the estimate did not minimise this objective: a failed `S` is then the #1781 fallback's
-    //   `FailedNonPd`, whose proposal is built from `R`;
-    // - a SIR fallback is armed (`covariance_fallback = sir` or `sir = true`): an `R` with no
-    //   positive eigenvalue returns `FailedNonPd` with the |λ|-rectified proposal, and
-    //   `should_run_sir_fallback` turns that into SIR intervals. Stopping on `S` first would
-    //   return `Unusable` with no proposal, and the fit would get no intervals at all.
-    let sir_fallback_armed = options.covariance_fallback == CovarianceFallback::Sir || options.sir;
-    let s_first = if options.covariance_method == CovarianceMethod::Sandwich
-        && estimate_minimises_cov_objective(fit_method)
-        && !sir_fallback_armed
-    {
-        let Some(s_free) = score_cross_product() else {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
-        };
-        match s_free {
-            Ok(s) => Some(s),
-            Err(reason) => return CovarianceStepResult::Unusable(reason),
-        }
-    } else {
-        None
-    };
 
     // ── The exact analytic R-matrix (#436), attempted before the FD stencil ─────────────
     //
@@ -2249,8 +2336,48 @@ pub(crate) fn compute_covariance_for(
     if matches!(assembly, AnalyticCovAssembly::Unavailable)
         && crate::cancel::is_cancelled(&options.cancel)
     {
-        return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+        return Some(CovarianceStepResult::Unusable(
+            COV_CANCELLED_MSG.to_string(),
+        ));
     }
+
+    // A step run at the fit's tolerance only because `R` was expected fully analytic stops
+    // here when it is not: its `S` and its stencil belong to the tightened step instead
+    // ([`compute_covariance_for`], #520 review round 6). Before `S`, so nothing is wasted
+    // but the assembly.
+    if require_analytic_r && !matches!(assembly, AnalyticCovAssembly::Full(_)) {
+        return None;
+    }
+
+    // `rsr` reads `S` too, and `S` costs one pass where `R`'s stencil costs `2·n²` objectives,
+    // so `S` is assembled ahead of the stencil (after the analytic assembly, whose route decides
+    // the step's ODE tolerance — #520) and a failed one stops the step before the stencil starts. A
+    // singular `S` does not stop `rsr` — `R⁻¹SR⁻¹` never inverts it — so this changes what fails
+    // first, never whether the step succeeds, except where a failed `R` carries a SIR proposal.
+    // Two gates keep `S` after `R` there:
+    // - the estimate did not minimise this objective: a failed `S` is then the #1781 fallback's
+    //   `FailedNonPd`, whose proposal is built from `R`;
+    // - a SIR fallback is armed (`covariance_fallback = sir` or `sir = true`): an `R` with no
+    //   positive eigenvalue returns `FailedNonPd` with the |λ|-rectified proposal, and
+    //   `should_run_sir_fallback` turns that into SIR intervals. Stopping on `S` first would
+    //   return `Unusable` with no proposal, and the fit would get no intervals at all.
+    let sir_fallback_armed = options.covariance_fallback == CovarianceFallback::Sir || options.sir;
+    let s_first = if options.covariance_method == CovarianceMethod::Sandwich
+        && estimate_minimises_cov_objective(fit_method)
+        && !sir_fallback_armed
+    {
+        let Some(s_free) = score_cross_product() else {
+            return Some(CovarianceStepResult::Unusable(
+                COV_CANCELLED_MSG.to_string(),
+            ));
+        };
+        match s_free {
+            Ok(s) => Some(s),
+            Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
+        }
+    } else {
+        None
+    };
 
     // Which subjects the objective stencil still has to cover.
     enum FdScope {
@@ -2332,41 +2459,35 @@ pub(crate) fn compute_covariance_for(
         // over those subjects — `find_ebe` is deterministic, so the value is exactly their
         // share of `base_ofv`, recomputed rather than carried because `pop_nll` keeps no
         // per-subject breakdown.
-        //
-        // On an integrated model looser than the stencil's accuracy plateau, the base point,
-        // the step probe and every stencil point are solved at that plateau instead (#520):
-        // `1/h²` amplifies integration noise, and on the 3-cpt IV ODE fixture the default
-        // tolerance left the SEs 2–7× too large with no warning. All of them, or the base is
-        // differenced against points from a different objective — so the whole-population
-        // base is re-evaluated here rather than taken from `base_ofv`.
-        let run_stencil = || {
-            let f0_fd = match scope {
-                FdScope::Whole if tight.is_none() => base_ofv,
-                FdScope::Whole if is_mixture => cov_ofv(x_hat),
-                FdScope::Whole => subset_cov_ofv(x_hat, population, eta_hats, true),
-                FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
-            };
-            let fd_floor = fd_step_floors(template, &model.default_params);
-            let stencil = fd_ofv_hessian(
-                n,
-                x_hat,
-                &free_idx,
-                &fd_floor,
-                initial_eps,
-                f0_fd,
-                &fd_ofv,
-                options,
-            );
-            (stencil, OdeToleranceFacts::from_route(model, population))
+        let f0_fd = match scope {
+            FdScope::Whole => base_ofv,
+            FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
-        let (stencil, ode_seen) = in_cov_ode_scope(options, tight, &scope_failure, run_stencil);
-        stencil_ode = ode_seen;
+
+        let fd_floor = fd_step_floors(template, &model.default_params);
+        let stencil = fd_ofv_hessian(
+            n,
+            x_hat,
+            &free_idx,
+            &fd_floor,
+            initial_eps,
+            f0_fd,
+            &fd_ofv,
+            options,
+        );
+        // Read here, on the thread the stencil ran on: inside a tightened step it is the
+        // plateau's tolerance, not the fit's (#520).
+        stencil_ode = OdeToleranceFacts::from_route(model, population);
         #[cfg(test)]
         FD_OBJECTIVE_EVALS
             .with(|c| c.set(c.get() + fd_evals.load(std::sync::atomic::Ordering::Relaxed)));
         let stencil = match stencil {
             Some(stencil) => stencil,
-            None => return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string()),
+            None => {
+                return Some(CovarianceStepResult::Unusable(
+                    COV_CANCELLED_MSG.to_string(),
+                ))
+            }
         };
         // `+=`, not `copy_from`: on the salvage route `hess` already holds the analytic terms.
         // On the `Whole` route it is the zero matrix, so this is the previous assignment.
@@ -2456,12 +2577,12 @@ pub(crate) fn compute_covariance_for(
         let reason = format!(
             "Covariance step failed: Hessian has ill-conditioned entries for the following \
              parameter(s) — {}. SE estimates not available.",
-            problem_params.join("; ")
+            problem_params.join("); ")
         );
         if options.verbose {
             eprintln!("  {}", reason);
         }
-        return CovarianceStepResult::Unusable(reason);
+        return Some(CovarianceStepResult::Unusable(reason));
     }
 
     // Build the reduced Hessian over free indices, invert, then embed back
@@ -2498,18 +2619,18 @@ pub(crate) fn compute_covariance_for(
                         4.0,
                         &unit_coords,
                     );
-                    return CovarianceStepResult::FailedNonPd {
+                    return Some(CovarianceStepResult::FailedNonPd {
                         reason: format_non_pd_warning(&eigvals),
                         fallback_proposal,
-                    };
+                    });
                 }
                 None => {
-                    return CovarianceStepResult::Unusable(
+                    return Some(CovarianceStepResult::Unusable(
                         "Covariance step failed: could not compute eigenvalues of the \
                          FD Hessian (Hessian may contain NaN or Inf). \
                          SE estimates not available."
                             .to_string(),
-                    );
+                    ));
                 }
             }
         }
@@ -2576,13 +2697,17 @@ pub(crate) fn compute_covariance_for(
             Some(s) => Ok(s),
             None => match score_cross_product() {
                 Some(s) => s,
-                None => return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string()),
+                None => {
+                    return Some(CovarianceStepResult::Unusable(
+                        COV_CANCELLED_MSG.to_string(),
+                    ))
+                }
             },
         };
         let s_free = match s_free {
             Ok(s) => s,
             Err(reason) if fallback_to_s => {
-                return CovarianceStepResult::FailedNonPd {
+                return Some(CovarianceStepResult::FailedNonPd {
                     reason: non_stationary(Some(&reason)),
                     fallback_proposal: build_non_pd_fallback_proposal(
                         &hess_free_sym,
@@ -2591,9 +2716,9 @@ pub(crate) fn compute_covariance_for(
                         4.0,
                         &unit_coords,
                     ),
-                }
+                })
             }
-            Err(reason) => return CovarianceStepResult::Unusable(reason),
+            Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
         };
         match combine_covariance_and_reference(estimator, r_inv, r_inv_ref, &s_free, &unit_coords) {
             Some(pair) => pair,
@@ -2602,7 +2727,7 @@ pub(crate) fn compute_covariance_for(
                     fallback_to_s,
                     "only `CrossProduct` fails to combine, and a requested `s` returned before `R`"
                 );
-                return CovarianceStepResult::FailedNonPd {
+                return Some(CovarianceStepResult::FailedNonPd {
                     reason: non_stationary(Some(
                         "S is singular or rank-deficient: typically fewer subjects than free \
                          parameters, or collinear per-subject scores",
@@ -2614,14 +2739,14 @@ pub(crate) fn compute_covariance_for(
                         4.0,
                         &unit_coords,
                     ),
-                };
+                });
             }
         }
     };
 
     let cov = embed_free(&cov_free, &free_idx, n);
 
-    let mut cov_warnings: Vec<String> = scope_failure.borrow_mut().take().into_iter().collect();
+    let mut cov_warnings: Vec<String> = Vec::new();
 
     // #1514: name the salvaged subjects, unconditionally — not only when the eigenvalue floor
     // fired. The route is a property of the numbers on the page, and a user comparing two runs
@@ -2738,11 +2863,11 @@ pub(crate) fn compute_covariance_for(
         cov_warnings.push(msg);
     }
 
-    CovarianceStepResult::Success(CovarianceOutput {
+    Some(CovarianceStepResult::Success(CovarianceOutput {
         matrix: cov,
         warnings: cov_warnings,
         method: estimator,
-    })
+    }))
 }
 
 /// The covariate-NN regularizer whose curvature the covariance step adds to `R` (#1352), or
