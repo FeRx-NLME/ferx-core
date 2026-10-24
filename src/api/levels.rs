@@ -3000,11 +3000,11 @@ fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
 /// not what refuses it, and the refusal names the θ instead. `with` holds the
 /// other θ — and the other blocks, by name — whose column, removed with the
 /// rest of the guard unchanged, gives the coded block its rank back: the
-/// members of the dependency, gathered over both probe points (a nonlinear
-/// model can alias different θ at each). It is empty when removing every
-/// member named would leave the block aliased at either point — two θ
-/// carrying the same combination, neither a member alone — and the refusal
-/// then names none. The rank is taken whether or not the random effect is
+/// members of the dependency: at each probe point a set of them whose removal
+/// gives the rank back and none of which can be kept, gathered over both
+/// points (a nonlinear model can alias different θ at each). It is empty
+/// when removing every other θ would still leave the block aliased at either
+/// point, and the refusal then names none. The rank is taken whether or not the random effect is
 /// held, and aliased at either point wins over held (#1991 review): the
 /// random effect's refusal would advise dropping it, which leaves the alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3335,10 +3335,17 @@ fn carried(
             ),
         };
         if full > 0 {
-            // #1991: the members of the dependency — each other θ, and each
-            // other block whole, whose removal lowers the excess. Only an
-            // aliased block pays for these bases.
-            let members = other_thetas
+            // #1991: the members of the dependency — other θ, and other blocks
+            // whole — found by backward elimination (#1991 review, round 3):
+            // start from every member removed, and put each back unless that
+            // aliases the block again. What stays is a set whose removal gives
+            // the rank back and none of whose members can be kept: a θ alone
+            // in a dependency with the levels, and two θ carrying the same
+            // combination together, neither of which a one-at-a-time test
+            // finds. Removing columns never raises the excess, so the order
+            // only decides between equally minimal sets. Only an aliased block
+            // pays for these bases.
+            let members: Vec<(String, std::ops::Range<usize>)> = other_thetas
                 .iter()
                 .enumerate()
                 .map(|(i, &k)| (model.theta_names[k].clone(), i..i + 1))
@@ -3347,18 +3354,38 @@ fn carried(
                         .iter()
                         .zip(&other_ranges)
                         .map(|(o, r)| (o.decl.name().to_string(), r.clone())),
-                );
-            let named: Vec<(String, std::ops::Range<usize>)> = members
-                .filter(|(_, range)| excess(&|i| !range.contains(&i)) < full)
+                )
                 .collect();
-            // Whether removing every member named gives the rank back: when not
-            // — two θ carrying the same combination, neither a member alone —
-            // the refusal names none rather than advise a removal that leaves
-            // the model aliased.
-            let complete = excess(&|i| !named.iter().any(|(_, range)| range.contains(&i))) == 0;
+            let mut removed = vec![true; members.len()];
+            let without = |removed: &[bool]| {
+                excess(&|i| {
+                    !members
+                        .iter()
+                        .zip(removed)
+                        .any(|((_, range), &r)| r && range.contains(&i))
+                })
+            };
+            // Whether removing every member gives the rank back: when not —
+            // the block deficient against nothing but itself — the refusal
+            // names none rather than advise a removal that leaves it aliased.
+            let complete = without(&removed) == 0;
+            if complete {
+                for m in 0..members.len() {
+                    removed[m] = false;
+                    if without(&removed) > 0 {
+                        removed[m] = true;
+                    }
+                }
+            }
+            let named: Vec<String> = members
+                .iter()
+                .zip(&removed)
+                .filter(|(_, &r)| r && complete)
+                .map(|((name, _), _)| name.clone())
+                .collect();
             let (with, all_complete) = alias.get_or_insert_with(|| (Vec::new(), true));
             *all_complete &= complete;
-            for (name, _) in named {
+            for name in named {
                 if !with.contains(&name) {
                     with.push(name);
                 }
@@ -4056,6 +4083,27 @@ fn resolve_absorbing(
                         Some(_) => "Remove the block",
                         None => "Drop the random effect",
                     }
+                )
+            } else if let Some(with) = certificate
+                .as_ref()
+                .and_then(|k| k.aliased(LevelContrast::SumToZeroWithin))
+            {
+                // The within-group contrast carries the random effect, but its
+                // coded levels are aliased too (#1991 review, round 3): advised
+                // as is, it would bind the same flat direction. Removing the
+                // members restores its rank by construction.
+                let (them, those) = match with.is_empty() {
+                    true => (
+                        "those θ".to_string(),
+                        "the θ that duplicate the levels".to_string(),
+                    ),
+                    false => (and_list(&with), and_list(&with)),
+                };
+                format!(
+                    " Under `contrast = sum_to_zero_within` some combination of the coded levels \
+                     moves `y` exactly as {} does too, so that contrast leaves {them} aliased. \
+                     Remove {those} and use it, or remove the block.",
+                    alias_who(&with)
                 )
             } else {
                 format!(

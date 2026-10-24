@@ -371,6 +371,8 @@ at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model wit
 a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
 measured, so it keeps the refusal.
 
+###### When the levels duplicate another θ
+
 A θ whose effect is itself a combination of the levels rescues nothing (#1977).
 `TVB * D2`, on study 2's records alone, carries the levels' sum but not study 1's
 reference level. Under `ref` it is then one of the coded levels' own sums, so the
@@ -387,12 +389,24 @@ exactly as `TVB` does. It adds that dropping the random effect would leave
 is not the cause, so the message does not suggest dropping it. The rank is
 checked even where the other θ already carry the random effect, as in
 `TVB * D1 + TVC * D2` with one subject per study. The θ named are gathered at
-both points the check uses.
+both points the check uses. Where only two θ together carry the combination, as in
+`TVB * D2 + TVC * D2`, the refusal names both.
 
 A nested block refused under a global contrast keeps its refusal. When its
 coded levels are also aliased with other θ, the refusal names them. It then
 advises `sum_to_zero_within` or removing the block, not dropping the random
-effect. A level at every observation is aliased with almost any θ. A one-column
+effect. A level at every observation is aliased with almost any θ.
+
+The binder checks `sum_to_zero_within` before advising it. Next to an intercept,
+or `EMAX` next to `ET50`, a time course shared by every study, such as
+`EMAX * TIME / (TIME + ET50)`, is a combination of the within-study levels. The
+refusal then names those θ and advises removing them before using the
+within-group contrast, or removing the block. A nested block that resolves to
+`sum_to_zero_within` under `auto` is not checked this way, so such a model still
+binds with a flat direction. Real data usually avoids this, because the drug
+term acts only on the treated arms.
+
+A one-column
 block under `none` next to an intercept keeps its refusal too. It adds that a
 model without the random effect needs a global contrast, since under `none` the
 levels are aliased with the intercept.

@@ -3258,11 +3258,15 @@ mod contrast_refusals {
     }
 
     const NOT_IDENTIFIED: &str = "the two are the same quantity, so the model is not identified.";
-    /// The nested advice when the coded block is aliased with other θ, as an
-    /// `[STUDY, TIME]` block at one subject per study is under every global
-    /// contrast: dropping the random effect would bind it aliased (#1991).
-    const USE_WITHIN: &str = "Use `contrast = sum_to_zero_within` (the default for this shape), \
-                              or remove the block.";
+    /// The nested advice when the coded block is aliased with `TVEMAX` and
+    /// `TVET50` under the within-group contrast as well, as an `[STUDY, TIME]`
+    /// block next to an intercept and a shared Emax time course is: neither
+    /// dropping the random effect nor that contrast is the advice (#1991).
+    const USE_WITHIN: &str = "Under `contrast = sum_to_zero_within` some combination of the \
+                              coded levels moves `y` exactly as a combination of `TVEMAX` and \
+                              `TVET50` does too, so that contrast leaves `TVEMAX` and `TVET50` \
+                              aliased. Remove `TVEMAX` and `TVET50` and use it, or remove the \
+                              block.";
 
     /// T6 (M1, M2). A block read in the readout next to an η on `E0` is
     /// refused under every global contrast, naming the readout and `E0`; the
@@ -5297,10 +5301,15 @@ mod absorption {
         }
     }
 
-    /// The nested advice when the coded block is aliased with other θ
-    /// (#1991): dropping the random effect would bind it aliased.
-    const USE_WITHIN: &str = " Use `contrast = sum_to_zero_within` (the default for this \
-                              shape), or remove the block.";
+    /// The nested advice when the coded block is aliased with `TVEMAX` and
+    /// `TVET50` under the within-group contrast as well, as the `cf_model`
+    /// shapes' intercept and shared Emax time course make it (#1991): neither
+    /// dropping the random effect nor that contrast is the advice.
+    const USE_WITHIN: &str = " Under `contrast = sum_to_zero_within` some combination of the \
+                              coded levels moves `y` exactly as a combination of `TVEMAX` and \
+                              `TVET50` does too, so that contrast leaves `TVEMAX` and `TVET50` \
+                              aliased. Remove `TVEMAX` and `TVET50` and use it, or remove the \
+                              block.";
     const SAME_QUANTITY: &str = " — the two are the same quantity, so the model is not identified.";
     const EVERY_OBSERVATION: &str = ", and the block takes a level at every observation, so \
                                      it can reproduce any effect that random effect has";
@@ -5371,7 +5380,10 @@ mod absorption {
                             "theta PLACEBO[STUDY, TIME]: `contrast = {c}` leaves each STUDY \
                              group's mean free, but {route}{EVERY_OBSERVATION}{SAME_QUANTITY}"
                         ),
-                        USE_WITHIN,
+                        // The aliased θ differ by route (`TVV` through `V`).
+                        " Under `contrast = sum_to_zero_within` some combination of the coded \
+                         levels moves `y` exactly as ",
+                        " and use it, or remove the block.",
                     ],
                 );
                 lacks(&err, &["reads this block", "individual parameter"]);
@@ -8222,11 +8234,13 @@ mod absorption {
     ///
     /// The mirror `TVB * (D1 - D2)` names `TVB` under `sum_to_zero`. Two θ
     /// carrying the same combination (`TVB * D2 + TVC * D2`) leave no single
-    /// member whose removal restores the rank, and the refusal names none.
+    /// member whose removal restores the rank; both together do, and the
+    /// refusal names both.
     ///
     /// Mutations — `carried` returns `Held` for an aliased block (every row
     /// gets the random-effect refusal: S1 dies); `with` holds every other θ
-    /// (`TVE0` named); the one-column arm asks only the resolved contrast
+    /// (`TVE0` named); membership tested one θ at a time (the pair names
+    /// none); the one-column arm asks only the resolved contrast
     /// (auto and `none` on `TVB * D2` lose S1); any one sentence deleted (its
     /// `has` dies).
     #[test]
@@ -8299,16 +8313,17 @@ mod absorption {
                 );
             }
         }
-        // No single member: the refusal names none, and still advises removal.
+        // No single member: neither removed alone gives the rank back, both
+        // together do, and the refusal names both (#1991 review, round 3).
         let e = try_bind(&one("TVB * D2 + TVC * D2")("ref"), &pop).expect_err("pair");
         has(
             &e,
             &[
                 "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
-                 some combination of the model's other θ does",
-                "so the data cannot tell those θ from the levels.",
-                "Dropping `ETA_E0` would leave those θ aliased under `contrast = ref`.",
-                " Remove the θ that duplicate the levels, or remove the block.",
+                 a combination of `TVB` and `TVC` does",
+                "so the data cannot tell `TVB` and `TVC` from the levels.",
+                "Dropping `ETA_E0` would leave `TVB` and `TVC` aliased under `contrast = ref`.",
+                " Remove `TVB` and `TVC`, or remove the block.",
             ],
         );
     }
@@ -8318,9 +8333,11 @@ mod absorption {
     /// global contrast — and adds the coded block's alias: under `ref`,
     /// `TVEMAX`'s and `TVET50`'s columns, zero at the reference level
     /// `TIME = 0`, are combinations of the coded levels, so dropping `ETA_E0`
-    /// would bind the block aliased. The advice is the within-group contrast or
-    /// removing the block, not dropping the random effect; `none` is measured
-    /// too, and says the same. The whole `ref` refusal is pinned, and the note
+    /// would bind the block aliased. Nor is the within-group contrast the
+    /// advice: its coded levels are aliased with `TVET50` (#1991 review, round
+    /// 3), so the refusal says so and advises removing `TVET50` and using it,
+    /// or removing the block. `none` is measured too. Where within keeps its
+    /// rank — `TVB * D2`, constant within each study — it is the advice. The whole `ref` refusal is pinned, and the note
     /// is gated on both sides: H1 on `[STUDY, VISIT]`, two visits per study
     /// with the Emax term varying within each, keeps its rank against the
     /// other θ under `sum_to_zero`, and keeps the advice to drop the random
@@ -8328,7 +8345,9 @@ mod absorption {
     ///
     /// Mutations — the nested arm ignores `Aliased` (no note, the old advice:
     /// the note's `has` dies); the certificate returns `Held` under `none`
-    /// before the rank (the `none` note dies).
+    /// before the rank (the `none` note dies); within advised unchecked (the
+    /// `ref` refusal's `assert_eq` dies); within never advised (`TVB * D2`'s
+    /// `has` dies).
     #[test]
     fn an_aliased_nested_block_names_the_theta() {
         let pop = arms_pop_d();
@@ -8349,11 +8368,23 @@ mod absorption {
                     exactly as a combination of `TVEMAX` and `TVET50` does (measured at the \
                     initial estimates and at a point near them), so dropping `ETA_E0` would leave \
                     `TVEMAX` and `TVET50` aliased.";
-        let fix = " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
-                   the block.";
+        // Within-study, `TIME / (TIME + ET50)` minus its study mean is a
+        // combination of the coded levels, so `ET50`'s column is too — with
+        // `EMAX`'s carrying the mean that is left (#1991 review, round 3).
+        let fix = " Under `contrast = sum_to_zero_within` some combination of the coded levels \
+                   moves `y` exactly as `TVET50` does too, so that contrast leaves `TVET50` \
+                   aliased. Remove `TVET50` and use it, or remove the block.";
         let e = try_bind(&text("ref"), &pop).expect_err("ref");
         assert_eq!(e, format!("{head}{note}{fix}"));
-        lacks(&e, &[ANY_CONTRAST, "drop the random effect", "`TVE0`"]);
+        lacks(
+            &e,
+            &[
+                ANY_CONTRAST,
+                "drop the random effect",
+                "`TVE0`",
+                "default for this shape",
+            ],
+        );
         let none = try_bind(&text("none"), &pop).expect_err("none");
         has(
             &none,
@@ -8363,6 +8394,29 @@ mod absorption {
                 fix,
             ],
         );
+        // The within gate's other side: `TVB * D2`, constant within each
+        // study, is a combination of the `ref`-coded levels but not of the
+        // within-coded ones, which sum to zero inside every study. So within
+        // keeps its rank and is the advice.
+        let r = (
+            "TVB*D2 nested",
+            "STUDY, TIME",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2"),
+            "E0".to_string(),
+            false,
+        );
+        let tvb = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)]);
+        let e = try_bind(&tvb("ref"), &pop).expect_err("TVB ref");
+        has(
+            &e,
+            &[
+                " Under `contrast = ref` some combination of the coded levels also moves `y` \
+                 exactly as `TVB` does",
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
+                 the block.",
+            ],
+        );
+        lacks(&e, &["drop the random effect", "leaves `TVB` aliased"]);
         let full = try_bind(
             &shape("H1", "STUDY, VISIT", "sum_to_zero"),
             &visit_pop(3, 1),
@@ -8389,10 +8443,12 @@ mod absorption {
     /// effect under any contrast; and under `ref` `TVC` is a coded level, under
     /// sum-to-zero `TVB - TVC` is one. Before the review the span held the
     /// random effect and the refusal advised dropping it — which would have
-    /// bound the block aliased, unmeasured. Now every contrast names both
-    /// aliases and advises removing `TVB` and `TVC`, which binds. The
-    /// straddle: the oracle absorbs `ETA_E0` under both global contrasts, and
-    /// the coded block is aliased under both.
+    /// bound the block aliased, unmeasured. Now every contrast names the
+    /// alias and advises removing `TVC`: the smallest removal that gives the
+    /// rank back under both (#1991 review, round 3). Followed, it does: the
+    /// model without `TVC` is refused for the random effect `TVB` still
+    /// carries, with no alias. The straddle: the oracle absorbs `ETA_E0` under
+    /// both global contrasts, and the coded block is aliased under both.
     ///
     /// Mutation — the span checked before the rank (every contrast gets the
     /// random-effect refusal: the `has` dies).
@@ -8417,17 +8473,14 @@ mod absorption {
         let by_ref = "under `contrast = ref` some combination of the coded levels moves `y` \
                       exactly as `TVC` does";
         let by_stz = "under `contrast = sum_to_zero` some combination of the coded levels moves \
-                      `y` exactly as a combination of `TVB` and `TVC` does";
+                      `y` exactly as `TVC` does";
         for c in ALL {
             let e = try_bind(&text(c), &pop).expect_err(c);
             has(&e, &[by_ref, ANY_CONTRAST, ", or remove the block."]);
             if c != "sum_to_zero_within" {
                 has(&e, &[by_stz]);
             }
-            assert!(
-                e.contains("Remove `TVC` and `TVB`") || e.contains("Remove `TVB` and `TVC`"),
-                "{c:?}: {e}"
-            );
+            has(&e, &["Remove `TVC`, or remove the block."]);
             lacks(
                 &e,
                 &[
@@ -8436,23 +8489,24 @@ mod absorption {
                 ],
             );
         }
-        let bare = row_1836("bare", format!("  E0 = {NO_INTERCEPT}"), false);
-        assert_eq!(
-            try_bind(&row_text(&bare)("ref"), &pop),
-            Ok((LevelContrast::Ref, 3)),
-            "without TVB and TVC"
-        );
+        let r = row_1836("no TVC", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)]);
+        for c in ["sum_to_zero", "ref"] {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[ANY_CONTRAST]);
+            lacks(&e, &["aliased"]);
+        }
     }
 
     /// #1991 review, F2. The members are gathered over both probe points.
     /// `TVB * TVS * D2` with `TVS` initialised at 0: at the initial estimates
     /// `TVB`'s column is zero and `TVS` alone duplicates study 2's level under
-    /// `ref`; at the moved point both do, and neither alone is a member. Named
-    /// from the first point, the refusal would advise removing `TVS` while the
-    /// moved point stays aliased; over both, no removal list is complete, and
-    /// it names none.
+    /// `ref`; at the moved point both do, and only both together are a
+    /// removal that gives the rank back. Named from the first point, the
+    /// refusal would advise removing `TVS` alone while the moved point stays
+    /// aliased; over both, it names `TVS` and `TVB`.
     ///
-    /// Mutation — `carried` returns at the first aliased point (`TVS` named).
+    /// Mutation — `carried` returns at the first aliased point (`TVB` missing).
     #[test]
     fn the_alias_members_are_gathered_over_both_points() {
         let pop = arms_pop_d();
@@ -8467,11 +8521,10 @@ mod absorption {
             &e,
             &[
                 "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
-                 some combination of the model's other θ does",
-                " Remove the θ that duplicate the levels, or remove the block.",
+                 a combination of `TVS` and `TVB` does",
+                " Remove `TVS` and `TVB`, or remove the block.",
             ],
         );
-        lacks(&e, &["`TVS`", "`TVB`"]);
     }
 
     /// #1991 review. The one-column refusal under `none` next to an intercept
