@@ -380,6 +380,19 @@ under every contrast. So is an Emax term `EMAX * TIME / (TIME + ET50)` under
 global sum-to-zero and `ref` on `[STUDY, TIME]`, and a hand-coded region effect
 `TVB1 * (R1 - R2)` over two equal-size regions under sum-to-zero.
 
+That refusal names the θ and the contrast it is aliased under (#1991). For `TVB * D2`,
+under every contrast, it says that under `contrast = ref` the coded levels move `y`
+exactly as `TVB` does. It adds that dropping the random effect would leave
+`TVB` aliased there, and advises removing `TVB` or the block. The random effect
+is not the cause, so the message does not suggest dropping it.
+
+The binder checks this aliasing only for a block that must rescue an absorbed
+random effect. A block that needs no rescue is not checked. Examples are
+`TVE0 + PLACEBO` under `contrast = none` with no random effect on `E0`, or
+`TVB * D2` next to `ref` with the random effect dropped. Such a block still
+binds aliased, and the fit has a flat direction. Use `auto` (sum-to-zero) next to
+an intercept, and do not write a θ that is a combination of the levels.
+
 The two contrasts can still disagree when a coarser random effect shares a
 direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
 column minus `TVC`'s is study 2's level. That carries the levels' sum but not the

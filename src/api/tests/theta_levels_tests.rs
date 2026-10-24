@@ -7953,8 +7953,9 @@ mod absorption {
     /// the reference level `TIME = 0`, is one of the `ref`-coded columns' too.
     /// Under the contrast #1840 bound them with, the oracle absorbs nothing and
     /// the coded block is aliased: each is refused under both global contrasts,
-    /// the one-column rows with "under any contrast" and auto refused; the
-    /// nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
+    /// each refusal naming the aliased θ (#1991) — `TVB`, or on the nested row
+    /// `TVEMAX` — and the one-column rows "under any contrast" with auto
+    /// refused; the nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
     /// the split rows' oracle absorbs under one contrast and not the other, with
     /// the block of full rank; the aliased rows' oracle absorbs under one and
     /// finds the block aliased under the other — and every row agrees with the
@@ -8054,13 +8055,18 @@ mod absorption {
                 }
                 match (try_bind(&text(token(*other)), &pop), is_aliased) {
                     (Ok((c, _)), false) if c == *other => {}
-                    (Err(e), true) if j.one_column && e.contains(ANY_CONTRAST) => {}
-                    (Err(_), true) if !j.one_column => {}
+                    // #1991: refused for the aliasing, naming the θ.
+                    (Err(e), true)
+                        if j.one_column
+                            && e.contains(ANY_CONTRAST)
+                            && e.contains("exactly as `TVB` does") => {}
+                    (Err(e), true) if !j.one_column && e.contains("`TVEMAX`") => {}
                     (got, _) => wrong.push(format!("{tag} {other:?}: {got:?}")),
                 }
                 match (try_bind(&text(""), &pop), auto) {
                     (Ok((c, _)), Some(want)) if c == *want => {}
-                    (Err(e), None) if e.contains(ANY_CONTRAST) => {}
+                    (Err(e), None)
+                        if e.contains(ANY_CONTRAST) && e.contains("exactly as `TVB` does") => {}
                     (got, _) => wrong.push(format!("{tag} auto: {got:?}, want {auto:?}")),
                 }
                 agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
@@ -8117,7 +8123,9 @@ mod absorption {
             );
             for c in ALL {
                 match try_bind(&text(c), &pop) {
-                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    Err(e)
+                        if e.contains(ANY_CONTRAST)
+                            && e.contains(&format!("exactly as `{}` does", &extra[..4])) => {}
                     got => wrong.push(format!("{tag} {c:?}: {got:?}")),
                 }
             }
@@ -8144,6 +8152,160 @@ mod absorption {
         }
         agrees_with_joint_oracle("pair", &text, &pop, &mut wrong);
         assert!(wrong.is_empty(), "aliased rescue:\n{}", wrong.join("\n"));
+    }
+
+    /// #1991. An aliased coded block is refused for the aliasing, naming the
+    /// θ, not for the random effect. `TVB * D2` puts no weight on study 1, so
+    /// under `ref` some combination of the coded levels moves `y` exactly as
+    /// `TVB` does; under sum-to-zero it carries the levels' mean, and the
+    /// levels reproduce `ETA_E0`. Whichever contrast is asked for — auto,
+    /// either global one, `none` — the refusal is the aliased one, and each of
+    /// its sentences is pinned on its own:
+    ///
+    /// - S1 names the contrast and `TVB`, and not `TVE0`, which the levels do
+    ///   not reproduce: the dependency's members, not every other θ.
+    /// - S2 says what every other contrast does with `ETA_E0`, so the model is
+    ///   not identified under any contrast (the substring the older tests pin).
+    /// - S3 says dropping `ETA_E0` — the old advice — leaves `TVB` aliased
+    ///   under `ref`: the oracle's rank on the coded block, which never reads
+    ///   the random effect, agrees.
+    /// - S4 advises removing `TVB` or the block, and both bind: without `TVB`
+    ///   the row is R8s, and without the block nothing is left to alias.
+    ///
+    /// The mirror `TVB * (D1 - D2)` names `TVB` under `sum_to_zero`. Two θ
+    /// carrying the same combination (`TVB * D2 + TVC * D2`) leave no single
+    /// member whose removal restores the rank, and the refusal names none.
+    ///
+    /// Mutations — `carried` returns `Held` for an aliased block (every row
+    /// gets the random-effect refusal: S1 dies); `with` holds every other θ
+    /// (`TVE0` named); the one-column arm asks only the resolved contrast
+    /// (auto and `none` on `TVB * D2` lose S1); any one sentence deleted (its
+    /// `has` dies).
+    #[test]
+    fn an_aliased_block_names_the_theta() {
+        let pop = arms_pop_d();
+        let one = |extra: &str| {
+            let r = row_1836("aliased", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            move |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)])
+        };
+        let head = "theta PLACEBO[STUDY]: ";
+        let measured = " (measured at the initial estimates and at a point near them), so the \
+                        data cannot tell `TVB` from the levels.";
+        let s2 = " Under every other contrast the levels, with the rest of the model, reproduce \
+                  the random effect `ETA_E0` entirely,";
+        let s4 = " Remove `TVB`, or remove the block.";
+        for (tag, extra, aliased_under, token) in [
+            ("TVB*D2", "TVB * D2", LevelContrast::Ref, "ref"),
+            (
+                "TVB*(D1-D2)",
+                "TVB * (D1 - D2)",
+                LevelContrast::SumToZero,
+                "sum_to_zero",
+            ),
+        ] {
+            let text = one(extra);
+            let j = jacobian(&text("none"), &pop);
+            assert!(
+                block_aliased(&j, aliased_under),
+                "{tag}: aliased under {token}"
+            );
+            for c in ALL {
+                // One column has one group: asked for, the within-group
+                // contrast is named in the global one's place, not beside it.
+                let token = match (c, token) {
+                    ("sum_to_zero_within", "sum_to_zero") => c,
+                    _ => token,
+                };
+                let s1 = format!(
+                    "{head}under `contrast = {token}` some combination of the coded levels moves \
+                     `y` exactly as `TVB` does{measured}"
+                );
+                let s3 = format!(
+                    " so the model is not identified under any contrast. Dropping `ETA_E0` would \
+                     leave `TVB` aliased under `contrast = {token}`."
+                );
+                let e = try_bind(&text(c), &pop).expect_err(tag);
+                has(&e, &[&s1, s2, &s3, s4]);
+                assert!(e.ends_with(s4), "{tag} {c:?}: S4 last: {e}");
+                lacks(
+                    &e,
+                    &[
+                        "`TVE0`",
+                        "random effect are the same quantity",
+                        "drop the random effect",
+                    ],
+                );
+            }
+            // S4's advice binds.
+            let bare = row_1836("bare", format!("  E0 = {NO_INTERCEPT}"), false);
+            let without = row_text(&bare);
+            assert!(!without("").contains("TVB"), "{tag}: TVB removed");
+            for (c, want) in [
+                ("sum_to_zero", LevelContrast::SumToZero),
+                ("ref", LevelContrast::Ref),
+            ] {
+                assert_eq!(
+                    try_bind(&without(c), &pop),
+                    Ok((want, 3)),
+                    "{tag} without TVB {c}"
+                );
+            }
+        }
+        // No single member: the refusal names none, and still advises removal.
+        let e = try_bind(&one("TVB * D2 + TVC * D2")("ref"), &pop).expect_err("pair");
+        has(
+            &e,
+            &[
+                "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
+                 some combination of the model's other θ does",
+                "so the data cannot tell those θ from the levels.",
+                "Dropping `ETA_E0` would leave those θ aliased under `contrast = ref`.",
+                " Remove the θ that duplicate the levels, or remove the block.",
+            ],
+        );
+    }
+
+    /// #1991, the nested block. T2's row `E0 + EMAX * TIME / (TIME + ET50)`
+    /// under an explicit `ref`: `TVEMAX`'s column is zero at the reference
+    /// level `TIME = 0`, so the coded block is aliased with it, and the refusal
+    /// says so for this contrast — not the random-effect text, and not "under
+    /// any contrast", since `sum_to_zero_within` binds.
+    ///
+    /// Mutation — the nested arm ignores `Aliased` (the random-effect text
+    /// comes back: S1 dies).
+    #[test]
+    fn an_aliased_nested_block_names_the_theta() {
+        let pop = arms_pop_d();
+        let text = |c: &str| {
+            row_text(&(
+                "nested",
+                "STUDY, TIME",
+                format!("  E0 = {NO_INTERCEPT}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            ))(c)
+        };
+        let e = try_bind(&text("ref"), &pop).expect_err("ref");
+        has(
+            &e,
+            &[
+                "theta PLACEBO[STUDY, TIME]: under `contrast = ref` some combination of the coded \
+                 levels moves `y` exactly as ",
+                "`TVEMAX`",
+                " So the model is not identified under this contrast, and dropping `ETA_E0` \
+                 would leave ",
+                " aliased under it. Remove ",
+                ", or remove the block.",
+            ],
+        );
+        lacks(
+            &e,
+            &[ANY_CONTRAST, "the two are the same quantity", "`TVE0`"],
+        );
+        assert_eq!(
+            try_bind(&text(""), &pop).map(|(c, _)| c),
+            Ok(LevelContrast::SumToZeroWithin)
+        );
     }
 
     /// T3 (#1840). An inconclusive point keeps the refusal. The intercept is
