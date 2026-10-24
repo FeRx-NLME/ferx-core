@@ -1,12 +1,16 @@
 # #1065 S1: the plan's 100-study x 8-visit placebo model (M6's `plc.ferx`) with the
-# block declared `profile`. Data: `s100t8.csv`, from `simulate_s1.py 100 8`. Unprofiled,
-# the same model is 705 packed coordinates; profiled, the optimizer searches 5.
+# block declared `profile`, plus a study baseline ETA_E0 that both arms read (#2326). Data:
+# `s100t8.csv`, from `simulate_s1.py 100 8`. ETA_E0 is absorbed by the block, so auto takes
+# `sum_to_zero_within` and the profiled solve is 100 groups of 8; ETA_EMAX, read by the
+# drug arm only, is not (#2131). Unprofiled, the model is 3 + 700 + 2 + 1 = 706 packed
+# coordinates; profiled, the optimizer searches 6.
 
 [parameters]
   theta TVE0(4.0, -20.0, 20.0)
   theta TVEMAX(1.0, 0.01, 20.0)
   theta TVET50(1.0, 0.01, 50.0)
   theta PLACEBO[STUDY, TIME](0.0) profile
+  omega ETA_E0 ~ 0.1
   omega ETA_EMAX ~ 0.2
   sigma ADD_ERR ~ 0.05 (variance)
 
@@ -14,11 +18,12 @@
   TRT categorical
 
 [individual_parameters]
+  E0 = TVE0 + ETA_E0
   EMAX = TVEMAX * exp(ETA_EMAX)
   ET50 = TVET50
 
 [structural_model]
-  y = TVE0 + PLACEBO - TRT * EMAX * TIME / (TIME + ET50)
+  y = E0 + PLACEBO - TRT * EMAX * TIME / (TIME + ET50)
 
 [error_model]
   DV ~ additive(ADD_ERR)
