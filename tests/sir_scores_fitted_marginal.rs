@@ -1122,9 +1122,9 @@ fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
     );
 
     // SAEM reports the FOCEI mixture marginal (`mixture_ofv`) at its estimates, so a
-    // FOCEI evaluation there — parameters rebuilt from the fit — is the same number. With
-    // the stale class-2 Cholesky factor the SAEM side read 303.7455718454021 against
-    // 302.3294566894659 (macOS arm64).
+    // FOCEI evaluation there — parameters rebuilt from the fit — is the same number
+    // (304.14592327836084, macOS arm64). Before #1765 the class-2 Ω kept the base's
+    // Cholesky factor, and the SAEM side read 1.4 units off the FOCEI value.
     let at = ferx_core::estimation::uncertainty_samples::fitted_params_from_result(&r, &model)
         .expect("rebuild the SAEM fit's parameters");
     let eval = fit(
