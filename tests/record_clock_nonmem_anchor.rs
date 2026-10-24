@@ -253,8 +253,8 @@ const PRED_TOL: f64 = 1e-7;
 
 // The #1909 anchors print 17 significant figures, so they get their own bound. Worst
 // |PRED − NONMEM| over both twins: 1.1e-14 on addl_tie and addl_{f,lag,ftime} (Linux x86_64
-// at 5998edf2, macOS arm64 alike), 3.2e-14 on addl_{lagt,dx,dt} (addl_dt, macOS arm64;
-// Linux x86_64 PENDING). 1e-12 leaves about 30× over the worst. The
+// at 5998edf2, macOS arm64 alike), 3.2e-14 on addl_{lagt,dx,dt} (addl_dt; Linux x86_64
+// at ccf042db, macOS arm64 alike). 1e-12 leaves about 30× over the worst. The
 // smallest regression these anchors catch moves a PRED by 8.3e-2 (the governing record
 // taken strictly after the dose, on addl_dt), so the bound is not what catches it; it is
 // what keeps a 1e-8 drift in either engine from passing.

@@ -88,7 +88,7 @@ Its compartment **lag** (`lagtime`, NONMEM's `ALAG`) is the exception. An implie
 Two more attributes need care:
 
 - **A modelled infusion rate `R{n}` (`RATE=-1`) still differs from NONMEM.** NONMEM re-reads `R1` on every advance, so the rate follows the record that ends each advance. ferx fixes the rate when the dose starts ([#2332](https://github.com/FeRx-NLME/ferx-core/issues/2332)).
-- **A route's own lag, `first_order(ka=…, lag=L)`, is read at the governing record**, while the compartment `lagtime` comes from the parent row. NONMEM has no direct spelling of a per-route lag, so no anchor decides between the two.
+- **A route's own lag, `first_order(ka=…, lag=L)`, is read at the governing record**, while the compartment `lagtime` comes from the parent row. NONMEM has no direct spelling of a per-route lag, so no anchor decides between the two ([#2367](https://github.com/FeRx-NLME/ferx-core/issues/2367)).
 
 So a dose row at `TIME 0` with `ADDL=2, II=12`, followed by an observation at `TIME 14` where `WT` changes, gives the dose at 12 the `WT` and `F` of the record at 14 and the lag of the row at 0. Before #1909 every implied dose used the parent row's values, which differs from NONMEM whenever a covariate changes along the train. The NONMEM comparison is `addl_tie`, `addl_f`, `addl_lag`, `addl_ftime`, `addl_lagt`, `addl_dx` and `addl_dt` in [`nonmem_anchor/`](https://github.com/FeRx-NLME/ferx-core/tree/main/nonmem_anchor).
 
