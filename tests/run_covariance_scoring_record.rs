@@ -241,12 +241,23 @@ field_row!(
 /// macOS arm64 across `outer_maxiter` 2–6 — and by nothing at 3 on macOS, where this
 /// premise failed. On `warfarin_iov` the same pair differs by 2.0e-7–2.2e-6 at every budget
 /// from 2 to 6, on both platforms.
+///
+/// On the finite-difference R-matrix (`analytic_cov_hessian = false`, held on both sides: it
+/// is a step setting, never recorded). Since #2261 the step's re-solve at θ̂ starts at the
+/// fit's whole mode, κ̂ included, which a 1e-8 fit already converged, so on the exact
+/// route it stops at once under either tolerance and the premise has nothing to see; the
+/// stencil's perturbed points start away from their own modes, and there the tolerance
+/// still moves the bits.
 #[test]
 fn inner_tol() {
-    let with = FitOptions {
+    let fd = |o: FitOptions| FitOptions {
+        analytic_cov_hessian: false,
+        ..o
+    };
+    let with = fd(FitOptions {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
         ..quiet(EstimationMethod::FoceI)
-    };
+    });
     let f = Fitted::new(&WARFARIN_IOV, &with, "inner_tol");
     assert_eq!(
         f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
@@ -255,11 +266,11 @@ fn inner_tol() {
     );
     let inline = bits(&f.fit, "inner_tol");
     assert!(
-        f.cov(&f.unrecorded(), &defaults(), "inner_tol") != inline,
+        f.cov(&f.unrecorded(), &fd(defaults()), "inner_tol") != inline,
         "inner_tol: premise — the top-level inner_tol must move the covariance"
     );
     assert!(
-        f.cov(&f.fit, &defaults(), "inner_tol") == inline,
+        f.cov(&f.fit, &fd(defaults()), "inner_tol") == inline,
         "inner_tol: run_covariance with default options must take the stage's recorded inner_tol"
     );
 }
