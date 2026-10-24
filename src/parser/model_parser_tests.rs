@@ -29820,6 +29820,24 @@ fn a_random_effect_reaching_one_scale_twice_is_custom() {
             "an alias fed into a conditional overwrite of a log-normal parameter, was LogNormal",
             "  CL = TVCL * exp(RE)\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD * exp(RE)\n  }",
         ),
+        // Dies under: `follow` dropping a `Custom` arrival from a reader that
+        // flows back into the parameter — `CL` ends `2·TVCL + 3·RE`.
+        (
+            "a transformed alias fed back into a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD + RE",
+        ),
+        // Dies under: that arrival counted once — here the reassignment adds
+        // no ETA of its own, and `CL = 2·TVCL + 2·RE`.
+        (
+            "a transformed alias that replaces a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD",
+        ),
+        // Dies under: `log_root` stopping at an off-product reader — `A` is
+        // `2·exp(RE)`, but `CL = A * A` is `4·exp(2·RE)` (#1724 review).
+        (
+            "an exp intermediate added to itself, then squared, was LogNormal",
+            "  EV = exp(RE)\n  A = EV + EV\n  CL = TVCL * A * A",
+        ),
     ]
     .into_iter()
     .map(|(l, t)| (format!("{v}{t}"), l))

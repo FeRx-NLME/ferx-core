@@ -670,8 +670,9 @@ variable without using its old value (`A = ETA`, then
 `if (WT > 70) { A = ETA }`), or `max(ETA, 0)`, which reads the ETA in a
 condition. An `exp` is evaluated once, so reading an `exp` intermediate more
 than once outside a product keeps the label: `EV = exp(ETA_CL)`,
-`CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. A sign never changes the CV, so
-a minus anywhere on the way keeps the label.
+`CL = EV + EV` is `2·exp(ETA_CL)`, log-normal (though `A = EV + EV`,
+`CL = A * A` is `4·exp(2·ETA_CL)`, custom). A sign never changes the CV, so a
+minus anywhere on the way keeps the label.
 
 An ETA that reaches the top of an intermediate variable is followed to where
 that variable is used, exactly as a kappa is (see

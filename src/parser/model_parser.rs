@@ -3166,9 +3166,11 @@ impl<'a> ScaleWalk<'a> {
     /// product twice (`log V = log TVV + 2η`). Any other read leaves the leaf
     /// on this `exp`, as the walk always has, and the `exp` is reached at most
     /// once however many such reads there are: it is evaluated once, so
-    /// `EV = exp(ETA_CL)`, `CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. The
-    /// definition's range, the consumer stop and the reader combination are
-    /// [`Self::root_scale`]'s.
+    /// `EV = exp(ETA_CL)`, `CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. Such
+    /// a reader is still followed into the products downstream of it, so
+    /// `A = EV + EV`, `CL = A * A` (`4·exp(2·ETA_CL)`) reaches `CL`'s product
+    /// twice. The definition's range, the consumer stop and the reader
+    /// combination are [`Self::root_scale`]'s.
     fn log_root(&self, def: usize) -> ScaleReach {
         if let Some(done) = &self.log_memo.borrow()[def] {
             return done.clone();
@@ -3190,6 +3192,7 @@ impl<'a> ScaleWalk<'a> {
             }
             if others > 0 {
                 reach_add(&mut r, here, others);
+                reach_sum(&mut r, &self.log_root(j));
             }
             r
         });
@@ -3211,7 +3214,10 @@ impl<'a> ScaleWalk<'a> {
     /// what flows back into a later definition of it ([`Self::is_own`]):
     /// `OLD = CL`, `if (WT > 70) { CL = OLD + ETA_CL }` ends on the
     /// reassignment's root through `OLD` as well (#1724), while `K10 = CL / V`
-    /// still does not change the label.
+    /// still does not change the label. A `Custom` arrival is on no
+    /// definition, so where the reader's own value goes on to reach a later
+    /// definition of the parameter, that definition is reached twice:
+    /// `OLD = CL * 2`, `CL = OLD + ETA_CL` is `2·TVCL + 3·ETA_CL`.
     fn follow(
         &self,
         def: usize,
@@ -3233,6 +3239,13 @@ impl<'a> ScaleWalk<'a> {
             {
                 let mut r = read(j, &is_var);
                 if consumed && *lhs != var {
+                    if r.iter().any(|(t, _)| *t == Terminal::Custom) {
+                        for (t, _) in self.root_scale(j) {
+                            if self.is_own(&t, var) {
+                                reach_add(&mut r, t, 2);
+                            }
+                        }
+                    }
                     r.retain(|(t, _)| self.is_own(t, var));
                 }
                 if !r.is_empty() {
