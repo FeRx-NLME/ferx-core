@@ -9407,7 +9407,7 @@ fn assert_first_eval_starts_at_preflight_mode(
     (model, pop, opts): (CompiledModel, Population, FitOptions),
     first_eval: FirstEval,
 ) {
-    use crate::estimation::inner_optimizer::CERTIFIED_IOV_STARTS;
+    use crate::estimation::inner_optimizer::record_inner_solves;
     let PreflightStart {
         params,
         mu_k,
@@ -9420,8 +9420,7 @@ fn assert_first_eval_starts_at_preflight_mode(
         "{label}: fixture: every κ̂ is 0, so a dropped κ block cannot show"
     );
     let starts = on_one_thread(|| {
-        CERTIFIED_IOV_STARTS.with(|s| s.borrow_mut().clear());
-        match first_eval {
+        record_inner_solves(|| match first_eval {
             FirstEval::ThroughOptimizer => {
                 let fit = optimize_population(&model, &pop, &model.default_params, &opts);
                 assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
@@ -9453,12 +9452,16 @@ fn assert_first_eval_starts_at_preflight_mode(
                 .4;
                 assert!(nll.is_finite(), "{label}: NLL {nll}");
             }
-        }
-        CERTIFIED_IOV_STARTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        })
+        .1
+        .starts
     });
     let mut n_iov = 0;
     for (i, subject) in pop.subjects.iter().enumerate() {
-        let mine: Vec<_> = starts.iter().filter(|s| s.0 == subject.id).collect();
+        let mine: Vec<_> = starts
+            .iter()
+            .filter(|s| s.certified && s.subject == subject.id)
+            .collect();
         if kappas[i].is_empty() {
             assert!(mine.is_empty(), "{label}: subject {} has no κ", subject.id);
             continue;
@@ -9470,7 +9473,7 @@ fn assert_first_eval_starts_at_preflight_mode(
             "{label}: subject {}: expected one certified start (the first evaluation's)",
             subject.id
         );
-        let (_, psi, mu, cells) = mine[0];
+        let (psi, mu, cells) = (&mine[0].psi, &mine[0].mu, &mine[0].kappas);
         let want_psi: Vec<u64> = ehs[i]
             .iter()
             .zip(mu)
@@ -10760,6 +10763,282 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
     };
     assert_eq!(scales(1.0), vec![(1, 1e-5)], "guard off");
     assert_eq!(scales(0.0), vec![], "guard rejects the start");
+}
+
+/// Which pass [`assert_next_pass_starts_at_previous_mode`] takes as the one whose EBEs the
+/// next pass must start from.
+enum WarmAnchor {
+    /// The first pass handed certified modes: the first evaluation of an optimizer that
+    /// takes the pre-flight's EBEs (NLopt, the built-in BFGS).
+    FirstCertified,
+    /// The first pass: Gauss–Newton's cold initial solve, which no pre-flight precedes.
+    FirstPass,
+}
+
+/// How many subjects of a [`assert_next_pass_starts_at_previous_mode`] check had κ cells,
+/// and how many had none.
+#[derive(Debug, PartialEq)]
+struct WarmCounts {
+    iov: usize,
+    plain: usize,
+}
+
+/// #2261: the pass after `anchor` starts every IOV subject at the anchor pass's whole mode,
+/// bit for bit — the BSV block at `η̂ + μ` and every cell at its κ̂ — and hands every subject
+/// `η̂` then every cell's κ̂ in the per-occasion layout; a subject with no κ is handed its
+/// `η̂` alone, as before. Before the fix the κ block of every start after the first was 0.
+fn assert_next_pass_starts_at_previous_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    anchor: WarmAnchor,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+) -> WarmCounts {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    let a = match anchor {
+        WarmAnchor::FirstCertified => {
+            rec.passes
+                .iter()
+                .find(|p| p.certified)
+                .unwrap_or_else(|| panic!("{label}: no pass was handed the pre-flight's modes"))
+                .pass
+        }
+        WarmAnchor::FirstPass => 0,
+    };
+    let b = a + 1;
+    let pass = |k: usize| -> Vec<_> { rec.passes.iter().filter(|p| p.pass == k).collect() };
+    let (prev, next) = (pass(a), pass(b));
+    assert_eq!(prev.len(), pop.subjects.len(), "{label}: pass {a}");
+    assert_eq!(
+        next.len(),
+        pop.subjects.len(),
+        "{label}: no pass after pass {a}"
+    );
+    assert!(!next[0].certified, "{label}: pass {b} is certified");
+    let mut counts = WarmCounts { iov: 0, plain: 0 };
+    for (i, subject) in pop.subjects.iter().enumerate() {
+        let (p, n) = (prev[i], next[i]);
+        assert_eq!(
+            (&p.subject, &n.subject),
+            (&subject.id, &subject.id),
+            "{label}: pass order"
+        );
+        if p.kappas.is_empty() {
+            counts.plain += 1;
+        } else {
+            counts.iov += 1;
+            // The fixture must make a dropped κ̂ visible: κ = 0 has to differ from the mode.
+            assert!(
+                p.kappas.iter().flatten().any(|&v| v != 0.0),
+                "{label}: subject {}: fixture: every κ̂ is 0, so a dropped κ block cannot show",
+                subject.id
+            );
+            let starts: Vec<_> = rec
+                .starts
+                .iter()
+                .filter(|s| s.pass == Some(b) && s.subject == subject.id)
+                .collect();
+            assert_eq!(starts.len(), 1, "{label}: subject {}", subject.id);
+            let s = starts[0];
+            let want_psi: Vec<u64> = p
+                .eta
+                .iter()
+                .zip(&s.mu)
+                .map(|(e, m)| (e + m).to_bits())
+                .collect();
+            assert_eq!(
+                bits(&s.psi),
+                want_psi,
+                "{label}: subject {}: η block of pass {b}'s start {:?} is not pass {a}'s η̂ \
+                 {:?} + μ {:?}",
+                subject.id,
+                s.psi,
+                p.eta,
+                s.mu
+            );
+            let got: Vec<Vec<u64>> = s.kappas.iter().map(|c| bits(c)).collect();
+            let want: Vec<Vec<u64>> = p.kappas.iter().map(|c| bits(c)).collect();
+            assert_eq!(
+                got, want,
+                "{label}: subject {}: κ block of pass {b}'s start {:?} is not pass {a}'s κ̂ {:?}",
+                subject.id, s.kappas, p.kappas
+            );
+        }
+        let want_init: Vec<u64> = p
+            .eta
+            .iter()
+            .chain(p.kappas.iter().flatten())
+            .map(|x| x.to_bits())
+            .collect();
+        let got_init = n
+            .init
+            .as_deref()
+            .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        assert_eq!(
+            bits(got_init),
+            want_init,
+            "{label}: subject {}: pass {b} was handed {got_init:?}, not pass {a}'s η̂ {:?} \
+             then κ̂ {:?}",
+            subject.id,
+            p.eta,
+            p.kappas
+        );
+    }
+    counts
+}
+
+/// The NLopt objective (`state.cached_etas`): its second evaluation starts at the first's.
+fn nlopt_second_eval(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 3,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// The built-in BFGS (`cached_etas`): its first line-search probe starts at the first
+/// evaluation's EBEs.
+fn bfgs_first_probe(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::Bfgs,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// Gauss–Newton: its first trial step starts at the initial solve's EBEs.
+fn gn_first_trial(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        method: EstimationMethod::FoceGn,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit =
+        crate::estimation::gauss_newton::run_foce_gn(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_one_level() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov nlopt",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    // Both sides of the "subject has κ cells" gate: the `NO_OCC` subject is handed `η̂`
+    // alone.
+    assert_eq!(
+        counts,
+        WarmCounts { iov: 2, plain: 1 },
+        "warfarin_iov nlopt"
+    );
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_nested_levels() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "nested_levels_3 nlopt",
+        nested_levels_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "nested_levels_3 nlopt: {counts:?}");
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_kappa_correlation() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov ar1 nlopt",
+        kappa_correlation_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "warfarin_iov ar1 nlopt: {counts:?}");
+}
+
+#[test]
+fn bfgs_probe_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov bfgs",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        bfgs_first_probe,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov bfgs");
+}
+
+#[test]
+fn gauss_newton_trial_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov gn",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstPass,
+        gn_first_trial,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov gn");
+}
+
+/// #2261, the other side of the gate on a whole model: with no κ declared anywhere, every
+/// optimizer hands each subject its `η̂` alone, bit for bit as before the change.
+#[test]
+fn non_iov_model_is_handed_eta_hat_alone() {
+    let fixture = || {
+        load_iov_fixture(
+            include_str!("../../examples/warfarin.ferx"),
+            "data/warfarin.csv",
+            3,
+        )
+    };
+    assert_eq!(fixture().0.n_kappa, 0, "fixture: no κ");
+    let runs: [(
+        &str,
+        WarmAnchor,
+        fn(&CompiledModel, &Population, &FitOptions),
+    ); 3] = [
+        ("nlopt", WarmAnchor::FirstCertified, nlopt_second_eval),
+        ("bfgs", WarmAnchor::FirstCertified, bfgs_first_probe),
+        ("gn", WarmAnchor::FirstPass, gn_first_trial),
+    ];
+    for (label, anchor, run) in runs {
+        let counts = assert_next_pass_starts_at_previous_mode(label, fixture(), anchor, run);
+        assert_eq!(counts, WarmCounts { iov: 0, plain: 3 }, "warfarin {label}");
+    }
+}
+
+/// #2261: the off-width debug assertion covers the nested-level path too, which compacts
+/// a joint warm start and before cut any other width to `η̂`.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "is neither η̂")]
+fn nested_level_warm_start_of_another_width_panics_in_debug() {
+    let (model, pop, _) = nested_levels_fixture();
+    let subject = &pop.subjects[0];
+    let off = vec![0.0; model.n_eta + 1];
+    assert_ne!(
+        off.len(),
+        crate::stats::stacked_layout::stacked_width(
+            model.n_eta,
+            model.n_kappa,
+            crate::stats::stacked_layout::group_count(subject)
+        ),
+        "fixture: n_eta + 1 must be off-width"
+    );
+    crate::estimation::inner_optimizer::find_ebe(
+        &model,
+        subject,
+        &model.default_params,
+        200,
+        1e-5,
+        Some(&off),
+        None,
+        0,
+    );
 }
 
 // ── nlopt_scale_vector: large-magnitude identity-packed θ (#2146) ────────

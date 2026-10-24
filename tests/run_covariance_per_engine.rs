@@ -349,6 +349,17 @@ fn warfarin_iov_focei() {
     );
 }
 
+/// κ̂ per group of each nested level, which the optimizer's warm caches carry since #2261.
+#[test]
+fn nested_levels_3_focei() {
+    check_row(
+        "nonmem_anchor/nested_levels_3.ferx",
+        "nonmem_anchor/nested_levels_3.csv",
+        &[FoceI],
+        Ebes::Cold,
+    );
+}
+
 #[test]
 fn warfarin_gn() {
     check_row(WARFARIN.0, WARFARIN.1, &[FoceGn], Ebes::WarmStarted);

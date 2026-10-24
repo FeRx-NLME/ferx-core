@@ -1782,18 +1782,77 @@ thread_local! {
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// One certified IOV start (`InnerSolvePolicy::init_is_mode`) as `find_ebe_iov` built it:
-/// the subject, the BSV block in ψ-space (`η + μ`), the `μ` it was shifted by, and the
-/// per-cell κ vectors (#2217).
+/// One IOV start as `find_ebe_iov` built it (#2217, #2261).
 #[cfg(test)]
-pub(crate) type CertifiedIovStart = (String, Vec<f64>, Vec<f64>, Vec<Vec<f64>>);
+#[derive(Debug, Clone)]
+pub(crate) struct IovStart {
+    /// The population pass ([`PassRecord::pass`]) the solve ran in; `None` for a solve
+    /// outside one (a per-subject finite-difference re-solve, say).
+    pub(crate) pass: Option<usize>,
+    pub(crate) subject: String,
+    /// Whether the start was certified a mode (`InnerSolvePolicy::init_is_mode`).
+    pub(crate) certified: bool,
+    /// The BSV block in ψ-space (`η + μ`).
+    pub(crate) psi: Vec<f64>,
+    /// The `μ` the BSV block was shifted by.
+    pub(crate) mu: Vec<f64>,
+    /// The per-cell κ vectors.
+    pub(crate) kappas: Vec<Vec<f64>>,
+}
 
-// Every certified IOV start solved on this thread, so a test can read the vector the first
-// outer evaluation actually started from (#2217).
+/// One subject of one population pass (`run_inner_loop_warm_map_impl`): the warm start it
+/// was handed and the EBE it returned (#2261).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PassRecord {
+    /// The pass's index among the passes of the recording, from 0.
+    pub(crate) pass: usize,
+    pub(crate) subject: String,
+    /// Whether the pass's warm starts were certified modes (`InnerSolvePolicy::init_is_mode`).
+    pub(crate) certified: bool,
+    pub(crate) init: Option<Vec<f64>>,
+    pub(crate) eta: Vec<f64>,
+    /// Per-cell κ̂; empty for a subject with no κ.
+    pub(crate) kappas: Vec<Vec<f64>>,
+}
+
+/// What [`record_inner_solves`] saw.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct InnerRecording {
+    pub(crate) starts: Vec<IovStart>,
+    pub(crate) passes: Vec<PassRecord>,
+    n_passes: usize,
+    current_pass: Option<usize>,
+}
+
+// The recording [`record_inner_solves`] runs on this thread; `None` (nothing recorded)
+// outside it, so the inner loops of every other test leave nothing behind.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static CERTIFIED_IOV_STARTS: std::cell::RefCell<Vec<CertifiedIovStart>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static INNER_RECORDING: std::cell::RefCell<Option<InnerRecording>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, recording every IOV start and every population pass on this thread, so a
+/// test can read where an outer evaluation's inner solves started and what the previous
+/// one returned (#2217, #2261). Call it on a one-thread pool: the solves of a pass run on
+/// the pool's workers, and only this thread's are seen.
+#[cfg(test)]
+pub(crate) fn record_inner_solves<R>(f: impl FnOnce() -> R) -> (R, InnerRecording) {
+    INNER_RECORDING.with(|r| *r.borrow_mut() = Some(InnerRecording::default()));
+    let out = f();
+    let recording = INNER_RECORDING.with(|r| r.borrow_mut().take());
+    (out, recording.expect("the recording outlives `f`"))
+}
+
+#[cfg(test)]
+fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
+    INNER_RECORDING.with(|r| {
+        if let Some(rec) = r.borrow_mut().as_mut() {
+            f(rec);
+        }
+    });
 }
 
 // Solves on this thread that entered the guarded cold-start multi-start in `find_ebe_solve`,
@@ -2749,9 +2808,19 @@ fn find_ebe_iov(
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
     // A joint warm start arrives in the per-occasion layout (`η̂` then each cell's κ̂,
-    // as `EbeResult` reports them); under nested levels it is compacted first.
+    // as `EbeResult` reports them); under nested levels it is compacted first. Any other
+    // width is a caller that lost the layout: below, it would be silently cut to `η̂`
+    // with κ restarted at 0 (#2261), so it is loud in debug on both paths.
+    let joint_width = stacked_width(n_eta, n_kappa, k_occasions);
+    debug_assert!(
+        eta_init.is_none_or(|w| w.len() == n_eta || w.len() == joint_width),
+        "subject {}: IOV warm start of width {} is neither η̂ ({n_eta}) nor η̂ and every \
+         cell's κ̂ ({joint_width})",
+        subject.id,
+        eta_init.map_or(0, <[f64]>::len),
+    );
     let nested_warm: Option<Vec<f64>> = match (&nested, eta_init) {
-        (Some(n), Some(w)) if w.len() == stacked_width(n_eta, n_kappa, k_occasions) => {
+        (Some(n), Some(w)) if w.len() == joint_width => {
             let cells: Vec<&[f64]> = (0..k_occasions)
                 .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
                 .collect();
@@ -2766,16 +2835,16 @@ fn find_ebe_iov(
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
     #[cfg(test)]
-    if init_is_mode {
-        CERTIFIED_IOV_STARTS.with(|s| {
-            s.borrow_mut().push((
-                subject.id.clone(),
-                x[..n_eta].to_vec(),
-                mu.clone(),
-                to_kappas(&x),
-            ))
-        });
-    }
+    with_recording(|r| {
+        r.starts.push(IovStart {
+            pass: r.current_pass,
+            subject: subject.id.clone(),
+            certified: init_is_mode,
+            psi: x[..n_eta].to_vec(),
+            mu: mu.clone(),
+            kappas: to_kappas(&x),
+        })
+    });
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -5953,8 +6022,9 @@ fn cancelled_ebe_placeholder(
     subject: &Subject,
     init: Option<&[f64]>,
 ) -> EbeResult {
+    // A joint warm start (`η̂` then each cell's κ̂, #2261) leads with `η̂`.
     let eta = match init {
-        Some(e) if e.len() == model.n_eta => DVector::from_column_slice(e),
+        Some(e) if e.len() >= model.n_eta => DVector::from_column_slice(&e[..model.n_eta]),
         _ => DVector::zeros(model.n_eta),
     };
     let n_occ = if model.n_kappa > 0 {
@@ -6000,6 +6070,14 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
 ) {
     use rayon::prelude::*;
 
+    #[cfg(test)]
+    let mut pass = 0;
+    #[cfg(test)]
+    with_recording(|r| {
+        pass = r.n_passes;
+        r.n_passes += 1;
+        r.current_pass = Some(pass);
+    });
     let results: Vec<(EbeResult, T)> = population
         .subjects
         .par_iter()
@@ -6035,6 +6113,20 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
             (ebe, extra)
         })
         .collect();
+    #[cfg(test)]
+    with_recording(|r| {
+        r.current_pass = None;
+        for (i, ((ebe, _), subject)) in results.iter().zip(&population.subjects).enumerate() {
+            r.passes.push(PassRecord {
+                pass,
+                subject: subject.id.clone(),
+                certified: policy.init_is_mode,
+                init: prev_etas.map(|pe| pe[i].as_slice().to_vec()),
+                eta: ebe.eta.as_slice().to_vec(),
+                kappas: ebe.kappas.iter().map(|k| k.as_slice().to_vec()).collect(),
+            });
+        }
+    });
 
     let stats = InnerLoopStats {
         n_unconverged: results
