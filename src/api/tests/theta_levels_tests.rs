@@ -4406,6 +4406,7 @@ mod absorption {
     /// The layout is the `none` layout of the levels the data shows
     /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],
     /// so a model the binder refuses can still be measured.
+    #[derive(Clone)]
     pub(super) struct Jac {
         xb: DMatrix<f64>,
         xo: DMatrix<f64>,
@@ -4417,6 +4418,9 @@ mod absorption {
         /// Every other level block (#1963): its name, its level labels, and
         /// the `xo` columns that are its raw per-level θ, in level order.
         others: Vec<(String, Vec<String>, Vec<usize>)>,
+        /// The block's `FIX` levels, by position (#1992): their coded columns
+        /// are dropped ([`coding_of_fixed`]). Empty from [`jacobian_at`].
+        fixed: Vec<usize>,
     }
 
     impl Jac {
@@ -4425,16 +4429,25 @@ mod absorption {
         /// `X_other · C`, by the chain rule `∂y/∂β = ∂y/∂θ_level · C`. A block
         /// not named stays raw, as under `none`.
         pub(super) fn coded(&self, contrasts: &[(&str, LevelContrast)]) -> Jac {
+            let with: Vec<(&str, LevelContrast, &[usize])> =
+                contrasts.iter().map(|&(n, c)| (n, c, &[][..])).collect();
+            self.coded_fixed(&with)
+        }
+
+        /// [`Jac::coded`] with some levels of each named block `FIX` (#1992):
+        /// a fixed level has no θ, so its coded column is dropped
+        /// ([`coding_of_fixed`]).
+        pub(super) fn coded_fixed(&self, contrasts: &[(&str, LevelContrast, &[usize])]) -> Jac {
             let mut keep: Vec<usize> = (0..self.xo.ncols()).collect();
             let mut parts: Vec<DMatrix<f64>> = Vec::new();
             for (name, labels, cols) in &self.others {
-                let Some(&(_, c)) = contrasts.iter().find(|(n, _)| n == name) else {
+                let Some(&(_, c, fixed)) = contrasts.iter().find(|(n, ..)| n == name) else {
                     continue;
                 };
                 keep.retain(|k| !cols.contains(k));
                 let raw =
                     DMatrix::from_fn(self.xo.nrows(), cols.len(), |r, k| self.xo[(r, cols[k])]);
-                parts.push(raw * coding_of(labels, c));
+                parts.push(raw * coding_of_fixed(labels, c, fixed));
             }
             let kept = DMatrix::from_fn(self.xo.nrows(), keep.len(), |r, k| self.xo[(r, keep[k])]);
             let mut all: Vec<&DMatrix<f64>> = vec![&kept];
@@ -4447,7 +4460,15 @@ mod absorption {
                 labels: self.labels.clone(),
                 one_column: self.one_column,
                 others: Vec::new(),
+                fixed: self.fixed.clone(),
             }
+        }
+
+        /// This Jacobian with the block's levels at positions `fixed` `FIX`
+        /// (#1992).
+        pub(super) fn with_fixed(mut self, fixed: Vec<usize>) -> Jac {
+            self.fixed = fixed;
+            self
         }
     }
 
@@ -4663,12 +4684,31 @@ mod absorption {
             one_column: !labels[0].contains(','),
             labels,
             others,
+            fixed: Vec::new(),
         }
     }
 
-    /// The coding matrix of `contrast` over the per-level columns.
+    /// The coding matrix of `contrast` over the per-level columns, the block's
+    /// `FIX` levels' columns dropped.
     fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
-        coding_of(&j.labels, contrast)
+        coding_of_fixed(&j.labels, contrast, &j.fixed)
+    }
+
+    /// [`coding_of`] with the levels at positions `fixed` `FIX` (#1992): each
+    /// column is one θ of the bound model, the level it carries `+1`, and a
+    /// fixed level's θ is no direction, so its column goes. Under sum-to-zero a
+    /// free level keeps `e_i − e_last`, and the dependent last level — no θ of
+    /// its own — moves through the free ones whatever `fixed` says of it.
+    pub(super) fn coding_of_fixed(
+        labels: &[String],
+        contrast: LevelContrast,
+        fixed: &[usize],
+    ) -> DMatrix<f64> {
+        let c = coding_of(labels, contrast);
+        let keep: Vec<usize> = (0..c.ncols())
+            .filter(|&k| !fixed.iter().any(|&i| c[(i, k)] == 1.0))
+            .collect();
+        DMatrix::from_fn(c.nrows(), keep.len(), |r, k| c[(r, keep[k])])
     }
 
     /// [`coding`] for a block whose levels are `labels`; a block is one-column
@@ -8561,6 +8601,191 @@ mod absorption {
         assert!(wrong.is_empty(), "mean carried:\n{}", wrong.join("\n"));
     }
 
+    // ── #1992: a `FIX` level codes no column ────────────────────────────────
+    //
+    // A block can be partly fixed — through `ModelParameters::theta_fixed`, or a
+    // θ ferx froze (#1891) — though no model text spells it, so these fixtures
+    // set the flag on the `none` model and call `carried` directly. Under
+    // sum-to-zero a fixed non-last level used to be coded `−col_last`: a column
+    // for a θ that does not exist, which widens the span and can refuse a model
+    // the joint oracle identifies. Binder-only, on the compartment-free
+    // predictor: no fit, no FD or dual engine.
+
+    /// Three studies of one subject each, in the arms layout ([`arms_pop`]'s),
+    /// with `D1`, the 0/1 indicator of study 1, and `A1`, of arm `OCC = 1`, on
+    /// every record.
+    fn three_pop() -> Population {
+        let mut p = occ_pop(3, 1, &T6, 3, true);
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                let occ = m["OCC"];
+                m.insert("D1".to_string(), f64::from(u8::from(study == 1.0)));
+                m.insert("A1".to_string(), f64::from(u8::from(occ == 1.0)));
+            }
+        }
+        p
+    }
+
+    /// [`carried`] on `ETA_E0` for `PLACEBO` of `text` under sum-to-zero, on
+    /// the `none` model with the θ named in `fixed` set `FIX`, each other block
+    /// named in `others` coded sum-to-zero.
+    fn carried_fixed(
+        text: &str,
+        pop0: &Population,
+        fixed: &[&str],
+        others: &[&str],
+    ) -> super::super::Carried {
+        let none = regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
+            .unwrap()
+            .replace_all(text, ", contrast = none]")
+            .into_owned();
+        let decls = parse_full_model(&none)
+            .unwrap()
+            .model
+            .theta_blocks()
+            .level_blocks()
+            .to_vec();
+        let levels: Vec<Vec<Level>> = decls
+            .iter()
+            .map(|d| discover_levels(d, pop0).unwrap())
+            .collect();
+        let mut pop = pop0.clone();
+        let mut parsed = parse_full_model(&none).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &none, &mut pop, &none_layout(&none, pop0))
+            .expect("from_fit");
+        let mut model = parsed.model;
+        for name in fixed {
+            let k = model.theta_names.iter().position(|n| n == name);
+            let k = k.unwrap_or_else(|| panic!("no θ {name}: {:?}", model.theta_names));
+            model.default_params.theta_fixed[k] = true;
+        }
+        let at = |name: &str| decls.iter().position(|d| d.name() == name).unwrap();
+        let coded: Vec<super::super::Coded> = others
+            .iter()
+            .map(|o| super::super::Coded {
+                decl: &decls[at(o)],
+                levels: &levels[at(o)],
+                contrast: LevelContrast::SumToZero,
+                groups: super::super::assign_groups(
+                    &decls[at(o)],
+                    &levels[at(o)],
+                    LevelContrast::SumToZero,
+                ),
+            })
+            .collect();
+        let p = at("PLACEBO");
+        super::super::carried(
+            &model,
+            &decls[p],
+            &levels[p],
+            &pop,
+            "ETA_E0",
+            false,
+            LevelContrast::SumToZero,
+            &coded,
+        )
+    }
+
+    /// #1992, the block's own coding. `E0 = TVE0 * FAC + TVB * D1 + PLACEBO +
+    /// ETA_E0` on three one-subject studies: `TVB * D1` is study 1's level
+    /// column. With every level free, sum-to-zero codes `c1 − c3, c2 − c3`,
+    /// which with `TVB` span every study: `ETA_E0` is absorbed (`Held`). With
+    /// level 1 `FIX` the block codes `c2 − c3` alone, and `TVB`'s `c1` adds
+    /// nothing to reach `ETA_E0`'s mean: identified, and `carried` agrees with
+    /// the joint oracle on the coding with the fixed column dropped. The
+    /// straddle: the oracle on the old coding — level 1's column zeroed but
+    /// still coded, i.e. `−c3` — absorbs, which is the false refusal.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// level-1 row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_its_own_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let r = row_1836("fix", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
+        let text = with_thetas(row_text(&r)("sum_to_zero"), &[("TVB", 0.5)]);
+        let j = jacobian(&with_thetas(row_text(&r)("none"), &[("TVB", 0.5)]), &pop);
+        assert_eq!(j.labels.len(), 3, "{:?}", j.labels);
+        let stz = LevelContrast::SumToZero;
+        let (free, _) = joint_oracle(&j, stz);
+        let (fixed, n_fixed) = joint_oracle(&j.clone().with_fixed(vec![0]), stz);
+        let mut old = j.clone();
+        old.xb.column_mut(0).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old, stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && n_fixed == 1 && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with level 1 FIX \
+             ({n_fixed} coded), {old_fixed:?} on the old coding"
+        );
+        let level = |l: usize| format!("PLACEBO[{}]", j.labels[l]);
+        let got = [
+            ("free", carried_fixed(&text, &pop, &[], &[])),
+            ("level 1 FIX", carried_fixed(&text, &pop, &[&level(0)], &[])),
+        ];
+        assert_eq!(
+            got,
+            [
+                ("free", Carried::Held),
+                ("level 1 FIX", Carried::Identified),
+            ]
+        );
+    }
+
+    /// #1992, another block's coding (#1985 applies it to every first-pass
+    /// block). `E0 = P_BASE + B2 + TVC * A1 + PLACEBO + ETA_E0`, `B2[OCC]`
+    /// three arms coded sum-to-zero, `TVC * A1` arm 1's column. With B2 free its
+    /// coded `b1 − b3, b2 − b3` and `TVC`'s `b1` sum to the levels' mean, so
+    /// `PLACEBO`'s sum-to-zero leaves `ETA_E0` nothing: `Held`. With B2's arm 1
+    /// `FIX` the coding is `b2 − b3`, which with `b1` does not reach the mean:
+    /// identified, in agreement with the joint oracle on B2 coded with that
+    /// column dropped ([`Jac::coded_fixed`]). The straddle: on the old coding
+    /// (`b1` zeroed, still coded, `−b3`) the oracle absorbs.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// fixed row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_another_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let decl = level_decl("B2[OCC]", "sum_to_zero");
+        let text = |c: &str| {
+            with_thetas(
+                two_block(P_BASE, " + B2 + TVC * A1", Some(&decl), false, c),
+                &[("TVC", 0.5)],
+            )
+        };
+        let j = jacobian(&text("none"), &pop);
+        let stz = LevelContrast::SumToZero;
+        let b2 = j.others.iter().find(|(n, ..)| n == "B2").unwrap();
+        assert_eq!(b2.1.len(), 3, "{:?}", b2.1);
+        let (free, _) = joint_oracle(&j.coded(&[("B2", stz)]), stz);
+        let (fixed, _) = joint_oracle(&j.coded_fixed(&[("B2", stz, &[0])]), stz);
+        let mut old = j.clone();
+        old.xo.column_mut(b2.2[0]).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old.coded(&[("B2", stz)]), stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with arm 1 FIX, \
+             {old_fixed:?} on the old coding"
+        );
+        let arm1 = format!("B2[{}]", b2.1[0]);
+        let got = [
+            (
+                "free",
+                carried_fixed(&text("sum_to_zero"), &pop, &[], &["B2"]),
+            ),
+            (
+                "arm 1 FIX",
+                carried_fixed(&text("sum_to_zero"), &pop, &[&arm1], &["B2"]),
+            ),
+        ];
+        assert_eq!(
+            got,
+            [("free", Carried::Held), ("arm 1 FIX", Carried::Identified)]
+        );
+    }
+
     /// T3 (#1963). Declaration order does not decide: T1's and T2's level
     /// rows with B2 declared before `PLACEBO` give, cell by cell, the verdict
     /// they give with B2 after it.
@@ -8888,8 +9113,9 @@ mod absorption {
     /// three explicit contrasts bind); a kappa measured over the whole subject
     /// as one unit, its first occasion's (the twin is refused). Equivalent on
     /// this closed form, so not killed: the kappa bumped on every occasion at
-    /// once, and a unit's columns taken from every level of the subject —
-    /// a kappa and a level move only their own occasion's records here.
+    /// once, and a unit's columns restricted to its own records or to its own
+    /// levels — a kappa and a level move only their own occasion's records
+    /// here. The ODE periods fixtures of `carry_over` kill the last two (#1877).
     #[test]
     fn a_measured_kappa_absorption() {
         let pop = arms_pop();
@@ -12842,6 +13068,10 @@ mod written_time_keys;
 /// A level block against kappas at nested levels (#2034).
 #[path = "theta_levels_nested_units_tests.rs"]
 mod nested_units;
+
+/// The span certificate on an ODE model's carried-over state (#1877).
+#[path = "theta_levels_carry_over_tests.rs"]
+mod carry_over;
 
 mod carried_scale {
     use super::*;

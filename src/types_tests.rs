@@ -733,6 +733,61 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
     }
 }
 
+/// #2341: every outer-optimizer verdict that demotes `converged` without the words "did
+/// not converge" still classifies `(Critical, Convergence)`. Each row is the emitting
+/// function's own text — `profiled_verdict_warning` for the profiled path's four ends,
+/// `polish_leg_cap_warning` for BOBYQA's leg cap — not a copy, so a reworded message that
+/// drops the phrase the arm keys on fails here naming the row. Before #2341 all five
+/// classified `(Warning, General)`.
+///
+/// The other side of the gate: the SS-equilibration cycle-cap warning says "without
+/// converging" too, and is not an optimizer verdict, so widening the arm's
+/// "optimizer stopped without converging" to the bare phrase reddens the last assert. The
+/// straddle is asserted, so that row cannot silently stop containing the phrase.
+#[test]
+fn classify_warning_outer_optimizer_verdicts_are_convergence() {
+    use crate::estimation::outer_optimizer::{polish_leg_cap_warning, PolishEnd};
+    use crate::estimation::profile::profiled_verdict_warning;
+    use nlopt::{FailState as F, SuccessState as S};
+    let profiled = |end, last, converged| {
+        profiled_verdict_warning(end, &last, converged).expect("an unconverged verdict warns")
+    };
+    let rows = [
+        // profile.rs `profiled_verdict_warning`: leg cap, budget spent before a leg, budget
+        // spent during one, and an unverified stop.
+        profiled(
+            PolishEnd::LegCapReached { last_gain: 2.1e-5 },
+            Ok((S::XtolReached, 1.0)),
+            false,
+        ),
+        profiled(PolishEnd::BudgetSpent, Ok((S::FtolReached, 1.0)), false),
+        profiled(PolishEnd::Settled, Ok((S::MaxEvalReached, 1.0)), false),
+        profiled(PolishEnd::NotNeeded, Err((F::Failure, 1.0)), false),
+        // outer_optimizer.rs, BOBYQA's polish-leg cap.
+        polish_leg_cap_warning(0.25),
+    ];
+    for msg in &rows {
+        for raw in [msg.clone(), format!("[FOCEI] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+        }
+    }
+
+    let ss = "Steady-state (SS=1) equilibration reached the 200-cycle cap without converging \
+              (per-cycle carryover ratio ≈ 0.990); the returned SS trough is approximately \
+              38% below the true periodic steady state.";
+    assert!(ss.contains("without converging"), "{ss}");
+    assert_ne!(
+        classify_warning(ss).category.as_str(),
+        "convergence",
+        "{ss}"
+    );
+}
+
 #[test]
 fn classify_warning_flat_parameter_is_warning() {
     let w = classify_warning(

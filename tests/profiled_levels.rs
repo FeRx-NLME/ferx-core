@@ -581,3 +581,61 @@ fn a_profiled_fit_reports_the_unprofiled_parameter_count() {
         prof.theta_fixed
     );
 }
+
+// ── P2: which contrast `auto` takes on S1's shape, by the count (#2326) ─────────
+
+const S1: &str = "tests/data/profile_mbma/s1_profile.ferx";
+/// The first 10 studies of S1's `s100t8.csv` (same simulator, same seed).
+const S1_DATA_10: &str = "tests/data/profile_mbma/s10t8.csv";
+
+/// S1's `[STUDY, TIME]` block over two arms at each visit, with and without the study
+/// baseline `ETA_E0`. Both arms read `ETA_E0`, so the block absorbs it and `auto` takes
+/// `sum_to_zero_within`: 80 levels less one per study, **70**. `ETA_EMAX` is read by the
+/// drug arm only, so the block cannot reproduce it (#2131): without `ETA_E0` nothing is
+/// absorbed and `auto` takes global `sum_to_zero`, **79**. The other contrast would count
+/// 85 with `ETA_E0` and 75 without. Mutations (measured): calling co-timed arms with a
+/// different `TRT` replicates again (the pre-#2305 rule) refuses the first model ("absorb
+/// `ETA_E0` and `ETA_EMAX` together"); resolving the absorbed arm of `auto` to
+/// `sum_to_zero` refuses it as not identified. Disabling that arm alone does not reach
+/// this test: `admissible` then sends `auto` to `sum_to_zero_within` anyway. S1 itself
+/// (`profiled_levels_fits.rs`) leans on the first count: under global `sum_to_zero` its
+/// 800 levels are one coupled group and the fit no longer fits the slow tier (#2326).
+#[test]
+fn s1_auto_contrast_splits_per_study_only_when_a_both_arm_eta_is_absorbed() {
+    let count = |with_e0: bool| {
+        let text = std::fs::read_to_string(root().join(S1)).unwrap();
+        let text = if with_e0 {
+            text
+        } else {
+            let edited = text
+                .replace("  omega ETA_E0 ~ 0.1\n", "")
+                .replace("E0 = TVE0 + ETA_E0", "E0 = TVE0");
+            assert_ne!(edited, text, "fixture moved");
+            edited
+        };
+        let path = unique_temp("ferx_profiled_levels_s1");
+        std::fs::write(&path, text).unwrap();
+        let p = ferx_core::prepare_run(
+            path.to_str().unwrap(),
+            Some(root().join(S1_DATA_10).to_str().unwrap()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(p.init_params.omega.eta_names.len(), 1 + with_e0 as usize);
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..p.parsed.fit_options.clone()
+        };
+        let f = ferx_core::fit(&p.parsed.model, &p.population, &p.init_params, &opts)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(f.profiled_blocks, ["PLACEBO"]);
+        f.n_parameters
+    };
+    assert_eq!(
+        count(true),
+        76,
+        "3 θ, 70 levels (sum_to_zero_within), 2 ω, σ"
+    );
+    assert_eq!(count(false), 84, "3 θ, 79 levels (sum_to_zero), ω, σ");
+}
