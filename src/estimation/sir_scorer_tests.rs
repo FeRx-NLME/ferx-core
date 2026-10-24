@@ -563,6 +563,57 @@ fn mixture_override_values_refusals_carry_their_codes() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// #1765 review r4: a fit that records `mixture_overrides` has a stored counterpart for
+/// the packed vector's override segment, so `fit_packed_estimate` reuses the vector only
+/// when that segment unpacks bit-equal to the recorded values. Rows on one fit: the fit's
+/// own fields are `Usable`; the recorded value one ULP up is `Stale` (`run_covariance`
+/// would otherwise centre on the packed vector's override while `run_sir` uses the
+/// recorded one); the field absent (an R-built or pre-#1765 fit) is `Usable` on length
+/// alone, as before.
+///
+/// Mutations — the override comparison removed: the ULP row is `Usable`; the comparison
+/// applied when the field is absent: the legacy row is `Stale`.
+#[test]
+fn fit_packed_estimate_checks_recorded_mixture_overrides() {
+    use crate::estimation::uncertainty_samples::{fit_packed_estimate, PackedEstimate};
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let template = &model.default_params;
+    assert!(
+        fit.mixture_overrides.is_some(),
+        "fixture premise: the fit records its override values"
+    );
+    let mut edited = fit.clone();
+    let x = &mut edited.mixture_overrides.as_mut().unwrap()[0];
+    *x = f64::from_bits(x.to_bits() + 1);
+    let mut legacy = fit.clone();
+    legacy.mixture_overrides = None;
+    let mut wrong = Vec::new();
+    for (what, f, usable) in [
+        ("the fit's own", &fit, true),
+        ("override one ULP up", &edited, false),
+        ("no recorded overrides", &legacy, true),
+    ] {
+        let got = fit_packed_estimate(f, template);
+        let ok = if usable {
+            matches!(got, PackedEstimate::Usable(_))
+        } else {
+            got == PackedEstimate::Stale
+        };
+        if !ok {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// #1765 review: SAEM holds every per-class Σ override at its initial value and marks it
 /// `FIX` (later stages of the chain inherit the flag), so the parameters rebuilt from a fit
 /// whose chain ran SAEM carry the overrides `FIX`, and the standalone covariance / SIR steps

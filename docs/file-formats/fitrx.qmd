@@ -398,8 +398,8 @@ ferx-r; all of those load it as `None`. VI writes it too, but its vector never
 matches its stored Ω (one ULP off,
 [#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)), so a reloaded VI
 fit takes the fallback. Consumers use it only when it unpacks
-bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV and correlations
-under the supplied model. An edited bundle, or a model with another layout of
+bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV, correlations and,
+when the bundle has that key, `mixture_overrides` under the supplied model. An edited bundle, or a model with another layout of
 the same length, falls back to the stored estimates; a `[mixture]` fit with an
 override then reads its override values from `mixture_overrides`, and is refused
 only when that key is absent too. The format version did not change.

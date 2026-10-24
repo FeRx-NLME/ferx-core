@@ -159,7 +159,8 @@ pub fn fitted_params_from_result(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PackedEstimate<'a> {
     /// Has this model's packed length and unpacks bit-for-bit to the fit's θ, Ω, σ,
-    /// Ω_IOV and ρ: the optimizer's own point, safe to reuse as the centre.
+    /// Ω_IOV, ρ and recorded `[mixture]` override values: the optimizer's own point,
+    /// safe to reuse as the centre.
     Usable(&'a [f64]),
     /// The fit carries none (SAEM / IMP / Bayes, a fit built in R, a `.fitrx`
     /// bundle saved before #1815 or written by ferx-r).
@@ -183,7 +184,9 @@ pub(crate) enum PackedEstimate<'a> {
 /// unpack), and it is what makes the vector safe to persist: a `.fitrx` bundle
 /// whose estimates were edited, or a model of the same length with another layout,
 /// is `Stale`, never evaluated at the wrong centre. A `[mixture]` override segment
-/// has no stored counterpart, so only its length is checked.
+/// must unpack bit-equal to [`FitResult::mixture_overrides`] when the fit records
+/// them (#1765); a fit without that field has no stored counterpart for the segment,
+/// so only its length is checked.
 pub(crate) fn fit_packed_estimate<'a>(
     fit: &'a FitResult,
     template: &ModelParameters,
@@ -231,7 +234,16 @@ pub(crate) fn fit_packed_estimate<'a>(
         &rho(&p.residual_correlations),
         &rho(&fit.residual_correlations),
     );
-    if theta_ok && omega_ok && sigma_ok && iov_ok && rho_ok {
+    // A fit that records its `[mixture]` override values (#1765) has the segment's
+    // counterpart too; one without them (R-built, pre-#1765) is checked by length only.
+    let mixture_ok = fit.mixture_overrides.as_deref().is_none_or(|recorded| {
+        let unpacked = p
+            .mixture
+            .as_ref()
+            .and_then(crate::estimation::parameterization::mixture_override_values);
+        unpacked.is_some_and(|u| same(&u, recorded))
+    });
+    if theta_ok && omega_ok && sigma_ok && iov_ok && rho_ok && mixture_ok {
         PackedEstimate::Usable(v)
     } else {
         PackedEstimate::Stale

@@ -1059,6 +1059,46 @@ fn mixture_override_reloaded_without_packed_estimate_is_identical_to_in_fit() {
     assert_sir_identical(&s, &r, "run_sir (no packed vector) vs in-fit");
 }
 
+/// #1765 review r4. A FOCEI override fit whose recorded override was edited after the fit,
+/// with its (now conflicting) packed vector kept. `run_covariance` must centre on the
+/// recorded override, as `run_sir` does, so it equals `run_covariance` on the same fit with
+/// the packed vector removed, and differs from the in-fit covariance at the old override.
+///
+/// Mutation — `fit_packed_estimate` stops comparing `mixture_overrides`: the packed vector
+/// reads as usable, `run_covariance` evaluates at the old override and lands on the in-fit
+/// covariance, so the first assertion dies.
+#[test]
+fn run_covariance_centres_on_an_edited_mixture_override() {
+    let (model, pop, r) = mixture_sir_fit(true);
+    let mut edited = r.clone();
+    edited
+        .mixture_overrides
+        .as_mut()
+        .expect("recorded override")[0] *= 1.25;
+    assert!(
+        edited.packed_estimate.is_some(),
+        "fixture keeps the packed vector"
+    );
+    let mut stripped = edited.clone();
+    stripped.packed_estimate = None;
+
+    let c = run_covariance(&edited, Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_covariance on an edited override fit");
+    let want = run_covariance(&stripped, Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_covariance on the edited fit without its packed vector");
+    assert_cov_identical(&c, &want, "edited override: packed kept vs packed removed");
+    let (a, b) = (
+        c.covariance_matrix.as_ref().unwrap(),
+        r.covariance_matrix.as_ref().unwrap(),
+    );
+    assert!(
+        a.iter()
+            .zip(b.iter())
+            .any(|(x, y)| x.to_bits() != y.to_bits()),
+        "the edited override must move the covariance away from the in-fit one"
+    );
+}
+
 /// An SAEM fit of `MIX_OVERRIDE` with the covariance step and SIR, from the FOCEI
 /// optimum (so a short run stays near it).
 fn saem_mixture_sir_fit() -> (ferx_core::CompiledModel, ferx_core::Population, FitResult) {
