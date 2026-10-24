@@ -1349,7 +1349,7 @@ pub(crate) fn profiled_verdict_warning(
 ) -> Option<String> {
     let budget = || {
         "Profiled outer optimizer spent its evaluation budget before its stop was \
-         verified; increase maxiter."
+         verified, so it is not reported as converged; increase maxiter."
             .to_string()
     };
     match end {

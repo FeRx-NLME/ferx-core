@@ -4378,7 +4378,7 @@ pub(crate) fn drive_polish_legs<R>(
 }
 
 /// The warning for [`PolishEnd::LegCapReached`].
-fn polish_leg_cap_warning(last_gain: f64) -> String {
+pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
     format!(
         "Outer optimization (BOBYQA) was still improving after {MAX_POLISH_LEGS} polish legs \
          from its tolerance stop (the last lowered the objective by {last_gain:.3e}), so it is \
