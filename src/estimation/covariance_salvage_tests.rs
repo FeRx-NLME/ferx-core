@@ -1543,3 +1543,530 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
     }
     assert_eq!(remediable, 2, "a remediable clause was added or lost");
 }
+
+// ── #520: the FD stencil integrates at the covariance plateau, not at the fit's tolerance ──
+
+/// A one-state ODE model with saturable elimination — nonlinear, so `ode_method = auto`
+/// integrates it rather than solving it by matrix exponential — with its tolerances baked by
+/// `[fit_options]`, or left at the default when `tol` is `None`.
+fn ode_model_at(tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
+    one_state_ode_at("-(CL/V) * central / (1 + central / (5 * V))", tol)
+}
+
+/// [`ode_model_at`]'s model with right-hand side `rhs` for `d/dt(central)`.
+fn one_state_ode_at(rhs: &str, tol: Option<(f64, f64)>) -> crate::types::CompiledModel {
+    let fit_options = tol.map_or(String::new(), |(r, a)| {
+        format!("[fit_options]\n  ode_reltol = {r:e}\n  ode_abstol = {a:e}\n")
+    });
+    crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
+         omega ETA_CL ~ 0.15\n  omega ETA_V ~ 0.15\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = {rhs}\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit_options}"
+    ))
+    .unwrap()
+}
+
+/// Twelve subjects of `two_cpt_oral_cov.csv`, renamed `{tag}-{id}` so a forced analytic
+/// decline (`forced_cov_decline`, a global keyed on id) cannot reach any other test.
+fn cov_520_population(tag: &str) -> crate::types::Population {
+    let mut population = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/two_cpt_oral_cov.csv"),
+        None,
+        None,
+    )
+    .expect("two_cpt_oral_cov.csv loads");
+    // Twelve for the estimators that read `S`: it is a sum of per-subject rank-1 terms, and six
+    // subjects over five free coordinates leave it rank-deficient, so `s` would be refused before
+    // any tolerance is compared.
+    population.subjects.truncate(12);
+    for s in &mut population.subjects {
+        s.id = format!("{tag}-{}", s.id);
+    }
+    population
+}
+
+/// A covariance step's modes, `H` and κ̂, one entry per subject.
+type Modes = (
+    Vec<nalgebra::DVector<f64>>,
+    Vec<nalgebra::DMatrix<f64>>,
+    Vec<Vec<nalgebra::DVector<f64>>>,
+);
+
+/// The modes, `H` and κ̂ a fit of `model` would hand the covariance step: each subject's EBE
+/// found from scratch at `model`'s own tolerance.
+fn fit_modes(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    options: &crate::types::FitOptions,
+) -> Modes {
+    let p = &model.default_params;
+    let (etas, hs): (Vec<_>, Vec<_>) = population
+        .subjects
+        .iter()
+        .map(|s| {
+            let e = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                model, s, p, 200, 1e-8, None, None, 0, options,
+            );
+            (e.eta, e.h_matrix)
+        })
+        .unzip();
+    (etas, hs, vec![Vec::new(); population.subjects.len()])
+}
+
+/// The modes, `H` and κ̂ re-found from `warm` at `model`'s own tolerance — what a tightened
+/// covariance step builds every matrix at, computed here on a model pinned to the plateau, with
+/// no override armed.
+fn modes_reconverged(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    options: &crate::types::FitOptions,
+    warm: &[nalgebra::DVector<f64>],
+) -> Modes {
+    let p = &model.default_params;
+    let x = crate::estimation::parameterization::pack_params(p);
+    let (_, e, h, k) = super::reconverge_population(
+        &x,
+        model,
+        population,
+        p,
+        warm,
+        options,
+        options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        true,
+    );
+    (e, h, k)
+}
+
+/// The covariance matrix of a step that must succeed without falling back from the tight
+/// scope.
+fn cov_520(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    modes: &Modes,
+    options: &crate::types::FitOptions,
+) -> nalgebra::DMatrix<f64> {
+    let p = &model.default_params;
+    let x = crate::estimation::parameterization::pack_params(p);
+    let method = options.covariance_method;
+    match super::compute_covariance(
+        &x, p, model, population, &modes.0, &modes.1, &modes.2, options,
+    ) {
+        super::CovarianceStepResult::Success(out) => {
+            assert!(
+                !out.warnings
+                    .iter()
+                    .any(|w| w.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED")),
+                "{method:?}: the tight scope was built, so nothing fell back: {:?}",
+                out.warnings
+            );
+            assert!(out.matrix.iter().all(|v| v.is_finite()), "{method:?}");
+            out.matrix
+        }
+        super::CovarianceStepResult::Unusable(r) => panic!("{method:?}: {r}"),
+        super::CovarianceStepResult::FailedNonPd { reason, .. } => panic!("{method:?}: {reason}"),
+    }
+}
+
+/// #520: with the analytic R-matrix off, the covariance step of an ODE model at the default
+/// `1e-4` / `1e-6` runs whole at the `1e-6` / `1e-8` plateau — the modes, `H` and κ̂ it builds
+/// at, base point, step probe, every stencil point and the score matrix. Asserted as
+/// bit-identity with the same step on a model that *pins* the plateau (where nothing is
+/// tightened), each cell fed its own, independently generated inputs: the default cell the
+/// modes a default-tolerance fit hands it, the plateau cell those modes re-found on the plateau
+/// model with no override armed (#520 review round 6 — one shared set of plateau modes hid an
+/// `S` built at the fit's loose `H`). The `1e-9` / `1e-11` cell must differ, so the identity is
+/// a statement about the tolerance the step ran at.
+///
+/// For the estimators that read `S`, a second control: the plateau cell fed the *loose* modes
+/// directly — what an `S` evaluated under the override at the fit's modes computes — must
+/// differ too, or the identity cannot tell the two apart.
+///
+/// The override itself: `None` once the fit is on the plateau or tighter; each of `reltol` /
+/// `abstol` tightened only where it is looser, so a tight `reltol` with a loose `abstol` moves
+/// `abstol` alone. A linear model `auto` solves by matrix exponential is armed too — see
+/// `the_fd_stencil_override_covers_a_segment_the_matrix_exponential_declines`.
+#[test]
+fn the_fd_covariance_step_runs_whole_at_the_plateau_tolerance() {
+    use crate::types::{CovarianceMethod, FitOptions};
+    let population = cov_520_population("cov520-fd");
+    let options = FitOptions {
+        analytic_cov_hessian: false,
+        ..FitOptions::default()
+    };
+
+    let default = ode_model_at(None);
+    let ov = super::cov_ode_override(&default, &options)
+        .expect("a default-tolerance ODE model is tightened");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
+    let plateau = ode_model_at(Some((1e-6, 1e-8)));
+    assert!(super::cov_ode_override(&plateau, &options).is_none());
+    let mixed = ode_model_at(Some((1e-9, 1e-6)));
+    let ov = super::cov_ode_override(&mixed, &options).expect("abstol");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-9), Some(1e-8)));
+    assert!(
+        super::cov_ode_override(&padded_ode_model(0), &options).is_some(),
+        "a linear model solved by matrix exponential can still decline a segment to the integrator"
+    );
+
+    let loose = fit_modes(&default, &population, &options);
+    let at_plateau_modes = modes_reconverged(&plateau, &population, &options, &loose.0);
+    let tight = ode_model_at(Some((1e-9, 1e-11)));
+    // `r` (the stencil alone), `s` (the score matrix alone) and `rsr` (both): each estimator is
+    // checked on its own (#520 review round 2 — `S` was first left at the fit's tolerance).
+    // `r` keeps the first six subjects, the cost of its stencil.
+    for (method, n_subj) in [
+        (CovarianceMethod::Hessian, 6),
+        (CovarianceMethod::CrossProduct, 12),
+        (CovarianceMethod::Sandwich, 12),
+    ] {
+        let mut population = population.clone();
+        population.subjects.truncate(n_subj);
+        let cut = |m: &Modes| {
+            (
+                m.0[..n_subj].to_vec(),
+                m.1[..n_subj].to_vec(),
+                m.2[..n_subj].to_vec(),
+            )
+        };
+        let (loose, at_plateau_modes) = (cut(&loose), cut(&at_plateau_modes));
+        let options = FitOptions {
+            covariance_method: method,
+            ..options.clone()
+        };
+        let at_default = cov_520(&default, &population, &loose, &options);
+        let at_plateau = cov_520(&plateau, &population, &at_plateau_modes, &options);
+        assert_eq!(
+            at_default, at_plateau,
+            "{method:?}: the default-tolerance step must run at the 1e-6 / 1e-8 plateau, at the \
+             modes re-found there"
+        );
+        assert_ne!(
+            at_plateau,
+            cov_520(&tight, &population, &at_plateau_modes, &options),
+            "{method:?}: control — the step must read the tolerance at all"
+        );
+        if method != CovarianceMethod::Hessian {
+            assert_ne!(
+                at_default,
+                cov_520(&plateau, &population, &loose, &options),
+                "{method:?}: control — `S` at the fit's loose modes must be told apart"
+            );
+        }
+    }
+}
+
+/// #520 review round 6: on the exact analytic R-matrix route `R` keeps the fit's tolerance, and
+/// so does the `S` that `rsr` pairs with it — `R⁻¹SR⁻¹` is not built from a tight `S` and a
+/// loose `R`. Asserted as bit-identity of the step's `rsr` with `R⁻¹SR⁻¹` composed by hand from
+/// the same step's `r` and an `S` assembled at the fit's modes with no override armed. The
+/// control composes the same `R⁻¹` with the `S` of the tightened step's inputs — the plateau
+/// modes on the plateau model — and must differ, so the identity can see which `S` was used.
+/// Tightening `S` alone (round 5) or the whole analytic step reddens it.
+#[test]
+fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
+    use crate::types::{CovarianceMethod, FitOptions};
+    let population = cov_520_population("cov520-analytic");
+    let default = ode_model_at(None);
+    let options = FitOptions::default();
+    assert!(options.analytic_cov_hessian);
+    assert!(super::cov_ode_override(&default, &options).is_some());
+    assert_eq!(
+        super::predicted_r_route(&default, &population, &options, false),
+        super::PredictedRRoute::Analytic,
+        "fixture: every subject is on the analytic R-matrix"
+    );
+    let plateau = ode_model_at(Some((1e-6, 1e-8)));
+    let loose = fit_modes(&default, &population, &options);
+    let at_plateau_modes = modes_reconverged(&plateau, &population, &options, &loose.0);
+
+    let with = |method| FitOptions {
+        covariance_method: method,
+        ..options.clone()
+    };
+    let r_inv = cov_520(
+        &default,
+        &population,
+        &loose,
+        &with(CovarianceMethod::Hessian),
+    );
+    let rsr = cov_520(
+        &default,
+        &population,
+        &loose,
+        &with(CovarianceMethod::Sandwich),
+    );
+    let p = &default.default_params;
+    let x = crate::estimation::parameterization::pack_params(p);
+    let n = x.len();
+    let free_idx: Vec<usize> = (0..n).collect();
+    let bounds = crate::estimation::parameterization::pack_with_bounds(p).bounds;
+    let units = super::free_coordinate_units(p, &x, &free_idx, &default.nn_weight_theta_ranges());
+    let compose = |m: &crate::types::CompiledModel, modes: &Modes| {
+        let s = super::assemble_score_cross_product(
+            &x,
+            p,
+            m,
+            &population,
+            &modes.0,
+            &modes.1,
+            &modes.2,
+            &bounds,
+            &options,
+            &free_idx,
+        )
+        .expect("S assembles");
+        super::combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &units)
+            .expect("R⁻¹SR⁻¹ combines")
+    };
+    assert_eq!(
+        rsr,
+        compose(&default, &loose),
+        "rsr on the analytic route must pair R with an S at the same, fit, tolerance"
+    );
+    assert_ne!(
+        rsr,
+        compose(&plateau, &at_plateau_modes),
+        "control — an S from the plateau must be told apart"
+    );
+}
+
+/// #520 review round 6: the hybrid `R` route (#1514 — exact analytic terms for most subjects,
+/// a stencil over the declined minority) runs whole at the plateau, analytic terms included:
+/// summing loose analytic terms with tight FD ones gives the derivative of no one objective.
+/// The decline is forced at run time (`forced_cov_decline`), so the route walk still predicts
+/// the analytic route and the step reaches the tightened one by abandoning its fit-tolerance
+/// attempt after the assembly. Bit-identity with the plateau-pinned model's step at the modes
+/// re-found there, for `r` and `rsr`; a `1e-9` / `1e-11` cell must differ. Leaving the
+/// analytic assembly (or the abandoned attempt's `S`) at the fit's tolerance reddens it.
+#[test]
+fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
+    use crate::types::{CovarianceMethod, FitOptions};
+    let population = cov_520_population("cov520-hybrid");
+    super::forced_cov_decline::decline(&population.subjects[0].id);
+    let default = ode_model_at(None);
+    let plateau = ode_model_at(Some((1e-6, 1e-8)));
+    let tight = ode_model_at(Some((1e-9, 1e-11)));
+    let options = FitOptions::default();
+    assert_eq!(
+        super::predicted_r_route(&default, &population, &options, false),
+        super::PredictedRRoute::Analytic,
+        "fixture: the decline is invisible to the route walk"
+    );
+    let loose = fit_modes(&default, &population, &options);
+    let at_plateau_modes = modes_reconverged(&plateau, &population, &options, &loose.0);
+    for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
+        let options = FitOptions {
+            covariance_method: method,
+            ..options.clone()
+        };
+        let p = &default.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let super::CovarianceStepResult::Success(out) = super::compute_covariance(
+            &x,
+            p,
+            &default,
+            &population,
+            &loose.0,
+            &loose.1,
+            &loose.2,
+            &options,
+        ) else {
+            panic!("{method:?}: the hybrid step succeeds");
+        };
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains(&population.subjects[0].id)),
+            "{method:?}: fixture — the step took the hybrid route: {:?}",
+            out.warnings
+        );
+        let at_default = cov_520(&default, &population, &loose, &options);
+        let at_plateau = cov_520(&plateau, &population, &at_plateau_modes, &options);
+        assert_eq!(
+            at_default, at_plateau,
+            "{method:?}: the hybrid step must run whole at the plateau"
+        );
+        assert_ne!(
+            at_plateau,
+            cov_520(&tight, &population, &at_plateau_modes, &options),
+            "{method:?}: control — the step must read the tolerance at all"
+        );
+    }
+}
+
+/// #520 review round 3: a linear model `auto` solves by matrix exponential (#852) still
+/// integrates every segment the exponential declines, and those integrate under the
+/// covariance override like any other. The decline is forced through the solver's test seam
+/// (`FORCE_LINEAR_DECLINE`), set on the worker of a one-thread pool and carried by the fit
+/// scope onto the one-thread pool the override arms, so every stencil point sees it. Under the seam the default-tolerance step must equal
+/// the plateau-pinned one bit for bit, and a `1e-9` / `1e-11` control must differ — which
+/// also shows the seam reached the stencil, since an exact segment reads no tolerance at all.
+/// Restoring the `Linear` exemption in `cov_ode_override` reddens the first assertion.
+#[test]
+fn the_fd_stencil_override_covers_a_segment_the_matrix_exponential_declines() {
+    use crate::ode::solver::FORCE_LINEAR_DECLINE;
+    use crate::types::FitOptions;
+    let mut population = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/two_cpt_oral_cov.csv"),
+        None,
+        None,
+    )
+    .expect("two_cpt_oral_cov.csv loads");
+    population.subjects.truncate(6);
+    let options = FitOptions {
+        analytic_cov_hessian: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let linear = |tol| one_state_ode_at("-(CL/V) * central", tol);
+    let default = linear(None);
+    let plateau = linear(Some((1e-6, 1e-8)));
+    assert_eq!(
+        default
+            .ode_spec
+            .as_ref()
+            .expect("an [odes] model")
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "fixture: `auto` solves this model by matrix exponential"
+    );
+
+    // On the one worker of a one-thread pool, so a step with no override to arm (the pinned
+    // cells) runs its `par_iter`s where the seam is set too, and no other test sees it.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let seamed = |f: &(dyn Fn() -> super::CovarianceStepResult + Sync)| {
+        pool.install(|| {
+            FORCE_LINEAR_DECLINE.set(true);
+            let out = f();
+            FORCE_LINEAR_DECLINE.set(false);
+            out
+        })
+    };
+    let modes_seamed = |f: &(dyn Fn() -> Modes + Sync)| {
+        pool.install(|| {
+            FORCE_LINEAR_DECLINE.set(true);
+            let out = f();
+            FORCE_LINEAR_DECLINE.set(false);
+            out
+        })
+    };
+    // Each cell its own inputs (#520 review round 6): the default cell the modes a
+    // default-tolerance fit hands it, the plateau cells those re-found on the plateau model.
+    let loose = modes_seamed(&|| fit_modes(&default, &population, &options));
+    let at_plateau_modes =
+        modes_seamed(&|| modes_reconverged(&plateau, &population, &options, &loose.0));
+    let p = default.default_params.clone();
+    let x = crate::estimation::parameterization::pack_params(&p);
+    let cov = |m: &crate::types::CompiledModel, modes: &Modes| {
+        let out = seamed(&|| {
+            super::compute_covariance(
+                &x,
+                &p,
+                m,
+                &population,
+                &modes.0,
+                &modes.1,
+                &modes.2,
+                &options,
+            )
+        });
+        match out {
+            super::CovarianceStepResult::Success(out) => out.matrix,
+            super::CovarianceStepResult::Unusable(r) => panic!("{r}"),
+            super::CovarianceStepResult::FailedNonPd { reason, .. } => panic!("{reason}"),
+        }
+    };
+    let at_default = cov(&default, &loose);
+    let at_plateau = cov(&plateau, &at_plateau_modes);
+    let at_tight = cov(&linear(Some((1e-9, 1e-11))), &at_plateau_modes);
+    assert!(at_default.iter().all(|v| v.is_finite()));
+    assert_eq!(
+        at_default, at_plateau,
+        "declined segments of the default-tolerance step must integrate at the plateau"
+    );
+    assert_ne!(
+        at_plateau, at_tight,
+        "control — the forced decline must reach the stencil, or no tolerance is read"
+    );
+}
+
+/// #520 review: the override keys on the model *having* an integrator, not on the per-subject
+/// route `OdeToleranceFacts::from_route` predicts. A transit model on a plain bolus population
+/// is reported as never integrating — yet the flip-flop reroute is decided per `(θ, η)` and
+/// can send a subject to the ODE twin at a perturbed stencil point only. Both sides in one
+/// test: `from_route` says `None` for that population, and the override is still armed; a
+/// closed form with no twin gets none. Keying the gate back on `from_route` reddens the
+/// middle assertion.
+#[test]
+fn the_fd_stencil_override_covers_a_transit_twin_the_route_walk_cannot_see() {
+    use crate::estimation::cov_diagnostics::OdeToleranceFacts;
+    use crate::types::{FitOptions, Population};
+    let transit = parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n\
+         theta TVMTT(1.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  omega ETA_CL ~ 0.09\n\
+         sigma PROP_ERR ~ 0.15\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  MTT = TVMTT\n\
+         NTR = TVN\n\
+         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .unwrap();
+    assert!(transit.ode_spec.is_none() && transit.absorption_ode_equivalent.is_some());
+    // A plain bolus subject: the transit closed form serves it, so it keeps off the twin.
+    let closed = parse_model_string(WARFARIN).unwrap();
+    let subject = warfarin_subject(&closed, &[0.2, 10.0, 1.5], &[1.0, 4.0]);
+    let population = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    assert!(
+        OdeToleranceFacts::from_route(&transit, &population).is_none(),
+        "control: the route walk sees no integration on this population"
+    );
+    let options = FitOptions::default();
+    let ov = super::cov_ode_override(&transit, &options)
+        .expect("a transit model's twin is tightened whatever the route walk says");
+    assert_eq!((ov.reltol, ov.abstol), (Some(1e-6), Some(1e-8)));
+    assert!(super::cov_ode_override(&closed, &options).is_none());
+}
+
+/// #520 review: a stencil that could not be tightened says so, naming the reason, what it ran
+/// at instead, and the remedy.
+#[test]
+fn the_stencil_scope_failure_warning_names_the_fallback_and_the_remedy() {
+    let msg = super::stencil_scope_failure_warning("pool could not be built");
+    // Its own token, classified as a covariance-step warning, so a `run_covariance` re-run
+    // replaces it rather than leaving a stale copy beside a clean step (#520 review round 2).
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(
+        entry.category,
+        crate::types::WarningCode::CovarianceStep,
+        "{msg}"
+    );
+    assert_eq!(
+        entry.severity,
+        crate::types::WarningSeverity::Warning,
+        "{msg}"
+    );
+    for part in [
+        "W_COV_ODE_TOLERANCE_NOT_TIGHTENED:",
+        "ode_reltol = 1e-6 / ode_abstol = 1e-8",
+        "(pool could not be built)",
+        "ran at the fit's own ODE tolerance",
+        "may be inflated",
+        "#520",
+    ] {
+        assert!(msg.contains(part), "missing {part:?} in {msg}");
+    }
+}
