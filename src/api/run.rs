@@ -711,6 +711,8 @@ pub fn run_model_simulate_with_overrides(
             // the feature off there is no TTE endpoint, so the vec is empty.
             #[cfg(not(feature = "survival"))]
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     let mut template = Population {

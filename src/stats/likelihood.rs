@@ -4296,6 +4296,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -5516,6 +5518,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: vec![0, 100],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.5]);
@@ -5709,6 +5713,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.0]);
@@ -7666,6 +7672,8 @@ mod conditional_obs_terms_tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let p = &model.default_params;
         let eta = DVector::zeros(model.n_eta);

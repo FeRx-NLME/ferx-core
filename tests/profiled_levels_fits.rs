@@ -290,6 +290,60 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
     );
 }
 
+/// S1 under an explicit global `sum_to_zero` (#2135): one group of 799 θ tied by the
+/// dependent level, which study 100's subjects read. Before the bordered solve each of
+/// them was differenced over the whole block — one evaluation at the inits took 201 s and
+/// the fit did not finish in 5 400 s (Linux x86_64 CI, #2326), 85 s for that one
+/// evaluation on macOS arm64. Differenced over its own 8 levels it is 1.5 s, and the
+/// whole fit with its covariance step 108 s (macOS arm64, 8 threads). The OFV must not be
+/// above the `sum_to_zero_within` fit's: within nests in global, which leaves each
+/// study's mean free.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
+    let data = "tests/data/profile_mbma/s100t8.csv";
+    let model = "tests/data/profile_mbma/s1_profile.ferx";
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    let block = "PLACEBO[STUDY, TIME]";
+    assert!(text.contains(block), "fixture moved");
+    let path = unique_temp("ferx_profiled_s1_global");
+    std::fs::write(
+        &path,
+        text.replace(block, "PLACEBO[STUDY, TIME, contrast = sum_to_zero]"),
+    )
+    .unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(data).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let (prof, t_prof) = fit(&p, &p.init_params, true);
+    eprintln!(
+        "S1 global sum_to_zero: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {})",
+        prof.ofv, prof.n_iterations, prof.n_parameters
+    );
+    assert!(prof.converged, "{:?}", prof.warnings);
+    assert_eq!(prof.covariance_method, Some(CovarianceMethod::Hessian));
+    assert_eq!(prof.n_parameters, 804, "3 θ, 799 levels, ω, σ");
+    let se = prof.se_theta.as_ref().expect("profiled SE");
+    assert!(se.iter().all(|s| s.is_finite() && *s > 0.0));
+    let cov = prof.covariance_matrix.as_ref().unwrap();
+    let levels = &ferx_core::theta_level_values(&p.parsed.model, &prof.theta, Some(cov), None)
+        .unwrap()["PLACEBO"];
+    assert_eq!(levels.len(), 800);
+    assert!(levels
+        .iter()
+        .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
+    assert!(
+        prof.ofv <= S1_UNPROFILED_OFV + 1e-3,
+        "{} vs {S1_UNPROFILED_OFV}",
+        prof.ofv
+    );
+}
+
 /// The unprofiled S1 fit's OFV (705 packed coordinates, from the model file's inits, no
 /// covariance step): −3579.167062, the same six digits on Linux aarch64
 /// (`tools/linux-test.sh`) and macOS arm64 at #2130's head, and in the plan's M6. It

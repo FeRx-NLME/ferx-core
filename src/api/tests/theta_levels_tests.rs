@@ -99,6 +99,8 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();
@@ -937,6 +939,8 @@ mod theta_gather_index_check {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         Population {
             subjects: vec![subject],
@@ -1056,6 +1060,37 @@ mod binder_helpers {
         Level {
             values: values.to_vec(),
         }
+    }
+
+    /// `write_index_column` looks a record's level up by `level_key` (#1799), where it
+    /// used to scan the table with `==`. The map must answer what `==` answered on every
+    /// input the scan could see: `-0.0` and `0.0` are one level in either direction, a
+    /// `NaN` matches nothing (the record is refused, not bound to a `NaN` entry), and a
+    /// table repeating a level gives the first entry's index.
+    #[test]
+    fn the_index_lookup_is_level_equality_under_eq() {
+        use super::super::write_index_column;
+        let parsed = parse_full_model(&no_eta_model()).unwrap();
+        let decl = parsed.model.theta_blocks().level_blocks()[0].clone();
+        let index_at = |study: f64, table: &[(Level, usize)]| -> Result<f64, String> {
+            let mut pop = population(1, 1);
+            pop.subjects[0].covariates.insert("STUDY".into(), study);
+            write_index_column(&decl, table, &mut pop.subjects)?;
+            Ok(pop.subjects[0].covariates[&level_index_column(decl.name())])
+        };
+        // Signed zero, both ways round.
+        assert_eq!(index_at(-0.0, &[(level(&[0.0, 1.0]), 7)]), Ok(7.0));
+        assert_eq!(index_at(0.0, &[(level(&[-0.0, 1.0]), 7)]), Ok(7.0));
+        // A `NaN` record finds no level, even a `NaN` one with the same bits.
+        assert!(index_at(f64::NAN, &[(level(&[f64::NAN, 1.0]), 7)]).is_err());
+        // An infinite value is `==` itself, so it still binds.
+        assert_eq!(
+            index_at(f64::INFINITY, &[(level(&[f64::INFINITY, 1.0]), 7)]),
+            Ok(7.0)
+        );
+        // A repeated level: the first entry wins, as `find` gave.
+        let repeated = [(level(&[1.0, 1.0]), 3), (level(&[1.0, 1.0]), 9)];
+        assert_eq!(index_at(1.0, &repeated), Ok(3.0));
     }
 
     #[test]

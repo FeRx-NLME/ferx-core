@@ -46,7 +46,8 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
 use crate::estimation::outer_optimizer::{
-    drive_polish_legs, ebe_guard_rejects, max_scaled_deviation, population_gradient,
+    drive_polish_legs, ebe_guard_rejects, flat_theta_candidates, flat_theta_probe_moves,
+    flat_theta_probe_value, flat_theta_warning, max_scaled_deviation, population_gradient,
     resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
     OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS,
 };
@@ -103,19 +104,65 @@ const OFV_NOISE: f64 = 1e-9;
 const MAX_BACKTRACK: usize = 30;
 
 /// The solved coordinates and how the subjects share them.
+///
+/// **Two spaces.** The solve's unknowns are the θ in `coords`, but each subject is
+/// differenced over the **levels** it reads (#2135). The two differ only at a
+/// sum-to-zero dependent level, `−(sum of the group's other levels)`: in θ a subject that
+/// reads it reads every θ of the group, which under a global `sum_to_zero` is the whole
+/// block, so its Newton matrix took ~k²/2 objective evaluations and its gradient 2k EBE
+/// re-solves at k = 799 (S1, 100 × 8). Over levels it reads its own 8, the dependent one
+/// among them. The dependent becomes a coordinate of its own (a [`Border`]) and the
+/// group's levels are tied by one linear constraint, `Σ y = c`, whose multiplier the
+/// Newton step solves for ([`bordered_step`]).
+///
+/// A subject's term is a function of its own levels only, so it is evaluated off the
+/// constraint by moving a **slack**: a θ of the dependent's group the subject does not
+/// read. Shifting the dependent by `d` is `θ_slack −= d`; shifting a level it reads by
+/// `d` is that θ `+= d` and `θ_slack −= d`, so the dependent stays put. Off the
+/// constraint the subject's term is then an extension of the objective that agrees with
+/// it on the constraint, which is all a linearly constrained Newton step reads: on the
+/// constraint `y = Tθ + c`, the θ-space gradient and Hessian are `Tᵀg` and `TᵀMT`
+/// ([`ProfileGroup::theta_gradient`], [`ProfileGroup::theta_matrix`]), exactly the ones
+/// the θ-space differences gave.
+///
+/// A subject that reads every θ of a dependent's group has no slack. It keeps the θ
+/// form: its levels are the group's θ, and the dependent is read through them.
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileLayout {
     /// θ index of every coordinate the solve sets: each free θ of a `profile`d block,
     /// less any level ferx froze (#1891), which is solved around as an offset. Sorted.
     pub(crate) coords: Vec<usize>,
-    /// Per subject, in population order, the positions into `coords` its rows read.
-    pub(crate) active: Vec<Vec<usize>>,
+    /// Per subject, in population order, the levels it is differenced over, sorted by
+    /// [`LevelRead::level`].
+    pub(crate) reads: Vec<Vec<LevelRead>>,
     /// Coordinates no two subjects couple fall into independent groups, each solved on
     /// its own: a study's levels under `sum_to_zero_within`, the whole block under a
-    /// global `sum_to_zero`, whose dependent level every subject reads.
+    /// global `sum_to_zero`, whose dependent level ties every level.
     pub(crate) groups: Vec<ProfileGroup>,
+    /// The dependent levels some subject reads through a slack.
+    pub(crate) borders: Vec<Border>,
     /// `(group, index within the group)` per position of `coords`.
     local: Vec<(usize, usize)>,
+}
+
+/// One level a subject's term is differenced over.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LevelRead {
+    /// The layout's level index: a position of [`ProfileLayout::coords`] below
+    /// `coords.len()`, else `coords.len()` plus a [`ProfileLayout::borders`] index.
+    pub(crate) level: usize,
+    /// The θ moves, `(θ index, coefficient)`, that shift this level by one unit and leave
+    /// every other level the subject reads where it was.
+    pub(crate) moves: Vec<(usize, f64)>,
+}
+
+/// A sum-to-zero dependent level solved as a coordinate of its own, tied to the free
+/// levels it sums by one bordered constraint.
+#[derive(Debug, Clone)]
+pub(crate) struct Border {
+    /// Its group, and its index in that group's [`ProfileGroup::borders`].
+    group: usize,
+    slot: usize,
 }
 
 /// One independent set of coordinates and the subjects that read them.
@@ -125,6 +172,117 @@ pub(crate) struct ProfileGroup {
     pub(crate) coords: Vec<usize>,
     /// Subject indices, sorted.
     pub(crate) subjects: Vec<usize>,
+    /// Indices into [`ProfileLayout::borders`]; `borders[j]` is the group's level
+    /// `coords.len() + j`, after its θ.
+    pub(crate) borders: Vec<usize>,
+    /// Per entry of `coords`, the index into `borders` of the dependent that sums it.
+    border_of: Vec<Option<usize>>,
+}
+
+impl ProfileGroup {
+    /// The group's level count: its θ, then its borders.
+    fn n_levels(&self) -> usize {
+        self.coords.len() + self.borders.len()
+    }
+
+    /// `Tᵀg`: the gradient over the group's θ from one over its levels, a θ moving the
+    /// dependent that sums it by `−1`.
+    fn theta_gradient(&self, gy: &[f64]) -> Vec<f64> {
+        let n = self.coords.len();
+        (0..n)
+            .map(|a| match self.border_of[a] {
+                Some(j) => gy[a] - gy[n + j],
+                None => gy[a],
+            })
+            .collect()
+    }
+
+    /// `TᵀMT`: the Hessian over the group's θ from one over its levels. Without borders
+    /// it is `m` itself, bit for bit.
+    fn theta_matrix(&self, m: &DMatrix<f64>) -> DMatrix<f64> {
+        let n = self.coords.len();
+        DMatrix::from_fn(n, n, |a, b| {
+            let (ja, jb) = (
+                self.border_of[a].map(|j| n + j),
+                self.border_of[b].map(|j| n + j),
+            );
+            let mut v = m[(a, b)];
+            if let Some(jb) = jb {
+                v -= m[(a, jb)];
+            }
+            if let Some(ja) = ja {
+                v -= m[(ja, b)];
+                if let Some(jb) = jb {
+                    v += m[(ja, jb)];
+                }
+            }
+            v
+        })
+    }
+
+    /// The diagonal of [`Self::theta_matrix`], without forming it.
+    fn theta_diagonal(&self, m: &DMatrix<f64>) -> Vec<f64> {
+        let n = self.coords.len();
+        (0..n)
+            .map(|a| match self.border_of[a] {
+                Some(j) => m[(a, a)] - 2.0 * m[(a, n + j)] + m[(n + j, n + j)],
+                None => m[(a, a)],
+            })
+            .collect()
+    }
+}
+
+/// The Newton step over a group's θ, `−(TᵀMT)⁻¹Tᵀg`, as the bordered system over its
+/// levels: `min ½ΔᵀMΔ + gᵀΔ` subject to `AΔ = 0`, one row of `A` per border (the border
+/// and every θ it sums). With `M` block diagonal over `blocks` (the levels no subject
+/// couples), `Δ = −M⁻¹(g + Aᵀλ)` and `(AM⁻¹Aᵀ)λ = −AM⁻¹g`: a Cholesky per block and one
+/// of the borders' `nb × nb` system, where the θ form is one dense Cholesky over the
+/// whole group. `None` when a block or the border system is not positive definite (a
+/// level no subject reads directly has no curvature of its own); the caller then takes
+/// the θ form, which is positive definite whenever the levels are identified.
+fn bordered_step(
+    g: &ProfileGroup,
+    m: &DMatrix<f64>,
+    gy: &[f64],
+    blocks: &[Vec<usize>],
+) -> Option<Vec<f64>> {
+    let n = g.coords.len();
+    let nb = g.borders.len();
+    let row_of = |l: usize| if l >= n { Some(l - n) } else { g.border_of[l] };
+    // Columns: M⁻¹g, then M⁻¹Aᵀ per border.
+    let mut sol = DMatrix::<f64>::zeros(g.n_levels(), 1 + nb);
+    for blk in blocks {
+        let k = blk.len();
+        let chol = DMatrix::from_fn(k, k, |a, b| m[(blk[a], blk[b])]).cholesky()?;
+        let mut rhs = DMatrix::zeros(k, 1 + nb);
+        for (a, &l) in blk.iter().enumerate() {
+            rhs[(a, 0)] = gy[l];
+            if let Some(j) = row_of(l) {
+                rhs[(a, 1 + j)] = 1.0;
+            }
+        }
+        let x = chol.solve(&rhs);
+        for (a, &l) in blk.iter().enumerate() {
+            for c in 0..=nb {
+                sol[(l, c)] = x[(a, c)];
+            }
+        }
+    }
+    // A·M⁻¹[g, Aᵀ]: each row of A sums its levels.
+    let mut a_sol = DMatrix::<f64>::zeros(nb, 1 + nb);
+    for l in 0..g.n_levels() {
+        if let Some(j) = row_of(l) {
+            for c in 0..=nb {
+                a_sol[(j, c)] += sol[(l, c)];
+            }
+        }
+    }
+    let s = a_sol.columns(1, nb).into_owned();
+    let lambda = -s.cholesky()?.solve(&a_sol.column(0).into_owned());
+    let step: Vec<f64> = (0..n)
+        .map(|a| -(sol[(a, 0)] + (0..nb).map(|j| sol[(a, 1 + j)] * lambda[j]).sum::<f64>()))
+        .collect();
+    step.iter().all(|v| v.is_finite()).then_some(step)
 }
 
 impl ProfileLayout {
@@ -142,16 +300,62 @@ impl ProfileLayout {
         }
         let frozen = |k: usize| template.theta_fixed.get(k).copied().unwrap_or(false);
         let n_subj = population.subjects.len();
+        // Per subject: the θ it couples (every θ of a dependent it reads, which is what
+        // ties a group together) and its reads before positions exist — a θ with the
+        // slack of the dependent it shares, or a dependent `(block, level)` with its range
+        // and slack.
+        enum Raw {
+            Theta(usize, Option<usize>),
+            Dep((usize, usize), std::ops::Range<usize>, usize),
+        }
         let mut theta_sets: Vec<Vec<usize>> = vec![Vec::new(); n_subj];
+        let mut raw: Vec<Vec<Raw>> = (0..n_subj).map(|_| Vec::new()).collect();
         for al in &active_levels {
-            let decl = blocks.decls.iter().find(|d| d.name == al.block)?;
+            let (di, decl) = blocks
+                .decls
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.name == al.block)?;
             for (i, levels) in al.per_subject.iter().enumerate() {
+                let direct: Vec<usize> = levels
+                    .iter()
+                    .filter_map(|&l| match decl.spec.levels[l] {
+                        LevelRule::Free(k) => Some(k as usize),
+                        LevelRule::NegSum(..) => None,
+                    })
+                    .collect();
+                // The dependents read, each with its slack (`None`: no θ of its group
+                // is left unread, so the subject keeps the θ form).
+                let mut deps: Vec<(std::ops::Range<usize>, Option<usize>)> = Vec::new();
                 for &l in levels {
-                    let range = match decl.spec.levels[l] {
-                        LevelRule::Free(k) => k as usize..k as usize + 1,
-                        LevelRule::NegSum(a, b) => a as usize..b as usize,
+                    let LevelRule::NegSum(a, b) = decl.spec.levels[l] else {
+                        continue;
                     };
-                    theta_sets[i].extend(range.filter(|&k| !frozen(k)));
+                    let range = a as usize..b as usize;
+                    // A reference level, or a sum of frozen levels: a constant.
+                    if !range.clone().any(|k| !frozen(k)) {
+                        continue;
+                    }
+                    theta_sets[i].extend(range.clone().filter(|&k| !frozen(k)));
+                    let slack = range.clone().find(|k| !direct.contains(k));
+                    match slack {
+                        Some(s) => raw[i].push(Raw::Dep((di, l), range.clone(), s)),
+                        None => raw[i].extend(
+                            range
+                                .clone()
+                                .filter(|&k| !frozen(k))
+                                .map(|k| Raw::Theta(k, None)),
+                        ),
+                    }
+                    deps.push((range, slack));
+                }
+                for &k in direct.iter().filter(|&&k| !frozen(k)) {
+                    theta_sets[i].push(k);
+                    let slack = deps
+                        .iter()
+                        .find(|(r, _)| r.contains(&k))
+                        .and_then(|(_, s)| *s);
+                    raw[i].push(Raw::Theta(k, slack));
                 }
             }
         }
@@ -169,50 +373,157 @@ impl ProfileLayout {
             })
             .collect();
 
-        // Union-find over positions: a subject couples every coordinate it reads.
+        // Union-find over positions: a subject couples every coordinate it reads, a
+        // dependent's reader every θ of its group.
         let mut parent: Vec<usize> = (0..coords.len()).collect();
-        fn find(parent: &mut [usize], mut a: usize) -> usize {
-            while parent[a] != a {
-                parent[a] = parent[parent[a]];
-                a = parent[a];
-            }
-            a
-        }
-        for set in &active {
-            for w in set.windows(2) {
-                let (ra, rb) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
-                if ra != rb {
-                    parent[ra.max(rb)] = ra.min(rb);
-                }
-            }
-        }
+        union_sets(&mut parent, &active);
         let mut root_group: std::collections::HashMap<usize, usize> = Default::default();
         let mut groups: Vec<ProfileGroup> = Vec::new();
         let mut local = vec![(0, 0); coords.len()];
         for (p, slot) in local.iter_mut().enumerate() {
-            let r = find(&mut parent, p);
+            let r = find_root(&mut parent, p);
             let g = *root_group.entry(r).or_insert_with(|| {
                 groups.push(ProfileGroup {
                     coords: Vec::new(),
                     subjects: Vec::new(),
+                    borders: Vec::new(),
+                    border_of: Vec::new(),
                 });
                 groups.len() - 1
             });
             *slot = (g, groups[g].coords.len());
             groups[g].coords.push(p);
+            groups[g].border_of.push(None);
         }
         for (i, set) in active.iter().enumerate() {
             if let Some(&p) = set.first() {
                 groups[local[p].0].subjects.push(i);
             }
         }
+
+        let n = coords.len();
+        let mut borders: Vec<Border> = Vec::new();
+        let mut border_id: std::collections::HashMap<(usize, usize), usize> = Default::default();
+        let reads: Vec<Vec<LevelRead>> = raw
+            .into_iter()
+            .map(|subject| {
+                let mut out: Vec<LevelRead> = subject
+                    .into_iter()
+                    .map(|r| match r {
+                        Raw::Theta(k, slack) => LevelRead {
+                            level: position(k),
+                            moves: std::iter::once((k, 1.0))
+                                .chain(slack.map(|s| (s, -1.0)))
+                                .collect(),
+                        },
+                        Raw::Dep(key, range, slack) => {
+                            let id = *border_id.entry(key).or_insert_with(|| {
+                                let range: Vec<usize> =
+                                    range.filter(|&k| !frozen(k)).map(position).collect();
+                                let group = local[range[0]].0;
+                                let slot = groups[group].borders.len();
+                                for &p in &range {
+                                    groups[group].border_of[local[p].1] = Some(slot);
+                                }
+                                groups[group].borders.push(borders.len());
+                                borders.push(Border { group, slot });
+                                borders.len() - 1
+                            });
+                            LevelRead {
+                                level: n + id,
+                                moves: vec![(slack, -1.0)],
+                            }
+                        }
+                    })
+                    .collect();
+                out.sort_by_key(|r| r.level);
+                out.dedup_by_key(|r| r.level);
+                out
+            })
+            .collect();
         Some(Self {
             coords,
-            active,
+            reads,
             groups,
+            borders,
             local,
         })
     }
+
+    /// The group of level `u` and its index among the group's levels.
+    fn level_local(&self, u: usize) -> (usize, usize) {
+        match u.checked_sub(self.coords.len()) {
+            None => self.local[u],
+            Some(b) => {
+                let b = &self.borders[b];
+                (b.group, self.groups[b.group].coords.len() + b.slot)
+            }
+        }
+    }
+
+    /// The layout's level count: every coordinate, then every border.
+    fn n_levels(&self) -> usize {
+        self.coords.len() + self.borders.len()
+    }
+
+    /// The global level index of a group's local level `l`.
+    fn level_of(&self, g: &ProfileGroup, l: usize) -> usize {
+        match l.checked_sub(g.coords.len()) {
+            None => g.coords[l],
+            Some(j) => self.coords.len() + g.borders[j],
+        }
+    }
+}
+
+/// The union-find root of `a`.
+fn find_root(parent: &mut [usize], mut a: usize) -> usize {
+    while parent[a] != a {
+        parent[a] = parent[parent[a]];
+        a = parent[a];
+    }
+    a
+}
+
+/// Join every member of each set (sorted indices) under one root.
+fn union_sets(parent: &mut [usize], sets: &[Vec<usize>]) {
+    for set in sets {
+        for w in set.windows(2) {
+            let (ra, rb) = (find_root(parent, w[0]), find_root(parent, w[1]));
+            if ra != rb {
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+}
+
+/// The blocks of `n` levels no set couples: each a sorted list, a level no set reads a
+/// block of its own.
+fn coupled_blocks(n: usize, sets: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..n).collect();
+    union_sets(&mut parent, sets);
+    let mut by_root: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for l in 0..n {
+        by_root
+            .entry(find_root(&mut parent, l))
+            .or_default()
+            .push(l);
+    }
+    by_root.into_values().collect()
+}
+
+/// `params` with each `(read, shift)` applied: the reads' θ moves, scaled.
+fn shifted(
+    params: &ModelParameters,
+    reads: &[LevelRead],
+    shifts: &[(usize, f64)],
+) -> ModelParameters {
+    let mut p = params.clone();
+    for &(j, d) in shifts {
+        for &(k, c) in &reads[j].moves {
+            p.theta[k] += c * d;
+        }
+    }
+    p
 }
 
 /// Warm start for the next solve: the levels and each subject's η̂.
@@ -256,6 +567,9 @@ pub(crate) struct ProfileSolve {
     /// Per coordinate, `1 / sqrt(M_kk)`: the conditional standard error the step sizes
     /// are measured in.
     pub(crate) se_scale: Vec<f64>,
+    /// Per level of the layout (coordinates, then borders), `1 / sqrt(M_yy)` from the
+    /// Newton matrix over levels: the scale a level's own differences step in.
+    pub(crate) level_scale: Vec<f64>,
     /// The EBE convergence of this evaluation, for the outer loop's guard and published
     /// counts (#2130 review #2): the population inner loop at the start levels, plus every
     /// subject whose final mode came from a re-solve that did not converge or fell back to
@@ -352,13 +666,13 @@ impl ProfileCtx<'_> {
         )
     }
 
-    /// The Newton matrix of subject `i` over the positions `pos` (a subset of its active
-    /// set): `XᵀC̃⁻¹X`, the Hessian in those levels of the subject's **FOCE** term
+    /// The Newton matrix of subject `i` over its levels ([`ProfileLayout::reads`]):
+    /// `XᵀC̃⁻¹X`, the Hessian in those levels of the subject's **FOCE** term
     /// (`interaction = false`) with η̂, H and κ̂ held. That term is the Sheiner–Beal
     /// marginal `(y − f(η̂) + Hη̂)ᵀ C̃⁻¹ (·) + log|C̃|`, `C̃ = HΩHᵀ + R`, so it is quadratic
     /// in the levels and a forward second difference is exact up to rounding at any step
     /// (`1 + 2k + k(k−1)/2` evaluations, where a central stencil takes `2k²`); `steps`
-    /// sets it per coordinate.
+    /// sets it per level.
     ///
     /// Not the fit's own term under FOCEI: that one is the conditional (Laplace) form, whose
     /// held-η̂ Hessian is `XᵀR⁻¹X` — the curvature with the random effects *not* free to
@@ -369,18 +683,11 @@ impl ProfileCtx<'_> {
         i: usize,
         params: &ModelParameters,
         s: &SubjectState,
-        pos: &[usize],
         steps: &[f64],
     ) -> DMatrix<f64> {
-        let k = pos.len();
-        let coords = &self.layout.coords;
-        let at = |moves: &[(usize, f64)]| {
-            let mut p = params.clone();
-            for &(j, d) in moves {
-                p.theta[coords[pos[j]]] += d;
-            }
-            self.held(i, &p, s, false)
-        };
+        let reads = &self.layout.reads[i];
+        let k = reads.len();
+        let at = |moves: &[(usize, f64)]| self.held(i, &shifted(params, reads, moves), s, false);
         let f0 = at(&[]);
         let f1: Vec<f64> = (0..k).map(|a| at(&[(a, steps[a])])).collect();
         let mut m = DMatrix::zeros(k, k);
@@ -397,24 +704,23 @@ impl ProfileCtx<'_> {
         m
     }
 
-    /// The total gradient of subject `i`'s term over `pos`: central differences with the
-    /// EBE re-solved at every point, warm-started from the subject's current mode.
+    /// The total gradient of subject `i`'s term over its levels: central differences with
+    /// the EBE re-solved at every point, warm-started from the subject's current mode.
     fn total_gradient(
         &self,
         i: usize,
         params: &ModelParameters,
         s: &SubjectState,
-        pos: &[usize],
         steps: &[f64],
     ) -> Vec<f64> {
-        let coords = &self.layout.coords;
-        pos.iter()
-            .zip(steps)
-            .map(|(&p, &h)| {
+        let reads = &self.layout.reads[i];
+        steps
+            .iter()
+            .enumerate()
+            .map(|(a, &h)| {
                 let at = |d: f64| {
-                    let mut q = params.clone();
-                    q.theta[coords[p]] += d;
-                    self.resolve(i, &q, &s.eta).nll
+                    self.resolve(i, &shifted(params, reads, &[(a, d)]), &s.eta)
+                        .nll
                 };
                 (at(h) - at(-h)) / (2.0 * h)
             })
@@ -482,6 +788,7 @@ impl ProfileCtx<'_> {
         let mut iterations = 0;
         let mut criterion = 0.0_f64;
         let mut se_scale = vec![f64::NAN; layout.coords.len()];
+        let mut level_scale = vec![f64::NAN; layout.n_levels()];
         for (g, out) in layout.groups.iter().zip(outcomes) {
             let out = out?;
             iterations = iterations.max(out.iterations);
@@ -489,6 +796,9 @@ impl ProfileCtx<'_> {
             for (j, &pos) in g.coords.iter().enumerate() {
                 p.theta[layout.coords[pos]] = out.beta[j];
                 se_scale[pos] = out.se[j];
+            }
+            for (l, &v) in out.level_se.iter().enumerate() {
+                level_scale[layout.level_of(g, l)] = v;
             }
             for (&i, s) in g.subjects.iter().zip(out.states) {
                 states[i] = s;
@@ -517,11 +827,14 @@ impl ProfileCtx<'_> {
             iterations,
             criterion,
             se_scale,
+            level_scale,
             ebe,
         })
     }
 
-    /// Newton with backtracking on one group, from the levels in `theta0`.
+    /// Newton with backtracking on one group, from the levels in `theta0`. The Newton
+    /// matrix and the gradient are summed over the group's levels, each subject
+    /// differenced over its own ([`ProfileLayout`]); the step is taken in θ.
     fn solve_group(
         &self,
         g: &ProfileGroup,
@@ -530,18 +843,21 @@ impl ProfileCtx<'_> {
         mut states: Vec<SubjectState>,
     ) -> Result<GroupOutcome, ProfileFailure> {
         let layout = self.layout;
-        let n = g.coords.len();
+        let n = g.n_levels();
         let mut p = params.clone();
         let mut beta: Vec<f64> = g.coords.iter().map(|&c| theta0[layout.coords[c]]).collect();
-        // Each subject's active positions, and their indices within the group.
-        let subj_pos: Vec<(&[usize], Vec<usize>)> = g
+        // Each subject's levels, as indices among the group's.
+        let subj_loc: Vec<Vec<usize>> = g
             .subjects
             .iter()
             .map(|&i| {
-                let pos = layout.active[i].as_slice();
-                (pos, pos.iter().map(|&c| layout.local[c].1).collect())
+                layout.reads[i]
+                    .iter()
+                    .map(|r| layout.level_local(r.level).1)
+                    .collect()
             })
             .collect();
+        let blocks = coupled_blocks(n, &subj_loc);
         let mut iterations = 0;
         // The step of the Newton matrix's difference: one SE once a pass has measured
         // it, a unit step before. The term is quadratic, so either is exact up to
@@ -549,58 +865,64 @@ impl ProfileCtx<'_> {
         let mut m_steps = vec![1.0; n];
         loop {
             // The Newton matrix first: its diagonal sizes the gradient's steps.
-            let m_at = |steps: &[f64], states: &[SubjectState], p: &ModelParameters| {
-                let parts: Vec<DMatrix<f64>> = g
-                    .subjects
-                    .par_iter()
-                    .zip(states.par_iter())
-                    .zip(subj_pos.par_iter())
-                    .map(|((&i, s), (pos, loc))| {
-                        let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
-                        self.held_hessian(i, p, s, pos, &st)
-                    })
-                    .collect();
-                let mut m = DMatrix::zeros(n, n);
-                for (part, (_, loc)) in parts.iter().zip(&subj_pos) {
-                    for (a, &la) in loc.iter().enumerate() {
-                        for (b, &lb) in loc.iter().enumerate() {
-                            m[(la, lb)] += part[(a, b)];
-                        }
+            let parts: Vec<DMatrix<f64>> = g
+                .subjects
+                .par_iter()
+                .zip(states.par_iter())
+                .zip(subj_loc.par_iter())
+                .map(|((&i, s), loc)| {
+                    let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
+                    self.held_hessian(i, &p, s, &st)
+                })
+                .collect();
+            let mut m = DMatrix::zeros(n, n);
+            for (part, loc) in parts.iter().zip(&subj_loc) {
+                for (a, &la) in loc.iter().enumerate() {
+                    for (b, &lb) in loc.iter().enumerate() {
+                        m[(la, lb)] += part[(a, b)];
                     }
                 }
-                m
-            };
-            let m = m_at(&m_steps, &states, &p);
-            let se_of = |m: &DMatrix<f64>| -> Option<Vec<f64>> {
-                (0..n)
-                    .map(|a| {
-                        let d = m[(a, a)];
-                        (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt())
-                    })
-                    .collect()
-            };
-            let se = se_of(&m).ok_or(ProfileFailure::Singular)?;
-            m_steps.clone_from(&se);
-            let steps: Vec<f64> = se.iter().map(|s| FD_STEP_SE * s).collect();
+            }
+            let se: Vec<f64> = g
+                .theta_diagonal(&m)
+                .into_iter()
+                .map(|d| (d.is_finite() && d > 0.0).then(|| 1.0 / d.sqrt()))
+                .collect::<Option<_>>()
+                .ok_or(ProfileFailure::Singular)?;
+            // A level's own scale. Without borders it is `se`; a θ no subject reads
+            // directly has no curvature of its own and is never stepped.
+            let level_se: Vec<f64> = (0..n)
+                .map(|l| {
+                    let d = m[(l, l)];
+                    if d.is_finite() && d > 0.0 {
+                        1.0 / d.sqrt()
+                    } else {
+                        1.0
+                    }
+                })
+                .collect();
+            m_steps.clone_from(&level_se);
+            let steps: Vec<f64> = level_se.iter().map(|s| FD_STEP_SE * s).collect();
             let parts: Vec<Vec<f64>> = g
                 .subjects
                 .par_iter()
                 .zip(states.par_iter())
-                .zip(subj_pos.par_iter())
-                .map(|((&i, s), (pos, loc))| {
+                .zip(subj_loc.par_iter())
+                .map(|((&i, s), loc)| {
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
-                    self.total_gradient(i, &p, s, pos, &st)
+                    self.total_gradient(i, &p, s, &st)
                 })
                 .collect();
-            let mut grad = vec![0.0; n];
-            for (part, (_, loc)) in parts.iter().zip(&subj_pos) {
+            let mut grad_levels = vec![0.0; n];
+            for (part, loc) in parts.iter().zip(&subj_loc) {
                 for (v, &l) in part.iter().zip(loc) {
-                    grad[l] += v;
+                    grad_levels[l] += v;
                 }
             }
-            if !grad.iter().all(|v| v.is_finite()) {
+            if !grad_levels.iter().all(|v| v.is_finite()) {
                 return Err(ProfileFailure::NonFinite);
             }
+            let grad = g.theta_gradient(&grad_levels);
             let criterion = grad
                 .iter()
                 .zip(&se)
@@ -613,13 +935,27 @@ impl ProfileCtx<'_> {
                     iterations,
                     criterion,
                     se,
+                    level_se,
                 });
             }
             if iterations == MAX_PROFILE_ITER {
                 return Err(ProfileFailure::NotConverged { criterion });
             }
-            let chol = m.clone().cholesky().ok_or(ProfileFailure::Singular)?;
-            let step = -chol.solve(&DVector::from_vec(grad.clone()));
+            let bordered = if g.borders.is_empty() {
+                None
+            } else {
+                bordered_step(g, &m, &grad_levels, &blocks)
+            };
+            let step = match bordered {
+                Some(s) => DVector::from_vec(s),
+                None => {
+                    let chol = g
+                        .theta_matrix(&m)
+                        .cholesky()
+                        .ok_or(ProfileFailure::Singular)?;
+                    -chol.solve(&DVector::from_vec(grad.clone()))
+                }
+            };
             let slope: f64 = grad.iter().zip(step.iter()).map(|(g, s)| g * s).sum();
             let o0: f64 = states.iter().map(|s| s.nll).sum();
             let mut alpha = 1.0;
@@ -664,6 +1000,8 @@ struct GroupOutcome {
     iterations: usize,
     criterion: f64,
     se: Vec<f64>,
+    /// Per level of the group, `1 / sqrt(M_yy)`.
+    level_se: Vec<f64>,
 }
 
 /// The packed value of θ `k` at `value`, as `pack_params` would write it.
@@ -684,9 +1022,27 @@ pub(crate) fn hold_template(layout: &ProfileLayout, template: &ModelParameters) 
     hold
 }
 
+/// The packed point `x` with its level coordinates at the solve's `β̂`.
+fn solved_point(
+    layout: &ProfileLayout,
+    hold: &ModelParameters,
+    x: &[f64],
+    solve: &ProfileSolve,
+) -> Vec<f64> {
+    let mut x_hat = x.to_vec();
+    for &k in &layout.coords {
+        x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
+    }
+    x_hat
+}
+
 /// The outer gradient at a solved point: the production gradient, the levels held at
 /// `β̂` in `hold` (envelope theorem). Indexed over the whole packed vector; the held
 /// coordinates' entries are not read.
+///
+/// `declines` should be built by [`profiled_decline_log`], as [`optimize_profiled`]'s
+/// is: then a subject that declines the analytic gradient at
+/// runtime is reconverged too (#2136).
 pub(crate) fn envelope_gradient(
     ctx: &ProfileCtx<'_>,
     hold: &ModelParameters,
@@ -696,17 +1052,16 @@ pub(crate) fn envelope_gradient(
     grad_idx: &mut usize,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
-    let mut x_hat = x.to_vec();
-    for &k in &ctx.layout.coords {
-        x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
-    }
+    let x_hat = solved_point(ctx.layout, hold, x, solve);
     // Off the analytic route, every evaluation's gradient reconverges the EBEs. The FD
     // route's default is the fixed-EBE gradient, which drops `dη̂/dθ`: an approximation the
     // unprofiled fit's optimizer tolerates, but the profile's L-BFGS stopped on it 0.42
     // OFV above the optimum on S1 (#1065, 100 × 8), where the reconverged gradient reaches
     // it. The envelope theorem removes `dβ̂/dθ`, not `dη̂/dθ`. The analytic gradient is
     // exact and is left alone (the schedule would replace it), and the IOV FD route
-    // reconverges already.
+    // reconverges already. On the analytic route a subject can still decline at runtime
+    // and take the per-subject salvage; that one is keyed on the subject's own route, by
+    // the reconverging `declines` log, not on this model-level predicate (#2136).
     let analytic = crate::sens::provider::analytic_outer_gradient_for_interaction(
         ctx.model,
         ctx.options.interaction,
@@ -734,6 +1089,74 @@ pub(crate) fn envelope_gradient(
         OuterTrial::unknown(),
         declines,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`optimize_profiled`] replaced its incumbent on this thread, so a
+    /// test can tell evaluations that improved from those that did not.
+    static INCUMBENT_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
+/// declines the analytic gradient at runtime takes the reconverged salvage rather than the
+/// held-EBE one (#2136, see [`envelope_gradient`]). The one constructor both of
+/// [`optimize_profiled`]'s gradient sites use.
+pub(crate) fn profiled_decline_log(n_subjects: usize) -> OuterFdDeclineLog {
+    OuterFdDeclineLog::reconverging(n_subjects)
+}
+
+/// The flat-θ pre-flight (#826) of a profiled fit: each free structural θ the profile
+/// objective ignores at the start `x0`, with its warning. The rule is the unprofiled
+/// pre-flight's (`flat_theta_candidates`, then the perturbation probe), on the objective
+/// this loop minimises: the envelope gradient at the start's solve, and the probe
+/// re-profiled. A probe whose solve fails counts as moving the objective, so it never
+/// freezes.
+fn profiled_flat_thetas(
+    ctx: &ProfileCtx<'_>,
+    hold: &ModelParameters,
+    x0: &[f64],
+    bounds: &PackedBounds,
+) -> Vec<(usize, String)> {
+    let n_theta = hold.theta.len();
+    let is_free = |i: usize| !hold.theta_fixed[i];
+    if !(0..n_theta).any(is_free) {
+        return Vec::new();
+    }
+    let params = unpack_params(x0, hold);
+    let Ok(solve) = ctx.solve(&params, &ProfileWarm::from_template(ctx.layout, hold)) else {
+        return Vec::new();
+    };
+    // A log of its own, dropped, as the unprofiled pre-flight's: a decline here is not one
+    // the optimizer's gradient took.
+    let grad = envelope_gradient(
+        ctx,
+        hold,
+        x0,
+        &solve,
+        bounds,
+        &mut 0,
+        &profiled_decline_log(ctx.population.subjects.len()),
+    );
+    let Some(candidates) = flat_theta_candidates(&grad, n_theta, is_free) else {
+        return Vec::new();
+    };
+    let warm = ProfileWarm::from_solve(ctx.layout, &solve);
+    candidates
+        .into_iter()
+        .filter_map(|i| {
+            let ti = params.theta[i];
+            let probe = flat_theta_probe_value(ti, hold.theta_lower[i], hold.theta_upper[i])?;
+            let mut p = params.clone();
+            p.theta[i] = probe;
+            let probed = ctx.solve(&p, &warm).ok()?.ofv;
+            if flat_theta_probe_moves(solve.ofv, probed) {
+                return None;
+            }
+            let name = hold.theta_names.get(i).map_or("<theta>", |s| s.as_str());
+            Some((i, flat_theta_warning(name, ti)))
+        })
+        .collect()
 }
 
 /// The outer algorithm of a profiled fit: `auto` is L-BFGS on the envelope gradient,
@@ -981,14 +1404,41 @@ pub(crate) fn optimize_profiled(
 ) -> OuterResult {
     let layout = ProfileLayout::build(model, population, init_params)
         .expect("optimize_profiled is called for a model with a profiled block");
-    let hold = hold_template(&layout, init_params);
+    let mut hold = hold_template(&layout, init_params);
     let PackedStart {
         packed: mut x0,
         bounds,
-        fixed,
         ..
     } = pack_with_bounds(&hold);
     clamp_to_bounds(&mut x0, &bounds);
+    // The fit's template, with any θ the flat-θ pre-flight freezes marked: its
+    // `theta_fixed` is what the result publishes, as the unprofiled path's frozen template.
+    let mut fit_template = init_params.clone();
+    let mut warnings: Vec<String> = Vec::new();
+    let runs = runs_outer_optimizer(options);
+    {
+        let ctx = ProfileCtx {
+            model,
+            population,
+            layout: &layout,
+            options,
+            inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+        };
+        // The flat-θ pre-flight (#826), on the profile objective. Only when the optimizer
+        // runs, as in `optimize_population`.
+        if runs {
+            for (i, w) in profiled_flat_thetas(&ctx, &hold, &x0, &bounds) {
+                let v = unpack_params(&x0, &hold).theta[i];
+                for t in [&mut hold, &mut fit_template] {
+                    t.theta[i] = v;
+                    t.theta_fixed[i] = true;
+                }
+                warnings.push(w);
+            }
+        }
+    }
+    let hold = hold;
+    let fixed = packed_fixed_mask(&hold);
     let free: Vec<usize> = (0..x0.len()).filter(|&i| !fixed[i]).collect();
     let ctx = ProfileCtx {
         model,
@@ -997,8 +1447,10 @@ pub(crate) fn optimize_profiled(
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
     };
-    let declines = OuterFdDeclineLog::new(population.subjects.len());
-    let mut warnings: Vec<String> = Vec::new();
+    // Reconverging: a subject that declines the analytic gradient at runtime takes the
+    // reconverged salvage, not the held-EBE one (#2136, see `envelope_gradient`).
+    let declines = profiled_decline_log(population.subjects.len());
+    let algo = profiled_algorithm(options);
 
     // The incumbent: its solve warm-starts the next evaluation (#1290: a warm start from
     // a rejected trial can stall a line search).
@@ -1006,11 +1458,14 @@ pub(crate) fn optimize_profiled(
         x: Vec<f64>,
         solve: Option<ProfileSolve>,
         warm: ProfileWarm,
+        /// The evaluation that found it, recorded in its checkpoint.
+        iter: usize,
     }
     let best = Mutex::new(Incumbent {
         x: x0.clone(),
         solve: None,
         warm: ProfileWarm::from_template(&layout, init_params),
+        iter: 0,
     });
     let n_evals = AtomicUsize::new(0);
     let grad_idx = Mutex::new(0usize);
@@ -1022,7 +1477,7 @@ pub(crate) fn optimize_profiled(
         x
     };
     let ebe_accum = Mutex::new(EbeAccum::default());
-    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+    let evaluate_once = |x: &[f64]| -> Option<ProfileSolve> {
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
@@ -1048,13 +1503,64 @@ pub(crate) fn optimize_profiled(
             b.x = x.to_vec();
             b.warm = ProfileWarm::from_solve(&layout, &solve);
             b.solve = Some(solve.clone());
+            b.iter = n_evals.load(Ordering::Relaxed);
+            #[cfg(test)]
+            INCUMBENT_UPDATES.with(|c| c.set(c.get() + 1));
         }
         Some(solve)
     };
+    // Every evaluation, improving or not, then checks whether a checkpoint (#755) is due,
+    // and writes the incumbent — the best point, its levels at β̂ — not this evaluation's
+    // (#1317): a resume unpacks them as the start's levels, which warm-start its first
+    // profile solve. Keyed on the incumbent rather than on an improvement, so a run whose
+    // incumbent was found before the interval elapsed still writes once it has. Only a
+    // feasible point is ever an incumbent (#1617).
+    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+        let out = evaluate_once(x);
+        if crate::io::checkpoint::is_due() {
+            let b = best.lock().unwrap();
+            if let Some(solve) = &b.solve {
+                crate::io::checkpoint::maybe_write(
+                    b.iter,
+                    solve.ofv,
+                    &solved_point(&layout, &hold, &b.x, solve),
+                );
+            }
+        }
+        out
+    };
+    // Optimizer trace: one row per feasible evaluation, every packed coordinate's value
+    // (levels at β̂) and the gradient handed to NLopt (`NA` on held coordinates).
+    let trace_row = |solve: &ProfileSolve, grad: Option<&[f64]>| {
+        if !crate::estimation::trace::is_active() {
+            return;
+        }
+        let grad_norm = grad.map(|g| free.iter().map(|&i| g[i] * g[i]).sum::<f64>().sqrt());
+        let grads = grad.map(|g| {
+            (0..g.len())
+                .map(|i| if fixed[i] { f64::NAN } else { g[i] })
+                .collect::<Vec<_>>()
+        });
+        crate::estimation::trace::write_foce(
+            n_evals.load(Ordering::Relaxed),
+            if options.interaction { "focei" } else { "foce" },
+            solve.ofv,
+            grad_norm,
+            None,
+            match algo {
+                nlopt::Algorithm::Bobyqa => "bobyqa",
+                nlopt::Algorithm::Slsqp => "slsqp",
+                _ => "nlopt_lbfgs",
+            },
+            Some(solve.ebe.n_unconverged),
+            Some(solve.ebe.n_fallback),
+            &crate::estimation::parameterization::coordinate_values(&solve.params),
+            grads.as_deref(),
+        );
+    };
 
     let mut converged = false;
-    if runs_outer_optimizer(options) && !free.is_empty() {
-        let algo = profiled_algorithm(options);
+    if runs && !free.is_empty() {
         let lower: Vec<f64> = free.iter().map(|&i| bounds.lower[i]).collect();
         let upper: Vec<f64> = free.iter().map(|&i| bounds.upper[i]).collect();
         let objective = |xs: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
@@ -1069,12 +1575,20 @@ pub(crate) fn optimize_profiled(
                 Some(solve) => {
                     if let Some(g) = grad {
                         let mut idx = grad_idx.lock().unwrap();
-                        let gr = envelope_gradient(
+                        let mut gr = envelope_gradient(
                             &ctx, &hold, &x, &solve, &bounds, &mut idx, &declines,
                         );
-                        for (gi, &i) in g.iter_mut().zip(&free) {
-                            *gi = if gr[i].is_finite() { gr[i] } else { 0.0 };
+                        for &i in &free {
+                            if !gr[i].is_finite() {
+                                gr[i] = 0.0;
+                            }
                         }
+                        for (gi, &i) in g.iter_mut().zip(&free) {
+                            *gi = gr[i];
+                        }
+                        trace_row(&solve, Some(&gr));
+                    } else {
+                        trace_row(&solve, None);
                     }
                     if options.verbose {
                         eprintln!(
@@ -1182,7 +1696,9 @@ pub(crate) fn optimize_profiled(
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
         // levels are still solved at the initial structural point.
-        evaluate(&x0);
+        if let Some(solve) = evaluate(&x0) {
+            trace_row(&solve, None);
+        }
     }
 
     let (x_best, solve) = {
@@ -1193,14 +1709,11 @@ pub(crate) fn optimize_profiled(
         warnings.push(
             "Profile solve failed at every evaluated point: no objective is available.".to_string(),
         );
-        let params = unpack_params(&x0, init_params);
+        let params = unpack_params(&x0, &fit_template);
         let ebe = ebe_accum.into_inner().unwrap();
         return failed_result(params, population, model, warnings, &ebe);
     };
-    let mut x_hat = x_best.clone();
-    for &k in &layout.coords {
-        x_hat[k] = packed_theta(&hold, k, solve.params.theta[k]);
-    }
+    let x_hat = solved_point(&layout, &hold, &x_best, &solve);
 
     let cov = if options.run_covariance_step {
         let out = ctx.covariance_at_estimate(&hold, &x_hat, &free, &solve.params, &solve.etas);
@@ -1216,7 +1729,7 @@ pub(crate) fn optimize_profiled(
         warnings.push(w);
     }
     let mut params = solve.params.clone();
-    params.theta_fixed = init_params.theta_fixed.clone();
+    params.theta_fixed = fit_template.theta_fixed.clone();
     let ebe = ebe_accum.into_inner().unwrap();
     OuterResult {
         params,
@@ -1238,7 +1751,7 @@ pub(crate) fn optimize_profiled(
         total_ebe_fallbacks: ebe.total_fallback as u32,
         final_gradient: None,
         final_gradient_source: None,
-        sir_fallback_proposal: None,
+        sir_fallback_proposal: cov.and_then(|c| c.sir_fallback_proposal),
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
@@ -1257,6 +1770,22 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
     format!(
         "Covariance step failed: the profile solve did not converge at the \
          estimates ({e:?}). SE estimates not available."
+    )
+}
+
+/// The warning of a profiled covariance step whose profile-objective Hessian `A_p` is not
+/// positive definite, its eigenvalues listed; the step then hands SIR the rectified
+/// fallback proposal. A function so the `classify_warning` table test classifies the text
+/// this site emits (#2158).
+pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
+    let eig = eigvals
+        .iter()
+        .map(|&v| crate::estimation::covariance::fmt_eig(v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Covariance step failed: the Hessian of the profile objective is not positive \
+         definite (eigenvalues [{eig}]). SE estimates not available."
     )
 }
 
@@ -1358,6 +1887,72 @@ fn failed_result(
     }
 }
 
+/// The inflation of the non-PD SIR fallback proposal, as the unprofiled step's.
+const NON_PD_PROPOSAL_INFLATION: f64 = 4.0;
+
+/// The full packed covariance of a profiled fit (levels included) from the structural
+/// block `cov_s` (`nf × nf`, over `free`), `D` per group and `B` (`nf × L`, both OFV
+/// scale), with `H = [[A, B], [Bᵀ, D]]`:
+/// - `Cov(θ, β) = −Cov(θ)·B·D⁻¹`,
+/// - `Cov(β) = d_scale·D⁻¹ + D⁻¹Bᵀ·Cov(θ)·B·D⁻¹`.
+///
+/// `d_scale = 2` and `cov_s = 2·A_p⁻¹` give the blocks of `2·H⁻¹`; the non-PD SIR proposal
+/// passes its own inflated `cov_s` and `d_scale`. `None` when a group's `D` is not
+/// positive definite.
+fn assemble_profiled_covariance(
+    layout: &ProfileLayout,
+    free: &[usize],
+    n: usize,
+    cov_s: &DMatrix<f64>,
+    d_groups: &[DMatrix<f64>],
+    b: &DMatrix<f64>,
+    d_scale: f64,
+) -> Option<DMatrix<f64>> {
+    let nf = free.len();
+    let l = layout.coords.len();
+    // D⁻¹ per group, and D⁻¹Bᵀ (L × nf).
+    let mut d_inv_bt = DMatrix::zeros(l, nf);
+    let mut d_inv: Vec<DMatrix<f64>> = Vec::with_capacity(layout.groups.len());
+    for (g, d) in layout.groups.iter().zip(d_groups) {
+        let inv = d.clone().cholesky()?.inverse();
+        for (a, &pa) in g.coords.iter().enumerate() {
+            for s in 0..nf {
+                d_inv_bt[(pa, s)] = (0..g.coords.len())
+                    .map(|c| inv[(a, c)] * b[(s, g.coords[c])])
+                    .sum();
+            }
+        }
+        d_inv.push(inv);
+    }
+    // Cov(θ, β) = −Cov(θ)·B·D⁻¹ = −Cov(θ)·(D⁻¹Bᵀ)ᵀ.
+    let cov_sb = -(cov_s * d_inv_bt.transpose());
+    // Cov(β) = d_scale·D⁻¹ + (D⁻¹Bᵀ)·Cov(θ)·(D⁻¹Bᵀ)ᵀ.
+    let mut cov_bb = &d_inv_bt * cov_s * d_inv_bt.transpose();
+    for (g, inv) in layout.groups.iter().zip(&d_inv) {
+        for (a, &pa) in g.coords.iter().enumerate() {
+            for (c, &pc) in g.coords.iter().enumerate() {
+                cov_bb[(pa, pc)] += d_scale * inv[(a, c)];
+            }
+        }
+    }
+    let mut full = DMatrix::zeros(n, n);
+    for a in 0..nf {
+        for c in 0..nf {
+            full[(free[a], free[c])] = cov_s[(a, c)];
+        }
+        for (p, &k) in layout.coords.iter().enumerate() {
+            full[(free[a], k)] = cov_sb[(a, p)];
+            full[(k, free[a])] = cov_sb[(a, p)];
+        }
+    }
+    for (p, &k) in layout.coords.iter().enumerate() {
+        for (q, &j) in layout.coords.iter().enumerate() {
+            full[(k, j)] = cov_bb[(p, q)];
+        }
+    }
+    Some(full)
+}
+
 impl ProfileCtx<'_> {
     /// The profile objective at the packed point `x` (levels ignored), re-profiled from
     /// `warm`; `NaN` when the solve fails.
@@ -1397,10 +1992,7 @@ impl ProfileCtx<'_> {
         };
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters only when the re-solve moves the levels.
-        let mut x_hat = x.to_vec();
-        for &k in &layout.coords {
-            x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
-        }
+        let x_hat = solved_point(layout, hold, x, &solve);
         self.covariance(hold, &x_hat, free, &solve)
     }
 
@@ -1471,68 +2063,95 @@ impl ProfileCtx<'_> {
         }
         let nf = free.len();
         let a_p = DMatrix::from_fn(nf, nf, |a, b| stencil.hess[(free[a], free[b])]);
-        let Some(a_chol) = a_p.clone().cholesky() else {
-            return fail(
-                "Covariance step failed: the Hessian of the profile objective is not positive \
-                 definite. SE estimates not available."
-                    .to_string(),
-            );
+        cov_ctx.covariance_from_profile_hessian(hold, x_hat, free, solve, &a_p, start)
+    }
+
+    /// The rest of [`Self::covariance`] once `A_p` (the profile objective's OFV Hessian over
+    /// `free`) is known: `D` and `B`, then the full matrix — or, when `A_p` is not positive
+    /// definite, no matrix and the non-PD SIR fallback proposal over every packed
+    /// coordinate. `self` is the covariance step's context (its inner tolerance).
+    pub(crate) fn covariance_from_profile_hessian(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+        a_p: &DMatrix<f64>,
+        start: Instant,
+    ) -> CovStepOutcome {
+        let fail = |reason: String| CovStepOutcome {
+            matrix: None,
+            wall_time_secs: start.elapsed().as_secs_f64(),
+            warnings: vec![reason],
+            sir_fallback_proposal: None,
+            method: None,
         };
-        let cov_s = a_chol.inverse() * 2.0;
+        let options = self.options;
+        let n = x_hat.len();
+        let nf = free.len();
+        // `R⁻¹` over the structural coordinates, or — when `A_p` is not positive definite —
+        // the non-PD fallback's |λ|-rectified proposal (`build_non_pd_fallback_proposal`,
+        // as the unprofiled step builds it, at the same 4× inflation), with the reason.
+        let (cov_s, non_pd) = match a_p.clone().cholesky() {
+            Some(ch) => (ch.inverse() * 2.0, None),
+            None => {
+                let sym = (a_p + a_p.transpose()) * 0.5;
+                let Some(eigvals) = crate::estimation::covariance::extract_eigenvalues(&sym) else {
+                    return fail(
+                        "Covariance step failed: could not compute eigenvalues of the Hessian \
+                         of the profile objective (it may contain NaN or Inf). SE estimates \
+                         not available."
+                            .to_string(),
+                    );
+                };
+                let units = crate::estimation::covariance::free_coordinate_units(
+                    hold,
+                    x_hat,
+                    free,
+                    &self.model.nn_weight_theta_ranges(),
+                );
+                let all: Vec<usize> = (0..nf).collect();
+                let proposal = crate::estimation::covariance::build_non_pd_fallback_proposal(
+                    &sym,
+                    &all,
+                    nf,
+                    NON_PD_PROPOSAL_INFLATION,
+                    &units,
+                );
+                (proposal, Some(profile_non_pd_msg(&eigvals)))
+            }
+        };
 
         // D (per group) and B, per subject over its own levels, with the EBE re-solved.
-        let (d_groups, b) = match cov_ctx.level_blocks(hold, x_hat, free, solve) {
+        let (d_groups, b) = match self.level_blocks(hold, x_hat, free, solve) {
             Ok(v) => v,
-            Err(reason) => return fail(reason),
+            Err(reason) => return fail(non_pd.unwrap_or(reason)),
         };
-        let layout = self.layout;
-        let l = layout.coords.len();
-        // D⁻¹ per group, and D⁻¹Bᵀ (L × nf).
-        let mut d_inv_bt = DMatrix::zeros(l, nf);
-        let mut d_inv: Vec<DMatrix<f64>> = Vec::with_capacity(layout.groups.len());
-        for (g, d) in layout.groups.iter().zip(&d_groups) {
-            let Some(ch) = d.clone().cholesky() else {
-                return fail(
-                    "Covariance step failed: the Hessian of the objective in the profiled \
-                     levels is not positive definite. SE estimates not available."
-                        .to_string(),
-                );
+        // The proposal is `4·|H|⁻¹` where the covariance is `2·H⁻¹`: its `D⁻¹` term carries
+        // the same factor 2, so the level blocks are those of the rectified, inflated
+        // block inverse.
+        let d_scale = if non_pd.is_some() {
+            NON_PD_PROPOSAL_INFLATION
+        } else {
+            2.0
+        };
+        let Some(full) =
+            assemble_profiled_covariance(self.layout, free, n, &cov_s, &d_groups, &b, d_scale)
+        else {
+            return fail(non_pd.unwrap_or_else(|| {
+                "Covariance step failed: the Hessian of the objective in the profiled \
+                 levels is not positive definite. SE estimates not available."
+                    .to_string()
+            }));
+        };
+        if let Some(reason) = non_pd {
+            return CovStepOutcome {
+                matrix: None,
+                wall_time_secs: start.elapsed().as_secs_f64(),
+                warnings: vec![reason],
+                sir_fallback_proposal: Some(full),
+                method: None,
             };
-            let inv = ch.inverse();
-            for (a, &pa) in g.coords.iter().enumerate() {
-                for s in 0..nf {
-                    d_inv_bt[(pa, s)] = (0..g.coords.len())
-                        .map(|c| inv[(a, c)] * b[(s, g.coords[c])])
-                        .sum();
-                }
-            }
-            d_inv.push(inv);
-        }
-        // Cov(θ, β) = −Cov(θ)·B·D⁻¹ = −Cov(θ)·(D⁻¹Bᵀ)ᵀ.
-        let cov_sb = -(&cov_s * d_inv_bt.transpose());
-        // Cov(β) = 2·D⁻¹ + (D⁻¹Bᵀ)·Cov(θ)·(D⁻¹Bᵀ)ᵀ.
-        let mut cov_bb = &d_inv_bt * &cov_s * d_inv_bt.transpose();
-        for (g, inv) in layout.groups.iter().zip(&d_inv) {
-            for (a, &pa) in g.coords.iter().enumerate() {
-                for (c, &pc) in g.coords.iter().enumerate() {
-                    cov_bb[(pa, pc)] += 2.0 * inv[(a, c)];
-                }
-            }
-        }
-        let mut full = DMatrix::zeros(n, n);
-        for a in 0..nf {
-            for c in 0..nf {
-                full[(free[a], free[c])] = cov_s[(a, c)];
-            }
-            for (p, &k) in layout.coords.iter().enumerate() {
-                full[(free[a], k)] = cov_sb[(a, p)];
-                full[(k, free[a])] = cov_sb[(a, p)];
-            }
-        }
-        for (p, &k) in layout.coords.iter().enumerate() {
-            for (q, &j) in layout.coords.iter().enumerate() {
-                full[(k, j)] = cov_bb[(p, q)];
-            }
         }
         if options.verbose {
             eprintln!("  Covariance step successful (profile)");
@@ -1548,7 +2167,10 @@ impl ProfileCtx<'_> {
 
     /// `D` per group (OFV scale, over the group's coordinates) and `B` (`nf × L`, OFV
     /// scale), by central differences of each subject's term over the structural free
-    /// coordinates and its own levels, the EBE re-solved at every point.
+    /// coordinates and its own levels, the EBE re-solved at every point. Differenced over
+    /// levels, a subject reading a global `sum_to_zero`'s dependent costs its own `k²`
+    /// re-solves, not the block's (#2135); `D` and `B` are mapped to θ after
+    /// (`TᵀDT`, `BT`).
     #[allow(clippy::type_complexity)]
     fn level_blocks(
         &self,
@@ -1567,42 +2189,46 @@ impl ProfileCtx<'_> {
                 fd_step(self.options.fd_hessian_step, x_hat[i], floor)
             })
             .collect();
-        let level_steps: Vec<f64> = solve.se_scale.iter().map(|s| COV_STEP_SE * s).collect();
-        if !level_steps.iter().all(|s| s.is_finite() && *s > 0.0) {
+        let level_steps: Vec<f64> = solve.level_scale.iter().map(|s| COV_STEP_SE * s).collect();
+        let stepped = |s: f64| s.is_finite() && s > 0.0;
+        if !solve.se_scale.iter().all(|&s| stepped(s))
+            || !layout
+                .reads
+                .iter()
+                .flatten()
+                .all(|r| stepped(level_steps[r.level]))
+        {
             return Err(
                 "Covariance step failed: a profiled level has no curvature at the estimate. \
                  SE estimates not available."
                     .to_string(),
             );
         }
-        // Per subject: (D_i over its positions, B_i nf × its positions).
+        // Per subject: (D_i over its levels, B_i nf × its levels).
         let parts: Vec<(DMatrix<f64>, DMatrix<f64>)> = (0..self.population.subjects.len())
             .into_par_iter()
             .map(|i| {
-                let pos = &layout.active[i];
-                let k = pos.len();
+                let reads = &layout.reads[i];
+                let k = reads.len();
                 let warm = &solve.etas[i];
-                // A packed point moved along structural coordinates `ds` and level
-                // positions `dl`, scored as subject `i`'s term (OFV scale). `x_hat`
-                // already carries `β̂` in the level coordinates.
+                // A packed point moved along structural coordinates `ds` and the
+                // subject's levels `dl`, scored as subject `i`'s term (OFV scale).
+                // `x_hat` already carries `β̂` in the level coordinates.
                 let at = |ds: &[(usize, f64)], dl: &[(usize, f64)]| -> f64 {
                     let mut x = x_hat.to_vec();
                     for &(a, d) in ds {
                         x[free[a]] += d;
                     }
-                    let mut p = unpack_params(&x, hold);
-                    for &(j, d) in dl {
-                        p.theta[layout.coords[pos[j]]] += d;
-                    }
+                    let p = shifted(&unpack_params(&x, hold), reads, dl);
                     2.0 * self.resolve(i, &p, warm).nll
                 };
                 let f0 = at(&[], &[]);
                 let mut d = DMatrix::zeros(k, k);
                 for a in 0..k {
-                    let h = level_steps[pos[a]];
+                    let h = level_steps[reads[a].level];
                     d[(a, a)] = (at(&[], &[(a, h)]) - 2.0 * f0 + at(&[], &[(a, -h)])) / (h * h);
                     for c in 0..a {
-                        let g = level_steps[pos[c]];
+                        let g = level_steps[reads[c].level];
                         let v = (at(&[], &[(a, h), (c, g)])
                             - at(&[], &[(a, h), (c, -g)])
                             - at(&[], &[(a, -h), (c, g)])
@@ -1616,7 +2242,7 @@ impl ProfileCtx<'_> {
                 for s in 0..nf {
                     let hs = theta_steps[s];
                     for a in 0..k {
-                        let h = level_steps[pos[a]];
+                        let h = level_steps[reads[a].level];
                         b[(s, a)] = (at(&[(s, hs)], &[(a, h)])
                             - at(&[(s, hs)], &[(a, -h)])
                             - at(&[(s, -hs)], &[(a, h)])
@@ -1627,24 +2253,39 @@ impl ProfileCtx<'_> {
                 (d, b)
             })
             .collect();
-        let mut d_groups: Vec<DMatrix<f64>> = layout
+        let mut d_levels: Vec<DMatrix<f64>> = layout
             .groups
             .iter()
-            .map(|g| DMatrix::zeros(g.coords.len(), g.coords.len()))
+            .map(|g| DMatrix::zeros(g.n_levels(), g.n_levels()))
             .collect();
-        let mut b: DMatrix<f64> = DMatrix::zeros(nf, l);
+        let mut b_levels: DMatrix<f64> = DMatrix::zeros(nf, layout.n_levels());
         for (i, (di, bi)) in parts.iter().enumerate() {
-            let pos = &layout.active[i];
-            for (a, &pa) in pos.iter().enumerate() {
-                let (g, la) = layout.local[pa];
-                for (c, &pc) in pos.iter().enumerate() {
-                    d_groups[g][(la, layout.local[pc].1)] += di[(a, c)];
+            let reads = &layout.reads[i];
+            for (a, ra) in reads.iter().enumerate() {
+                let (g, la) = layout.level_local(ra.level);
+                for (c, rc) in reads.iter().enumerate() {
+                    d_levels[g][(la, layout.level_local(rc.level).1)] += di[(a, c)];
                 }
                 for s in 0..nf {
-                    b[(s, pa)] += bi[(s, a)];
+                    b_levels[(s, ra.level)] += bi[(s, a)];
                 }
             }
         }
+        // To θ: `D = TᵀD_yT` per group, and `B = B_yT`, a θ moving the dependent that
+        // sums it by `−1`.
+        let d_groups: Vec<DMatrix<f64>> = layout
+            .groups
+            .iter()
+            .zip(&d_levels)
+            .map(|(g, d)| g.theta_matrix(d))
+            .collect();
+        let b = DMatrix::from_fn(nf, l, |s, pos| {
+            let (g, a) = layout.local[pos];
+            match layout.groups[g].border_of[a] {
+                Some(j) => b_levels[(s, pos)] - b_levels[(s, l + layout.groups[g].borders[j])],
+                None => b_levels[(s, pos)],
+            }
+        });
         if !d_groups.iter().all(|d| d.iter().all(|v| v.is_finite()))
             || !b.iter().all(|v| v.is_finite())
         {
