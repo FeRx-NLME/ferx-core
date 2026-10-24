@@ -141,6 +141,60 @@ pub(crate) fn assert_starts_at_modes(
     )
 }
 
+/// #2261, the invariant over a whole fit: every population pass of `rec` that is handed
+/// warm starts (not all zero) hands each IOV subject (one whose EBE has κ cells) `η̂` then every cell's κ̂,
+/// and the subject's IOV solve in that pass starts at that κ block, bit for bit. Returns the
+/// number of such (pass, subject) pairs, which must be positive. A site that hands `η̂`
+/// alone fails here, naming the pass.
+pub(crate) fn assert_every_warm_pass_is_joint(
+    label: &str,
+    rec: &InnerRecording,
+    model: &CompiledModel,
+) -> usize {
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_eta = model.n_eta;
+    let mut checked = 0;
+    for p in &rec.passes {
+        let Some(init) = &p.init else { continue };
+        // A cold start spelled as zeros (the identity-scale pre-flight's `cold_etas`)
+        // carries no mode to lose.
+        if p.kappas.is_empty() || init.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let joint = n_eta + p.kappas.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(
+            init.len(),
+            joint,
+            "{label}: pass {} handed subject {} a warm start of width {}, not η̂ and κ̂ \
+             ({joint}): the κ block was dropped",
+            p.pass,
+            p.subject,
+            init.len()
+        );
+        let start = rec
+            .starts
+            .iter()
+            .find(|s| s.pass == Some(p.pass) && s.subject == p.subject)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: pass {} subject {}: no IOV start",
+                    p.pass, p.subject
+                )
+            });
+        let got: Vec<u64> = start.kappas.iter().flat_map(|c| bits(c)).collect();
+        assert_eq!(
+            got,
+            bits(&init[n_eta..]),
+            "{label}: pass {} subject {}: κ block of the start is not the κ̂ it was handed",
+            p.pass,
+            p.subject
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "{label}: no warm pass reached an IOV subject");
+    checked
+}
+
 /// #2261: every inner solve of `rec` for a subject `select` picks ran at the stencil
 /// tolerance `stencil_inner_tol(stage_tol)`, and `stage_tol` is looser than it, so a stencil
 /// that dropped the tightening would show. Returns the number of solves, which must be

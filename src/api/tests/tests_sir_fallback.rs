@@ -142,6 +142,7 @@ fn resolve_sir_fallback_is_none_when_option_off() {
         &pop,
         &params,
         &eta_hats,
+        &[],
         0.0,
         &mut warnings,
     );
@@ -188,6 +189,7 @@ fn resolve_sir_fallback_fires_and_yields_finite_cis() {
         &pop,
         &params,
         &eta_hats,
+        &[],
         // ofv_hat cancels in the SIR log-sum-exp weight normalisation, so any
         // finite value yields identical CIs — 0.0 keeps the fixture simple.
         0.0,
@@ -370,6 +372,7 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
         pop,
         &params,
         &eta_hats,
+        &[],
         0.0,
         &mut warnings,
     )
@@ -428,4 +431,55 @@ fn a_fit_without_sir_reports_no_sir_seed_or_settings() {
     assert_eq!(fit.sir_ess, None, "SIR must not have run");
     assert_eq!(fit.sir_seed, None);
     assert_eq!(fit.sir_settings, None);
+}
+
+/// #2261: the fallback's draws re-solve from the fit's joint mode, the η̂ and κ̂ the fit hands
+/// it. Every warm draw pass of an IOV subject is handed both, and starts at that κ̂.
+/// Mutation: build the warm start from `eta_hats` alone.
+#[test]
+fn resolve_sir_fallback_draws_start_at_the_fit_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{
+        assert_every_warm_pass_is_joint, on_one_thread,
+    };
+    let prep = crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare warfarin_iov");
+    let model = &prep.parsed.model;
+    let pop = &prep.population;
+    let params = prep.init_params.clone();
+    let (eta_hats, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        model, pop, &params, 200, 1e-8, None, None, 0, 0,
+    );
+    let n_packed = crate::estimation::parameterization::pack_params(&params).len();
+    let proposal = DMatrix::from_diagonal(&DVector::from_element(n_packed, 0.01));
+    let opts = FitOptions {
+        verbose: false,
+        covariance_fallback: CovarianceFallback::Sir,
+        sir_samples: 10,
+        sir_resamples: 5,
+        sir_seed: Some(2261),
+        threads: Some(1),
+        ..prep.parsed.fit_options.clone()
+    };
+    let mut warnings = Vec::new();
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            resolve_sir_fallback(
+                &opts,
+                false,
+                false,
+                Some(&proposal),
+                model,
+                pop,
+                &params,
+                &eta_hats,
+                &kappas,
+                0.0,
+                &mut warnings,
+            )
+            .unwrap_or_else(|| panic!("the fallback must run: {warnings:?}"))
+        })
+        .1
+    });
+    assert_every_warm_pass_is_joint("SIR fallback", &rec, model);
 }

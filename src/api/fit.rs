@@ -173,6 +173,10 @@ mod derived_cmt_tv_warning_tests;
 #[path = "tests/optimizer_label_tests.rs"]
 mod optimizer_label_tests;
 
+#[cfg(test)]
+#[path = "tests/joint_warm_start_tests.rs"]
+mod joint_warm_start_tests;
+
 #[cfg(all(test, feature = "nn"))]
 #[path = "tests/nn_info_tests.rs"]
 mod nn_info_tests;
@@ -2642,8 +2646,9 @@ fn fit_inner(
             .expect("every stage that runs records its scoring settings")
             .overwrite(options),
     );
-    // Both SIR runs re-solve each draw's EBEs from the fit's joint mode, κ̂ included, as
-    // `run_sir` does from the stored fit, so an IOV draw does not restart κ at 0 (#2261).
+    // The SIR draws re-solve each EBE from the fit's joint mode, κ̂ included, as `run_sir`
+    // does from the stored fit and the fallback below does, so an IOV draw does not restart
+    // κ at 0 (#2261).
     let sir_warm =
         crate::estimation::outer_optimizer::joint_warm_starts(&result.eta_hats, &result.kappas);
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
@@ -2694,7 +2699,8 @@ fn fit_inner(
         model,
         population,
         &result.params,
-        &sir_warm,
+        &result.eta_hats,
+        &result.kappas,
         result.ofv,
         &mut warnings,
     );

@@ -1877,23 +1877,49 @@ pub(crate) struct InnerRecording {
 }
 
 // The recording [`record_inner_solves`] runs on this thread; `None` (nothing recorded)
-// outside it, so the inner loops of every other test leave nothing behind.
+// outside it, so the inner loops of every other test leave nothing behind. A handle, so a
+// fit that moves onto a pool of its own can carry it there (`recording_handle`).
+#[cfg(test)]
+pub(crate) type RecordingHandle = std::sync::Arc<std::sync::Mutex<InnerRecording>>;
+
 #[cfg(test)]
 thread_local! {
-    static INNER_RECORDING: std::cell::RefCell<Option<InnerRecording>> =
+    static INNER_RECORDING: std::cell::RefCell<Option<RecordingHandle>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f`, recording every IOV start and every population pass on this thread, so a
 /// test can read where an outer evaluation's inner solves started and what the previous
 /// one returned (#2217, #2261). Call it on a one-thread pool: the solves of a pass run on
-/// the pool's workers, and only this thread's are seen.
+/// the pool's workers, and only this thread's are seen. A `fit()` with `threads = 1` is
+/// seen too: `FitScope::armed` carries the recording onto the thread that runs the fit.
 #[cfg(test)]
 pub(crate) fn record_inner_solves<R>(f: impl FnOnce() -> R) -> (R, InnerRecording) {
-    INNER_RECORDING.with(|r| *r.borrow_mut() = Some(InnerRecording::default()));
+    let handle = RecordingHandle::default();
+    let out = with_recording_handle(Some(handle.clone()), f);
+    let recording = std::sync::Arc::try_unwrap(handle)
+        .unwrap_or_else(|_| panic!("the recording outlives `f`"))
+        .into_inner()
+        .unwrap();
+    (out, recording)
+}
+
+/// The recording this thread writes to, if any.
+#[cfg(test)]
+pub(crate) fn recording_handle() -> Option<RecordingHandle> {
+    INNER_RECORDING.with(|r| r.borrow().clone())
+}
+
+/// Run `f` with this thread writing to `handle`, then restore what it wrote to before.
+#[cfg(test)]
+pub(crate) fn with_recording_handle<R>(
+    handle: Option<RecordingHandle>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = INNER_RECORDING.with(|r| std::mem::replace(&mut *r.borrow_mut(), handle));
     let out = f();
-    let recording = INNER_RECORDING.with(|r| r.borrow_mut().take());
-    (out, recording.expect("the recording outlives `f`"))
+    INNER_RECORDING.with(|r| *r.borrow_mut() = previous);
+    out
 }
 
 #[cfg(test)]
@@ -1902,11 +1928,9 @@ pub(crate) mod test_helpers;
 
 #[cfg(test)]
 fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
-    INNER_RECORDING.with(|r| {
-        if let Some(rec) = r.borrow_mut().as_mut() {
-            f(rec);
-        }
-    });
+    if let Some(handle) = recording_handle() {
+        f(&mut handle.lock().unwrap());
+    }
 }
 
 // Solves on this thread that entered the guarded cold-start multi-start in `find_ebe_solve`,
