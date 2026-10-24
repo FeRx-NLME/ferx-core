@@ -642,6 +642,12 @@ struct ScoringSettingsWire {
     /// route as it did before.
     #[serde(default = "default_gradient_method")]
     gradient_method: String,
+    /// Absent from a bundle written before #1352, which did not record the covariate-NN
+    /// strengths: `None` stands in, and a post-hoc step takes the caller's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_l2_lambda: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_smooth_lambda: Option<f64>,
 }
 
 fn default_inner_restarts() -> usize {
@@ -711,6 +717,8 @@ impl From<&crate::ScoringSettings> for ScoringSettingsWire {
             ode_stiff_abort_after: s.ode_stiff_abort_after,
             ode_auto_switch: s.ode_auto_switch,
             gradient_method: enum_token(&s.gradient_method),
+            nn_l2_lambda: s.nn_l2_lambda,
+            nn_smooth_lambda: s.nn_smooth_lambda,
         }
     }
 }
@@ -778,6 +786,8 @@ impl ScoringSettingsWire {
             ode_stiff_abort_after: self.ode_stiff_abort_after,
             ode_auto_switch: self.ode_auto_switch,
             gradient_method: enum_from_token(block, "gradient_method", self.gradient_method)?,
+            nn_l2_lambda: self.nn_l2_lambda,
+            nn_smooth_lambda: self.nn_smooth_lambda,
         };
         settings
             .check_domain()
@@ -3091,6 +3101,8 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             });
         }
         Population {
@@ -4190,6 +4202,8 @@ mod tests {
             ode_stiff_abort_after: Some(9),
             ode_auto_switch: false,
             gradient_method: crate::types::GradientMethod::Fd,
+            nn_l2_lambda: Some(0.25),
+            nn_smooth_lambda: Some(0.5),
         }
     }
 
@@ -6042,9 +6056,10 @@ mod tests {
     /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
     /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
     /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
-    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835) and
-    /// `inner_screen` (#2013), still flat; the unrecorded `gradient_method` loads as `auto`
-    /// and the unrecorded `inner_screen` as `0`, the screen such a fit did not run.
+    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835),
+    /// `inner_screen` (#2013) and the covariate-NN strengths (#1352), still flat; the
+    /// unrecorded `gradient_method` loads as `auto`, the unrecorded `inner_screen` as `0`, the
+    /// screen such a fit did not run, and the unrecorded NN strengths as `None`.
     /// Mutations: drop `#[serde(flatten)]` (the frozen object fails to load, and the writer
     /// nests a `scoring` key); drop the `inner_restarts` or `inner_screen` default (the
     /// frozen object fails to load).
@@ -6065,6 +6080,8 @@ mod tests {
                 inner_restarts: crate::types::FitOptions::default().inner_restarts,
                 inner_screen: 0,
                 gradient_method: crate::types::GradientMethod::Auto,
+                nn_l2_lambda: None,
+                nn_smooth_lambda: None,
                 ..off_default_scoring_settings()
             },
             ..off_default_sir_settings()
@@ -6085,6 +6102,9 @@ mod tests {
         want_keys.push(&gradient);
         let screen = "inner_screen".to_string();
         want_keys.push(&screen);
+        let (nn_l2, nn_smooth) = ("nn_l2_lambda".to_string(), "nn_smooth_lambda".to_string());
+        want_keys.push(&nn_l2);
+        want_keys.push(&nn_smooth);
         want_keys.sort();
         assert_eq!(keys, want_keys);
     }
@@ -6135,6 +6155,16 @@ mod tests {
                 "gradient_method",
                 serde_json::json!("ad"),
                 serde_json::json!("auto"),
+            ),
+            (
+                "nn_l2_lambda",
+                serde_json::json!(-1.0),
+                serde_json::json!(0.0),
+            ),
+            (
+                "nn_smooth_lambda",
+                serde_json::json!(-0.5),
+                serde_json::json!(0.0),
             ),
         ] {
             match load(field, reject) {

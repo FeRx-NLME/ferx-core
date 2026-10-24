@@ -1697,6 +1697,8 @@ fn off_default_scoring() -> ScoringSettings {
         ode_stiff_abort_after: Some(9),
         ode_auto_switch: false,
         gradient_method: crate::types::GradientMethod::Fd,
+        nn_l2_lambda: Some(0.25),
+        nn_smooth_lambda: Some(0.5),
     }
 }
 
@@ -1752,6 +1754,8 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
         gradient_method: _,
+        nn_l2_lambda: _,
+        nn_smooth_lambda: _,
     } = rec.clone();
     macro_rules! field {
         ($f:ident) => {
@@ -1906,6 +1910,8 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
         ode_stiff_abort_after: _,
         ode_auto_switch: _,
         gradient_method: _,
+        nn_l2_lambda: _,
+        nn_smooth_lambda: _,
     } = rec.clone();
     macro_rules! differs {
         ($f:ident) => {

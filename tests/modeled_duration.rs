@@ -1330,8 +1330,9 @@ fn modeled_rate_addl_matches_nonmem() {
 /// `0.0`. The finite control is the straddle.
 #[test]
 fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
-    // `WT = 1000` overflows `exp(WT)` to `+inf`, and `inf − inf` is `NaN`. `exp` is
-    // the one DSL arithmetic with no domain guard, so this is the reachable route.
+    // `WT = 1000` overflows `exp(WT)` to `+inf`, and `inf − inf` is `NaN`. `exp` and
+    // `^` are the two DSL operations with no domain guard (#2040), and `exp` reaches
+    // both values, so it is the route used here.
     fn model_src(structural: &str, attr: &str, expr: &str) -> String {
         format!(
             r#"

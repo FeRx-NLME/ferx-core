@@ -2375,6 +2375,8 @@ fn tv_cov_population() -> crate::types::Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
@@ -12302,6 +12304,8 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     // sigma = [SD_total, SD_unbound] from the block diagonal.
@@ -12377,6 +12381,8 @@ fn test_selected_error_obs_keys_dispatch() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let keys = model.error_spec.obs_keys(&subject);
@@ -22910,6 +22916,8 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     };
 
@@ -23033,6 +23041,8 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".into(),
@@ -24814,25 +24824,106 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         "`TAD` in the PK RHS likewise"
     );
 
-    // Documented over-decline: an intermediate that reads time and is consumed
-    // *only* by the hazard is a top-level `AssignBc`, not one of the excluded
-    // derivative lines, so it still reads wide. Conservative in the safe
-    // direction — pinned so a later dataflow cut is a deliberate change.
-    //
-    // `pk_reads_absolute_time` inherits it, and there it is no longer free: #1166's consumer
-    // is a gradient-routing gate, where over-declining costs speed, while #1139 T3's is a
-    // user-facing warning, where it is a false positive on a legitimate joint model.
-    // Accepted rather than narrowed here — the dataflow cut is #1166's deferred change — and
-    // the *consequence* is pinned end-to-end by
-    // `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    // #1279: factoring the hazard's time read out into an `[odes]` intermediate is not a
+    // property of the model, so the intermediate spelling must agree with the inline one
+    // row-for-row — narrow flags off, wide flags on. Before the dataflow cut the intermediate
+    // was a top-level `AssignBc` the kind filter kept, and this read `(.., true, true)`.
+    const HAZ_TT: &str = "H0 * exp(0.05*TT) * exp(BETA * (central / V))";
+    let inline = joint_flags("", "", "H0 * exp(0.05*TIME) * exp(BETA * (central / V))");
+    assert_eq!(
+        inline,
+        (false, true, true, false, false),
+        "inline `TIME` in the hazard"
+    );
+    assert_eq!(
+        joint_flags("", "TT = TIME", HAZ_TT),
+        inline,
+        "a time-reading intermediate used only by the hazard reads as the inline spelling"
+    );
+    // Transitive, not one-hop: `UU` is what the hazard reads, `TT` only `UU` does.
     assert_eq!(
         joint_flags(
             "",
-            "TT = TIME",
-            "H0 * exp(0.05*TT) * exp(BETA * (central / V))"
+            "TT = TIME\n  UU = TT",
+            "H0 * exp(0.05*UU) * exp(BETA * (central / V))"
+        ),
+        inline,
+        "a chain of intermediates read only by the hazard is cut as a whole"
+    );
+    // The arm a naive "drop every intermediate" fix breaks: the same intermediate, read by a
+    // *retained* derivative line, is a genuinely non-autonomous PK block — under each
+    // spelling, including the `TAD` one that leaves the absolute-clock flag off.
+    for (pre, want) in [
+        ("TT = TIME", (false, true, true, true, true)),
+        ("TT = TIME\n  UU = TT", (false, true, true, true, true)),
+        ("TT = TAFD", (true, false, true, true, true)),
+        ("TT = TAD", (true, false, true, true, false)),
+    ] {
+        let pk = if pre.contains("UU") {
+            " * (1.0 + 0.01*UU)"
+        } else {
+            " * (1.0 + 0.01*TT)"
+        };
+        assert_eq!(
+            joint_flags(pk, pre, AUTO),
+            want,
+            "`{pre}` read by the PK RHS must keep the PK block non-autonomous"
+        );
+    }
+    // An `if` guarding a retained derivative keeps its condition, so a time-reading
+    // intermediate read only *there* still counts.
+    assert_eq!(
+        joint_flags(
+            " * K",
+            "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }",
+            AUTO
         ),
         (false, true, true, true, true),
-        "a time-reading intermediate used only by the hazard over-declines, by design"
+        "a time-reading intermediate in an `if` condition the PK RHS depends on"
+    );
+    // ...and the same `if` feeding only the hazard is cut with it.
+    assert_eq!(
+        joint_flags(
+            "",
+            "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }",
+            "H0 * K * exp(BETA * (central / V))"
+        ),
+        inline,
+        "an `if` whose only consumer is the hazard is not part of the PK block"
+    );
+    // A later `else if` cannot govern an earlier arm, so its condition is cut with the
+    // hazard-only arm it guards — keeping it made `TT` live through the condition alone.
+    // The straddle: the same `TT` condition *before* the PK arm does govern it, as does an
+    // `else` that keeps a PK statement, which needs every condition ahead of it.
+    let ladder = |c1: &str, c2: &str, els: &str| {
+        format!(
+            "TT = TIME\n  K = 1.0\n  G = 1.0\n  if ({c1}) {{\n    K = 2.0\n  }} else if \
+             ({c2}) {{\n    G = 2.0\n  }}{els}"
+        )
+    };
+    const HAZ_G: &str = "H0 * G * exp(BETA * (central / V))";
+    assert_eq!(
+        joint_flags(" * K", &ladder("CL > 5.0", "TT > 5.0", ""), HAZ_G),
+        (false, true, true, false, false),
+        "a trailing `else if` condition read only on the way to a hazard-only arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * G",
+            &ladder("TT > 5.0", "CL > 5.0", ""),
+            "H0 * K * exp(BETA * (central / V))"
+        ),
+        (false, true, true, true, true),
+        "an earlier condition governs a later PK arm"
+    );
+    assert_eq!(
+        joint_flags(
+            " * K",
+            &ladder("CL > 5.0", "TT > 5.0", " else {\n    K = 3.0\n  }"),
+            HAZ_G
+        ),
+        (false, true, true, true, true),
+        "an `else` keeping a PK statement depends on every condition before it"
     );
 }
 
@@ -35517,4 +35608,75 @@ mod analytic_hazard_time_1919 {
         );
         parse_model_string(&src).expect("a TIME-reading logit predictor must parse");
     }
+}
+
+// ---- #1854: per-parameter covariate dependence (the covariate axis of #1853's mask) ----
+
+/// `(name, reads any of covs)` pairs, in declaration order, on [`time_taint_model`].
+#[cfg(feature = "markov")]
+fn cov_mask_of(ip: &str, covs: &[&str]) -> Vec<(String, bool)> {
+    let model = time_taint_model(ip);
+    let mask = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("indiv param program present")
+        .params_reading_covariates(covs);
+    assert_eq!(
+        mask.len(),
+        model.indiv_param_names.len(),
+        "the mask must be parallel to indiv_param_names"
+    );
+    model.indiv_param_names.iter().cloned().zip(mask).collect()
+}
+
+/// Per parameter and per covariate: `CL` reads `WT` directly, `V` through an intermediate,
+/// `KA` reads `AGE` only, the rest read none. Asked for `WT` alone, `KA` must stay clear —
+/// a mask that ignores *which* covariate (any `PushCov` taints) flags it; one that stops at
+/// direct reads misses `V`.
+#[cfg(feature = "markov")]
+#[test]
+fn the_covariate_mask_flags_only_parameters_reading_the_named_covariates() {
+    let ip = "  CL   = TVCL * (WT / 70) * exp(ETA_CL)\n\
+              \x20 VW   = TVV * WT / 70\n\
+              \x20 V    = VW\n\
+              \x20 KA   = TVKA * AGE / 40\n\
+              \x20 H0   = TVH0\n\
+              \x20 BETA = TVBETA\n";
+    let wt = cov_mask_of(ip, &["WT"]);
+    for (name, want) in [
+        ("CL", true),
+        ("VW", true),
+        ("V", true),
+        ("KA", false),
+        ("H0", false),
+        ("BETA", false),
+    ] {
+        assert_eq!(reads_time(&wt, name), want, "{name} under WT: {wt:?}");
+    }
+    let age = cov_mask_of(ip, &["AGE"]);
+    for (name, want) in [("CL", false), ("V", false), ("KA", true)] {
+        assert_eq!(reads_time(&age, name), want, "{name} under AGE: {age:?}");
+    }
+    let none = cov_mask_of(ip, &[]);
+    assert!(none.iter().all(|(_, t)| !t), "no covariate named: {none:?}");
+}
+
+/// The branch rule: an assignment whose *value* is covariate-free but whose arm is chosen
+/// by a `WT` condition depends on `WT`.
+#[cfg(feature = "markov")]
+#[test]
+fn the_covariate_mask_taints_an_assignment_under_a_covariate_condition() {
+    let ip = "  if (WT > 70) {\n\
+              \x20   CL = 2.0 * TVCL * exp(ETA_CL)\n\
+              \x20 } else {\n\
+              \x20   CL = TVCL * exp(ETA_CL)\n\
+              \x20 }\n\
+              \x20 V    = TVV\n\
+              \x20 KA   = TVKA\n\
+              \x20 H0   = TVH0\n\
+              \x20 BETA = TVBETA\n";
+    let wt = cov_mask_of(ip, &["WT"]);
+    assert!(reads_time(&wt, "CL"), "CL's arm is chosen by WT: {wt:?}");
+    assert!(!reads_time(&wt, "V"), "V reads no covariate: {wt:?}");
 }

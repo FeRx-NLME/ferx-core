@@ -15112,24 +15112,16 @@ fn build_ode_spec(
     // equilibration integrates the augmented system including `__chz`.
     //
     // The injected line is always top-level (`d/dt(__chz_<cmt>) = <hazard>` is
-    // pushed as its own `[odes]` line), so no `If` recursion is needed for the
-    // exclusion and the user's `if` bodies are walked exactly as before. By this
-    // point `resolve_variable_indices` has rewritten every `DiffEq` to
-    // `DiffEqBc(slot, _)`; `DiffEqIdx` is matched too because it is a documented
-    // fallback form and silently skipping it would widen the flag, not narrow it.
+    // pushed as its own `[odes]` line). Dropping it is not enough on its own: an
+    // `[odes]` intermediate the hazard alone consumes (`TT = TIME` … `hazard =
+    // f(TT)`) is an ordinary assignment, and keeping it made the PK block read
+    // time although no PK derivative depends on it (#1279). So the view is a
+    // **dataflow cut** — an intermediate survives only if some retained
+    // derivative line transitively reads it; see `pk_block_statements`.
     let pk_stmts: Vec<Statement> = if chz_state_slots.is_empty() {
         Vec::new()
     } else {
-        stmts_owned
-            .iter()
-            .filter(|s| match s {
-                Statement::DiffEqBc(slot, _) | Statement::DiffEqIdx(slot, _) => {
-                    !chz_state_slots.contains(slot)
-                }
-                _ => true,
-            })
-            .cloned()
-            .collect()
+        pk_block_statements(&stmts_owned, chz_state_slots)
     };
     // The one view every PK-block-only question below is asked of, so the `__chz`
     // exclusion has a single implementation. With no injected lines the filter is a
@@ -27892,6 +27884,109 @@ fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
     })
 }
 
+/// The statements the **PK block** depends on: the RHS with the injected
+/// joint-PK-TTE hazard lines (`d/dt(__chz_*)`, slots in `chz_state_slots`)
+/// removed, and with every assignment removed that no retained derivative line
+/// reads, directly or through a chain of intermediates (#1279).
+///
+/// A fixpoint over the set of *live* assignment targets: start with none live,
+/// cut, then mark live every target the cut program reads, and repeat until the
+/// set stops growing. It only grows, so it terminates. Flow-insensitive — a
+/// target is live if *any* retained statement reads it, wherever the read sits —
+/// which can only keep more than strictly needed, never less.
+///
+/// An `if` survives when any arm keeps a statement, with the conditions up to and
+/// including the last such arm (all of them when the `else` keeps one), so a
+/// condition guarding a retained statement still counts as a read and one that
+/// only follows it does not. An
+/// unresolved `Assign` / `DiffEq` has no slot to test and is always kept, and
+/// `DiffEqIdx` / `AssignIdx` are matched alongside the bytecode forms: silently
+/// dropping a shape this does not model would narrow the flag, not widen it.
+fn pk_block_statements(stmts: &[Statement], chz_state_slots: &[usize]) -> Vec<Statement> {
+    fn cut(stmts: &[Statement], chz: &[usize], live: &[usize]) -> Vec<Statement> {
+        stmts
+            .iter()
+            .filter_map(|s| match s {
+                Statement::DiffEqBc(k, _) | Statement::DiffEqIdx(k, _) => {
+                    (!chz.contains(k)).then(|| s.clone())
+                }
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    live.contains(t).then(|| s.clone())
+                }
+                Statement::Assign(..) | Statement::DiffEq(..) => Some(s.clone()),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut branches: Vec<(Condition, Vec<Statement>)> = branches
+                        .iter()
+                        .map(|(c, b)| (c.clone(), cut(b, chz, live)))
+                        .collect();
+                    let else_body = else_body
+                        .as_deref()
+                        .map(|b| cut(b, chz, live))
+                        .filter(|b| !b.is_empty());
+                    // Arm `k` runs only after conditions `0..k` failed, so a retained
+                    // arm depends on its own condition and every earlier one — never
+                    // on a later one. Keep the condition prefix through the last live
+                    // arm (all of them when the `else` survives), as
+                    // `chz_dependency_slice` does: a trailing `else if (TT > 5)` whose
+                    // arm fed only the hazard must not make `TT` live.
+                    if else_body.is_none() {
+                        let live_arms = branches
+                            .iter()
+                            .rposition(|(_, b)| !b.is_empty())
+                            .map_or(0, |k| k + 1);
+                        branches.truncate(live_arms);
+                    }
+                    (!branches.is_empty()).then_some(Statement::If {
+                        branches,
+                        else_body,
+                    })
+                }
+            })
+            .collect()
+    }
+    fn targets(stmts: &[Statement], out: &mut Vec<usize>) {
+        for s in stmts {
+            match s {
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    if !out.contains(t) {
+                        out.push(*t);
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        targets(b, out);
+                    }
+                    if let Some(b) = else_body {
+                        targets(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    targets(stmts, &mut all);
+    let mut live: Vec<usize> = Vec::new();
+    loop {
+        let kept = cut(stmts, chz_state_slots, &live);
+        let before = live.len();
+        for t in &all {
+            if !live.contains(t) && stmts_read_slots(&kept, &[*t]) {
+                live.push(*t);
+            }
+        }
+        if live.len() == before {
+            return kept;
+        }
+    }
+}
+
 /// Whether an expression reads the bare `TIME` built-in.
 ///
 /// `TIME` is **not** a variable slot: it resolves to `Op::PushTime` /
@@ -29101,10 +29196,11 @@ impl OdeRhsProgram {
     /// Safe to ask on a non-joint model: with no injected lines the two are equal
     /// by construction, asserted rather than assumed.
     ///
-    /// Deliberately over-declines one shape: an intermediate that reads time and
-    /// is used only by the hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level
-    /// `AssignBc`, not one of the excluded derivative lines, so it still reads
-    /// wide. Conservative in the correct direction; a dataflow cut is out of scope.
+    /// The exclusion is a dataflow cut, not a statement-kind filter (#1279): an
+    /// `[odes]` intermediate consumed only by the hazard (`TT = TIME` … `hazard =
+    /// f(TT)`), or a chain of them, is excluded with it, so the flag does not depend
+    /// on whether the hazard's time term was factored out. An intermediate any PK
+    /// derivative line reads, transitively, still counts.
     pub(crate) fn pk_reads_model_time(&self) -> bool {
         self.pk_reads_model_time
     }
@@ -29149,15 +29245,11 @@ impl OdeRhsProgram {
     /// Composed from the two accessors rather than the two fields, for the reason given on
     /// [`Self::reads_model_time`]: neither may quietly become dead code.
     ///
-    /// **Inherits [`Self::pk_reads_model_time`]'s documented over-decline** (#1166), and
-    /// that costs more here. A time-reading `[odes]` intermediate consumed only by the
-    /// hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level `AssignBc`, not one of the
-    /// excluded derivative lines, so such a joint model reads `true` and is warned about
-    /// although its PK block is autonomous. Over-declining is free for #1166's own
-    /// consumer — a gate choosing a gradient route — and is a false positive for a
-    /// user-facing diagnostic. Accepted rather than narrowed: the dataflow cut is #1166's
-    /// deferred change, not this one's. Pinned by
-    /// `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    /// Shares [`Self::pk_reads_model_time`]'s PK-block view, so a time-reading `[odes]`
+    /// intermediate consumed only by the hazard does not make a joint model warn (#1279).
+    /// Before the dataflow cut it did — #1166's kind filter kept every intermediate, an
+    /// over-decline free for its routing consumer and a false positive for this diagnostic.
+    /// Pinned by `a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn`.
     pub(crate) fn pk_reads_absolute_time(&self) -> bool {
         self.pk_reads_tafd() || self.pk_reads_solver_time()
     }
@@ -29451,7 +29543,36 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
 /// where every assignment carries its slot.
 #[cfg(feature = "survival")]
 fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
-    fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &stmts_read_time_builtin,
+        &cond_reads_time_builtin,
+    )
+}
+
+/// Classify each individual-parameter var slot as dependent (`true`) on an outside
+/// **source** — the `TIME` built-in for [`compute_time_dependent_mask`], a set of
+/// covariates for [`compute_covariate_dependent_mask`] (#1854) — directly or through
+/// another slot that is. `reads` / `cond_reads` answer "does this statement / condition
+/// read the source itself"; the slot propagation and the branch rule are this walk's,
+/// shared so the two questions cannot drift apart. See [`compute_time_dependent_mask`]
+/// for why each rule is what it is.
+#[cfg(feature = "survival")]
+fn compute_source_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    reads: &dyn Fn(&[Statement]) -> bool,
+    cond_reads: &dyn Fn(&Condition) -> bool,
+) -> Vec<bool> {
+    fn walk(
+        stmts: &[Statement],
+        ctx_time: bool,
+        time_vars: &mut Vec<bool>,
+        changed: &mut bool,
+        reads: &dyn Fn(&[Statement]) -> bool,
+        cond_reads: &dyn Fn(&Condition) -> bool,
+    ) {
         // The slot list the two slot-walks take, rebuilt per statement group from the
         // current mask (`n_vars` is tens, and this runs once per model).
         let tainted = |mask: &[bool]| -> Vec<usize> {
@@ -29468,7 +29589,7 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     }
                     let one = std::slice::from_ref(s);
                     let slots = tainted(time_vars);
-                    if ctx_time || stmts_read_time_builtin(one) || stmts_read_slots(one, &slots) {
+                    if ctx_time || reads(one) || stmts_read_slots(one, &slots) {
                         if let Some(slot) = time_vars.get_mut(*idx) {
                             *slot = true;
                             *changed = true;
@@ -29497,13 +29618,11 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);
-                        governed = governed
-                            || cond_reads_time_builtin(cond)
-                            || cond_reads_slots(cond, &slots);
-                        walk(body, governed, time_vars, changed);
+                        governed = governed || cond_reads(cond) || cond_reads_slots(cond, &slots);
+                        walk(body, governed, time_vars, changed, reads, cond_reads);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, governed, time_vars, changed);
+                        walk(eb, governed, time_vars, changed, reads, cond_reads);
                     }
                 }
                 // No wildcard arm, for the reason `bytecode_is_dynamic`'s `Op` list has
@@ -29533,12 +29652,98 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
     let mut time_vars = vec![false; n_vars];
     loop {
         let mut changed = false;
-        walk(stmts, false, &mut time_vars, &mut changed);
+        walk(
+            stmts,
+            false,
+            &mut time_vars,
+            &mut changed,
+            reads,
+            cond_reads,
+        );
         if !changed {
             break;
         }
     }
     time_vars
+}
+
+/// Classify each individual-parameter var slot as dependent (`true`) on any of the
+/// covariates at `cov_idx` — indices into [`IndivParamProgram`]'s `cov_names`, the slice
+/// `Op::PushCov` / [`Expression::CovariateIdx`] read — directly or through another slot
+/// (#1854). The covariate axis of [`compute_time_dependent_mask`], on the same walk.
+///
+/// Two reads are attributed conservatively, both in the direction of a false refusal:
+/// a `[covariate_nn]` output (its inputs are covariates, chosen outside this program, so
+/// any NN read counts as reading the set), and an unresolved `Covariate` / `Variable`
+/// name, which the resolved program does not contain.
+#[cfg(feature = "markov")]
+fn compute_covariate_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    cov_idx: &[usize],
+) -> Vec<bool> {
+    fn expr_reads(e: &Expression, cov_idx: &[usize]) -> bool {
+        match e {
+            Expression::CovariateIdx(i) => cov_idx.contains(i),
+            Expression::NnOutput { .. } | Expression::Covariate(_) | Expression::Variable(_) => {
+                true
+            }
+            Expression::Literal(_)
+            | Expression::Theta(_)
+            | Expression::VariableIdx(_)
+            | Expression::Eta(_)
+            | Expression::Time
+            | Expression::MixNum => false,
+            Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+                expr_reads(a, cov_idx) || expr_reads(b, cov_idx)
+            }
+            Expression::UnaryFn(_, a) => expr_reads(a, cov_idx),
+            Expression::ThetaGather { idx, .. } => expr_reads(idx, cov_idx),
+            Expression::Conditional(c, t, f) => {
+                cond_reads(c, cov_idx) || expr_reads(t, cov_idx) || expr_reads(f, cov_idx)
+            }
+        }
+    }
+    fn cond_reads(c: &Condition, cov_idx: &[usize]) -> bool {
+        match c {
+            Condition::Compare(a, _, b) => expr_reads(a, cov_idx) || expr_reads(b, cov_idx),
+            Condition::And(a, b) | Condition::Or(a, b) => {
+                cond_reads(a, cov_idx) || cond_reads(b, cov_idx)
+            }
+            Condition::Not(a) => cond_reads(a, cov_idx),
+            Condition::Present(e) => expr_reads(e, cov_idx),
+        }
+    }
+    fn stmts_read(stmts: &[Statement], cov_idx: &[usize]) -> bool {
+        stmts.iter().any(|s| match s {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                bc.ops.iter().any(|op| match op {
+                    Op::PushCov(i) => cov_idx.contains(&(*i as usize)),
+                    Op::PushNnOutput(..) => true,
+                    _ => false,
+                })
+            }
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => expr_reads(e, cov_idx),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, b)| cond_reads(c, cov_idx) || stmts_read(b, cov_idx))
+                    || else_body.as_deref().is_some_and(|b| stmts_read(b, cov_idx))
+            }
+        })
+    }
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &|one: &[Statement]| stmts_read(one, cov_idx),
+        &|c: &Condition| cond_reads(c, cov_idx),
+    )
 }
 
 /// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
@@ -30031,6 +30236,27 @@ impl IndivParamProgram {
     #[cfg(feature = "survival")]
     pub(crate) fn params_reading_time(&self) -> Vec<bool> {
         let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
+        (0..self.n_top_level_vars)
+            .map(|i| mask.get(i).copied().unwrap_or(true))
+            .collect()
+    }
+
+    /// Which **top-level individual parameters** depend on any of the covariates
+    /// `names`, one `bool` per entry of [`crate::types::CompiledModel::indiv_param_names`]
+    /// and in that order — the covariate axis of [`Self::params_reading_time`] (#1854),
+    /// with the same slot-layout contract and the same fail-closed `true` for a slot the
+    /// mask does not cover. A name this block never reads contributes nothing, but a
+    /// `[covariate_nn]` output read counts as reading every name (see
+    /// [`compute_covariate_dependent_mask`]).
+    #[cfg(feature = "markov")]
+    pub(crate) fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
+        let cov_idx: Vec<usize> = self
+            .cov_names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| names.contains(&n.as_str()).then_some(i))
+            .collect();
+        let mask = compute_covariate_dependent_mask(&self.stmts, self.n_vars, &cov_idx);
         (0..self.n_top_level_vars)
             .map(|i| mask.get(i).copied().unwrap_or(true))
             .collect()

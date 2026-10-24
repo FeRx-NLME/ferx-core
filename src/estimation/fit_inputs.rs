@@ -932,6 +932,19 @@ pub struct ScoringSettings {
     /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
     #[serde(default)]
     pub gradient_method: GradientMethod,
+    /// `nn_l2_lambda`: the covariate-NN L2 strength the stage's objective carried (#1352).
+    /// Unlike the solver settings above it *defines* the objective — the covariance step adds
+    /// its curvature to `R` — so a recorded value wins over the caller's, whatever the caller
+    /// passes: re-running `run_covariance` with default options on a regularized fit must not
+    /// drop the penalty, and a non-zero λ must not be added to a fit that never had one.
+    ///
+    /// `None` when unrecorded (a record written before #1352): the caller's value stands.
+    #[serde(default)]
+    pub nn_l2_lambda: Option<f64>,
+    /// `nn_smooth_lambda`: the covariate-NN smoothness strength, recorded and restored as
+    /// [`nn_l2_lambda`](Self::nn_l2_lambda) is (#1352).
+    #[serde(default)]
+    pub nn_smooth_lambda: Option<f64>,
 }
 
 impl ScoringSettings {
@@ -953,6 +966,8 @@ impl ScoringSettings {
             ode_stiff_abort_after: options.ode_stiff_abort_after,
             ode_auto_switch: options.ode_auto_switch,
             gradient_method: options.gradient_method,
+            nn_l2_lambda: Some(options.nn_l2_lambda),
+            nn_smooth_lambda: Some(options.nn_smooth_lambda),
         }
     }
 
@@ -1002,8 +1017,12 @@ impl ScoringSettings {
             ode_stiff_abort_after,
             ode_auto_switch,
             gradient_method,
+            nn_l2_lambda,
+            nn_smooth_lambda,
         } = self.clone();
         FitOptions {
+            nn_l2_lambda: nn_l2_lambda.unwrap_or(options.nn_l2_lambda),
+            nn_smooth_lambda: nn_smooth_lambda.unwrap_or(options.nn_smooth_lambda),
             inner_maxiter,
             inner_tol,
             inner_restarts,
@@ -1126,6 +1145,18 @@ impl ScoringSettings {
         ode_max_steps_in_domain(self.ode_max_steps)?;
         n_agq_in_domain(self.n_agq)?;
         ode_stiff_abort_after_in_domain(self.ode_stiff_abort_after)?;
+        for (field, v) in [
+            ("nn_l2_lambda", self.nn_l2_lambda),
+            ("nn_smooth_lambda", self.nn_smooth_lambda),
+        ] {
+            if let Some(v) = v.filter(|v| !(*v >= 0.0 && v.is_finite())) {
+                return Err(OutOfDomain {
+                    field,
+                    why: "a non-negative finite value".into(),
+                    got: v.to_string(),
+                });
+            }
+        }
         if self.gradient_method == GradientMethod::Ad {
             return Err(OutOfDomain {
                 field: "gradient_method",
@@ -1171,6 +1202,8 @@ pub(crate) fn with_scoring_record(
         ode_stiff_abort_after,
         ode_auto_switch,
         gradient_method,
+        nn_l2_lambda,
+        nn_smooth_lambda,
     } = rec.clone();
     let d = FitOptions::default();
     macro_rules! recorded {
@@ -1197,6 +1230,14 @@ pub(crate) fn with_scoring_record(
     // Over the two values a record can hold, `{Auto, Fd}`, this is the union: a recorded
     // `Fd` fills a caller's `Auto`, and a caller's `Fd` is kept whatever the record says.
     recorded!(gradient_method);
+    // The covariate-NN strengths define the objective rather than how it is solved, so a
+    // recorded value wins outright (#1352) — see [`ScoringSettings::nn_l2_lambda`].
+    if let Some(l2) = nn_l2_lambda {
+        o.nn_l2_lambda = l2;
+    }
+    if let Some(smooth) = nn_smooth_lambda {
+        o.nn_smooth_lambda = smooth;
+    }
     o
 }
 

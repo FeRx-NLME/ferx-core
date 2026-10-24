@@ -43,10 +43,15 @@ const IOV_MODEL: &str = "examples/warfarin_iov.ferx";
 const NO_OCC_DATA: &str = "data/warfarin.csv";
 
 /// The measurement from the issue: warfarin_iov with no `iov_column` and no OCC
-/// column validates with exactly one error, `E_IOV_MISSING_OCC`, yet fits with
-/// `iov_occasion = dose`. The override on `iov_column` reaches the data read (the
+/// column validates with exactly one error, `E_IOV_MISSING_OCC`, yet fits with a
+/// derived `iov_occasion`. The override on `iov_column` reaches the data read (the
 /// file's `iov_column = OCC` is cleared), and the one on `iov_occasion` reaches the
-/// model–data rule (occasions derived from doses need no column).
+/// model–data rule (derived occasions need no column).
+///
+/// `data/warfarin.csv` is single-dose, so `iov_occasion = dose` gives every subject
+/// one occasion and `fit()` refuses it with `E_IOV_SINGLE_OCCASION` (#757) — which
+/// the check now reports too (#1788). A breakpoint inside the sampling window,
+/// `time(24)`, splits each subject into two occasions and clears every error.
 #[test]
 fn iov_occasion_override_clears_the_missing_occ_error() {
     let no_column = validate_model_file_with(
@@ -64,12 +69,24 @@ fn iov_occasion_override_clears_the_missing_occ_error() {
     let derived = validate_model_file_with(
         IOV_MODEL,
         Some(NO_OCC_DATA),
-        &pairs(&[("iov_column", "none"), ("iov_occasion", "dose")]),
+        &pairs(&[("iov_column", "none"), ("iov_occasion", "time(24)")]),
     );
     assert!(
         error_codes(&derived).is_empty(),
-        "iov_occasion = dose derives occasions from the doses: {:#?}",
+        "iov_occasion = time(24) derives two occasions per subject: {:#?}",
         derived.diagnostics
+    );
+
+    let single_dose = validate_model_file_with(
+        IOV_MODEL,
+        Some(NO_OCC_DATA),
+        &pairs(&[("iov_column", "none"), ("iov_occasion", "dose")]),
+    );
+    assert_eq!(
+        error_codes(&single_dose),
+        vec!["E_IOV_SINGLE_OCCASION"],
+        "iov_occasion = dose on single-dose data gives one occasion: {:#?}",
+        single_dose.diagnostics
     );
 }
 

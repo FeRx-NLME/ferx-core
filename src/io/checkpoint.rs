@@ -150,6 +150,18 @@ thread_local! {
     static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Successful writes on this thread, so a test can see how often a due sink is written.
+    static WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many checkpoints this thread has written (tests only).
+#[cfg(test)]
+pub(crate) fn writes() -> usize {
+    WRITES.with(std::cell::Cell::get)
+}
+
 /// Begin checkpointing for this fit on the current thread. Replaces any prior
 /// sink (e.g. back-to-back fits on a pooled worker). Does **not** touch the file
 /// — the first write only happens after `interval_secs` elapse, so a checkpoint
@@ -236,6 +248,8 @@ pub fn maybe_write(iter: usize, ofv: f64, packed: &[f64]) {
         };
         if save_atomic(&sink.path, &cp).is_ok() {
             sink.last = Instant::now();
+            #[cfg(test)]
+            WRITES.with(|w| w.set(w.get() + 1));
         }
     });
 }

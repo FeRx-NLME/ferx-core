@@ -7,12 +7,10 @@
 //!
 //! Tier 3 (slow): warm-started end-to-end convergence on rich data. Plain IMP
 //! uses a one-iteration-*lagged* proposal (mode/variance found only on the first
-//! iteration), so on rich data — where the conditional posterior is razor-sharp
-//! — a cold start that takes large early steps moves the posterior past the
-//! lagged proposal and the ESS collapses. This is the documented rich-data
-//! weakness of `METHOD=IMP` (the reason NONMEM offers IMPMAP). The estimator is
-//! therefore exercised for convergence in its robust regime: sparse data, or
-//! warm-started from FOCEI where the per-iteration steps are tiny.
+//! iteration). A cold start on rich data used to collapse the ESS on iteration
+//! 2, which was read as the rich-data weakness of `METHOD=IMP`; it was the stale
+//! proposal mean after the mu-ref θ shift (#1365), pinned by
+//! `imp_cold_start_on_rich_data_does_not_collapse` below.
 //!
 //! The evaluation-only path (`imp_eval_only = true`, NONMEM `EONLY=1`) is covered
 //! in `importance_sampling_api.rs`.
@@ -132,6 +130,52 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
         is.mc_standard_error.is_finite() && is.mc_standard_error >= 0.0,
         "marginal MC SE must be finite & non-negative, got {}",
         is.mc_standard_error
+    );
+}
+
+/// #1365: a **cold-start** IMP on rich warfarin must not collapse after the
+/// first moment update. IMP centres iteration k+1's proposal on iteration k's
+/// weighted η mean; the closed-form mu-ref step moves the packed θ by that
+/// population mean, so the posterior of η moves the other way. While the stored
+/// means were left stale the proposal sat several posterior SDs off from
+/// iteration 2 on and every subject went low-ESS.
+///
+/// Measured (macOS arm64, `ci-fast`) at these settings — 3 iterations, K = 300,
+/// seed 7: fixed, the marginal −2 log L at the final estimates is −286.23 and
+/// the Laplace `ofv` −285.93; with the recentre reverted they are +350.66 and
+/// +355.92. NONMEM `METHOD=IMP` on this model is −285.69
+/// (`warfarin_imp_nonmem.rs`). The −250 bound sits ~36 above the fixed result
+/// and ~600 below the collapsed one.
+#[test]
+fn imp_cold_start_on_rich_data_does_not_collapse() {
+    let (model, population) = warfarin();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.run_covariance_step = false;
+    opts.method = EstimationMethod::Imp;
+    opts.imp_iterations = 3;
+    opts.imp_samples = 300;
+    opts.imp_averaging = 1;
+    opts.imp_seed = Some(7);
+    opts.imp_auto = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("cold-start imp on warfarin must produce a fit");
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("estimating imp surfaces the marginal −2 log L");
+    // `< -250` is `false` for NaN, so a non-finite collapse fails here too.
+    assert!(
+        is.minus2_log_likelihood < -250.0,
+        "marginal −2 log L {} after 3 cold-start IMP iterations — the proposal \
+         recentre collapsed (#1365)",
+        is.minus2_log_likelihood
+    );
+    assert!(
+        result.ofv < -250.0,
+        "Laplace OFV {} after 3 cold-start IMP iterations (#1365)",
+        result.ofv
     );
 }
 

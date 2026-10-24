@@ -734,10 +734,11 @@ sparsely-sampled PK).
   imp_eval_only  = true
 ```
 
-> On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
-> warm-start with `[focei, imp]`; plain `imp`'s one-iteration-lagged proposal
-> can collapse the ESS on a sharp posterior. See the
-> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-prefer-impmap-or-warm-start).
+> Plain `imp` runs from a cold start on rich data since #1365. If the low-ESS
+> count stays high, warm-start with `[focei, imp]` or switch to
+> [`impmap`](#impmap-importance_sampling_map), which re-centres on the mode every
+> iteration. See the
+> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-and-cold-starts).
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -761,7 +762,7 @@ Like the estimating `imp`, `impmap` is a Monte-Carlo EM **estimator** —
 equivalent to NONMEM `METHOD=IMPMAP`. The difference is the proposal: `impmap`
 re-centers at the freshly-computed conditional mode (MAP) **every** iteration
 (robust on rich data), whereas `imp` re-centers from the previous iteration's
-sample moments (cheaper, but fragile on rich data). Both update θ/Ω/σ from the
+sample moments (cheaper; see the note above on sharp posteriors). Both update θ/Ω/σ from the
 importance-weighted posterior moments. It runs standalone or as a chain stage:
 
 ```
@@ -931,7 +932,7 @@ Two optional penalties regularize the small MLP behind a [`[covariate_nn]`](cova
 
 Motivation: on a null covariate structure (no true effect) an unregularized DCM invents spurious covariate-driven variation that scales with net capacity, with sharp wiggles at higher capacity. `nn_l2` shrinks all weights; `nn_smooth` targets the wiggles directly. The two are independently toggleable.
 
-**Reported OFV is unpenalized.** The optimizer minimizes the penalized objective, but `fit$ofv` — and therefore AIC/BIC — report the **unpenalized −2·log-likelihood**, so a regularized DCM's information criteria stay directly comparable to an analytic-covariate model's. The `optimizer_trace` `ofv` column, the checkpoint and the verbose `Eval`/`Iter` lines carry that same unpenalized value. What *is* penalized: `final_gradient` (the gradient of the objective the fit converged on), the ranking of multi-start candidates and of the `gn_hybrid` phases (so a heavier λ cannot lose to a start that merely fits the data better), and the convergence gates. Standard errors are still the curvature of the unpenalized objective at the regularized optimum — see the [covariate-NN page](covariate-nn.qmd#regularization-nn_l2-nn_smooth) for how to read NN-weight SEs under a strong λ. (Set via the model file `[fit_options]` block or, in ferx-r, `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))` — the same code path.)
+**Reported OFV is unpenalized.** The optimizer minimizes the penalized objective, but `fit$ofv` — and therefore AIC/BIC — report the **unpenalized −2·log-likelihood**, so a regularized DCM's information criteria stay directly comparable to an analytic-covariate model's. The `optimizer_trace` `ofv` column, the checkpoint and the verbose `Eval`/`Iter` lines carry that same unpenalized value. What *is* penalized: `final_gradient` (the gradient of the objective the fit converged on), the ranking of multi-start candidates and of the `gn_hybrid` phases (so a heavier λ cannot lose to a start that merely fits the data better), and the convergence gates. Standard errors are the curvature of the penalized objective (penalized-ML SEs; `covariance_method = s` cannot represent the penalty) — see the [covariate-NN page](covariate-nn.qmd#regularization-nn_l2-nn_smooth) for how to read NN-weight SEs under a strong λ. (Set via the model file `[fit_options]` block or, in ferx-r, `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))` — the same code path.)
 
 ```
 [fit_options]
