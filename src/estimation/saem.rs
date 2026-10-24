@@ -6265,7 +6265,20 @@ pub fn run_saem(
     // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
     // synced from the final Ω/σ in the last NLL-cache refresh.
     if let Some(mix) = saem_mix.as_ref() {
-        let mut mp = mix.mp.clone();
+        // Rebuilt over the final base with the shared helper rather than cloned:
+        // `sync_base` writes an override into the class matrix's diagonal and leaves
+        // that class's Cholesky factor at the base's, which `pack_params` and the
+        // analytic kernels read. Rebuilding is also exactly what
+        // `fitted_params_from_result` does from `FitResult::mixture_overrides`, so a
+        // post-hoc `run_sir` / `run_covariance` sees these very class matrices
+        // (#1765).
+        let mut mp = crate::estimation::parameterization::mixture_from_overrides(
+            &mix.mp,
+            &final_params.omega,
+            &final_params.sigma,
+            &crate::estimation::parameterization::mixture_override_values(&mix.mp)
+                .unwrap_or_default(),
+        );
         // SAEM holds the per-class σ overrides at their inits (warned above), so
         // they are FIX as far as this fit is concerned. Marking them keeps the
         // covariance step from building an FD-Hessian row for a coordinate SAEM

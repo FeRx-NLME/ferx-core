@@ -389,8 +389,8 @@ The outer optimizer's parameter vector at the estimate, in its own packed space
 covariance step used, and so repeat that step bit for bit; re-decomposing the
 stored `omega` instead lands on a factor a few ULP away, which the
 finite-difference Hessian amplifies. It also carries a `[mixture]` fit's fitted
-override values, which have no other field. Elements are full-precision floats,
-non-finite as `null`.
+override values, which a bundle saved before `mixture_overrides` existed has
+nowhere else. Elements are full-precision floats, non-finite as `null`.
 
 It is written by FOCE, FOCEI, Laplace and Gauss-Newton fits, and absent for
 SAEM, IMP and Bayes, on a bundle saved before #1815, and on one written by
@@ -401,8 +401,33 @@ fit takes the fallback. Consumers use it only when it unpacks
 bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV and correlations
 under the supplied model. An edited bundle, or a model with another layout of
 the same length, falls back to the stored estimates; a `[mixture]` fit with an
-override is then refused, since its override value lives only in this vector.
-The format version did not change.
+override then reads its override values from `mixture_overrides`, and is refused
+only when that key is absent too. The format version did not change.
+
+### `mixture_overrides`
+
+The fitted values of a `[mixture]` model's per-class Ω/Σ overrides
+(`omega(k)` / `sigma(k)` in `[mixture]`;
+[#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)), on the natural
+scale: one class **variance** per Ω override, then one class σ per Σ override,
+each in declaration order:
+
+```json
+"mixture_overrides": [0.09724885350038842]
+```
+
+The base `omega` / `sigma` rebuild every class entry that is not overridden, so
+this is the only part of a mixture fit's parameters no other key records. With
+it, `run_sir`, `run_covariance` and `simulate_with_uncertainty` on a reloaded
+fit rebuild the class matrices the fit had, without `packed_estimate` — which
+is how an SAEM mixture fit (no packed vector) reloads and repeats its in-fit SIR
+and covariance step bit for bit. It is read ahead of `packed_estimate`, and
+refused when it does not hold one positive finite value per declared override.
+
+It is written by every estimator that fits a `[mixture]` model with at least one
+override, and absent for a model without overrides, on a bundle saved before
+#1765, and on one written by ferx-r before it writes the key; all of those load
+it as `None`. The format version did not change.
 
 ### `vi`
 

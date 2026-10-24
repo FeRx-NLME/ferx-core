@@ -3010,6 +3010,14 @@ fn fit_inner(
         // `run_covariance` reproduces this fit's covariance step bit-for-bit (#816
         // follow-up). `None` for estimators that don't pack in Cholesky space.
         packed_estimate: result.packed_estimate,
+        // The per-class override values no other field records (#1765), read off
+        // the final parameters every estimator hands back, so SAEM (which packs
+        // nothing) records them too.
+        mixture_overrides: result
+            .params
+            .mixture
+            .as_ref()
+            .and_then(crate::estimation::parameterization::mixture_override_values),
         left_init: result.left_init,
         omega_is_diagonal: Some(result.params.omega.diagonal),
         kappa_is_diagonal: result.params.omega_iov.as_ref().map(|m| m.diagonal),

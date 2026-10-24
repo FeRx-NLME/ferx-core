@@ -61,11 +61,14 @@ pub enum UncertaintyMethod {
 ///
 /// The per-class Ω/Σ are rebuilt from the fitted base, so a class that overrides
 /// nothing is exact. A class **override** (`omega(2) ETA_CL ~ …` in `[mixture]`) is
-/// estimated, but its fitted value is not a `FitResult` field: it is read from
-/// [`FitResult::packed_estimate`], which the result of a packed-space `fit()` (FOCE /
-/// FOCEI / Laplace / Gauss-Newton) carries in memory, and a `.fitrx` bundle
-/// [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload (#1815). It is read
-/// only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ / Ω_IOV / ρ.
+/// estimated, and its fitted value is read from [`FitResult::mixture_overrides`]
+/// (#1765), which every `fit()` of such a model records — SAEM included — and a `.fitrx`
+/// bundle [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload. A fit
+/// without it (built in R, or a bundle saved before #1765) falls back to the override
+/// segment of [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI /
+/// Laplace / Gauss-Newton) carries in memory and in a bundle saved since #1815. That
+/// vector is read only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ /
+/// Ω_IOV / ρ.
 ///
 /// # Errors
 ///
@@ -74,11 +77,13 @@ pub enum UncertaintyMethod {
 /// / κ count; a σ of the wrong length; an Ω_IOV absent on a model with κ, or present
 /// on one without. The model's initial Ω_IOV is never substituted for a missing one.
 ///
-/// For a `[mixture]` model with at least one override, when `packed_estimate` is
-/// `None` (a fit built in R, a `.fitrx` bundle saved before #1815 or written by
-/// ferx-r, or a fit estimated by SAEM / IMP / Bayes), does not have this model's
-/// packed length (a different model), or no longer unpacks to the fit's reported
-/// estimates (they were edited after the fit, or the model's layout differs).
+/// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
+/// `mixture_overrides` does not hold one positive finite value per declared override.
+/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a fit
+/// built in R, a `.fitrx` bundle written by ferx-r or saved before #1765 / #1815), and
+/// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
+/// model) or no longer unpacks to the fit's reported estimates (they were edited after
+/// the fit, or the model's layout differs).
 pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
@@ -118,12 +123,7 @@ pub fn fitted_params_from_result(
     };
     let mixture = match template.mixture.as_ref() {
         None => None,
-        Some(tmpl) => Some(crate::estimation::parameterization::mixture_from_base(
-            tmpl,
-            &omega,
-            &sigma,
-            fitted_mixture_overrides(fit_result, template, tmpl)?,
-        )),
+        Some(tmpl) => Some(fitted_mixture(fit_result, template, tmpl, &omega, &sigma)?),
     };
     Ok(ModelParameters {
         theta: fit_result.theta.clone(),
@@ -238,20 +238,50 @@ pub(crate) fn fit_packed_estimate<'a>(
     }
 }
 
-/// The packed `[mixture]` override segment of `fit_result`'s estimate (#1704): empty
-/// for a model without overrides, the `packed_estimate` slice otherwise. See
-/// [`fitted_params_from_result`] for when that is unavailable.
-fn fitted_mixture_overrides<'a>(
-    fit_result: &'a FitResult,
+/// The per-class Ω/Σ of `fit_result` under a `[mixture]` model (#1704, #1765), every
+/// class rebuilt from the fitted base `omega` / `sigma`. A model without overrides needs
+/// nothing more. Otherwise the override values come from
+/// [`FitResult::mixture_overrides`] when the fit records them, else from the override
+/// segment of a usable `packed_estimate`. See [`fitted_params_from_result`] for when
+/// neither is available.
+fn fitted_mixture(
+    fit_result: &FitResult,
     template: &ModelParameters,
     tmpl: &crate::types::MixtureParams,
-) -> Result<&'a [f64], EngineError> {
-    if tmpl.omega_override_addr.is_empty() && tmpl.sigma_override_addr.is_empty() {
-        return Ok(&[]);
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+) -> Result<crate::types::MixtureParams, EngineError> {
+    use crate::estimation::parameterization::{mixture_from_base, mixture_from_overrides};
+    let n_overrides = tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len();
+    if n_overrides == 0 {
+        return Ok(mixture_from_base(tmpl, omega, sigma, &[]));
+    }
+    if let Some(values) = fit_result.mixture_overrides.as_deref() {
+        if values.len() != n_overrides {
+            return Err(crate::api::fit_input_model(format!(
+                "the fit records {} [mixture] override value(s) but this model declares {} \
+                 per-class override(s). Supply the model the fit was estimated with.",
+                values.len(),
+                n_overrides
+            )));
+        }
+        if let Some(bad) = values.iter().find(|v| !(v.is_finite() && **v > 0.0)) {
+            return Err(crate::api::fit_input_model(format!(
+                "the fit's recorded [mixture] override values include {bad}, which is not a \
+                 positive finite variance or sigma, so the per-class Omega/Sigma cannot be \
+                 rebuilt from them."
+            )));
+        }
+        return Ok(mixture_from_overrides(tmpl, omega, sigma, values));
     }
     let segs = packed_segments(template);
     match fit_packed_estimate(fit_result, template) {
-        PackedEstimate::Usable(v) => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
+        PackedEstimate::Usable(v) => Ok(mixture_from_base(
+            tmpl,
+            omega,
+            sigma,
+            &v[segs.mixture_omega_start()..segs.rho_start()],
+        )),
         PackedEstimate::WrongLength(n) => Err(crate::api::fit_input_model(format!(
             "the fit's packed estimate has {} coordinates but this model's parameter layout \
              has {}, so the [mixture] override values cannot be read from it. Supply the \
@@ -277,12 +307,12 @@ fn fitted_mixture_overrides<'a>(
                 )
                 .collect();
             Err(crate::api::fit_input_missing(format!(
-                "this [mixture] fit estimates the per-class override(s) {}, and a FitResult \
-                 does not store their fitted values. They are carried by the result of a \
-                 FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a .fitrx bundle save_fit \
-                 wrote from one; a fit built in R, a .fitrx bundle saved before #1815 or \
-                 written by ferx-r, or a fit estimated by SAEM, IMP or Bayes lacks them \
-                 (#1765).",
+                "this [mixture] fit estimates the per-class override(s) {}, and the fit \
+                 records neither their fitted values (mixture_overrides) nor a packed \
+                 estimate holding them. A fit() result records them, and so does a .fitrx \
+                 bundle save_fit wrote from one; a fit built in R, a .fitrx bundle written by \
+                 ferx-r, or one saved before #1765 from an SAEM fit or before #1815 from any \
+                 other method lacks them.",
                 names.join(", ")
             )))
         }
@@ -975,6 +1005,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,

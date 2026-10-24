@@ -3210,6 +3210,7 @@ pub ferx_core::types::FitResult::max_unconverged_subjects: u32
 pub ferx_core::types::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::types::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_name: alloc::string::String
 pub ferx_core::types::FitResult::model_path: core::option::Option<alloc::string::String>
@@ -4747,6 +4748,7 @@ pub ferx_core::FitResult::max_unconverged_subjects: u32
 pub ferx_core::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_name: alloc::string::String
 pub ferx_core::FitResult::model_path: core::option::Option<alloc::string::String>

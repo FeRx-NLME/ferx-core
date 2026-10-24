@@ -133,11 +133,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # `[mixture]` models
 ///
 /// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
-/// from the fit (#1704). A class override's fitted value is carried only by the
-/// in-memory result of a packed-space `fit()`, so for a mixture model with at least
-/// one override this returns an error on a fit read from `.fitrx`, built in R, or
-/// estimated by SAEM / IMP / Bayes (see
-/// [`fitted_params_from_result`]).
+/// from the fit (#1704). A class override's fitted value is read from
+/// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
+/// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
+/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
+/// #1815) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,

@@ -313,6 +313,19 @@ struct FitWire {
         with = "crate::io::serde_nan::opt_vec"
     )]
     packed_estimate: Option<Vec<f64>>,
+    /// The fitted `[mixture]` per-class Ω/Σ override values (#1765), natural
+    /// scale, in `omega_override_addr` then `sigma_override_addr` order. Unlike
+    /// `packed_estimate` it is written by every estimator that fits an override,
+    /// SAEM included, so a reloaded mixture fit rebuilds its class matrices
+    /// without the packed vector. Absent for a fit with no override and on bundles
+    /// saved before the field existed; both load as `None`. Additive: no
+    /// `FORMAT_VERSION` bump.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    mixture_overrides: Option<Vec<f64>>,
     /// The variational-inference result (#2058), in the layout of the YAML
     /// writer's `vi:` section. Absent for every other method and on bundles saved
     /// before the field existed; both load as `None`. Additive: no
@@ -1338,6 +1351,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         population_fingerprint: r.population_fingerprint.clone(),
         iov_occasion: r.iov_occasion.clone(),
         packed_estimate: r.packed_estimate.clone(),
+        mixture_overrides: r.mixture_overrides.clone(),
         vi: r.vi.as_ref().map(|v| ViWire::from_result(v, r)),
     }
 }
@@ -2999,6 +3013,7 @@ fn wire_to_fit_result(
         // it). `None` for SAEM / IMP / Bayes and for older bundles; consumers
         // validate it against the estimates above before reusing it.
         packed_estimate: w.packed_estimate,
+        mixture_overrides: w.mixture_overrides,
         left_init: w.left_init,
         omega_is_diagonal: w.omega_is_diagonal,
         kappa_is_diagonal: w.kappa_is_diagonal,
@@ -4954,6 +4969,47 @@ mod tests {
         );
         let old: FitWire = serde_json::from_value(value).unwrap();
         assert!(old.packed_estimate.is_none());
+    }
+
+    /// #1765: a `[mixture]` fit's recorded override values survive `save_fit` →
+    /// `load_fit` bit for bit; a fit without them writes no key; and a bundle from
+    /// before #1765 (key deleted) loads `None`, with nothing else disturbed.
+    ///
+    /// Mutations — read `mixture_overrides: None` on load: the bit comparison dies;
+    /// write `None`: the same; drop `skip_serializing_if`: the absent-key assert dies.
+    #[test]
+    fn roundtrip_mixture_overrides_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixture.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        let values = vec![0.097_248_853_500_388_42, 0.1 + 0.2, 5e-324];
+        let mut r = minimal_fit_result();
+        r.mixture_overrides = Some(values.clone());
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let back = load_fit(&path)
+            .unwrap()
+            .fit
+            .mixture_overrides
+            .expect("a bundle saved with override values loads them");
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&back), bits(&values));
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("mixture_overrides").is_none(),
+            "mixture_overrides: written when absent"
+        );
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("mixture_overrides")
+                .is_some(),
+            "must be written when set, or the removal tests nothing"
+        );
+        let old: FitWire = serde_json::from_value(value).unwrap();
+        assert!(old.mixture_overrides.is_none());
     }
 
     /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects

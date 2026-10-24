@@ -766,9 +766,11 @@ fn mixture_override_run_covariance_is_identical_to_in_fit() {
 fn mixture_without_packed_estimate() {
     let (model, pop, r) = mixture_sir_fit(true);
 
-    // Row 1: the override fit as a `.fitrx` / R object / SAEM fit carries it.
+    // Row 1: the override fit as an R object or a pre-#1765 / pre-#1815 bundle carries
+    // it: neither the recorded override values nor the packed vector.
     let mut stored = cleared(&r);
     stored.packed_estimate = None;
+    stored.mixture_overrides = None;
     for (entry, res) in [
         (
             "run_sir",
@@ -783,11 +785,13 @@ fn mixture_without_packed_estimate() {
         for must in [
             format!("{entry}: this [mixture] fit"),
             "per-class override(s) omega(2) ETA_CL".to_string(),
-            "a FitResult does not store their fitted values".to_string(),
-            "carried by the result of a FOCE, FOCEI, Laplace or Gauss-Newton fit()".to_string(),
-            "and by a .fitrx bundle save_fit wrote from one".to_string(),
-            "a fit built in R, a .fitrx bundle saved before #1815 or written by ferx-r, or a \
-             fit estimated by SAEM, IMP or Bayes lacks them (#1765)"
+            "the fit records neither their fitted values (mixture_overrides) nor a packed \
+             estimate holding them"
+                .to_string(),
+            "A fit() result records them".to_string(),
+            "and so does a .fitrx bundle save_fit wrote from one".to_string(),
+            "a fit built in R, a .fitrx bundle written by ferx-r, or one saved before #1765 \
+             from an SAEM fit or before #1815 from any other method lacks them"
                 .to_string(),
         ] {
             assert!(
@@ -811,6 +815,7 @@ fn mixture_without_packed_estimate() {
         v.resize(other_len, 0.0);
         let mut other = cleared(&r);
         other.packed_estimate = Some(v);
+        other.mixture_overrides = None;
         let e = run_sir(&other, Some(&model), Some(&pop), &sir_defaults())
             .expect_err("a packed estimate of the wrong length must be refused");
         for must in [
@@ -838,8 +843,10 @@ fn mixture_without_packed_estimate() {
     // message says so without the length or `.fitrx` stories.
     let mut edited = cleared(&r);
     edited.theta[0] *= 1.01;
+    edited.mixture_overrides = None;
     let mut damaged = cleared(&r);
     damaged.packed_estimate.as_mut().unwrap()[6] = f64::NAN;
+    damaged.mixture_overrides = None;
     for (cause, stale) in [("theta edited", &edited), ("vector damaged", &damaged)] {
         assert_eq!(stale.packed_estimate.as_ref().map(Vec::len), Some(7));
         for (entry, res) in [
@@ -901,11 +908,12 @@ fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
 
     let mut legacy = cleared(&loaded);
     legacy.packed_estimate = None;
+    legacy.mixture_overrides = None;
     let e = run_sir(&legacy, Some(&model), Some(&pop), &sir_defaults())
         .expect_err("premise: a reloaded override fit without its packed vector is refused");
     assert!(
         e.to_string()
-            .contains("a FitResult does not store their fitted values"),
+            .contains("the fit records neither their fitted values (mixture_overrides)"),
         "premise: the refusal must be the #1765 one, not another error: {e}"
     );
 
@@ -982,4 +990,174 @@ fn focei_run_sir_reloaded_from_fitrx_is_identical_to_in_fit() {
     )
     .expect("run_sir on the reloaded fit must run");
     assert_sir_identical(&s, &r, "run_sir on reloaded vs in-fit (FOCEI)");
+}
+
+// ---------------------------------------------------------------------------------------
+// #1765: a `[mixture]` fit records its fitted per-class override values
+// (`FitResult::mixture_overrides`, natural scale), so a fit without the packed vector —
+// an SAEM fit, an R skeleton, a bundle saved before #1815 — still rebuilds the class
+// matrices it had, and `run_sir` / `run_covariance` repeat the in-fit steps.
+// ---------------------------------------------------------------------------------------
+
+/// Bitwise equality of two fits' covariance matrices, with `side` in the failure message.
+fn assert_cov_identical(a: &FitResult, b: &FitResult, side: &str) {
+    let a = a
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("{side}: no covariance on the first"));
+    let b = b
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("{side}: no covariance on the second"));
+    assert_eq!(a.shape(), b.shape(), "{side}: covariance shape");
+    for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(x.is_finite(), "{side}: covariance[{k}] not finite");
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "{side}: covariance[{k}]: {x} vs {y}"
+        );
+    }
+}
+
+/// T1. The FOCEI mixture-override fit saved to `.fitrx` and reloaded, then stripped of its
+/// packed vector — what a bundle saved before #1815, or written by ferx-r with the new key,
+/// carries. `run_sir` and `run_covariance` on it reproduce the in-fit SIR and covariance
+/// bit for bit, from the recorded override value alone.
+///
+/// Mutation — `fitted_params_from_result` stops reading `mixture_overrides`: both calls
+/// are refused (`E_FIT_INPUT_MISSING`); `save_fit` / `load_fit` drop the key: the
+/// `loaded.mixture_overrides` assertion dies.
+#[test]
+fn mixture_override_reloaded_without_packed_estimate_is_identical_to_in_fit() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let (model, pop, r) = mixture_sir_fit(true);
+    let recorded = r
+        .mixture_overrides
+        .clone()
+        .expect("a FOCEI override fit records its override values");
+    eprintln!("MEASURE #1765 T1 class-2 omega = {:?}", recorded);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixture.fitrx");
+    save_fit(&r, &pop, MIX_OVERRIDE, &path, SaveFitOptions::default()).expect("save_fit");
+    let mut loaded = load_fit(&path).expect("load_fit").fit;
+    assert_eq!(
+        loaded
+            .mixture_overrides
+            .as_ref()
+            .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
+        Some(recorded.iter().map(|x| x.to_bits()).collect()),
+        "the bundle must carry the override values bit for bit"
+    );
+    loaded.packed_estimate = None;
+
+    let c = run_covariance(&loaded, Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_covariance on a reloaded override fit without its packed vector");
+    assert_cov_identical(&c, &r, "run_covariance (no packed vector) vs in-fit");
+    let s = run_sir(&cleared(&loaded), Some(&model), Some(&pop), &sir_defaults())
+        .expect("run_sir on a reloaded override fit without its packed vector");
+    assert_sir_identical(&s, &r, "run_sir (no packed vector) vs in-fit");
+}
+
+/// An SAEM fit of `MIX_OVERRIDE` with the covariance step and SIR, from the FOCEI
+/// optimum (so a short run stays near it).
+fn saem_mixture_sir_fit() -> (ferx_core::CompiledModel, ferx_core::Population, FitResult) {
+    let model = ferx_core::parse_model_string(MIX_OVERRIDE).expect("mixture model must parse");
+    let pop = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("mixture data must load");
+    let init =
+        ferx_core::estimation::parameterization::unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_n_exploration: 60,
+        saem_n_convergence: 60,
+        saem_seed: Some(1765),
+        run_covariance_step: true,
+        sir: true,
+        ..sir_defaults()
+    };
+    let r = fit(&model, &pop, &init, &opts).expect("SAEM mixture fit must run");
+    (model, pop, r)
+}
+
+/// T2. An SAEM fit of the override model carries no packed vector — it never had one —
+/// yet `run_sir` and `run_covariance` reproduce its in-fit SIR and covariance bit for bit,
+/// in memory and after a `.fitrx` round trip, because the fit records the override's
+/// fitted value. Before #1765 both were refused.
+///
+/// Mutations — the field's read removed: every call refused; `fit()` not setting the
+/// field: the premise dies; SAEM's final class matrices cloned with `sync_base`'s stale
+/// Cholesky factor again: the reported OFV leaves the FOCEI value at the same estimates
+/// (and the in-fit covariance, which packs that factor in the override slot, leaves the
+/// standalone one).
+#[test]
+fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let (model, pop, r) = saem_mixture_sir_fit();
+    assert_eq!(r.method, EstimationMethod::Saem);
+    assert!(r.packed_estimate.is_none(), "premise: SAEM packs nothing");
+    let recorded = r
+        .mixture_overrides
+        .as_ref()
+        .expect("an SAEM override fit records its override values");
+    eprintln!(
+        "MEASURE #1765 T2 SAEM ofv={:?} class-1 omega={:?} class-2 omega={:?} ess={:?}",
+        r.ofv,
+        r.omega[(0, 0)],
+        recorded,
+        r.sir_ess
+    );
+    assert!(
+        recorded.len() == 1 && recorded[0].to_bits() != r.omega[(0, 0)].to_bits(),
+        "premise: the override is not the base Ω, so the base alone cannot rebuild it"
+    );
+    assert_eq!(
+        r.covariance_matrix.as_ref().map(|m| m.nrows()),
+        Some(7),
+        "the override is a packed coordinate of the SAEM covariance step"
+    );
+
+    // SAEM reports the FOCEI mixture marginal (`mixture_ofv`) at its estimates, so a
+    // FOCEI evaluation there — parameters rebuilt from the fit — is the same number. With
+    // the stale class-2 Cholesky factor the SAEM side read 303.7455718454021 against
+    // 302.3294566894659 (macOS arm64).
+    let at = ferx_core::estimation::uncertainty_samples::fitted_params_from_result(&r, &model)
+        .expect("rebuild the SAEM fit's parameters");
+    let eval = fit(
+        &model,
+        &pop,
+        &at,
+        &FitOptions {
+            method: EstimationMethod::FoceI,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..sir_defaults()
+        },
+    )
+    .expect("FOCEI evaluation at the SAEM estimates");
+    assert!(r.ofv.is_finite(), "SAEM OFV not finite");
+    assert_eq!(
+        r.ofv.to_bits(),
+        eval.ofv.to_bits(),
+        "SAEM OFV {} vs FOCEI at its estimates {}",
+        r.ofv,
+        eval.ofv
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saem_mixture.fitrx");
+    save_fit(&r, &pop, MIX_OVERRIDE, &path, SaveFitOptions::default()).expect("save_fit");
+    let loaded = load_fit(&path).expect("load_fit").fit;
+    for (side, f) in [("in memory", &r), ("reloaded", &loaded)] {
+        let c = run_covariance(f, Some(&model), Some(&pop), &sir_defaults())
+            .unwrap_or_else(|e| panic!("{side}: run_covariance on an SAEM override fit: {e}"));
+        assert_cov_identical(&c, &r, &format!("SAEM run_covariance {side} vs in-fit"));
+        let s = run_sir(&cleared(f), Some(&model), Some(&pop), &sir_defaults())
+            .unwrap_or_else(|e| panic!("{side}: run_sir on an SAEM override fit: {e}"));
+        assert_sir_identical(&s, &r, &format!("SAEM run_sir {side} vs in-fit"));
+    }
 }
