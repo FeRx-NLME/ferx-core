@@ -710,3 +710,289 @@ fn a_profiled_gradient_fit_stops_on_its_own_ftol() {
         "auto"
     );
 }
+
+// ── #2135: a global sum_to_zero is differenced over each subject's own levels ──────
+
+const GLOBAL: &str = "PLACEBO[STUDY, TIME, contrast = sum_to_zero]";
+const WITHIN: &str = "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]";
+
+/// F2 cut to `studies`, its block under the global `sum_to_zero`.
+fn global_prep(studies: usize) -> crate::api::PreparedRun {
+    prep(F2, F2_DATA, Some(studies), |t| {
+        assert!(t.contains(WITHIN), "fixture moved");
+        t.replace(WITHIN, GLOBAL)
+    })
+}
+
+/// Under the global contrast the whole block is one group, its dependent level one
+/// border, and each subject is differenced over **its own** levels — the cost #2135 is
+/// about: in θ, a subject reading the dependent read every θ of the block. Each read's
+/// moves shift exactly its own level by the step and leave every other level the subject
+/// reads where it was (`eval_gather`, the prediction's own evaluator, is the judge). Dies
+/// when the slack's sign flips, when a slack the subject reads is chosen, when a read
+/// sharing the dependent's group loses its slack, or when the layout falls back to
+/// expanding the dependent to its range.
+#[test]
+fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
+    let p = global_prep(3);
+    let layout = layout_of(&p);
+    let model = &p.parsed.model;
+    let decl = model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap();
+    let al = crate::api::active_levels(model, &p.population);
+    let per_subject = &al
+        .iter()
+        .find(|a| a.block == "PLACEBO")
+        .unwrap()
+        .per_subject;
+    assert_eq!(
+        layout.groups.len(),
+        1,
+        "the global contrast ties every level"
+    );
+    assert_eq!(layout.borders.len(), 1, "one dependent level");
+    let n_levels = decl.spec.levels.len();
+    assert_eq!(layout.coords.len(), n_levels - 1);
+    let theta = &p.init_params.theta;
+    let level_values = |theta: &[f64], levels: &[usize]| -> Vec<f64> {
+        levels
+            .iter()
+            .map(|&l| crate::parser::model_parser::eval_gather(&decl.spec, theta, (l + 1) as f64))
+            .collect()
+    };
+    let (mut dependent_readers, mut max_reads) = (0, 0);
+    for (i, levels) in per_subject.iter().enumerate() {
+        let reads = &layout.reads[i];
+        assert_eq!(
+            reads.len(),
+            levels.len(),
+            "subject {i}: its own levels only"
+        );
+        max_reads = max_reads.max(reads.len());
+        if levels.contains(&(n_levels - 1)) {
+            dependent_readers += 1;
+            assert!(
+                reads.iter().any(|r| r.level >= layout.coords.len()),
+                "subject {i}"
+            );
+        }
+        let before = level_values(theta, levels);
+        for (j, _) in reads.iter().enumerate() {
+            let d = 0.5;
+            let after = level_values(&shifted(&p.init_params, reads, &[(j, d)]).theta, levels);
+            let moved: Vec<f64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+            assert_eq!(
+                moved.iter().filter(|m| m.abs() > 1e-12).count(),
+                1,
+                "subject {i} read {j}: {moved:?}"
+            );
+            assert!(moved.iter().any(|m| (m - d).abs() < 1e-12), "{moved:?}");
+        }
+    }
+    assert!(
+        dependent_readers > 0,
+        "the fixture reads the dependent level"
+    );
+    assert!(
+        max_reads < layout.coords.len() / 2,
+        "{max_reads} of {} levels",
+        layout.coords.len()
+    );
+}
+
+/// Under `sum_to_zero_within` every F2 subject reads all of its study's levels, so no θ
+/// of the dependent's group is left for a slack: no border, and the θ form, unchanged.
+#[test]
+fn a_subject_reading_its_whole_group_keeps_the_theta_form() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    assert!(layout.borders.is_empty());
+    for (i, reads) in layout.reads.iter().enumerate() {
+        assert!(
+            reads
+                .iter()
+                .all(|r| r.level < layout.coords.len()
+                    && r.moves == vec![(layout.coords[r.level], 1.0)]),
+            "subject {i}"
+        );
+    }
+}
+
+/// A group of four θ and `borders` dependents over a block-diagonal level matrix.
+fn bordered_fixture(border_of: Vec<Option<usize>>, nb: usize) -> ProfileGroup {
+    ProfileGroup {
+        coords: (0..border_of.len()).collect(),
+        subjects: Vec::new(),
+        borders: (0..nb).collect(),
+        border_of,
+    }
+}
+
+/// An SPD matrix over `n` levels, block diagonal over `blocks`.
+fn block_spd(n: usize, blocks: &[Vec<usize>], seed: u64) -> DMatrix<f64> {
+    let mut x = seed;
+    let mut next = || {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((x >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut m = DMatrix::zeros(n, n);
+    for blk in blocks {
+        let k = blk.len();
+        let a = DMatrix::from_fn(k, k, |_, _| next());
+        let s = &a * a.transpose() + DMatrix::identity(k, k) * 0.5;
+        for (i, &li) in blk.iter().enumerate() {
+            for (j, &lj) in blk.iter().enumerate() {
+                m[(li, lj)] = s[(i, j)];
+            }
+        }
+    }
+    m
+}
+
+/// The bordered step is the θ-form Newton step `−(TᵀMT)⁻¹Tᵀg`, with one border and with
+/// two, whose blocks each straddle a border's range. Dies on a dropped multiplier term,
+/// a wrong sign in `T`, or a border row that misses its own level.
+#[test]
+fn the_bordered_step_is_the_theta_newton_step() {
+    let cases: Vec<(Vec<Option<usize>>, usize, Vec<Vec<usize>>)> = vec![
+        // θ 1..4 summed by border 0 (level 4); θ 0 outside it.
+        (
+            vec![None, Some(0), Some(0), Some(0)],
+            1,
+            vec![vec![0, 1], vec![2, 4], vec![3]],
+        ),
+        // Two dependents: θ 0, 1 → level 4; θ 2, 3 → level 5.
+        (
+            vec![Some(0), Some(0), Some(1), Some(1)],
+            2,
+            vec![vec![0, 2], vec![1, 4], vec![3, 5]],
+        ),
+    ];
+    for (seed, (border_of, nb, blocks)) in cases.into_iter().enumerate() {
+        let g = bordered_fixture(border_of, nb);
+        let n = g.n_levels();
+        let m = block_spd(n, &blocks, seed as u64 + 7);
+        let gy: Vec<f64> = (0..n).map(|l| (l as f64 * 0.7).sin() + 0.3).collect();
+        let step = bordered_step(&g, &m, &gy, &blocks).expect("PD blocks");
+        let dense = -g
+            .theta_matrix(&m)
+            .cholesky()
+            .unwrap()
+            .solve(&DVector::from_vec(g.theta_gradient(&gy)));
+        let diag = g.theta_diagonal(&m);
+        for a in 0..g.coords.len() {
+            assert!((diag[a] - g.theta_matrix(&m)[(a, a)]).abs() < 1e-12);
+            assert!(
+                (step[a] - dense[a]).abs() < 1e-10 * (1.0 + dense[a].abs()),
+                "case {seed}, θ {a}: {} vs {}",
+                step[a],
+                dense[a]
+            );
+        }
+        // A level with no curvature of its own: the bordered form declines.
+        let mut flat = m.clone();
+        for l in 0..n {
+            flat[(blocks[0][0], l)] = 0.0;
+            flat[(l, blocks[0][0])] = 0.0;
+        }
+        assert!(bordered_step(&g, &flat, &gy, &blocks).is_none());
+    }
+}
+
+/// The covariance step's `D` and `B`, differenced over each subject's own levels and
+/// mapped to θ, equal the dense θ-space FD of the population objective (every EBE
+/// re-solved cold) at the solved point, under the global contrast. Dies on a wrong sign
+/// or a dropped term in either mapping (`TᵀDT`, `BT`).
+#[test]
+fn level_blocks_over_levels_are_the_theta_hessian() {
+    let p = global_prep(2);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let hold = hold_template(&layout, &p.init_params);
+    let PackedStart {
+        packed: mut x,
+        fixed,
+        ..
+    } = pack_with_bounds(&hold);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
+    for &k in &layout.coords {
+        x[k] = packed_theta(&hold, k, s.params.theta[k]);
+    }
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let (d, b) = c.level_blocks(&hold, &x, &free, &s).unwrap();
+    assert_eq!(d.len(), 1);
+    let n = layout.coords.len();
+    let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
+    let at = |ds: &[(usize, f64)], dl: &[(usize, f64)]| {
+        let mut y = x.clone();
+        for &(a, v) in ds {
+            y[free[a]] += v;
+        }
+        let mut bb = beta.clone();
+        for &(j, v) in dl {
+            bb[j] += v;
+        }
+        total_ofv(&c, &unpack_params(&y, &hold), &bb)
+    };
+    let hl: Vec<f64> = s.se_scale.iter().map(|v| 0.1 * v).collect();
+    let mut worst_d = 0.0_f64;
+    let scale_d = d[0].amax();
+    for a in 0..n {
+        for cc in 0..=a {
+            let (h, g) = (hl[a], hl[cc]);
+            let fd = if a == cc {
+                (at(&[], &[(a, h)]) - 2.0 * at(&[], &[]) + at(&[], &[(a, -h)])) / (h * h)
+            } else {
+                (at(&[], &[(a, h), (cc, g)])
+                    - at(&[], &[(a, h), (cc, -g)])
+                    - at(&[], &[(a, -h), (cc, g)])
+                    + at(&[], &[(a, -h), (cc, -g)]))
+                    / (4.0 * h * g)
+            };
+            assert!(fd.is_finite() && d[0][(a, cc)].is_finite());
+            worst_d = worst_d.max((fd - d[0][(a, cc)]).abs() / scale_d);
+        }
+    }
+    let mut worst_b = 0.0_f64;
+    let scale_b = b.amax();
+    let mut worst_at = (0, 0, 0.0, 0.0);
+    for sidx in 0..free.len() {
+        // The structural step production takes, so the two sides share their truncation.
+        let floor = fd_step_floor(&hold, &c.model.default_params, free[sidx]);
+        let hs = fd_step(o.fd_hessian_step, x[free[sidx]], floor);
+        for a in 0..n {
+            let h = hl[a];
+            let fd = (at(&[(sidx, hs)], &[(a, h)])
+                - at(&[(sidx, hs)], &[(a, -h)])
+                - at(&[(sidx, -hs)], &[(a, h)])
+                + at(&[(sidx, -hs)], &[(a, -h)]))
+                / (4.0 * hs * h);
+            assert!(fd.is_finite() && b[(sidx, a)].is_finite());
+            let gap = (fd - b[(sidx, a)]).abs() / scale_b;
+            if gap > worst_b {
+                worst_at = (sidx, a, fd, b[(sidx, a)]);
+            }
+            worst_b = worst_b.max(gap);
+        }
+    }
+    eprintln!(
+        "#2135 level blocks: D {worst_d:.3e}, B {worst_b:.3e} (relative to max; worst B at \
+         {worst_at:?}, max {scale_b:.3e})"
+    );
+    assert!(worst_d < LEVEL_BLOCKS_BOUND, "D {worst_d}");
+    assert!(worst_b < LEVEL_BLOCKS_BOUND, "B {worst_b}");
+}
+
+/// Worst realised gap relative to the largest entry: `D` 3.6e-7, `B` 3.4e-6 (macOS arm64),
+/// both FD of one objective at shared steps; ~8× headroom over `B`. Dropping the border's
+/// term from the `B` mapping moves it to 4.1e-1 (measured).
+const LEVEL_BLOCKS_BOUND: f64 = 3e-5;
