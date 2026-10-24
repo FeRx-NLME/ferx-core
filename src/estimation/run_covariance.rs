@@ -1833,6 +1833,16 @@ mod from_fit_bindings {
 /// unpack — warfarin `0.3360326090905553` vs `…554`), pinned here as `Stale` so a
 /// VI fix flips the row and prompts the docs (`foce.qmd`, #1847).
 ///
+/// VI builds its Ω in natural space and packs it, so whether `unpack(pack(Ω))` gives back
+/// the same bits depends on the values VI stopped at, and on the OS `exp`/`ln`. On macOS
+/// arm64, sweeping `vi_iters` over 10..=40, each Ω diagonal round-trips exactly about
+/// half the time and all three together once, at 33. θ and σ always round-trip. So a
+/// single VI fit is `Stale` only with high probability: #2187 moved VI's θ steps, and
+/// at `vi_iters = 20` Linux x86_64 then landed on an exact round trip (`Usable`)
+/// while macOS did not. The VI row therefore fits ten neighbouring stopping points and
+/// asserts that at least one is `Stale`. A VI that reported `unpack(pack(Ω))` would
+/// make all ten `Usable`.
+///
 /// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
 /// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:
 /// the VI row dies.
@@ -1848,28 +1858,26 @@ mod packed_estimate_guard_per_engine {
             "examples/warfarin.ferx",
         ))
         .expect("model");
-        let cases: [(&str, M, O, bool); 11] = [
-            ("auto", M::FoceI, O::Auto, true),
-            ("bfgs", M::FoceI, O::Bfgs, true),
-            ("slsqp", M::FoceI, O::Slsqp, true),
-            ("mma", M::FoceI, O::Mma, true),
-            ("bobyqa", M::FoceI, O::Bobyqa, true),
-            ("trust_region", M::FoceI, O::TrustRegion, true),
-            ("foce", M::Foce, O::Auto, true),
-            ("laplace", M::Laplace, O::Auto, true),
-            ("gn", M::FoceGn, O::Auto, true),
-            ("gn_hybrid", M::FoceGnHybrid, O::Auto, true),
-            ("vi", M::Vi, O::Auto, false),
+        let cases: [(&str, M, O); 10] = [
+            ("auto", M::FoceI, O::Auto),
+            ("bfgs", M::FoceI, O::Bfgs),
+            ("slsqp", M::FoceI, O::Slsqp),
+            ("mma", M::FoceI, O::Mma),
+            ("bobyqa", M::FoceI, O::Bobyqa),
+            ("trust_region", M::FoceI, O::TrustRegion),
+            ("foce", M::Foce, O::Auto),
+            ("laplace", M::Laplace, O::Auto),
+            ("gn", M::FoceGn, O::Auto),
+            ("gn_hybrid", M::FoceGnHybrid, O::Auto),
         ];
-        let mut wrong = Vec::new();
-        for (name, method, optimizer, usable) in cases {
+        let verdict = |name: &str, method: M, optimizer: O, vi_iters: usize| {
             let opts = FitOptions {
                 method,
                 optimizer,
                 interaction: method != M::Foce,
                 outer_maxiter: 3,
                 // VI ignores `outer_maxiter`; its default run is ~25 s in debug.
-                vi_iters: 20,
+                vi_iters,
                 run_covariance_step: false,
                 verbose: false,
                 ..FitOptions::default()
@@ -1886,15 +1894,34 @@ mod packed_estimate_guard_per_engine {
                 "{name}: a packed-space engine must carry packed_estimate"
             );
             let base = fitted_params_from_result(&fit, &model).expect("base");
-            let got = fit_packed_estimate(&fit, &base);
-            let ok = if usable {
-                matches!(got, PackedEstimate::Usable(_))
-            } else {
-                got == PackedEstimate::Stale
-            };
-            if !ok {
+            // `Ok(true)` Usable, `Ok(false)` Stale, any other verdict an `Err`.
+            match fit_packed_estimate(&fit, &base) {
+                PackedEstimate::Usable(_) => Ok(true),
+                PackedEstimate::Stale => Ok(false),
+                other => Err(format!("{other:?}")),
+            }
+        };
+        let mut wrong = Vec::new();
+        for (name, method, optimizer) in cases {
+            let got = verdict(name, method, optimizer, 20);
+            if got != Ok(true) {
                 wrong.push(format!("{name}: {got:?}"));
             }
+        }
+        let mut vi = Vec::new();
+        for iters in 16..=25 {
+            let got = verdict("vi", M::Vi, O::Auto, iters);
+            eprintln!("vi_iters = {iters}: usable = {got:?}");
+            if let Err(e) = &got {
+                wrong.push(format!("vi at vi_iters = {iters}: {e}"));
+            }
+            vi.push(got);
+        }
+        if !vi.contains(&Ok(false)) {
+            wrong.push(format!(
+                "vi: Usable at all of vi_iters 16..=25: either VI's stored Ω now round-trips \
+                 (update `foce.qmd`, #1847) or the guard no longer compares Ω: {vi:?}"
+            ));
         }
         assert!(wrong.is_empty(), "guard misclassified: {wrong:?}");
     }

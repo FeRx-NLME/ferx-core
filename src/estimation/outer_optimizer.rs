@@ -6737,7 +6737,8 @@ fn reconverged_fd_gradient(
     };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// Central-FD gradient of the **penalized** outer objective at the reported
@@ -6817,15 +6818,22 @@ fn reporting_fd_gradient(
             raw
         }
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
 /// coordinates and dropping non-finite differences to zero. Shared by the non-IOV and
 /// IOV per-subject reconverged-FD gradients so the two cannot drift (#466 review round 2).
+///
+/// Coordinate `k` is stepped by `fd_step(1e-4, xₖ, floor[k])`, `floor` from
+/// `fd_step_floors` (#2187): `1` — the pre-#2187 `1e-4·(1 + |xₖ|)`, bit for bit — except on
+/// a small identity-packed θ, whose absolute step would otherwise be ~12 % of a θ of 8e-4
+/// and step a θ below 1e-4 through zero.
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
+    floor: &[f64],
     bounds: &PackedBounds,
     eval: impl Fn(&[f64]) -> f64,
 ) -> Vec<f64> {
@@ -6837,7 +6845,7 @@ fn central_diff_packed(
         if fixed[k] {
             continue;
         }
-        let h = eps * (1.0 + x[k].abs());
+        let h = fd_step(eps, x[k], floor[k]);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
         let denom = xp - xm;
@@ -7176,7 +7184,8 @@ fn subject_reconverged_fd_gradient(
             options.interaction,
         ))
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
@@ -7227,7 +7236,8 @@ fn subject_reconverged_fd_gradient_iov(
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
         )
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or
