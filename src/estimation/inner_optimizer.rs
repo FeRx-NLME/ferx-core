@@ -1408,9 +1408,11 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 ///
 /// The reroute considered here is subject-static (TV-cov / `TIME` / IOV via `effective_for`), so
 /// a non-rerouted subject — including a constant-parameter, in-domain subject of a twin-carrying
-/// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
-/// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
-/// those, so this adds no cost on the common path.)
+/// model, or a purely analytic model — keeps the exact `gnorm < tol` stop and never stalls out.
+/// (Its steps are not those of releases before #2270: an exact objective's search takes
+/// gradient-verified sub-resolution steps and the relative curvature-pair gate — see
+/// [`choose_step`] and [`curvature_pair_accepted`].) `effective_for` returns `self` without
+/// building the twin for those, so this adds no cost on the common path.
 ///
 /// **This is the subject-static half only**, and no solve calls it any more: the non-IOV inner
 /// solve calls [`inner_stall_enabled_at`] and the IOV solve [`inner_stall_enabled_at_iov`],
