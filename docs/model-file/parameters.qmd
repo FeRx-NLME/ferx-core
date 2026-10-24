@@ -416,6 +416,10 @@ test suite, absorbed ones come out below `1e-10` and identified ones above
 proportional there by accident. A subject observed once is the plainest case:
 with each level within one subject, a random effect that moves its single
 record is a multiple of the level there, whatever the model, and is refused.
+A kappa's effect is taken over every record of its subject, though, against all
+of the subject's levels (#1877): on an ODE model an occasion's kappa also moves
+the next occasion's records through the drug it leaves behind, so an occasion
+sampled once is not refused on that alone when the carry-over identifies it.
 The refusal says the absorption was measured, not where it sits.
 
 On a nested block the measurement also decides whether

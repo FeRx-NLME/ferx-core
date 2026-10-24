@@ -8888,8 +8888,9 @@ mod absorption {
     /// three explicit contrasts bind); a kappa measured over the whole subject
     /// as one unit, its first occasion's (the twin is refused). Equivalent on
     /// this closed form, so not killed: the kappa bumped on every occasion at
-    /// once, and a unit's columns taken from every level of the subject —
-    /// a kappa and a level move only their own occasion's records here.
+    /// once, and a unit's columns restricted to its own records or to its own
+    /// levels — a kappa and a level move only their own occasion's records
+    /// here. The ODE periods fixtures of `carry_over` kill the last two (#1877).
     #[test]
     fn a_measured_kappa_absorption() {
         let pop = arms_pop();
@@ -12426,6 +12427,10 @@ mod written_time_keys;
 /// A level block against kappas at nested levels (#2034).
 #[path = "theta_levels_nested_units_tests.rs"]
 mod nested_units;
+
+/// The span certificate on an ODE model's carried-over state (#1877).
+#[path = "theta_levels_carry_over_tests.rs"]
+mod carry_over;
 
 mod carried_scale {
     use super::*;

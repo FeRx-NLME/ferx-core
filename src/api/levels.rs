@@ -2038,7 +2038,7 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// The span certificate (#1834): for each random effect in `silent` (an index
 /// into `eta_couplings` and the unit its levels nest in) — one the walk names
 /// no site for — whether, in every unit, its effect on `y` lies in the span of
-/// the block's effect on that unit's records, measured on `model` (every block
+/// the block's effect on that unit's subject, measured on `model` (every block
 /// under `contrast = none`). Parallel to `eta_couplings`.
 ///
 /// Proportionality is a property of the functions, not of how they are
@@ -2046,8 +2046,9 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// distributed over a sum all absorb the random effect with no expression
 /// that reads both, and no syntactic rule is complete for that. So the binder
 /// measures it, on the data, as it measures dead levels: per unit, the relative
-/// residual of the random effect's column against the columns of the levels on
-/// the unit's records, by central differences of the predictions
+/// residual of the random effect's column against the columns of the levels the
+/// subject's records read, both over every record of the subject, by central
+/// differences of the predictions
 /// (`record_diffs` says why not the residual multipliers), at both
 /// [`probe_points`], with the random effects spread by [`probe_res`]. One
 /// point is not enough: at η = 0 an `ETA * ETA * OCC` term has derivative 0
@@ -2056,8 +2057,20 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// point and every unit's residual is under [`SPAN_TOL`]. Anything non-finite
 /// fails the tolerance, so an inconclusive point binds, never refuses.
 ///
+/// Over the whole subject, not the unit's own records, and against every level
+/// of the subject, not the unit's own (#1877): on an ODE model a kappa on one
+/// occasion moves the next occasion's records through the state it carries
+/// over, and so does a level of that occasion. Restricted to its own records, an
+/// occasion sampled once makes the kappa proportional to its level by default,
+/// and the carry-over that identifies it is discarded — a false refusal. Against its
+/// own levels only, a carry-over that the next occasion's level reproduces is
+/// missed — a false bind. Since the block's levels nest in the units, each
+/// level moves one subject's records only, so this is the joint oracle's test
+/// on the one column. On a closed form a kappa and a level move only their own
+/// occasion's records, and the two readings agree.
+///
 /// On a nested block a second residual decides whether `sum_to_zero_within`
-/// rescues it (#1874 review, F1): against the differences of the unit's level
+/// rescues it (#1874 review, F1): against the differences of the subject's level
 /// columns inside each within-group, the directions that contrast leaves free.
 /// A random effect inside those is [`Span::Within`], absorbed under every
 /// contrast; one only inside the full span is [`Span::Levels`].
@@ -2112,12 +2125,14 @@ fn spanned(
             };
             // The level columns this subject's records read, each over every record.
             let mut level_cols: HashMap<u64, Option<Vec<f64>>> = HashMap::new();
+            let mut read: Vec<u64> = Vec::new();
             for j in 0..n_obs {
                 let Some(index) = level_of(j) else { continue };
                 let Some(&(k, _)) = level_theta.get(&index) else {
                     continue;
                 };
                 level_cols.entry(index).or_insert_with(|| {
+                    read.push(index);
                     let h = SPAN_STEP * theta[k].abs().max(1.0);
                     let (mut up, mut down) = (theta.clone(), theta.clone());
                     up[k] += h;
@@ -2129,18 +2144,17 @@ fn spanned(
                 if !holds[s] {
                     continue;
                 }
-                // The records of each unit of this subject.
-                let mut units: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
+                // The units of this subject, in record order.
+                let mut units: Vec<Vec<u64>> = Vec::new();
                 for j in 0..n_obs {
                     let Some(u) = unit_of(subject, unit, j, tree) else {
                         continue;
                     };
-                    match units.iter_mut().find(|(u0, _)| *u0 == u) {
-                        Some((_, rows)) => rows.push(j),
-                        None => units.push((u, vec![j])),
+                    if !units.contains(&u) {
+                        units.push(u);
                     }
                 }
-                for (u, rows) in units {
+                for u in units {
                     let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
                     let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
                     if k < model.n_eta {
@@ -2167,18 +2181,12 @@ fn spanned(
                         holds[s] = false;
                         break;
                     };
-                    let restrict = |col: &[f64]| -> Vec<f64> {
-                        rows.iter().filter_map(|&j| col.get(j).copied()).collect()
-                    };
-                    let mut read: Vec<u64> = rows.iter().filter_map(|&j| level_of(j)).collect();
-                    read.sort_unstable();
-                    read.dedup();
-                    // The unit's level columns, and per within-group the
-                    // differences from its first level there.
+                    // Every level column of the subject, and per within-group
+                    // the differences from its first level there.
                     let mut cols: Vec<Vec<f64>> = Vec::new();
                     let mut firsts: Vec<(usize, Vec<f64>)> = Vec::new();
                     let mut diffs: Vec<Vec<f64>> = Vec::new();
-                    for index in read {
+                    for &index in &read {
                         let (Some(&(_, group)), Some(col)) =
                             (level_theta.get(&index), level_cols.get(&index))
                         else {
@@ -2188,16 +2196,15 @@ fn spanned(
                             holds[s] = false;
                             continue;
                         };
-                        let col = restrict(col);
                         match firsts.iter().find(|(g, _)| *g == group) {
                             Some((_, first)) => {
                                 diffs.push(col.iter().zip(first).map(|(a, b)| a - b).collect())
                             }
                             None => firsts.push((group, col.clone())),
                         }
-                        cols.push(col);
+                        cols.push(col.clone());
                     }
-                    let g = restrict(&re_col);
+                    let g = re_col;
                     match span_residual(&g, &cols) {
                         None => {}
                         Some(r) if r < SPAN_TOL => {
