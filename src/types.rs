@@ -8145,6 +8145,23 @@ pub struct FitResult {
     /// stale centre.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// The fitted values of a `[mixture]` model's per-class Ω/Σ overrides
+    /// (`omega(k)` / `sigma(k)` in `[mixture]`, #1765), on the natural scale: one
+    /// class **variance** per Ω override in
+    /// [`MixtureParams::omega_override_addr`] order, then one class σ value (the
+    /// scale the base `sigma` reports) per Σ override in
+    /// [`MixtureParams::sigma_override_addr`] order.
+    ///
+    /// The base `omega` / `sigma` rebuild every class entry that is not
+    /// overridden, so this is the only part of a mixture fit's parameters no other
+    /// field records. [`crate::run_sir`], [`crate::run_covariance`] and
+    /// [`crate::simulate_with_uncertainty`] read it (ahead of `packed_estimate`) to
+    /// rebuild the per-class matrices the fit had. `Some` for every estimator that
+    /// produces a `[mixture]` fit with at least one override — SAEM included, which
+    /// carries no `packed_estimate`; `None` otherwise, for hand-built results, and
+    /// for a `.fitrx` bundle saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the

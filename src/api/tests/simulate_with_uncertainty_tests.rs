@@ -772,6 +772,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
