@@ -702,8 +702,8 @@ fn solved_point(
 /// `β̂` in `hold` (envelope theorem). Indexed over the whole packed vector; the held
 /// coordinates' entries are not read.
 ///
-/// `declines` should be built [`OuterFdDeclineLog::reconverging`], as
-/// [`optimize_profiled`]'s is: then a subject that declines the analytic gradient at
+/// `declines` should be built by [`profiled_decline_log`], as [`optimize_profiled`]'s
+/// is: then a subject that declines the analytic gradient at
 /// runtime is reconverged too (#2136).
 pub(crate) fn envelope_gradient(
     ctx: &ProfileCtx<'_>,
@@ -753,6 +753,21 @@ pub(crate) fn envelope_gradient(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`optimize_profiled`] replaced its incumbent on this thread, so a
+    /// test can tell evaluations that improved from those that did not.
+    static INCUMBENT_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
+/// declines the analytic gradient at runtime takes the reconverged salvage rather than the
+/// held-EBE one (#2136, see [`envelope_gradient`]). The one constructor both of
+/// [`optimize_profiled`]'s gradient sites use.
+pub(crate) fn profiled_decline_log(n_subjects: usize) -> OuterFdDeclineLog {
+    OuterFdDeclineLog::reconverging(n_subjects)
+}
+
 /// The flat-θ pre-flight (#826) of a profiled fit: each free structural θ the profile
 /// objective ignores at the start `x0`, with its warning. The rule is the unprofiled
 /// pre-flight's (`flat_theta_candidates`, then the perturbation probe), on the objective
@@ -783,7 +798,7 @@ fn profiled_flat_thetas(
         &solve,
         bounds,
         &mut 0,
-        &OuterFdDeclineLog::reconverging(ctx.population.subjects.len()),
+        &profiled_decline_log(ctx.population.subjects.len()),
     );
     let Some(candidates) = flat_theta_candidates(&grad, n_theta, is_free) else {
         return Vec::new();
@@ -927,7 +942,7 @@ pub(crate) fn optimize_profiled(
     };
     // Reconverging: a subject that declines the analytic gradient at runtime takes the
     // reconverged salvage, not the held-EBE one (#2136, see `envelope_gradient`).
-    let declines = OuterFdDeclineLog::reconverging(population.subjects.len());
+    let declines = profiled_decline_log(population.subjects.len());
     let algo = profiled_algorithm(options);
 
     // The incumbent: its solve warm-starts the next evaluation (#1290: a warm start from
@@ -936,11 +951,14 @@ pub(crate) fn optimize_profiled(
         x: Vec<f64>,
         solve: Option<ProfileSolve>,
         warm: ProfileWarm,
+        /// The evaluation that found it, recorded in its checkpoint.
+        iter: usize,
     }
     let best = Mutex::new(Incumbent {
         x: x0.clone(),
         solve: None,
         warm: ProfileWarm::from_template(&layout, init_params),
+        iter: 0,
     });
     let n_evals = AtomicUsize::new(0);
     let grad_idx = Mutex::new(0usize);
@@ -952,7 +970,7 @@ pub(crate) fn optimize_profiled(
         x
     };
     let ebe_accum = Mutex::new(EbeAccum::default());
-    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+    let evaluate_once = |x: &[f64]| -> Option<ProfileSolve> {
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
@@ -978,18 +996,31 @@ pub(crate) fn optimize_profiled(
             b.x = x.to_vec();
             b.warm = ProfileWarm::from_solve(&layout, &solve);
             b.solve = Some(solve.clone());
-            // Checkpoint (#755) at the new incumbent, its levels at β̂: a resume unpacks
-            // them as the start's levels, which warm-start its first profile solve. Only a
-            // feasible point gets here (#1617).
-            if crate::io::checkpoint::is_due() {
+            b.iter = n_evals.load(Ordering::Relaxed);
+            #[cfg(test)]
+            INCUMBENT_UPDATES.with(|c| c.set(c.get() + 1));
+        }
+        Some(solve)
+    };
+    // Every evaluation, improving or not, then checks whether a checkpoint (#755) is due,
+    // and writes the incumbent — the best point, its levels at β̂ — not this evaluation's
+    // (#1317): a resume unpacks them as the start's levels, which warm-start its first
+    // profile solve. Keyed on the incumbent rather than on an improvement, so a run whose
+    // incumbent was found before the interval elapsed still writes once it has. Only a
+    // feasible point is ever an incumbent (#1617).
+    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+        let out = evaluate_once(x);
+        if crate::io::checkpoint::is_due() {
+            let b = best.lock().unwrap();
+            if let Some(solve) = &b.solve {
                 crate::io::checkpoint::maybe_write(
-                    n_evals.load(Ordering::Relaxed),
+                    b.iter,
                     solve.ofv,
-                    &solved_point(&layout, &hold, x, &solve),
+                    &solved_point(&layout, &hold, &b.x, solve),
                 );
             }
         }
-        Some(solve)
+        out
     };
     // Optimizer trace: one row per feasible evaluation, every packed coordinate's value
     // (levels at β̂) and the gradient handed to NLopt (`NA` on held coordinates).

@@ -782,6 +782,13 @@ fn a_profiled_fit_freezes_a_theta_the_objective_ignores() {
 /// holds them at 0), and re-profiling from it reproduces its recorded objective — what a
 /// resume starts from. Dies when the profiled loop writes no checkpoint, or writes the
 /// optimizer's point with the levels still at the template.
+///
+/// And a due sink is written after **every** evaluation, improving or not, with the
+/// incumbent: the fixture is asserted to have evaluations that did not replace the
+/// incumbent, so a write keyed on an improvement (round 1 of #2136's review: with a
+/// positive interval that never writes once the incumbent predates the interval) writes
+/// fewer times than there were evaluations and fails. The last write holds the final
+/// incumbent, so its objective is the fit's own, bit for bit.
 #[test]
 fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
     let path = temp("checkpoint.json");
@@ -797,14 +804,32 @@ fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
         0,
     );
     let o = FitOptions {
-        outer_maxiter: 3,
+        outer_maxiter: 10,
         run_covariance_step: false,
         ..options(&p)
     };
+    let writes_before = crate::io::checkpoint::writes();
+    let updates_before = INCUMBENT_UPDATES.with(std::cell::Cell::get);
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let writes = crate::io::checkpoint::writes() - writes_before;
+    let updates = INCUMBENT_UPDATES.with(std::cell::Cell::get) - updates_before;
     crate::io::checkpoint::abandon();
     let cp = crate::io::checkpoint::load(&path_s).expect("a checkpoint was written");
     crate::io::checkpoint::remove(&path_s);
+    // Measured (macOS arm64): 45 evaluations, 39 incumbent updates, 45 writes.
+    eprintln!(
+        "#2136 checkpoint: {} evaluations, {updates} incumbent updates, {writes} writes",
+        r.n_iterations
+    );
+    assert!(
+        updates >= 1 && updates < r.n_iterations,
+        "fixture: some evaluation must not improve, or the straddle is empty"
+    );
+    // The first evaluation is feasible here, so an incumbent exists after every one.
+    assert_eq!(writes, r.n_iterations, "a write after every evaluation");
+    assert_eq!(cp.ofv.to_bits(), r.ofv.to_bits(), "the final incumbent");
+    assert!(cp.iter >= 1 && cp.iter <= r.n_iterations, "{}", cp.iter);
+
     assert_eq!(
         cp.packed.len(),
         crate::estimation::parameterization::packed_len(&p.init_params)
@@ -998,7 +1023,9 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
 /// #10, the envelope gradient's reconverge override, keyed on the route each subject
 /// took. F2 without κ is analytic at model level; every subject is forced to decline the
 /// analytic gradient at runtime, the numerical decline `sens/provider.rs` names. On the
-/// reconverging log `optimize_profiled` builds, the declined subjects are reconverged
+/// reconverging log `optimize_profiled` builds — taken from the same
+/// [`profiled_decline_log`] the driver calls, so a driver built on a plain log fails
+/// here — the declined subjects are reconverged
 /// and the gradient is still the profile gradient (G1's bound); on a plain log they take
 /// the held-EBE salvage, which drops `dη̂/dθ`, and it is not — the straddle, asserted so
 /// the test cannot pass on a fixture where the two agree. Dies when the profiled loop
@@ -1062,7 +1089,7 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
         }
         worst
     };
-    let reconverged = worst(OuterFdDeclineLog::reconverging(n_subj));
+    let reconverged = worst(profiled_decline_log(n_subj));
     let held = worst(OuterFdDeclineLog::new(n_subj));
     eprintln!("#2136 #10: reconverged {reconverged:.3e}, held-EBE {held:.3e}");
     assert!(reconverged < G1_HANDED_BOUND, "{reconverged}");
