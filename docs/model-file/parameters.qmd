@@ -418,6 +418,20 @@ with each level within one subject, a random effect that moves its single
 record is a multiple of the level there, whatever the model, and is refused.
 The refusal says the absorption was measured, not where it sits.
 
+The measurement is joint over the random effects it measures in one subject
+(#1878): the block can absorb a combination of two that neither reaches alone.
+With `E0 = S + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC` and `ETA_X` read
+nowhere else, either random effect alone moves `y` with `OCC`, which the
+subject's one level cannot follow; shifted together they leave the square
+unchanged and move `y` by a constant the level takes up. So each random effect
+is measured against the levels and the other measured random effects together,
+and the refusal names its partners (`` `ETA_E0`, moved together with
+`ETA_X`, ``) and says to drop one of them: unlike two random effects each
+absorbed alone, dropping one breaks the combination. The others join only where they do not reproduce it on their own:
+two random effects that only duplicate each other are not the block's to
+absorb. Read `ETA_X` anywhere else as well (`EMAX = TVEMAX * exp(ETA_X)`) and
+the joint shift moves `EMAX` too: the model binds.
+
 On a nested block the measurement also decides whether
 `sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
 helps only when the random effect moves `y` like a shift common to the
@@ -429,8 +443,8 @@ every contrast.
 Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
 predictions absorbs the random effect, and a random effect on the residual
-error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
-judges each random effect alone, not a combination of two. And like the
+error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. And
+like the
 [dead-level check](#levels-with-no-effect), it is skipped for a model with a
 hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term: there
 such an absorption still binds.

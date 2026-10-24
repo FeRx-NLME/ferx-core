@@ -9142,6 +9142,129 @@ mod absorption {
         assert!(wrong.is_empty(), "not refused:\n{}", wrong.join("\n"));
     }
 
+    /// #1878. F3 with `ETA_X` read nowhere but the square:
+    /// `E0 = S + (ETA_E0 - ETA_X)² · OCC`. Each random effect alone moves `y`
+    /// with `OCC` inside the subject, outside the one level's column; but
+    /// shifting both by `c` leaves the square unchanged, and the level absorbs
+    /// the `c` left over. The joint oracle at the moved point absorbs both, and
+    /// the binder refuses under every contrast and auto, naming `ETA_E0` with
+    /// its partner. (`ETA_X` itself has derivative 0 at η = 0, the first probe
+    /// point, so it is not measured there and the refusal names `ETA_E0`
+    /// alone, which dropping does resolve.) The twin is F3 itself: the same
+    /// square with `ETA_X` also on `EMAX`, where the shared shift moves `EMAX`
+    /// too; it binds, so the pair straddles the joint span.
+    ///
+    /// The linear pair `E0 = S + (ETA_E0 - ETA_X) · OCC` is the same
+    /// combination at first order at both points, so both are measured: the
+    /// refusal names each with its partner and says dropping one is a remedy —
+    /// not the one-column refusal's "drop all of them" (#1880), which holds
+    /// only for random effects each absorbed alone.
+    ///
+    /// The baseline: `(ETA_E0 + 2 * ETA_X) * W` moves `y` with `W` under
+    /// either, and one is twice the other. They duplicate each other, and
+    /// together they still reach no level; the oracle absorbs neither, and it
+    /// binds.
+    ///
+    /// Mutations — the joint span taken against the levels alone (the issue's
+    /// head: both pairs bind); the partner clause deleted, or the combined
+    /// refusal (the refusals lack them); the others joined where they carry
+    /// the column on their own (the duplicate pair is refused).
+    #[test]
+    fn a_combination_of_random_effects_is_measured_jointly() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let model = |emax: &'static str, e0: String| {
+            move |c: &str| {
+                let r = row_1836("#1878", format!("  EMAX = {emax}\n  E0 = {e0}"), false);
+                let text = row_text(&r)(c);
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n",
+                );
+                assert_ne!(out, text, "ETA_X is declared");
+                out
+            }
+        };
+        let together = |re: &str, other: &str| {
+            format!(
+                "the random effect `{re}`, moved together with `{other}`, moves `y`, at every \
+                 record of each subject, exactly as some combination of this block's levels does"
+            )
+        };
+        let square = format!("{S} + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC");
+        let pair = model("TVEMAX", square.clone());
+        let twin = model("TVEMAX * exp(ETA_X)", square);
+        let linear = model("TVEMAX", format!("{S} + (ETA_E0 - ETA_X) * OCC"));
+        let mut wrong = Vec::new();
+        for (tag, text, at) in [("pair", &pair, moved), ("linear", &linear, Point::ZERO)] {
+            let jac = jacobian_at(&text("none"), &pop, at);
+            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            if absorbed != ["ETA_E0", "ETA_X"] {
+                wrong.push(format!("{tag}: the oracle absorbs {absorbed:?}"));
+            }
+        }
+        for c in ALL {
+            match try_bind(&pair(c), &pop) {
+                Err(e) => {
+                    let e0 = together("ETA_E0", "ETA_X");
+                    if !e.contains(&e0) || !e.contains(MEASURED_AT) {
+                        wrong.push(format!("pair {c:?}: lacks the joint clause: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("pair {c:?}: bound {b:?}")),
+            }
+            match try_bind(&linear(c), &pop) {
+                Err(e) => {
+                    for must in [
+                        together("ETA_E0", "ETA_X").as_str(),
+                        together("ETA_X", "ETA_E0").as_str(),
+                        MEASURED_AT,
+                        "the levels absorb `ETA_E0` and `ETA_X` in combination",
+                        "none of them alone, but moved together they move `y` as the levels do, \
+                         so the model is not identified under any contrast.",
+                        "Drop one of the random effects, or remove the block.",
+                    ] {
+                        if !e.contains(must) {
+                            wrong.push(format!("linear {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("linear {c:?}: bound {b:?}")),
+            }
+            for (tag, text) in [("pair", &pair), ("linear", &linear)] {
+                // Dropping one is a remedy here, not something to deny.
+                if let Err(e) = try_bind(&text(c), &pop) {
+                    if e.contains("drop all of them") {
+                        wrong.push(format!("{tag} {c:?}: says drop all: {e}"));
+                    }
+                }
+            }
+        }
+        agrees_with_joint_oracle_at("pair", &pair, &pop, moved, &mut wrong);
+        agrees_with_joint_oracle("linear", &linear, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("linear moved", &linear, &pop, moved, &mut wrong);
+        for c in ALL {
+            if let Err(e) = try_bind(&twin(c), &pop) {
+                wrong.push(format!("twin {c:?}: refused: {e}"));
+            }
+        }
+        agrees_with_joint_oracle_at("twin", &twin, &pop, moved, &mut wrong);
+        let duplicate = model(
+            "TVEMAX",
+            "TVE0 + PLACEBO\n  E0 = E0 + (ETA_E0 + 2 * ETA_X) * W".to_string(),
+        );
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            if let Err(e) = try_bind(&duplicate(c), &pop) {
+                wrong.push(format!("duplicate {c:?}: refused: {e}"));
+            }
+        }
+        agrees_with_joint_oracle_at("duplicate", &duplicate, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "jointly:\n{}", wrong.join("\n"));
+    }
+
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
     /// a dense basis of every column spans: on three subjects, one-subject
     /// columns, a column across two subjects and a θ-like column across all
