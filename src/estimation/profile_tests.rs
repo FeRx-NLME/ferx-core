@@ -711,6 +711,358 @@ fn a_profiled_gradient_fit_stops_on_its_own_ftol() {
     );
 }
 
+/// #2285: every leg of a profiled gradient fit runs at `xtol_rel ≤`
+/// [`PROFILED_GRADIENT_XTOL_REL`], whatever looser `outer_xtol` is set (the default
+/// 1e-4 let one short L-BFGS step end #2280's A2 fit 1.584e-3 above the optimum); a
+/// tighter user value wins; BOBYQA keeps `outer_xtol`. Dies when the ceiling is deleted
+/// or applied to BOBYQA.
+#[test]
+fn a_profiled_gradient_fit_caps_its_xtol() {
+    let default = FitOptions::default();
+    assert_eq!(default.outer_xtol, 1e-4, "the default this caps moved");
+    let looser = FitOptions {
+        outer_xtol: 1e-2,
+        ..FitOptions::default()
+    };
+    let tighter = FitOptions {
+        outer_xtol: 1e-9,
+        ..FitOptions::default()
+    };
+    for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
+        assert_eq!(profiled_xtol(algo, &default), PROFILED_GRADIENT_XTOL_REL);
+        assert_eq!(profiled_xtol(algo, &looser), PROFILED_GRADIENT_XTOL_REL);
+        assert_eq!(profiled_xtol(algo, &tighter), 1e-9);
+    }
+    assert!(PROFILED_GRADIENT_XTOL_REL < default.outer_xtol);
+    let bobyqa = nlopt::Algorithm::Bobyqa;
+    assert_eq!(profiled_xtol(bobyqa, &default), 1e-4);
+    assert_eq!(profiled_xtol(bobyqa, &looser), 1e-2);
+}
+
+fn ok(s: nlopt::SuccessState) -> NloptReturn {
+    Ok((s, 101.9))
+}
+
+fn err(f: nlopt::FailState) -> NloptReturn {
+    Err((f, 101.9))
+}
+
+/// Which profiled stops get a verification leg: every stop that could be a minimum,
+/// `Failure` and `RoundoffLimited` included (`main`'s L-BFGS returns `Failure` at the
+/// optimum, #2285 M5); not a spent budget, a cancelled run, a bad argument, or BOBYQA.
+/// A `Failure` / `RoundoffLimited` that has not left the start is not verified (#2338
+/// review #3: a first step that fails would otherwise be verified by a leg that gains
+/// nothing); a tolerance stop is verified either way. Dies when the `left_init` gate is
+/// dropped, or applied to tolerance stops too.
+#[test]
+fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
+        for r in [
+            ok(S::Success),
+            ok(S::FtolReached),
+            ok(S::XtolReached),
+            ok(S::StopValReached),
+            err(F::Failure),
+            err(F::RoundoffLimited),
+        ] {
+            assert!(
+                profiled_stop_needs_verify(algo, &r, false, true),
+                "{algo:?} {r:?}"
+            );
+            assert!(
+                !profiled_stop_needs_verify(algo, &r, true, true),
+                "cancelled {r:?}"
+            );
+        }
+        for r in [
+            ok(S::Success),
+            ok(S::FtolReached),
+            ok(S::XtolReached),
+            ok(S::StopValReached),
+        ] {
+            assert!(
+                profiled_stop_needs_verify(algo, &r, false, false),
+                "a tolerance stop at the start: {algo:?} {r:?}"
+            );
+        }
+        for r in [err(F::Failure), err(F::RoundoffLimited)] {
+            assert!(
+                !profiled_stop_needs_verify(algo, &r, false, false),
+                "a failure at the start: {algo:?} {r:?}"
+            );
+        }
+        for r in [
+            ok(S::MaxEvalReached),
+            ok(S::MaxTimeReached),
+            err(F::ForcedStop),
+            err(F::InvalidArgs),
+            err(F::OutOfMemory),
+        ] {
+            assert!(
+                !profiled_stop_needs_verify(algo, &r, false, true),
+                "{algo:?} {r:?}"
+            );
+        }
+    }
+    let bobyqa = nlopt::Algorithm::Bobyqa;
+    assert!(!profiled_stop_needs_verify(
+        bobyqa,
+        &ok(S::FtolReached),
+        false,
+        true
+    ));
+    assert!(!profiled_stop_needs_verify(
+        bobyqa,
+        &err(F::Failure),
+        false,
+        true
+    ));
+}
+
+/// The verdict comes from the verification gain, not from NLopt's status: a settled
+/// leg is converged on `Failure` as on `XtolReached`; a leg cap, a spent budget or a leg
+/// that could not start is not; with nothing verified the status decides (BOBYQA keeps
+/// today's rule, #2336). Dies when `Failure` is mapped to unconverged again.
+#[test]
+fn a_profiled_verdict_is_the_verification_gain() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let lbfgs = nlopt::Algorithm::Lbfgs;
+    let verdict = |end, r: NloptReturn| profiled_converged(lbfgs, end, &r, false, true);
+    // A `Failure` that never left the start is judged on its status, not converged.
+    assert!(!profiled_converged(
+        lbfgs,
+        PolishEnd::NotNeeded,
+        &err(F::Failure),
+        false,
+        false
+    ));
+    assert!(verdict(PolishEnd::Settled, err(F::Failure)));
+    assert!(verdict(PolishEnd::Settled, err(F::RoundoffLimited)));
+    assert!(verdict(PolishEnd::Settled, ok(S::XtolReached)));
+    assert!(verdict(PolishEnd::Settled, ok(S::FtolReached)));
+    // A leg that ended on its budget settles the loop, but verified nothing.
+    assert!(!verdict(PolishEnd::Settled, ok(S::MaxEvalReached)));
+    assert!(!verdict(PolishEnd::NotNeeded, ok(S::MaxEvalReached)));
+    assert!(!verdict(PolishEnd::NotNeeded, err(F::ForcedStop)));
+    for r in [ok(S::XtolReached), err(F::Failure)] {
+        assert!(!verdict(
+            PolishEnd::LegCapReached { last_gain: 2e-5 },
+            r.clone()
+        ));
+        assert!(!verdict(PolishEnd::BudgetSpent, r.clone()));
+        assert!(!verdict(PolishEnd::Skipped, r));
+    }
+    let bobyqa = nlopt::Algorithm::Bobyqa;
+    let r = ok(S::FtolReached);
+    assert!(profiled_converged(
+        bobyqa,
+        PolishEnd::NotNeeded,
+        &r,
+        false,
+        true
+    ));
+    assert!(!profiled_converged(
+        bobyqa,
+        PolishEnd::NotNeeded,
+        &err(F::Failure),
+        false,
+        true
+    ));
+}
+
+/// Each warning a profiled verdict emits, sentence by sentence, over every way the
+/// verification can end (#2338 review #1, #6): the leg cap names the legs, the last gain
+/// and that the fit is not converged; a budget spent before a leg and one spent during a
+/// leg (`Settled` on `MaxEvalReached`) both get the budget advice; any other unconverged
+/// stop names its status; a converged fit gets nothing.
+#[test]
+fn a_profiled_verdict_names_why_it_is_not_converged() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let w = |end, r: NloptReturn, converged| profiled_verdict_warning(end, &r, converged);
+
+    let cap = w(
+        PolishEnd::LegCapReached { last_gain: 2.1e-5 },
+        ok(S::XtolReached),
+        false,
+    )
+    .expect("a leg cap warns");
+    for sentence in [
+        format!("still improving after {MAX_POLISH_LEGS} verification legs"),
+        "the last lowered the objective by 2.100e-5".to_string(),
+        "so it is not reported as converged".to_string(),
+        "re-run from these estimates".to_string(),
+    ] {
+        assert!(cap.contains(&sentence), "{sentence:?} missing from {cap:?}");
+    }
+
+    let budget = w(PolishEnd::BudgetSpent, ok(S::FtolReached), false).expect("a spent budget");
+    for sentence in [
+        "spent its evaluation budget",
+        "before its stop was verified",
+        "increase maxiter",
+    ] {
+        assert!(
+            budget.contains(sentence),
+            "{sentence:?} missing from {budget:?}"
+        );
+    }
+    assert_eq!(
+        w(PolishEnd::Settled, ok(S::MaxEvalReached), false).as_deref(),
+        Some(budget.as_str()),
+        "a budget spent during a leg"
+    );
+
+    assert_eq!(
+        w(PolishEnd::NotNeeded, err(F::Failure), false).as_deref(),
+        Some("Profiled outer optimizer stopped without converging (Failure).")
+    );
+    assert_eq!(
+        w(PolishEnd::NotNeeded, ok(S::MaxEvalReached), false).as_deref(),
+        Some("Profiled outer optimizer stopped without converging (MaxEvalReached).")
+    );
+    assert_eq!(
+        w(PolishEnd::Skipped, ok(S::XtolReached), false).as_deref(),
+        Some("Profiled outer optimizer stopped without converging (XtolReached).")
+    );
+
+    assert_eq!(w(PolishEnd::Settled, err(F::Failure), true), None);
+    assert_eq!(w(PolishEnd::NotNeeded, ok(S::FtolReached), true), None);
+}
+
+/// The loop the verdict reads, driven by the profiled predicate over a scripted run:
+/// a `Failure` stop is verified by a leg, a leg that still gains more than
+/// [`PROFILED_VERIFY_GAIN`] is followed by another, and the fit is converged on the leg
+/// that gains less — on whatever status that leg ended. A run whose every leg gains more
+/// ends on the leg cap, not converged. Dies when `Failure` is not verified (the stop is
+/// then judged on its status) or when a large gain settles the loop.
+#[test]
+fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let lbfgs = nlopt::Algorithm::Lbfgs;
+    let mut script = vec![(ok(S::XtolReached), 2.1e-5), (err(F::Failure), 6e-8)].into_iter();
+    let (last, end) = drive_polish_legs(
+        err(F::Failure),
+        PROFILED_VERIFY_GAIN,
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| script.next(),
+    );
+    assert_eq!(end, PolishEnd::Settled);
+    assert!(script.next().is_none(), "both legs ran");
+    assert!(profiled_converged(lbfgs, end, &last, false, true));
+
+    let (last, end) = drive_polish_legs(
+        ok(S::FtolReached),
+        PROFILED_VERIFY_GAIN,
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| Some((ok(S::XtolReached), 2.1e-5)),
+    );
+    assert_eq!(end, PolishEnd::LegCapReached { last_gain: 2.1e-5 });
+    assert!(!profiled_converged(lbfgs, end, &last, false, true));
+
+    // A `Failure` that never left the start runs no leg and is not converged.
+    let (last, end) = drive_polish_legs(
+        err(F::Failure),
+        PROFILED_VERIFY_GAIN,
+        |r| profiled_stop_needs_verify(lbfgs, r, false, false),
+        || 100,
+        |_| -> Option<(NloptReturn, f64)> { panic!("no leg may run from a failed start") },
+    );
+    assert_eq!(end, PolishEnd::NotNeeded);
+    assert!(!profiled_converged(lbfgs, end, &last, false, false));
+}
+
+/// The verification legs [`optimize_profiled`] ran on this thread since the last call.
+fn take_verify_legs() -> Vec<VerifyLeg> {
+    VERIFY_LEGS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// The legs of one profiled fit: each runs at the capped `xtol_rel`, read back from the
+/// leg itself, and reports the gain the incumbent actually made.
+fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
+    let want = profiled_xtol(nlopt::Algorithm::Lbfgs, o);
+    assert!(want <= PROFILED_GRADIENT_XTOL_REL);
+    for (k, l) in legs.iter().enumerate() {
+        assert_eq!(l.xtol, Some(want), "leg {k} ran at another xtol_rel: {l:?}");
+        assert!(
+            l.before.is_finite() && l.after.is_finite(),
+            "leg {k}: {l:?}"
+        );
+        assert_eq!(
+            l.gain,
+            l.before - l.after,
+            "leg {k} reported a gain it did not make"
+        );
+    }
+}
+
+/// A profiled L-BFGS fit runs its verification leg and ends converged: F2 on its first
+/// two studies, through [`optimize_profiled`] itself, every leg at the capped `xtol_rel`
+/// and reporting its real gain. Dies when the leg is not run, or runs at `outer_xtol`
+/// (#2338 review #2, M1).
+#[test]
+fn a_profiled_fit_runs_its_verification_leg() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    assert!(matches!(profiled_algorithm(&o), nlopt::Algorithm::Lbfgs));
+    take_verify_legs();
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let legs = take_verify_legs();
+    eprintln!("F2 legs: {legs:?}");
+    assert!(!legs.is_empty(), "no verification leg ran");
+    assert_legs_are_capped_and_honest(&legs, &o);
+    let last = legs.last().unwrap();
+    assert!(last.gain <= PROFILED_VERIFY_GAIN, "{legs:?}");
+    assert!(r.converged, "{} legs: {:?}", legs.len(), r.warnings);
+}
+
+/// A stop far from the optimum is followed by legs while they still gain more than
+/// [`PROFILED_VERIFY_GAIN`]: F2 with a user `outer_ftol` loose enough that every run,
+/// legs included, stops well short of the optimum. Each leg gains more than the
+/// threshold, so the loop reaches the leg cap and the fit is not converged, with the
+/// leg-cap warning. Dies when a leg's gain is not what decides another leg (#2338
+/// review #2, M2: the loop settles after one leg and the fit is called converged).
+///
+/// Measured (macOS arm64): the four legs gain 3.48e-5, 4.58e-2, 4.86e-3 and 3.32e-4 from
+/// OFV 22.234048, the smallest 35× the threshold; the fit ends at 22.183013, 0.043 above
+/// the 22.139638 the default run reaches with one leg gaining 2.3e-10.
+#[test]
+fn a_profiled_fit_whose_legs_keep_gaining_is_not_converged() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let o = FitOptions {
+        run_covariance_step: false,
+        outer_ftol: Some(LOOSE_FTOL),
+        ..options(&p)
+    };
+    take_verify_legs();
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let legs = take_verify_legs();
+    eprintln!("F2 loose-ftol legs: {legs:?}; warnings {:?}", r.warnings);
+    assert_legs_are_capped_and_honest(&legs, &o);
+    assert_eq!(legs.len(), MAX_POLISH_LEGS, "{legs:?}");
+    assert!(
+        legs.iter().all(|l| l.gain > PROFILED_VERIFY_GAIN),
+        "{legs:?}"
+    );
+    assert!(!r.converged);
+    assert_eq!(
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("verification legs"))
+            .count(),
+        1,
+        "{:?}",
+        r.warnings
+    );
+}
+
+const LOOSE_FTOL: f64 = 1e-3;
+
 // ── #2136: the unprofiled loop's machinery, in the profiled loop ───────────────────
 
 /// F2 on two studies, run through [`optimize_profiled`] for a few iterations with no

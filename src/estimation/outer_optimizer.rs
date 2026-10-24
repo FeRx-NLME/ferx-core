@@ -3510,7 +3510,10 @@ fn decrement_ode_override(
 /// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
 /// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
 /// (#2001 review). A subject with no κ cells is its `η̂` alone.
-fn joint_warm_starts(ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> Vec<DVector<f64>> {
+pub(super) fn joint_warm_starts(
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
     ehs.iter()
         .enumerate()
         .map(|(i, eta)| {
@@ -4245,7 +4248,11 @@ const POLISH_XTOL_REL: f64 = 1e-7;
 const POLISH_MIN_GAIN: f64 = 1e-3;
 /// Polish legs after the first BOBYQA stop, at most. Each costs at least the
 /// `2n + 1` evaluations BOBYQA spends rebuilding its interpolation model.
-const MAX_POLISH_LEGS: usize = 4;
+///
+/// Also the cap on a profiled gradient fit's verification legs (`optimize_profiled`,
+/// #2285), which run through the same [`drive_polish_legs`]; one there costs about 5–20
+/// evaluations. Changing it changes both.
+pub(crate) const MAX_POLISH_LEGS: usize = 4;
 
 /// Does this NLopt return need the #1782 polish leg before it may be called
 /// converged? Only a BOBYQA *tolerance* stop, which it reports three ways:
@@ -4296,20 +4303,24 @@ fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// How the #1782 polish of a BOBYQA tolerance stop ended — see [`drive_polish_legs`].
+/// How a [`drive_polish_legs`] run ended: the #1782 polish of a BOBYQA tolerance stop,
+/// or the #2285 verification legs of a profiled gradient fit (`optimize_profiled`).
+/// `min_gain` below is `POLISH_MIN_GAIN` for the one and `PROFILED_VERIFY_GAIN` for the
+/// other.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PolishEnd {
-    /// The first stop was not a tolerance stop; nothing ran.
+    /// The first stop needed no leg (`needs_polish` was false); nothing ran.
     NotNeeded,
-    /// The last leg ran and settled: either it stopped on something other than a
-    /// tolerance (its own status decides), or it gained no more than `POLISH_MIN_GAIN`.
+    /// The last leg ran and settled: either it stopped on something that needs no leg
+    /// (its own status decides), or it gained no more than `min_gain`. A budget that
+    /// runs out during a leg ends here too, on that leg's `MaxEvalReached`.
     Settled,
-    /// A tolerance stop wanted a leg but the evaluation budget was spent — reachable,
-    /// since BOBYQA checks `maxeval` *before* an evaluation and can return
+    /// A stop wanted a leg but the evaluation budget was already spent before it —
+    /// reachable, since BOBYQA checks `maxeval` *before* an evaluation and can return
     /// `FtolReached` after the last permitted one.
     BudgetSpent,
-    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than
-    /// `POLISH_MIN_GAIN`: the objective was still falling when polishing stopped.
+    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than `min_gain`:
+    /// the objective was still falling when the legs stopped.
     LegCapReached { last_gain: f64 },
     /// A leg was wanted but could not start (no feasible point to polish from, #1617);
     /// the verdict is left to the paths that handle that run.
@@ -4317,9 +4328,12 @@ pub(crate) enum PolishEnd {
 }
 
 /// The #1782 polish loop, with the NLopt run abstracted out so every exit is
-/// unit-testable without driving BOBYQA. `first` is the first leg's NLopt return;
-/// `min_gain` is the gain above which another leg runs (`POLISH_MIN_GAIN` in
-/// production); `needs_polish` classifies a return ([`bobyqa_stop_needs_polish`]); `budget_left`
+/// unit-testable without driving BOBYQA. Shared by two callers: the BOBYQA polish
+/// (`min_gain = POLISH_MIN_GAIN`, `needs_polish` = [`bobyqa_stop_needs_polish`]) and a
+/// profiled gradient fit's verification legs (`PROFILED_VERIFY_GAIN`,
+/// `profiled_stop_needs_verify`, #2285). `first` is the first leg's NLopt return;
+/// `min_gain` is the gain above which another leg runs; `needs_polish` classifies a
+/// return; `budget_left`
 /// reads what remains of the fit's evaluation budget; `leg` runs one polish leg on
 /// that budget and returns its NLopt return and the objective gain it bought, or
 /// `None` if it could not start. Returns the **last** leg's NLopt return — the one
@@ -4367,7 +4381,7 @@ pub(crate) fn drive_polish_legs<R>(
 }
 
 /// The warning for [`PolishEnd::LegCapReached`].
-fn polish_leg_cap_warning(last_gain: f64) -> String {
+pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
     format!(
         "Outer optimization (BOBYQA) was still improving after {MAX_POLISH_LEGS} polish legs \
          from its tolerance stop (the last lowered the objective by {last_gain:.3e}), so it is \
@@ -4977,18 +4991,20 @@ fn optimize_nlopt_once(
         // mixture cache the branch above has already overwritten (#1290).
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
+            // The next evaluation starts every subject at this one's whole mode, κ̂ with
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
+            state.cached_etas = joint_warm_starts(&ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
             // twice.
             *best_solve_cl.lock().unwrap() = Some(IncumbentSolve {
                 xs: xs.to_vec(),
-                etas: ehs.clone(),
+                etas: ehs,
                 h_mats: hms.clone(),
                 kappas: kappas.clone(),
             });
             state.cached_h_mats = hms;
-            state.cached_etas = ehs;
         } else {
             state.cached_h_mats = hms;
             if let Some(prev) = warm_start_by_class {
@@ -5756,7 +5772,7 @@ fn optimize_nlopt_once(
                     // it does not (the tracker can rank a guard-penalised eval best,
                     // whose EBEs are never adopted), it still seeds the re-solve.
                     let held_is_at_this_point = inc.xs == restored_xs;
-                    let seed = inc.etas.clone();
+                    let seed = joint_warm_starts(&inc.etas, &inc.kappas);
                     let warm = solve_at(Some(&seed));
                     // Cold first: `reported_candidate` breaks ties by index, so a fit
                     // whose candidates agree keeps reporting the cold number.
@@ -6297,7 +6313,8 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        (f, g, ehs, hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
+        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -6363,6 +6380,8 @@ fn optimize_bfgs(
     // objective), so it engages for both FOCE and FOCEI on analytical models;
     // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
     // unavailable it degrades to plain warm-start from prior η̂.
+    // `n_kappa == 0` also keeps `cached_etas` η̂-wide here: under IOV it holds η̂ and every
+    // cell's κ̂ (#2261), which the predictor's per-η Jacobian would misalign.
     let use_predictor = model.n_kappa == 0
         && crate::sens::ode_provider::adjoint::model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
