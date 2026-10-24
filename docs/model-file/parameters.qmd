@@ -593,8 +593,14 @@ stopped early on the test fixture. `bobyqa` and `slsqp` can be chosen explicitly
 `nlopt_lbfgs`, `lbfgs` and `bfgs` all run the same NLopt L-BFGS (from the model file
 they always do, profiled or not). `trust_region` and `mma` are refused. With no
 `outer_ftol` set, a profiled L-BFGS or SLSQP fit stops on a relative objective change
-of `1e-8`, not the unprofiled `1e-6`. At an OFV near 100, `1e-6` let L-BFGS stop while
-still descending and report `converged: true` up to 1.6e-3 above the optimum (#2285).
+of `1e-8`, not the unprofiled `1e-6`, and its `xtol_rel` is `outer_xtol` capped at
+`1e-6`. Both are tests on one iteration, which L-BFGS can meet while still
+descending: from a nearby start of the profiled MBMA anchor, a fit reported
+`converged: true` 2.2e-5 above NONMEM's optimum, and fits that had reached it were
+reported not converged on NLopt `Failure`. So a stop is then verified: a fresh run
+from the best point must lower the OFV by no more than `1e-6`, or another follows (up
+to four). The fit is `converged` when one does, whatever NLopt's status, and not
+converged if four runs still improve it (#2285).
 
 ##### What the profiled outer loop shares with the unprofiled one
 
