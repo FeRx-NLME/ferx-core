@@ -72,7 +72,16 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 /// caller defaults, minus the fit's data OFV. Bitwise 0 is the claim.
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let got = sir_draw_ofv(model, pop, &params, &params, &etas, &options);
+    let class_etas = sir_class_etas(model, pop, &params, &options);
+    let got = sir_draw_ofv(
+        model,
+        pop,
+        &params,
+        &params,
+        &etas,
+        class_etas.as_deref(),
+        &options,
+    );
     (got, fit.ofv - fit.ofv_prior)
 }
 
@@ -610,4 +619,98 @@ fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
             "{what}: override FIX flags"
         );
     }
+}
+
+/// #1769: a `[mixture]` draw away from the estimates is scored warm, every class started
+/// from its own η̂ at the estimates ([`sir_class_etas`]); a draw at the estimates is scored
+/// cold, the pass the fit's objective comes from (T3's bitwise claim).
+///
+/// The warm and cold objectives differ only at the inner tolerance (−1.3e-7 at the draw
+/// below), so both sides of the `same_point` gate are asserted bitwise, each against the
+/// twin it must not equal. Dies if the
+/// scorer drops the warm start (the draw scores the cold value), if it warm-starts at the
+/// estimate too (the estimate scores the warm value), or if `sir_class_etas` stops returning
+/// per-class starts for a mixture or starts returning them for a non-mixture model.
+#[test]
+fn mixture_draws_warm_start_from_the_estimates_classes() {
+    use crate::estimation::mixture::mixture_ofv;
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let (options, params, etas) = scorer_inputs(&model, &fit);
+    let class = sir_class_etas(&model, &pop, &params, &options).expect("mixture: Some");
+    assert_eq!(class.len(), 2, "one start set per class");
+    assert!(
+        class.iter().all(|c| c.len() == pop.subjects.len()),
+        "one start per subject per class"
+    );
+    let score = |p: &ModelParameters, starts: &[Vec<DVector<f64>>]| {
+        sir_draw_ofv(&model, &pop, p, &params, &etas, Some(starts), &options)
+    };
+    let ofv = |p: &ModelParameters, warm: Option<&[Vec<DVector<f64>>]>| {
+        mixture_ofv(&model, &pop, p, &options, warm).ofv
+    };
+
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.02;
+    let (cold, warm) = (ofv(&draw, None), ofv(&draw, Some(&class)));
+    eprintln!(
+        "MEASURE draw cold={cold:?} warm={warm:?} gap={:e}",
+        warm - cold
+    );
+    assert!(cold.is_finite() && warm.is_finite(), "{cold} / {warm}");
+    assert_ne!(
+        cold.to_bits(),
+        warm.to_bits(),
+        "fixture premise: warm ≠ cold at the draw"
+    );
+    assert_eq!(
+        score(&draw, &class).to_bits(),
+        warm.to_bits(),
+        "draw not scored warm"
+    );
+
+    // At the estimates the cold pass's own η̂ is a fixed point of the warm solve on macOS
+    // arm64 (gap 0), so those starts cannot tell the arms apart; starts moved off it can.
+    let moved: Vec<Vec<DVector<f64>>> = class
+        .iter()
+        .map(|c| c.iter().map(|e| e.add_scalar(0.05)).collect())
+        .collect();
+    let (cold, warm) = (ofv(&params, None), ofv(&params, Some(&moved)));
+    eprintln!(
+        "MEASURE estimate cold={cold:?} warm={warm:?} gap={:e}",
+        warm - cold
+    );
+    assert_ne!(
+        cold.to_bits(),
+        warm.to_bits(),
+        "fixture premise: warm ≠ cold at the estimate"
+    );
+    assert_eq!(
+        score(&params, &moved).to_bits(),
+        cold.to_bits(),
+        "estimate not scored cold"
+    );
+
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    assert!(
+        sir_class_etas(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &options
+        )
+        .is_none(),
+        "a non-mixture model has no class starts"
+    );
 }

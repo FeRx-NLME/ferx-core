@@ -1019,8 +1019,10 @@ fn cold_eta_seed(
 ///    (`stall_at`, #555 / #1521), so a subject whose objective is numerical (an ODE, or a
 ///    transit/IG closed form rerouted to its ODE twin) is certified by the stall stop at its
 ///    noise floor rather than held to a `tol` below it. The polished point replaces η̂ only
-///    when the polish certifies it (it is never worse: every accepted step is an Armijo
-///    decrease), so the flag always belongs to the returned point (the #1337 rule).
+///    when the polish certifies it (it is no worse beyond the objective's resolution: every
+///    accepted step is an Armijo decrease, or a gradient-verified step whose objective rises by
+///    at most `INNER_FTOL_REL·(1 + |f|)` while the gradient norm at least halves, #2270), so the
+///    flag always belongs to the returned point (the #1337 rule).
 ///
 /// A point that passes none of them is returned unchanged and reported **unconverged**.
 pub(crate) struct FallbackCertifier<'a> {
@@ -1152,9 +1154,12 @@ impl FallbackCertifier<'_> {
             return false;
         }
         // No objective comparison against the handed-in point: both drivers take only steps
-        // that pass the Armijo test along a descent direction (`backtracking_line_search`), so
-        // a polished point is never worse than its start. A gate re-checking that could not
-        // fail, and no test could pin it (#1527 mutation sweep).
+        // that pass the Armijo test along a descent direction (`backtracking_line_search`), or
+        // gradient-verified steps whose objective rises by at most `INNER_FTOL_REL·(1 + |f|)`
+        // while the gradient norm at least halves (`exact_step_verified_by_gradient`, #2270).
+        // So a polished point is no worse than its start beyond the objective's resolution.
+        // An exact comparison would undo exactly those verified steps; a comparison with that
+        // slack could not fail, and no test could pin it (#1527 mutation sweep).
         *x = polished;
         true
     }
@@ -1403,9 +1408,11 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 ///
 /// The reroute considered here is subject-static (TV-cov / `TIME` / IOV via `effective_for`), so
 /// a non-rerouted subject — including a constant-parameter, in-domain subject of a twin-carrying
-/// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
-/// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
-/// those, so this adds no cost on the common path.)
+/// model, or a purely analytic model — keeps the exact `gnorm < tol` stop and never stalls out.
+/// (Its steps are not those of releases before #2270: an exact objective's search takes
+/// gradient-verified sub-resolution steps and the relative curvature-pair gate — see
+/// [`choose_step`] and [`curvature_pair_accepted`].) `effective_for` returns `self` without
+/// building the twin for those, so this adds no cost on the common path.
 ///
 /// **This is the subject-static half only**, and no solve calls it any more: the non-IOV inner
 /// solve calls [`inner_stall_enabled_at`] and the IOV solve [`inner_stall_enabled_at_iov`],
@@ -2085,7 +2092,8 @@ fn find_ebe_solve(
     // RK45 gradient-noise floor that can sit above `tol` (#555) — i.e. when the *effective*
     // model for this subject is ODE, which includes a closed-form transit/IG subject rerouted to
     // its ODE twin (TV-cov / `TIME`; #719/#814). Analytical/event-driven objectives are exact, so
-    // they keep the pure `gnorm < tol` criterion and stay bit-identical to prior releases.
+    // they keep the pure `gnorm < tol` criterion (since #2270 with a relative BFGS pair gate and
+    // gradient-verified sub-resolution steps, which ODE objectives do not take).
     // Evaluated at whatever iterate the search is standing on — see the latch in
     // [`dense_bfgs_core`] / [`lbfgs_core`]. The value at the *start* point still drives the
     // two pre-solve policies below (`short_line_search`, `certify_partial`), which have to
@@ -4692,7 +4700,11 @@ fn lbfgs_core(
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
     // abscissa partway through the search, at which point its objective becomes an RK45
     // integration and picks up the solver's noise floor. `stall_at` is therefore evaluated
-    // at the current iterate each pass and **latched** monotonically rather than read fresh.
+    // at the start point and at every accepted point, and **latched** monotonically rather
+    // than read fresh. The accepted point's value is in place before that step's curvature
+    // pair is judged ([`curvature_pair_accepted`]), so a step that lands on the twin has its
+    // noise-floored `y` judged as an ODE pair (#2280 review); the stall stop of that same step
+    // still reads the latch from before it.
     //
     // Latched, not per-iterate, because everything the stall criterion reads is *history*:
     // `stall` counts consecutive flat steps and `best_gnorm` is the best norm seen, so once
@@ -4707,10 +4719,9 @@ fn lbfgs_core(
     // closed-form transit/IG model that carries a twin — `effective_model_for_eval` returns
     // the structural model by reference for everything else, and `AbsorptionTwin::built` is
     // a field read, not a rebuild.
-    let mut enable_stall = false;
+    let mut enable_stall = stall_at(x);
 
     for _iter in 0..max_iter {
-        enable_stall = enable_stall || stall_at(x);
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
         // L2 norm would be dominated by the sharp covariate pseudo-obs dims and
         // never fall below `tol` (issue #406), so the preconditioned (≈ Newton-
@@ -4751,32 +4762,27 @@ fn lbfgs_core(
             bound_curvature_free(&mut d);
         }
 
-        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-        let (alpha, f_new) = backtracking_line_search(
+        let (alpha, f_new, mut verified_g) = match choose_step(
             obj,
+            grad,
             x,
             &d,
             &g,
             f_cur,
+            stop_precond,
+            enable_stall,
+            gnorm_improving,
             &mut line_search_point,
             short_line_search,
-            floor,
-        );
-        // At the noise floor an unverifiable step is convergence, not a failure — unless the
-        // gradient verifies it ([`gradient_verified_step`]).
-        let (alpha, f_new) = if alpha == 0.0 && floor {
-            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                Some(fc) => (1.0, fc),
-                None => return true,
-            }
-        } else {
-            (alpha, f_new)
+        ) {
+            StepChoice::Step {
+                alpha,
+                f_new,
+                g_new,
+            } => (alpha, f_new, g_new),
+            StepChoice::ConvergedAtFloor => return true,
+            StepChoice::Failed => return false,
         };
-        // No sufficient-decrease step found: report non-convergence so the caller takes the
-        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
-        if alpha == 0.0 {
-            return false;
-        }
         // Stall only for ODE objectives, and only once the gradient has plateaued (no
         // longer improving) — see [`INNER_FTOL_REL`]. `objective_stalled` is always called
         // so the flat-step counter stays accurate; the plateau/ODE gates only decide
@@ -4792,12 +4798,13 @@ fn lbfgs_core(
         if stalled {
             return true;
         }
+        enable_stall = enable_stall || stall_at(x);
 
-        let g_new = grad(x);
+        let g_new = verified_g.take().unwrap_or_else(|| grad(x));
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
-        if sy > 1e-12 {
+        if curvature_pair_accepted(sy, l2_norm(&s), l2_norm(&y), enable_stall) {
             if s_hist.len() == LBFGS_MEMORY {
                 s_hist.remove(0);
                 y_hist.remove(0);
@@ -4854,8 +4861,8 @@ fn dense_bfgs_core(
     // the full-gradient step again.
     let mut h_unshaped = true;
     // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): gated on
-    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so
-    // smooth analytical/FD fits stay bit-identical and a non-stationary mid-descent iterate
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so the
+    // stall never stops a smooth analytical/FD fit and a non-stationary mid-descent iterate
     // can't be accepted.
     let mut stall = 0u32;
     let mut best_gnorm = f64::INFINITY;
@@ -4863,7 +4870,11 @@ fn dense_bfgs_core(
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
     // abscissa partway through the search, at which point its objective becomes an RK45
     // integration and picks up the solver's noise floor. `stall_at` is therefore evaluated
-    // at the current iterate each pass and **latched** monotonically rather than read fresh.
+    // at the start point and at every accepted point, and **latched** monotonically rather
+    // than read fresh. The accepted point's value is in place before that step's curvature
+    // pair is judged ([`curvature_pair_accepted`]), so a step that lands on the twin has its
+    // noise-floored `y` judged as an ODE pair (#2280 review); the stall stop of that same step
+    // still reads the latch from before it.
     //
     // Latched, not per-iterate, because everything the stall criterion reads is *history*:
     // `stall` counts consecutive flat steps and `best_gnorm` is the best norm seen, so once
@@ -4878,10 +4889,9 @@ fn dense_bfgs_core(
     // closed-form transit/IG model that carries a twin — `effective_model_for_eval` returns
     // the structural model by reference for everything else, and `AbsorptionTwin::built` is
     // a field read, not a rebuild.
-    let mut enable_stall = false;
+    let mut enable_stall = stall_at(x);
 
     for _iter in 0..max_iter {
-        enable_stall = enable_stall || stall_at(x);
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
         // on the raw L2 norm so the converged EBE is independent of the `precond`
         // H0 that accelerates the search.
@@ -4938,32 +4948,27 @@ fn dense_bfgs_core(
             if seed_inv.is_none() {
                 cap_curvature_free_step(&mut d, precond);
             }
-            let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-            let (alpha, f_new) = backtracking_line_search(
+            let (alpha, f_new, mut verified_g) = match choose_step(
                 obj,
+                grad,
                 x,
                 &d,
                 &g,
                 f_cur,
+                stop_precond,
+                enable_stall,
+                gnorm_improving,
                 &mut line_search_point,
                 short_line_search,
-                floor,
-            );
-            // At the noise floor an unverifiable step is convergence, not a failure — unless
-            // the gradient verifies it ([`gradient_verified_step`]).
-            let (alpha, f_new) = if alpha == 0.0 && floor {
-                match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                    Some(fc) => (1.0, fc),
-                    None => return true,
-                }
-            } else {
-                (alpha, f_new)
+            ) {
+                StepChoice::Step {
+                    alpha,
+                    f_new,
+                    g_new,
+                } => (alpha, f_new, g_new),
+                StepChoice::ConvergedAtFloor => return true,
+                StepChoice::Failed => return false,
             };
-            // Even steepest descent found no sufficient-decrease step: report
-            // non-convergence so the caller takes the argmin Nelder–Mead fallback.
-            if alpha == 0.0 {
-                return false;
-            }
             for i in 0..n {
                 x[i] += alpha * d[i];
             }
@@ -4973,36 +4978,32 @@ fn dense_bfgs_core(
             if stalled {
                 return true;
             }
-            g = grad(x);
+            enable_stall = enable_stall || stall_at(x);
+            g = verified_g.take().unwrap_or_else(|| grad(x));
             continue;
         }
 
-        let floor = step_below_noise_floor(enable_stall && !gnorm_improving, &d, &g, f_cur);
-        let (alpha, f_new) = backtracking_line_search(
+        let (alpha, f_new, mut verified_g) = match choose_step(
             obj,
+            grad,
             x,
             &d,
             &g,
             f_cur,
+            stop_precond,
+            enable_stall,
+            gnorm_improving,
             &mut line_search_point,
             short_line_search,
-            floor,
-        );
-        // At the noise floor an unverifiable step is convergence, not a failure — unless the
-        // gradient verifies it ([`gradient_verified_step`]).
-        let (alpha, f_new) = if alpha == 0.0 && floor {
-            match gradient_verified_step(obj, grad, x, &d, f_cur, &g, stop_precond) {
-                Some(fc) => (1.0, fc),
-                None => return true,
-            }
-        } else {
-            (alpha, f_new)
+        ) {
+            StepChoice::Step {
+                alpha,
+                f_new,
+                g_new,
+            } => (alpha, f_new, g_new),
+            StepChoice::ConvergedAtFloor => return true,
+            StepChoice::Failed => return false,
         };
-        // No sufficient-decrease step found: report non-convergence so the caller takes the
-        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
-        if alpha == 0.0 {
-            return false;
-        }
 
         for i in 0..n {
             s[i] = alpha * d[i];
@@ -5014,8 +5015,9 @@ fn dense_bfgs_core(
         if stalled {
             return true;
         }
+        enable_stall = enable_stall || stall_at(x);
 
-        let g_new = grad(x);
+        let g_new = verified_g.take().unwrap_or_else(|| grad(x));
         for i in 0..n {
             y[i] = g_new[i] - g[i];
         }
@@ -5023,7 +5025,7 @@ fn dense_bfgs_core(
         s_vec.as_mut_slice().copy_from_slice(&s);
         y_vec.as_mut_slice().copy_from_slice(&y);
         let sy = s_vec.dot(&y_vec);
-        if sy > 1e-12 {
+        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
             let rho = 1.0 / sy;
             let s_yt = rho * &s_vec * y_vec.transpose();
             let y_st = rho * &y_vec * s_vec.transpose();
@@ -5195,8 +5197,8 @@ fn inner_line_search_trials(short_line_search: bool) -> usize {
 /// guards keep it from accepting a non-stationary iterate:
 ///
 /// 1. **ODE-only** (`enable_stall`, set by `find_ebe`/`find_ebe_iov` for `[odes]` models).
-///    Analytical / event-driven objectives are exact, reach `gnorm < tol` normally, and
-///    stay bit-identical to prior releases — the stall never touches them.
+///    Analytical / event-driven objectives are exact and reach `gnorm < tol` normally — the
+///    stall never touches them.
 /// 2. **Gradient-plateau.** The stall fires only once the gradient has *stopped
 ///    decreasing* — the current `gnorm` no longer improves the best seen by more than
 ///    [`INNER_FTOL_GNORM_PLATEAU`]. Mid-descent (including a heavily-backtracked
@@ -5371,17 +5373,185 @@ fn iov_prior_maha(
 /// the stall stop's own plateau guard, so a solve whose gradient is still falling keeps
 /// descending even when each step is flat.
 fn step_below_noise_floor(enable_stall: bool, d: &[f64], g: &[f64], f: f64) -> bool {
-    if !enable_stall {
-        return false;
-    }
+    enable_stall && step_below_resolution(d, g, f)
+}
+
+/// Whether the full step along `d` predicts a decrease (`|∇f·d|`) no larger than the flat-step
+/// threshold `INNER_FTOL_REL·(1 + |f|)`: a gain the objective cannot resolve, so no Armijo test
+/// along `d` can verify it. [`step_below_noise_floor`] arms this on an ODE objective's noise
+/// floor; [`exact_step_verified_by_gradient`] on an exact one's rounding.
+fn step_below_resolution(d: &[f64], g: &[f64], f: f64) -> bool {
     let dg: f64 = d.iter().zip(g).map(|(di, gi)| di * gi).sum();
     dg < 0.0 && -dg <= INNER_FTOL_REL * (1.0 + f.abs())
+}
+
+/// On an **exact** objective (`!enable_stall`), a step whose predicted gain is below the
+/// objective's resolution ([`step_below_resolution`]) is taken when the gradient verifies it
+/// ([`gradient_verified_step`]: the objective stays within its resolution and the gradient norm
+/// at least halves), without a line search ([`Verdict::Verified`]); otherwise the step goes to
+/// the line search as before.
+///
+/// Why (#2270): next to the mode the gain a good step can make is below the objective's rounding,
+/// so the Armijo test reads noise. Measured on `examples/warfarin_iov` started from the previous
+/// mode at ‖∇‖ = 25–28·`tol`: the full step's gain was ~1e-14 against `f ≈ 6`, the line search
+/// backtracked to α ≈ 1e-10, accepted `f_new == f` there (`c1·α·∇f·d` is below ulp(f)), and the
+/// same non-move repeated to `max_iter`, so the subject went to the Nelder–Mead fallback. The
+/// gradient is exact and still resolves the mode. This never declares convergence: a verified step
+/// is an accepted step, and the solve still stops only on `gnorm < tol` (#1527).
+///
+/// "Exact" is the objective, not the gradient: `!enable_stall` means the effective model is not an
+/// ODE, and the gradient may still be finite differences (`gradient = fd`, a subject out of the
+/// analytic scope, the per-point FD fallback, the IOV FD route). Measured on PR #2280 with
+/// `gradient = fd`, base `main` → these rules, macOS arm64, every fit converged: `warfarin`
+/// −280.359506 → −280.359505 at the default `inner_tol = 1e-5` and −280.359507 → −280.359505 at
+/// 1e-8; `warfarin_iov` 205.091863 → 205.090480 and 205.091290 → 205.091104 (NONMEM 205.0903).
+/// Below ~1e-9 an FD gradient cannot meet `inner_tol` at all, with or without these rules. The
+/// same holds for [`curvature_pair_accepted`].
+#[allow(clippy::too_many_arguments)]
+fn exact_step_verified_by_gradient(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    f: f64,
+    g: &[f64],
+    stop_precond: Option<&[f64]>,
+    enable_stall: bool,
+) -> Verdict {
+    if enable_stall || !step_below_resolution(d, g, f) {
+        return Verdict::Rejected(None);
+    }
+    gradient_verified_step(obj, grad, x, d, f, g, stop_precond)
+}
+
+/// How far one step goes along `d`, for both BFGS drivers and the dense driver's
+/// steepest-descent reset — written once so the three sites cannot drift (#2280 review).
+///
+/// In order: an exact objective's gradient-verified sub-resolution step
+/// ([`exact_step_verified_by_gradient`]); else the backtracking line search, trying the full step
+/// alone at an ODE objective's noise floor ([`step_below_noise_floor`]); there an unverifiable
+/// step is convergence, not a failure, unless the gradient verifies it
+/// ([`gradient_verified_step`]); and no sufficient-decrease step at all is a failure, so the
+/// caller takes the Nelder–Mead fallback rather than accepting a non-stationary η̂. A step whose
+/// end point already had its gradient evaluated hands it back (`g_new`), which the driver uses
+/// instead of evaluating it again: a verified step, or a full step the verification rejected and
+/// the line search then accepted.
+#[allow(clippy::too_many_arguments)]
+fn choose_step(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64],
+    d: &[f64],
+    g: &[f64],
+    f_cur: f64,
+    stop_precond: Option<&[f64]>,
+    enable_stall: bool,
+    gnorm_improving: bool,
+    line_search_point: &mut [f64],
+    short_line_search: bool,
+) -> StepChoice {
+    let at_full_step = match exact_step_verified_by_gradient(
+        obj,
+        grad,
+        x,
+        d,
+        f_cur,
+        g,
+        stop_precond,
+        enable_stall,
+    ) {
+        Verdict::Verified(f_new, g_new) => {
+            return StepChoice::Step {
+                alpha: 1.0,
+                f_new,
+                g_new: Some(g_new),
+            }
+        }
+        Verdict::Rejected(g_full) => g_full,
+    };
+    let floor = step_below_noise_floor(enable_stall && !gnorm_improving, d, g, f_cur);
+    let (alpha, f_new) = backtracking_line_search(
+        obj,
+        x,
+        d,
+        g,
+        f_cur,
+        line_search_point,
+        short_line_search,
+        floor,
+    );
+    if alpha == 0.0 && floor {
+        return match gradient_verified_step(obj, grad, x, d, f_cur, g, stop_precond) {
+            Verdict::Verified(f_new, g_new) => StepChoice::Step {
+                alpha: 1.0,
+                f_new,
+                g_new: Some(g_new),
+            },
+            Verdict::Rejected(_) => StepChoice::ConvergedAtFloor,
+        };
+    }
+    if alpha == 0.0 {
+        return StepChoice::Failed;
+    }
+    // A full step the verification rejected but the line search accepted lands where the
+    // verification already took the gradient: `x + 1.0·d` is `x + d` bit for bit.
+    StepChoice::Step {
+        alpha,
+        f_new,
+        g_new: if alpha == 1.0 { at_full_step } else { None },
+    }
+}
+
+/// [`choose_step`]'s outcome.
+enum StepChoice {
+    /// Take `x + alpha·d`, where the objective is `f_new` and, after a verified step, the
+    /// gradient `g_new`.
+    Step {
+        alpha: f64,
+        f_new: f64,
+        g_new: Option<Vec<f64>>,
+    },
+    /// At an ODE objective's noise floor no step is verifiable: the solve has converged.
+    ConvergedAtFloor,
+    /// No sufficient-decrease step: the solve has not converged.
+    Failed,
+}
+
+/// Relative curvature a BFGS pair must carry to update the metric, beside the absolute
+/// `sᵀy > 1e-12` (see [`curvature_pair_accepted`]).
+const CURVATURE_PAIR_REL: f64 = 1e-8;
+
+/// Whether an accepted step's pair `(s, y)` updates the BFGS metric: `sᵀy > 1e-12`, or — on an
+/// **exact** objective (`!enable_stall`) — `sᵀy > CURVATURE_PAIR_REL·‖s‖·‖y‖`, positive curvature
+/// resolvable relative to the pair itself, which does not depend on the step's length.
+///
+/// Why (#2270): the absolute test alone rejects every pair of a search whose steps are small, and
+/// near the mode they all are: `sᵀy ≈ λ‖s‖²`. Measured on `nonmem_anchor/nested_levels_3` with
+/// the IOV solve started from the previous mode (‖∇‖ = 7–28·`tol`, curvature ~1e4): `sᵀy` was
+/// 1e-13–1e-14 from the second step on, so the metric stayed the identity, the search zigzagged
+/// and stalled at ‖∇‖ ~ 2–3e-5 > `tol = 1e-5` until `max_iter`, and 24 solves went to Nelder–Mead.
+/// The union only *adds* pairs, all in the small-step regime: a pair the absolute test accepted is
+/// still accepted.
+///
+/// Not on an ODE objective: there a short step's `y` is the solver's gradient noise, and the
+/// relative test admits it as curvature. Measured on `per_route_lag_matches_reconverged_fd`
+/// (`reltol = 1e-12`): the reconverged-FD reference's EBE re-solves fell from 5.4e-8 to 1.04e-6
+/// in stationarity with the relative arm on there. On an exact objective with a finite-difference
+/// gradient the relative arm stays on; see [`exact_step_verified_by_gradient`] for what was
+/// measured there.
+fn curvature_pair_accepted(sy: f64, s_norm: f64, y_norm: f64, enable_stall: bool) -> bool {
+    sy > 1e-12 || (!enable_stall && sy > CURVATURE_PAIR_REL * s_norm * y_norm)
+}
+
+fn l2_norm(v: &[f64]) -> f64 {
+    v.iter().map(|vi| vi * vi).sum::<f64>().sqrt()
 }
 
 /// At the noise floor, whether the full step `x + d` that the objective could not verify is
 /// verified by the **gradient** instead: the objective stays within its resolution
 /// (`INNER_FTOL_REL·(1 + |f|)`, the flat-step threshold) and the gradient norm at least
-/// halves. Returns the objective there when it is.
+/// halves. Returns the objective and the gradient there when it is, so the driver that takes the
+/// step does not evaluate that gradient a second time ([`Verdict`]).
 ///
 /// The objective-based stop treats "no resolvable decrease" as convergence, which is right
 /// when the gradient carries the same noise. When the ODE is integrated tightly enough for
@@ -5399,14 +5569,29 @@ fn gradient_verified_step(
     f: f64,
     g: &[f64],
     stop_precond: Option<&[f64]>,
-) -> Option<f64> {
+) -> Verdict {
     let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
     let fc = obj(&cand);
     if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
-        return None;
+        return Verdict::Rejected(None);
     }
-    let gc = grad_norm_metric(&grad(&cand), stop_precond);
-    (gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond)).then_some(fc)
+    let g_cand = grad(&cand);
+    let gc = grad_norm_metric(&g_cand, stop_precond);
+    if gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond) {
+        Verdict::Verified(fc, g_cand)
+    } else {
+        Verdict::Rejected(Some(g_cand))
+    }
+}
+
+/// [`gradient_verified_step`]'s outcome. A rejected step still hands back the gradient it took
+/// at `x + d`, when it took one: the line search that runs next may accept that same full step
+/// (α = 1), and the driver then needs no second evaluation there (#2280).
+enum Verdict {
+    /// Take `x + d`: the objective and the gradient there.
+    Verified(f64, Vec<f64>),
+    /// Not verified; the gradient at `x + d` if it was evaluated.
+    Rejected(Option<Vec<f64>>),
 }
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
