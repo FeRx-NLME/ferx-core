@@ -6402,4 +6402,65 @@ mod tests {
             "{n} objective evaluations after the first call cancelled (at most {THREADS})"
         );
     }
+
+    // ── #2261: every reconverged point of the step starts at the fit's (η̂, κ̂) ──────
+
+    /// The covariance step on `fixture`'s default-parameter modes, with the exact R-matrix
+    /// off so the base reconvergence and the whole-population stencil run: every IOV start
+    /// of the step begins at the modes it was handed, κ̂ included.
+    fn assert_cov_points_start_at_mode(
+        label: &str,
+        (model, pop, opts): (
+            crate::types::CompiledModel,
+            crate::types::Population,
+            crate::types::FitOptions,
+        ),
+    ) {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_starts_at_modes, on_one_thread,
+        };
+        use crate::types::FitOptions;
+        let p = &model.default_params;
+        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let opts = FitOptions {
+            analytic_cov_hessian: false,
+            ..opts
+        };
+        let x = crate::estimation::parameterization::pack_params(p);
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                super::compute_covariance(&x, p, &model, &pop, &etas, &hms, &kappas, &opts)
+            })
+            .1
+        });
+        assert!(
+            rec.passes.is_empty(),
+            "{label}: the step solves per subject"
+        );
+        assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_one_level() {
+        use crate::estimation::inner_optimizer::test_helpers::warfarin_iov_fixture;
+        assert_cov_points_start_at_mode("covariance step warfarin_iov", warfarin_iov_fixture());
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_nested_levels() {
+        use crate::estimation::inner_optimizer::test_helpers::nested_levels_fixture;
+        assert_cov_points_start_at_mode("covariance step nested_levels_3", nested_levels_fixture());
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_kappa_correlation() {
+        use crate::estimation::inner_optimizer::test_helpers::kappa_correlation_fixture;
+        assert_cov_points_start_at_mode(
+            "covariance step warfarin_iov ar1",
+            kappa_correlation_fixture(),
+        );
+    }
 }

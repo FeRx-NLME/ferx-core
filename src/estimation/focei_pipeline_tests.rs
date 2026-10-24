@@ -857,3 +857,45 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         "a central difference has two probes per free coordinate, got {n}"
     );
 }
+
+/// #2261: the covariance step's per-subject salvage (#1514) reconverges the subject the
+/// exact R-matrix declines, from that subject's mode, κ̂ included. The exact subjects solve
+/// once each, at the base reconvergence, so the salvaged subject's extra starts are the
+/// subset stencil's, which is what the per-subject counts pin.
+#[test]
+fn covariance_salvage_points_start_at_the_subject_mode() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::{assert_starts_at_modes, on_one_thread};
+    let (model, pop) = fixture(true, true);
+    let params = &model.default_params;
+    let x = pack_params(params);
+    let opts = FitOptions::default();
+    assert!(
+        opts.analytic_cov_hessian,
+        "the exact R-matrix routes the salvage"
+    );
+    let (etas, hms, _, kappas) =
+        run_inner_loop_warm(&model, &pop, params, 200, 1e-8, None, None, 0, 0);
+    let rec = on_one_thread(|| {
+        record_inner_solves(|| {
+            crate::estimation::covariance::compute_covariance(
+                &x, params, &model, &pop, &etas, &hms, &kappas, &opts,
+            )
+        })
+        .1
+    });
+    let starts_of = |id: &str| rec.starts.iter().filter(|s| s.subject == id).count();
+    for s in &pop.subjects[1..] {
+        assert_eq!(
+            starts_of(&s.id),
+            1,
+            "exact subject {} solves at the base only",
+            s.id
+        );
+    }
+    assert!(
+        starts_of(&pop.subjects[0].id) > 1,
+        "fixture: subject 0 must take the subset stencil"
+    );
+    assert_starts_at_modes("covariance salvage", &rec, |_| true, &pop, &etas, &kappas);
+}
