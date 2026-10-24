@@ -123,6 +123,7 @@ fn worst_pred_error_on(
     nm.retain(|(id, _, _)| keep(id));
     assert!(!nm.is_empty(), "{anchor}: no observations kept");
     assert_eq!(ferx.len(), nm.len(), "{anchor}: observation count");
+    let tol = pred_tol(anchor);
     let mut worst = 0.0_f64;
     for (r, (id, t, want)) in ferx.iter().zip(&nm) {
         assert!(
@@ -139,7 +140,7 @@ fn worst_pred_error_on(
         );
         let err = (r.pred - want).abs();
         assert!(
-            err < PRED_TOL,
+            err < tol,
             "{anchor} ID {id} TIME {t}: ferx PRED {} vs NONMEM {want} (|error| {err:.3e})",
             r.pred
         );
@@ -247,8 +248,25 @@ fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_recor
 
 // Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |PRED − NONMEM| 2.79e-9
 // (evid2_clock; 4.7e-11 on tied_evid2_advan1, 0 on tied_evid2), so 36× headroom. The `.tab`
-// prints 11 significant figures, about 1e-9 at these magnitudes. The #1909 anchors print 17
-// and stay under 1.1e-14 (Linux x86_64 at 5998edf2; 3.2e-14 on addl_dt, macOS arm64). The
-// smallest regression they catch moves a PRED by 8.3e-2: the governing record taken strictly
-// after the dose, on addl_dt.
+// prints 11 significant figures, about 1e-9 at these magnitudes.
 const PRED_TOL: f64 = 1e-7;
+
+// The #1909 anchors print 17 significant figures, so they get their own bound. Worst
+// |PRED − NONMEM| over both twins: 1.1e-14 on addl_tie and addl_{f,lag,ftime} (Linux x86_64
+// at 5998edf2, macOS arm64 alike), 3.2e-14 on addl_{lagt,dx,dt} (addl_dt, macOS arm64;
+// Linux x86_64 PENDING). 1e-12 leaves about 30× over the worst. The
+// smallest regression these anchors catch moves a PRED by 8.3e-2 (the governing record
+// taken strictly after the dose, on addl_dt), so the bound is not what catches it; it is
+// what keeps a 1e-8 drift in either engine from passing.
+const PRED_TOL_17: f64 = 1e-12;
+
+/// The bound for `anchor`'s `.tab`, by how many significant figures it prints.
+fn pred_tol(anchor: &str) -> f64 {
+    match anchor {
+        "evid2_clock" | "tied_evid2" | "tied_evid2_advan1" => PRED_TOL,
+        "addl_tie" | "addl_f" | "addl_lag" | "addl_ftime" | "addl_lagt" | "addl_dx" | "addl_dt" => {
+            PRED_TOL_17
+        }
+        other => panic!("{other}: no PRED bound; name its `.tab` precision in `pred_tol`"),
+    }
+}

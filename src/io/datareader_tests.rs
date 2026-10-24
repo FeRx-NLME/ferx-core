@@ -1228,6 +1228,24 @@ fn an_implied_dose_takes_the_governing_records_occasion() {
         .remove(0);
     // The observation at 24 ties with the implied dose there and governs it.
     assert_eq!(s.dose_occasions, vec![1, 2, 3, 1]);
+    // Every other kind of governing record hands over its own OCC, too: an EVID=2 row, an
+    // explicit dose and a reset at 15 (OCC 2), ahead of an observation at 20 (OCC 3). A
+    // lookup that fell back to the parent would leave the implied dose at 12 on OCC 1.
+    for (row15, want) in [
+        ("1,15,.,2,1,.,.,.,2", vec![1, 2]),
+        ("1,15,.,1,1,50,.,.,2", vec![1, 2, 2]),
+        ("1,15,.,3,1,.,.,.,2", vec![1, 2]),
+    ] {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,1,12,1\n{row15}\n\
+             1,20,5,0,0,.,.,.,3\n"
+        ));
+        let s = read_nonmem_csv(f.path(), None, Some("OCC"))
+            .unwrap()
+            .subjects
+            .remove(0);
+        assert_eq!(s.dose_occasions, want, "{row15}");
+    }
 }
 
 #[test]

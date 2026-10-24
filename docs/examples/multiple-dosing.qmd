@@ -77,13 +77,18 @@ After ADDL expansion, `TAD` automatically resets to 0 at each expanded dose time
 
 ## Time-varying covariates across an ADDL train
 
-An implied dose has no record of its own, so no row's covariates belong to it. ferx does what NONMEM does: it evaluates the implied dose's individual parameters at the **governing record**, the first record at or after the dose time. Records are ordered by `TIME`, then by file order, and a record of any `EVID` counts. From that record the dose takes:
+An implied dose has no record of its own, so no row's covariates belong to it. Like NONMEM, ferx evaluates the implied dose's individual parameters at the **governing record**, the first record at or after the dose time. Records are ordered by `TIME`, then by file order, and a record of any `EVID` counts. From that record the dose takes:
 
 - its covariates, `TIME` and occasion;
 - its bioavailability `F`;
 - its modelled infusion duration `D{n}` (`RATE=-2`).
 
-Its **lag** is the exception. An implied dose keeps the lag of the row that carried `ADDL`, evaluated at that row's covariates and `TIME`. A dose implied after the subject's last record has no governing record, so it keeps the parent row's values for everything.
+Its compartment **lag** (`lagtime`, NONMEM's `ALAG`) is the exception. An implied dose keeps the lag of the row that carried `ADDL`, evaluated at that row's covariates and `TIME`. A dose implied after the subject's last record has no governing record, so it keeps the parent row's values for everything.
+
+Two more attributes need care:
+
+- **A modelled infusion rate `R{n}` (`RATE=-1`) still differs from NONMEM.** NONMEM re-reads `R1` on every advance, so the rate follows the record that ends each advance. ferx fixes the rate when the dose starts ([#2332](https://github.com/FeRx-NLME/ferx-core/issues/2332)).
+- **A route's own lag, `first_order(ka=…, lag=L)`, is read at the governing record**, while the compartment `lagtime` comes from the parent row. NONMEM has no direct spelling of a per-route lag, so no anchor decides between the two.
 
 So a dose row at `TIME 0` with `ADDL=2, II=12`, followed by an observation at `TIME 14` where `WT` changes, gives the dose at 12 the `WT` and `F` of the record at 14 and the lag of the row at 0. Before #1909 every implied dose used the parent row's values, which differs from NONMEM whenever a covariate changes along the train. The NONMEM comparison is `addl_tie`, `addl_f`, `addl_lag`, `addl_ftime`, `addl_lagt`, `addl_dx` and `addl_dt` in [`nonmem_anchor/`](https://github.com/FeRx-NLME/ferx-core/tree/main/nonmem_anchor).
 

@@ -1267,6 +1267,14 @@ pub(crate) fn inherit_parent_dose_attrs_g<T: Clone>(
     dose: &mut [Vec<T>],
 ) {
     for (k, p, slot) in parent_dose_attr_copies(model, subject) {
+        // Every seed vector spans the `ode_param_slots` layout, which reserves the lag
+        // slot; a shorter one would leave the implied dose on the governing record's lag.
+        debug_assert!(
+            slot < dose[p].len() && slot < dose[k].len(),
+            "seed vector too short for parent-dose slot {slot}: dose {k} has {}, parent {p} has {}",
+            dose[k].len(),
+            dose[p].len()
+        );
         if slot < dose[p].len() && slot < dose[k].len() {
             dose[k][slot] = dose[p][slot].clone();
         }

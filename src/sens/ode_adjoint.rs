@@ -1218,9 +1218,15 @@ fn record_analytic_events<T: VmNum>(
             )
         })
         .collect();
-    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike.
+    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
+    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
+    // come from the same `parent_dose_attr_copies`.
     for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
         doses[k].0.values[slot] = doses[p].0.values[slot];
+        debug_assert!(
+            slot < doses[p].1.len() && slot < doses[k].1.len(),
+            "dual seed too short for parent-dose slot {slot}"
+        );
         if slot < doses[p].1.len() && slot < doses[k].1.len() {
             doses[k].1[slot] = doses[p].1[slot];
         }
