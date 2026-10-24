@@ -1865,12 +1865,24 @@ fn free_level_thetas(
     levels: &[Level],
 ) -> Vec<Option<usize>> {
     let p = &model.default_params;
+    level_theta_indices(model, decl, levels)
+        .into_iter()
+        .map(|k| k.filter(|&k| !p.theta_fixed.get(k).copied().unwrap_or(false)))
+        .collect()
+}
+
+/// [`free_level_thetas`] with the `FIX` levels kept: `None` only for a level
+/// with no θ in `model`.
+fn level_theta_indices(
+    model: &CompiledModel,
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+) -> Vec<Option<usize>> {
     levels
         .iter()
         .map(|level| {
             let name = format!("{}[{}]", decl.name(), level.label(decl.columns()));
-            let k = model.theta_names.iter().position(|n| *n == name)?;
-            (!p.theta_fixed.get(k).copied().unwrap_or(false)).then_some(k)
+            model.theta_names.iter().position(|n| *n == name)
         })
         .collect()
 }
@@ -3005,10 +3017,15 @@ fn carried(
         return Carried::Held;
     }
     let level_thetas = free_level_thetas(model, decl, levels);
+    let all_level_thetas = level_theta_indices(model, decl, levels);
     // The θ that enter coded: this block's, and every block's in `others`.
     let other_levels: Vec<Vec<Option<usize>>> = others
         .iter()
         .map(|o| free_level_thetas(model, o.decl, o.levels))
+        .collect();
+    let other_all_levels: Vec<Vec<Option<usize>>> = others
+        .iter()
+        .map(|o| level_theta_indices(model, o.decl, o.levels))
         .collect();
     let coded: Vec<usize> = level_thetas
         .iter()
@@ -3084,14 +3101,22 @@ fn carried(
             diff_col(&all, h, &|d, th, _, _| th[k] += d)
         };
 
-        // A block's level columns (a `FIX` level moves nothing), coded by its
-        // contrast over its groups: under `none` every level, under `ref` the
-        // first level of each group dropped. Under sum-to-zero every level,
-        // tagged with its group: the coded span, each level but its group's
-        // last taken against that last one, is what [`BlockBasis::grouped`]
-        // spans on those tags (#1962). `None` when anything is non-finite.
+        // A block's level columns, coded by its contrast over its groups: a
+        // column per free θ of the bound model, so a `FIX` level gives none
+        // (#1992). Under `none` every free level, under `ref` the free levels
+        // but the first of each group. Under sum-to-zero each free level but
+        // its group's last, tagged with its group, followed by that last
+        // level — the dependent one, which has no θ of its own in the bound
+        // model and moves through the free ones, so its column is taken from
+        // `all_thetas` whatever its `FIX` flag in `model` — when the group has
+        // a free level to take against it: the coded span, each free level
+        // minus its group's last, is what [`BlockBasis::grouped`] spans on
+        // those tags (#1962). A fixed level coded as `−last` there would add a
+        // column for a θ that does not exist. `None` when anything is
+        // non-finite.
         let coded_cols = |decl: &LevelBlockDecl,
                           thetas: &[Option<usize>],
+                          all_thetas: &[Option<usize>],
                           groups: &[usize],
                           contrast: LevelContrast|
          -> Option<Vec<(Pieces, Option<usize>)>> {
@@ -3109,25 +3134,38 @@ fn carried(
                     }
                 }
             }
-            let mut level_cols: Vec<Pieces> = Vec::with_capacity(thetas.len());
-            for (i, k) in thetas.iter().enumerate() {
-                let col = match *k {
-                    Some(k) => {
-                        let h = SPAN_STEP * theta[k].abs().max(1.0);
-                        diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)?
-                    }
-                    None => Pieces::new(),
-                };
-                level_cols.push(col);
-            }
+            let level_col = |i: usize, k: usize| {
+                let h = SPAN_STEP * theta[k].abs().max(1.0);
+                diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)
+            };
             let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
+            let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
             let mut out = Vec::new();
-            for (i, col) in level_cols.into_iter().enumerate() {
+            let mut group_free = false;
+            for (i, k) in thetas.iter().enumerate() {
                 match contrast {
-                    LevelContrast::Unconstrained => out.push((col, None)),
-                    LevelContrast::Ref if !first(i) => out.push((col, None)),
-                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
-                        out.push((col, Some(groups[i])))
+                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if last(i) => {
+                        if std::mem::take(&mut group_free) {
+                            let Some(k) = all_thetas[i] else {
+                                return None;
+                            };
+                            out.push((level_col(i, k)?, Some(groups[i])));
+                        }
+                    }
+                    LevelContrast::Ref if first(i) => {}
+                    LevelContrast::Unconstrained
+                    | LevelContrast::Ref
+                    | LevelContrast::SumToZero
+                    | LevelContrast::SumToZeroWithin => {
+                        let Some(k) = *k else { continue };
+                        let tag = match contrast {
+                            LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
+                                group_free = true;
+                                Some(groups[i])
+                            }
+                            _ => None,
+                        };
+                        out.push((level_col(i, k)?, tag));
                     }
                     _ => {}
                 }
@@ -3155,14 +3193,15 @@ fn carried(
             cols.push(c);
             tags.push(None);
         }
-        for (o, thetas) in others.iter().zip(&other_levels) {
-            let Some(c) = coded_cols(o.decl, thetas, &o.groups, o.contrast) else {
+        for ((o, thetas), all_thetas) in others.iter().zip(&other_levels).zip(&other_all_levels) {
+            let Some(c) = coded_cols(o.decl, thetas, all_thetas, &o.groups, o.contrast) else {
                 return Carried::Held;
             };
             push_coded(c, &mut cols, &mut tags);
         }
         let n_other = cols.len();
-        let Some(own_coded) = coded_cols(decl, &level_thetas, &groups, contrast) else {
+        let Some(own_coded) = coded_cols(decl, &level_thetas, &all_level_thetas, &groups, contrast)
+        else {
             return Carried::Held;
         };
         push_coded(own_coded, &mut cols, &mut tags);
