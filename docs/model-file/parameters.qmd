@@ -432,6 +432,15 @@ two random effects that only duplicate each other are not the block's to
 absorb. Read `ETA_X` anywhere else as well (`EMAX = TVEMAX * exp(ETA_X)`) and
 the joint shift moves `EMAX` too: the model binds.
 
+A kappa is measured together with the random effects at its occasion and at
+coarser units: every η, and under nested levels the kappas of its own and outer
+levels. On `[STUDY, OCC]`, `E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1)`
+with `W` varying inside each occasion moves `y`, shifting the η by `c` and every
+occasion's kappa by `-c`, exactly as a shift of every level by `c`. The block
+refuses the global contrasts, naming `KAPPA_E0` moved together with `ETA_E0`;
+`sum_to_zero_within` removes that common shift, binds, and is what `auto`
+chooses.
+
 On a nested block the measurement also decides whether
 `sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
 helps only when the random effect moves `y` like a shift common to the

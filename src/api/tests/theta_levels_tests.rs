@@ -4261,7 +4261,7 @@ mod absorption {
     use super::*;
     use crate::api::bind_theta_levels_from_fit;
     use crate::parser::model_parser::{LevelBindings, LevelContrast};
-    use nalgebra::DMatrix;
+    use nalgebra::{DMatrix, DVector};
 
     /// Rank threshold on singular values normalised by `‖Z‖_F`; the gap it
     /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
@@ -9263,6 +9263,93 @@ mod absorption {
         }
         agrees_with_joint_oracle_at("duplicate", &duplicate, &pop, moved, &mut wrong);
         assert!(wrong.is_empty(), "jointly:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r1. On `[STUDY, OCC]`, `E0 = TVE0 + PLACEBO + ETA_E0 · W +
+    /// KAPPA_E0 · (W + 1)`, `W` varying inside each occasion: neither random
+    /// effect alone moves `y` as an occasion's level does, but shifting the η
+    /// by `c`, every occasion's kappa by `−c` and every level by `c` leaves `y`
+    /// unchanged. A kappa is measured against the η, coarser than its
+    /// occasion, so the block refuses the global contrasts, naming the kappa
+    /// with the η. The levels are left a shift common to the subject's
+    /// occasions, which `sum_to_zero_within` removes: within binds, and auto
+    /// resolves to it.
+    ///
+    /// The joint oracle tests each kappa column on its own (`unit_rank`), and
+    /// only the sum of a subject's kappa columns lies in the span, so it
+    /// absorbs nothing here; the direction is asserted on the Jacobian
+    /// instead, `Σ Z_η − Σ Z_κ + Σ X_block = 0`. The twin reads `W · W` on the
+    /// η: that direction keeps a residual of order 1, the oracle absorbs
+    /// nothing either, and the twin binds global — the pair straddles it.
+    ///
+    /// Mutations — partners of the same unit only (the review's head: the
+    /// pair binds global, and auto with it); `carried` without the coarser
+    /// random effects restricted to the kappa's unit (global still carries the
+    /// direction by the η's whole column: the pair binds global).
+    #[test]
+    fn a_kappa_is_measured_jointly_with_a_coarser_eta() {
+        let pop = arms_pop();
+        let row = |tag, eta: &str| -> Row {
+            (
+                tag,
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * {eta} + KAPPA_E0 * (W + 1)"),
+                format!("E0 + {EMAXY}"),
+                true,
+            )
+        };
+        let pair = row("η·W, κ·(W + 1)", "W");
+        let twin = row("η·W², κ·(W + 1)", "W * W");
+        // `Σ Z_η − Σ Z_κ + Σ X_block`, relative to `‖Σ Z_κ‖`.
+        let direction = |r: &Row| {
+            let j = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
+            let sum = |name: &str| -> DVector<f64> {
+                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
+                z.column_sum()
+            };
+            let kappa = sum("KAPPA_E0");
+            let v = sum("ETA_E0") - &kappa + j.xb.column_sum();
+            assert!(v.iter().all(|x| x.is_finite()), "{}: non-finite", r.0);
+            v.norm() / kappa.norm()
+        };
+        let (dp, dt) = (direction(&pair), direction(&twin));
+        eprintln!("direction residual: pair {dp:.3e}, twin {dt:.3e}");
+        let mut wrong = Vec::new();
+        if dp >= 1e-8 || dt <= 1e-2 {
+            wrong.push(format!("direction: pair {dp:.1e}, twin {dt:.1e}"));
+        }
+        let clause = format!(
+            "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at every \
+             record of each occasion, exactly as some combination of this block's levels does \
+             {MEASURED_AT}"
+        );
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&row_text(&pair)(c), &pop) {
+                Err(e) if e.contains(&clause) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}")),
+            }
+        }
+        match try_bind(&row_text(&pair)("sum_to_zero_within"), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("pair within: {got:?}")),
+        }
+        match try_bind(&row_text(&pair)(""), &pop) {
+            Ok((LevelContrast::SumToZeroWithin, _)) => {}
+            got => wrong.push(format!("pair auto: {got:?}, want within")),
+        }
+        match try_bind(&row_text(&twin)(""), &pop) {
+            Ok((LevelContrast::SumToZero, _)) => {}
+            got => wrong.push(format!("twin auto: {got:?}, want global")),
+        }
+        for r in [&pair, &twin] {
+            let jac = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
+            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            if !absorbed.is_empty() {
+                wrong.push(format!("{}: the oracle absorbs {absorbed:?}", r.0));
+            }
+        }
+        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
+        assert!(wrong.is_empty(), "coarser:\n{}", wrong.join("\n"));
     }
 
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
