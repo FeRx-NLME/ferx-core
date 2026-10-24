@@ -4147,6 +4147,44 @@ mod tests {
         check_gn_grad_matches_fd_at(model, population, 0, &eta_hat, &h_matrix, interaction);
     }
 
+    /// Central FD of the objective, `subject_nll_at` at fixed η̂ and η-Jacobian, at the
+    /// packed point `x` of the model's default parameters, step `1e-5·(1 + |x_j|)`.
+    fn objective_fd_gradient(
+        model: &CompiledModel,
+        population: &Population,
+        subject: usize,
+        x: &[f64],
+        eta_hat: &DVector<f64>,
+        h_matrix: &DMatrix<f64>,
+        options: &FitOptions,
+    ) -> Vec<f64> {
+        let template = &model.default_params;
+        let eps = 1e-5;
+        (0..x.len())
+            .map(|j| {
+                let at = |sign: f64| {
+                    let mut xs = x.to_vec();
+                    xs[j] += sign * eps * (1.0 + x[j].abs());
+                    let nll = subject_nll_at(
+                        model,
+                        population,
+                        subject,
+                        &unpack_params(&xs, template),
+                        eta_hat,
+                        h_matrix,
+                        &[],
+                        options,
+                    );
+                    (xs[j], nll)
+                };
+                let ((xp, nll_p), (xm, nll_m)) = (at(1.0), at(-1.0));
+                let fd = (nll_p - nll_m) / (xp - xm);
+                assert!(fd.is_finite(), "FD reference must be finite at grad[{j}]");
+                fd
+            })
+            .collect()
+    }
+
     /// [`check_gn_grad_matches_fd_on`] at an explicit subject, η̂ and η-Jacobian — for
     /// fixtures whose shape is not the one-η / three-observation default (an `n_eta = 0`
     /// TTE model has an empty η̂ and no Gaussian rows at all).
@@ -4203,35 +4241,9 @@ mod tests {
             "GN NLL disagrees with the shared magnitude-aware marginal: {nll} vs {nll_ref}"
         );
 
-        let eps = 1e-5;
-        for j in 0..x.len() {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let two_h = xp[j] - xm[j];
-            let nll_p = subject_nll_at(
-                model,
-                population,
-                subject,
-                &unpack_params(&xp, template),
-                eta_hat,
-                h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                model,
-                population,
-                subject,
-                &unpack_params(&xm, template),
-                eta_hat,
-                h_matrix,
-                &[],
-                &options,
-            );
-            let fd = (nll_p - nll_m) / two_h;
-            assert!(fd.is_finite(), "FD reference must be finite at grad[{j}]");
+        let fd_ref =
+            objective_fd_gradient(model, population, subject, &x, eta_hat, h_matrix, &options);
+        for (j, &fd) in fd_ref.iter().enumerate() {
             for (leg, g) in [("uncached", &grad), ("cached", &grad_c)] {
                 let rel = (g[j] - fd).abs() / fd.abs().max(1e-6);
                 assert!(
@@ -4458,8 +4470,9 @@ mod tests {
     /// #2023's routing, as a straddle: the FREM fixture shuts the fixed-EBE gate, and the
     /// same model with `frem_config` cleared opens it, so the FREM clause is what decides.
     /// The gate also governs the FOCEI `log|H̃|` EBE-response term and, through it, the
-    /// covariance step's `s` / `rsr` subject score, which must come back as exactly
-    /// the FD-fallback gradient with no closed-form term added.
+    /// covariance step's `s` / `rsr` subject score, which must match the central FD of
+    /// the objective on every coordinate. Measured worst rel 2.3e-6, bounded at 1e-4; with
+    /// the gate open the closed form scores `TV_WT` −1120 against FD −70.
     #[test]
     fn frem_routes_every_fixed_ebe_consumer_to_the_fd_fallback() {
         let (model, population) = frem_gn_fixture();
@@ -4506,18 +4519,6 @@ mod tests {
             "a FREM model must decline the closed-form EBE-response term"
         );
 
-        let (_, grad) = subject_nll_pop_grad(
-            &x,
-            &template,
-            &model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
-            &[],
-            &bounds,
-            &options,
-        );
         let score = crate::estimation::covariance::fixed_ebe_subject_score(
             &x,
             &template,
@@ -4530,10 +4531,19 @@ mod tests {
             &bounds,
             &options,
         );
-        assert_eq!(
-            score, grad,
-            "the covariance score of a FREM subject is the FD-fallback gradient"
-        );
+        let fd = objective_fd_gradient(&model, &population, 0, &x, &eta_hat, &h_matrix, &options);
+        let mut worst = 0.0f64;
+        for (j, (&s, &f)) in score.iter().zip(&fd).enumerate() {
+            assert!(s.is_finite(), "score[{j}] = {s}");
+            let rel = (s - f).abs() / f.abs().max(1e-6);
+            assert!(
+                rel < 1e-4,
+                "the covariance score of a FREM subject is the objective's gradient: \
+                 score[{j}] = {s:.6e}, FD {f:.6e}, rel {rel:.2e}"
+            );
+            worst = worst.max(rel);
+        }
+        eprintln!("worst score-vs-FD rel = {worst:.3e}");
     }
 
     /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
