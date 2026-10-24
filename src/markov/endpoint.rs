@@ -323,8 +323,10 @@ fn ctmm_endpoint_nll_inhomogeneous(
     };
 
     // PK/PD disposition snapshot at (θ, η) — the ODE solve integrates under it, and
-    // `init()` reads it (baseline covariate snapshot; a time-varying covariate on the
-    // generator is rejected at fit setup). Every dose-record quantity — absorption kernel,
+    // `init()` reads it (baseline covariate snapshot). A time-varying covariate on the
+    // generator is rejected at fit setup, and so is one on a parameter this solve feeds
+    // into the generator's states (CL, V, …; #1854) — both in
+    // `api::check_survival_tv_covariates`. Every dose-record quantity — absorption kernel,
     // pathway fraction, route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`,
     // the SS run-in — is read at its own dose record instead (#1575), always, as the
     // ODE hazard reads it (`survival::ode_cumhaz_hazard`).

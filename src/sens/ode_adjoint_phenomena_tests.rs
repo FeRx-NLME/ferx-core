@@ -821,6 +821,134 @@ fn tvcov_lag_arrival_across_a_covariate_change_matches_reconverged_fd() {
     assert!(grad < 4e-8, "TV-cov × lag gradient: {grad:.2e}");
 }
 
+/// [`IV_LAG_CROSS_ODE`] with a second state fed by a built-in `first_order` forcing whose
+/// `KA` reads the time-varying weight — the kernel `R_in(tad)` is an explicit function of
+/// time *and* of the PK snapshot.
+const LAG_STRADDLE_INPUT_RATE_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  theta TVKA(0.8, 0.01, 10.0)
+  theta TVK21(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  KA = TVKA * (WT/70)^THETA_WT
+  K21 = TVK21
+  ALAG1 = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central, periph])
+[odes]
+  d/dt(central) = -(CL/V) * central + K21 * periph
+  d/dt(periph)  = first_order(ka=KA) - K21 * periph
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1075 (the geometry it was filed on, re-anchored from the retired forward provider's
+/// `ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production`): a lagged
+/// bolus into `central` arrives across a covariate change while a `first_order` forcing from
+/// an earlier, unlagged dose into `periph` is active on both sides, its `KA` reading `WT`.
+/// The forward provider's saltation carried only `J·f` of `ẍ = ∂f/∂t + J·f` and missed
+/// `∂²f/∂η_LAG²` here by 6.4e-2, because each side evaluated the kernel at a different
+/// snapshot. Two changes since make it exact: the kernel reads its own dose record's
+/// snapshot (#1575), so `R_in(tad)` is one function on both sides of the arrival; and the
+/// adjoint crosses every moving boundary by flowing over the shift (#2093), carrying `∂f/∂t`.
+///
+/// The oral dose row carries `WT = 90`, not the baseline 70, so `(WT/70)^THETA_WT ≠ 1` and
+/// the covariate actually reaches the kernel (asserted against a `KA = TVKA` twin). Checked
+/// at first order (`∂f/∂η`, FOCEI gradient) and at second order: the exact inner η-Hessian
+/// (which carries `∂²f/∂η²`) against a Richardson difference of the production objective,
+/// and the R-matrix against reconverged FD of the gradient.
+#[test]
+fn lagged_arrival_across_a_covariate_change_under_a_snapshot_reading_input_rate_is_exact() {
+    let m = tight(parse_model_string(LAG_STRADDLE_INPUT_RATE_ODE).unwrap());
+    assert!(
+        !m.ode_spec.as_ref().unwrap().input_rate.is_empty(),
+        "fixture must carry a built-in input-rate forcing"
+    );
+    // No t = 0 row: it predicts 0, where the proportional variance floor puts a kink in the
+    // objective (see `tvcov_lag_arrival_across_a_covariate_change_matches_reconverged_fd`).
+    let times = [0.5, 1.5, 2.0, 4.0, 8.0];
+    let wts = [70.0, 70.0, 140.0, 150.0, 160.0];
+    // The oral dose feeds `periph`'s `first_order` kernel unlagged (`ALAG1` lags compartment
+    // 1 only); the lagged bolus lands in `central`.
+    let doses = vec![
+        DoseEvent::new(0.0, 400.0, 2, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut s = subject_shell(doses, &times);
+    s.covariates.insert("WT".into(), 70.0);
+    s.dose_covariates = vec![wt(90.0), wt(70.0)];
+    s.obs_covariates = wts.iter().map(|&w| wt(w)).collect();
+    let eta0 = [0.1, -0.05, 0.07];
+    let theta = &m.default_params.theta;
+    let preds = crate::pk::compute_predictions_with_tv(&m, &s, theta, &eta0);
+    assert!(preds.iter().all(|&v| v > 0.0), "every row positive");
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    assert!(s.has_tv_covariates() && m.has_lagtime());
+    let differs = |other: &[f64], what: &str| {
+        assert!(
+            preds
+                .iter()
+                .zip(other)
+                .any(|(a, b)| (a - b).abs() > 1e-3 * b.abs().max(1e-6)),
+            "{what} changes no prediction: the fixture is vacuous"
+        );
+    };
+    // Non-vacuity: the straddling forcing carries mass, and `KA` reads the covariate.
+    let mut bolus_only = s.clone();
+    bolus_only.doses = vec![s.doses[1].clone()];
+    bolus_only.dose_covariates = vec![wt(70.0)];
+    differs(
+        &crate::pk::compute_predictions_with_tv(&m, &bolus_only, theta, &eta0),
+        "the `first_order` forcing",
+    );
+    let ka_free = parse_model_string(
+        &LAG_STRADDLE_INPUT_RATE_ODE.replace("KA = TVKA * (WT/70)^THETA_WT", "KA = TVKA"),
+    )
+    .unwrap();
+    differs(
+        &crate::pk::compute_predictions_with_tv(&ka_free, &s, theta, &eta0),
+        "`WT` on `KA`",
+    );
+    // The straddle: at the moved θ and its EBE the bolus arrives strictly inside the
+    // [1.5, 2.0] segment, whose snapshot (WT = 140) is not the dose row's (WT = 70).
+    let p = moved_params(&m);
+    let e = ebe_for(&m, &s, &p, 1e-12, true);
+    let arrival = 1.0 + p.theta[3] * e[2].exp();
+    assert!(
+        arrival > 1.5 + 1e-2 && arrival < 2.0 - 1e-2,
+        "arrival {arrival} must sit inside the [1.5, 2.0] segment"
+    );
+    let label = "#1075 straddling input rate";
+    let (jac, grad) = measure(&m, &s, &[0, 2, 3, 4, 5], label);
+    let inner = inner_hessian_gap(&m, &s, &probe_eta(m.n_eta));
+    let (r, _) = hessian_gaps(&m, &s, true);
+    eprintln!("{label}: inner η-Hessian vs FD {inner:.2e}; R-matrix vs FD {r:.2e}");
+    // Measured on macOS arm64: ∂f/∂η 4.9e-11, gradient 6.7e-9, inner η-Hessian 7.5e-10,
+    // R-matrix 5.1e-10; ~10× headroom.
+    assert!(jac < 6e-10, "{label}: ∂f/∂η {jac:.2e}");
+    assert!(grad < 7e-8, "{label}: FOCEI gradient {grad:.2e}");
+    assert!(inner < 8e-9, "{label}: inner η-Hessian {inner:.2e}");
+    assert!(r.is_finite() && r < 6e-9, "{label}: R-matrix {r:.2e}");
+}
+
 // ---- TIME in [individual_parameters] -------------------------------------------------
 
 const ODE_TIME_PARAM: &str = r#"

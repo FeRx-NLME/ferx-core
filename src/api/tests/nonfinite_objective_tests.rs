@@ -117,6 +117,8 @@ pub(super) fn subject_with_dose_time(id: &str, dose_time: f64, scale: f64) -> Su
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

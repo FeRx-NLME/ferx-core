@@ -593,25 +593,90 @@ stopped early on the test fixture. `bobyqa` and `slsqp` can be chosen explicitly
 `nlopt_lbfgs`, `lbfgs` and `bfgs` all run the same NLopt L-BFGS (from the model file
 they always do, profiled or not). `trust_region` and `mma` are refused. With no
 `outer_ftol` set, a profiled L-BFGS or SLSQP fit stops on a relative objective change
-of `1e-8`, not the unprofiled `1e-6`. At an OFV near 100, `1e-6` let L-BFGS stop while
-still descending and report `converged: true` up to 1.6e-3 above the optimum (#2285).
+of `1e-8`, not the unprofiled `1e-6`, and its `xtol_rel` is `outer_xtol` capped at
+`1e-6`. Both are tests on one iteration, which L-BFGS can meet while still
+descending: from a nearby start of the profiled MBMA anchor, a fit reported
+`converged: true` 2.2e-5 above NONMEM's optimum, and fits that had reached it were
+reported not converged on NLopt `Failure`. So a stop is then verified: a fresh run
+from the best point must lower the OFV by no more than `1e-6`, or another follows (up
+to four). The fit is `converged` when one does, whatever NLopt's status, and not
+converged if four runs still improve it (#2285).
+
+##### What the profiled outer loop shares with the unprofiled one
+
+The profiled outer loop is a separate driver, but it does the same housekeeping as
+the unprofiled one (#2136):
+
+- **Flat θ.** A structural θ the objective never reads (an unmapped parameter) is
+  frozen at its initial value, with the same `has no effect on the objective`
+  warning as an unprofiled fit, and reported as `FIX`. The check uses the profile
+  objective, with the levels solved.
+- **Checkpoints.** `checkpoint` writes the best point so far with the levels at
+  their solved values, so a resumed fit starts its first profile solve from them.
+- **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
+  `val:` columns show the levels at their solved values. Their `grad:` columns are
+  `NA`, because the optimizer does not search over the levels.
+- **Per-subject gradient fallback.** If a subject cannot get the analytic outer
+  gradient at some trial point, its finite-difference replacement re-solves its
+  EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
+  The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
+  enough to stop the profiled L-BFGS early.
+
+##### Agreement with the unprofiled fit
 
 Nothing about the model changes. The objective is the one the unprofiled block
-minimises, so the OFV, the structural estimates and their standard errors are the
-unprofiled fit's, and a likelihood-ratio test against an unprofiled model is valid.
+minimises, so a likelihood-ratio test against an unprofiled model is valid, and the
+OFV and the structural estimates agree with the unprofiled fit's to the optimizer's
+tolerance. The standard errors agree to within the accuracy of a finite-difference
+Hessian, not exactly. They are two FD Hessians of one objective: the profiled step
+differences the profile objective over the structural parameters, the unprofiled one
+the full objective over every parameter. At one shared point
+(`tests/profiled_levels.rs`, C1) they differ by up to 4.7e-3 relative on a structural
+SE, 2.3e-4 on a level SE and 3.0e-3 on the Ω and κ SEs, on Linux aarch64 and macOS
+arm64 alike. Two separate fits also stop at slightly different optima, which adds to
+it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to 0.4% and the
+OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
+
 The levels are still estimated parameters: they stay in `theta`, count in
 `n_parameters` and BIC, and get standard errors. `FitResult.profiled_blocks` and the
 YAML's `theta_blocks.<name>.profiled: true` name the block.
 
-**Standard errors.** `covariance_method = r` differences the profile objective over
-the structural parameters, re-solving the levels at every point. This gives the
-structural block of the full `R⁻¹`. The level blocks come from the objective's
-Hessian in the levels and its mixed θ-level Hessian. `s` and `rsr` are refused for
-now (#2108).
+##### When to profile
+
+`profile` pays off when a block has many levels, since they leave the outer search.
+On a small model it can be slower than the unprofiled fit, because every outer
+evaluation re-solves the levels and every EBE with them. On ferx-r's `mbma_placebo`
+example (6 studies) the profiled fit takes 1.7 s and the unprofiled one 0.1 s, both
+reaching OFV 97.0700 (Linux aarch64, one thread, core `a481f002`).
+
+A global `contrast = sum_to_zero` costs about the same as `sum_to_zero_within`. Its
+dependent level is minus the sum of every other level, so in θ a subject that reads it
+reads the whole block. ferx instead solves the dependent level as a coordinate of its
+own, tied to the others by one constraint, so each subject is still differenced over
+its own levels only (#2135). On the 100-study × 8-visit placebo fixture
+(`tests/data/profile_mbma/s1_profile.ferx` without its `ETA_E0`, with
+`contrast = sum_to_zero`, on its data before #2326), one profile
+evaluation took 85 s before this change and takes 1.5 s now. The whole fit, covariance
+step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish in
+5,400 s on Linux CI.
+
+##### Standard errors
+
+`covariance_method = r` differences the profile objective over the structural
+parameters, re-solving the levels at every point. This gives the structural block of
+the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
+its mixed θ-level Hessian. `s` and `rsr` are refused for now (#2108).
+If the Hessian of the profile objective is not positive definite, the step reports
+no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
+the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
+proposal is extended over the levels by the same block formulas, so the SIR draws
+include them (#2136).
 `run_covariance` on a profiled fit, in memory or reloaded from a `.fitrx` bundle,
 repeats this step bit for bit (#2173).
 
-**When it applies.** The solve is a least-squares step, so the block must enter
+##### When it applies
+
+The solve is a least-squares step, so the block must enter
 every prediction as `c × block` plus terms that do not read it, with `c` taken from
 the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
 some other way:
@@ -630,7 +695,9 @@ as they do unprofiled), and so is a prediction nonlinear in them. Some affine fo
 are refused all the same: a data-only `if` choosing the coefficient, and a block read
 through two parameters that are then added. Write those as one product instead.
 
-**Validation.** On a synthetic 12-study set where the drug effect is nonlinear in η
+##### Validation
+
+On a synthetic 12-study set where the drug effect is nonlinear in η
 and a between-arm κ shares the block's rows, NONMEM fits every level as a `THETA`.
 ferx is given only NONMEM's structural optimum, and solves the levels itself. Its OFV
 is NONMEM's to 5e-8, its levels are NONMEM's to 1e-5 standard errors, its structural

@@ -353,6 +353,70 @@ fn the_summary_kappa_shrinkage_names_the_level_it_pooled_over() {
     );
 }
 
+/// The console's pooled kappa shrinkage block (#2083) names each κ's level under nested
+/// levels and only then, agreeing with the summary's label. The whole block is pinned on
+/// both sides of the gate, so a level dropped from a nested fit, a level printed for a
+/// one-level fit, and any other change to a one-level fit's console output each redden
+/// it. A NaN pooled entry and a per-occasion slot keep those arms in the fixture; the
+/// slot lines keep the bare names, as the summary's do.
+#[test]
+fn the_console_kappa_shrinkage_names_the_level_it_pooled_over() {
+    use crate::io::output::{format_kappa_shrinkage_lines, format_summary};
+    use crate::types::CovarianceStatus;
+    let result = |nested| {
+        let mut r = kappa_result(nested, false, false, CovarianceStatus::Computed);
+        r.shrinkage_kappa_by_occ = vec![vec![0.3, f64::NAN]];
+        r
+    };
+    let (flat, nested) = (
+        format_kappa_shrinkage_lines(&result(false)),
+        format_kappa_shrinkage_lines(&result(true)),
+    );
+    assert_eq!(
+        flat,
+        [
+            "\n--- Kappa Shrinkage (pooled) ---",
+            "  K_ST shrinkage: 10.0%",
+            "  K_ARM shrinkage: 20.0%",
+            "  Per-occasion:",
+            "    Occasion slot 1: K_ST 30.0%, K_ARM NaN",
+        ]
+    );
+    assert_eq!(
+        nested,
+        [
+            "\n--- Kappa Shrinkage (pooled) ---",
+            "  K_ST at STUDY shrinkage: 10.0%",
+            "  K_ARM at ARM shrinkage: 20.0%",
+            "  Per-occasion:",
+            "    Occasion slot 1: K_ST 30.0%, K_ARM NaN",
+        ]
+    );
+    // The console and the summary agree on the label, on both sides of the gate.
+    for (nested, lines) in [(false, &flat), (true, &nested)] {
+        let summary = format_summary(&result(nested));
+        for (k, line) in lines[1..3].iter().enumerate() {
+            let label = line.trim().split(" shrinkage:").next().unwrap();
+            let pct = (k + 1) * 10;
+            assert!(
+                summary.contains(&format!("{label} {pct}.0%")),
+                "nested={nested}: {label:?} not in\n{summary}"
+            );
+        }
+    }
+    // A NaN pooled entry prints as such, with its level.
+    let mut r = result(true);
+    r.shrinkage_kappa[1] = f64::NAN;
+    assert_eq!(
+        format_kappa_shrinkage_lines(&r)[2],
+        "  K_ARM at ARM shrinkage: NaN"
+    );
+    // No kappa shrinkage, no block.
+    let mut r = result(true);
+    r.shrinkage_kappa.clear();
+    assert!(format_kappa_shrinkage_lines(&r).is_empty());
+}
+
 /// The fit YAML's `omega_iov:` entry of a nested κ says its level; a one-level fit's has
 /// no `level:` line, so its YAML is unchanged.
 #[test]

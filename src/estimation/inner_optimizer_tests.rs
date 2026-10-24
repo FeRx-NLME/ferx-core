@@ -299,6 +299,8 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let result = find_ebe(
@@ -441,6 +443,8 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -525,6 +529,8 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -671,6 +677,8 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -2086,6 +2094,8 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: vec![0, 0, 100], // last obs is FREM
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     (model, subject)
@@ -2299,6 +2309,8 @@ fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         !subject.has_resets() && !subject.has_tv_covariates(),
@@ -2430,6 +2442,8 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let base = crate::parser::model_parser::parse_model_string(model_src)
@@ -2520,6 +2534,8 @@ fn cached_schedule_inner_loop_matches_uncached() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let reset_subject = Subject {
         obs_rgroup: Vec::new(),
@@ -2549,6 +2565,8 @@ fn cached_schedule_inner_loop_matches_uncached() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(!no_reset_subject.has_resets());
     assert!(reset_subject.has_resets());
@@ -2682,6 +2700,8 @@ fn flip_flop_transit_subject() -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -3297,6 +3317,8 @@ mod frozen_ebe_variance {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let p = model.default_params.clone();
         let preds = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.1]);
@@ -4305,6 +4327,8 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
     assert!(!subject.has_tv_covariates());
@@ -4804,6 +4828,8 @@ fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     (model, subject)
 }
@@ -5789,6 +5815,103 @@ mod weighted_dense_residual_inner {
         // Measured worst 6.1e-10 (θ-magnitude × correlation, macOS arm64); 1e-7 is
         // ~160× headroom. With `mult` dropped from the kernel's `R` it fails.
         eprintln!("worst relative gap {worst:.3e}");
+        assert!(worst < 1e-7, "worst relative gap {worst:.3e}");
+    }
+
+    /// T3 (#2220): T2 under non-interaction FOCE. With `frozen = Some(f(η = 0))` the
+    /// dense kernel takes its frozen branch (#1722) — `R⁰` built once at the population
+    /// predictions, `∂R/∂η = 0` — and is checked against central FD of the frozen
+    /// objective (`individual_nll_into_prepared_with_schedule_frozen`, which applies the
+    /// same `mult`) at a nonzero η, on the three weighted dense cells. A straddle per
+    /// cell asserts the frozen gradient is not the conditional one, so the FD half
+    /// cannot pass on a kernel that ignores `frozen`. Kills: dropping `mult` from the
+    /// frozen-branch `R⁰` build only — the conditional branch, and so T2, stays green.
+    #[test]
+    fn weighted_dense_residual_frozen_inner_gradient_matches_fd() {
+        use crate::stats::likelihood::{
+            individual_nll_into_prepared_with_schedule_frozen, population_variance_preds,
+        };
+        let eta = [0.17, -0.11];
+        let (mut worst, mut min_sep) = (0.0_f64, f64::INFINITY);
+        for &(cell, error, fd) in &CELLS[..3] {
+            assert!(!fd);
+            let model = model_for(cell, error, false);
+            let s = subject_for(&model);
+            let p = &model.default_params;
+            let mult = model.ruv_obs_mult(&s, &p.theta);
+            assert!(mult.is_some(), "{cell}: magnitude multiplier live");
+            let keys = model.error_spec.obs_keys(&s);
+            let f0 = population_variance_preds(&model, &s, &p.theta, model.n_eta)
+                .unwrap_or_else(|| panic!("{cell}: combined error has an f-dependent R"));
+            let grad = |frozen: Option<&[f64]>| {
+                analytic_eta_nll_gradient_with_schedule(
+                    &model,
+                    &s,
+                    &p.theta,
+                    &eta,
+                    &p.omega,
+                    &p.sigma.values,
+                    model.residual_cov_at(p),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    frozen,
+                )
+                .unwrap_or_else(|| panic!("{cell}: the dense kernel serves the subject"))
+            };
+            let nll = |e: &[f64]| {
+                individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    &s,
+                    &p.theta,
+                    e,
+                    &p.omega,
+                    &p.sigma.values,
+                    model.residual_cov_at(p),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(e.len()),
+                    &mut DVector::zeros(e.len()),
+                    Some(&f0),
+                )
+            };
+            let (g, gc) = (grad(Some(&f0)), grad(None));
+            for k in 0..eta.len() {
+                let h = 1e-5;
+                let (mut a, mut b) = (eta.to_vec(), eta.to_vec());
+                a[k] += h;
+                b[k] -= h;
+                let want = (nll(&a) - nll(&b)) / (2.0 * h);
+                // Finite first: `f64::max` would discard a NaN and keep the rows that worked.
+                assert!(
+                    g[k].is_finite() && gc[k].is_finite() && want.is_finite(),
+                    "{cell}[{k}]"
+                );
+                let rel = (g[k] - want).abs() / (1.0 + want.abs());
+                eprintln!(
+                    "{cell}[{k}]: frozen {} conditional {} FD {want} rel {rel:.3e}",
+                    g[k], gc[k]
+                );
+                worst = worst.max(rel);
+            }
+            let sep = g
+                .iter()
+                .zip(&gc)
+                .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+            assert!(sep > 1e-2, "{cell}: frozen vs conditional gradient {sep:e}");
+            min_sep = min_sep.min(sep);
+        }
+        // Measured worst 8.6e-10 (weight × block_sigma, macOS arm64); 1e-7 is ~115×
+        // headroom. With `mult` dropped from the frozen `R⁰` only, the worst gap is 1.2.
+        // Smallest frozen/conditional separation measured 2.7, so the 1e-2 straddle
+        // bound above sits ~270× below it.
+        eprintln!("worst relative gap {worst:.3e}, smallest frozen/conditional gap {min_sep:.3e}");
         assert!(worst < 1e-7, "worst relative gap {worst:.3e}");
     }
 }

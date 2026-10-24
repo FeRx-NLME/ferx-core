@@ -2596,10 +2596,12 @@ fn fit_inner(
     // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
     // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
     // interaction in most practice, surface the non-interaction choice so a user does not
-    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599). Gated on
+    // `final_method`, not `options.method` (the chain's last stage): under `[foce, imp]` +
+    // `imp_eval_only` the estimates are FOCE-M3 though the last stage is IMP (#1726).
     if matches!(model.bloq_in_force(), BloqMethod::M3)
         && matches!(
-            options.method,
+            final_method,
             EstimationMethod::Foce | EstimationMethod::FoceGn
         )
         && !options.interaction
