@@ -475,9 +475,10 @@ fn fill_iov_record_params(
             theta,
             &combined_for(occ),
             subject.dose_cov(d),
-            subject.param_time_at(subject.doses[d].time),
+            subject.dose_param_time(d),
         )
     }));
+    inherit_parent_dose_attrs(model, subject, dose);
     obs.reserve_exact(subject.obs_times.len());
     obs.extend((0..subject.obs_times.len()).map(|j| {
         let occ = subject.occasions.get(j).copied().unwrap_or(0);
@@ -1207,10 +1208,75 @@ fn fill_dose_pk_params(
                         theta,
                         eta,
                         subject.dose_cov(k),
-                        subject.param_time_at(subject.doses[k].time),
+                        subject.dose_param_time(k),
                     )
                 });
             }
+            inherit_parent_dose_attrs(model, subject, out);
+        }
+    }
+}
+
+/// The dose attributes an `ADDL`-implied dose takes from its parent row's `$PK` rather
+/// than from the governing record's (#1909, [`crate::types::ImpliedDose`]). Measured
+/// against NONMEM 7.5.1: the lag is fixed when the parent row schedules the train, while
+/// `F` and the disposition follow the governing record (`nonmem_anchor/addl_*`).
+const PARENT_DOSE_ATTRS: [crate::types::DoseAttr; 1] = [crate::types::DoseAttr::Lag];
+
+/// `(k, parent, slot)` for every `ADDL`-implied dose `k` and every slot of
+/// [`PARENT_DOSE_ATTRS`] its compartment reads: the copies that turn per-dose snapshots
+/// built at each dose's own inputs into NONMEM's. The slot is the one the engine resolves
+/// for that dose (`ALAG{cmt}`, else the bare lag), so no other dose's attribute moves.
+pub(crate) fn parent_dose_attr_copies<'a>(
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+    (0..subject.doses.len()).flat_map(move |k| {
+        let parent = subject.implied_dose_parent(k);
+        let cmt = subject.doses[k].cmt_1based();
+        PARENT_DOSE_ATTRS.iter().filter_map(move |&attr| {
+            let p = parent?;
+            let map = model.active_dose_attr_map();
+            let slot = match attr {
+                crate::types::DoseAttr::Lag => Some(map.lag_slot(cmt)),
+                other => map.indexed_slot(other, cmt),
+            }?;
+            Some((k, p, slot))
+        })
+    })
+}
+
+/// Give each `ADDL`-implied dose its parent's [`PARENT_DOSE_ATTRS`] (#1909): the one
+/// post-pass every per-dose builder runs after evaluating each dose at its own inputs,
+/// so the engines read the parent's lag at the implied dose without a second `$PK` call.
+pub(crate) fn inherit_parent_dose_attrs(
+    model: &CompiledModel,
+    subject: &Subject,
+    dose: &mut [PkParams],
+) {
+    for (k, p, slot) in parent_dose_attr_copies(model, subject) {
+        dose[k].values[slot] = dose[p].values[slot];
+    }
+}
+
+/// [`inherit_parent_dose_attrs`] over per-dose seed vectors of any scalar, for the
+/// `sens/` walks whose dose snapshots are `Vec<T>` of duals.
+pub(crate) fn inherit_parent_dose_attrs_g<T: Clone>(
+    model: &CompiledModel,
+    subject: &Subject,
+    dose: &mut [Vec<T>],
+) {
+    for (k, p, slot) in parent_dose_attr_copies(model, subject) {
+        // Every seed vector spans the `ode_param_slots` layout, which reserves the lag
+        // slot; a shorter one would leave the implied dose on the governing record's lag.
+        debug_assert!(
+            slot < dose[p].len() && slot < dose[k].len(),
+            "seed vector too short for parent-dose slot {slot}: dose {k} has {}, parent {p} has {}",
+            dose[k].len(),
+            dose[p].len()
+        );
+        if slot < dose[p].len() && slot < dose[k].len() {
+            dose[k][slot] = dose[p][slot].clone();
         }
     }
 }
@@ -1476,9 +1542,10 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.dose_cov(k),
-            subject.param_time_at(t),
+            subject.dose_param_time(k),
         ));
     }
+    inherit_parent_dose_attrs(model, subject, &mut out.dose);
     for j in 0..subject.obs_times.len() {
         let t = subject.obs_times[j];
         out.obs.push(pk_params_at_time(
@@ -3431,6 +3498,10 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
 #[cfg(test)]
 #[path = "iov_scratch_tests.rs"]
 mod iov_scratch_tests;
+
+#[cfg(test)]
+#[path = "parent_dose_attr_tests.rs"]
+mod parent_dose_attr_tests;
 
 #[cfg(test)]
 mod tests {

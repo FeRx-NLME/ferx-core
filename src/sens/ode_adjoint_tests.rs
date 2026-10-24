@@ -919,6 +919,138 @@ fn ode_time_varying_covariate_on_the_event_walk_matches_reconverged_fd() {
     assert!(worst < 4e-6, "worst relative difference {worst:.2e}");
 }
 
+/// An estimated lag and a clearance that both read `X`, on the ODE and closed-form walks;
+/// under `iov` the lag also carries a κ.
+fn addl_lag_src(ode: bool, iov: bool) -> String {
+    let structural = if ode {
+        "  ode(states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+         d/dt(central) = KA * depot - (CL/V) * central\n[scaling]\n  y = central / V\n"
+    } else {
+        "  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)\n"
+    };
+    let (kappa, kappa_term, fit) = if iov {
+        (
+            "  kappa KAPPA_LAG ~ 0.04\n",
+            " + KAPPA_LAG",
+            "[fit_options]\n  iov_column = OCC\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  theta TVLAG(0.4, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  \
+         omega ETA_LAG ~ 0.1\n{kappa}  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * sqrt(X) * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n  \
+         LAGTIME = TVLAG * X * exp(ETA_LAG{kappa_term})\n[structural_model]\n{structural}\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit}"
+    )
+}
+
+/// #1909: the dose at 12 is implied by the row at 0 (X = 1) and governed by the
+/// observation at 13 (X = 2), so its clearance is the governing record's and its lag the
+/// parent's — 0.4·e^η, not 0.8·e^η. The walk copies the lag's dual from the parent with its
+/// value, so a gradient of the governing-record lag, or of a value the predictor never
+/// used, both show as a gap to FD of the production objective. `tv = false` holds X at 1,
+/// so that only an occasion separates the two records (the IOV walk's static branch);
+/// under IOV the dose rows sit on occasions 1 and 2, the implied one on its governing
+/// record's.
+fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
+    let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
+    implied.implied = Some(crate::types::ImpliedDose {
+        parent: 0,
+        param_time: 13.0,
+    });
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), implied];
+    let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let mut s = subject_shell(doses, &times);
+    s.covariates.insert("X".into(), 1.0);
+    if tv {
+        s.dose_covariates = vec![x(1.0), x(2.0)];
+        s.obs_covariates = times
+            .iter()
+            .map(|&t| x(if t < 13.0 { 1.0 } else { 2.0 }))
+            .collect();
+    }
+    if model.n_kappa > 0 {
+        s.occasions = times
+            .iter()
+            .map(|&t| if t < 12.0 { 1 } else { 2 })
+            .collect();
+        s.dose_occasions = vec![1, 2];
+    }
+    let preds = crate::pk::compute_predictions_with_tv(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    assert_eq!(s.implied_dose_parent(1), Some(0));
+    assert_eq!(s.has_tv_covariates(), tv);
+    // Served by the adjoint, at the stacked `[η, κ…]` under IOV.
+    let p = model.default_params.clone();
+    let stacked = ebe_for(model, &s, &p, 1e-11, true);
+    assert!(
+        subject_adjoint_packed_gradient(model, &s, &p, &pack_params(&p), stacked.as_slice(), true)
+            .is_some(),
+        "the adjoint must serve the fixture"
+    );
+    s
+}
+
+#[test]
+fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
+    // (ODE, IOV, time-varying X, bound): one row per seeder that copies the lag — the
+    // closed-form walk, `seed_tvcov_snapshots`, and both branches of `seed_iov_events`.
+    // Measured vs reconverged FD (Richardson, EBE re-solved per point) at 5998edf2 on
+    // Linux x86_64: 9.0e-8, 3.3e-9, 4.3e-8 and 5.2e-8. macOS arm64 agrees on the three ODE
+    // rows and gives 6.5e-7 on the closed-form walk. Each bound is 5×
+    // the larger of the two, so 37× the Linux value on the first row. Without the copy the
+    // closed-form walk's gap is 3.0.
+    let cases = [
+        (false, false, true, 3.3e-6),
+        (true, false, true, 1.7e-8),
+        (true, true, true, 2.2e-7),
+        (true, true, false, 2.6e-7),
+    ];
+    for (ode, iov, tv, bound) in cases {
+        let label = format!("ode {ode}, iov {iov}, tv {tv}");
+        let src = addl_lag_src(ode, iov);
+        let model = if ode {
+            with_tol(parse_model_string(&src).unwrap(), 1e-8, 1e-10)
+        } else {
+            parse_model_string(&src).unwrap()
+        };
+        let s = addl_implied_lag_subject(&model, tv);
+        if !iov {
+            // The copy is live: the parent's lag is half the governing record's.
+            let lag = model.active_dose_attr_map().lag_slot(1);
+            let mut dose = Vec::new();
+            let theta = &model.default_params.theta;
+            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
+            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            let params = moved_params(&model);
+            let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
+            assert!(
+                gf < 1e-10 && gl < 1e-10,
+                "{label}: kernel vs production {gf:.2e}, {gl:.2e}"
+            );
+        }
+        let worst = parity(&model, &s);
+        eprintln!("addl implied lag ({label}) vs reconverged FD {worst:.2e}");
+        assert!(
+            worst < bound,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
 #[test]
 fn ode_steady_state_dose_matches_reconverged_fd() {
     let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());

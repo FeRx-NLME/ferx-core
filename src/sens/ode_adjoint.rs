@@ -730,7 +730,7 @@ fn record_ode<T: VmNum>(
     }
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) =
-        seed_tvcov_snapshots::<T>(subject, uses_time, |cov, time| {
+        seed_tvcov_snapshots::<T>(model, subject, uses_time, |cov, time| {
             // One taped parameter set per distinct covariate snapshot (the seeder caches by key).
             let _time_guard =
                 crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
@@ -976,6 +976,7 @@ fn record_ode_iov<T: VmNum>(
         Some(static_groups()?)
     };
     let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) = seed_iov_events::<T>(
+        model,
         subject,
         layout.occ_to_group(),
         k,
@@ -1208,15 +1209,28 @@ fn record_analytic_events<T: VmNum>(
             .or_insert_with(|| at(occ, cov, time))
             .clone()
     };
-    let doses: Vec<_> = (0..subject.doses.len())
+    let mut doses: Vec<_> = (0..subject.doses.len())
         .map(|k| {
             at_record(
                 crate::pk::dose_row_occasion(subject, k),
                 subject.dose_cov(k),
-                subject.param_time_at(subject.doses[k].time),
+                subject.dose_param_time(k),
             )
         })
         .collect();
+    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
+    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
+    // come from the same `parent_dose_attr_copies`.
+    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
+        doses[k].0.values[slot] = doses[p].0.values[slot];
+        debug_assert!(
+            slot < doses[p].1.len() && slot < doses[k].1.len(),
+            "dual seed too short for parent-dose slot {slot}"
+        );
+        if slot < doses[p].1.len() && slot < doses[k].1.len() {
+            doses[k].1[slot] = doses[p].1[slot];
+        }
+    }
     let obs: Vec<_> = (0..subject.obs_times.len())
         .map(|j| {
             at_record(

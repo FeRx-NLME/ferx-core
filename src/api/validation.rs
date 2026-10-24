@@ -1162,10 +1162,7 @@ pub(crate) fn check_theta_gather_indices(
             // restarts TIME runs at a shifted engine time the file does not hold.
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
-                .chain(
-                    (0..subj.doses.len())
-                        .map(|d| (subj.param_time_at(subj.doses[d].time), subj.dose_cov(d))),
-                );
+                .chain((0..subj.doses.len()).map(|d| (subj.dose_param_time(d), subj.dose_cov(d))));
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
                     diags.push(
@@ -1253,7 +1250,7 @@ pub(crate) fn check_kappa_weights(
             // rebuilt at every dose event), and a dose-only occasion has no
             // observation to have caught it above.
             for d in 0..subj.doses.len() {
-                let time = subj.param_time_at(subj.doses[d].time);
+                let time = subj.dose_param_time(d);
                 let w = (weight.eval)(theta, subj.dose_cov(d), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
@@ -2075,11 +2072,7 @@ pub(crate) fn check_level_labels(
             }
             let (what, cov, time) = match kind {
                 RecordKind::Observation => ("observation", subj.obs_cov(i), subj.param_time_obs(i)),
-                RecordKind::Dose => (
-                    "dose",
-                    subj.dose_cov(i),
-                    subj.param_time_at(subj.doses[i].time),
-                ),
+                RecordKind::Dose => ("dose", subj.dose_cov(i), subj.dose_param_time(i)),
                 RecordKind::PkOnly => (
                     "non-observation (EVID=2 or MDV=1)",
                     subj.pk_only_cov(i),
@@ -3507,7 +3500,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
         .enumerate()
         .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
-            time: subject.param_time_at(subject.doses[k].time),
+            time: subject.dose_param_time(k),
             index: k,
         })
         .collect()
