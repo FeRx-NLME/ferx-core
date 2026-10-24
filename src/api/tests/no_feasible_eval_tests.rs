@@ -139,6 +139,8 @@ fn subject(id: &str, observations: Vec<f64>) -> Subject {
         reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

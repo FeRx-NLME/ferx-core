@@ -188,7 +188,7 @@ fn mixture_override_len(template: &ModelParameters) -> usize {
 /// The exact-zero branch handles rank-deficient inputs (e.g. a parameter block
 /// that is entirely FIX) where `SymmetricEigen` returns eigenvalue `0.0` exactly.
 /// Any non-zero value — even 1e-300 — uses fixed or scientific notation instead.
-fn fmt_eig(v: f64) -> String {
+pub(crate) fn fmt_eig(v: f64) -> String {
     let abs = v.abs();
     if abs == 0.0 {
         "0".to_string()

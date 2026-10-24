@@ -698,6 +698,48 @@ fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
     }
 }
 
+/// The console's `--- Kappa Shrinkage (pooled) ---` block, one string per line
+/// (#2083), empty when the fit has no kappa shrinkage. The pooled lines name each κ's
+/// level under nested levels, as [`format_summary`] does, since the pool is that
+/// level's groups; the per-occasion lines keep the bare names, as there.
+pub(crate) fn format_kappa_shrinkage_lines(result: &FitResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    if result.shrinkage_kappa.is_empty() {
+        return lines;
+    }
+    let pct = |sh: f64| {
+        if sh.is_finite() {
+            format!("{:.1}%", sh * 100.0)
+        } else {
+            "NaN".to_string()
+        }
+    };
+    lines.push("\n--- Kappa Shrinkage (pooled) ---".to_string());
+    for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+        lines.push(format!(
+            "  {} shrinkage: {}",
+            kappa_name_at_level(result, k),
+            pct(sh)
+        ));
+    }
+    if !result.shrinkage_kappa_by_occ.is_empty() {
+        lines.push("  Per-occasion:".to_string());
+        for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+            let parts: Vec<String> = occ_sh
+                .iter()
+                .enumerate()
+                .map(|(k, &sh)| format!("{} {}", kappa_name(result, k), pct(sh)))
+                .collect();
+            lines.push(format!(
+                "    Occasion slot {}: {}",
+                occ_idx + 1,
+                parts.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
 /// [`kappa_name`] over the bare name list.
 fn kappa_name_in(names: &[String], k: usize) -> &str {
     names.get(k).map(|s| s.as_str()).unwrap_or("KAPPA")
@@ -1418,34 +1460,8 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
-    if !result.shrinkage_kappa.is_empty() {
-        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
-        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
-            let name = kappa_name(result, k);
-            if sh.is_finite() {
-                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
-            } else {
-                eprintln!("  {} shrinkage: NaN", name);
-            }
-        }
-        if !result.shrinkage_kappa_by_occ.is_empty() {
-            eprintln!("  Per-occasion:");
-            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
-                let parts: Vec<String> = occ_sh
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &sh)| {
-                        let name = kappa_name(result, k);
-                        if sh.is_finite() {
-                            format!("{} {:.1}%", name, sh * 100.0)
-                        } else {
-                            format!("{} NaN", name)
-                        }
-                    })
-                    .collect();
-                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
-            }
-        }
+    for line in format_kappa_shrinkage_lines(result) {
+        eprintln!("{line}");
     }
 
     // Run info
@@ -4919,6 +4935,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

@@ -258,6 +258,8 @@ fn adaptive_base_subject() -> crate::types::Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

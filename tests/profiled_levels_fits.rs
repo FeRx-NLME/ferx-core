@@ -302,3 +302,85 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
 /// The profiled and unprofiled S1 fits reach one optimum: 3.0e-6 apart on Linux aarch64
 /// (module doc of the test). 1e-4 is 30× that.
 const S1_OFV: f64 = 1e-4;
+
+/// S1's old shape (#2326: no `ETA_E0`, so nothing is absorbed) under an explicit global
+/// `sum_to_zero` (#2135): one group of 799 θ tied by the dependent level, which study
+/// 100's subjects read. Before the bordered solve each of them was differenced over the
+/// whole block — one evaluation at the inits took 201 s and the fit did not finish in
+/// 5 400 s (Linux x86_64 CI, #2326), 85 s for that one evaluation on macOS arm64.
+/// Differenced over its own 8 levels it is 1.5 s, and the whole fit with its covariance
+/// step 108 s (macOS arm64, 8 threads; both on the data before #2326 added a study
+/// baseline). With `ETA_E0` global `sum_to_zero` is refused, since that η is each study's
+/// mean (`profiled_levels.rs` P2). The OFV must not be above the same model's
+/// `sum_to_zero_within` fit, run here: within nests in global, which leaves each study's
+/// mean free.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
+    let data = "tests/data/profile_mbma/s100t8.csv";
+    let model = "tests/data/profile_mbma/s1_profile.ferx";
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    let no_e0 = text
+        .replace("  omega ETA_E0 ~ 0.1\n", "")
+        .replace("E0 = TVE0 + ETA_E0", "E0 = TVE0");
+    let block = "PLACEBO[STUDY, TIME]";
+    assert!(
+        no_e0.contains(block) && !no_e0.contains("omega ETA_E0") && !no_e0.contains("+ ETA_E0"),
+        "fixture moved"
+    );
+    let with_contrast = |contrast: &str| {
+        let path = unique_temp("ferx_profiled_s1_global");
+        std::fs::write(
+            &path,
+            no_e0.replace(
+                block,
+                &format!("PLACEBO[STUDY, TIME, contrast = {contrast}]"),
+            ),
+        )
+        .unwrap();
+        ferx_core::prepare_run(
+            path.to_str().unwrap(),
+            Some(root().join(data).to_str().unwrap()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let p = with_contrast("sum_to_zero");
+    let (prof, t_prof) = fit(&p, &p.init_params, true);
+    eprintln!(
+        "S1 global sum_to_zero: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {})",
+        prof.ofv, prof.n_iterations, prof.n_parameters
+    );
+    assert!(prof.converged, "{:?}", prof.warnings);
+    assert_eq!(prof.covariance_method, Some(CovarianceMethod::Hessian));
+    assert_eq!(prof.n_parameters, 804, "3 θ, 799 levels, ω, σ");
+    let se = prof.se_theta.as_ref().expect("profiled SE");
+    assert!(se.iter().all(|s| s.is_finite() && *s > 0.0));
+    let cov = prof.covariance_matrix.as_ref().unwrap();
+    let levels = &ferx_core::theta_level_values(&p.parsed.model, &prof.theta, Some(cov), None)
+        .unwrap()["PLACEBO"];
+    assert_eq!(levels.len(), 800);
+    assert!(levels
+        .iter()
+        .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
+    let w = with_contrast("sum_to_zero_within");
+    let (within, t_within) = fit(&w, &w.init_params, false);
+    eprintln!(
+        "S1 sum_to_zero_within: profiled OFV {:.6} ({t_within:.1}s, n_parameters {})",
+        within.ofv, within.n_parameters
+    );
+    assert!(
+        within.converged && within.ofv.is_finite(),
+        "{:?}",
+        within.warnings
+    );
+    assert_eq!(within.n_parameters, 705, "3 θ, 700 levels, ω, σ");
+    assert!(
+        prof.ofv <= within.ofv + 1e-3,
+        "global {} vs within {}",
+        prof.ofv,
+        within.ofv
+    );
+}

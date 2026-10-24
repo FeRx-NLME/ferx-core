@@ -41,6 +41,8 @@ fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),

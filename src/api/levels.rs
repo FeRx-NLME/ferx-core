@@ -874,7 +874,9 @@ fn match_level_table(
 }
 
 /// The hash key of a level's values: their bits, with `-0.0` folded onto `0.0` so two
-/// keys are equal exactly when the values are `==` (every value is finite here).
+/// keys are equal exactly when the values are `==`, for values holding no `NaN`. The
+/// one spelling of level equality the binder ([`write_index_column`]) and the level-table
+/// check ([`match_level_table`]) share (#1799).
 fn level_key(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| (v + 0.0).to_bits()).collect()
 }
@@ -4158,12 +4160,18 @@ fn write_index_column(
     subjects: &mut [Subject],
 ) -> Result<Vec<Unindexed>, String> {
     let column = level_index_column(decl.name());
-    let index_of = |values: &[f64]| -> Option<f64> {
-        table
-            .iter()
-            .find(|(l, _)| l.values == values)
-            .map(|&(_, i)| i as f64)
-    };
+    // Keyed on `level_key`, the one spelling of level equality the level-table check
+    // uses too (#1799), rather than a linear `==` scan per record. A level holding a
+    // `NaN` is left out, since `==` matched it to nothing (`NaN != NaN`), and the
+    // first entry of a repeated level wins, as `find` gave.
+    let mut by_key: HashMap<Vec<u64>, usize> = HashMap::with_capacity(table.len());
+    for (level, i) in table {
+        if !level.values.iter().any(|v| v.is_nan()) {
+            by_key.entry(level_key(&level.values)).or_insert(*i);
+        }
+    }
+    let index_of =
+        |values: &[f64]| -> Option<f64> { by_key.get(&level_key(values)).map(|&i| i as f64) };
 
     let mut unindexed = Vec::new();
     for subject in subjects.iter_mut() {

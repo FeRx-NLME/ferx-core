@@ -70,6 +70,8 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let population = Population {
@@ -1037,6 +1039,8 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let population = Population {
@@ -1529,6 +1533,8 @@ fn dcm_fixture() -> (CompiledModel, Population, ModelParameters) {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     };
     let population = Population {
