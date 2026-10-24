@@ -349,6 +349,8 @@ Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inne
 
 To amortize that cost, `reconverge_gradient_interval = N` reconverges only every `N`-th gradient evaluation and uses the cheap fixed-EBE gradient in between — the periodic correction is often enough to keep the optimizer off the plateau at a fraction of the always-on cost. The default `0` disables reconverging entirely (cheap fixed-EBE gradient).
 
+Every perturbed point of a reconverged gradient starts its inner solve at the EBEs of the base point, $\hat\eta$ and (under IOV) each occasion's $\hat\kappa$, and re-solves at an inner tolerance of at most `1e-7`, tighter than the default `inner_tol = 1e-5` ([#2261](https://github.com/FeRx-NLME/ferx-core/issues/2261)). The reason is that a probe starting at the base mode starts within a loose tolerance of its own mode. Its solve can then stop almost where it began, and the difference loses part of the EBE response it exists to capture. Measured against an `inner_tol = 1e-12` reference, the worst relative gradient error on the `nested_levels_3` anchor falls from $9.2 \times 10^{-4}$ to $1.2 \times 10^{-5}$. The same tolerance covers the per-subject salvage gradients, the reported final gradient of a derivative-free fit and the AGQ finite-difference score. The covariance step keeps `cov_inner_tol`: tightening it there moved no standard error measurably.
+
 **Validation** — cefepime pediatric population PK, 2-compartment IV infusion, combined error, no IOV (5937 subjects / 17380 observations). All ferx rows use FOCEI and the same likelihood convention, so OFVs are directly comparable:
 
 | Configuration | OFV | Wall time |
