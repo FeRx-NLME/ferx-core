@@ -62,8 +62,8 @@ pub use model_selection::{
     stalled_at_init, BicType, Strictness, StrictnessVerdict,
 };
 pub use parser::model_parser::{
-    known_block_names, parse_full_model_file, parse_model_file, parse_model_string,
-    ODE_INIT_REJECTED_BUILTINS, ODE_INIT_SCOPE_BUILTINS,
+    apply_method_option, known_block_names, parse_full_model_file, parse_method_token,
+    parse_model_file, parse_model_string, ODE_INIT_REJECTED_BUILTINS, ODE_INIT_SCOPE_BUILTINS,
 };
 pub use propensity_match::MatchMethod;
 // Adaptive (feedback) dosing vocabulary (#391). Re-exported at the crate root so

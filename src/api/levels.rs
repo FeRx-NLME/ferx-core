@@ -31,7 +31,10 @@ use crate::parser::model_parser::{
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
     ScaleShare,
 };
-use crate::types::{CompiledModel, IovOccasionRule, ParsedModel, Population, Subject};
+use crate::stats::nested_levels::{label_path, NestedLayout};
+use crate::types::{
+    CompiledModel, IovOccasionRule, NestedLevels, ParsedModel, Population, Subject,
+};
 
 /// The record time, addressable as a level column even though it is not a
 /// covariate.
@@ -131,22 +134,31 @@ fn bind_levels_on_data(
 
     // A kappa's unit is a subject-occasion, so the binder needs the occasions
     // `fit()` will use: a derived `iov_occasion` rule is applied on a copy, by
-    // the same call `fit()` makes.
+    // the same call `fit()` makes. Under nested levels (#1082) those are the
+    // level cells, written by the call `fit()` makes when it prepares the
+    // population, which a derived rule never overwrites.
     let derived;
-    let with_occasions: &Population =
-        if parsed.model.n_kappa > 0 && parsed.fit_options.iov_occasion != IovOccasionRule::Column {
-            let mut p = bound.clone();
-            apply_iov_occasion_rule(
-                &mut p,
-                &parsed.fit_options.iov_occasion,
-                parsed.fit_options.iov_column.is_some(),
-                &mut Vec::new(),
-            );
-            derived = p;
-            &derived
-        } else {
-            &bound
-        };
+    let with_occasions: &Population = if parsed.model.n_kappa > 0
+        && parsed.model.has_nested_levels()
+    {
+        let mut p = bound.clone();
+        crate::stats::nested_levels::assign_level_cells(&parsed.model, &mut p);
+        derived = p;
+        &derived
+    } else if parsed.model.n_kappa > 0 && parsed.fit_options.iov_occasion != IovOccasionRule::Column
+    {
+        let mut p = bound.clone();
+        apply_iov_occasion_rule(
+            &mut p,
+            &parsed.fit_options.iov_occasion,
+            parsed.fit_options.iov_column.is_some(),
+            &mut Vec::new(),
+        );
+        derived = p;
+        &derived
+    } else {
+        &bound
+    };
 
     // Rule 1 (#1679): measure which levels the likelihood never reads, and
     // (#1834) which random effects the block absorbs where the walk names no
@@ -167,7 +179,7 @@ fn bind_levels_on_data(
     let absorbing: Vec<bool> = decls
         .iter()
         .zip(&measured)
-        .map(|(decl, m)| !absorbed(decl, with_occasions, &m.spanned).is_empty())
+        .map(|(decl, m)| !absorbed(decl, with_occasions, m).is_empty())
         .collect();
     let mut resolved: Vec<Option<Result<(LevelContrast, Vec<usize>), String>>> =
         vec![None; decls.len()];
@@ -862,7 +874,9 @@ fn match_level_table(
 }
 
 /// The hash key of a level's values: their bits, with `-0.0` folded onto `0.0` so two
-/// keys are equal exactly when the values are `==` (every value is finite here).
+/// keys are equal exactly when the values are `==`, for values holding no `NaN`. The
+/// one spelling of level equality the binder ([`write_index_column`]) and the level-table
+/// check ([`match_level_table`]) share (#1799).
 fn level_key(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| (v + 0.0).to_bits()).collect()
 }
@@ -1225,26 +1239,43 @@ fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
 }
 
 /// The unit a random effect varies over: a subject for an η, an occasion of
-/// one subject for a kappa.
+/// one subject for a kappa, or under nested levels (#1082) a group of the
+/// kappa's own level within one subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unit {
     Subject,
     Occasion,
+    /// A group of nested level `L` (outermost 0): the records whose label path
+    /// starts with the group's, as `stats::nested_levels` keys a group, so `ARM 1`
+    /// of two studies is two units.
+    Level(usize),
 }
 
-/// The unit observation row `j` of `subject` lies in, within that subject:
-/// the subject itself for [`Unit::Subject`], the row's occasion for
-/// [`Unit::Occasion`] — `None` when the subject carries no occasions, so a
-/// kappa counts nowhere (`fit()` reports the missing occasions later).
-fn unit_of(subject: &Subject, unit: Unit, j: usize) -> Option<u32> {
+/// The key of the unit observation row `j` of `subject` lies in, within that
+/// subject: empty for [`Unit::Subject`], the row's occasion for
+/// [`Unit::Occasion`], the row's label path down to the level for
+/// [`Unit::Level`]. `None` when the row has none — no occasions, or a missing
+/// label — so a kappa counts nowhere there (`fit()` reports the missing
+/// occasions or labels later).
+fn unit_of(
+    subject: &Subject,
+    unit: Unit,
+    j: usize,
+    nested: Option<&NestedLevels>,
+) -> Option<Vec<u64>> {
     match unit {
-        Unit::Subject => Some(0),
-        Unit::Occasion => subject.occasions.get(j).copied(),
+        Unit::Subject => Some(Vec::new()),
+        Unit::Occasion => subject.occasions.get(j).map(|&o| vec![u64::from(o)]),
+        Unit::Level(l) => {
+            let path = label_path(nested?, subject.obs_cov(j))?;
+            path.get(..=l).map(<[u64]>::to_vec)
+        }
     }
 }
 
 /// Whether every level's observation records lie in a single unit (#1678,
-/// #1696): one subject for an η, one occasion of one subject for a kappa.
+/// #1696): one subject for an η, one occasion of one subject for a kappa, one
+/// group of the kappa's level of one subject under nested levels.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
 /// coarser than or equal to the block's": only then can a unit's random effect
@@ -1252,8 +1283,13 @@ fn unit_of(subject: &Subject, unit: Unit, j: usize) -> Option<u32> {
 /// unit's (#1649). It does not ask the leading columns to identify subjects:
 /// two subjects of one study on disjoint times nest a `[STUDY, TIME]` block in
 /// subjects while sharing its `STUDY` key.
-fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Unit) -> bool {
-    let mut owner: HashMap<Vec<u64>, (usize, u32)> = HashMap::new();
+fn levels_nest_in_units(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    unit: Unit,
+    nested: Option<&NestedLevels>,
+) -> bool {
+    let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
     for (s, subject) in population.subjects.iter().enumerate() {
         for j in 0..subject.obs_times.len() {
             let level: Option<Vec<u64>> = decl
@@ -1261,10 +1297,11 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
                 .iter()
                 .map(|c| column_value(subject, c, j).map(f64::to_bits))
                 .collect();
-            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j)) else {
+            let (Some(level), Some(u)) = (level, unit_of(subject, unit, j, nested)) else {
                 return false;
             };
-            if *owner.entry(level).or_insert((s, u)) != (s, u) {
+            let u = (s, u);
+            if *owner.entry(level).or_insert_with(|| u.clone()) != u {
                 return false;
             }
         }
@@ -1275,12 +1312,18 @@ fn levels_nest_in_units(decl: &LevelBlockDecl, population: &Population, unit: Un
 /// Whether a block of two or more columns resolves every subject's
 /// observations: no level holds two different observation times of one
 /// subject (#1650). Replicates at one time still resolve, since a random
-/// effect's effect is the same at both.
+/// effect's effect is the same at both — but only replicates ([`replicates`]):
+/// two records at one instant that the data tells apart — one moved a ULP
+/// below a co-timed dose, two arms of a study keyed as occasions, a `TRT`
+/// that differs, or two compartments — can be moved differently by a random
+/// effect that the one level they share moves alike, so the block does not
+/// resolve them (#2131). The span certificate then
+/// measures, row by row, whether the levels reproduce the random effect.
 ///
 /// Such a block is a free curve per subject at the observed times, so it
 /// reproduces any per-subject effect at all, whatever route a random effect
 /// takes to `y`.
-fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool {
+fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged: bool) -> bool {
     if decl.columns().len() < 2 {
         return false;
     }
@@ -1293,8 +1336,8 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
                 .filter_map(|c| column_value(subject, c, j))
                 .collect();
             match seen.iter().find(|(l, _)| *l == level) {
-                // One instant, so a random effect moves both alike (#1959).
-                Some(&(_, j0)) => subject.same_instant(j0, j),
+                // Replicates, so a random effect moves both alike (#2131).
+                Some(&(_, j0)) => replicates(subject, j0, j, lagged),
                 None => {
                     seen.push((level, j));
                     true
@@ -1304,18 +1347,60 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population) -> bool
     })
 }
 
+/// Whether observation records `j` and `k` of `subject` are replicates: one
+/// instant ([`Subject::same_instant`]) with no dose or reset between them, and
+/// the same occasion, compartment and record covariates, so the data gives a
+/// random effect no way to move one and not the other.
+///
+/// One instant is not enough on its own: the reader moves a record one ULP
+/// below a co-timed row to keep file order (#614, #1810), and when that row is
+/// a dose the two records straddle it, so a random effect on the dose or on
+/// the state it changes moves the later one only. A move below a row that
+/// changes no state — an `MDV = 1` row — leaves them replicates (#1959).
+///
+/// A dose can also change the state at its arrival, `dose.time + lag`, which
+/// on a `lagged` model ([`lagged_arrivals`]) the θ and η place and the data
+/// does not: a moved record can sit just below a lagged arrival with no dose
+/// row between the two. So on such a model two records the engine clock
+/// separates at all are not replicates, and the span certificate measures
+/// them; two at one exact engine time still are, since every arrival at that
+/// time acts on both or on neither.
+fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
+    fn same<T: PartialEq>(v: &[T], j: usize, k: usize) -> bool {
+        v.get(j) == v.get(k)
+    }
+    let (Some(&a), Some(&b)) = (subject.obs_times.get(j), subject.obs_times.get(k)) else {
+        return false;
+    };
+    let (lo, hi) = (a.min(b), a.max(b));
+    let between = |t: f64| lo < t && t <= hi;
+    subject.same_instant(j, k)
+        && (a == b || !lagged)
+        && !subject.doses.iter().any(|d| between(d.time))
+        && !subject.reset_times.iter().copied().any(between)
+        && same(&subject.occasions, j, k)
+        && same(&subject.obs_cmts, j, k)
+        && same(&subject.obs_covariates, j, k)
+}
+
 /// Whether every covariate in `covariates` is constant within every unit's
 /// observation records — the data-side condition of a funnel
 /// (`EtaCoupling::funnels`): within each subject for an η, within each
-/// occasion of a subject for a kappa.
-fn constant_within_units(covariates: &[String], population: &Population, unit: Unit) -> bool {
+/// occasion of a subject for a kappa, and within each group of its level for a
+/// kappa of a nested model.
+fn constant_within_units(
+    covariates: &[String],
+    population: &Population,
+    unit: Unit,
+    nested: Option<&NestedLevels>,
+) -> bool {
     population.subjects.iter().all(|subject| {
         covariates.iter().all(|c| {
             // Missing compares like any other value: a column absent from every
             // record is constant, one present on only some records changes.
-            let mut first: Vec<(u32, Option<f64>)> = Vec::new();
+            let mut first: Vec<(Vec<u64>, Option<f64>)> = Vec::new();
             (0..subject.obs_times.len()).all(|j| {
-                let Some(u) = unit_of(subject, unit, j) else {
+                let Some(u) = unit_of(subject, unit, j, nested) else {
                     return false;
                 };
                 let v = column_value(subject, c, j);
@@ -1339,6 +1424,10 @@ struct Absorbed<'a> {
     /// (`LevelBlockDecl::eta_readers`).
     readers: &'a [String],
     how: How<'a>,
+    /// What one of the random effect's units is called ([`unit_noun`]).
+    unit: String,
+    /// The unit itself, for [`within_parts_them`].
+    unit_kind: Unit,
 }
 
 enum How<'a> {
@@ -1390,7 +1479,7 @@ impl Absorbed<'_> {
                  combination of this block's levels does{} (measured at the initial estimates and \
                  at a point near them)",
                 self.name(),
-                if self.kappa() { "occasion" } else { "subject" },
+                self.unit,
                 match span {
                     Span::Levels => "",
                     Span::Within => ", one that sums to zero within each group",
@@ -1400,18 +1489,59 @@ impl Absorbed<'_> {
     }
 }
 
+/// What one unit is called in a refusal: `subject`, `occasion`, or under
+/// nested levels the level's group (`` `STUDY` group ``).
+fn unit_noun(unit: Unit, nested: Option<&NestedLevels>) -> String {
+    match unit {
+        Unit::Subject => "subject".to_string(),
+        Unit::Occasion => "occasion".to_string(),
+        Unit::Level(l) => match nested.and_then(|n| n.levels.get(l)) {
+            Some(level) => format!("`{}` group", level.name),
+            None => "group".to_string(),
+        },
+    }
+}
+
+/// The unit of random effect `k` of `decl` (an index into `eta_couplings`, η
+/// first): a subject for an η; for a kappa, an occasion, or under nested levels
+/// (#1082) a group of the level the kappa is declared `at`
+/// (`NestedLevels::kappa_level`).
+fn unit_of_random_effect(decl: &LevelBlockDecl, k: usize, nested: Option<&NestedLevels>) -> Unit {
+    if !decl.eta_couplings[k].kappa {
+        return Unit::Subject;
+    }
+    let Some(nested) = nested else {
+        return Unit::Occasion;
+    };
+    let n_eta = decl.eta_couplings.iter().filter(|c| !c.kappa).count();
+    match nested.kappa_level.get(k - n_eta) {
+        Some(&l) => Unit::Level(l),
+        None => Unit::Occasion,
+    }
+}
+
 /// Per random effect of `decl`, parallel to `eta_couplings`: the unit its
 /// levels nest in ([`levels_nest_in_units`]) — a subject for an η, an occasion
-/// for a kappa — or `None` when they do not, and the block cannot absorb it.
-fn nesting_units(decl: &LevelBlockDecl, population: &Population) -> Vec<Option<Unit>> {
-    let has = |kappa: bool| decl.eta_couplings.iter().any(|c| c.kappa == kappa);
-    let by_subject = has(false) && levels_nest_in_units(decl, population, Unit::Subject);
-    let by_occasion = has(true) && levels_nest_in_units(decl, population, Unit::Occasion);
-    decl.eta_couplings
-        .iter()
-        .map(|c| match c.kappa {
-            true => by_occasion.then_some(Unit::Occasion),
-            false => by_subject.then_some(Unit::Subject),
+/// for a kappa, a group of its level for a kappa of a nested model — or `None`
+/// when they do not, and the block cannot absorb it.
+fn nesting_units(
+    decl: &LevelBlockDecl,
+    population: &Population,
+    nested: Option<&NestedLevels>,
+) -> Vec<Option<Unit>> {
+    let mut verdicts: Vec<(Unit, bool)> = Vec::new();
+    (0..decl.eta_couplings.len())
+        .map(|k| {
+            let unit = unit_of_random_effect(decl, k, nested);
+            let nests = match verdicts.iter().find(|(u, _)| *u == unit) {
+                Some(&(_, v)) => v,
+                None => {
+                    let v = levels_nest_in_units(decl, population, unit, nested);
+                    verdicts.push((unit, v));
+                    v
+                }
+            };
+            nests.then_some(unit)
         })
         .collect()
 }
@@ -1425,12 +1555,13 @@ fn structural_site<'a>(
     c: &'a EtaCoupling,
     population: &Population,
     unit: Unit,
+    nested: Option<&NestedLevels>,
     resolving: bool,
 ) -> Option<How<'a>> {
     let funnel = c
         .funnels
         .iter()
-        .find(|f| constant_within_units(&f.covariates, population, unit));
+        .find(|f| constant_within_units(&f.covariates, population, unit, nested));
     if let Some(f) = funnel {
         return Some(How::Site(&f.site));
     }
@@ -1445,8 +1576,8 @@ fn structural_site<'a>(
 enum Placement<'a> {
     /// The block's levels do not nest in its units: the block cannot absorb it.
     Unnested,
-    /// Nested, and the walk names the site ([`structural_site`]).
-    Site(How<'a>),
+    /// Nested, and the walk names the site ([`structural_site`]) on this unit.
+    Site(How<'a>, Unit),
     /// Nested, and the walk names no site: the span certificate measures it
     /// ([`spanned`]) on this unit.
     Silent(Unit),
@@ -1457,16 +1588,21 @@ enum Placement<'a> {
 /// random effects [`measure_levels`] measures, and where [`absorbed`] takes a
 /// site from the walk and where from the measurement — so the two cannot
 /// disagree on which random effects are silent (#1874 review, F12).
-fn placements<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Placement<'a>> {
-    let units = nesting_units(decl, population);
-    let resolving = resolves_observations(decl, population);
+fn placements<'a>(
+    decl: &'a LevelBlockDecl,
+    population: &Population,
+    lagged: bool,
+    nested: Option<&NestedLevels>,
+) -> Vec<Placement<'a>> {
+    let units = nesting_units(decl, population, nested);
+    let resolving = resolves_observations(decl, population, lagged);
     decl.eta_couplings
         .iter()
         .zip(units)
         .map(|(c, unit)| match unit {
             None => Placement::Unnested,
-            Some(unit) => match structural_site(c, population, unit, resolving) {
-                Some(how) => Placement::Site(how),
+            Some(unit) => match structural_site(c, population, unit, nested, resolving) {
+                Some(how) => Placement::Site(how, unit),
                 None => Placement::Silent(unit),
             },
         })
@@ -1482,22 +1618,28 @@ fn placements<'a>(decl: &'a LevelBlockDecl, population: &Population) -> Vec<Plac
 fn absorbed<'a>(
     decl: &'a LevelBlockDecl,
     population: &Population,
-    spanned: &[Option<Span>],
+    measured: &Measured,
 ) -> Vec<Absorbed<'a>> {
-    placements(decl, population)
+    let spanned = &measured.spanned;
+    let nested = measured.nested.as_ref();
+    placements(decl, population, measured.lagged, nested)
         .into_iter()
         .enumerate()
         .filter_map(|(k, placement)| {
-            let how = match placement {
+            let (how, unit) = match placement {
                 Placement::Unnested => return None,
-                Placement::Site(how) => how,
-                Placement::Silent(_) => How::Measured(spanned.get(k).copied().flatten()?),
+                Placement::Site(how, unit) => (how, unit),
+                Placement::Silent(unit) => {
+                    (How::Measured(spanned.get(k).copied().flatten()?), unit)
+                }
             };
             let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
             Some(Absorbed {
                 coupling: &decl.eta_couplings[k],
                 readers,
                 how,
+                unit: unit_noun(unit, nested),
+                unit_kind: unit,
             })
         })
         .collect()
@@ -1926,6 +2068,7 @@ fn spanned(
     population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Span>> {
+    let tree = model.nested_levels();
     let mut out = vec![None; decl.eta_couplings.len()];
     if silent.is_empty() {
         return out;
@@ -1953,7 +2096,8 @@ fn spanned(
                 break;
             }
             let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
-            let (eta, kappa) = probe_res(re, model, layout.n_groups().max(1));
+            let cells = NestedLayout::of(model, subject);
+            let (eta, kappa) = subject_probe_res(re, model, cells.as_ref(), layout.n_groups());
             let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| {
                 predictions_at(model, subject, th, et, ka)
             };
@@ -1986,9 +2130,9 @@ fn spanned(
                     continue;
                 }
                 // The records of each unit of this subject.
-                let mut units: Vec<(u32, Vec<usize>)> = Vec::new();
+                let mut units: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
                 for j in 0..n_obs {
-                    let Some(u) = unit_of(subject, unit, j) else {
+                    let Some(u) = unit_of(subject, unit, j, tree) else {
                         continue;
                     };
                     match units.iter_mut().find(|(u0, _)| *u0 == u) {
@@ -2003,13 +2147,17 @@ fn spanned(
                         eta_up[k] += SPAN_STEP;
                         eta_down[k] -= SPAN_STEP;
                     } else {
-                        // A kappa moves its own occasion only.
-                        let Some(g) = layout.group_of(u) else {
+                        // A kappa moves its own occasion only; under nested levels,
+                        // every cell of its group (#1082).
+                        let groups = unit_groups(&layout, cells.as_ref(), unit, &u);
+                        if groups.is_empty() {
                             holds[s] = false;
                             break;
-                        };
-                        ka_up[g][k - model.n_eta] += SPAN_STEP;
-                        ka_down[g][k - model.n_eta] -= SPAN_STEP;
+                        }
+                        for g in groups {
+                            ka_up[g][k - model.n_eta] += SPAN_STEP;
+                            ka_down[g][k - model.n_eta] -= SPAN_STEP;
+                        }
                     }
                     let Some(re_col) = record_diffs(
                         &at(&theta, &eta_up, &ka_up),
@@ -2097,6 +2245,90 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
     (eta, kappa)
 }
 
+/// [`probe_res`] for one subject with `n_groups` occasion groups. Under nested
+/// levels (#1082) the κ are spread by the group of each κ's own level, not by
+/// cell, so every cell of one group reads the same value: the probe is a point
+/// the model can take, where a study's κ is one number shared by its arms.
+fn subject_probe_res(
+    re: f64,
+    model: &CompiledModel,
+    cells: Option<&NestedLayout>,
+    n_groups: usize,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let (eta, mut kappa) = probe_res(re, model, n_groups.max(1));
+    let (Some(levels), Some(cells)) = (model.nested_levels(), cells) else {
+        return (eta, kappa);
+    };
+    let widest = (0..levels.levels.len())
+        .map(|l| cells.level_count(l))
+        .max()
+        .unwrap_or(1);
+    let (_, by_group) = probe_res(re, model, widest.max(1));
+    for (g, row) in kappa.iter_mut().enumerate().take(cells.n_cells()) {
+        for (q, v) in row.iter_mut().enumerate() {
+            if let Some(&l) = levels.kappa_level.get(q) {
+                *v = by_group[cells.cell_group(g, l)][q];
+            }
+        }
+    }
+    (eta, kappa)
+}
+
+/// The κ groups — positions in the `kappas` [`predict_iov`](crate::pk::predict_iov)
+/// reads — that a kappa of unit `key` (of `unit`, [`unit_of`]) moves: the
+/// occasion's own group, or under nested levels every cell of the level's group
+/// (#1082), a cell with no observation in it too. Empty when the key names no
+/// group.
+fn unit_groups(
+    layout: &crate::stats::stacked_layout::StackedLayout,
+    cells: Option<&NestedLayout>,
+    unit: Unit,
+    key: &[u64],
+) -> Vec<usize> {
+    match unit {
+        Unit::Subject => Vec::new(),
+        Unit::Occasion => key
+            .first()
+            .and_then(|&o| u32::try_from(o).ok())
+            .and_then(|o| layout.group_of(o))
+            .into_iter()
+            .collect(),
+        Unit::Level(l) => cells.map_or_else(Vec::new, |cells| {
+            (0..cells.n_cells())
+                .filter(|&g| {
+                    let path: Vec<u64> = cells.labels(g, l).iter().map(|v| v.to_bits()).collect();
+                    path == key
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Per unit of kappa `q` in one subject with `n_groups` occasion groups, the κ
+/// groups it moves ([`unit_groups`]): each occasion group on its own, or under
+/// nested levels the cells of each group of the kappa's level. `None` for a
+/// nested model whose subject has no cells, which measures nothing.
+fn kappa_units(
+    model: &CompiledModel,
+    cells: Option<&NestedLayout>,
+    n_groups: usize,
+    q: usize,
+) -> Option<Vec<Vec<usize>>> {
+    let Some(levels) = model.nested_levels() else {
+        return Some((0..n_groups.max(1)).map(|g| vec![g]).collect());
+    };
+    let (cells, &l) = (cells?, levels.kappa_level.get(q)?);
+    Some(
+        (0..cells.level_count(l))
+            .map(|group| {
+                (0..cells.n_cells())
+                    .filter(|&g| cells.cell_group(g, l) == group)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
 /// An orthonormal basis of the span of `cols` by modified Gram–Schmidt with one
 /// re-orthogonalisation pass: the population-wide columns [`carried`] stacks are
 /// far from orthogonal (a θ read on every record against the levels'), where
@@ -2104,12 +2336,6 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// non-finite column, or one already in the span, adds no direction.
 #[cfg(test)]
 fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    orthonormal_basis_with(cols, &mut Vec::new())
-}
-
-/// [`orthonormal_basis`], pushing each nonzero finite column's remnant
-/// `‖c − P c‖ / ‖c‖` against the columns before it onto `remnants`.
-fn orthonormal_basis_with(cols: &[Vec<f64>], remnants: &mut Vec<f64>) -> Vec<Vec<f64>> {
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for c in cols {
         let c_norm = dot(c, c).sqrt();
@@ -2119,8 +2345,7 @@ fn orthonormal_basis_with(cols: &[Vec<f64>], remnants: &mut Vec<f64>) -> Vec<Vec
         let mut v = c.clone();
         project_out(&mut v, &basis);
         let n = dot(&v, &v).sqrt();
-        remnants.push(n / c_norm);
-        if n > 1e-12 * c_norm {
+        if n > DROP_TOL * c_norm {
             basis.push(v.into_iter().map(|x| x / n).collect());
         }
     }
@@ -2134,12 +2359,21 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// `v` minus its projection on the orthonormal `basis`, projected twice (one
 /// re-orthogonalisation pass, as [`orthonormal_basis`] builds it).
 fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
+    project_out_coefs(v, basis);
+}
+
+/// [`project_out`], returning the coefficient of `v` on each basis vector,
+/// both passes summed.
+fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
+    let mut coefs = vec![0.0; basis.len()];
     for _ in 0..2 {
-        for b in basis {
+        for (b, c) in basis.iter().zip(coefs.iter_mut()) {
             let d = dot(v, b);
             v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            *c += d;
         }
     }
+    coefs
 }
 
 /// A population-wide column of [`carried`], as its nonzero per-subject
@@ -2159,14 +2393,83 @@ fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
     out
 }
 
+/// Whether two columns are the same vector — `a − b` is zero. A raw column
+/// holds only pieces with a nonzero entry, so that is the same subjects with
+/// the same values.
+fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
+    fn sorted(p: &Pieces) -> Vec<&(usize, Vec<f64>)> {
+        let mut v: Vec<&(usize, Vec<f64>)> = p.iter().collect();
+        v.sort_by_key(|(s, _)| *s);
+        v
+    }
+    a.len() == b.len() && sorted(a) == sorted(b)
+}
+
+/// Under this ratio a combination of sum-to-zero functionals is representable
+/// on the columns of a [`BlockBasis`] (#1962): the misfit of the equations of
+/// the columns Gram–Schmidt dropped as already in the span, each over its
+/// column's norm, as a singular value of the misfit part of the orthonormalised
+/// `(t, misfit)` pairs. A dropped column lies in the span to [`DROP_TOL`] of its
+/// norm, so a representable combination leaves a misfit of that order; one that
+/// is not leaves one of the order of the functional. Measured over the 2464
+/// bases the `api::levels` tests build in [`carried`], macOS arm64 debug: a
+/// representable combination reaches at most 4.2e-11, one that is not at least
+/// 8.5e-2; the constant sits 4.4 decades above the one and 4.9 below the other.
+/// In the same run the loose rank count's direction test ([`SPAN_TOL`] on a
+/// group's last column against `A`) saw at most 5.3e-11 where the column is
+/// held and at least 1.4e-2 where it adds a direction.
+const CONSISTENT_TOL: f64 = 1e-6;
+
+/// A column keeping at most this fraction of its norm against the columns
+/// before it adds no direction to a [`BlockBasis`].
+const DROP_TOL: f64 = 1e-12;
+
+#[cfg(test)]
+thread_local! {
+    /// Per [`BlockBasis`] built on this thread, its population-wide vector
+    /// count: the scale #1962 bounds, read by the tests without a clock.
+    static DENSE_COUNTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A column of a [`BlockBasis`] as Gram–Schmidt took it: its coefficients on
+/// the basis vectors before it, as `(first coordinate, coefficients)`
+/// segments, and the coordinate and norm of the basis vector it added, if it
+/// added one.
+struct Taken {
+    coefs: Vec<(usize, Vec<f64>)>,
+    added: Option<(usize, f64)>,
+    norm: f64,
+    group: Option<usize>,
+}
+
 /// An orthonormal basis of the span of [`Pieces`] columns that keeps their
 /// subject structure (#1961 review, F1): columns on one subject's records are
 /// orthonormalised per subject — they are orthogonal across subjects for free
 /// — and only the columns spanning several subjects (a θ read on every
-/// record, sum-to-zero's difference against another subject's level) become
-/// population-wide vectors, orthogonalised against those per-subject bases
-/// first. The span is the one a dense basis of every column would have; the
-/// cost is in the population-wide columns alone.
+/// record, a level read by several subjects) become population-wide vectors,
+/// orthogonalised against those per-subject bases first. The span is the one
+/// a dense basis of every column would have; the cost is in the
+/// population-wide columns alone.
+///
+/// A column may belong to a sum-to-zero group (#1962). The basis then spans
+/// `A`: the ungrouped columns, and each group's columns under the constraint
+/// that their coefficients sum to zero — the span of each column's difference
+/// against its group's last, which is what the contrast codes. Those
+/// differences cross subjects whenever the levels do, one population-wide
+/// vector per level and a cost cubic in the subjects, so the basis is built on
+/// the raw columns instead, spanning `Q ⊇ A`, and the directions the groups
+/// remove are kept apart: an orthonormal `T` with `Q = A ⊕ T`, one direction
+/// per group at most. `R_A z` then has `‖R_A z‖² = ‖R_Q z‖² + ‖Tᵀ z‖²`.
+///
+/// `t ∈ Q` is orthogonal to `A` exactly when it is orthogonal to every
+/// ungrouped column and every column of group `g` has the same inner product
+/// `λ_g` with it. In the coordinates of the orthonormal basis that is a
+/// triangular system in the order Gram–Schmidt took the columns — per subject,
+/// then population-wide — for the columns that added a basis vector, and an
+/// equation to satisfy for each it dropped: solved per group for `λ = e_g`,
+/// the `λ` whose dropped equations hold (to [`CONSISTENT_TOL`]) give `T`. A
+/// group none of whose functionals is representable — the intercept that
+/// carries the levels' mean — removes nothing, and `A = Q` there.
 struct BlockBasis {
     /// Per subject, the orthonormal basis of its one-subject columns.
     local: Vec<Vec<Vec<f64>>>,
@@ -2177,20 +2480,136 @@ struct BlockBasis {
     /// Per nonzero finite column, `‖c − P c‖ / ‖c‖` against the columns
     /// orthonormalised before it.
     remnants: Vec<f64>,
+    /// Per subject, the coordinate of its first local basis vector; the
+    /// population-wide ones follow every subject's.
+    local_at: Vec<usize>,
+    /// `T`, orthonormal, in the coordinates of the basis.
+    removed: Vec<Vec<f64>>,
+    /// What the grouped columns change in [`BlockBasis::aliased`]'s count
+    /// against the raw columns' remnants.
+    coded_shift: isize,
+    /// How many groups the joint solve for `T` took: the scale review r1 of
+    /// #1962 bounds.
+    #[cfg(test)]
+    joint: usize,
 }
 
 impl BlockBasis {
+    #[cfg(test)]
     fn new(cols: &[Pieces], lens: &[usize], offsets: &[usize]) -> Self {
+        Self::grouped(cols, &vec![None; cols.len()], lens, offsets)
+    }
+
+    /// The basis of `cols`, column `j` in sum-to-zero group `groups[j]` (a
+    /// group's last column is its last in `cols`).
+    ///
+    /// A group whose columns all sit on one subject — a `sum_to_zero_within`
+    /// group of one subject's levels — enters as its difference columns, which
+    /// sit on that subject too and stay per subject, as the coded columns did
+    /// before #1962 (review r1): only a group crossing subjects goes through
+    /// `T`, whose joint solve is dense in the groups. Under
+    /// `sum_to_zero_within` with one group per subject that is none of them;
+    /// a group that crosses subjects has at least one population-wide
+    /// difference column, so `T` never costs more than those did.
+    fn grouped(
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        lens: &[usize],
+        offsets: &[usize],
+    ) -> Self {
+        // Per group: its last column, and whether every column sits on one
+        // subject (a zero column sits anywhere).
+        let mut last: HashMap<usize, usize> = HashMap::new();
+        let mut subject: HashMap<usize, Option<usize>> = HashMap::new();
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            let Some(g) = *g else { continue };
+            last.insert(g, j);
+            let on = subject.entry(g).or_insert(None);
+            match c.as_slice() {
+                [] => {}
+                [(s, _)] if on.is_none_or(|t| t == *s) => *on = Some(*s),
+                _ => *on = Some(usize::MAX),
+            }
+        }
+        let local = |g: &usize| subject[g] != Some(usize::MAX);
+        let mut kept_cols: Vec<Pieces> = Vec::with_capacity(cols.len());
+        let mut kept_groups: Vec<Option<usize>> = Vec::with_capacity(cols.len());
+        for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+            match g {
+                Some(g) if local(g) => {
+                    if j != last[g] {
+                        kept_cols.push(pieces_minus(c, &cols[last[g]]));
+                        kept_groups.push(None);
+                    }
+                }
+                _ => {
+                    kept_cols.push(c.clone());
+                    kept_groups.push(*g);
+                }
+            }
+        }
+        Self::grouped_raw(&kept_cols, &kept_groups, lens, offsets)
+    }
+
+    /// [`BlockBasis::grouped`] with every group taken through `T`.
+    fn grouped_raw(
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        lens: &[usize],
+        offsets: &[usize],
+    ) -> Self {
         let n_rows: usize = lens.iter().sum();
-        let mut singles: Vec<Vec<Vec<f64>>> = vec![Vec::new(); lens.len()];
-        for col in cols.iter().filter(|c| c.len() == 1) {
-            singles[col[0].0].push(col[0].1.clone());
+        let norm_of = |c: &Pieces| c.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+        let mut singles: Vec<Vec<usize>> = vec![Vec::new(); lens.len()];
+        for (j, col) in cols.iter().enumerate().filter(|(_, c)| c.len() == 1) {
+            singles[col[0].0].push(j);
         }
         let mut remnants: Vec<f64> = Vec::new();
-        let local: Vec<Vec<Vec<f64>>> = singles
+        // Per column taken, in order: (column, subject or population-wide,
+        // per-subject coefficients, population-wide coefficients, added norm).
+        let mut taken_local: Vec<(usize, usize, Vec<f64>, Option<f64>)> = Vec::new();
+        let mut local: Vec<Vec<Vec<f64>>> = Vec::with_capacity(lens.len());
+        for (s, js) in singles.iter().enumerate() {
+            let mut basis: Vec<Vec<f64>> = Vec::new();
+            for &j in js {
+                let c = &cols[j][0].1;
+                let c_norm = dot(c, c).sqrt();
+                if c_norm == 0.0 || !c_norm.is_finite() {
+                    continue;
+                }
+                let mut v = c.clone();
+                let coefs = project_out_coefs(&mut v, &basis);
+                let n = dot(&v, &v).sqrt();
+                remnants.push(n / c_norm);
+                let added = (n > DROP_TOL * c_norm).then_some(n);
+                if added.is_some() {
+                    basis.push(v.into_iter().map(|x| x / n).collect());
+                }
+                taken_local.push((j, s, coefs, added));
+            }
+            local.push(basis);
+        }
+        let local_at: Vec<usize> = local
             .iter()
-            .map(|c| orthonormal_basis_with(c, &mut remnants))
+            .scan(0, |at, b| {
+                let o = *at;
+                *at += b.len();
+                Some(o)
+            })
             .collect();
+        let dense_at: usize = local.iter().map(|b| b.len()).sum();
+        let mut taken: Vec<Taken> = Vec::new();
+        for (j, s, coefs, added) in taken_local {
+            // A column's coefficients run over the basis before it, so the
+            // vector it adds is the next one.
+            let k = local_at[s] + coefs.len();
+            taken.push(Taken {
+                added: added.map(|n| (k, n)),
+                coefs: vec![(local_at[s], coefs)],
+                norm: norm_of(&cols[j]),
+                group: groups[j],
+            });
+        }
         // Each multi-subject column, projected against the local bases and the
         // dense part so far, adds a direction only when what is left is not
         // rounding of the *original* column — the test `orthonormal_basis`
@@ -2198,56 +2617,268 @@ impl BlockBasis {
         // column inside the local span would turn ~1e-17 of rounding into a
         // unit vector and shrink every residual (#1961 review r2, R2-1).
         let mut dense: Vec<Vec<f64>> = Vec::new();
-        for col in cols.iter().filter(|c| c.len() > 1) {
-            let c_norm = col.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+        for (j, col) in cols.iter().enumerate().filter(|(_, c)| c.len() > 1) {
+            let c_norm = norm_of(col);
             if c_norm == 0.0 || !c_norm.is_finite() {
                 continue;
             }
             let mut v = vec![0.0; n_rows];
+            let mut coefs: Vec<(usize, Vec<f64>)> = Vec::new();
             for (s, piece) in col {
                 let mut piece = piece.clone();
-                project_out(&mut piece, &local[*s]);
+                coefs.push((local_at[*s], project_out_coefs(&mut piece, &local[*s])));
                 v[offsets[*s]..offsets[*s] + piece.len()].copy_from_slice(&piece);
             }
-            project_out(&mut v, &dense);
+            coefs.push((dense_at, project_out_coefs(&mut v, &dense)));
             let n = dot(&v, &v).sqrt();
             remnants.push(n / c_norm);
-            if n > 1e-12 * c_norm {
+            let added = (n > DROP_TOL * c_norm).then_some((dense_at + dense.len(), n));
+            if added.is_some() {
                 dense.push(v.into_iter().map(|x| x / n).collect());
             }
+            taken.push(Taken {
+                coefs,
+                added,
+                norm: c_norm,
+                group: groups[j],
+            });
         }
-        BlockBasis {
+        let mut basis = BlockBasis {
             local,
             dense,
             offsets: offsets.to_vec(),
             n_rows,
             remnants,
+            local_at,
+            removed: Vec::new(),
+            coded_shift: 0,
+            #[cfg(test)]
+            joint: 0,
+        };
+        basis.remove_groups(cols, groups, &taken, dense_at);
+        #[cfg(test)]
+        DENSE_COUNTS.with(|d| d.borrow_mut().push(basis.dense.len()));
+        basis
+    }
+
+    /// `T` (see [`BlockBasis`]) and the grouped columns' shift of
+    /// [`BlockBasis::aliased`], from the columns as Gram–Schmidt `taken` them.
+    fn remove_groups(
+        &mut self,
+        cols: &[Pieces],
+        groups: &[Option<usize>],
+        taken: &[Taken],
+        dense_at: usize,
+    ) {
+        let dim = dense_at + self.dense.len();
+        // Per group, in order of first appearance: its columns.
+        let mut members: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (j, g) in groups.iter().enumerate() {
+            let Some(g) = *g else { continue };
+            match members.iter_mut().find(|(h, _)| *h == g) {
+                Some((_, js)) => js.push(j),
+                None => members.push((g, vec![j])),
+            }
         }
+        if members.is_empty() {
+            return;
+        }
+        let nonzero = |c: &Pieces| {
+            let n = c.iter().map(|(_, v)| dot(v, v)).sum::<f64>();
+            n != 0.0 && n.is_finite()
+        };
+        // The coded columns are each column's difference against its group's
+        // last: count the nonzero ones against the nonzero raw ones.
+        let mut shift: isize = 0;
+        for (_, js) in &members {
+            let last = &cols[*js.last().expect("a group has a column")];
+            let coded = js[..js.len() - 1]
+                .iter()
+                .filter(|&&j| !pieces_equal(&cols[j], last))
+                .count();
+            let raw = js.iter().filter(|&&j| nonzero(&cols[j])).count();
+            shift += coded as isize - raw as isize;
+        }
+        // A group with a zero column leaves its constraint nothing to act on:
+        // that column's equation forces `λ_g = 0`, and the group removes no
+        // direction.
+        let live: Vec<&(usize, Vec<usize>)> = members
+            .iter()
+            .filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j])))
+            .collect();
+        #[cfg(test)]
+        {
+            self.joint = live.len();
+        }
+        // Per live group, `t` for `λ = e_g` in coordinates, and the misfit of
+        // each dropped column's equation over its norm.
+        let mut ts: Vec<Vec<f64>> = Vec::with_capacity(live.len());
+        let mut misfits: Vec<Vec<f64>> = Vec::with_capacity(live.len());
+        for (g, _) in &live {
+            let mut t = vec![0.0; dim];
+            let mut misfit = Vec::new();
+            for col in taken {
+                let rhs = if col.group == Some(*g) { 1.0 } else { 0.0 };
+                let acc: f64 = col
+                    .coefs
+                    .iter()
+                    .map(|(at, c)| dot(c, &t[*at..*at + c.len()]))
+                    .sum();
+                match col.added {
+                    Some((k, n)) => t[k] = (rhs - acc) / n,
+                    None => misfit.push((acc - rhs) / col.norm),
+                }
+            }
+            ts.push(t);
+            misfits.push(misfit);
+        }
+        // The `λ` whose misfit vanishes against its `t`. A group's `t` alone
+        // can be zero — every column of it dropped — and still complete
+        // another's: two levels of one block summing to a level of another
+        // tie their `λ` (2 : 1), and neither unit `λ` is consistent. So the
+        // stacked `(t, misfit)` are orthonormalised together, which no `λ`
+        // annuls (both vanish only when every equation's right-hand side
+        // does), and the misfit part's small singular directions are the `λ`
+        // sought: a singular value there is `‖misfit‖ / ‖(t, misfit)‖`.
+        let mut units: Vec<Vec<f64>> = Vec::new();
+        for (t, m) in ts.into_iter().zip(misfits) {
+            let mut w = t;
+            w.extend(m);
+            let w_norm = dot(&w, &w).sqrt();
+            if w_norm == 0.0 || !w_norm.is_finite() {
+                continue;
+            }
+            project_out(&mut w, &units);
+            let n = dot(&w, &w).sqrt();
+            if n > DROP_TOL * w_norm {
+                units.push(w.into_iter().map(|x| x / n).collect());
+            }
+        }
+        let n_drop = units.first().map_or(0, |u| u.len() - dim);
+        if !units.is_empty() {
+            let r = units.len();
+            // A zero row keeps the matrix at least square, so the SVD returns
+            // a right singular vector for every unit.
+            let rows = n_drop.max(r);
+            let misfit = nalgebra::DMatrix::from_fn(rows, r, |i, a| {
+                units[a].get(dim + i).copied().unwrap_or(0.0)
+            });
+            let svd = misfit.svd(false, true);
+            let v_t = svd.v_t.expect("requested");
+            for (i, sv) in svd.singular_values.iter().enumerate() {
+                if sv.is_nan() || *sv >= CONSISTENT_TOL {
+                    continue;
+                }
+                let mut t = vec![0.0; dim];
+                for (a, u) in units.iter().enumerate() {
+                    let w = v_t[(i, a)];
+                    t.iter_mut().zip(&u[..dim]).for_each(|(x, y)| *x += w * y);
+                }
+                let n = dot(&t, &t).sqrt();
+                self.removed.push(t.into_iter().map(|x| x / n).collect());
+            }
+        }
+        // Each live group's last column adds the direction its difference
+        // columns lack, unless `A` and the groups before it already hold it:
+        // that is the coded columns' rank against the raw ones.
+        let mut held: Vec<Vec<f64>> = Vec::new();
+        for (_, js) in &live {
+            let d = &cols[*js.last().expect("a group has a column")];
+            let d_norm = d.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
+            let (coords, _) = self.project(d);
+            let mut s: Vec<f64> = self
+                .removed
+                .iter()
+                .map(|t| dot_coords(t, &coords))
+                .collect();
+            project_out(&mut s, &held);
+            let n = dot(&s, &s).sqrt();
+            if n >= SPAN_TOL * d_norm {
+                shift += 1;
+            }
+            if n > DROP_TOL * d_norm {
+                held.push(s.into_iter().map(|x| x / n).collect());
+            }
+        }
+        self.coded_shift = shift;
+    }
+
+    /// `z`'s coordinates on the basis, as `(first coordinate, values)`
+    /// segments, and its remnant outside the raw columns' span.
+    fn project(&self, z: &Pieces) -> (Vec<(usize, Vec<f64>)>, Vec<f64>) {
+        let mut coords = Vec::with_capacity(z.len() + 1);
+        let mut r = vec![0.0; self.n_rows];
+        for (s, piece) in z {
+            let mut piece = piece.clone();
+            coords.push((
+                self.local_at[*s],
+                project_out_coefs(&mut piece, &self.local[*s]),
+            ));
+            r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
+        }
+        let dense_at =
+            self.local_at.last().copied().unwrap_or(0) + self.local.last().map_or(0, |b| b.len());
+        coords.push((dense_at, project_out_coefs(&mut r, &self.dense)));
+        (coords, r)
     }
 
     /// How many nonzero columns kept less than [`SPAN_TOL`] of their norm
     /// against the columns orthonormalised before them (#1977): the columns'
     /// rank deficiency at that tolerance, whatever order they were taken in.
+    /// A sum-to-zero group counts as its coded columns, the differences
+    /// against its last (#1962): those number one fewer than its raw columns,
+    /// and its last column adds back what they lack unless the rest already
+    /// holds it.
     fn aliased(&self) -> usize {
-        self.remnants.iter().filter(|r| **r < SPAN_TOL).count()
+        let raw = self.remnants.iter().filter(|r| **r < SPAN_TOL).count() as isize;
+        (raw + self.coded_shift).max(0) as usize
     }
 
-    /// `‖z − P z‖ / ‖z‖`; `None` when `z` is zero. A non-finite value comes
-    /// back as `NaN`, which no tolerance accepts.
+    /// `‖z − P z‖ / ‖z‖`, `P` the projection on the coded span `A`; `None`
+    /// when `z` is zero. A non-finite value comes back as `NaN`, which no
+    /// tolerance accepts.
     fn residual(&self, z: &Pieces) -> Option<f64> {
         let z_norm = z.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
         if z_norm == 0.0 {
             return None;
         }
-        let mut r = vec![0.0; self.n_rows];
-        for (s, piece) in z {
-            let mut piece = piece.clone();
-            project_out(&mut piece, &self.local[*s]);
-            r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
-        }
-        project_out(&mut r, &self.dense);
-        Some(dot(&r, &r).sqrt() / z_norm)
+        let (coords, r) = self.project(z);
+        let removed: f64 = self
+            .removed
+            .iter()
+            .map(|t| dot_coords(t, &coords).powi(2))
+            .sum();
+        Some((dot(&r, &r) + removed).sqrt() / z_norm)
     }
+}
+
+/// The coded columns of `cols` under `groups`, each grouped column but its
+/// group's last taken against that last one: the columns
+/// [`BlockBasis::grouped`] spans without building them.
+#[cfg(test)]
+fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
+    let mut out = Vec::new();
+    for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
+        match g {
+            None => out.push(c.clone()),
+            Some(g) => {
+                let last = (0..cols.len())
+                    .rev()
+                    .find(|&k| groups[k] == Some(*g))
+                    .unwrap();
+                if j != last {
+                    out.push(pieces_minus(c, &cols[last]));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `t · c`, `t` dense in the coordinates of a [`BlockBasis`] and `c` as
+/// segments.
+fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
+    c.iter().map(|(at, v)| dot(v, &t[*at..*at + v.len()])).sum()
 }
 
 /// Whether a contrast's coded block, with the rest of the model, reproduces an
@@ -2298,17 +2929,28 @@ impl BlockBasis {
 /// Measured over every guard the `api::levels` tests reach (2334 with the
 /// two-block tests of #1963, macOS arm64 debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
 /// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
-/// below the other.
+/// below the other. Under sum-to-zero the count is taken on the raw levels and
+/// shifted to the coded ones ([`BlockBasis::aliased`], #1962); over the 2464
+/// bases the tests build it gave the rank verdict the difference columns gave
+/// in every one, and the count itself in all but one, where a difference of
+/// two 2e-8-norm levels kept 1.3e-9 of its norm at its own rounding floor and
+/// counted a third deficiency in a block whose exact deficiency is two.
 ///
 /// Only branches that refuse without it ask for it, so a model that binds
 /// without the certificate never pays for it. On those branches it costs the
-/// population-wide columns of a [`BlockBasis`]: the other θ, and under
-/// sum-to-zero one difference per level against its group's last — cubic in
-/// the subject count there (#1961 review, F1: on a 5-η `two_cpt_oral`
-/// intercept model, release, 0.16 s at 200 subjects, 1.1 s at 400, 19 s at
-/// 1000, where the binder before #1840 refused in ~20 ms). The coarser random
-/// effects' columns, one per unit, are built only when the point is not
-/// already held without them.
+/// population-wide columns of a [`BlockBasis`]: the other θ, and the levels
+/// read by more than one subject. Under sum-to-zero the coded columns — each
+/// level's difference against its group's last — cross subjects whenever the
+/// levels do, one population-wide column per level and a cost cubic in the
+/// subjects (#1961 review, F1: 19 s at 1000 subjects on a 5-η `two_cpt_oral`
+/// intercept model, release, where the binder before #1840 refused in
+/// ~20 ms). So the basis takes the raw levels, tagged with their group, and
+/// keeps apart the at most one direction per group the contrast removes
+/// (#1962, [`BlockBasis::grouped`]): on the same fixture 48 ms at 200
+/// subjects, 56 ms at 400 and 0.29 s at 1000 (release, macOS arm64), the
+/// refusal text unchanged. The coarser random effects'
+/// columns, one per unit, are built only when the point is not already held
+/// without them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Carried {
     /// Every unit column of the random effect lies in the span: the contrast
@@ -2399,9 +3041,15 @@ fn carried(
             .iter()
             .map(|s| crate::stats::stacked_layout::StackedLayout::of(model, s))
             .collect();
+        let cells: Vec<Option<NestedLayout>> = population
+            .subjects
+            .iter()
+            .map(|s| NestedLayout::of(model, s))
+            .collect();
         let res: Vec<(Vec<f64>, Vec<Vec<f64>>)> = layouts
             .iter()
-            .map(|l| probe_res(re, model, l.n_groups().max(1)))
+            .zip(&cells)
+            .map(|(l, c)| subject_probe_res(re, model, c.as_ref(), l.n_groups()))
             .collect();
         // One population-wide column: per subject, the central difference of
         // its predictions under `perturb`, which moves θ or that subject's
@@ -2438,43 +3086,48 @@ fn carried(
 
         // A block's level columns (a `FIX` level moves nothing), coded by its
         // contrast over its groups: under `none` every level, under `ref` the
-        // first level of each group dropped, under sum-to-zero each level but
-        // its group's last taken against that last one. `None` when anything
-        // is non-finite.
+        // first level of each group dropped. Under sum-to-zero every level,
+        // tagged with its group: the coded span, each level but its group's
+        // last taken against that last one, is what [`BlockBasis::grouped`]
+        // spans on those tags (#1962). `None` when anything is non-finite.
         let coded_cols = |decl: &LevelBlockDecl,
                           thetas: &[Option<usize>],
                           groups: &[usize],
                           contrast: LevelContrast|
-         -> Option<Vec<Pieces>> {
+         -> Option<Vec<(Pieces, Option<usize>)>> {
             let column = level_index_column(decl.name());
+            // Per level, the subjects that read it.
+            let mut readers: Vec<Vec<usize>> = vec![Vec::new(); thetas.len()];
+            for &s in &all {
+                let mut read = indices_read(&population.subjects[s], &column);
+                read.sort_by(f64::total_cmp);
+                read.dedup();
+                for index in read {
+                    let i = index as usize;
+                    if index == i as f64 && (1..=thetas.len()).contains(&i) {
+                        readers[i - 1].push(s);
+                    }
+                }
+            }
             let mut level_cols: Vec<Pieces> = Vec::with_capacity(thetas.len());
             for (i, k) in thetas.iter().enumerate() {
-                let readers: Vec<usize> = all
-                    .iter()
-                    .copied()
-                    .filter(|&s| {
-                        indices_read(&population.subjects[s], &column).contains(&((i + 1) as f64))
-                    })
-                    .collect();
                 let col = match *k {
                     Some(k) => {
                         let h = SPAN_STEP * theta[k].abs().max(1.0);
-                        diff_col(&readers, h, &|d, th, _, _| th[k] += d)?
+                        diff_col(&readers[i], h, &|d, th, _, _| th[k] += d)?
                     }
                     None => Pieces::new(),
                 };
                 level_cols.push(col);
             }
             let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
-            let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
             let mut out = Vec::new();
-            for i in 0..level_cols.len() {
+            for (i, col) in level_cols.into_iter().enumerate() {
                 match contrast {
-                    LevelContrast::Unconstrained => out.push(level_cols[i].clone()),
-                    LevelContrast::Ref if !first(i) => out.push(level_cols[i].clone()),
-                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin if !last(i) => {
-                        let j = (i..groups.len()).find(|&j| last(j)).expect("a group ends");
-                        out.push(pieces_minus(&level_cols[i], &level_cols[j]));
+                    LevelContrast::Unconstrained => out.push((col, None)),
+                    LevelContrast::Ref if !first(i) => out.push((col, None)),
+                    LevelContrast::SumToZero | LevelContrast::SumToZeroWithin => {
+                        out.push((col, Some(groups[i])))
                     }
                     _ => {}
                 }
@@ -2482,41 +3135,56 @@ fn carried(
             Some(out)
         };
 
+        // The columns, and per column its sum-to-zero group, numbered across
+        // the blocks.
         let mut cols: Vec<Pieces> = Vec::new();
+        let mut tags: Vec<Option<usize>> = Vec::new();
+        let push_coded = |coded: Vec<(Pieces, Option<usize>)>,
+                          cols: &mut Vec<Pieces>,
+                          tags: &mut Vec<Option<usize>>| {
+            let base = tags.iter().flatten().map(|g| g + 1).max().unwrap_or(0);
+            for (c, g) in coded {
+                cols.push(c);
+                tags.push(g.map(|g| base + g));
+            }
+        };
         for &k in &other_thetas {
             let Some(c) = theta_col(k) else {
                 return Carried::Held;
             };
             cols.push(c);
+            tags.push(None);
         }
         for (o, thetas) in others.iter().zip(&other_levels) {
             let Some(c) = coded_cols(o.decl, thetas, &o.groups, o.contrast) else {
                 return Carried::Held;
             };
-            cols.extend(c);
+            push_coded(c, &mut cols, &mut tags);
         }
         let n_other = cols.len();
         let Some(own_coded) = coded_cols(decl, &level_thetas, &groups, contrast) else {
             return Carried::Held;
         };
-        cols.extend(own_coded);
+        push_coded(own_coded, &mut cols, &mut tags);
 
         // Per unit of each random effect: its column. A unit is a subject for
-        // an η, an occasion group of a subject for a κ.
+        // an η, an occasion group of a subject for a κ, and under nested levels
+        // every cell of one group of the κ's level (#1082).
         let unit_cols = |r: usize, is_kappa: bool| -> Option<Vec<Pieces>> {
             let mut out = Vec::new();
             for s in 0..population.subjects.len() {
-                let units = if is_kappa {
-                    layouts[s].n_groups().max(1)
-                } else {
-                    1
+                let units = match is_kappa {
+                    true => kappa_units(model, cells[s].as_ref(), layouts[s].n_groups(), r)?,
+                    false => vec![Vec::new()],
                 };
-                for g in 0..units {
+                for groups in units {
                     let col = diff_col(&[s], SPAN_STEP, &|d, _, et, ka| match is_kappa {
                         false => et[r] += d,
                         true => {
-                            if let Some(row) = ka.get_mut(g) {
-                                row[r] += d;
+                            for &g in &groups {
+                                if let Some(row) = ka.get_mut(g) {
+                                    row[r] += d;
+                                }
                             }
                         }
                     })?;
@@ -2557,23 +3225,26 @@ fn carried(
         // their one column per unit (#1961 review, F1). It is held whatever the
         // rank says, so it never builds the other θ's basis either; nor does a
         // full basis with no aliased column, whose other θ are independent too.
-        let basis = BlockBasis::new(&cols, &lens, &offsets);
+        let basis = BlockBasis::grouped(&cols, &tags, &lens, &offsets);
         if outside(&basis) != Some(true) {
             return Carried::Held;
         }
         if basis.aliased() > 0
-            && basis.aliased() > BlockBasis::new(&cols[..n_other], &lens, &offsets).aliased()
+            && basis.aliased()
+                > BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets).aliased()
         {
             return Carried::Held;
         }
         // The random effects at a coarser-or-equal unit: the other η for an η,
-        // every η and the other κ for a κ.
+        // every η and the other κ for a κ — under nested levels the other κ at
+        // its own level or an outer one (#1082).
+        let level_of = |q: usize| model.nested_levels().and_then(|n| n.kappa_level.get(q));
         let coarser: Vec<(usize, bool)> = (0..model.n_eta)
             .filter(|&e| kappa || e != index)
             .map(|e| (e, false))
             .chain(
                 (0..model.n_kappa)
-                    .filter(|&q| kappa && q != index)
+                    .filter(|&q| kappa && q != index && level_of(q) <= level_of(index))
                     .map(|q| (q, true)),
             )
             .collect();
@@ -2584,9 +3255,10 @@ fn carried(
             let Some(c) = unit_cols(r, is_kappa) else {
                 return Carried::Held;
             };
+            tags.extend(std::iter::repeat_n(None, c.len()));
             cols.extend(c);
         }
-        if outside(&BlockBasis::new(&cols, &lens, &offsets)) != Some(true) {
+        if outside(&BlockBasis::grouped(&cols, &tags, &lens, &offsets)) != Some(true) {
             return Carried::Held;
         }
     }
@@ -2645,6 +3317,28 @@ struct Measured {
     dead: DeadLevels,
     spanned: Vec<Option<Span>>,
     model: Option<std::rc::Rc<CompiledModel>>,
+    /// Whether a dose of the model can arrive after its record
+    /// ([`lagged_arrivals`]), measured or not: [`replicates`] reads it.
+    lagged: bool,
+    /// The model's nested levels (#1082), measured or not: a kappa's unit is a
+    /// group of its own level ([`Unit::Level`]).
+    nested: Option<NestedLevels>,
+}
+
+/// Whether a dose of `model` can change the state at a time the data does not
+/// hold (#2131 review): a compartment lag — the bare lag slot or an indexed
+/// `ALAGn` ([`CompiledModel::has_lagtime`]), or an `ALAGn` entry of the
+/// `dose_attr_map` the engines resolve every dose's lag through — or a
+/// per-route lag on an absorption forcing. A lag the model assigns but the
+/// engines never apply moves no arrival, so it does not count;
+/// `the_lag_predicate_sees_every_lag_the_engine_applies` pins the two
+/// together over every spelling.
+fn lagged_arrivals(model: &CompiledModel) -> bool {
+    model.has_lagtime()
+        || model
+            .dose_attr_map
+            .has_indexed_attr(crate::types::DoseAttr::Lag)
+        || model.has_route_absorption_lag()
 }
 
 /// Run [`dead_levels`] and [`spanned`] on every block, on the model re-parsed
@@ -2673,6 +3367,8 @@ fn measure_levels(
         })
         .collect();
     let model = parse_full_model_with(model_text, &none)?.model;
+    let lagged = lagged_arrivals(&model);
+    let nested = model.nested_levels().cloned();
     if !dead_check_reads_every_channel(&model) {
         return Ok(decls
             .iter()
@@ -2680,6 +3376,8 @@ fn measure_levels(
                 dead: DeadLevels::default(),
                 spanned: vec![None; decl.eta_couplings.len()],
                 model: None,
+                lagged,
+                nested: nested.clone(),
             })
             .collect());
     }
@@ -2688,7 +3386,7 @@ fn measure_levels(
         .iter()
         .zip(discovered)
         .map(|(decl, levels)| {
-            let silent: Vec<(usize, Unit)> = placements(decl, population)
+            let silent: Vec<(usize, Unit)> = placements(decl, population, lagged, nested.as_ref())
                 .into_iter()
                 .enumerate()
                 .filter_map(|(k, placement)| match placement {
@@ -2700,6 +3398,8 @@ fn measure_levels(
                 dead: dead_levels(&model, decl, levels, population),
                 spanned: spanned(&model, decl, levels, population, &silent),
                 model: Some(model.clone()),
+                lagged,
+                nested: nested.clone(),
             }
         })
         .collect())
@@ -2871,7 +3571,12 @@ fn dead_levels_message(
 /// the reference level — another θ of the model carries ([`carried`], #1840);
 /// the nested block's explicit global contrasts follow the same certificate.
 /// Two absorbed random effects have no rescue either: within leaves each unit's
-/// mean to one of them, and the levels reproduce the other.
+/// mean to one of them, and the levels reproduce the other — unless the
+/// within-group contrast parts them ([`within_parts_them`]): each within-group
+/// lies inside one unit of every one of them, and no two group the records
+/// alike. Within then leaves each its own groups' means, as a nested model
+/// tells a study kappa from an arm kappa (#2034), and each is resolved as if it
+/// were the only one, the first refusal winning.
 ///
 /// `others` is `None` for a block that absorbs nothing, which
 /// [`bind_levels_on_data`] resolves first and which never reads the
@@ -2883,16 +3588,110 @@ fn resolve_contrast(
     population: &Population,
     others: Option<&[Coded]>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
-    let nested = decl.columns().len() >= 2;
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
-    let dead = &measured.dead;
-    let absorbed = absorbed(decl, population, &measured.spanned);
-    if absorbed.len() >= 2 {
+    let absorbed = absorbed(decl, population, measured);
+    if absorbed.len() < 2 {
+        let one = absorbed.into_iter().next();
+        return resolve_absorbing(decl, levels, measured, population, others, one);
+    }
+    if !within_parts_them(
+        decl,
+        levels,
+        &absorbed,
+        population,
+        measured.nested.as_ref(),
+    ) {
         return Err(jointly_absorbed_message(
             &block, decl, &absorbed, population,
         ));
     }
-    let absorbed = absorbed.into_iter().next();
+    let mut resolved = None;
+    for one in absorbed {
+        let r = resolve_absorbing(decl, levels, measured, population, others, Some(one))?;
+        resolved.get_or_insert(r);
+    }
+    Ok(resolved.expect("two or more"))
+}
+
+/// Whether the within-group contrast of a nested block parts the random effects
+/// `absorbed` (#2034): every within-group's records lie in one unit of each of
+/// them, and no two of them group the records into the same units. The first
+/// keeps each random effect constant across a group, so within leaves it the
+/// group means; the second keeps two of them from competing for the same means,
+/// which a kappa does with an η on one occasion per subject (K3′), or with the
+/// kappa of an outer level whose groups each hold one group of its level.
+fn within_parts_them(
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    absorbed: &[Absorbed],
+    population: &Population,
+    nested: Option<&NestedLevels>,
+) -> bool {
+    if decl.columns().len() < 2 {
+        return false;
+    }
+    let groups = assign_groups(decl, levels, LevelContrast::SumToZeroWithin);
+    let column = level_index_column(decl.name());
+    // Per record of every subject: its within-group, and its unit under each
+    // random effect.
+    let mut records: Vec<(usize, Vec<(usize, Vec<u64>)>)> = Vec::new();
+    for (s, subject) in population.subjects.iter().enumerate() {
+        for j in 0..subject.obs_times.len() {
+            let Some(index) = column_value(subject, &column, j) else {
+                return false;
+            };
+            let Some(&group) = (index as usize).checked_sub(1).and_then(|i| groups.get(i)) else {
+                return false;
+            };
+            let units: Option<Vec<(usize, Vec<u64>)>> = absorbed
+                .iter()
+                .map(|a| unit_of(subject, a.unit_kind, j, nested).map(|u| (s, u)))
+                .collect();
+            let Some(units) = units else {
+                return false;
+            };
+            records.push((group, units));
+        }
+    }
+    // `a` determines `b`: every key of `a` meets a single key of `b`.
+    fn determines<A: Eq + std::hash::Hash, B: Eq + Clone>(pairs: &[(A, B)]) -> bool {
+        let mut seen: HashMap<&A, &B> = HashMap::new();
+        pairs.iter().all(|(a, b)| *seen.entry(a).or_insert(b) == b)
+    }
+    let nests = (0..absorbed.len()).all(|r| {
+        let pairs: Vec<(usize, (usize, Vec<u64>))> =
+            records.iter().map(|(g, u)| (*g, u[r].clone())).collect();
+        determines(&pairs)
+    });
+    let apart = (0..absorbed.len()).all(|a| {
+        (0..a).all(|b| {
+            let ab: Vec<_> = records
+                .iter()
+                .map(|(_, u)| (u[a].clone(), u[b].clone()))
+                .collect();
+            let ba: Vec<_> = records
+                .iter()
+                .map(|(_, u)| (u[b].clone(), u[a].clone()))
+                .collect();
+            !(determines(&ab) && determines(&ba))
+        })
+    });
+    nests && apart
+}
+
+/// [`resolve_contrast`] for a block that absorbs at most the one random effect
+/// `absorbed`.
+fn resolve_absorbing(
+    decl: &LevelBlockDecl,
+    levels: &[Level],
+    measured: &Measured,
+    population: &Population,
+    others: Option<&[Coded]>,
+    absorbed: Option<Absorbed>,
+) -> Result<(LevelContrast, Vec<usize>), String> {
+    let nested = decl.columns().len() >= 2;
+    let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
+    let dead = &measured.dead;
     // A random effect the levels reproduce through within-group differences
     // has no rescue: `sum_to_zero_within` leaves exactly those directions free
     // (#1874 review, F1).
@@ -3036,10 +3835,11 @@ fn resolve_contrast(
             // occasion, which the within-group contrast removes as it does an η.
             if found.kappa() {
                 return Err(format!(
-                    "{block}: `contrast = {}` lets the levels reproduce `{}` at every occasion: \
+                    "{block}: `contrast = {}` lets the levels reproduce `{}` at every {}: \
                      {why} — the two are the same quantity, so the model is not identified.{fix}",
                     contrast_token(resolved),
                     found.name(),
+                    found.unit,
                 ));
             }
             return Err(format!(
@@ -3126,11 +3926,14 @@ fn one_column_message(
 ) -> String {
     let (unit, whose) = if found.kappa() {
         (
-            "lies within a single occasion of one subject",
-            "that occasion's",
+            format!("lies within a single {} of one subject", found.unit),
+            format!("that {}'s", found.unit),
         )
     } else {
-        ("belongs to a single subject", "that subject's")
+        (
+            "belongs to a single subject".to_string(),
+            "that subject's".to_string(),
+        )
     };
     let column = &decl.columns()[0];
     let Some(alt) = alt else {
@@ -3229,19 +4032,23 @@ fn jointly_absorbed_message(
     }
     // Within leaves each unit's mean to one of them: a subject's when an η is
     // among them, an occasion's when they are all kappas (F6).
+    // Kappas at two nested levels (#1082) share no one unit name: a group.
     let unit = if absorbed.iter().all(|a| a.kappa()) {
-        "occasion"
+        match absorbed.split_first() {
+            Some((a, rest)) if rest.iter().all(|b| b.unit == a.unit) => a.unit.clone(),
+            _ => "group".to_string(),
+        }
     } else {
-        "subject"
+        "subject".to_string()
     };
     // A one-column block has no within rescue and dropping one random effect
     // does not help: each level lies within one unit, so the block absorbs
     // every one of them on its own (#1880).
     if decl.columns().len() == 1 {
-        let within = if unit == "occasion" {
-            "a single occasion of one subject"
+        let within = if unit == "subject" {
+            "a single subject".to_string()
         } else {
-            "a single subject"
+            format!("a single {unit} of one subject")
         };
         return format!(
             "{block}: each `{}` level lies within {within}, and the levels absorb {} and {last} \
@@ -3353,12 +4160,18 @@ fn write_index_column(
     subjects: &mut [Subject],
 ) -> Result<Vec<Unindexed>, String> {
     let column = level_index_column(decl.name());
-    let index_of = |values: &[f64]| -> Option<f64> {
-        table
-            .iter()
-            .find(|(l, _)| l.values == values)
-            .map(|&(_, i)| i as f64)
-    };
+    // Keyed on `level_key`, the one spelling of level equality the level-table check
+    // uses too (#1799), rather than a linear `==` scan per record. A level holding a
+    // `NaN` is left out, since `==` matched it to nothing (`NaN != NaN`), and the
+    // first entry of a repeated level wins, as `find` gave.
+    let mut by_key: HashMap<Vec<u64>, usize> = HashMap::with_capacity(table.len());
+    for (level, i) in table {
+        if !level.values.iter().any(|v| v.is_nan()) {
+            by_key.entry(level_key(&level.values)).or_insert(*i);
+        }
+    }
+    let index_of =
+        |values: &[f64]| -> Option<f64> { by_key.get(&level_key(values)).map(|&i| i as f64) };
 
     let mut unindexed = Vec::new();
     for subject in subjects.iter_mut() {

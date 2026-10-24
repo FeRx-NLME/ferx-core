@@ -450,10 +450,12 @@ both literals are not checked.
 function, where it is caught. The nested `min(max(x, lo), hi)` instead returns
 `lo`, because `max`'s `x >= lo` is false for `NaN` and the `else` branch is the
 bound. So if you rewrite an existing `min`/`max` pair as `clamp` around a
-quantity that can go `NaN` — a `log` or `sqrt` of something that dips negative
-mid-search, say — that model was being quietly pinned to `lo`, and will now
-surface the `NaN` instead. That is the intended direction: a silently bounded
-`NaN` is a wrong number that fits.
+quantity that can go `NaN` — `x ^ 0.5` of something that dips negative
+mid-search, or a covariate that is missing for some subject — that model was
+being quietly pinned to `lo`, and will now surface the `NaN` instead. That is the
+intended direction: a silently bounded `NaN` is a wrong number that fits. A
+`log` or `sqrt` never gives a `NaN` to surface, because both floor their argument
+([Values outside an operation's domain](individual-parameters.qmd#values-outside-an-operations-domain)).
 
 In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is
 "the largest `IPRED` over rows where `TIME > 0`"). The two are told apart by the

@@ -287,6 +287,54 @@ fn m3_warning_follows_the_fitted_marginal() {
     assert!(focei.interaction);
 }
 
+/// The M3 warning gates on the last **estimating** stage, not the chain's last stage
+/// (#1726). Under `[foce, imp]` + `imp_eval_only` the estimates are FOCE-M3 while
+/// `options.method` reads `Imp`; the gate read that and stayed shut. Both sides in one
+/// test: the FOCE chain must warn, the FOCEI chain on the same data must not.
+#[test]
+fn m3_warning_follows_the_last_estimating_stage_of_a_chain() {
+    let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+        .expect("warfarin BLOQ model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+        .expect("warfarin BLOQ data must load");
+    let run = |first: EstimationMethod| {
+        let o = FitOptions {
+            method: EstimationMethod::Imp,
+            methods: vec![first, EstimationMethod::Imp],
+            imp_eval_only: true,
+            imp_samples: 200,
+            imp_seed: Some(1726),
+            user_set_keys: vec!["method".to_string()],
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        fit(&model, &population, &model.default_params, &o).expect("M3 chain must run")
+    };
+    let has_m3 = |r: &FitResult| {
+        r.warnings
+            .iter()
+            .any(|w| w.contains("M3 censoring under FOCE uses non-interaction"))
+    };
+    let foce = run(EstimationMethod::Foce);
+    let focei = run(EstimationMethod::FoceI);
+    // Premise: the reported method is the estimating stage, and the readout stage ran.
+    assert_eq!(foce.method, EstimationMethod::Foce);
+    assert_eq!(focei.method, EstimationMethod::FoceI);
+    assert!(foce.importance_sampling.is_some(), "IMP readout must run");
+    assert!(!foce.interaction);
+    assert!(
+        has_m3(&foce),
+        "[foce, imp] + imp_eval_only + censored rows must warn: {:?}",
+        foce.warnings
+    );
+    assert!(
+        !has_m3(&focei),
+        "[focei, imp] must not carry the FOCE-M3 warning: {:?}",
+        focei.warnings
+    );
+}
+
 /// T6. The issue's exit condition, end to end on the shipped model file: a converged
 /// warfarin_iov FOCE fit, SIR 1000 / 250, seed 1705. ESS ≥ 100 (396.2 measured on
 /// Linux aarch64 and macOS arm64; 4.87 under the leak) and every θ / ω / σ / κ estimate

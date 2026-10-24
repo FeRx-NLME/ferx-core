@@ -775,6 +775,45 @@ fn affinity_is_proven_from_the_expression_form() {
     );
 }
 
+/// The affinity walk reads a typical-value program's definitions through their
+/// references (#1699), and walks each one once however many paths reach it.
+/// `D0 = θ0 · WT`, then `D{k+1} = D{k} · D{k}` 40 levels deep: `2^40` paths to
+/// `θ0`, one definition per level. Under the log link the root is log-affine
+/// in `θ0` alone, and a sum below the root (`D40 + θ1`) is refused.
+///
+/// Dies under: the `VariableIdx` arms in `Forms::{is_const, lin, log}` (each
+/// reference then reads as no recognised form, so the first assertion is
+/// `None`); the memo lookup in `Forms::def` (the walk takes `2^40` steps, so
+/// the test does not finish).
+#[test]
+fn affinity_reads_a_programs_definitions_once() {
+    use crate::parser::model_parser::{BinOp, Expression as E};
+    let free = |_t: usize| true;
+    let r = |j: usize| Box::new(E::VariableIdx(j));
+    let mut defs = vec![E::BinOp(
+        Box::new(E::Theta(0)),
+        BinOp::Mul,
+        Box::new(E::Covariate("WT".into())),
+    )];
+    for j in 0..40 {
+        defs.push(E::BinOp(r(j), BinOp::Mul, r(j)));
+    }
+    let forms = Forms::new(&defs, &free);
+    assert_eq!(forms.log(&E::VariableIdx(40)), Some(vec![(0, true)]));
+    assert_eq!(forms.lin(&E::VariableIdx(40)), None);
+    let sum = E::BinOp(r(40), BinOp::Add, Box::new(E::Theta(1)));
+    assert_eq!(forms.log(&sum), None);
+    // A definition of data alone is a constant.
+    let data = [E::BinOp(
+        Box::new(E::Covariate("WT".into())),
+        BinOp::Div,
+        Box::new(E::Literal(70.0)),
+    )];
+    let forms = Forms::new(&data, &free);
+    let scaled = E::BinOp(Box::new(E::Theta(1)), BinOp::Mul, r(0));
+    assert_eq!(forms.lin(&scaled), Some(vec![(1, false)]));
+}
+
 /// End to end: with the exponents' columns zero, every free θ still moves —
 /// the typical values on the conjugate move, the exponents on the random walk
 /// under their declared bounds.

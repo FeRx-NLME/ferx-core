@@ -1,4 +1,5 @@
-//! FREM covariate rows on the adaptive path (#2156).
+//! FREM covariate rows on the adaptive path (#2156), and the `W_FREM_DRAWN_ETA` warning every
+//! simulator raises when it draws a FREM model's covariate η (#2245, at the end).
 //!
 //! `simulate_adaptive` returned the ODE readout on a `FREMTYPE > 0` row, where every
 //! other prediction path returns the covariate pseudo-observation `θ_k + η_m` (the
@@ -125,6 +126,8 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: FREMTYPE.to_vec(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -486,4 +489,209 @@ fn window_auc_divide_asserts_no_per_event_pk() {
         "fixture moves the PK"
     );
     auc_divide(&m, &s, None);
+}
+
+// ---- W_FREM_DRAWN_ETA (#2245) ---------------------------------------------------------
+//
+// A FREM model links its covariates to the PK only through Ω, so a subject simulated at a
+// drawn η has PK that follows the drawn covariate η, not its own covariate values. Every
+// path that draws η says so; every path that does not (propensity matching, supplied η)
+// stays silent. Each test asserts the whole message, so deleting any sentence of it — the
+// shared head, the gated FREMTYPE sentence, or an entry point's remedy — reddens one.
+
+const DRAWN_CODE: &str = "W_FREM_DRAWN_ETA";
+
+/// The message head for `n` of `of` drawn subjects; `rows` adds the FREMTYPE sentence.
+fn drawn_head(n: usize, of: usize, rows: bool) -> String {
+    let rows = if rows {
+        " Their FREMTYPE rows report the drawn covariate values, not the ones in the data."
+    } else {
+        ""
+    };
+    format!(
+        "W_FREM_DRAWN_ETA: {n} of {of} subject(s) of this FREM model were simulated with an \
+         eta drawn from Omega, covariate etas included. A FREM model links its covariates to \
+         the PK only through the correlations in Omega, so the PK of each of these subjects \
+         follows its drawn covariate etas, not its own covariate values.{rows} "
+    )
+}
+
+const SIMULATE_REMEDY: &str = "To keep each subject's PK with its own covariates, set \
+     `SimulateOptions::match_method`, which reassigns the drawn etas by matching them to each \
+     subject's posthoc eta (approximately), or simulate the fitted subjects from the FREM \
+     fit's EBEs with `simulate_adaptive_with_inputs` and `SuppliedEtas`.";
+const UNCERTAINTY_REMEDY: &str = "`simulate_with_uncertainty` has no matching option: to keep \
+     each subject's PK with its own covariates, use `simulate_with_options` with \
+     `SimulateOptions::match_method`, or `simulate_adaptive_with_inputs` with the FREM fit's \
+     EBEs as `SuppliedEtas`.";
+const ADAPTIVE_REMEDY: &str = "A controller reading `ControllerCtx::covariates` doses these \
+     subjects on covariate values their PK does not follow. Supply the FREM fit's EBEs as \
+     `SuppliedEtas` (`AdaptiveInputs::with_etas`), which are conditioned on each subject's \
+     covariate rows.";
+
+fn drawn_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| w.starts_with(DRAWN_CODE))
+        .collect()
+}
+
+/// A FREM fixture subject with no `FREMTYPE` column at all.
+fn subject_without_frem_rows(id: &str) -> Subject {
+    let mut s = subject(id, [1; 6], vec![1u32; OBS.len()]);
+    s.fremtype = Vec::new();
+    s
+}
+
+/// The helper's gates, both sides of each in one test: FREM vs not, a drawn subject vs
+/// none, and the FREMTYPE sentence on a subject with covariate rows vs one without.
+///
+/// Regressions: drop the `frem_config` gate → the non-FREM case warns; drop the
+/// `n_drawn == 0` arm → the empty case warns; make the FREMTYPE sentence unconditional
+/// (or drop it) → one of the two text assertions fails.
+#[test]
+fn frem_drawn_eta_warning_gates_and_text() {
+    let m = model("  obs_scale = V", false, [1; 6]);
+    let with_rows = subject("1", [1; 6], vec![1u32; OBS.len()]);
+    let without_rows = subject_without_frem_rows("2");
+
+    let got = crate::api::frem_drawn_eta_warning(&m, 3, [&with_rows, &without_rows], "R.");
+    assert_eq!(
+        got.as_deref(),
+        Some(format!("{}R.", drawn_head(2, 3, true)).as_str())
+    );
+    let got = crate::api::frem_drawn_eta_warning(&m, 3, [&without_rows], "R.");
+    assert_eq!(
+        got.as_deref(),
+        Some(format!("{}R.", drawn_head(1, 3, false)).as_str())
+    );
+
+    assert_eq!(
+        crate::api::frem_drawn_eta_warning(&m, 3, std::iter::empty(), "R."),
+        None,
+        "no drawn subject: silent"
+    );
+    let mut plain = model("  obs_scale = V", false, [1; 6]);
+    plain.frem_config = None;
+    assert_eq!(
+        crate::api::frem_drawn_eta_warning(&plain, 3, [&with_rows], "R."),
+        None,
+        "a non-FREM model: silent"
+    );
+
+    // Classified as a simulation finding, not by a prose arm keyed on "omega".
+    let w = crate::types::classify_warning(&drawn_head(1, 1, true));
+    assert_eq!(w.category.as_str(), "simulation");
+    assert_eq!(w.severity, crate::types::WarningSeverity::Warning);
+}
+
+/// `simulate_with_options_diag` warns on its drawn branch, with its own remedy, and is
+/// silent under `match_method`, the route that remedy names.
+///
+/// Regressions: drop the call → the drawn case has no warning; move it below the branch
+/// split so it also runs on the matched branch → the matched case warns.
+#[test]
+fn simulate_with_options_diag_reports_a_drawn_frem_eta() {
+    let m = model("  obs_scale = V", false, [1; 6]);
+    let mut pop = population([1; 6]);
+    // Finite, positive observations so the matched branch's posthoc pass has data.
+    pop.subjects[0].observations = vec![70.0, 1.8, 1.0, 0.2, 70.0, 0.1];
+    let drawn = simulate_with_options_diag(
+        &m,
+        &pop,
+        &m.default_params,
+        1,
+        &SimulateOptions {
+            seed: Some(7),
+            ..Default::default()
+        },
+    )
+    .expect("simulate");
+    let want = format!("{}{SIMULATE_REMEDY}", drawn_head(1, 1, true));
+    assert_eq!(drawn_warnings(&drawn.warnings), vec![&want]);
+
+    let matched = simulate_with_options_diag(
+        &m,
+        &pop,
+        &m.default_params,
+        1,
+        &SimulateOptions {
+            seed: Some(7),
+            match_method: Some(crate::propensity_match::MatchMethod::Optimal),
+            ..Default::default()
+        },
+    )
+    .expect("matched simulate");
+    assert!(
+        drawn_warnings(&matched.warnings).is_empty(),
+        "propensity matching is the named remedy: {:?}",
+        matched.warnings
+    );
+}
+
+/// `simulate_with_uncertainty_diag` always draws η, so it always warns on a FREM model,
+/// with a remedy that does not point at an option it lacks.
+///
+/// Regression: drop the call → no warning.
+#[test]
+fn simulate_with_uncertainty_diag_reports_a_drawn_frem_eta() {
+    let m = model("  obs_scale = V", false, [1; 6]);
+    let pop = population([1; 6]);
+    let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+    let out = simulate_with_uncertainty_diag(
+        &m,
+        &pop,
+        &fit,
+        &SimulateUncertaintyOptions {
+            n_uncertainty_draws: 2,
+            n_sim_per_draw: 1,
+            method: crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
+            seed: Some(7),
+        },
+    )
+    .expect("uncertainty");
+    let want = format!("{}{UNCERTAINTY_REMEDY}", drawn_head(1, 1, true));
+    assert_eq!(drawn_warnings(&out.warnings), vec![&want]);
+}
+
+/// The adaptive path counts only the subjects whose η was drawn: all of them with no
+/// supplied η, none when every subject is supplied, and the unmatched one when the run
+/// mixes supplied and drawn subjects (`UnmatchedSubjects::Draw`).
+///
+/// Regressions: drop the call → the drawn case has no warning; drop the `is_none` filter
+/// → the all-supplied case warns and the mixed case says 2 of 2.
+#[test]
+fn adaptive_reports_only_the_subjects_whose_frem_eta_was_drawn() {
+    let m = model("  obs_scale = V", false, [1; 6]);
+    let pop = population([1; 6]);
+    let drawn = simulate_adaptive(&m, &pop, &m.default_params, 1, hold, &opts()).expect("drawn");
+    let want = format!("{}{ADAPTIVE_REMEDY}", drawn_head(1, 1, true));
+    assert_eq!(drawn_warnings(&drawn.warnings), vec![&want]);
+
+    let e = SuppliedEtas::from_table(
+        vec!["1".to_string()],
+        vec!["ETA_V".to_string(), "ETA_WT".to_string()],
+        vec![vec![0.2, 11.5]],
+    )
+    .expect("valid table");
+    let inputs = AdaptiveInputs::new(&m.default_params).with_etas(&e);
+    let supplied =
+        simulate_adaptive_with_inputs(&m, &pop, &inputs, 1, hold, &opts()).expect("supplied");
+    assert!(
+        drawn_warnings(&supplied.warnings).is_empty(),
+        "every η supplied: {:?}",
+        supplied.warnings
+    );
+
+    // Subject "2" has no supplied η and no FREMTYPE rows; "1" is supplied and has them,
+    // so the FREMTYPE sentence must also follow the drawn subjects only.
+    let mut mixed_pop = population([1; 6]);
+    mixed_pop.subjects.push(subject_without_frem_rows("2"));
+    let inputs = AdaptiveInputs::new(&m.default_params)
+        .with_etas(&e)
+        .with_unmatched(UnmatchedSubjects::Draw);
+    let mixed =
+        simulate_adaptive_with_inputs(&m, &mixed_pop, &inputs, 1, hold, &opts()).expect("mixed");
+    let want = format!("{}{ADAPTIVE_REMEDY}", drawn_head(1, 2, false));
+    assert_eq!(drawn_warnings(&mixed.warnings), vec![&want]);
 }

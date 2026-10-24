@@ -216,7 +216,17 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // 332.264851 → 332.264852, the optimizer stops at OFV 205.09032950834 → 205.09032950484
     // (−3.5e-9), worst θ TVKA 2.7e-6 relative, |g|∞ 1.5e-3 → 1.8e-4. The FOCEI literals
     // stayed inside `ESS_REL_TOL` again.
-    assert_ess(f.sir_ess, 402.382_022_243_937_3, "FOCE packed");
+    // #2210 moved it by −2.3e-6 relative (402.3820222439373 → 402.38107815756786; Linux
+    // x86_64 with CI's `ci-test` profile and `ci,slow-tests` features reproduces the old pin
+    // to every printed digit at the base and the new value at `main` ebd20c6e, matching the
+    // CI dispatches since): `div_taped` stopped recording a node for a constant zero over a
+    // taped value, so the θ-gradient's reverse sweep sums in a different order. Its last bits
+    // move the L-BFGS path, which stops at the same optimum: OFV 205.090329609855 →
+    // 205.090329605773 (−2.0e-11 relative) after 44 → 48 evaluations, worst θ TVKA 5.5e-7
+    // relative, measured base (fe129ea5) against #2210 (15041af3). The fixed-seed SIR
+    // proposal is built from the covariance at that slightly different point. The FOCEI
+    // literals above stayed inside `ESS_REL_TOL`.
+    assert_ess(f.sir_ess, 402.381_078_157_567_86, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 

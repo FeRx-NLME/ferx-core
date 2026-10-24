@@ -11,7 +11,8 @@
 //! No NONMEM anchor: the fix creates no new numeric object — the 25-axis program is
 //! evaluated in two θ-column chunks whose blocks are bit-identical to the one-chunk
 //! evaluation (pinned in Tier 1, `sens::provider::tests::iov_program_*`). What this pins is
-//! the wiring: a real fit of the 25-axis model reports no subject on finite differences.
+//! the wiring: a real fit of the 25-axis model puts no subject on finite-difference inner
+//! gradients and does not put the population on finite-difference outer ones.
 //! Mutation (pre-#2093; `iov_combined_derivs_dyn` was retired in #2093): it returning
 //! `None` past 24 axes again — the pad18 fit
 //! then warns that 10 of 10 subjects use finite-difference inner gradients and that 10 of
@@ -70,11 +71,28 @@ fn iov_program_one_past_the_axis_cap_keeps_the_analytic_gradient() {
         );
         assert_eq!(r.gradient_method_inner, "analytic (Dual2)", "{name}: inner");
         assert_eq!(r.gradient_method_outer, "analytic (Dual2)", "{name}: outer");
+        // The inner route has no trial-point declines: any inner FD use is structural.
         assert!(
-            !r.warnings.iter().any(|w| w
-                .contains("could not be given the exact analytic outer gradient")
-                || w.contains("finite-difference inner gradients")),
-            "{name}: a subject fell back to finite differences: {:?}",
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("finite-difference inner gradients")),
+            "{name}: a subject fell back to finite-difference inner gradients: {:?}",
+            r.warnings
+        );
+        // The outer route can decline a subject at a single trial point where its gradient
+        // cannot be formed, independently of the program's width: on #2210 (a change to
+        // gradient rounding only) pad17's one line search jumped to `ln TVCL = 2.30`, where
+        // subject 2's EBE collapsed to `η_V = −647` (`V ≈ 1e-280`) and its θ-gradient was
+        // `NaN` — under the old rounding too, measured, at that exact point; the old path just
+        // never visited it. The pre-#1907 defect was structural: every subject, at every
+        // point. So the claim is "not all": a program past the cap must not put the whole
+        // population on finite differences.
+        let n = 10;
+        let outer_all =
+            format!("{n} of {n} subjects could not be given the exact analytic outer gradient");
+        assert!(
+            !r.warnings.iter().any(|w| w.contains(&outer_all)),
+            "{name}: every subject fell back to finite-difference outer gradients: {:?}",
             r.warnings
         );
     }

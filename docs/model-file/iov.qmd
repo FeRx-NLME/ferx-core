@@ -243,7 +243,11 @@ A wrapper prints the same rows through the engine's own formatter, at print time
 `format_kappa_rows_from`. A covariance step run later therefore changes the printed
 notes, just as it does in the CLI. `KappaRowsOptions { ascii: true }` spells `→` as `->`
 and `κ` as `kappa` for a console that cannot print UTF-8. Names are printed as
-given.
+given. A `block_kappa`'s correlations are not part of the
+rows: `ferx_core::io::output::offdiag_corrs` over `omega_iov`,
+`omega_iov_param_corr` and the kappa names returns the pairs the console's
+`--- Correlations ---` block reports, with each correlation's source (#2231; see
+[Printing the OMEGA rows from a wrapper](individual-parameters.qmd#printing-the-omega-rows-from-a-wrapper)).
 
 ### Rules and diagnostics
 
@@ -411,9 +415,11 @@ All levels are integrated inside one subject. The coarsest grouping that needs a
 
 The level columns are read with the data, like covariates, so they need no `[covariates]` declaration, and a model with a `[covariates]` block does not warn about them unless an expression also reads one (`if (ARM == 2)`) or a `theta …[COL]` level block indexes on one (`theta PLACEBO[STUDY, TIME]`), which makes it a covariate as well. Every record needs a value in every level column, since its group at each level is identified by those values, and a label is a **numeric code**: a text id such as `NCT01` has to be written as a number. A record with no numeric value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time.
 
-Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group. This holds when the data are read for the model: by the model file's own fit, by `read_population_for` (the CLI and the R package use it) and by `ferx check --data`. The model-blind readers (`read_nonmem_csv*`) carry a blank level cell forward like any covariate, so a population built with them should have a label on every row.
+Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row's missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group. This holds when the data are read for the model: by the model file's own fit, by `read_population_for` (the CLI and the R package use it) and by `ferx check --data`. The model-blind readers (`read_nonmem_csv*`) do not know which columns are levels, so they fill a blank level cell from the record before it like any covariate's, but they note the filled cell (`Subject::filled_cells`), and `fit()`, `ferx check --data` and `simulate*` refuse it with `E_LEVEL_MISSING_LABEL` all the same (#2036).
 
 A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
+
+`ferx check --data` prints one informational row per level, `W_LEVEL_SUMMARY`, so a level where only some parents hold a single group is visible before the fit: the level's group count, the groups per parent (min, median and max), how many parents hold a single group, and the kappas at the level. It counts on the observation records, as the refusal does.
 
 ### What this release supports {#nested-levels-scope}
 
@@ -423,7 +429,7 @@ Nested levels (more than one `level`) are estimated with `method = foce` or `foc
 - **Other estimators are refused** with `E_NESTED_LEVEL_METHOD_UNSUPPORTED`: SAEM, IMP, IMPMAP, Bayes, VI, Laplace and FOCEI quadrature, GN, a `[mixture]` and FREM. Each is enabled later with its own anchor. A single level is not affected.
 - **Simulation** draws each kappa once per group of its level ([below](#nested-levels-simulation)). The adaptive-dosing entry points are refused with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: their kappa stream draws one kappa per occasion.
 - **A residual `correlation … by` line** fits and simulates with nested levels, as with one level ([residual correlation](residual-correlation.qmd#with-kappa-and-nested-levels)): the marginal's `R̃` carries every level's random effects and the line's dense `R`. `by ARM` naming a level groups by that level's groups, nested by key. With the line, the inner and outer gradients and the covariance step stay analytic (#2101), and `cs` over the groups of a kappa-carrying level is refused with `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`.
-- **A `theta NAME[COL, …]` level block** whose levels each lie inside one group of a level that carries a kappa could absorb that kappa. The check that decides whether it does is not yet available for nested levels, so such a model is refused with `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`. A block whose levels cross those groups (`PLACEBO[TIME]`, say) fits as before.
+- **A `theta NAME[COL, …]` level block** is checked against the kappas as with one level. Whether a block can absorb a kappa is decided per group of the kappa's level: a kappa at `STUDY` is absorbed by `PLACEBO[STUDY, TIME]` when each of the block's levels lies inside one study, and the block then takes the within-study contrast, or is refused when no contrast identifies both. When measuring, the binder moves the kappa on every arm of its study at once, since the arms share it. A block whose levels cross those groups (`PLACEBO[TIME]`, say) cannot absorb the kappa.
 - **Post-fit output is per level** ([below](#nested-levels-output)).
 
 ### Output per level {#nested-levels-output}

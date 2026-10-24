@@ -498,19 +498,18 @@ to converge to. Measured on `0.003*TAFD`, a 21-dose and a 41-dose train differ b
 not the solver's; `SS=1` does not remove it, it only hides it behind one number.
 
 ::: {.callout-note}
-## The warning over-reports one joint PK-TTE shape
+## What the check counts as the PK block
 
 The check asks whether the **PK block** reads an absolute clock, so a `TIME`-reading hazard
 alone does not trigger it — the run-in holds the cumulative-hazard accumulator at its record
 value, so a time-dependent baseline is unaffected (see
 [SS with an ODE-accumulated hazard](#ss-with-an-ode-accumulated-hazard)).
 
-One shape slips through: an `[odes]` **intermediate** that reads time and is consumed only by
-the hazard (`TT = TIME`, then `hazard = f(TT)`) is not one of the injected derivative lines
-the filter removes, so such a model is warned about although its PK block is autonomous. It is
-safe to ignore there, and writing the time term directly in the `hazard =` expression avoids
-it. Tracked as [issue #1279](https://github.com/FeRx-NLME/ferx-core/issues/1279); the warning
-will stop appearing on this shape once that lands.
+That holds however the hazard's time term is written. An `[odes]` **intermediate** consumed
+only by the hazard (`TT = TIME`, then `hazard = f(TT)`) is not part of the PK block, and
+neither is a chain of them (`TT = TIME`, `UU = TT`, `hazard = f(UU)`): an intermediate counts
+only if some `d/dt(...)` line reads it, directly or through other intermediates. The same
+`TT = TIME` read by `d/dt(central)` *is* reported (#1279).
 
 It asks the `[odes]` right-hand side only, so `TIME` read from
 [`[individual_parameters]`](individual-parameters.qmd#time-dependent-parameters) is out of scope and

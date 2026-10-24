@@ -382,3 +382,184 @@ fn a_posthoc_run_sir_with_retired_ad_records_auto_and_its_bundle_loads() {
         Some(GradientMethod::Auto)
     );
 }
+
+// ── #1862: a pre-#1835 bundle of an FD fit warns that the post-hoc step goes analytic ───
+
+/// `fit` (carrying both records) through a `.fitrx` bundle whose `fit.json` has
+/// `gradient_method` removed from `scoring_settings` and `sir.settings` — the shape of a
+/// bundle saved before #1835 — reloaded.
+fn through_pre_1835_bundle(fit: &FitResult, population: &Population) -> FitResult {
+    use std::io::{Read as _, Write as _};
+    let dir = tempfile::tempdir().unwrap();
+    let saved = dir.path().join("new.fitrx");
+    crate::io::fitrx::save_fit(fit, population, "src\n", &saved, Default::default())
+        .expect("save_fit");
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&saved).unwrap()).unwrap();
+    let old = dir.path().join("pre_1835.fitrx");
+    let mut zw = zip::ZipWriter::new(std::fs::File::create(&old).unwrap());
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        if name == "fit.json" {
+            let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            let removed = [
+                v["scoring_settings"]
+                    .as_object_mut()
+                    .and_then(|o| o.remove("gradient_method")),
+                v["sir"]["settings"]
+                    .as_object_mut()
+                    .and_then(|o| o.remove("gradient_method")),
+            ];
+            assert!(
+                removed.iter().all(Option::is_some),
+                "premise: the key is written in both blocks"
+            );
+            buf = serde_json::to_vec(&v).unwrap();
+        }
+        zw.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(&buf).unwrap();
+    }
+    zw.finish().unwrap();
+    let loaded = crate::io::fitrx::load_fit(&old).expect("load_fit").fit;
+    assert_eq!(
+        loaded.scoring_settings.as_ref().map(|s| s.gradient_method),
+        Some(GradientMethod::Auto),
+        "premise: the stripped stage record loads auto"
+    );
+    assert_eq!(
+        loaded
+            .sir_settings
+            .as_ref()
+            .map(|s| s.scoring.gradient_method),
+        Some(GradientMethod::Auto),
+        "premise: the stripped SIR record loads auto"
+    );
+    loaded
+}
+
+/// `fit` with a SIR record (a short `run_sir` under the fit's own route), so the bundle
+/// carries both blocks the field is removed from.
+fn with_sir_record(fit: &FitResult, model: &CompiledModel, population: &Population) -> FitResult {
+    let o = FitOptions {
+        sir_samples: 20,
+        sir_resamples: 10,
+        sir_seed: Some(7),
+        ..FitOptions::default()
+    };
+    let r = crate::run_sir(fit, Some(model), Some(population), &o).expect("run_sir");
+    assert!(r.sir_settings.is_some(), "premise: the SIR record is set");
+    r
+}
+
+fn warns(r: &FitResult) -> bool {
+    let n = r
+        .warnings
+        .iter()
+        .filter(|w| *w == crate::estimation::fit_inputs::UNRECORDED_FD_ROUTE_WARNING)
+        .count();
+    assert!(n <= 1, "the note is pushed once: {:?}", r.warnings);
+    n == 1
+}
+
+/// **#1862 — an FD fit's pre-#1835 bundle: the post-hoc steps under default options warn
+/// that they go analytic, and a caller's `gradient_method = fd` silences it.** Both sides of
+/// the gate in one test, on the same loaded fit: the default call warns, the `Fd` call does
+/// not. The `run_covariance` output is fed back into `run_covariance` with `Fd` too, so a
+/// note carried over from the earlier step is taken off rather than kept.
+///
+/// Mutations: drop either `note_unrecorded_fd_route` call → that step's `warns` dies; drop
+/// the `inner_reports_analytic_model` clause → the `Fd` calls warn; key on the outer label
+/// alone (`gradient_method_inner` ignored) → the analytic control below warns.
+#[test]
+fn a_pre_1835_bundle_of_an_fd_fit_warns_that_posthoc_goes_analytic() {
+    let (model, population, f) = direct_fd_fit();
+    assert_ne!(
+        f.gradient_method_outer, ANALYTIC,
+        "premise: the outer ran FD"
+    );
+    let fd_record = with_sir_record(&f, &model, &population);
+    assert!(
+        !warns(&fd_record),
+        "a fit that records gradient_method = fd is silent"
+    );
+    let loaded = through_pre_1835_bundle(&fd_record, &population);
+    assert_eq!(
+        loaded.gradient_method_inner, FD,
+        "premise: the label survives"
+    );
+
+    let cov = |fit: &FitResult, g| {
+        let o = FitOptions {
+            gradient_method: g,
+            ..FitOptions::default()
+        };
+        crate::run_covariance(fit, Some(&model), Some(&population), &o).expect("run_covariance")
+    };
+    let sir = |fit: &FitResult, g| {
+        let o = FitOptions {
+            sir_samples: 20,
+            sir_resamples: 10,
+            sir_seed: Some(7),
+            gradient_method: g,
+            ..FitOptions::default()
+        };
+        crate::run_sir(fit, Some(&model), Some(&population), &o).expect("run_sir")
+    };
+    let cov_default = cov(&loaded, GradientMethod::Auto);
+    assert!(
+        warns(&cov_default),
+        "run_covariance: {:?}",
+        cov_default.warnings
+    );
+    assert!(
+        !warns(&cov(&loaded, GradientMethod::Fd)),
+        "run_covariance with gradient_method = fd runs as the fit did"
+    );
+    assert!(
+        !warns(&cov(&cov_default, GradientMethod::Fd)),
+        "a carried-over note is taken off when it no longer applies"
+    );
+    assert!(
+        warns(&cov(&cov_default, GradientMethod::Auto)),
+        "and kept once"
+    );
+    assert!(warns(&sir(&loaded, GradientMethod::Auto)), "run_sir");
+    assert!(
+        !warns(&sir(&loaded, GradientMethod::Fd)),
+        "run_sir with gradient_method = fd"
+    );
+}
+
+/// **#1862 control — an analytic fit's pre-#1835 bundle stays analytic and is silent.** The
+/// same stripping as above; the labels say analytic, so the `auto` the bundle loads is what
+/// the fit ran.
+#[test]
+fn a_pre_1835_bundle_of_an_analytic_fit_is_silent() {
+    let (model, population, base) = posthoc_base();
+    assert_eq!(base.gradient_method_inner, ANALYTIC, "premise");
+    let loaded = through_pre_1835_bundle(&with_sir_record(&base, &model, &population), &population);
+    let r = crate::run_covariance(
+        &loaded,
+        Some(&model),
+        Some(&population),
+        &FitOptions::default(),
+    )
+    .expect("run_covariance");
+    assert!(!warns(&r), "run_covariance: {:?}", r.warnings);
+    let r = crate::run_sir(
+        &loaded,
+        Some(&model),
+        Some(&population),
+        &FitOptions {
+            sir_samples: 20,
+            sir_resamples: 10,
+            sir_seed: Some(7),
+            ..FitOptions::default()
+        },
+    )
+    .expect("run_sir");
+    assert!(!warns(&r), "run_sir: {:?}", r.warnings);
+}

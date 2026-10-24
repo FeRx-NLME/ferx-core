@@ -261,11 +261,13 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
   honour each observation's occasion kappa, so `[derived]` expressions and
   `[output]` columns built from them are occasion-correct; only compartment-state
   access is unavailable.
-- **Analytical models with time-varying covariates**: `compartments[i]` evaluates
+- **Analytical models with time-varying covariates, or individual parameters that
+  read `TIME`**: `compartments[i]` evaluates
   to `NaN` for affected subjects — states would require time-varying PK params that
   the superposition path does not support
   (`W_DERIVED_CMT_TV_ANALYTICAL` warning is emitted).
-- **ODE models with time-varying covariates**: `compartments[i]` is approximate —
+- **ODE models with time-varying covariates, or individual parameters that read
+  `TIME`** (e.g. `CL = TVCL * (1 + k * TIME)`, #1855): `compartments[i]` is approximate —
   states integrate under the first observation's disposition parameters (`CL`, `V`,
   …) while `IPRED` uses the correct per-event PK (`W_DERIVED_CMT_TV_ODE` warning is
   emitted). An `init(state) = expr` seed is *not* part of that approximation: it is

@@ -146,6 +146,8 @@ fn make_iov_population() -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -896,7 +898,11 @@ fn simulation_single_occasion_check_has_the_fit_gate() {
     // `make_iov_population` doses at 0.0 and 3.5 with observations at 1..6.
     assert!(check(&model, &pop, &IovOccasionRule::PerDose).is_none());
     assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![3.5])).is_none());
-    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_some());
+    // #1788: the code `fit()` gives the same refusal, on the same block.
+    let d = check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0]))
+        .expect("a breakpoint after every record derives one occasion");
+    assert_eq!(d.code, "E_IOV_SINGLE_OCCASION");
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
     // No derived rule, or no kappa: not this check's refusal.
     assert!(check(&model, &pop, &IovOccasionRule::Column).is_none());
     let mut no_kappa = make_iov_model();
@@ -1451,6 +1457,8 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1537,6 +1545,8 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1686,6 +1696,8 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1790,6 +1802,8 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1883,6 +1897,8 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1984,6 +2000,8 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -2066,7 +2084,9 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
+        // The first record's value, as the reader fills it: a covariate is present
+        // only when the subject-static map carries it (#2181).
+        covariates: HashMap::from([("FREE".to_string(), 0.0)]),
         dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
@@ -2086,6 +2106,8 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -2450,6 +2472,8 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2698,6 +2722,8 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 reset_occasions: reset_label.into_iter().collect(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();

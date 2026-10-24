@@ -772,3 +772,75 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
     );
     assert!(natural.abs() < 0.15, "natural tracks the floor: {natural}");
 }
+
+/// [`floor_probe`] on the probe fixture at its own estimate, `cancel` polled,
+/// with a stand-in `ofv_at` that counts its calls and scores every point 0 —
+/// so each probed variance has ΔOFV 0 and is flagged. Returns the probe and
+/// the call count.
+fn counted_floor_probe(cancel: Option<crate::cancel::CancelFlag>) -> (Vec<FloorProbe>, usize) {
+    let (model, _) = probe_fixture();
+    let p = &model.default_params;
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+        ..
+    } = pack_with_bounds(p);
+    let names = coordinate_names(p);
+    let calls = Cell::new(0);
+    let ofv_at = |_: &ModelParameters, _: &[f64]| {
+        calls.set(calls.get() + 1);
+        0.0
+    };
+    let probe = floor_probe(&packed, &bounds, p, &fixed, &names, &cancel, ofv_at);
+    (probe, calls.get())
+}
+
+/// #1754: a cancelled SIR run spends no inner loop on the floor probe. Not
+/// cancelled, the probe scores the baseline plus each of the four free
+/// variances (5 calls) and flags all four; pre-cancelled it scores nothing.
+/// Cancelled after the baseline and the first variance, it stops there and
+/// returns nothing rather than a partial list. Mutations: the baseline check
+/// deleted — the pre-cancelled count is 1; the per-point check deleted — the
+/// mid-probe count is 5 and the probe non-empty.
+#[test]
+fn floor_probe_stops_on_cancel_and_returns_nothing() {
+    use crate::cancel::CancelFlag;
+    let (all, n) = counted_floor_probe(None);
+    assert_eq!(n, 5, "baseline + four free variances");
+    let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["ETA_CL", "ETA_V", "ETA_Q", "KAPPA_CL"]);
+
+    let (pre, n) = counted_floor_probe(Some(CancelFlag::trip_after(0)));
+    assert_eq!((pre.len(), n), (0, 0), "pre-cancelled probe ran: {pre:?}");
+
+    // Polls: before the baseline (0), before ETA_CL (1), before ETA_V (2: trips).
+    let (mid, n) = counted_floor_probe(Some(CancelFlag::trip_after(2)));
+    assert_eq!((mid.len(), n), (0, 2), "mid-probe cancel ignored: {mid:?}");
+}
+
+/// #1754, warning level: the same probe through [`low_ess_warning`]. Not
+/// cancelled, every variance is flagged and the shelf sentence is there;
+/// pre-cancelled it is gone and the ESS, draw and more-samples sentences stay.
+#[test]
+fn low_ess_warning_after_a_cancel_drops_the_shelf_sentence_only() {
+    let warn = |cancel| {
+        low_ess_warning(3.5, 1000, SirScale::Packed, &heaviest(), || {
+            counted_floor_probe(cancel).0
+        })
+        .expect("warns")
+    };
+    let live = warn(None);
+    assert!(
+        has(&live, S_SHELF_HEAD) && has(&live, S_SHELF_TAIL),
+        "{live}"
+    );
+    assert!(has(&live, S_TO_NATURAL), "{live}");
+    let cut = warn(Some(crate::cancel::CancelFlag::trip_after(0)));
+    for s in [S_ESS, S_THRESHOLD, S_HEAVIEST, S_MORE] {
+        assert!(has(&cut, s), "lost {s:?}: {cut}");
+    }
+    for s in [S_SHELF_HEAD, S_SHELF_TAIL, S_TO_NATURAL, S_TO_PACKED] {
+        assert!(!has(&cut, s), "kept {s:?}: {cut}");
+    }
+}

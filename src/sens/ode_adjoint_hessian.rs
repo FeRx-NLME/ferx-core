@@ -127,6 +127,7 @@ impl<const N: usize> Dir<N> {
 /// (`pack_params` order; the per-subject NLL Hessian, which the caller scales by 2 to the
 /// OFV), or `None` outside the adjoint's scope. `eta_hat` is the mode (the stacked
 /// `[η, κ]` under IOV) for `unpack_params(x)`.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_cov_hessian(
     model: &CompiledModel,
     subject: &Subject,
@@ -135,7 +136,89 @@ pub(crate) fn subject_adjoint_cov_hessian(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
-    let mut sc = scope(model, subject, template, x, eta_hat)?;
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_cov_hessian_at(model, subject, &pt, eta_hat, objective)
+}
+
+/// `subject_adjoint_cov_hessian` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`] the caller unpacked once for its
+/// population.
+pub(crate) fn subject_adjoint_cov_hessian_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<DMatrix<f64>> {
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Full)? {
+        HessianOut::Full(h) => Some(h),
+        HessianOut::Diag(_) => None,
+    }
+}
+
+/// The diagonal of [`subject_adjoint_cov_hessian_at`] along the packed `axes` (in `axes`
+/// order): `∂²Fᵢ/∂x_a²` for each `a`, at `axes.len()` directions instead of `x.len()` and
+/// without the dense block — what the #2159 identity-scale pre-flight reads its candidates'
+/// curvature from. `None` outside the adjoint's scope or for an axis past `x`.
+pub(crate) fn subject_adjoint_cov_diag_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<Vec<f64>> {
+    if axes.iter().any(|&i| i >= pt.x.len()) {
+        return None;
+    }
+    match cov_hessian(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        HessianSel::Diag(axes),
+    )? {
+        HessianOut::Diag(d) => Some(d),
+        HessianOut::Full(_) => None,
+    }
+}
+
+/// Which part of the covariance Hessian a pass assembles.
+#[derive(Clone, Copy)]
+enum HessianSel<'a> {
+    /// The full `x.len()`-square matrix.
+    Full,
+    /// The diagonal entries along these packed axes.
+    Diag(&'a [usize]),
+}
+
+/// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
+enum HessianOut {
+    Full(DMatrix<f64>),
+    Diag(Vec<f64>),
+}
+
+impl HessianOut {
+    fn all_finite(&self) -> bool {
+        match self {
+            HessianOut::Full(h) => h.iter().all(|v| v.is_finite()),
+            HessianOut::Diag(d) => d.iter().all(|v| v.is_finite()),
+        }
+    }
+}
+
+/// The bucket dispatch shared by [`subject_adjoint_cov_hessian_at`] and
+/// [`subject_adjoint_cov_diag_at`].
+fn cov_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    sel: HessianSel<'_>,
+) -> Option<HessianOut> {
+    let (template, x) = (pt.template, pt.x);
+    let mut sc = scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -144,13 +227,19 @@ pub(crate) fn subject_adjoint_cov_hessian(
     // stack: this runs on the fit pool's workers (`FIT_RAYON_STACK_SIZE`), on the caller's
     // thread so every fit-scoped override (`bloq_method`, …) it reads is the fit's.
     let h = match (bucket, exact) {
-        (4, true) => hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective),
-        (8, true) => hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective),
-        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
-        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
-        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
-        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
-        (48, _) => hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
+        (4, true) => {
+            hessian_with::<4, 10, DualH<4, 10, R>>(&sc, subject, template, x, objective, sel)
+        }
+        (8, true) => {
+            hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective, sel)
+        }
+        (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective, sel),
+        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective, sel),
+        (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective, sel),
+        (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective, sel),
+        (48, _) => {
+            hessian_with::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective, sel)
+        }
         _ => None,
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
@@ -201,6 +290,7 @@ pub(crate) fn cov_width_declines(
 /// The exact mode response `dη̂/dx` (one `n_eta`-vector, stacked `[η, κ]` under IOV, per
 /// packed coordinate) at the EBE `eta_hat` of `unpack_params(x)`: the EBE warm-start
 /// predictor's Jacobian (Almquist Eq. 48), FOCE's frozen-variance mode included.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_eta_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -209,12 +299,25 @@ pub(crate) fn subject_adjoint_eta_dx(
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
+    let pt = PackedPoint::new(template, x)?;
+    subject_adjoint_eta_dx_at(model, subject, &pt, eta_hat, interaction)
+}
+
+/// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
+pub(crate) fn subject_adjoint_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    interaction: bool,
+) -> Option<Vec<DVector<f64>>> {
+    let (template, x) = (pt.template, pt.x);
     let objective = if interaction {
         Objective::Focei
     } else {
         Objective::Foce
     };
-    let mut sc = scope(model, subject, template, x, eta_hat)?;
+    let mut sc = scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -225,8 +328,8 @@ pub(crate) fn subject_adjoint_eta_dx(
         x: &[f64],
         objective: Objective,
     ) -> Option<Vec<DVector<f64>>> {
-        let ctx = LikCtx::new(sc.model, subject, &sc.params);
-        let so = stacked_omega::<N>(sc.model, subject, template, &sc.params, sc.width);
+        let ctx = LikCtx::new(sc.model, subject, sc.params);
+        let so = stacked_omega::<N>(sc.model, subject, template, sc.params, sc.width);
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
         };
@@ -330,8 +433,9 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     template: &ModelParameters,
     x: &[f64],
     objective: Objective,
-) -> Option<DMatrix<f64>> {
-    let (model, params) = (sc.model, &sc.params);
+    sel: HessianSel<'_>,
+) -> Option<HessianOut> {
+    let (model, params) = (sc.model, sc.params);
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
@@ -352,7 +456,7 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
                 dirs,
             )
         };
-        if let Some(h) = red.hessian::<N>(model, &pass, template, x, sc.width) {
+        if let Some(h) = red.hessian::<N>(model, &pass, template, x, sc.width, sel) {
             #[cfg(test)]
             NN_REDUCED_HITS.with(|c| c.set(c.get() + 1));
             return Some(h);
@@ -361,13 +465,23 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let pass = |dirs: &[Dir<N>]| {
         pass::<N, M, J>(&ctx, sc, subject, template, x, objective, &so, None, dirs)
     };
-    let (w, eta_x, nodes) = mode_response::<N>(&pass, &x_dirs(n))?;
+    let axes: Vec<usize> = match sel {
+        HessianSel::Full => (0..n).collect(),
+        HessianSel::Diag(axes) => axes.to_vec(),
+    };
+    let along: Vec<Dir<N>> = axes.iter().map(|&i| Dir::x(i, [0.0; N])).collect();
+    let (w, eta_x, nodes) = mode_response::<N>(&pass, &along)?;
     // Uᵀ∇²Ψ U along u_a = (e_a, η′e_a).
-    let dirs: Vec<Dir<N>> = (0..n)
-        .map(|i| Dir::x(i, std::array::from_fn(|k| eta_x[(k, i)])))
+    let dirs: Vec<Dir<N>> = axes
+        .iter()
+        .enumerate()
+        .map(|(c, &i)| Dir::x(i, std::array::from_fn(|k| eta_x[(k, c)])))
         .collect();
-    let (_, hess) = psi_along(&pass, &w, &dirs, pass_width(nodes))?;
-    hess.iter().all(|v| v.is_finite()).then_some(hess)
+    let out = match sel {
+        HessianSel::Full => HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1),
+        HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&pass, &w, &dirs, pass_width(nodes))?),
+    };
+    out.all_finite().then_some(out)
 }
 
 /// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by reverse over forward: per pass,
@@ -383,7 +497,43 @@ fn psi_along<const N: usize>(
     let n = dirs.len();
     let mut grad = DVector::<f64>::zeros(n);
     let mut hess = DMatrix::<f64>::zeros(n, n);
-    for (c, chunk) in dirs.chunks(width.clamp(1, K)).enumerate() {
+    psi_lanes(pass, w, dirs, width, |i, g, along| {
+        grad[i] = g;
+        for (j, d) in dirs.iter().enumerate() {
+            hess[(j, i)] = along(d);
+        }
+    })?;
+    Some((grad, hess.symmetric_part()))
+}
+
+/// The diagonal of [`psi_along`]'s `∇²Ψ_w` along `dirs`: each lane read along its own
+/// direction only, `O(n)` reads instead of `O(n²)` and no `n × n` matrix.
+fn psi_diag<const N: usize>(
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
+    w: &[f64; N],
+    dirs: &[Dir<N>],
+    width: usize,
+) -> Option<Vec<f64>> {
+    let mut diag = vec![0.0; dirs.len()];
+    psi_lanes(pass, w, dirs, width, |i, _, along| {
+        diag[i] = along(&dirs[i])
+    })?;
+    Some(diag)
+}
+
+/// The sweep [`psi_along`] and [`psi_diag`] share: per pass `width` (≤ `K`) of `dirs` as
+/// the forward tangents and one sweep of `Ψ_w = F − wᵀg`, then `lane(i, ∂Ψ_w/∂u_i, along)`
+/// for each direction `i` in the pass, where `along(d)` reads `d`'s component of the column
+/// `∇²Ψ_w u_i` off the sweep.
+fn psi_lanes<const N: usize>(
+    pass: &impl Fn(&[Dir<N>]) -> Option<Pass<N>>,
+    w: &[f64; N],
+    dirs: &[Dir<N>],
+    width: usize,
+    mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir<N>) -> f64),
+) -> Option<()> {
+    let width = width.clamp(1, K);
+    for (c, chunk) in dirs.chunks(width).enumerate() {
         let p = pass(chunk)?;
         let psi = p.f
             - <Out as PkNum>::wsum3(
@@ -392,14 +542,12 @@ fn psi_along<const N: usize>(
             );
         let adj = rsweep::<K>(&psi.g);
         for a in 0..chunk.len() {
-            let i = c * width.clamp(1, K) + a;
-            grad[i] = psi.g[a].v;
-            for (j, d) in dirs.iter().enumerate() {
-                hess[(j, i)] = p.leaves.along(adj, a, d);
-            }
+            lane(c * width + a, psi.g[a].v, &|d: &Dir<N>| {
+                p.leaves.along(&adj, a, d)
+            });
         }
     }
-    Some((grad, hess.symmetric_part()))
+    Some(())
 }
 
 #[cfg(all(test, feature = "nn"))]
@@ -434,21 +582,27 @@ fn nn_reduce_off() -> bool {
 /// with `η′` along `a` equal to `η′_z J_z[:, a]`. The passes through the recorders are then over
 /// `|B| = n_r + n_z + N` directions instead of `n` (16 against 147 on the 141-weight
 /// `warfarin_dcm`), and the weights' own curvature comes from the networks alone.
+///
+/// The outer gradient (`run`) reads the same reduction: the outputs as tape leaves, and the
+/// weights' adjoint as one backward pass through each network.
 #[cfg(feature = "nn")]
-struct NnReduction {
+pub(super) struct NnReduction<'s> {
     /// Raw outputs per network at the current weights.
-    z: Vec<Vec<f64>>,
+    pub(super) z: Vec<Vec<f64>>,
     /// Per network: its first packed weight coordinate, its weight count, and its inputs.
-    nets: Vec<(usize, usize, std::collections::HashMap<String, f64>)>,
+    pub(super) nets: Vec<(usize, usize, &'s std::collections::HashMap<String, f64>)>,
+    /// Per network, the forward pass `z` came from, kept for the gradient's backward pass
+    /// (`MlpMapper::vjp_at`), so a gradient evaluates each network once.
+    pub(super) forward: Vec<crate::nn::NnForward>,
 }
 
 #[cfg(feature = "nn")]
-impl NnReduction {
+impl<'s> NnReduction<'s> {
     /// `None` when the reduction does not hold (a weight read directly, an input that
     /// varies over the subject's records) or does not pay (fewer weights than outputs).
-    fn build(
+    pub(super) fn build(
         model: &CompiledModel,
-        subject: &Subject,
+        subject: &'s Subject,
         template: &ModelParameters,
         theta: &[f64],
     ) -> Option<Self> {
@@ -459,6 +613,7 @@ impl NnReduction {
         }
         let mut z = Vec::new();
         let mut nets = Vec::new();
+        let mut forward = Vec::new();
         for nn in &model.covariate_nns {
             let n_w = nn.mapper.mlp().n_weights();
             let end = nn.weights_offset + n_w;
@@ -475,12 +630,16 @@ impl NnReduction {
             {
                 return None;
             }
-            z.push(nn.mapper.forward_raw_g(&theta[nn.weights_offset..end], rep));
-            nets.push((nn.weights_offset, n_w, rep.clone()));
+            let fwd = nn
+                .mapper
+                .forward_kept_raw(&theta[nn.weights_offset..end], rep)?;
+            z.push(fwd.output().to_vec());
+            forward.push(fwd);
+            nets.push((nn.weights_offset, n_w, rep));
         }
         let n_w: usize = nets.iter().map(|n| n.1).sum();
         let n_z: usize = z.iter().map(Vec::len).sum();
-        (n_w > n_z).then_some(NnReduction { z, nets })
+        (n_w > n_z).then_some(NnReduction { z, nets, forward })
     }
 
     fn hessian<const N: usize>(
@@ -490,7 +649,8 @@ impl NnReduction {
         template: &ModelParameters,
         x: &[f64],
         width: usize,
-    ) -> Option<DMatrix<f64>> {
+        sel: HessianSel<'_>,
+    ) -> Option<HessianOut> {
         let n = x.len();
         let n_z: usize = self.z.iter().map(Vec::len).sum();
         let mut is_w = vec![false; n];
@@ -536,15 +696,41 @@ impl NnReduction {
                 c[(nr + n_z + j, *a)] = (0..n_z).map(|k| resp[(j, nr + k)] * ja[k]).sum();
             }
         }
-        let mut hess = c.transpose() * hb * &c;
-        for (k, net_h) in hz.iter().enumerate() {
-            let gk = gb[nr + k];
-            for &((a, b), v) in net_h {
-                hess[(a, b)] += gk * v;
+        let out = match sel {
+            HessianSel::Full => {
+                let mut hess = c.transpose() * hb * &c;
+                for (k, net_h) in hz.iter().enumerate() {
+                    let gk = gb[nr + k];
+                    for &((a, b), v) in net_h {
+                        hess[(a, b)] += gk * v;
+                    }
+                }
+                HessianOut::Full(hess.symmetric_part())
             }
-        }
-        let hess = hess.symmetric_part();
-        hess.iter().all(|v| v.is_finite()).then_some(hess)
+            // `cᵢᵀ H_B cᵢ` per axis plus the networks' own curvature on the diagonal, with no
+            // `n × n` product.
+            HessianSel::Diag(axes) => {
+                let mut own = vec![0.0; n];
+                for (k, net_h) in hz.iter().enumerate() {
+                    let gk = gb[nr + k];
+                    for &((a, b), v) in net_h {
+                        if a == b {
+                            own[a] += gk * v;
+                        }
+                    }
+                }
+                let hbs = hb.symmetric_part();
+                HessianOut::Diag(
+                    axes.iter()
+                        .map(|&a| {
+                            let ca = c.column(a);
+                            (ca.transpose() * &hbs * ca)[(0, 0)] + own[a]
+                        })
+                        .collect(),
+                )
+            }
+        };
+        out.all_finite().then_some(out)
     }
 
     /// `J_z` as `(packed weight axis, ∂z/∂x_a over all outputs)` and per output `k` the
@@ -678,7 +864,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     dirs: &[Dir<N>],
 ) -> Option<Pass<N>> {
     debug_assert!(dirs.len() <= K);
-    let (model, params, eta) = (sc.model, &sc.params, &sc.eta[..]);
+    let (model, params, eta) = (sc.model, sc.params, &sc.eta[..]);
     let n_obs = subject.observations.len();
     let seed = |i: usize| -> [R; K] {
         std::array::from_fn(|a| {
@@ -728,7 +914,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             outer.push(o);
             plain.push(p);
         }
-        NnPresetGuard::enter(vec![Box::new(outer), Box::new(plain)])
+        (outer, plain)
     });
     #[cfg(not(feature = "nn"))]
     let _ = nn_z;
@@ -747,13 +933,17 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             g: lift_g(tan(k)),
         })
         .collect();
+    #[cfg(feature = "nn")]
+    let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o.as_slice()));
+    #[cfg(not(feature = "nn"))]
+    let leaves_outer = ThetaLeaves::theta(&th);
     let preds = record(
         model,
         subject,
         sc.layout.as_ref(),
         &params.theta,
         eta,
-        &th,
+        &leaves_outer,
         &et,
     )?;
     if preds.len() != n_obs {
@@ -798,7 +988,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         sc.layout.as_ref(),
                         &params.theta,
                         &[0.0; N],
-                        &th,
+                        &leaves_outer,
                         &et0,
                     )?;
                     (p0.len() == n_obs).then(|| p0.iter().map(|y| comp(y, 0)).collect())
@@ -858,6 +1048,11 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 inner_l(ctx, &f, &eo, &p, None)? + half_logdet
             } else {
                 let th_o: Vec<Out> = unpack_theta(template, xo);
+                #[cfg(feature = "nn")]
+                let leaves_plain =
+                    ThetaLeaves::with_nn(&th_o, preset.as_ref().map(|(_, p)| p.as_slice()));
+                #[cfg(not(feature = "nn"))]
+                let leaves_plain = ThetaLeaves::theta(&th_o);
                 let mut terms: Vec<Out> = Vec::new();
                 for (z, c) in agq_grid::<N>(n_agq, sc.width) {
                     // b = η + √2·L⁻ᵀz, and the predictions recorded at b.
@@ -879,7 +1074,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         sc.layout.as_ref(),
                         &params.theta,
                         &bv,
-                        &th_o,
+                        &leaves_plain,
                         &b,
                     )
                     .filter(|q| q.len() == n_obs)?;
@@ -901,13 +1096,6 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             Some((a, inner_grad(ctx, &f, &g, &eo, &p, None)?))
         }
     };
-    // A recording that did not read the seeded outputs differentiated the wrong function.
-    #[cfg(feature = "nn")]
-    if preset.as_ref().is_some_and(NnPresetGuard::missed) {
-        return None;
-    }
-    #[cfg(feature = "nn")]
-    drop(preset);
     let (f, g) = out?;
     Some(Pass {
         f,

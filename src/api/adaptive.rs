@@ -1118,6 +1118,21 @@ where
 
     // The SS note first, then the bundle — the order the simulate paths use.
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    // A supplied η (#1594) is the FREM fit's EBE, conditioned on the subject's own covariate
+    // rows, so only the subjects whose η was drawn are counted (#2245).
+    warnings.extend(super::frem_drawn_eta_warning(
+        model,
+        population.subjects.len(),
+        population
+            .subjects
+            .iter()
+            .zip(&supplied_etas)
+            .filter(|(_, e)| e.is_none())
+            .map(|(s, _)| s),
+        "A controller reading `ControllerCtx::covariates` doses these subjects on covariate \
+         values their PK does not follow. Supply the FREM fit's EBEs as `SuppliedEtas` \
+         (`AdaptiveInputs::with_etas`), which are conditioned on each subject's covariate rows.",
+    ));
     warnings.extend(super::non_fit_diagnostics(
         model,
         population,
@@ -1192,6 +1207,8 @@ pub(crate) fn adaptive_window_aucs_to_model_scale(
 ///    scales each occasion under its own κ.
 /// 2. The LTBS log-wrap. A no-op today, since `reject_unsupported_adaptive` refuses a
 ///    log-transformed model; it is here so this function mirrors the sink step for step.
+///    Steps 2 and 3 are the sink's own `pk::finish_on_observation_scale`, so a step the
+///    sink's tail gains reaches this conversion too (#2259).
 /// 3. The FREM override (#2156): a `FREMTYPE > 0` covariate pseudo-observation is
 ///    `θ_k + η_m`, not the readout. `eta_slice` is `[η_bsv | 0…0]`, so the BSV indices
 ///    `frem_predictions` names read it directly, with or without IOV — the sink passes
@@ -1227,8 +1244,7 @@ pub(crate) fn adaptive_rows_to_model_scale(
         }
         Some(_) => {}
     }
-    crate::pk::apply_log_transform(model, preds);
-    crate::pk::apply_frem_prediction_override(model, subject, theta, eta_slice, preds);
+    crate::pk::finish_on_observation_scale(model, subject, theta, eta_slice, preds);
 }
 
 /// Validate that the per-(subject, replicate) PK snapshots the reactive driver was
@@ -1789,19 +1805,16 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     super::check_param_shape(model, &super::ParamBlock::all_of(params))?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
-    // Apply the same loud check fits use for model covariates (`check_covariates`).
+    // Apply the same loud check fits use for model covariates (`check_covariates`),
+    // through the same per-subject predicate (#2181).
     let missing: Vec<&str> = compiled
         .observe_covariates
         .iter()
-        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .filter(|name| !super::validation::population_carries(population, name))
         .map(|s| s.as_str())
         .collect();
     if !missing.is_empty() {
-        let available = if population.covariate_names.is_empty() {
-            "(none)".to_string()
-        } else {
-            population.covariate_names.join(", ")
-        };
+        let available = super::validation::available_covariate_columns(population);
         // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
         return Err(super::entry_refusals::observe_covariate_missing(format!(
             "[adaptive_dosing] `observe` references covariate(s) not found in data \

@@ -48,7 +48,15 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   (`pk_only_raw_times`) and the written `TIME` of each dose and reset row of a
 ///   reset period that restarts `TIME` (`reset_period_times`), the `TIME`
 ///   `[individual_parameters]` now reads there.
-pub(crate) const SCHEME: u32 = 4;
+/// - `5`: #1854. The reader keeps the covariate snapshot of each endpoint row
+///   (`endpoint_covariates`) when a covariate is time-varying, hashed with the other
+///   snapshots, so a fit of a population differing only in an endpoint row's covariate
+///   is caught.
+/// - `6`: #2036. The reader notes each covariate column whose blank cell it filled
+///   from another record (`filled_cells`), hashed with the covariates, so a
+///   population whose blank level cell `fit()` refuses does not match the fit of one
+///   that writes the carried value out.
+pub(crate) const SCHEME: u32 = 6;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
@@ -397,6 +405,8 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         pk_only_occasions,
         fremtype,
         obs_records,
+        endpoint_covariates,
+        filled_cells,
     } = s;
 
     let mut r = Encoder::default();
@@ -456,9 +466,19 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         obs_covariates,
         pk_only_covariates,
         reset_covariates,
+        endpoint_covariates,
     ] {
         c.len(snapshots.len());
         snapshots.iter().for_each(|m| c.map(m));
+    }
+    // Which blank cells the reader filled from another record (#2036). The snapshots
+    // cannot say: `ARM = 1, 2, 2` and `1, 2, <blank>` carry the same values forward,
+    // and only the second is refused (`E_LEVEL_MISSING_LABEL`), so a fit of the first
+    // must not vouch for the second in `run_covariance` / `run_sir`.
+    c.len(filled_cells.len());
+    for (column, time) in filled_cells {
+        c.str(column);
+        c.f64(*time);
     }
 
     SubjectPrint {
@@ -482,6 +502,10 @@ fn dose(e: &mut Encoder, d: &DoseEvent) {
         ii,
         rate_mode,
         infusion_def,
+        // Not hashed: an `EVID=4` row and an `EVID=3` row followed by a co-timed dose
+        // build the same engine input, so the objective cannot tell them apart. It only
+        // labels records for the #2104 warning's count.
+        evid4: _,
     } = d;
     e.f64(*time);
     e.f64(*amt);

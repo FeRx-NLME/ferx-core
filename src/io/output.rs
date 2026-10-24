@@ -48,6 +48,24 @@ fn cv_pct(var: f64) -> f64 {
     }
 }
 
+/// Above this a console CV% switches from `{:.1}` to scientific notation
+/// (#1883). `{:.1}` prints every integer digit of the double, so a variance
+/// near 156 printed a 36-digit CV% of which ~17 carry information; a CV% this
+/// large already says the log-normal reading does not fit the variance.
+const CV_PCT_FIXED_MAX: f64 = 1e6;
+
+/// A CV% for a console row: `{:.1}` below [`CV_PCT_FIXED_MAX`], three
+/// significant figures in scientific notation (`7.64e35`) from it up, `inf`
+/// past `exp_m1`'s overflow. Rust's `e` spelling parses back as a number in R
+/// and Python, which ferx-r's tests rely on.
+fn console_cv_pct(cv: f64) -> String {
+    if cv.is_finite() && cv >= CV_PCT_FIXED_MAX {
+        format!("{:.2e}", cv)
+    } else {
+        format!("{:.1}", cv)
+    }
+}
+
 /// A CV% as a YAML scalar: `{:.2}` when finite, else `.inf` — YAML's own
 /// spelling of infinity, which a numeric reader parses as a float. Rust's
 /// `inf` would be read back as a string.
@@ -125,7 +143,9 @@ fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<St
 /// `100 · √var / √n` (#1858).
 fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}{}", cv_pct(var), at)),
+        None | Some(EtaParamType::LogNormal) => {
+            Some(format!("CV% = {}{}", console_cv_pct(cv_pct(var)), at))
+        }
         Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at)),
         Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
             Some(format!("SD = {:.4}{}, logit scale", sd_from_var(var), at))
@@ -678,6 +698,48 @@ fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
     }
 }
 
+/// The console's `--- Kappa Shrinkage (pooled) ---` block, one string per line
+/// (#2083), empty when the fit has no kappa shrinkage. The pooled lines name each κ's
+/// level under nested levels, as [`format_summary`] does, since the pool is that
+/// level's groups; the per-occasion lines keep the bare names, as there.
+pub(crate) fn format_kappa_shrinkage_lines(result: &FitResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    if result.shrinkage_kappa.is_empty() {
+        return lines;
+    }
+    let pct = |sh: f64| {
+        if sh.is_finite() {
+            format!("{:.1}%", sh * 100.0)
+        } else {
+            "NaN".to_string()
+        }
+    };
+    lines.push("\n--- Kappa Shrinkage (pooled) ---".to_string());
+    for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+        lines.push(format!(
+            "  {} shrinkage: {}",
+            kappa_name_at_level(result, k),
+            pct(sh)
+        ));
+    }
+    if !result.shrinkage_kappa_by_occ.is_empty() {
+        lines.push("  Per-occasion:".to_string());
+        for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+            let parts: Vec<String> = occ_sh
+                .iter()
+                .enumerate()
+                .map(|(k, &sh)| format!("{} {}", kappa_name(result, k), pct(sh)))
+                .collect();
+            lines.push(format!(
+                "    Occasion slot {}: {}",
+                occ_idx + 1,
+                parts.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
 /// [`kappa_name`] over the bare name list.
 fn kappa_name_in(names: &[String], k: usize) -> &str {
     names.get(k).map(|s| s.as_str()).unwrap_or("KAPPA")
@@ -688,28 +750,59 @@ fn eta_name(result: &FitResult, k: usize) -> &str {
     result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA")
 }
 
-/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
-/// covariance matrix: the names, the covariance and its parameter correlation.
-struct OffDiagCorr<'a> {
-    i: usize,
-    j: usize,
-    name_i: &'a str,
-    name_j: &'a str,
-    cov: f64,
-    corr: f64,
+/// Where an [`OffDiagCorr::corr`] came from, so a wrapper can label it: the
+/// covariance step's parameter-correlation matrix, or the cov/√var fallback
+/// when none was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffDiagCorrSource {
+    /// The `param_corr` matrix entry `(i, j)`.
+    ParamCorr,
+    /// `cov / (√var_i · √var_j)`, or 0 when either variance is not positive.
+    /// Used when no `param_corr` matrix was given, or it has no `(i, j)` entry.
+    Fallback,
 }
 
-/// The off-diagonal entries of `m` the console and `format_summary` report, in
-/// row-major lower-triangle order: every `|cov| > 1e-15`, its correlation from
-/// `param_corr` or the cov/√var fallback ([`param_corr_fallback`]). The four
-/// correlation walks (Ω and Ω_IOV, console and summary) all read this, so they
-/// cannot disagree on which pairs are correlated (#1682); each keeps its own
-/// line format.
-fn offdiag_corrs<'a>(
+/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
+/// covariance matrix: the names, the covariance and its correlation. Returned
+/// by [`offdiag_corrs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffDiagCorr<'a> {
+    /// Row of the entry (the later random effect).
+    pub i: usize,
+    /// Column of the entry, `j < i`.
+    pub j: usize,
+    /// Name of random effect `i`.
+    pub name_i: &'a str,
+    /// Name of random effect `j`.
+    pub name_j: &'a str,
+    /// The covariance `m[(i, j)]`.
+    pub cov: f64,
+    /// The correlation, from the source named by `corr_source`.
+    pub corr: f64,
+    /// Whether `corr` is the `param_corr` entry or the cov/√var fallback.
+    pub corr_source: OffDiagCorrSource,
+}
+
+/// The off-diagonal entries of the random-effect covariance matrix `m` (Ω, or
+/// Ω_IOV of a `block_kappa`) that the console's `--- Correlations ---` blocks
+/// and [`format_summary`] report, in row-major lower-triangle order: every
+/// `(i, j)`, `j < i`, with `|cov| > 1e-15`. Its correlation is the
+/// `param_corr` entry when the matrix is given (`FitResult::omega_param_corr`
+/// / `omega_iov_param_corr`), else `cov / (√var_i · √var_j)` (0 when either
+/// variance is not positive); [`OffDiagCorr::corr_source`] says which.
+///
+/// `names` is indexed like `m`; a missing name reads as `default_name` (the
+/// console uses `ETA` for Ω and `KAPPA` for Ω_IOV). The console and summary
+/// walks for Ω and Ω_IOV all read this, so they cannot disagree on which pairs
+/// are correlated (#1682); a wrapper (ferx-r's `print.ferx_fit()`, #2231)
+/// reads the same facts and formats each line itself.
+pub fn offdiag_corrs<'a>(
     m: &nalgebra::DMatrix<f64>,
     param_corr: Option<&nalgebra::DMatrix<f64>>,
-    name: impl Fn(usize) -> &'a str,
+    names: &'a [String],
+    default_name: &'a str,
 ) -> Vec<OffDiagCorr<'a>> {
+    let name = |k: usize| names.get(k).map_or(default_name, |s| s.as_str());
     let mut out = Vec::new();
     for i in 0..m.nrows() {
         for j in 0..i {
@@ -717,13 +810,21 @@ fn offdiag_corrs<'a>(
             if cov.abs() <= 1e-15 {
                 continue;
             }
+            let (corr, corr_source) = match param_corr.and_then(|pc| pc.get((i, j))) {
+                Some(&c) => (c, OffDiagCorrSource::ParamCorr),
+                None => (
+                    param_corr_fallback(None, cov, m[(i, i)], m[(j, j)], i, j),
+                    OffDiagCorrSource::Fallback,
+                ),
+            };
             out.push(OffDiagCorr {
                 i,
                 j,
                 name_i: name(i),
                 name_j: name(j),
                 cov,
-                corr: param_corr_fallback(param_corr, cov, m[(i, i)], m[(j, j)], i, j),
+                corr,
+                corr_source,
             });
         }
     }
@@ -735,9 +836,12 @@ fn offdiag_corrs<'a>(
 fn format_omega_corr_rows(result: &FitResult) -> String {
     use std::fmt::Write;
     let n_eta = result.omega.nrows();
-    let corrs = offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-        eta_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        &result.omega,
+        result.omega_param_corr.as_ref(),
+        &result.eta_names,
+        "ETA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -764,9 +868,12 @@ fn format_kappa_corr_rows(result: &FitResult) -> String {
     let Some(iov) = result.omega_iov.as_ref() else {
         return String::new();
     };
-    let corrs = offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-        kappa_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        iov,
+        result.omega_iov_param_corr.as_ref(),
+        &result.kappa_names,
+        "KAPPA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -888,10 +995,23 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
     out
 }
 
-/// `(min, median, max)` of a slice, for the compact block summary. The median
-/// is the lower of the two middle values on an even count — the levels are a
-/// nuisance block, not a quantity anyone interpolates.
-fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+/// `(min, median, max)` of a block's values — the statistic `print_results`,
+/// `format_summary` and the fit YAML print for each block [`compact_theta_blocks`]
+/// returns. The median is the **lower** of the two middle values on an even count
+/// — the levels are a nuisance block, not a quantity anyone interpolates.
+///
+/// Public so a binding that collapses the same blocks (ferx-r's `print.ferx_fit`)
+/// prints the same median as the engine instead of restating the rule (#1812):
+/// pass it `&theta[range]` for each range `compact_theta_blocks` returns.
+///
+/// Values are ordered by [`f64::total_cmp`], so a `NaN` sorts past `+inf` (or,
+/// sign bit set, below `-inf`) rather than being dropped. An empty slice has no
+/// summary and returns `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
+/// empty block.
+pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
@@ -1340,34 +1460,8 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
-    if !result.shrinkage_kappa.is_empty() {
-        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
-        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
-            let name = kappa_name(result, k);
-            if sh.is_finite() {
-                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
-            } else {
-                eprintln!("  {} shrinkage: NaN", name);
-            }
-        }
-        if !result.shrinkage_kappa_by_occ.is_empty() {
-            eprintln!("  Per-occasion:");
-            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
-                let parts: Vec<String> = occ_sh
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &sh)| {
-                        let name = kappa_name(result, k);
-                        if sh.is_finite() {
-                            format!("{} {:.1}%", name, sh * 100.0)
-                        } else {
-                            format!("{} NaN", name)
-                        }
-                    })
-                    .collect();
-                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
-            }
-        }
+    for line in format_kappa_shrinkage_lines(result) {
+        eprintln!("{line}");
     }
 
     // Run info
@@ -1526,9 +1620,12 @@ pub fn format_summary(result: &FitResult) -> String {
         // (#1657), so the two cannot drift.
         out.push_str(&format_omega_rows(result));
         // Off-diagonal correlations (block omega).
-        for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-            eta_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            &result.omega,
+            result.omega_param_corr.as_ref(),
+            &result.eta_names,
+            "ETA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -1540,9 +1637,12 @@ pub fn format_summary(result: &FitResult) -> String {
         out.push_str(&format_kappa_rows(result));
         // Off-diagonal correlations (block_kappa, #1667), in the OMEGA style
         // above and from the same matrix the console reads.
-        for c in offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-            kappa_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            iov,
+            result.omega_iov_param_corr.as_ref(),
+            &result.kappa_names,
+            "KAPPA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -2610,6 +2710,40 @@ pub fn write_result_json(result: &FitResult, path: &str) -> Result<(), String> {
 /// Write the curated, human-readable parameter estimates and uncertainty as
 /// YAML to `path` (`{model}-fit.yaml`). This is a selected subset for reading;
 /// for the complete machine-readable result use [`write_result_json`].
+/// The `warning_details:` block (#2268): every structured warning that carries a
+/// `details` payload, with its code, message and the payload itself, so the data a
+/// message points at (`W_NONFINITE_OBJECTIVE`'s `unusable_subjects`, `flip_flop`'s
+/// subjects, …) reaches a YAML reader. `warnings:` above stays a list of strings for
+/// existing consumers. Strings and the payload are written as JSON, which is valid
+/// YAML flow syntax and escapes whatever the message contains. Absent when no
+/// warning has a payload.
+fn write_yaml_warning_details(
+    f: &mut impl std::io::Write,
+    entries: &[crate::types::WarningEntry],
+) -> Result<(), String> {
+    fn json<T: serde::Serialize + ?Sized>(v: &T) -> Result<String, String> {
+        serde_json::to_string(v).map_err(|e| e.to_string())
+    }
+    let with_details: Vec<_> = entries
+        .iter()
+        .filter_map(|e| e.details.as_ref().map(|d| (e, d)))
+        .collect();
+    if with_details.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::from("\nwarning_details:\n");
+    for (e, details) in with_details {
+        out.push_str(&format!("  - code: {}\n", e.category));
+        out.push_str(&format!("    severity: {}\n", json(&e.severity)?));
+        if let Some(m) = &e.source_method {
+            out.push_str(&format!("    source_method: {}\n", json(m)?));
+        }
+        out.push_str(&format!("    message: {}\n", json(&e.message)?));
+        out.push_str(&format!("    details: {}\n", json(details)?));
+    }
+    f.write_all(out.as_bytes()).map_err(|e| e.to_string())
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -3456,10 +3590,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
+        // JSON-quoted, as in `warning_details:` below: a message interpolates
+        // subject IDs and parser text, so it can hold `"` or `\` (#2268).
         for w in &result.warnings {
-            writeln!(f, "  - \"{}\"", w).map_err(|e| e.to_string())?;
+            let quoted = serde_json::to_string(w).map_err(|e| e.to_string())?;
+            writeln!(f, "  - {quoted}").map_err(|e| e.to_string())?;
         }
     }
+    write_yaml_warning_details(&mut f, &result.warnings_structured)?;
 
     // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
     // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,
@@ -4083,6 +4221,14 @@ mod tests {
         assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
         assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
         assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn block_summary_of_an_empty_slice_is_nan_not_a_panic() {
+        // Public since #1812: a binding can hand it any slice, so the empty case
+        // must not index out of bounds.
+        let (mn, md, mx) = block_summary(&[]);
+        assert!(mn.is_nan() && md.is_nan() && mx.is_nan());
     }
 
     #[test]
@@ -4789,6 +4935,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -6856,6 +7004,21 @@ mod tests {
             );
             assert_eq!(note(t, 710.0, false), s("CV% = inf"));
         }
+        // #1883: a console CV% switches to three significant figures in
+        // scientific notation at 1e6, instead of printing every integer digit.
+        // Straddled on both sides of the bound, through `variance_note` (var
+        // 18 → 810308.4, var 19 → 1.34e6) and at the bound itself, so a switch
+        // that fires always, never, or at the wrong side of 1e6 reddens a cell.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(note(t, 18.0, false), s("CV% = 810308.4"), "{t:?}");
+            assert_eq!(note(t, 19.0, false), s("CV% = 1.34e6"), "{t:?}");
+            assert_eq!(note(t, 19.0, true), s("CV% = 1.34e6 at weight 1"));
+        }
+        assert_eq!(console_cv_pct(999_999.9), "999999.9");
+        assert_eq!(console_cv_pct(1e6), "1.00e6");
+        assert_eq!(console_cv_pct(f64::INFINITY), "inf");
+        // The YAML keeps its full `{:.2}` figure: only the console is shortened.
+        assert_eq!(variance_yaml_line(None, 19.0), s("    cv_pct: 1335972.68"));
         assert_eq!(
             variance_yaml_line(Some(Additive), add),
             s("    sd: 12.491476")
@@ -6915,12 +7078,14 @@ mod tests {
             }
             // An old bundle (no types): the CV% row carries the same label. The
             // exact CV% of an additive γ² read as log-normal is ~7.64e35 —
-            // absurd, as the 1249.1 it printed before was; only the leading
-            // digits are pinned, the rest is libm rounding.
+            // absurd, as the 1249.1 it printed before was — and prints in
+            // scientific notation, not as 36 integer digits (#1883).
             let old = format_kappa_rows(&mk(weighted, false));
             let row = line_with(&old, "K_ADD");
-            assert!(row.contains("= 156.036966  (CV% = 7638298975"), "{old}");
-            assert!(row.contains(&format!(".0{w})  SE =")), "{old}");
+            assert!(
+                row.contains(&format!("= 156.036966  (CV% = 7.64e35{w})  SE =")),
+                "{old}"
+            );
         }
 
         // #1683 / #1697: the weight line under a weighted kappa is its row's
@@ -6968,8 +7133,8 @@ mod tests {
                     false,
                     [
                         ("K_LN", Some("CV% = 11.2 at NARM = 4.0000")),
-                        ("K_ADD", Some("CV% = 29563044924.4 at NARM = 4.0000")),
-                        ("K_LGT", Some("CV% = 29563044924.4 at NARM = 4.0000")),
+                        ("K_ADD", Some("CV% = 2.96e10 at NARM = 4.0000")),
+                        ("K_LGT", Some("CV% = 2.96e10 at NARM = 4.0000")),
                         ("K_C", Some("CV% = 27.9 at NARM = 4.0000")),
                     ],
                 ),
@@ -7337,7 +7502,7 @@ mod tests {
         old.kappa_param_types.clear();
         let rows = format_kappa_rows(&old);
         assert!(
-            line_with(&rows, "K_ADD").contains("(CV% = 7638298975"),
+            line_with(&rows, "K_ADD").contains("(CV% = 7.64e35)"),
             "{rows}"
         );
 
@@ -7547,6 +7712,78 @@ mod tests {
         r.omega_iov_param_corr = Some(kc);
         r.kappa_names.truncate(2);
         r
+    }
+
+    /// #2231: the public `offdiag_corrs` facts a wrapper formats itself —
+    /// which pairs (the `1e-15` cut on `|cov|`, row-major lower triangle), their
+    /// names with the caller's default for a missing one, and the correlation
+    /// with its source: the `param_corr` entry when given, the cov/√var
+    /// fallback without one, and the fallback (not a panic) when a wrapper's
+    /// `param_corr` is smaller than the matrix.
+    #[test]
+    fn offdiag_corrs_public_facts() {
+        let r = corr_result();
+        let iov = r.omega_iov.as_ref().unwrap();
+        let facts = |m,
+                     pc,
+                     names,
+                     default|
+         -> Vec<(usize, usize, String, String, f64, f64, OffDiagCorrSource)> {
+            offdiag_corrs(m, pc, names, default)
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.i,
+                        c.j,
+                        c.name_i.to_string(),
+                        c.name_j.to_string(),
+                        c.cov,
+                        c.corr,
+                        c.corr_source,
+                    )
+                })
+                .collect()
+        };
+        use OffDiagCorrSource::{Fallback, ParamCorr};
+        let s = |x: &str| x.to_string();
+
+        assert_eq!(
+            facts(&r.omega, r.omega_param_corr.as_ref(), &r.eta_names, "ETA"),
+            vec![
+                (1, 0, s("eta_V"), s("eta_CL"), 0.02, -0.25, ParamCorr),
+                (2, 1, s("ETA"), s("eta_V"), 2e-15, 0.0, ParamCorr),
+            ],
+            "Ω with param_corr"
+        );
+        assert_eq!(
+            facts(
+                iov,
+                r.omega_iov_param_corr.as_ref(),
+                &r.kappa_names,
+                "KAPPA"
+            ),
+            vec![
+                (1, 0, s("K_ADD"), s("K_LN"), 0.5, 0.7, ParamCorr),
+                (2, 1, s("KAPPA"), s("K_ADD"), -3e-15, 0.0, ParamCorr),
+            ],
+            "Ω_IOV with param_corr"
+        );
+
+        let want_fb = 0.02 / (0.1f64.sqrt() * 0.2f64.sqrt());
+        let fb = facts(&r.omega, None, &r.eta_names, "ETA");
+        assert_eq!(fb.len(), 2, "fallback keeps the same pairs");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "no param_corr");
+
+        // A 1x1 param_corr has no (1, 0) entry: fallback, no out-of-bounds panic.
+        let short = DMatrix::identity(1, 1);
+        let fb = facts(&r.omega, Some(&short), &r.eta_names, "ETA");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "short param_corr");
+
+        // A non-positive variance makes the fallback 0, not NaN.
+        let mut m = r.omega.clone();
+        m[(0, 0)] = 0.0;
+        let fb = facts(&m, None, &[], "X");
+        assert_eq!((fb[0].2.as_str(), fb[0].5, fb[0].6), ("X", 0.0, Fallback));
     }
 
     /// The console's correlation blocks and `format_summary`'s `corr(...)`

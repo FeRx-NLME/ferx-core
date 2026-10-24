@@ -111,6 +111,8 @@ fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

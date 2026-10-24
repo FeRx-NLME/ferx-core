@@ -772,6 +772,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),
@@ -1018,6 +1020,8 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             };
             let ode_spec = OdeSpec {
                 chz_state_slots: Vec::new(),
@@ -1167,6 +1171,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),
@@ -2169,6 +2175,8 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),

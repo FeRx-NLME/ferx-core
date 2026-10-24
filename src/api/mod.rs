@@ -19,9 +19,9 @@ mod validation;
 pub(crate) use validation::check_ctmm_time_dependent_pk_diags;
 pub(crate) use validation::{
     all_uncertainty_draws_skipped_diags, check_simulation_iov_occasions,
-    check_simulation_iov_single_occasion, max_obs_dose_occasions, no_occasion_warning,
-    twinless_absorption_closed_form, uncertainty_draws_skipped_warning, with_derived_occasions,
-    SimulatedFlipFlopTally,
+    check_simulation_iov_single_occasion, frem_drawn_eta_warning, max_obs_dose_occasions,
+    no_occasion_warning, twinless_absorption_closed_form, uncertainty_draws_skipped_warning,
+    with_derived_occasions, SimulatedFlipFlopTally,
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{
@@ -42,7 +42,7 @@ pub use validation::{
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
-    check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
+    check_rtte_records_diags, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
 pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
@@ -104,14 +104,15 @@ pub(crate) use pool::{default_fit_pool, fit_scope_pool};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, apply_sir_result, boundary_estimate_warning,
     compute_eps_shrinkage, compute_eta_shrinkage, compute_param_corr, compute_subject_results,
-    cov_diagnostics, covariate_relation_estimates, eps_shrinkage_warning, eta_shrinkage_warning,
-    extract_residual_correlation_se, extract_standard_errors, high_correlation_warning,
-    inflated_rse_warning, integrates_odes, is_last_estimating_stage, kappa_shrinkages,
-    kappa_weight_typicals, keep_gn_zero_eta_warning, non_fit_diagnostics,
-    nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
-    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
-    runaway_guard_warning, sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
-    sweep_sensitivity_solver_stats, with_solver_stats, SolverStatsPhase,
+    contribution_terms, cov_diagnostics, covariate_relation_estimates, degenerate_cl_v_warning,
+    eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
+    extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
+    is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
+    name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
+    sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ};
@@ -383,6 +384,10 @@ mod non_fit_diagnostics_tests;
 mod stalled_at_init_warning_tests;
 
 #[cfg(test)]
+#[path = "tests/degenerate_cl_v_warning_tests.rs"]
+mod degenerate_cl_v_warning_tests;
+
+#[cfg(test)]
 #[path = "tests/nonfinite_objective_tests.rs"]
 mod nonfinite_objective_tests;
 
@@ -424,6 +429,15 @@ mod entry_point_errors_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
+// #1788: the codes of the refusals only `fit()` and the file entry points raised uncoded.
+#[cfg(test)]
+#[path = "tests/fit_refusal_codes_tests.rs"]
+mod fit_refusal_codes_tests;
+
+// #2181: a covariate is present when every subject carries it, not when it is listed.
+#[cfg(test)]
+#[path = "tests/covariate_presence_tests.rs"]
+mod covariate_presence_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]
@@ -488,6 +502,11 @@ mod adaptive_obs_scale_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]
 mod adaptive_frem_tests;
+
+// #2259: sdtab IPRED / IWRES of an ODE FREM fit on the covariate rows.
+#[cfg(test)]
+#[path = "tests/frem_ode_sdtab_tests.rs"]
+mod frem_ode_sdtab_tests;
 
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]

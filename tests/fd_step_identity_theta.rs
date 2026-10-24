@@ -392,10 +392,11 @@ fn mixture_ses(k: f64, logit: bool) -> Vec<f64> {
     se
 }
 
-/// Only `k = 1e-4`: at `k ≤ 1e-5` the `M_S` score column is ~1e5× the others and `S` is
-/// refused as rank-deficient by its eigenvalue floor — #2145's scale-dependence, not this
-/// step. `k = 1e-4` still separates the two steps by four orders of magnitude (see the
-/// tests), and the mixing derivative at θ = 7.7e-8 itself is pinned in `estimation::mixture`.
+/// Down to `k = 1e-6`. At `k ≤ 1e-5` the `M_S` score column is ~1e5× the others, and until
+/// #2145 the eigenvalue floor on the raw `S` refused it as rank-deficient; the floor now
+/// rescales identity-packed θ coordinates first, so those `k` are reachable (measured on macOS
+/// arm64: worst 2.9e-15 at `k = 1e-5`, 1.1e-15 at `1e-6`). The mixing derivative at θ = 7.7e-8
+/// itself is pinned in `estimation::mixture`.
 fn assert_mixture_scale_invariant(logit: bool, tol: f64) {
     let form = if logit { "logit" } else { "p" };
     let reference = mixture_ses(1.0, logit);
@@ -403,7 +404,7 @@ fn assert_mixture_scale_invariant(logit: bool, tol: f64) {
         reference.iter().all(|s| s.is_finite() && *s > 0.0),
         "{form}: reference SEs {reference:?}"
     );
-    for k in [1e-4] {
+    for k in [1e-4, 1e-5, 1e-6] {
         let got = mixture_ses(k, logit);
         let mut worst = 0.0_f64;
         for (i, (g, r)) in got.iter().zip(&reference).enumerate() {

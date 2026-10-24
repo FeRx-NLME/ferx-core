@@ -68,7 +68,8 @@ impl GradientMethodKind {
 /// walk declines LTBS, so every such subject runs FD), and out-of-scope ODE subjects (oral
 /// infusion into a built-in absorption compartment, a rate-defined infusion under `F ≠ 1`).
 /// Steady-state and modeled-duration doses are **analytic** on the ODE event-driven walk, not
-/// FD (#914 / #530).
+/// FD (#914 / #530). A model with a TTE endpoint reports FD (#1861): a hazard term has no
+/// analytic η-channel, so every subject carrying a survival record runs FD.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic

@@ -636,7 +636,8 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// handed in are the MIXEST-class EBEs, so building predictions from them with
 /// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
 /// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
-/// OFV) for every subject the fit assigned to another class.
+/// OFV) for every subject the fit assigned to another class. For the same reason
+/// the subject's Ω and Σ are its class's (`mixture::class_params`), not the base.
 ///
 /// # Parallel over subjects, and why the stats come back as a value (#1329)
 ///
@@ -679,9 +680,18 @@ pub(crate) fn compute_subject_results(
             let stats_scope =
                 collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
             // Hold this subject's fitted class for the whole per-subject block.
-            let _mix_guard = mixest
-                .and_then(|m| m.get(i))
-                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let class = mixest.and_then(|m| m.get(i)).copied();
+            let _mix_guard =
+                class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            // ...and that class's Ω and Σ (#2266 review 3): the guard moves only
+            // `MIXNUM`, so scoring IWRES/CWRES and the OFV contribution with the base
+            // (class-1) Ω/Σ would describe a class-2 subject by class 1's residual
+            // model — and `name_nonfinite_subjects` selects on that contribution.
+            // Class 1's entries equal the base, so a class-1 subject is unchanged.
+            let class_params = class
+                .filter(|_| params.mixture.is_some())
+                .map(|c| crate::estimation::mixture::class_params(params, c));
+            let params = class_params.as_ref().unwrap_or(params);
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
             let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {
@@ -1815,6 +1825,512 @@ pub(crate) fn nonfinite_objective_warning(
     Some((msg, entry))
 }
 
+/// How many subjects `W_NONFINITE_OBJECTIVE`'s message names before it says "and N
+/// more"; the `details` payload lists every one (#2038).
+pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
+
+/// One separately scored part of a subject's objective contribution (#2267): a
+/// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
+/// the raw value, not the OFV-scale `2·` the contribution carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionTerm {
+    pub(crate) name: String,
+    pub(crate) nll: f64,
+}
+
+/// What `SubjectResult::ofv_contribution` is, relative to the objective
+/// `W_NONFINITE_OBJECTIVE` gated (#2267).
+///
+/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal
+/// (`foce_subject_nll_cov` / the IOV form), under the fitted class for a mixture. The
+/// published objective is classified by what it *is*, not by the estimator's name: FOCE,
+/// FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP (estimating or `imp_eval_only`
+/// standalone) and VI's `vi_final_ofv = laplace` all publish `2·pop_nll` — the sum of
+/// these same scores at the same EBEs. Only three objectives are something else, and
+/// can be unusable while every score is usable or the reverse:
+///
+/// * quadrature — `laplace` at any `n_agq` (its exact-Hessian anchor already differs
+///   at one node) and `focei` with `n_agq > 1`, including an `agq_eval_only` readout;
+/// * `bayes`, whose `ofv` is `2·Σ` joint NLL at the posterior mean, not a marginal;
+/// * a mixture, whose objective is the class-marginal.
+///
+/// Plus the case where the objective's FOCE/FOCEI flag is not the one the scores were
+/// computed under. `prior` is the parameter-prior penalty `fit()` adds to the data
+/// objective, a population-level term no subject carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContributionSource {
+    /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
+    pub(crate) score: &'static str,
+    /// The objective's name when the contributions are not its terms, else `None`.
+    pub(crate) objective: Option<String>,
+    /// The parameter-prior penalty in the gated objective (`ofv_prior`; `0` unpriored).
+    pub(crate) prior: f64,
+}
+
+impl ContributionSource {
+    /// The source for the objective `method` published, with contributions scored under
+    /// `options.interaction` (the post-fit options), `mixture` when the fit is one, and
+    /// `prior` the penalty added to it.
+    pub(crate) fn of(
+        method: EstimationMethod,
+        options: &FitOptions,
+        mixture: bool,
+        prior: f64,
+    ) -> Self {
+        let score = if options.interaction { "FOCEI" } else { "FOCE" };
+        let agq = FitOptions::agq_nodes_for(method, options.n_agq);
+        let same = agq.is_none()
+            && method != EstimationMethod::Bayes
+            && !mixture
+            && crate::types::interaction_for(method, options.interaction) == options.interaction;
+        let objective = (!same).then(|| {
+            let mut name = method.label().to_string();
+            if let Some(n) = agq.filter(|&n| n > 1) {
+                name = format!("{name} (n_agq = {n})");
+            }
+            if method == EstimationMethod::Bayes {
+                name.push_str(" posterior-mean");
+            }
+            if mixture {
+                name.push_str(" mixture");
+            }
+            name
+        });
+        Self {
+            score,
+            objective,
+            prior,
+        }
+    }
+}
+
+/// The separately scored terms of `subject`'s contribution at `eta` (#2267), for
+/// [`name_nonfinite_subjects`], under the subject's fitted mixture class and that class's
+/// Ω and Σ. When `h_matrix` (its `∂f/∂η`, `n_obs × n_eta`) is given and shaped for it,
+/// these are the parts the marginal `compute_subject_results` scored records on the way,
+/// under the same `interaction` flag:
+///
+/// * a subject without κ (`kappas` empty): `stats::likelihood::foce_subject_contribution_parts`
+///   — the FOCE, row-wise FOCEI or dense-`R` FOCEI branch, or the joint form of a subject
+///   with time-to-event, categorical or CTMM records, whose curvature carries their
+///   Hessian;
+/// * an IOV subject: the same branches over the stacked `[η, κ]` linearization
+///   (`stats::likelihood::foce_subject_iov_contribution_parts`, review r6), or the FREM
+///   refusal alone, or — when its κ̂ do not line up with its occasion groups, which the
+///   marginal refuses — that mismatch.
+///
+/// Without a usable `h_matrix`, each non-Gaussian data term alone.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn contribution_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h_matrix: Option<&DMatrix<f64>>,
+    interaction: bool,
+    kappas: &[DVector<f64>],
+    mix_class: Option<usize>,
+) -> Vec<ContributionTerm> {
+    let iov = !kappas.is_empty();
+    if iov && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        return vec![ContributionTerm {
+            name: "IOV + FREM refusal".into(),
+            nll: crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+        }];
+    }
+    let _mix_guard =
+        mix_class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+    // That class's Ω and Σ, as `compute_subject_results` scores the contribution (#2266).
+    let class_params = mix_class
+        .filter(|_| params.mixture.is_some())
+        .map(|c| crate::estimation::mixture::class_params(params, c));
+    let params = class_params.as_ref().unwrap_or(params);
+    let shaped = h_matrix.filter(|h| {
+        h.nrows() == subject.observations.len()
+            && h.ncols() == eta.len()
+            && params.omega.matrix.nrows() == eta.len()
+    });
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut terms: Vec<(String, f64)> = Vec::new();
+    match (iov, shaped, params.omega_iov.as_ref()) {
+        (false, Some(h), _) => {
+            terms = crate::stats::likelihood::foce_subject_contribution_parts(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                interaction,
+            )
+        }
+        // The linearization `compute_subject_results` builds, from the same inputs.
+        (true, Some(h), Some(omega_iov)) => {
+            terms = match crate::stats::likelihood::iov_linearization(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                h,
+                &params.omega,
+                kappas,
+                omega_iov,
+            ) {
+                Some(lin) => crate::stats::likelihood::foce_subject_iov_contribution_parts(
+                    model,
+                    subject,
+                    &params.theta,
+                    &params.sigma.values,
+                    interaction,
+                    &lin,
+                ),
+                None => vec![(
+                    "IOV random effects (κ̂ do not match the occasion groups)".to_string(),
+                    f64::NAN,
+                )],
+            }
+        }
+        #[cfg(feature = "survival")]
+        _ => terms.extend(crate::stats::likelihood::non_gaussian_terms(
+            model,
+            subject,
+            &params.theta,
+            eta.as_slice(),
+        )),
+        #[cfg(not(feature = "survival"))]
+        _ => {}
+    }
+    terms
+        .into_iter()
+        .map(|(name, nll)| ContributionTerm { name, nll })
+        .collect()
+}
+
+/// The per-subject term scorer `name_nonfinite_subjects` calls for each subject it
+/// names: population index, data, post-fit result.
+pub(crate) type TermScorer<'a> =
+    dyn Fn(usize, &Subject, &SubjectResult) -> Vec<ContributionTerm> + 'a;
+
+/// A non-finite value as JSON: a number when finite, else its `Debug` string, since
+/// JSON has no `NaN`.
+fn json_value(v: f64) -> serde_json::Value {
+    if v.is_finite() {
+        serde_json::json!(v)
+    } else {
+        serde_json::json!(v.to_string())
+    }
+}
+
+/// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
+/// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
+/// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
+/// The `details` reach the Rust API, the JSON and YAML outputs (`warning_details:`)
+/// and a `.fitrx` reload (#2268), but not yet the R package, so the message says where
+/// the subjects beyond the first [`NONFINITE_SUBJECTS_NAMED`] are and where they are
+/// not.
+///
+/// A subject qualifies when its own post-fit objective contribution fails
+/// `ofv_is_valid` — `NaN`, infinite, or at least `DIVERGENCE_OFV`. That is the
+/// selector, and the per-record clauses only describe it; both score a mixture
+/// subject under its fitted class's Ω and Σ, so they cannot disagree on its class.
+/// Selecting on a non-finite
+/// `IPRED`/`PRED` instead would name every subject with no Gaussian observation,
+/// whose predictions are `NaN` by convention ("no prediction available") and which
+/// contribute nothing wrong. A `NaN` prediction on a scored record cannot hide the
+/// other way: the likelihood maps the subject's objective to the sentinel.
+///
+/// For each subject named, the sentence gives the contribution, then three clauses:
+///
+/// 1. **The records whose own likelihood term is unusable (#2266)**, with the
+///    written `TIME`, `DV` and `IPRED` of the first. The term is the record's own
+///    `−2 log L` in the FOCEI conditional data term at η̂, recorded off the scorer's
+///    own sweep (`conditional_obs_neg2ll_terms`): raw `IPRED`, unclamped `V`, the
+///    fitted correlations, an SDE's process-noise variance, an `iiv_on_ruv` scale
+///    and an M3 censored term are all in it. A mixture subject is evaluated under
+///    its fitted class (`mixest`, 0-based), with that class's Σ. The term is
+///    unusable when it fails the same `ofv_is_valid` test as the objective. This is
+///    the record to look at first. A runaway η̂ can leave an early record with a
+///    finite `IPRED` of 0 that a proportional error scores at `DV² × 1e12` (the
+///    variance floor), and the first non-finite *prediction* then names a later
+///    record, or none: on the same subject the closed form and the ODE disagree on
+///    the predictions but agree on this record. A runaway residual-error η makes `V`
+///    infinite, which `IWRES` (divided by `√V`) reports as `0` and the scorer
+///    rejects. A subject with no Gaussian observation has no such clause.
+/// 2. The observations whose `IPRED` or `PRED` is not finite, with the written
+///    `TIME` of the first, as #2038 wrote it. When none is, it says so ("no Gaussian
+///    observation" for a subject that has none).
+/// 3. Each term `terms` scores
+/// that is itself unusable (#2267): a Gaussian part — the residual term (a proportional
+/// error on a prediction of 0 scores `DV² × 1e12` per observation at the variance
+/// floor), a residual variance that is not finite and positive, the censored (M3) term,
+/// the random-effect prior, the curvature log-determinant or an `H̃` that is not
+/// positive definite — a time-to-event term at the `1e20` hazard sentinel, a
+/// categorical or CTMM term, or the IOV + FREM refusal. When every scored term is
+/// usable it says that, so a reader knows the failure is in how they combine (only
+/// their sum, FOCE's linearization, the non-Gaussian curvature) rather than in one of
+/// them.
+///
+/// A term is judged on the OFV scale the contribution carries, `2·nll`, against the
+/// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
+/// contribution and is named.
+///
+/// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
+/// objective is not their sum (see [`ContributionSource`]), the sentence says so after
+/// the list. An unusable parameter-prior penalty — a population-level term no subject
+/// carries — is named after the list too. And when no subject qualifies, the warning
+/// says why rather than ending silently (#2267), in the first of these that holds:
+/// the prior penalty is unusable; the objective is one the scores are not terms of
+/// (so they cannot locate its failure, and their sum is reported only as usable or not);
+/// the scores and the prior are each usable but their sum is past the cutoff; or their
+/// sum is usable, so the objective was evaluated at another point than the estimates
+/// and EBEs the subjects were scored at.
+///
+/// `subjects` is `compute_subject_results`' output, in population order; a subject
+/// whose position does not match `population` gets no `TIME`, and since its `DV`s
+/// are then unknown, no likelihood clause and no terms either.
+pub(crate) fn name_nonfinite_subjects(
+    msg: String,
+    entry: &mut WarningEntry,
+    subjects: &[SubjectResult],
+    population: &Population,
+    model: &CompiledModel,
+    params: &ModelParameters,
+    mixest: Option<&[usize]>,
+    source: &ContributionSource,
+    terms: &TermScorer<'_>,
+) -> String {
+    use crate::estimation::outer_optimizer::ofv_is_valid;
+    // A term's `nll` is raw; the contribution it sits in is `2·nll`-scaled.
+    let term_failed = |t: &ContributionTerm| !ofv_is_valid(2.0 * t.nll);
+    let prior_failed = !ofv_is_valid(source.prior);
+    struct Named<'a> {
+        s: &'a SubjectResult,
+        bad: Vec<usize>,
+        unusable: Vec<usize>,
+        data: Option<&'a Subject>,
+        terms: Vec<ContributionTerm>,
+    }
+    let named: Vec<Named<'_>> = subjects
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
+        .map(|(i, s)| {
+            let bad: Vec<usize> = (0..s.n_obs)
+                .filter(|&j| {
+                    !(s.ipred.get(j).is_some_and(|v| v.is_finite())
+                        && s.pred.get(j).is_some_and(|v| v.is_finite()))
+                })
+                .collect();
+            let data = population.subjects.get(i).filter(|d| d.id == s.id);
+            let unusable: Vec<usize> = data
+                .map(|d| {
+                    // The subject's fitted class (#985): held for the evaluation, so
+                    // a `MIXNUM`-keyed residual selector or magnitude reads it, and
+                    // that class's Σ, as `compute_subject_results` holds the guard.
+                    let class = mixest.and_then(|m| m.get(i)).copied();
+                    let _mix_guard =
+                        class.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let class_params = class
+                        .filter(|_| params.mixture.is_some())
+                        .map(|c| crate::estimation::mixture::class_params(params, c));
+                    let p = class_params.as_ref().unwrap_or(params);
+                    crate::stats::likelihood::conditional_obs_neg2ll_terms(
+                        model,
+                        d,
+                        &p.theta,
+                        &s.ipred,
+                        s.eta.as_slice(),
+                        &p.sigma.values,
+                        model.residual_cov_at(p),
+                    )
+                })
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, &t)| !ofv_is_valid(t))
+                .map(|(j, _)| j)
+                .collect();
+            let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
+            Named {
+                s,
+                bad,
+                unusable,
+                data,
+                terms,
+            }
+        })
+        .collect();
+    let caveat = source.objective.as_deref().map(|objective| {
+        format!(
+            " These are post-hoc {} contributions at the EBEs, not terms of the {objective} \
+             objective, which ferx does not split by subject.",
+            source.score
+        )
+    });
+    let full = if named.is_empty() {
+        let score = source.score;
+        let lead = format!(
+            "{msg} No subject can be named: every subject's post-hoc {score} contribution \
+             at these estimates is usable"
+        );
+        let total = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + source.prior;
+        let prior = source.prior;
+        let and_prior = if prior != 0.0 {
+            format!(", and so is the parameter-prior penalty ({prior:?})")
+        } else {
+            String::new()
+        };
+        match (prior_failed, source.objective.as_deref()) {
+            (true, _) => format!(
+                "{lead}, and the parameter-prior penalty, a population-level term no \
+                 subject carries, is not ({prior:?})."
+            ),
+            // The scores are not terms of this objective, so they cannot say where it
+            // failed (review r6): their sum is reported for what it is, not as a cause.
+            (false, Some(objective)) => {
+                let sum = if ofv_is_valid(total) {
+                    format!("their sum ({total:?}) is usable")
+                } else {
+                    format!("their sum ({total:?}) is past the cutoff as well")
+                };
+                format!(
+                    "{lead}{and_prior}, but the {objective} objective is not their sum and \
+                     ferx does not split it by subject, so these scores cannot locate its \
+                     failure; {sum}."
+                )
+            }
+            (false, None) => {
+                if ofv_is_valid(total) {
+                    format!(
+                        "{lead}{and_prior}, and so is their sum ({total:?}), so the objective \
+                         was evaluated at another point than the estimates and EBEs the \
+                         subjects are scored at."
+                    )
+                } else {
+                    format!("{lead}{and_prior}, but their sum ({total:?}) is past the cutoff.")
+                }
+            }
+        }
+    } else {
+        let describe = |n: &Named<'_>| {
+            let records = match (n.bad.first(), n.data) {
+                (None, _) if n.s.n_obs == 0 => "no Gaussian observation".to_string(),
+                (None, _) => "every IPRED and PRED finite".to_string(),
+                (Some(&j), Some(d)) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
+                    n.bad.len(),
+                    n.s.n_obs,
+                    d.readout_time(j)
+                ),
+                (Some(_), None) => format!(
+                    "a non-finite IPRED or PRED on {} of {} observations",
+                    n.bad.len(),
+                    n.s.n_obs
+                ),
+            };
+            let failed: Vec<String> = n
+                .terms
+                .iter()
+                .filter(|t| term_failed(t))
+                .map(|t| format!("{} = {:?}", t.name, t.nll))
+                .collect();
+            let terms = match failed.len() {
+                0 if n.terms.is_empty() => String::new(),
+                0 => ", every separately scored term usable".to_string(),
+                1 => format!(", failed term: {}", failed[0]),
+                _ => format!(", failed terms: {}", failed.join(", ")),
+            };
+            let residuals = match (n.unusable.first(), n.data) {
+                (_, None) => Some("likelihood terms not checked".to_string()),
+                (_, Some(_)) if n.s.n_obs == 0 => None,
+                (None, Some(_)) => {
+                    Some("every observation's likelihood term usable on its own".to_string())
+                }
+                (Some(&j), Some(d)) => Some(format!(
+                    "an unusable likelihood term on {} of {} observations, the first at TIME \
+                     {} (DV {}, IPRED {})",
+                    n.unusable.len(),
+                    n.s.n_obs,
+                    d.readout_time(j),
+                    d.observations.get(j).copied().unwrap_or(f64::NAN),
+                    n.s.ipred.get(j).copied().unwrap_or(f64::NAN)
+                )),
+            };
+            let residuals = residuals.map(|r| format!("{r}; ")).unwrap_or_default();
+            format!(
+                "{} (contribution {:?}, {residuals}{records}{terms})",
+                n.s.id, n.s.ofv_contribution
+            )
+        };
+        let mut list = named
+            .iter()
+            .take(NONFINITE_SUBJECTS_NAMED)
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if named.len() > NONFINITE_SUBJECTS_NAMED {
+            list.push_str(&format!(
+                "; and {} more, listed as `unusable_subjects` in the structured warning's \
+                 details (Rust API, JSON and YAML output, .fitrx; not yet in the R package)",
+                named.len() - NONFINITE_SUBJECTS_NAMED
+            ));
+        }
+        let prior = if prior_failed {
+            format!(
+                " The parameter-prior penalty, a population-level term no subject carries, is \
+                 unusable as well ({:?}).",
+                source.prior
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{msg} {} of {} subjects have an objective contribution that is itself unusable: \
+             {list}.{}{prior}",
+            named.len(),
+            subjects.len(),
+            caveat.unwrap_or_default()
+        )
+    };
+    let payload: Vec<serde_json::Value> = named
+        .iter()
+        .map(|n| {
+            let failed: Vec<serde_json::Value> = n
+                .terms
+                .iter()
+                .filter(|t| term_failed(t))
+                .map(|t| serde_json::json!({"term": t.name, "nll": json_value(t.nll)}))
+                .collect();
+            serde_json::json!({
+                "id": n.s.id,
+                "ofv_contribution": json_value(n.s.ofv_contribution),
+                "nonfinite_predictions": n.bad.len(),
+                "n_obs": n.s.n_obs,
+                "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "unusable_terms": n.data.map(|_| n.unusable.len()),
+                "first_unusable_term_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "failed_terms": failed,
+            })
+        })
+        .collect();
+    if let Some(serde_json::Value::Object(map)) = entry.details.as_mut() {
+        map.insert(
+            "unusable_subjects".into(),
+            serde_json::Value::Array(payload),
+        );
+        map.insert("contribution_score".into(), serde_json::json!(source.score));
+        map.insert(
+            "contributions_are_objective_terms".into(),
+            serde_json::json!(source.objective.is_none()),
+        );
+        map.insert("ofv_prior".into(), json_value(source.prior));
+    }
+    entry.message = full.clone();
+    full
+}
+
 /// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
 ///
@@ -2245,6 +2761,113 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
             "phase": "ebe",
             "model": model.pk_model.canonical_name(),
             "subjects": crossers,
+        })),
+    );
+    Some((msg, entry))
+}
+
+/// Build the human message + native structured entry for a closed-form fit whose final
+/// estimates put a non-positive or non-finite `CL` or `V` on any record, or `None` (#2104).
+///
+/// The closed-form engines give such a record one of two outcomes, and the message states
+/// whichever occurred — the two sentences are gated on their own record counts:
+///
+/// - **non-positive or infinite** — served a concentration of 0 (superposition drops the
+///   dose, the event-driven walk empties every compartment over the interval the record
+///   governs), so the fit completes and scores the subject against a confident, finite
+///   prediction;
+/// - **`NaN`** (an invalid covariate expression, say) — served `NaN` once a dose has
+///   arrived, so the subject's likelihood is repelled through the sentinel, and 0 before
+///   any dose. Which of the two a record got depends on the timeline, so the message states
+///   the rule rather than claiming an outcome per record.
+///
+/// NONMEM would not have made either prediction: PREDPP reports a non-positive PK parameter
+/// as a PRED error. `eta_hats` are the BSV EBEs and `kappas` the per-subject occasion κ, as
+/// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
+/// own fitted class.
+pub(crate) fn degenerate_cl_v_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    mixest: Option<&[usize]>,
+) -> Option<(String, WarningEntry)> {
+    let no_kappas: Vec<DVector<f64>> = Vec::new();
+    let hits: Vec<(String, Vec<(f64, bool)>)> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .enumerate()
+        .filter_map(|(si, (subject, eta))| {
+            // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
+            let class = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
+            let _mix = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let ks = kappas.get(si).unwrap_or(&no_kappas);
+            let records = crate::pk::invalid_cl_v_records(
+                model,
+                subject,
+                theta,
+                eta.as_slice(),
+                ks.iter()
+                    .map(|k| k.as_slice())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            );
+            (!records.is_empty()).then(|| (subject.id.clone(), records))
+        })
+        .collect();
+    let (first_id, first_records) = hits.first()?;
+    let all = || hits.iter().flat_map(|(_, r)| r.iter());
+    let n_records = all().count();
+    let n_nan = all().filter(|&&(_, nan)| nan).count();
+    let n_zero = n_records - n_nan;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    let mut msg = format!(
+        "W_DEGENERATE_CL_V: {} subject(s) [{}] have a non-positive or non-finite CL or V on {} \
+         record(s) at the final estimates (first at TIME {} in subject {}).",
+        hits.len(),
+        ids.join(", "),
+        n_records,
+        first_records[0].0,
+        first_id,
+    );
+    if n_zero > 0 {
+        msg.push_str(&format!(
+            " On {n_zero} of them CL or V is non-positive or infinite: the closed-form PK \
+             engines serve a concentration of 0 there and drop any drug in the body over an \
+             interval such a record governs, so the fit scored a confident, finite prediction."
+        ));
+    }
+    if n_nan > 0 {
+        msg.push_str(&format!(
+            " On {n_nan} of them CL or V is NaN: an observation there is predicted NaN once a \
+             dose has arrived, which repels that subject's likelihood, and 0 before any dose."
+        ));
+    }
+    msg.push_str(
+        " NONMEM would refuse these records: PREDPP rejects a non-positive PK parameter as an \
+         error. Check the individual-parameter model — a linear covariate term such as \
+         CL = TVCL * (1 + THETA * (AGE - 40)) can go negative on one record, and a covariate \
+         value the expression cannot use gives NaN — and prefer a form that keeps CL and V \
+         positive, such as an exponential or power model.",
+    );
+    let entry = warning_entry(
+        WarningCode::DegenerateClearanceOrVolume,
+        msg.clone(),
+        Some(serde_json::json!({
+            "model": model.pk_model.canonical_name(),
+            "n_records": n_records,
+            "n_zero_records": n_zero,
+            "n_nan_records": n_nan,
+            "subjects": hits
+                .iter()
+                .map(|(id, records)| serde_json::json!({
+                    "id": id,
+                    "times": records.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    "nan_times": records.iter().filter(|r| r.1).map(|r| r.0).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
         })),
     );
     Some((msg, entry))

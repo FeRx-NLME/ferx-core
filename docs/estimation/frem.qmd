@@ -218,3 +218,20 @@ FREM models is tracked in [#1365](https://github.com/FeRx-NLME/ferx-core/issues/
   ([#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)).
 - The `prepare_frem()` API handles the full transformation; manual FREM model
   construction is not recommended.
+- **Simulation.** A FREM model links its covariates to the PK only through the
+  correlations in Ω; no individual parameter reads them. `simulate()` and its
+  variants, `simulate_with_uncertainty()` and an adaptive simulation without
+  supplied η all draw each subject's whole η from Ω, covariate η included. So
+  each simulated subject's PK follows a drawn covariate value, not the one in
+  its data rows, and its `FREMTYPE` rows report that drawn value. The population
+  marginals are right; the association between a subject's covariates and its
+  PK is not. The `_diag` entry points and adaptive results report this as
+  `W_FREM_DRAWN_ETA`
+  ([#2245](https://github.com/FeRx-NLME/ferx-core/issues/2245)). Two routes keep
+  the association: supply the FREM fit's EBEs as `SuppliedEtas` to an adaptive
+  simulation (exact, for the fitted subjects only; see
+  [Supplied individual values](../model-file/adaptive-dosing.qmd#supplied-individual-values)),
+  or set `SimulateOptions::match_method` on `simulate_with_options()`, which
+  reassigns the drawn η by matching them to each subject's posthoc η
+  (approximate). A draw conditional on each subject's covariate values is not
+  implemented yet.

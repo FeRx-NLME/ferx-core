@@ -953,6 +953,7 @@ pub ferx_core::io::fitrx::FitrxError::Corrupt(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Io(std::io::error::Error)
 pub ferx_core::io::fitrx::FitrxError::Json(serde_json::error::Error)
 pub ferx_core::io::fitrx::FitrxError::UnsupportedVersion(alloc::string::String)
+pub ferx_core::io::fitrx::FitrxError::Unwritable(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Zip(zip::result::ZipError)
 pub struct ferx_core::io::fitrx::LoadedFit
 pub ferx_core::io::fitrx::LoadedFit::fit: ferx_core::FitResult
@@ -974,6 +975,9 @@ pub mod ferx_core::io::hash
 pub fn ferx_core::io::hash::sha256_bytes(bytes: &[u8]) -> alloc::string::String
 pub fn ferx_core::io::hash::sha256_file(path: &std::path::Path) -> core::result::Result<alloc::string::String, alloc::string::String>
 pub mod ferx_core::io::output
+pub enum ferx_core::io::output::OffDiagCorrSource
+pub ferx_core::io::output::OffDiagCorrSource::Fallback
+pub ferx_core::io::output::OffDiagCorrSource::ParamCorr
 pub struct ferx_core::io::output::EtaLinkedTheta
 pub ferx_core::io::output::EtaLinkedTheta::name: alloc::string::String
 pub ferx_core::io::output::EtaLinkedTheta::transform: core::option::Option<ferx_core::ThetaTransform>
@@ -992,6 +996,14 @@ impl<'a> ferx_core::io::output::KappaRowsInput<'a>
 pub fn ferx_core::io::output::KappaRowsInput<'a>::from_result(r: &'a ferx_core::FitResult) -> core::option::Option<Self>
 pub struct ferx_core::io::output::KappaRowsOptions
 pub ferx_core::io::output::KappaRowsOptions::ascii: bool
+pub struct ferx_core::io::output::OffDiagCorr<'a>
+pub ferx_core::io::output::OffDiagCorr::corr: f64
+pub ferx_core::io::output::OffDiagCorr::corr_source: ferx_core::io::output::OffDiagCorrSource
+pub ferx_core::io::output::OffDiagCorr::cov: f64
+pub ferx_core::io::output::OffDiagCorr::i: usize
+pub ferx_core::io::output::OffDiagCorr::j: usize
+pub ferx_core::io::output::OffDiagCorr::name_i: &'a str
+pub ferx_core::io::output::OffDiagCorr::name_j: &'a str
 pub struct ferx_core::io::output::OmegaRowsInput<'a>
 pub ferx_core::io::output::OmegaRowsInput::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::io::output::OmegaRowsInput::eta_linked_thetas: alloc::vec::Vec<core::option::Option<ferx_core::io::output::EtaLinkedTheta>>
@@ -1008,11 +1020,13 @@ pub ferx_core::io::output::OmegaRowsOptions::init_as_sd: bool
 pub ferx_core::io::output::OmegaRowsOptions::type_tag: bool
 pub ferx_core::io::output::OmegaRowsOptions::typical_value_spread: bool
 pub const ferx_core::io::output::THETA_BLOCK_COMPACT_MIN: usize
+pub fn ferx_core::io::output::block_summary(values: &[f64]) -> (f64, f64, f64)
 pub fn ferx_core::io::output::compact_theta_blocks(names: &[alloc::string::String]) -> alloc::vec::Vec<(alloc::string::String, core::ops::range::Range<usize>)>
 pub fn ferx_core::io::output::format_comparison(runs: &[(alloc::string::String, &ferx_core::FitResult)]) -> alloc::string::String
 pub fn ferx_core::io::output::format_kappa_rows_from(input: &ferx_core::io::output::KappaRowsInput<'_>, opts: ferx_core::io::output::KappaRowsOptions) -> alloc::string::String
 pub fn ferx_core::io::output::format_omega_rows_from(input: &ferx_core::io::output::OmegaRowsInput<'_>, opts: ferx_core::io::output::OmegaRowsOptions) -> alloc::string::String
 pub fn ferx_core::io::output::format_summary(result: &ferx_core::FitResult) -> alloc::string::String
+pub fn ferx_core::io::output::offdiag_corrs<'a>(m: &nalgebra::base::alias::DMatrix<f64>, param_corr: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, names: &'a [alloc::string::String], default_name: &'a str) -> alloc::vec::Vec<ferx_core::io::output::OffDiagCorr<'a>>
 pub fn ferx_core::io::output::parameter_table(result: &ferx_core::FitResult) -> alloc::string::String
 pub fn ferx_core::io::output::print_results(result: &ferx_core::FitResult)
 pub fn ferx_core::io::output::sdtab(result: &ferx_core::FitResult, population: &ferx_core::Population) -> alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<f64>)>
@@ -1436,12 +1450,14 @@ pub const ferx_core::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER: &s
 pub const ferx_core::parser::model_parser::ODE_INIT_REJECTED_BUILTINS: &[&str]
 pub const ferx_core::parser::model_parser::ODE_INIT_SCOPE_BUILTINS: &[&str]
 pub fn ferx_core::parser::model_parser::apply_fit_option(opts: &mut ferx_core::FitOptions, key: &str, value: &str) -> core::result::Result<bool, alloc::string::String>
+pub fn ferx_core::parser::model_parser::apply_method_option(opts: &mut ferx_core::FitOptions, value: &str) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::parser::model_parser::expand_prior_from_fit(model: &mut ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::parser::model_parser::known_block_names() -> alloc::vec::Vec<&'static str>
 pub fn ferx_core::parser::model_parser::parse_full_model(content: &str) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_bound(content: &str, level_bindings: &ferx_core::parser::model_parser::LevelBindings) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_with(content: &str, bindings: &ferx_core::parser::model_parser::ParseBindings) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
+pub fn ferx_core::parser::model_parser::parse_method_token(token: &str) -> core::result::Result<ferx_core::EstimationMethod, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_model_string(content: &str) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub type ferx_core::parser::model_parser::LevelBindings = std::collections::hash::map::HashMap<alloc::string::String, ferx_core::parser::model_parser::LevelBinding>
@@ -2666,6 +2682,7 @@ pub ferx_core::types::WarningCode::CovarianceFailed
 pub ferx_core::types::WarningCode::CovarianceRegularized
 pub ferx_core::types::WarningCode::CovarianceStep
 pub ferx_core::types::WarningCode::DataQuality
+pub ferx_core::types::WarningCode::DegenerateClearanceOrVolume
 pub ferx_core::types::WarningCode::DwAutocorrelation
 pub ferx_core::types::WarningCode::EbeStartDependent
 pub ferx_core::types::WarningCode::EpsShrinkage
@@ -2959,6 +2976,8 @@ pub fn ferx_core::DoseEvent::is_fixed(&self) -> bool
 pub fn ferx_core::DoseEvent::is_infusion(&self) -> bool
 pub fn ferx_core::DoseEvent::modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: ferx_core::RateMode) -> Self
 pub fn ferx_core::DoseEvent::new(time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64) -> Self
+impl core::fmt::Debug for ferx_core::DoseEvent
+pub fn ferx_core::DoseEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ferx_core::types::EndpointError
 pub ferx_core::types::EndpointError::error_model: ferx_core::ErrorModel
 pub ferx_core::types::EndpointError::sigma_idx: alloc::vec::Vec<usize>
@@ -3492,6 +3511,8 @@ pub ferx_core::types::Subject::covariates: std::collections::hash::map::HashMap<
 pub ferx_core::types::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
+pub ferx_core::types::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::types::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::types::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::types::Subject::id: alloc::string::String
 pub ferx_core::types::Subject::obs_cmts: alloc::vec::Vec<usize>
@@ -4053,6 +4074,7 @@ pub ferx_core::WarningCode::CovarianceFailed
 pub ferx_core::WarningCode::CovarianceRegularized
 pub ferx_core::WarningCode::CovarianceStep
 pub ferx_core::WarningCode::DataQuality
+pub ferx_core::WarningCode::DegenerateClearanceOrVolume
 pub ferx_core::WarningCode::DwAutocorrelation
 pub ferx_core::WarningCode::EbeStartDependent
 pub ferx_core::WarningCode::EpsShrinkage
@@ -4458,6 +4480,8 @@ pub fn ferx_core::DoseEvent::is_fixed(&self) -> bool
 pub fn ferx_core::DoseEvent::is_infusion(&self) -> bool
 pub fn ferx_core::DoseEvent::modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: ferx_core::RateMode) -> Self
 pub fn ferx_core::DoseEvent::new(time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64) -> Self
+impl core::fmt::Debug for ferx_core::DoseEvent
+pub fn ferx_core::DoseEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ferx_core::DoseLedgerEntry
 pub ferx_core::DoseLedgerEntry::amt: f64
 pub ferx_core::DoseLedgerEntry::cmt: usize
@@ -5094,6 +5118,8 @@ pub ferx_core::ScoringSettings::inner_screen: usize
 pub ferx_core::ScoringSettings::inner_tol: f64
 pub ferx_core::ScoringSettings::mu_referencing: bool
 pub ferx_core::ScoringSettings::n_agq: usize
+pub ferx_core::ScoringSettings::nn_l2_lambda: core::option::Option<f64>
+pub ferx_core::ScoringSettings::nn_smooth_lambda: core::option::Option<f64>
 pub ferx_core::ScoringSettings::ode_abstol: f64
 pub ferx_core::ScoringSettings::ode_auto_switch: bool
 pub ferx_core::ScoringSettings::ode_max_steps: usize
@@ -5157,6 +5183,8 @@ pub ferx_core::Subject::covariates: std::collections::hash::map::HashMap<alloc::
 pub ferx_core::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
+pub ferx_core::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::Subject::id: alloc::string::String
 pub ferx_core::Subject::obs_cmts: alloc::vec::Vec<usize>
@@ -5285,6 +5313,7 @@ pub const ferx_core::PK_IDX_Q3: usize
 pub const ferx_core::PK_IDX_V: usize
 pub const ferx_core::PK_IDX_V2: usize
 pub const ferx_core::PK_IDX_V3: usize
+pub fn ferx_core::apply_method_option(opts: &mut ferx_core::FitOptions, value: &str) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
 pub fn ferx_core::bind_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
@@ -5308,6 +5337,7 @@ pub fn ferx_core::method_specific_keys(m: ferx_core::EstimationMethod) -> &'stat
 pub fn ferx_core::natural_scale_covariance(result: &ferx_core::FitResult) -> core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub fn ferx_core::omega_se_at(se_omega: &core::option::Option<alloc::vec::Vec<f64>>, n_eta: usize, i: usize, j: usize) -> core::option::Option<f64>
 pub fn ferx_core::parse_full_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
+pub fn ferx_core::parse_method_token(token: &str) -> core::result::Result<ferx_core::EstimationMethod, alloc::string::String>
 pub fn ferx_core::parse_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub fn ferx_core::parse_model_string(content: &str) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::PredictionResult>, ferx_core::diagnostics::EngineError>

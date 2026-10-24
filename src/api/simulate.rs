@@ -782,6 +782,18 @@ pub fn simulate_with_options_diag(
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(iov_warning);
+            // Only this branch: a propensity-matched run reassigns the draws by each
+            // subject's posthoc η, covariate η included, which is the remedy named here.
+            warnings.extend(frem_drawn_eta_warning(
+                model,
+                population.subjects.len(),
+                &population.subjects,
+                "To keep each subject's PK with its own covariates, set \
+                 `SimulateOptions::match_method`, which reassigns the drawn etas by matching \
+                 them to each subject's posthoc eta (approximately), or simulate the fitted \
+                 subjects from the FREM fit's EBEs with `simulate_adaptive_with_inputs` and \
+                 `SuppliedEtas`.",
+            ));
             warnings.extend(super::non_fit_diagnostics(
                 model,
                 population,
@@ -1591,6 +1603,14 @@ pub fn simulate_with_uncertainty_diag(
     looped?;
     sim_warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     sim_warnings.extend(iov_warning);
+    sim_warnings.extend(frem_drawn_eta_warning(
+        model,
+        population.subjects.len(),
+        &population.subjects,
+        "`simulate_with_uncertainty` has no matching option: to keep each subject's PK with \
+         its own covariates, use `simulate_with_options` with `SimulateOptions::match_method`, \
+         or `simulate_adaptive_with_inputs` with the FREM fit's EBEs as `SuppliedEtas`.",
+    ));
     sim_warnings.extend(super::non_fit_diagnostics(
         model,
         population,
