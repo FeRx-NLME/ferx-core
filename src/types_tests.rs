@@ -572,9 +572,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         (
-            "Covariance step failed: the Hessian of the profile objective is not positive \
-             definite. SE estimates not available."
-                .into(),
+            crate::estimation::profile::profile_non_pd_msg(&[1.5, -2.0e-3]),
             "not positive definite",
         ),
         (

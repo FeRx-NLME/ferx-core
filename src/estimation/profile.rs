@@ -46,7 +46,8 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
 use crate::estimation::outer_optimizer::{
-    ebe_guard_rejects, population_gradient, resolve_outer_ftol, runs_outer_optimizer, subject_nll,
+    ebe_guard_rejects, flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value,
+    flat_theta_warning, population_gradient, resolve_outer_ftol, runs_outer_optimizer, subject_nll,
     OuterFdDeclineLog, OuterResult, OuterTrial,
 };
 use crate::estimation::parameterization::{
@@ -683,9 +684,27 @@ pub(crate) fn hold_template(layout: &ProfileLayout, template: &ModelParameters) 
     hold
 }
 
+/// The packed point `x` with its level coordinates at the solve's `β̂`.
+fn solved_point(
+    layout: &ProfileLayout,
+    hold: &ModelParameters,
+    x: &[f64],
+    solve: &ProfileSolve,
+) -> Vec<f64> {
+    let mut x_hat = x.to_vec();
+    for &k in &layout.coords {
+        x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
+    }
+    x_hat
+}
+
 /// The outer gradient at a solved point: the production gradient, the levels held at
 /// `β̂` in `hold` (envelope theorem). Indexed over the whole packed vector; the held
 /// coordinates' entries are not read.
+///
+/// `declines` should be built by [`profiled_decline_log`], as [`optimize_profiled`]'s
+/// is: then a subject that declines the analytic gradient at
+/// runtime is reconverged too (#2136).
 pub(crate) fn envelope_gradient(
     ctx: &ProfileCtx<'_>,
     hold: &ModelParameters,
@@ -695,17 +714,16 @@ pub(crate) fn envelope_gradient(
     grad_idx: &mut usize,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
-    let mut x_hat = x.to_vec();
-    for &k in &ctx.layout.coords {
-        x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
-    }
+    let x_hat = solved_point(ctx.layout, hold, x, solve);
     // Off the analytic route, every evaluation's gradient reconverges the EBEs. The FD
     // route's default is the fixed-EBE gradient, which drops `dη̂/dθ`: an approximation the
     // unprofiled fit's optimizer tolerates, but the profile's L-BFGS stopped on it 0.42
     // OFV above the optimum on S1 (#1065, 100 × 8), where the reconverged gradient reaches
     // it. The envelope theorem removes `dβ̂/dθ`, not `dη̂/dθ`. The analytic gradient is
     // exact and is left alone (the schedule would replace it), and the IOV FD route
-    // reconverges already.
+    // reconverges already. On the analytic route a subject can still decline at runtime
+    // and take the per-subject salvage; that one is keyed on the subject's own route, by
+    // the reconverging `declines` log, not on this model-level predicate (#2136).
     let analytic = crate::sens::provider::analytic_outer_gradient_for_interaction(
         ctx.model,
         ctx.options.interaction,
@@ -733,6 +751,74 @@ pub(crate) fn envelope_gradient(
         OuterTrial::unknown(),
         declines,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`optimize_profiled`] replaced its incumbent on this thread, so a
+    /// test can tell evaluations that improved from those that did not.
+    static INCUMBENT_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
+/// declines the analytic gradient at runtime takes the reconverged salvage rather than the
+/// held-EBE one (#2136, see [`envelope_gradient`]). The one constructor both of
+/// [`optimize_profiled`]'s gradient sites use.
+pub(crate) fn profiled_decline_log(n_subjects: usize) -> OuterFdDeclineLog {
+    OuterFdDeclineLog::reconverging(n_subjects)
+}
+
+/// The flat-θ pre-flight (#826) of a profiled fit: each free structural θ the profile
+/// objective ignores at the start `x0`, with its warning. The rule is the unprofiled
+/// pre-flight's (`flat_theta_candidates`, then the perturbation probe), on the objective
+/// this loop minimises: the envelope gradient at the start's solve, and the probe
+/// re-profiled. A probe whose solve fails counts as moving the objective, so it never
+/// freezes.
+fn profiled_flat_thetas(
+    ctx: &ProfileCtx<'_>,
+    hold: &ModelParameters,
+    x0: &[f64],
+    bounds: &PackedBounds,
+) -> Vec<(usize, String)> {
+    let n_theta = hold.theta.len();
+    let is_free = |i: usize| !hold.theta_fixed[i];
+    if !(0..n_theta).any(is_free) {
+        return Vec::new();
+    }
+    let params = unpack_params(x0, hold);
+    let Ok(solve) = ctx.solve(&params, &ProfileWarm::from_template(ctx.layout, hold)) else {
+        return Vec::new();
+    };
+    // A log of its own, dropped, as the unprofiled pre-flight's: a decline here is not one
+    // the optimizer's gradient took.
+    let grad = envelope_gradient(
+        ctx,
+        hold,
+        x0,
+        &solve,
+        bounds,
+        &mut 0,
+        &profiled_decline_log(ctx.population.subjects.len()),
+    );
+    let Some(candidates) = flat_theta_candidates(&grad, n_theta, is_free) else {
+        return Vec::new();
+    };
+    let warm = ProfileWarm::from_solve(ctx.layout, &solve);
+    candidates
+        .into_iter()
+        .filter_map(|i| {
+            let ti = params.theta[i];
+            let probe = flat_theta_probe_value(ti, hold.theta_lower[i], hold.theta_upper[i])?;
+            let mut p = params.clone();
+            p.theta[i] = probe;
+            let probed = ctx.solve(&p, &warm).ok()?.ofv;
+            if flat_theta_probe_moves(solve.ofv, probed) {
+                return None;
+            }
+            let name = hold.theta_names.get(i).map_or("<theta>", |s| s.as_str());
+            Some((i, flat_theta_warning(name, ti)))
+        })
+        .collect()
 }
 
 /// The outer algorithm of a profiled fit: `auto` is L-BFGS on the envelope gradient,
@@ -811,14 +897,41 @@ pub(crate) fn optimize_profiled(
 ) -> OuterResult {
     let layout = ProfileLayout::build(model, population, init_params)
         .expect("optimize_profiled is called for a model with a profiled block");
-    let hold = hold_template(&layout, init_params);
+    let mut hold = hold_template(&layout, init_params);
     let PackedStart {
         packed: mut x0,
         bounds,
-        fixed,
         ..
     } = pack_with_bounds(&hold);
     clamp_to_bounds(&mut x0, &bounds);
+    // The fit's template, with any θ the flat-θ pre-flight freezes marked: its
+    // `theta_fixed` is what the result publishes, as the unprofiled path's frozen template.
+    let mut fit_template = init_params.clone();
+    let mut warnings: Vec<String> = Vec::new();
+    let runs = runs_outer_optimizer(options);
+    {
+        let ctx = ProfileCtx {
+            model,
+            population,
+            layout: &layout,
+            options,
+            inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+        };
+        // The flat-θ pre-flight (#826), on the profile objective. Only when the optimizer
+        // runs, as in `optimize_population`.
+        if runs {
+            for (i, w) in profiled_flat_thetas(&ctx, &hold, &x0, &bounds) {
+                let v = unpack_params(&x0, &hold).theta[i];
+                for t in [&mut hold, &mut fit_template] {
+                    t.theta[i] = v;
+                    t.theta_fixed[i] = true;
+                }
+                warnings.push(w);
+            }
+        }
+    }
+    let hold = hold;
+    let fixed = packed_fixed_mask(&hold);
     let free: Vec<usize> = (0..x0.len()).filter(|&i| !fixed[i]).collect();
     let ctx = ProfileCtx {
         model,
@@ -827,8 +940,10 @@ pub(crate) fn optimize_profiled(
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
     };
-    let declines = OuterFdDeclineLog::new(population.subjects.len());
-    let mut warnings: Vec<String> = Vec::new();
+    // Reconverging: a subject that declines the analytic gradient at runtime takes the
+    // reconverged salvage, not the held-EBE one (#2136, see `envelope_gradient`).
+    let declines = profiled_decline_log(population.subjects.len());
+    let algo = profiled_algorithm(options);
 
     // The incumbent: its solve warm-starts the next evaluation (#1290: a warm start from
     // a rejected trial can stall a line search).
@@ -836,11 +951,14 @@ pub(crate) fn optimize_profiled(
         x: Vec<f64>,
         solve: Option<ProfileSolve>,
         warm: ProfileWarm,
+        /// The evaluation that found it, recorded in its checkpoint.
+        iter: usize,
     }
     let best = Mutex::new(Incumbent {
         x: x0.clone(),
         solve: None,
         warm: ProfileWarm::from_template(&layout, init_params),
+        iter: 0,
     });
     let n_evals = AtomicUsize::new(0);
     let grad_idx = Mutex::new(0usize);
@@ -852,7 +970,7 @@ pub(crate) fn optimize_profiled(
         x
     };
     let ebe_accum = Mutex::new(EbeAccum::default());
-    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+    let evaluate_once = |x: &[f64]| -> Option<ProfileSolve> {
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
@@ -878,13 +996,64 @@ pub(crate) fn optimize_profiled(
             b.x = x.to_vec();
             b.warm = ProfileWarm::from_solve(&layout, &solve);
             b.solve = Some(solve.clone());
+            b.iter = n_evals.load(Ordering::Relaxed);
+            #[cfg(test)]
+            INCUMBENT_UPDATES.with(|c| c.set(c.get() + 1));
         }
         Some(solve)
     };
+    // Every evaluation, improving or not, then checks whether a checkpoint (#755) is due,
+    // and writes the incumbent — the best point, its levels at β̂ — not this evaluation's
+    // (#1317): a resume unpacks them as the start's levels, which warm-start its first
+    // profile solve. Keyed on the incumbent rather than on an improvement, so a run whose
+    // incumbent was found before the interval elapsed still writes once it has. Only a
+    // feasible point is ever an incumbent (#1617).
+    let evaluate = |x: &[f64]| -> Option<ProfileSolve> {
+        let out = evaluate_once(x);
+        if crate::io::checkpoint::is_due() {
+            let b = best.lock().unwrap();
+            if let Some(solve) = &b.solve {
+                crate::io::checkpoint::maybe_write(
+                    b.iter,
+                    solve.ofv,
+                    &solved_point(&layout, &hold, &b.x, solve),
+                );
+            }
+        }
+        out
+    };
+    // Optimizer trace: one row per feasible evaluation, every packed coordinate's value
+    // (levels at β̂) and the gradient handed to NLopt (`NA` on held coordinates).
+    let trace_row = |solve: &ProfileSolve, grad: Option<&[f64]>| {
+        if !crate::estimation::trace::is_active() {
+            return;
+        }
+        let grad_norm = grad.map(|g| free.iter().map(|&i| g[i] * g[i]).sum::<f64>().sqrt());
+        let grads = grad.map(|g| {
+            (0..g.len())
+                .map(|i| if fixed[i] { f64::NAN } else { g[i] })
+                .collect::<Vec<_>>()
+        });
+        crate::estimation::trace::write_foce(
+            n_evals.load(Ordering::Relaxed),
+            if options.interaction { "focei" } else { "foce" },
+            solve.ofv,
+            grad_norm,
+            None,
+            match algo {
+                nlopt::Algorithm::Bobyqa => "bobyqa",
+                nlopt::Algorithm::Slsqp => "slsqp",
+                _ => "nlopt_lbfgs",
+            },
+            Some(solve.ebe.n_unconverged),
+            Some(solve.ebe.n_fallback),
+            &crate::estimation::parameterization::coordinate_values(&solve.params),
+            grads.as_deref(),
+        );
+    };
 
     let mut converged = false;
-    if runs_outer_optimizer(options) && !free.is_empty() {
-        let algo = profiled_algorithm(options);
+    if runs && !free.is_empty() {
         let lower: Vec<f64> = free.iter().map(|&i| bounds.lower[i]).collect();
         let upper: Vec<f64> = free.iter().map(|&i| bounds.upper[i]).collect();
         let objective = |xs: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
@@ -899,12 +1068,20 @@ pub(crate) fn optimize_profiled(
                 Some(solve) => {
                     if let Some(g) = grad {
                         let mut idx = grad_idx.lock().unwrap();
-                        let gr = envelope_gradient(
+                        let mut gr = envelope_gradient(
                             &ctx, &hold, &x, &solve, &bounds, &mut idx, &declines,
                         );
-                        for (gi, &i) in g.iter_mut().zip(&free) {
-                            *gi = if gr[i].is_finite() { gr[i] } else { 0.0 };
+                        for &i in &free {
+                            if !gr[i].is_finite() {
+                                gr[i] = 0.0;
+                            }
                         }
+                        for (gi, &i) in g.iter_mut().zip(&free) {
+                            *gi = gr[i];
+                        }
+                        trace_row(&solve, Some(&gr));
+                    } else {
+                        trace_row(&solve, None);
                     }
                     if options.verbose {
                         eprintln!(
@@ -973,7 +1150,9 @@ pub(crate) fn optimize_profiled(
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
         // levels are still solved at the initial structural point.
-        evaluate(&x0);
+        if let Some(solve) = evaluate(&x0) {
+            trace_row(&solve, None);
+        }
     }
 
     let (x_best, solve) = {
@@ -984,14 +1163,11 @@ pub(crate) fn optimize_profiled(
         warnings.push(
             "Profile solve failed at every evaluated point: no objective is available.".to_string(),
         );
-        let params = unpack_params(&x0, init_params);
+        let params = unpack_params(&x0, &fit_template);
         let ebe = ebe_accum.into_inner().unwrap();
         return failed_result(params, population, model, warnings, &ebe);
     };
-    let mut x_hat = x_best.clone();
-    for &k in &layout.coords {
-        x_hat[k] = packed_theta(&hold, k, solve.params.theta[k]);
-    }
+    let x_hat = solved_point(&layout, &hold, &x_best, &solve);
 
     let cov = if options.run_covariance_step {
         let out = ctx.covariance_at_estimate(&hold, &x_hat, &free, &solve.params, &solve.etas);
@@ -1007,7 +1183,7 @@ pub(crate) fn optimize_profiled(
         warnings.push(w);
     }
     let mut params = solve.params.clone();
-    params.theta_fixed = init_params.theta_fixed.clone();
+    params.theta_fixed = fit_template.theta_fixed.clone();
     let ebe = ebe_accum.into_inner().unwrap();
     OuterResult {
         params,
@@ -1029,7 +1205,7 @@ pub(crate) fn optimize_profiled(
         total_ebe_fallbacks: ebe.total_fallback as u32,
         final_gradient: None,
         final_gradient_source: None,
-        sir_fallback_proposal: None,
+        sir_fallback_proposal: cov.and_then(|c| c.sir_fallback_proposal),
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
@@ -1048,6 +1224,22 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
     format!(
         "Covariance step failed: the profile solve did not converge at the \
          estimates ({e:?}). SE estimates not available."
+    )
+}
+
+/// The warning of a profiled covariance step whose profile-objective Hessian `A_p` is not
+/// positive definite, its eigenvalues listed; the step then hands SIR the rectified
+/// fallback proposal. A function so the `classify_warning` table test classifies the text
+/// this site emits (#2158).
+pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
+    let eig = eigvals
+        .iter()
+        .map(|&v| crate::estimation::covariance::fmt_eig(v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Covariance step failed: the Hessian of the profile objective is not positive \
+         definite (eigenvalues [{eig}]). SE estimates not available."
     )
 }
 
@@ -1149,6 +1341,72 @@ fn failed_result(
     }
 }
 
+/// The inflation of the non-PD SIR fallback proposal, as the unprofiled step's.
+const NON_PD_PROPOSAL_INFLATION: f64 = 4.0;
+
+/// The full packed covariance of a profiled fit (levels included) from the structural
+/// block `cov_s` (`nf × nf`, over `free`), `D` per group and `B` (`nf × L`, both OFV
+/// scale), with `H = [[A, B], [Bᵀ, D]]`:
+/// - `Cov(θ, β) = −Cov(θ)·B·D⁻¹`,
+/// - `Cov(β) = d_scale·D⁻¹ + D⁻¹Bᵀ·Cov(θ)·B·D⁻¹`.
+///
+/// `d_scale = 2` and `cov_s = 2·A_p⁻¹` give the blocks of `2·H⁻¹`; the non-PD SIR proposal
+/// passes its own inflated `cov_s` and `d_scale`. `None` when a group's `D` is not
+/// positive definite.
+fn assemble_profiled_covariance(
+    layout: &ProfileLayout,
+    free: &[usize],
+    n: usize,
+    cov_s: &DMatrix<f64>,
+    d_groups: &[DMatrix<f64>],
+    b: &DMatrix<f64>,
+    d_scale: f64,
+) -> Option<DMatrix<f64>> {
+    let nf = free.len();
+    let l = layout.coords.len();
+    // D⁻¹ per group, and D⁻¹Bᵀ (L × nf).
+    let mut d_inv_bt = DMatrix::zeros(l, nf);
+    let mut d_inv: Vec<DMatrix<f64>> = Vec::with_capacity(layout.groups.len());
+    for (g, d) in layout.groups.iter().zip(d_groups) {
+        let inv = d.clone().cholesky()?.inverse();
+        for (a, &pa) in g.coords.iter().enumerate() {
+            for s in 0..nf {
+                d_inv_bt[(pa, s)] = (0..g.coords.len())
+                    .map(|c| inv[(a, c)] * b[(s, g.coords[c])])
+                    .sum();
+            }
+        }
+        d_inv.push(inv);
+    }
+    // Cov(θ, β) = −Cov(θ)·B·D⁻¹ = −Cov(θ)·(D⁻¹Bᵀ)ᵀ.
+    let cov_sb = -(cov_s * d_inv_bt.transpose());
+    // Cov(β) = d_scale·D⁻¹ + (D⁻¹Bᵀ)·Cov(θ)·(D⁻¹Bᵀ)ᵀ.
+    let mut cov_bb = &d_inv_bt * cov_s * d_inv_bt.transpose();
+    for (g, inv) in layout.groups.iter().zip(&d_inv) {
+        for (a, &pa) in g.coords.iter().enumerate() {
+            for (c, &pc) in g.coords.iter().enumerate() {
+                cov_bb[(pa, pc)] += d_scale * inv[(a, c)];
+            }
+        }
+    }
+    let mut full = DMatrix::zeros(n, n);
+    for a in 0..nf {
+        for c in 0..nf {
+            full[(free[a], free[c])] = cov_s[(a, c)];
+        }
+        for (p, &k) in layout.coords.iter().enumerate() {
+            full[(free[a], k)] = cov_sb[(a, p)];
+            full[(k, free[a])] = cov_sb[(a, p)];
+        }
+    }
+    for (p, &k) in layout.coords.iter().enumerate() {
+        for (q, &j) in layout.coords.iter().enumerate() {
+            full[(k, j)] = cov_bb[(p, q)];
+        }
+    }
+    Some(full)
+}
+
 impl ProfileCtx<'_> {
     /// The profile objective at the packed point `x` (levels ignored), re-profiled from
     /// `warm`; `NaN` when the solve fails.
@@ -1188,10 +1446,7 @@ impl ProfileCtx<'_> {
         };
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters only when the re-solve moves the levels.
-        let mut x_hat = x.to_vec();
-        for &k in &layout.coords {
-            x_hat[k] = packed_theta(hold, k, solve.params.theta[k]);
-        }
+        let x_hat = solved_point(layout, hold, x, &solve);
         self.covariance(hold, &x_hat, free, &solve)
     }
 
@@ -1262,68 +1517,95 @@ impl ProfileCtx<'_> {
         }
         let nf = free.len();
         let a_p = DMatrix::from_fn(nf, nf, |a, b| stencil.hess[(free[a], free[b])]);
-        let Some(a_chol) = a_p.clone().cholesky() else {
-            return fail(
-                "Covariance step failed: the Hessian of the profile objective is not positive \
-                 definite. SE estimates not available."
-                    .to_string(),
-            );
+        cov_ctx.covariance_from_profile_hessian(hold, x_hat, free, solve, &a_p, start)
+    }
+
+    /// The rest of [`Self::covariance`] once `A_p` (the profile objective's OFV Hessian over
+    /// `free`) is known: `D` and `B`, then the full matrix — or, when `A_p` is not positive
+    /// definite, no matrix and the non-PD SIR fallback proposal over every packed
+    /// coordinate. `self` is the covariance step's context (its inner tolerance).
+    pub(crate) fn covariance_from_profile_hessian(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+        a_p: &DMatrix<f64>,
+        start: Instant,
+    ) -> CovStepOutcome {
+        let fail = |reason: String| CovStepOutcome {
+            matrix: None,
+            wall_time_secs: start.elapsed().as_secs_f64(),
+            warnings: vec![reason],
+            sir_fallback_proposal: None,
+            method: None,
         };
-        let cov_s = a_chol.inverse() * 2.0;
+        let options = self.options;
+        let n = x_hat.len();
+        let nf = free.len();
+        // `R⁻¹` over the structural coordinates, or — when `A_p` is not positive definite —
+        // the non-PD fallback's |λ|-rectified proposal (`build_non_pd_fallback_proposal`,
+        // as the unprofiled step builds it, at the same 4× inflation), with the reason.
+        let (cov_s, non_pd) = match a_p.clone().cholesky() {
+            Some(ch) => (ch.inverse() * 2.0, None),
+            None => {
+                let sym = (a_p + a_p.transpose()) * 0.5;
+                let Some(eigvals) = crate::estimation::covariance::extract_eigenvalues(&sym) else {
+                    return fail(
+                        "Covariance step failed: could not compute eigenvalues of the Hessian \
+                         of the profile objective (it may contain NaN or Inf). SE estimates \
+                         not available."
+                            .to_string(),
+                    );
+                };
+                let units = crate::estimation::covariance::free_coordinate_units(
+                    hold,
+                    x_hat,
+                    free,
+                    &self.model.nn_weight_theta_ranges(),
+                );
+                let all: Vec<usize> = (0..nf).collect();
+                let proposal = crate::estimation::covariance::build_non_pd_fallback_proposal(
+                    &sym,
+                    &all,
+                    nf,
+                    NON_PD_PROPOSAL_INFLATION,
+                    &units,
+                );
+                (proposal, Some(profile_non_pd_msg(&eigvals)))
+            }
+        };
 
         // D (per group) and B, per subject over its own levels, with the EBE re-solved.
-        let (d_groups, b) = match cov_ctx.level_blocks(hold, x_hat, free, solve) {
+        let (d_groups, b) = match self.level_blocks(hold, x_hat, free, solve) {
             Ok(v) => v,
-            Err(reason) => return fail(reason),
+            Err(reason) => return fail(non_pd.unwrap_or(reason)),
         };
-        let layout = self.layout;
-        let l = layout.coords.len();
-        // D⁻¹ per group, and D⁻¹Bᵀ (L × nf).
-        let mut d_inv_bt = DMatrix::zeros(l, nf);
-        let mut d_inv: Vec<DMatrix<f64>> = Vec::with_capacity(layout.groups.len());
-        for (g, d) in layout.groups.iter().zip(&d_groups) {
-            let Some(ch) = d.clone().cholesky() else {
-                return fail(
-                    "Covariance step failed: the Hessian of the objective in the profiled \
-                     levels is not positive definite. SE estimates not available."
-                        .to_string(),
-                );
+        // The proposal is `4·|H|⁻¹` where the covariance is `2·H⁻¹`: its `D⁻¹` term carries
+        // the same factor 2, so the level blocks are those of the rectified, inflated
+        // block inverse.
+        let d_scale = if non_pd.is_some() {
+            NON_PD_PROPOSAL_INFLATION
+        } else {
+            2.0
+        };
+        let Some(full) =
+            assemble_profiled_covariance(self.layout, free, n, &cov_s, &d_groups, &b, d_scale)
+        else {
+            return fail(non_pd.unwrap_or_else(|| {
+                "Covariance step failed: the Hessian of the objective in the profiled \
+                 levels is not positive definite. SE estimates not available."
+                    .to_string()
+            }));
+        };
+        if let Some(reason) = non_pd {
+            return CovStepOutcome {
+                matrix: None,
+                wall_time_secs: start.elapsed().as_secs_f64(),
+                warnings: vec![reason],
+                sir_fallback_proposal: Some(full),
+                method: None,
             };
-            let inv = ch.inverse();
-            for (a, &pa) in g.coords.iter().enumerate() {
-                for s in 0..nf {
-                    d_inv_bt[(pa, s)] = (0..g.coords.len())
-                        .map(|c| inv[(a, c)] * b[(s, g.coords[c])])
-                        .sum();
-                }
-            }
-            d_inv.push(inv);
-        }
-        // Cov(θ, β) = −Cov(θ)·B·D⁻¹ = −Cov(θ)·(D⁻¹Bᵀ)ᵀ.
-        let cov_sb = -(&cov_s * d_inv_bt.transpose());
-        // Cov(β) = 2·D⁻¹ + (D⁻¹Bᵀ)·Cov(θ)·(D⁻¹Bᵀ)ᵀ.
-        let mut cov_bb = &d_inv_bt * &cov_s * d_inv_bt.transpose();
-        for (g, inv) in layout.groups.iter().zip(&d_inv) {
-            for (a, &pa) in g.coords.iter().enumerate() {
-                for (c, &pc) in g.coords.iter().enumerate() {
-                    cov_bb[(pa, pc)] += 2.0 * inv[(a, c)];
-                }
-            }
-        }
-        let mut full = DMatrix::zeros(n, n);
-        for a in 0..nf {
-            for c in 0..nf {
-                full[(free[a], free[c])] = cov_s[(a, c)];
-            }
-            for (p, &k) in layout.coords.iter().enumerate() {
-                full[(free[a], k)] = cov_sb[(a, p)];
-                full[(k, free[a])] = cov_sb[(a, p)];
-            }
-        }
-        for (p, &k) in layout.coords.iter().enumerate() {
-            for (q, &j) in layout.coords.iter().enumerate() {
-                full[(k, j)] = cov_bb[(p, q)];
-            }
         }
         if options.verbose {
             eprintln!("  Covariance step successful (profile)");
