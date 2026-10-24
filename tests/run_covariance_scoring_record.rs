@@ -492,6 +492,49 @@ fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
     );
 }
 
+/// #2261: on an IOV fit the in-fit SIR re-solves each draw from the fit's (η̂, κ̂), and
+/// `run_sir` from the stored `ebe_kappas`; the two repeat each other bit for bit, in memory
+/// and after a `.fitrx` reload, which writes κ̂ exactly. Mutation: hand the in-fit SIR `η̂`
+/// alone → both claims die (the standalone run still starts at κ̂).
+#[test]
+fn in_fit_sir_on_an_iov_fit_is_repeated_by_run_sir() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let row = "warfarin_iov focei";
+    let f = Fitted::new(
+        &WARFARIN_IOV,
+        &with_sir(quiet(EstimationMethod::FoceI)),
+        row,
+    );
+    assert!(
+        f.fit.ebe_kappas.iter().flatten().count() > 0,
+        "{row}: premise — the fit has κ̂ to start the draws from"
+    );
+    let inline = sir_bits(&f.fit, row);
+    assert_eq!(
+        f.sir(&sir_cleared(&f.fit), &defaults(), row),
+        inline,
+        "{row}: run_sir on the fit in memory must repeat the in-fit SIR"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fit.fitrx");
+    save_fit(
+        &f.fit,
+        &f.population,
+        "model\n",
+        &path,
+        SaveFitOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{row}: save_fit: {e}"));
+    let reloaded = load_fit(&path)
+        .unwrap_or_else(|e| panic!("{row}: load_fit: {e}"))
+        .fit;
+    assert_eq!(
+        f.sir(&sir_cleared(&reloaded), &defaults(), row),
+        inline,
+        "{row}: run_sir on the reloaded fit must repeat the in-fit SIR"
+    );
+}
+
 /// #1806 T3: `run_sir` on a fit with no SIR record takes the stage record, so, given the same
 /// SIR-only settings (draws, seed), it repeats the SIR the same fit would have run with
 /// `sir = true` (ferx-r#511). Each row's premise is the
