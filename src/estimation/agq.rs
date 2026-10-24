@@ -1112,6 +1112,11 @@ pub(crate) struct SubjectScoreContext<'a> {
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     force_fd: bool,
+    /// The inner tolerance of the finite-difference score's re-solves. Its probes start at
+    /// the subject's mode, so for the outer gradient it is the stencil tolerance
+    /// (`stencil_inner_tol`, #2261); the covariance step's S-matrix keeps its own
+    /// (`with_fd_inner_tol`).
+    fd_inner_tol: f64,
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
@@ -1138,7 +1143,16 @@ impl<'a> SubjectScoreContext<'a> {
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
+            fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+        }
+    }
+
+    /// This context with its finite-difference score re-solving at `tol`.
+    pub(crate) fn with_fd_inner_tol(self, tol: f64) -> Self {
+        Self {
+            fd_inner_tol: tol,
+            ..self
         }
     }
 
@@ -1222,8 +1236,7 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            // Every probe starts at the subject's mode (#2261).
-            crate::estimation::inner_optimizer::stencil_inner_tol(self.options.inner_tol),
+            self.fd_inner_tol,
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,

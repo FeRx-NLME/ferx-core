@@ -671,6 +671,8 @@ pub(crate) fn assemble_score_cross_product(
             bounds,
             crate::estimation::outer_optimizer::reconverge_this_eval(options, 0),
         )
+        // The covariance step's own tolerance, not the outer gradient's stencil one (#2261).
+        .with_fd_inner_tol(score_options.inner_tol)
     });
     // A mixture's subject marginal is `−log Σₖ pᵢₖ e^{−nllᵢₖ}`, not one class's nll
     // (#1956). Scoring it through the single-population path below ran every subject
@@ -1850,12 +1852,12 @@ pub(crate) fn compute_covariance_for(
     // Every reconverged point starts at the fit's joint mode, κ̂ included, so an IOV
     // subject does not re-solve its κ from 0 at each of the stencil's points (#2261).
     // `fit()` and `run_covariance` hand the same η̂ and κ̂, so the repeat stays bit for bit.
-    // A point that starts at the mode re-solves at the stencil tolerance, at most
-    // (`STENCIL_INNER_TOL`): at a loose one its solve could stop where it began. The base
-    // reconvergence takes the same tolerance, so the stencil's centre and its points are
-    // one objective. The mixture objective below solves cold and keeps `cov_inner_tol`.
+    // Unlike the FD gradient stencils, the points keep `cov_inner_tol` rather than the
+    // stencil tolerance (`STENCIL_INNER_TOL`): measured on `nested_levels_3` and
+    // `mbma_placebo`, tightening them moved no standard error by more than 1e-9 relative
+    // beyond what the joint start alone did, at up to 2.3× the inner solves (#2261), and
+    // tightening every model's covariance reconvergence is what #486 declined.
     let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
-    let stencil_tol = crate::estimation::inner_optimizer::stencil_inner_tol(cov_inner_tol);
 
     // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
     //
@@ -1885,7 +1887,7 @@ pub(crate) fn compute_covariance_for(
                 template,
                 warm,
                 options,
-                stencil_tol,
+                cov_inner_tol,
                 parallel_subjects,
             );
             2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options)
@@ -1962,7 +1964,7 @@ pub(crate) fn compute_covariance_for(
             template,
             &warm,
             options,
-            stencil_tol,
+            cov_inner_tol,
             true,
         );
         let o = 2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options);
@@ -2127,7 +2129,7 @@ pub(crate) fn compute_covariance_for(
     // did not honour. On the salvage route the probe still runs, but over the declined subjects
     // only, which is the same reduction the stencil itself gets.
     let assembly = if options.analytic_cov_hessian && !is_mixture {
-        // `base_eta_hats`, not `eta_hats` — the modes reconverged at the stencil tolerance, which
+        // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
         analytic_cov_assembly(
             model,
@@ -6446,12 +6448,22 @@ mod tests {
             "{label}: the step solves per subject"
         );
         assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
-        // The base reconvergence and every stencil point, at the stencil tolerance.
-        crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
-            label,
-            &rec,
-            |_| true,
-            opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        // The base reconvergence and every stencil point keep `cov_inner_tol`, not the FD
+        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs.
+        let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        assert!(
+            cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL,
+            "{label}: fixture: cov_inner_tol must differ from the stencil tolerance"
+        );
+        assert!(
+            rec.solve_tols
+                .iter()
+                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+            rec.solve_tols
+                .iter()
+                .map(|(_, t)| format!("{t:e}"))
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 
@@ -6474,5 +6486,61 @@ mod tests {
             "covariance step warfarin_iov ar1",
             kappa_correlation_fixture(),
         );
+    }
+
+    /// #2261: the quadrature S-matrix's FD score (forced here by
+    /// `reconverge_gradient_interval = 1`) re-solves at `cov_inner_tol`, the covariance step's
+    /// tolerance, not the outer gradient's stencil tolerance, and from the fit's (η̂, κ̂).
+    /// Mutation: drop `with_fd_inner_tol` → the score re-solves at the stencil tolerance.
+    #[test]
+    fn quadrature_s_matrix_fd_score_keeps_cov_inner_tol() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_starts_at_modes, on_one_thread, warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            reconverge_gradient_interval: 1,
+            ..opts
+        };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let free: Vec<usize> = crate::estimation::parameterization::packed_fixed_mask(p)
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !**f)
+            .map(|(i, _)| i)
+            .collect();
+        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                super::assemble_score_cross_product(
+                    &x, p, &model, &pop, &etas, &hms, &kappas, &bounds, &opts, &free,
+                )
+                .expect("the S matrix")
+            })
+            .1
+        });
+        let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        assert!(cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL);
+        assert!(
+            !rec.solve_tols.is_empty(),
+            "fixture: the FD score must re-solve"
+        );
+        assert!(
+            rec.solve_tols
+                .iter()
+                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "the S-matrix score re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+            rec.solve_tols
+                .iter()
+                .map(|(_, t)| format!("{t:e}"))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_starts_at_modes("S-matrix FD score", &rec, |_| true, &pop, &etas, &kappas);
     }
 }

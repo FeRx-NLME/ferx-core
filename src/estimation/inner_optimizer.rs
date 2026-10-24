@@ -1782,10 +1782,10 @@ thread_local! {
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The inner tolerance every reconverged central-difference stencil whose probes warm-start
-/// at the base mode re-solves at, at most: the FD gradients the optimizer is handed
-/// (`reconverged_fd_gradient` and the per-subject salvages), the reporting gradient, the AGQ
-/// FD score, the covariance step's R-matrix, and the profile's gradient probes and level
+/// The inner tolerance every reconverged finite-difference *gradient* stencil, whose probes
+/// warm-start at the base mode, re-solves at, at most: the FD gradients the optimizer is
+/// handed (`reconverged_fd_gradient` and the per-subject salvages), the reporting gradient,
+/// the AGQ FD score of the outer gradient, and the profile's gradient probes and level
 /// stencil (`PROFILE_INNER_TOL`). [`stencil_inner_tol`] applies it.
 ///
 /// A probe at `x ± h` that starts at the base mode starts within a loose `inner_tol` of its
@@ -1808,6 +1808,13 @@ thread_local! {
 ///
 /// A stencil whose probes start cold (the identity-scale pre-flight, the mixture FD
 /// gradient, the mixture covariance) has no stall to remove and keeps its own tolerance.
+///
+/// The covariance step keeps `cov_inner_tol` too, though its points also start at the mode.
+/// Measured on `nested_levels_3` and `mbma_placebo` (#2261), the stencil tolerance there
+/// moved no standard error by more than 1e-9 relative beyond what the joint start alone did,
+/// at up to 2.3× the IOV objective evaluations (20× on VI's covariance), and tightening every
+/// model's covariance reconvergence is what #486 declined. The FD gradients are where it
+/// buys accuracy: `nested_levels_3`'s worst gradient error goes from 9.2e-4 to 1.2e-5.
 pub(crate) const STENCIL_INNER_TOL: f64 = 1e-7;
 
 /// `tol`, tightened to at most [`STENCIL_INNER_TOL`]: the inner tolerance of a reconverged

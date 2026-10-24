@@ -904,12 +904,6 @@ fn covariance_salvage_points_start_at_the_subject_mode() {
         "fixture: subject 0 must take the subset stencil"
     );
     assert_starts_at_modes("covariance salvage", &rec, |_| true, &pop, &etas, &kappas);
-    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
-        "covariance salvage",
-        &rec,
-        |s| s == pop.subjects[0].id,
-        opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
-    );
 }
 
 /// #2261: the non-IOV per-subject reconverged salvage (a structural decline, #1536) re-solves
