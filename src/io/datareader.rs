@@ -2486,6 +2486,30 @@ fn filter_reads_unreadable_cell_error(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
+/// non-finite cell: the cells the LOCF update reads no value from.
+fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
+    row.get(idx)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Record, for each column of `watch` this record has no value in, the record's
+/// `TIME` as written, unless the column already has an entry: see
+/// [`Subject::filled_cells`] (#2036).
+fn note_filled_cells(
+    filled: &mut Vec<(String, f64)>,
+    watch: &[(&str, usize)],
+    row: &[String],
+    raw_time: f64,
+) {
+    for &(name, idx) in watch {
+        if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
+            filled.push((name.to_string(), raw_time));
+        }
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2618,6 +2642,10 @@ fn parse_subject(
     // models with no TV covariates.
     let mut tv_names: Vec<&str> = Vec::new();
     let mut tv_indices: Vec<usize> = Vec::new();
+    // Columns where a record with no value in the cell reads another record's value
+    // instead (#2036): the column holds a value somewhere in this subject and is not
+    // one of `routing.no_carry_forward`, whose missing cells read `NaN`.
+    let mut filled_watch: Vec<(&str, usize)> = Vec::new();
     for (name, idx) in cov_indices {
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
@@ -2650,7 +2678,14 @@ fn parse_subject(
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
+        if first_val.is_some()
+            && !routing.no_carry_forward.contains(name)
+            && rows.iter().any(|row| finite_cell(row, *idx).is_none())
+        {
+            filled_watch.push((name.as_str(), *idx));
+        }
     }
+    let mut filled_cells: Vec<(String, f64)> = Vec::new();
     let any_tv = !tv_names.is_empty();
 
     // LOCF state for the per-event snapshot path. Initialized from the
@@ -3027,6 +3062,7 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
             // reads (#1969). Doses below do the same.
             if time_offset != 0.0 {
@@ -3111,6 +3147,7 @@ fn parse_subject(
             // The reset half of an `EVID=4` row was pushed to `reset_times` above.
             dose.evid4 = evid == 4;
             doses.push(dose);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }
@@ -3426,6 +3463,7 @@ fn parse_subject(
                     }
                 };
                 obs_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
@@ -3511,6 +3549,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             pk_only_raw_times.push(raw_time);
             pk_only_rec.push(row_seq);
             if any_tv {
@@ -3726,6 +3765,7 @@ fn parse_subject(
             fremtype,
             obs_records,
             endpoint_covariates,
+            filled_cells,
         },
         occ_parse_failures,
         missing_dv_rows,

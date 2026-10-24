@@ -9578,6 +9578,7 @@ DV ~ additive(EPS)
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -9706,6 +9707,7 @@ DV ~ additive(EPS)
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -9814,6 +9816,7 @@ DV ~ additive(EPS)
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
@@ -9949,6 +9952,7 @@ DV ~ additive(EPS)
                     fremtype: Vec::new(),
                     obs_records: vec![],
                     endpoint_covariates: Vec::new(),
+                    filled_cells: Vec::new(),
                 }
             })
             .collect();
@@ -10125,6 +10129,7 @@ DV ~ additive(EPS)
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -11664,6 +11669,7 @@ DV ~ additive(EPS)
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

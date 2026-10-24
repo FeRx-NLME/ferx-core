@@ -395,6 +395,48 @@ fn a_pk_only_occasion_moves_the_digest_only_when_present() {
     );
 }
 
+/// #2036 review r1: `ARM = 1, 2, 2` and `1, 2, <blank>` read without the model carry
+/// the same values into every snapshot, but `fit()` refuses the second's blank level
+/// cell, so a resume on it must not reuse the first's fits. The written-out file is the
+/// control: identical snapshots, a different digest, and a resume refused. A population
+/// with no filled cell keeps the pre-#2036 digest (pinned above).
+#[test]
+fn a_filled_cell_moves_the_digest() {
+    let read = |tag: &str, csv: &str| {
+        let path = std::env::temp_dir().join(format!(
+            "ferx_journal_filled_{}_{tag}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, csv).unwrap();
+        let pop = ferx_core::read_nonmem_csv(&path, None, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        pop
+    };
+    let written = read(
+        "written",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
+    );
+    let blank = read(
+        "blank",
+        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
+    );
+    assert_eq!(
+        written.subjects[0].obs_covariates, blank.subjects[0].obs_covariates,
+        "the snapshots agree"
+    );
+    assert!(written.subjects[0].filled_cells.is_empty());
+    assert!(!blank.subjects[0].filled_cells.is_empty());
+    let (w, b) = (
+        SearchManifest::new(&options(), &written),
+        SearchManifest::new(&options(), &blank),
+    );
+    assert_ne!(w.data_fingerprint, b.data_fingerprint);
+    assert!(
+        w.check_compatible(&b, std::path::Path::new(".")).is_err(),
+        "a resume on the blank file reused the written-out file's fits"
+    );
+}
+
 #[test]
 fn the_fingerprint_is_stable_across_repeated_construction() {
     // Covariates live in `HashMap`s, whose iteration order varies per process.

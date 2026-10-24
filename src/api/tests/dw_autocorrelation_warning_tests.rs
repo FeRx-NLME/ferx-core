@@ -214,6 +214,7 @@ fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

@@ -712,6 +712,7 @@ pub fn run_model_simulate_with_overrides(
             #[cfg(not(feature = "survival"))]
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     let mut template = Population {

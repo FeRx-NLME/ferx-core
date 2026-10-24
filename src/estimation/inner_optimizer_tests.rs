@@ -300,6 +300,7 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let result = find_ebe(
@@ -443,6 +444,7 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -528,6 +530,7 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -675,6 +678,7 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let theta = &model.default_params.theta;
@@ -2070,6 +2074,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         fremtype: vec![0, 0, 100], // last obs is FREM
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     (model, subject)
@@ -2284,6 +2289,7 @@ fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(
         !subject.has_resets() && !subject.has_tv_covariates(),
@@ -2416,6 +2422,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let base = crate::parser::model_parser::parse_model_string(model_src)
@@ -2507,6 +2514,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let reset_subject = Subject {
         obs_rgroup: Vec::new(),
@@ -2537,6 +2545,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert!(!no_reset_subject.has_resets());
     assert!(reset_subject.has_resets());
@@ -2671,6 +2680,7 @@ fn flip_flop_transit_subject() -> Subject {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -3287,6 +3297,7 @@ mod frozen_ebe_variance {
             fremtype: Vec::new(),
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let p = model.default_params.clone();
         let preds = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.1]);
@@ -4296,6 +4307,7 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
     assert!(!subject.has_tv_covariates());
@@ -4796,6 +4808,7 @@ fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
         fremtype: Vec::new(),
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     (model, subject)
 }

@@ -100,6 +100,7 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
                 endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();
@@ -939,6 +940,7 @@ mod theta_gather_index_check {
             fremtype: Vec::new(),
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         Population {
             subjects: vec![subject],

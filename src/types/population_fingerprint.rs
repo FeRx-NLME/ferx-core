@@ -52,7 +52,11 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   (`endpoint_covariates`) when a covariate is time-varying, hashed with the other
 ///   snapshots, so a fit of a population differing only in an endpoint row's covariate
 ///   is caught.
-pub(crate) const SCHEME: u32 = 5;
+/// - `6`: #2036. The reader notes each covariate column whose blank cell it filled
+///   from another record (`filled_cells`), hashed with the covariates, so a
+///   population whose blank level cell `fit()` refuses does not match the fit of one
+///   that writes the carried value out.
+pub(crate) const SCHEME: u32 = 6;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
@@ -402,6 +406,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         fremtype,
         obs_records,
         endpoint_covariates,
+        filled_cells,
     } = s;
 
     let mut r = Encoder::default();
@@ -465,6 +470,15 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     ] {
         c.len(snapshots.len());
         snapshots.iter().for_each(|m| c.map(m));
+    }
+    // Which blank cells the reader filled from another record (#2036). The snapshots
+    // cannot say: `ARM = 1, 2, 2` and `1, 2, <blank>` carry the same values forward,
+    // and only the second is refused (`E_LEVEL_MISSING_LABEL`), so a fit of the first
+    // must not vouch for the second in `run_covariance` / `run_sir`.
+    c.len(filled_cells.len());
+    for (column, time) in filled_cells {
+        c.str(column);
+        c.f64(*time);
     }
 
     SubjectPrint {

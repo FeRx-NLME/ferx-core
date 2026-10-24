@@ -3512,6 +3512,7 @@ pub ferx_core::types::Subject::dose_covariates: alloc::vec::Vec<std::collections
 pub ferx_core::types::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
 pub ferx_core::types::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::types::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::types::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::types::Subject::id: alloc::string::String
 pub ferx_core::types::Subject::obs_cmts: alloc::vec::Vec<usize>
@@ -5183,6 +5184,7 @@ pub ferx_core::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash:
 pub ferx_core::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
 pub ferx_core::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::Subject::id: alloc::string::String
 pub ferx_core::Subject::obs_cmts: alloc::vec::Vec<usize>
