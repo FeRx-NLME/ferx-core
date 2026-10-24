@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed,
-    InnerLoopStats, InnerSolvePolicy,
+    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
+    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
@@ -3510,22 +3510,24 @@ fn decrement_ode_override(
 /// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
 /// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
 /// (#2001 review). A subject with no κ cells is its `η̂` alone.
-pub(super) fn joint_warm_starts(
+pub(crate) fn joint_warm_starts(
     ehs: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
 ) -> Vec<DVector<f64>> {
     ehs.iter()
         .enumerate()
-        .map(|(i, eta)| {
-            let cells = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            DVector::from_iterator(
-                eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
-                eta.iter()
-                    .chain(cells.iter().flat_map(|c| c.iter()))
-                    .copied(),
-            )
-        })
+        .map(|(i, eta)| joint_warm_start(eta, kappas.get(i).map(Vec::as_slice).unwrap_or(&[])))
         .collect()
+}
+
+/// One subject's [`joint_warm_starts`]: `eta`, then each of its κ `cells` in order.
+pub(crate) fn joint_warm_start(eta: &DVector<f64>, cells: &[DVector<f64>]) -> DVector<f64> {
+    DVector::from_iterator(
+        eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
+        eta.iter()
+            .chain(cells.iter().flat_map(|c| c.iter()))
+            .copied(),
+    )
 }
 
 /// [`bhhh_newton_decrement`] of the objective the optimizer minimises (−2LL plus any prior
@@ -6008,6 +6010,7 @@ fn optimize_nlopt_once(
                 model,
                 population,
                 &final_ehs,
+                &final_kappas,
                 &bounds,
                 options,
                 &nn_reg,
@@ -6699,7 +6702,10 @@ fn optimize_bfgs(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Central-FD `d(OFV)/d(x)` that **re-converges the EBEs at every perturbed
-/// point** (warm-started from `warm_etas`), rather than holding them fixed.
+/// point** (warm-started from `warm_etas` with `warm_kappas`, [`joint_warm_starts`], so an
+/// IOV probe starts at the mode's κ̂ rather than κ = 0, #2261), rather than holding them
+/// fixed. Every probe starts at the base mode, so it re-solves at the stencil tolerance
+/// ([`stencil_inner_tol`]): at a loose `inner_tol` the solve could stop where it began.
 ///
 /// For IOV models the variance components — especially `omega_iov` — are
 /// weakly identified, and the EBE response dominates their gradient: raising
@@ -6720,11 +6726,13 @@ fn reconverged_fd_gradient(
     model: &CompiledModel,
     population: &Population,
     warm_etas: &[DVector<f64>],
+    warm_kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
+    let warm = joint_warm_starts(warm_etas, warm_kappas);
 
     // OFV at a packed point, re-solving the inner loop (warm-started). Matches
     // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
@@ -6737,8 +6745,8 @@ fn reconverged_fd_gradient(
             population,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_etas),
+            stencil_inner_tol(options.inner_tol),
+            Some(&warm),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
@@ -6778,7 +6786,7 @@ fn reconverged_fd_gradient(
 /// `∇(OFV + penalty)` — the objective the fit actually converged on, matching
 /// [`FitResult::final_gradient`](crate::types::FitResult::final_gradient)'s
 /// documented contract — so the penalties go inside the stencil. The EBEs are
-/// re-solved (warm-started from the final ones) at every perturbed point, like
+/// re-solved (warm-started from the final ones, κ̂ included) at every perturbed point, like
 /// the objective closure itself, rather than held fixed.
 ///
 /// Cost: `2·n_free` objective evaluations, one gradient's worth.
@@ -6789,6 +6797,7 @@ fn reporting_fd_gradient(
     model: &CompiledModel,
     population: &Population,
     warm_etas: &[DVector<f64>],
+    warm_kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
@@ -6796,6 +6805,7 @@ fn reporting_fd_gradient(
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
+    let warm = joint_warm_starts(warm_etas, warm_kappas);
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
@@ -6817,8 +6827,8 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                options.inner_tol,
-                Some(warm_etas),
+                stencil_inner_tol(options.inner_tol),
+                Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
@@ -7177,7 +7187,7 @@ fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            stencil_inner_tol(options.inner_tol),
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
@@ -7205,13 +7215,15 @@ fn subject_reconverged_fd_gradient(
 /// ignore `reconverge_gradient_interval`, so unlike the non-IOV
 /// [`subject_fixed_ebe_gradient`] this salvage keeps the reconverged form (#1529). `find_ebe`
 /// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
-/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums).
+/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums). `warm` is the
+/// subject's joint mode (`η̂` then each cell's κ̂, [`joint_warm_start`]), so every probe
+/// starts at κ̂ rather than κ = 0 (#2261).
 fn subject_reconverged_fd_gradient_iov(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
     subject: &Subject,
-    warm_eta: &DVector<f64>,
+    warm: &DVector<f64>,
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
@@ -7224,8 +7236,8 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_eta.as_slice()),
+            stencil_inner_tol(options.inner_tol),
+            Some(warm.as_slice()),
             Some(&mu_k),
             0,
             options,
@@ -7961,16 +7973,13 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
-            for kap in &kappas[i] {
-                stacked.extend(kap.iter().copied());
-            }
+            let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_analytic_outer_gradient_iov(
                 model,
                 subject,
                 init_params,
                 x,
-                &stacked,
+                stacked.as_slice(),
                 options.interaction,
             ) {
                 Some(g) => g,
@@ -7989,7 +7998,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                                 init_params,
                                 model,
                                 subject,
-                                &ehs[i],
+                                &stacked,
                                 bounds,
                                 options,
                             )
@@ -8203,7 +8212,16 @@ fn population_gradient_with_agq_evaluation(
         // A subject's numerical score also failed. Only the optimizer may use its
         // guarded population objective here; covariance rejects an unavailable score
         // rather than differentiating this penalty and squaring it into S.
-        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
+        return reconverged_fd_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            ehs,
+            kappas,
+            bounds,
+            options,
+        );
     }
     // M3-censored models now have an exact analytic censored gradient on both the
     // FOCEI (`subject_packed_gradient` + `prepare`'s M3 branch) and the FOCE
@@ -8298,6 +8316,7 @@ fn population_gradient_with_agq_evaluation(
                         model,
                         population,
                         ehs,
+                        kappas,
                         bounds,
                         options,
                     );
@@ -8332,7 +8351,16 @@ fn population_gradient_with_agq_evaluation(
     // schedule (via `reconverge_this_eval`) opts a non-IOV fit into the
     // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias).
     if model.n_kappa > 0 || force_reconverge {
-        reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options)
+        reconverged_fd_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            ehs,
+            kappas,
+            bounds,
+            options,
+        )
     } else {
         ad_population_gradient(
             x,

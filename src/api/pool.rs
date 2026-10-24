@@ -221,6 +221,13 @@ impl FitScope {
     /// the `install` is what they would read (#1801 review, finding 1 — a job stolen during a
     /// default-options nested call on an `(Lbfgs, warm)` worker read `(Auto, false)`).
     fn armed<R>(self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+        // A test recording inner solves on the calling thread follows the call onto the
+        // thread that runs it (#2261).
+        #[cfg(test)]
+        let f = {
+            let recording = crate::estimation::inner_optimizer::recording_handle();
+            move || crate::estimation::inner_optimizer::with_recording_handle(recording, f)
+        };
         move || {
             let _ode = crate::ode::solver::arm_ode_solver_override(self.ode);
             let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
