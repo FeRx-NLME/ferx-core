@@ -171,7 +171,7 @@ pub(crate) use predict::grid_median_from_cumhaz;
 pub(crate) use run::derive_output_occasions;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
-pub(crate) use simulate::{correlated_residual_draw, draw_correlations};
+pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasses};
 
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same
@@ -462,6 +462,11 @@ mod multi_start_tests;
 #[cfg(test)]
 #[path = "tests/tests_mixture_postfit.rs"]
 mod tests_mixture_postfit;
+
+// #2163: each simulated subject runs under a class drawn from the mixing probabilities.
+#[cfg(test)]
+#[path = "tests/tests_mixture_simulate.rs"]
+mod tests_mixture_simulate;
 
 #[cfg(test)]
 #[path = "tests/zero_omega_tests.rs"]
