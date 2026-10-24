@@ -2792,16 +2792,22 @@ fn emit_eta_infos(
     use crate::types::EtaParamType;
     let scale = |ei: usize| {
         let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == ei);
-        let mut seen = Vec::new();
+        let mut own = Vec::new();
         for e in exprs {
             match cx.walk.def_of(e) {
-                Some(def) => cx.walk.resolved_leaf_scales(def, &is_eta, &mut seen),
+                Some(def) => own.push((
+                    cx.walk.scopes[def].as_slice(),
+                    cx.walk.def_reach(def, &is_eta),
+                )),
                 // Unreachable: every expression comes from the statements the
                 // walk was built from. Unknown is `Custom`, never a guess.
-                None => seen.push(EtaParamType::Custom),
+                None => own.push((&[][..], vec![(Terminal::Custom, 1)])),
             }
         }
-        common_scale(&seen)
+        // A terminal is counted over every statement that reads the ETA, not
+        // only this parameter's: `A = TVV + ETA_V`, `B = A + ETA_V` reaches `B`
+        // twice, from two rows (#1724).
+        reach_scale(&combine_scoped(&own, 0), &cx.walk.reach(&is_eta))
     };
     let pattern_eta = class.as_ref().map(|c| c.eta_idx);
     if let Some(mut c) = class {
@@ -2816,6 +2822,15 @@ fn emit_eta_infos(
                 c.theta_idx = None;
                 c.theta_transform = None;
             }
+        } else if c.eta_idx < cx.eta_names.len() && scale(c.eta_idx) == EtaParamType::Custom {
+            // The pattern matched one occurrence of an ETA that reaches the same
+            // scale more than once (`TVV * exp(ETA_V) * exp(ETA_V)`): the
+            // pattern's scale is wrong, so no CV% may be printed, and the link
+            // goes with it (#1724). Only the product patterns get here, and they
+            // set no transform: `exp(THETA + ETA)` holds its ETA once, in an
+            // `exp` no other read can reach.
+            c.param_type = EtaParamType::Custom;
+            c.theta_idx = None;
         }
         apply_class(
             c,
@@ -2900,8 +2915,10 @@ fn in_sibling_branches(a: &Scope, b: &Scope) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// Calls of [`ScaleWalk::root_scale`] on this thread, so a test can pin
-    /// that the walk is linear in the statements, not in the paths (#1674).
+    /// Calls of [`ScaleWalk::root_scale`] on this thread that its memo did not
+    /// answer, so a test can pin that the walk is linear in the statements, not
+    /// in the paths (#1674). Memo hits are not counted: the ETA classifier asks
+    /// for a definition once per row and once for the whole block (#1724).
     static ROOT_SCALE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2920,7 +2937,9 @@ struct ScaleWalk<'a> {
     scopes: Vec<Scope>,
     ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
-    memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
+    memo: std::cell::RefCell<Vec<Option<ScaleReach>>>,
+    /// [`Self::log_root`]'s memo, as `memo` is [`Self::root_scale`]'s.
+    log_memo: std::cell::RefCell<Vec<Option<ScaleReach>>>,
 }
 
 /// Where one definition is **in force**, per branch path, as a walk over the
@@ -2996,12 +3015,14 @@ impl<'a> ScaleWalk<'a> {
         let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
         flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
         let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
+        let log_memo = std::cell::RefCell::new(vec![None; assigns.len()]);
         Self {
             assigns,
             scopes,
             ifs,
             consumers,
             memo,
+            log_memo,
         }
     }
 
@@ -3013,23 +3034,94 @@ impl<'a> ScaleWalk<'a> {
             .position(|(_, e)| std::ptr::eq(*e, expr))
     }
 
-    /// The scale of every leaf that `is_leaf` picks out in definition `def`,
-    /// with a leaf that reached the root resolved by [`Self::root_scale`].
-    fn resolved_leaf_scales(
-        &self,
-        def: usize,
-        is_leaf: &dyn Fn(&Expression) -> bool,
-        out: &mut Vec<crate::types::EtaParamType>,
-    ) {
-        for s in leaf_scales(self.assigns[def].1, is_leaf) {
-            match s {
-                Some(t) => out.push(t),
-                None => out.extend(self.root_scale(def)),
+    /// Where every leaf that `is_leaf` picks out in definition `def` ends, and
+    /// how often: a leaf that reached the root is resolved by
+    /// [`Self::root_scale`], and one under an `exp` the root is a product of
+    /// (`EV = exp(ETA_V)`, `CL = TVCL * exp(ETA_CL)`) by [`Self::log_root`].
+    fn def_reach(&self, def: usize, is_leaf: &dyn Fn(&Expression) -> bool) -> ScaleReach {
+        let mut out = ScaleReach::new();
+        let log_key = root_product_key(self.assigns[def].1);
+        for (end, n) in leaf_scales(self.assigns[def].1, is_leaf) {
+            let follow = match end {
+                Some(Terminal::Call(key, crate::types::EtaParamType::LogNormal))
+                    if key == log_key =>
+                {
+                    self.log_root(def)
+                }
+                Some(t) => {
+                    reach_add(&mut out, t, n);
+                    continue;
+                }
+                None => self.root_scale(def),
+            };
+            for _ in 0..n {
+                reach_sum(&mut out, &follow);
             }
         }
+        out
     }
 
-    /// The distinct scale(s) of a leaf that reached the root of definition `def`.
+    /// [`Self::def_reach`] over every definition, combined by
+    /// [`combine_scoped`]: where the random effect `is_leaf` picks out ends,
+    /// across the whole block.
+    ///
+    /// A definition that a later one inside an `if` overwrites
+    /// (`A = ETA`, then `if (WT > 70) { A = ETA }`) reaches the readers after
+    /// that `if` only where the overwrite did not run, so it is combined with
+    /// the overwriting branch by `max`, as a virtual sibling branch of it: one
+    /// evaluation sees one of the two values. Only the first such overwrite is
+    /// used; a second one in another `if` is summed, which can only turn a
+    /// label `Custom`, never print a wrong CV.
+    fn reach(&self, is_leaf: &dyn Fn(&Expression) -> bool) -> ScaleReach {
+        let found: Vec<(usize, ScaleReach)> = (0..self.assigns.len())
+            .map(|def| (def, self.def_reach(def, is_leaf)))
+            .filter(|(_, r)| !r.is_empty())
+            .collect();
+        let origins: Vec<usize> = found.iter().map(|(d, _)| *d).collect();
+        let scopes: Vec<Scope> = origins
+            .iter()
+            .map(|&d| self.origin_scope(d, &origins))
+            .collect();
+        let items: Vec<_> = found
+            .into_iter()
+            .zip(&scopes)
+            .map(|((_, r), s)| (s.as_slice(), r))
+            .collect();
+        combine_scoped(&items, 0)
+    }
+
+    /// The scope [`Self::reach`] files origin `def` under: its own, or a
+    /// virtual sibling branch (`usize::MAX`) of the first later origin that
+    /// overwrites its variable inside an `if` below it.
+    ///
+    /// Only a pure replacement qualifies. An overwrite that `def`'s value
+    /// flows into ([`Self::flows_into`]), directly
+    /// (`if (WT > 70) { CL = CL + ETA }`) or through an alias (`OLD = CL`,
+    /// `if (WT > 70) { CL = OLD + ETA }`), adds to it on the branch it runs,
+    /// so the two are summed as usual: when `CL` is a parameter, `def` ends on
+    /// the overwrite's root once and so does the overwrite's own leaf, which
+    /// is `2·ETA` on that branch.
+    fn origin_scope(&self, def: usize, origins: &[usize]) -> Scope {
+        let (var, _) = self.assigns[def];
+        let own = &self.scopes[def];
+        for &y in origins.iter().filter(|&&y| y > def) {
+            let theirs = &self.scopes[y];
+            if self.assigns[y].0 == var
+                && theirs.len() > own.len()
+                && theirs.starts_with(own)
+                && !self.flows_into(def, y)
+            {
+                let mut v = theirs[..=own.len()].to_vec();
+                if let Some(last) = v.last_mut() {
+                    last.1 = usize::MAX;
+                }
+                return v;
+            }
+        }
+        own.clone()
+    }
+
+    /// Where a leaf that reached the root of definition `def` ends, and how often.
     ///
     /// Its **readers** are the later assignments where the definition is in
     /// force ([`InForce`], #1689) that read the variable (a reassignment reads
@@ -3045,34 +3137,119 @@ impl<'a> ScaleWalk<'a> {
     /// it is a parameter too. `consumers` holds upper-cased identifiers, so the
     /// check is case-insensitive.
     ///
+    /// The readers are combined by [`combine_scoped`], so two that both run
+    /// add up (`B = A + 1`, `C = A + 2`, `X = B + C` reaches `X` twice) while
+    /// two in sibling branches of an `if` do not (#1724).
+    ///
     /// A reader is always a later definition, so the recursion terminates: an
     /// in-place reassignment (`A = A + 1`) never reads itself.
-    fn root_scale(&self, def: usize) -> Vec<crate::types::EtaParamType> {
-        use crate::types::EtaParamType;
-        #[cfg(test)]
-        ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
+    fn root_scale(&self, def: usize) -> ScaleReach {
         if let Some(done) = &self.memo.borrow()[def] {
             return done.clone();
         }
+        #[cfg(test)]
+        ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
+        let out = self.follow(def, Terminal::Root(def), &|j, is_var| {
+            self.def_reach(j, is_var)
+        });
+        self.memo.borrow_mut()[def] = Some(out.clone());
+        out
+    }
+
+    /// Where a leaf ends whose definition `def` is a product with the leaf's
+    /// `exp` as a factor, so its log is the leaf plus terms free of it (#1724).
+    ///
+    /// The `exp` is its terminal unless a reader multiplies the variable in:
+    /// a read that only `*`, `/` and unary minus separate from the reader's
+    /// root carries the `exp` into the reader's product, which is followed
+    /// the same way, so `EV = exp(ETA_V)`, `V = TVV * EV * EV` reaches `V`'s
+    /// product twice (`log V = log TVV + 2η`). Any other read leaves the leaf
+    /// on this `exp`, as the walk always has, and the `exp` is reached at most
+    /// once however many such reads there are: it is evaluated once, so
+    /// `EV = exp(ETA_CL)`, `CL = EV + EV` is `2·exp(ETA_CL)`, log-normal. Such
+    /// a reader is still followed into the products downstream of it, so
+    /// `A = EV + EV`, `CL = A * A` (`4·exp(2·ETA_CL)`) reaches `CL`'s product
+    /// twice. The definition's range, the consumer stop and the reader
+    /// combination are [`Self::root_scale`]'s.
+    fn log_root(&self, def: usize) -> ScaleReach {
+        if let Some(done) = &self.log_memo.borrow()[def] {
+            return done.clone();
+        }
+        #[cfg(test)]
+        ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
+        let here = Terminal::Call(
+            root_product_key(self.assigns[def].1),
+            crate::types::EtaParamType::LogNormal,
+        );
+        let mut out = self.follow(def, here, &|j, is_var| {
+            let (factors, others) = product_reads(self.assigns[j].1, is_var);
+            let mut r = ScaleReach::new();
+            if factors > 0 {
+                let next = self.log_root(j);
+                for _ in 0..factors {
+                    reach_sum(&mut r, &next);
+                }
+            }
+            if others > 0 {
+                reach_add(&mut r, here, others);
+                reach_sum(&mut r, &self.log_root(j));
+            }
+            r
+        });
+        for (t, n) in out.iter_mut() {
+            if *t == here {
+                *n = 1;
+            }
+        }
+        self.log_memo.borrow_mut()[def] = Some(out.clone());
+        out
+    }
+
+    /// The walk over the readers of definition `def` shared by
+    /// [`Self::root_scale`] and [`Self::log_root`]: `read(j, is_var)` is where
+    /// reader `j`'s reads of the variable end, and `here` is the terminal of a
+    /// definition nothing reads or a consumer reads before any replacement.
+    ///
+    /// For a parameter, a reader that does not reassign it counts only for
+    /// what flows back into a later definition of it ([`Self::is_own`]):
+    /// `OLD = CL`, `if (WT > 70) { CL = OLD + ETA_CL }` ends on the
+    /// reassignment's root through `OLD` as well (#1724), while `K10 = CL / V`
+    /// still does not change the label. A `Custom` arrival is on no
+    /// definition, so where the reader's own value goes on to reach a later
+    /// definition of the parameter, that definition is reached twice:
+    /// `OLD = CL * 2`, `CL = OLD + ETA_CL` is `2·TVCL + 3·ETA_CL`.
+    fn follow(
+        &self,
+        def: usize,
+        here: Terminal,
+        read: &dyn Fn(usize, &dyn Fn(&Expression) -> bool) -> ScaleReach,
+    ) -> ScaleReach {
         let (var, _) = self.assigns[def];
         let scope = &self.scopes[def];
         let consumed = self.consumers.contains(&var.to_ascii_uppercase());
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
-        let mut out = Vec::new();
-        let (mut read, mut replaced) = (false, false);
+        let mut readers: Vec<(&[(usize, usize)], ScaleReach)> = Vec::new();
+        let mut replaced = false;
         let mut in_force = InForce::new(scope);
-        for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
+        for (j, (lhs, _)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
             if !in_force.reaches(other) {
                 continue;
             }
-            if !consumed || *lhs == var {
-                for s in leaf_scales(e, &is_var) {
-                    read = true;
-                    match s {
-                        Some(t) => out.push(t),
-                        None => out.extend(self.root_scale(j)),
+            {
+                let mut r = read(j, &is_var);
+                if consumed && *lhs != var {
+                    if r.iter().any(|(t, _)| *t == Terminal::Custom) {
+                        for (t, _) in self.root_scale(j) {
+                            if self.is_own(&t, var) {
+                                reach_add(&mut r, t, 2);
+                            }
+                        }
                     }
+                    r.retain(|(t, _)| self.is_own(t, var));
+                }
+                if !r.is_empty() {
+                    readers.push((other.as_slice(), r));
                 }
             }
             if *lhs == var && in_force.end(other, &self.ifs) {
@@ -3080,18 +3257,110 @@ impl<'a> ScaleWalk<'a> {
                 break;
             }
         }
-        if !read || (consumed && !replaced) {
-            out.push(EtaParamType::Additive);
+        let read_any = !readers.is_empty();
+        let mut out = combine_scoped(&readers, 0);
+        if !read_any || (consumed && !replaced) {
+            reach_add(&mut out, here, 1);
         }
-        let mut distinct: Vec<EtaParamType> = Vec::new();
-        for t in out {
-            if !distinct.contains(&t) {
-                distinct.push(t);
+        out
+    }
+
+    /// Whether terminal `t` is on a definition of `var`: its root, or a call
+    /// in its expression. `Custom` is on none.
+    fn is_own(&self, t: &Terminal, var: &str) -> bool {
+        match *t {
+            Terminal::Root(d) => self.assigns[d].0 == var,
+            Terminal::Call(key, _) => self.assigns.iter().any(|&(lhs, e)| {
+                lhs == var && {
+                    let mut hit = false;
+                    visit_expr_nodes(e, &mut |n| hit |= std::ptr::eq(n, key as *const Expression));
+                    hit
+                }
+            }),
+            Terminal::Custom => false,
+        }
+    }
+
+    /// Whether definition `def`'s value flows into definition `y`: `y` reads
+    /// its variable where it is in force, or reads a definition that does,
+    /// and so on. A read in an `if` condition is not a flow.
+    fn flows_into(&self, def: usize, y: usize) -> bool {
+        let mut seen = vec![false; self.assigns.len()];
+        let mut stack = vec![def];
+        while let Some(d) = stack.pop() {
+            let (var, _) = self.assigns[d];
+            let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
+            let mut in_force = InForce::new(&self.scopes[d]);
+            for (j, (lhs, e)) in self
+                .assigns
+                .iter()
+                .enumerate()
+                .skip(d + 1)
+                .take_while(|(j, _)| *j <= y)
+            {
+                let other = &self.scopes[j];
+                if !in_force.reaches(other) {
+                    continue;
+                }
+                if reads_node(e, &is_var) {
+                    if j == y {
+                        return true;
+                    }
+                    if !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+                if *lhs == var && in_force.end(other, &self.ifs) {
+                    break;
+                }
             }
         }
-        self.memo.borrow_mut()[def] = Some(distinct.clone());
-        distinct
+        false
     }
+}
+
+/// The address [`leaf_scales`] keys an `exp` factor of `expr`'s root product
+/// on: the root, past any unary minus (`0 - x`). An inline `if` at the root
+/// is its own key, and an `exp` in either branch is a factor of it.
+fn root_product_key(expr: &Expression) -> usize {
+    let mut e = expr;
+    while let Expression::BinOp(l, BinOp::Sub, r) = e {
+        if !is_literal_zero(l) {
+            break;
+        }
+        e = r;
+    }
+    e as *const Expression as usize
+}
+
+/// How often `expr` reads a leaf `is_leaf` picks out as a factor of its root
+/// product (only `*`, `/` and unary minus above it), and how often anywhere
+/// else, each capped at 2; an inline `if`'s branches by `max`, and a leaf in
+/// a condition not at all, as in [`leaf_scales`].
+fn product_reads(expr: &Expression, is_leaf: &dyn Fn(&Expression) -> bool) -> (u8, u8) {
+    fn walk(e: &Expression, is_leaf: &dyn Fn(&Expression) -> bool, factor: bool) -> (u8, u8) {
+        let add = |(a, b): (u8, u8), (c, d): (u8, u8)| ((a + c).min(2), (b + d).min(2));
+        if is_leaf(e) {
+            return if factor { (1, 0) } else { (0, 1) };
+        }
+        match e {
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => walk(r, is_leaf, factor),
+            Expression::BinOp(l, BinOp::Mul | BinOp::Div, r) => {
+                add(walk(l, is_leaf, factor), walk(r, is_leaf, factor))
+            }
+            Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                add(walk(l, is_leaf, false), walk(r, is_leaf, false))
+            }
+            Expression::UnaryFn(_, a) => walk(a, is_leaf, false),
+            Expression::Conditional(_, t, f) => {
+                let (t, f) = (walk(t, is_leaf, factor), walk(f, is_leaf, factor));
+                (t.0.max(f.0), t.1.max(f.1))
+            }
+            _ => (0, 0),
+        }
+    }
+    walk(expr, is_leaf, true)
 }
 
 /// The common type of every scale a random effect was seen at; `Custom` on any
@@ -3101,6 +3370,111 @@ fn common_scale(seen: &[crate::types::EtaParamType]) -> crate::types::EtaParamTy
         Some((first, rest)) if rest.iter().all(|t| t == first) => *first,
         _ => crate::types::EtaParamType::Custom,
     }
+}
+
+/// Where the walk of one random-effect leaf ends ([`leaf_scales`],
+/// [`ScaleWalk::root_scale`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Terminal {
+    /// The `exp` or `inv_logit`/`expit` call at this address decides the scale
+    /// (the address of the product it is a factor of, when it is one).
+    Call(usize, crate::types::EtaParamType),
+    /// The root of this definition, read as a parameter: `Additive`.
+    Root(usize),
+    /// Any other operation: `Custom`, however often it is reached.
+    Custom,
+}
+
+/// Every terminal a random effect reaches, with how often one evaluation
+/// reaches it, capped at 2: once is the unit coefficient the scale label
+/// assumes, twice is `2η` (or `η − η`) on that scale, which no `CV%` or `SD`
+/// of ω describes (#1724).
+type ScaleReach = Vec<(Terminal, u8)>;
+
+/// Add `n` arrivals at `t` to `r`.
+fn reach_add<T: PartialEq>(r: &mut Vec<(T, u8)>, t: T, n: u8) {
+    match r.iter_mut().find(|(u, _)| *u == t) {
+        Some((_, m)) => *m = (*m + n).min(2),
+        None => r.push((t, n.min(2))),
+    }
+}
+
+/// `r += s`: the arrivals of two parts that are both evaluated.
+fn reach_sum<T: PartialEq + Copy>(r: &mut Vec<(T, u8)>, s: &[(T, u8)]) {
+    for &(t, n) in s {
+        reach_add(r, t, n);
+    }
+}
+
+/// `r = max(r, s)` per terminal: the arrivals of two parts of which one
+/// evaluation takes only one (the branches of an `if`).
+fn reach_max<T: PartialEq + Copy>(r: &mut Vec<(T, u8)>, s: &[(T, u8)]) {
+    for &(t, n) in s {
+        match r.iter_mut().find(|(u, _)| *u == t) {
+            Some((_, m)) => *m = (*m).max(n),
+            None => r.push((t, n)),
+        }
+    }
+}
+
+/// Combine the reaches of several definitions by where they sit: summed when
+/// both run, and the most of any one branch across the branches of one `if`
+/// statement, so that `A = RE` in one branch and `A = RE + 1` in the other
+/// reach a later `exp(A)` once. `items` share their scopes up to `depth`.
+fn combine_scoped(items: &[(&[(usize, usize)], ScaleReach)], depth: usize) -> ScaleReach {
+    let mut out = ScaleReach::new();
+    let mut ifs: Vec<usize> = Vec::new();
+    for (scope, r) in items {
+        match scope.get(depth) {
+            None => reach_sum(&mut out, r),
+            Some(&(id, _)) if !ifs.contains(&id) => ifs.push(id),
+            Some(_) => {}
+        }
+    }
+    for id in ifs {
+        let mut branches: Vec<usize> = Vec::new();
+        for (scope, _) in items {
+            if let Some(&(i, b)) = scope.get(depth) {
+                if i == id && !branches.contains(&b) {
+                    branches.push(b);
+                }
+            }
+        }
+        let mut most = ScaleReach::new();
+        for b in branches {
+            let sub: Vec<_> = items
+                .iter()
+                .filter(|(scope, _)| scope.get(depth) == Some(&(id, b)))
+                .cloned()
+                .collect();
+            reach_max(&mut most, &combine_scoped(&sub, depth + 1));
+        }
+        reach_sum(&mut out, &most);
+    }
+    out
+}
+
+/// The scale of the terminals in `own`, a terminal reached more than once in
+/// `all` (a superset of `own`, the whole block's reach) counting as `Custom`;
+/// [`common_scale`] across them.
+fn reach_scale(own: &ScaleReach, all: &ScaleReach) -> crate::types::EtaParamType {
+    use crate::types::EtaParamType;
+    let seen: Vec<EtaParamType> = own
+        .iter()
+        .map(|&(t, n)| {
+            let n = all
+                .iter()
+                .find(|(u, _)| *u == t)
+                .map_or(n, |&(_, m)| m.max(n));
+            match t {
+                _ if n > 1 => EtaParamType::Custom,
+                Terminal::Call(_, ty) => ty,
+                Terminal::Root(_) => EtaParamType::Additive,
+                Terminal::Custom => EtaParamType::Custom,
+            }
+        })
+        .collect();
+    common_scale(&seen)
 }
 
 /// Blocks that read an `[individual_parameters]` variable **as a parameter**:
@@ -3203,11 +3577,8 @@ fn classify_kappa_params(
         .map(|k| {
             let slot = n_eta + k;
             let is_kappa = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
-            let mut seen = Vec::new();
-            for def in 0..walk.assigns.len() {
-                walk.resolved_leaf_scales(def, &is_kappa, &mut seen);
-            }
-            common_scale(&seen)
+            let all = walk.reach(&is_kappa);
+            reach_scale(&all, &all)
         })
         .collect()
 }
@@ -3217,66 +3588,102 @@ fn classify_kappa_params(
 #[cfg(test)]
 fn classify_kappa_scale(expr: &Expression, slot: usize, out: &mut Vec<crate::types::EtaParamType>) {
     let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
-    out.extend(
-        leaf_scales(expr, &is_eta)
-            .into_iter()
-            .map(|s| s.unwrap_or(crate::types::EtaParamType::Additive)),
-    );
+    let ends = leaf_scales(expr, &is_eta);
+    let reach: ScaleReach = ends
+        .iter()
+        .map(|&(end, n)| (end.unwrap_or(Terminal::Root(0)), n))
+        .collect();
+    for (end, _) in ends {
+        out.push(reach_scale(
+            &vec![(end.unwrap_or(Terminal::Root(0)), 1)],
+            &reach,
+        ));
+    }
 }
 
-/// The scale of every leaf of `expr` that `is_leaf` picks out.
+/// Where every leaf of `expr` that `is_leaf` picks out ends, and how often.
 ///
 /// Walking up from the leaf through `+`, `-` and unary minus (`0 - x`), the
 /// first other ancestor decides: `exp` → `LogNormal`, `inv_logit`/`expit` →
-/// `Logit`, anything else (`*`, `/`, `^`, another function) → `Custom`; `None`
-/// when the walk reaches the root, which the caller resolves. An inline `if` is
-/// transparent; a leaf in a condition or a gather index is not a scale position
-/// and is not counted.
+/// `Logit` (each a [`Terminal::Call`] on that call, or on the top of the
+/// `*`/`/` chain the call is a factor of, so two leaves under one `exp`, or
+/// under two `exp` factors of one product, reach it twice), anything else (`*`, `/`, `^`, another function) →
+/// `Custom`; `None` when the walk reaches the root, which the caller resolves.
+/// An inline `if` is transparent, and one evaluation takes one of its
+/// branches, so they combine by [`reach_max`] (`max(ETA, 0)` reads `ETA`
+/// once); a leaf in a condition or a gather index is not a scale position and
+/// is not counted.
 fn leaf_scales(
     expr: &Expression,
     is_leaf: &dyn Fn(&Expression) -> bool,
-) -> Vec<Option<crate::types::EtaParamType>> {
+) -> Vec<(Option<Terminal>, u8)> {
     use crate::types::EtaParamType;
 
+    /// `chain` is the top of the `*`/`/` chain `e` is a direct factor of.
     fn walk(
         e: &Expression,
         is_leaf: &dyn Fn(&Expression) -> bool,
-        scale: Option<EtaParamType>,
-        out: &mut Vec<Option<EtaParamType>>,
+        end: Option<Terminal>,
+        chain: Option<usize>,
+        out: &mut Vec<(Option<Terminal>, u8)>,
     ) {
         if is_leaf(e) {
-            out.push(scale);
+            reach_add(out, end, 1);
             return;
         }
+        let at = e as *const Expression as usize;
         match e {
+            // Unary minus (`0 - x`) is a sign, not a term: a negated factor
+            // stays a factor of its product, so `TVCL * -exp(η) * -exp(η)`
+            // still reaches one terminal twice.
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                walk(r, is_leaf, end, chain, out);
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
-                walk(l, is_leaf, scale, out);
-                walk(r, is_leaf, scale, out);
+                walk(l, is_leaf, end, None, out);
+                walk(r, is_leaf, end, None, out);
+            }
+            Expression::BinOp(l, BinOp::Mul | BinOp::Div, r) => {
+                let top = Some(chain.unwrap_or(at));
+                walk(l, is_leaf, Some(Terminal::Custom), top, out);
+                walk(r, is_leaf, Some(Terminal::Custom), top, out);
             }
             Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
-                walk(l, is_leaf, Some(EtaParamType::Custom), out);
-                walk(r, is_leaf, Some(EtaParamType::Custom), out);
+                walk(l, is_leaf, Some(Terminal::Custom), None, out);
+                walk(r, is_leaf, Some(Terminal::Custom), None, out);
             }
             Expression::UnaryFn(name, a) => {
+                // Keyed on the product it is a factor of, so `exp(η) * exp(η)`
+                // reaches one terminal twice: `log` of the product is `2η`.
+                let key = chain.unwrap_or(at);
                 let t = match name.as_str() {
-                    "exp" => EtaParamType::LogNormal,
-                    "inv_logit" | "expit" => EtaParamType::Logit,
-                    _ => EtaParamType::Custom,
+                    "exp" => Terminal::Call(key, EtaParamType::LogNormal),
+                    "inv_logit" | "expit" => Terminal::Call(key, EtaParamType::Logit),
+                    _ => Terminal::Custom,
                 };
-                walk(a, is_leaf, Some(t), out);
+                walk(a, is_leaf, Some(t), None, out);
             }
             // Transparent, like a statement-level `if`: each value branch keeps
             // the scale above it, and a leaf read only in the condition is not
-            // a scale position at all.
+            // a scale position at all. A branch is a factor of the product the
+            // `if` is a factor of (or of the `if` itself, which is the root
+            // product key when it is the root), so
+            // `TVCL * (if (c) exp(η) else exp(η)) * exp(η)` reaches one
+            // terminal twice on either path.
             Expression::Conditional(_, t, f) => {
-                walk(t, is_leaf, scale, out);
-                walk(f, is_leaf, scale, out);
+                let top = Some(chain.unwrap_or(at));
+                let mut branch = Vec::new();
+                walk(t, is_leaf, end, top, &mut branch);
+                let mut other = Vec::new();
+                walk(f, is_leaf, end, top, &mut other);
+                reach_max(&mut branch, &other);
+                reach_sum(out, &branch);
             }
             _ => {}
         }
     }
     let mut out = Vec::new();
-    walk(expr, is_leaf, None, &mut out);
+    walk(expr, is_leaf, None, None, &mut out);
     out
 }
 

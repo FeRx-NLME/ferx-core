@@ -73,7 +73,8 @@ reports an `SD` for both rows. A reassigned parameter is labelled by its last
 assignment for both, too (see
 [How an ETA row is labelled](individual-parameters.qmd#how-an-eta-row-is-labelled), #1673).
 
-A kappa that enters two parameters on different scales, or that no parameter
+A kappa that enters two parameters on different scales, that reaches one
+scale twice (`exp(KAPPA_CL) * exp(KAPPA_CL)`, #1724), or that no parameter
 reads, is custom. A weighted kappa is classified on the expression as written,
 before the `weight =` rewrite, and its CV% or SD is labelled `at weight 1` (see
 [What is reported](#what-is-reported)). The classification is stored on

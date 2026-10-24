@@ -714,6 +714,28 @@ however many terms sit beside it:
 | `inv_logit(TH + TH_WT * WT + ETA)` | logit, `SD = …, logit scale` |
 | `TVCL * exp(ETA_CL + ETA_X)` | log-normal, `CV%`, for both |
 | `TVV + ETA_V * WT` | custom, no CV% or SD |
+| `TVV * exp(ETA_V) * exp(ETA_V)`, `TVV + ETA_V + ETA_V` | custom, no CV% or SD |
+| `-TVV * exp(ETA_V)`, `TVV * exp(-ETA_V)` | log-normal, `CV%` |
+
+The label assumes the ETA enters its scale **once**. An ETA that reaches the
+same `exp`, `inv_logit` or parameter twice in one evaluation enters it as
+`2·η`: `log V = log TVV + 2·η`, whose CV is `√(e^{4ω} − 1)` (70.1% at
+ω = 0.1), not `100·√ω` (31.6%). So it is custom, however the two reads are
+spelled — two `exp` factors, `exp(ETA_V + ETA_V)`, an intermediate read twice
+(`ECL = ETA_CL`, `CL = TVCL * exp(ECL) * exp(ECL)`), an `exp` intermediate
+multiplied in twice (`EV = exp(ETA_V)`, `V = TVV * EV * EV`), two
+intermediates built from one (`B = A + 1`, `C = A + 2`, `exp(B + C)`), or a
+later line that adds it again (`CL = TVCL + ETA_CL`, then
+`CL = CL + ETA_CL`, even inside an `if`, and through an alias: `OLD = CL`,
+then `CL = OLD + ETA_CL`) (#1724). Reads that no single evaluation makes
+together count once: the two branches of an `if`, an `if` that overwrites a
+variable without using its old value (`A = ETA`, then
+`if (WT > 70) { A = ETA }`), or `max(ETA, 0)`, which reads the ETA in a
+condition. An `exp` is evaluated once, so reading an `exp` intermediate more
+than once outside a product keeps the label: `EV = exp(ETA_CL)`,
+`CL = EV + EV` is `2·exp(ETA_CL)`, log-normal (though `A = EV + EV`,
+`CL = A * A` is `4·exp(2·ETA_CL)`, custom). A sign never changes the CV, so a
+minus anywhere on the way keeps the label.
 
 An ETA that reaches the top of an intermediate variable is followed to where
 that variable is used, exactly as a kappa is (see

@@ -29506,10 +29506,11 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  CL = CL + CL * TVV",
             Custom,
         ),
+        // #1724: `2·(TVCL + RE)` — two arrivals at one root.
         (
-            "reads itself twice, both +, unchanged",
+            "reads itself twice, both +, was Additive",
             "  CL = CL + CL",
-            Additive,
+            Custom,
         ),
         // Dies under: a consumed variable following its other readers once a
         // reassignment replaces it — `K10` is not the parameter either way.
@@ -29735,15 +29736,18 @@ fn diamond(depth: usize, re: &str) -> String {
 /// Dies under: removing the memo lookup in `root_scale`.
 #[test]
 fn the_scale_walk_is_linear_on_a_diamond() {
-    use crate::types::EtaParamType::LogNormal;
+    use crate::types::EtaParamType::{Custom, LogNormal};
     for re in ["ETA_CL", "K"] {
         let count = |d: usize| {
             let (eta, kappa, calls) = walk_counted(&diamond(d, re));
-            // The answer, not just the cost: `+` all the way down to an `exp`.
+            // The answer, not just the cost: `+` all the way down to an `exp`,
+            // but from depth 1 `X{d}` holds `2^d` copies of the random effect,
+            // so the `exp` is reached more than once (#1724).
+            let want = if d == 0 { LogNormal } else { Custom };
             if re == "K" {
-                assert_eq!(kappa, LogNormal, "{re} depth {d}");
+                assert_eq!(kappa, want, "{re} depth {d}");
             } else {
-                assert_eq!(eta, [LogNormal], "{re} depth {d}");
+                assert_eq!(eta, [want], "{re} depth {d}");
             }
             calls
         };
@@ -29770,6 +29774,355 @@ fn a_self_reassignment_terminates() {
     assert_eq!(calls, 3, "one call per definition");
     let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
     assert_eq!(kappa, LogNormal);
+}
+
+// ── #1724: a random effect that reaches one scale more than once ─────────────
+
+/// Every row's ETA entries (each must carry `want`, and there must be some) and
+/// its kappa type, for the random effect `RE` in `indiv` — as in
+/// [`re_scale_twins`], which this checks every entry of.
+fn check_re_rows(rows: &[(&str, &str, crate::types::EtaParamType)]) {
+    let mut wrong = Vec::new();
+    for &(label, indiv, want) in rows {
+        let (eta, kappa) = re_scale_twins(indiv);
+        if eta.is_empty() || eta.iter().any(|(_, t)| *t != want) {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// #1724: the scale label assumes the random effect enters its scale once, with
+/// a unit coefficient. Reaching the same `exp`, `inv_logit` or parameter root
+/// twice is `2η` there (`log V = log TVV + 2η`: true CV `√(e^{4ω} − 1)` = 70.1%
+/// at ω = 0.1 against the printed `100·√ω` = 31.6%), so the label is `Custom`
+/// and no CV% or SD is printed. Every row was the label in its name before.
+/// Each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_reaching_one_scale_twice_is_custom() {
+    use crate::types::EtaParamType::Custom;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str)> = [
+        // Dies under: `reach_scale` ignoring the count (every row), and the
+        // `exp` terminal keyed on the call instead of its product (this row).
+        (
+            "two exp factors, was LogNormal",
+            "  CL = TVCL * exp(RE) * exp(RE)",
+        ),
+        // Dies under: unary minus (`0 - x`) resetting the product chain, so
+        // each negated `exp` is its own terminal (#1724 review).
+        (
+            "two negated exp factors, was LogNormal",
+            "  CL = TVCL * -exp(RE) * -exp(RE)",
+        ),
+        (
+            "a negated product times an exp, was LogNormal",
+            "  CL = -(TVCL * exp(RE)) * exp(RE)",
+        ),
+        // Dies under: `reach_add` not adding (the count stays 1 per call).
+        (
+            "one exp, read twice, was LogNormal",
+            "  CL = exp(RE + RE) * TVCL",
+        ),
+        (
+            "one exp, read with both signs, was LogNormal",
+            "  CL = TVCL * exp(RE - RE)",
+        ),
+        ("one root, was Additive", "  CL = TVCL + RE + RE"),
+        (
+            "one inv_logit, was Logit",
+            "  CL = inv_logit(TVCL + RE + RE)",
+        ),
+        // Dies under: `def_reach` resolving a root read once, not `n` times.
+        (
+            "an alias read twice, was LogNormal",
+            "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)",
+        ),
+        // Dies under: `root_scale` taking the readers' distinct terminals
+        // instead of summing them.
+        (
+            "a diamond, was LogNormal",
+            "  A = RE\n  B = A + 1\n  C = A + 2\n  CL = TVCL * exp(B + C)",
+        ),
+        // Dies under: `emit_eta_infos` counting only its own statement, not
+        // every statement that reads the ETA.
+        (
+            "two statements reach one exp, was LogNormal",
+            "  A = TVCL + RE\n  CL = exp(A + RE)",
+        ),
+        (
+            "a reassignment adds it again, was Additive",
+            "  CL = TVCL + RE\n  CL = CL + RE",
+        ),
+        // Dies under: `def_reach` stopping at an `exp` the root is a product
+        // of, instead of following it into `log_root` (the #1724 example).
+        (
+            "an exp intermediate multiplied in twice, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "an exp intermediate beside its own exp, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * exp(RE) * EV",
+        ),
+        // Dies under: `log_root` not recursing into a reader's own readers.
+        (
+            "an exp intermediate through a second product, was LogNormal",
+            "  EV = exp(RE)\n  E2 = EV * 2\n  CL = TVCL * E2 / EV",
+        ),
+        // Dies under: an inline `if`'s branches walked without the product
+        // chain they are a factor of (#1724 review round 3).
+        (
+            "an inline if of exps beside an exp, was LogNormal",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE)) * exp(RE)",
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in twice, was LogNormal",
+            "  EV = if (WT > 70) exp(RE) else exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        // The other side of `origin_scope`: an overwrite that reads the
+        // variable — on `WT > 70` `A` holds `2·RE`. (Custom through the
+        // original definition's own two routes, through the overwrite and
+        // around it, so it holds with `origin_scope`'s virtual branch.)
+        (
+            "a conditional overwrite that adds it again",
+            "  A = RE\n  if (WT > 70) {\n    A = A + RE\n  }\n  CL = TVCL * exp(A)",
+        ),
+        // Dies under: `origin_scope` filing a read-modify-write overwrite as
+        // a virtual sibling branch (#1724 review). `CL` is a parameter, so the
+        // original definition ends on the overwrite's root once, as does the
+        // overwrite's own leaf; maxed, that is 1, but on `WT > 70` `CL` holds
+        // `TVCL + 2·RE`.
+        (
+            "a conditional overwrite of a parameter that adds it again, was Additive",
+            "  CL = TVCL + RE\n  if (WT > 70) {\n    CL = CL + RE\n  }",
+        ),
+        // Dies under: `origin_scope` testing a direct read instead of
+        // `flows_into`, and under `follow` skipping a parameter's readers that
+        // do not reassign it — the old value reaches the overwrite through
+        // `OLD`, so on `WT > 70` `CL` holds `2·RE` (#1724 review).
+        (
+            "an alias fed into a conditional overwrite of a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD + RE\n  }",
+        ),
+        (
+            "an alias fed into a conditional overwrite of a log-normal parameter, was LogNormal",
+            "  CL = TVCL * exp(RE)\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD * exp(RE)\n  }",
+        ),
+        // Dies under: `follow` dropping a `Custom` arrival from a reader that
+        // flows back into the parameter — `CL` ends `2·TVCL + 3·RE`.
+        (
+            "a transformed alias fed back into a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD + RE",
+        ),
+        // Dies under: that arrival counted once — here the reassignment adds
+        // no ETA of its own, and `CL = 2·TVCL + 2·RE`.
+        (
+            "a transformed alias that replaces a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD",
+        ),
+        // Dies under: `log_root` stopping at an off-product reader — `A` is
+        // `2·exp(RE)`, but `CL = A * A` is `4·exp(2·RE)` (#1724 review).
+        (
+            "an exp intermediate added to itself, then squared, was LogNormal",
+            "  EV = exp(RE)\n  A = EV + EV\n  CL = TVCL * A * A",
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t)| (format!("{v}{t}"), l))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l)| (*l, i.as_str(), Custom)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724, the other side of every gate above: the random effect reaches each
+/// terminal at most once **per evaluation**, so the label stands. Each row
+/// names the mutation it dies under; each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_reaching_each_scale_once_keeps_its_label() {
+    use crate::types::EtaParamType::{self, *};
+    let rows: [(&str, &str, EtaParamType); 15] = [
+        // Dies under: an inline `if`'s branches summed, not maxed (`max` is
+        // desugared to `if (RE >= 0) RE else 0`, and the condition read is
+        // not a scale position at all).
+        (
+            "max() reads it in a condition and one branch",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * exp(max(RE, 0))",
+            LogNormal,
+        ),
+        (
+            "an inline if reads it in both branches",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * exp(if (WT > 70) RE else RE + 1)",
+            LogNormal,
+        ),
+        // Dies under: readers in sibling `if` branches summed by `combine_scoped`.
+        (
+            "two readers in sibling branches",
+            "  V = TVV * exp(ETA_V)\n  A = RE\n  \
+             if (WT > 70) {\n    B = A\n  } else {\n    B = A + 1\n  }\n  \
+             CL = TVCL * exp(B)",
+            LogNormal,
+        ),
+        // Dies under: definitions in sibling branches summed by `combine_scoped`
+        // across the origin statements (`reach`).
+        (
+            "two definitions in sibling branches",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    A = RE\n  } else {\n    A = RE + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            LogNormal,
+        ),
+        (
+            "assigned in sibling branches, additive",
+            "  V = TVV * exp(ETA_V)\n  \
+             if (WT > 70) {\n    CL = TVCL + RE\n  } else {\n    CL = TVCL - RE\n  }",
+            Additive,
+        ),
+        // Dies under: the count kept per random effect instead of per terminal
+        // — two different `exp` calls each reached once.
+        (
+            "one alias into two parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V = TVV * exp(ETA_V) * exp(A)",
+            LogNormal,
+        ),
+        // Dies under: `log_root` taking every reader's product as one
+        // terminal — the `exp` is multiplied into two parameters, once each.
+        (
+            "an exp intermediate in two products",
+            "  EV = exp(RE)\n  CL = TVCL * EV\n  V = TVV * exp(ETA_V) * EV",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate multiplied in once",
+            "  V = TVV * exp(ETA_V)\n  EV = exp(RE)\n  CL = TVCL / EV",
+            LogNormal,
+        ),
+        // Dies under: an inline `if`'s branches summed once they share the
+        // product's terminal.
+        (
+            "an inline if of exps in a product",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE))",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in once",
+            "  V = TVV * exp(ETA_V)\n  EV = if (WT > 70) exp(RE) else exp(RE)\n  \
+             CL = TVCL * EV",
+            LogNormal,
+        ),
+        // Dies under: `origin_scope` deleted — the definition the `if`
+        // overwrites and the overwrite are summed, though each evaluation
+        // sees one of them (#1724 review).
+        (
+            "a conditional overwrite that does not read it",
+            "  V = TVV * exp(ETA_V)\n  A = RE\n  if (WT > 70) {\n    A = RE\n  }\n  \
+             CL = TVCL * exp(A)",
+            LogNormal,
+        ),
+        // Dies under: `log_root` counting each off-product read of an `exp`
+        // intermediate as an arrival at it — `CL = 2·exp(RE)`, log-normal, as
+        // the inline spelling below already was (#1724 review).
+        (
+            "an exp intermediate added to itself",
+            "  V = TVV * exp(ETA_V)\n  EV = exp(RE)\n  CL = EV + EV",
+            LogNormal,
+        ),
+        (
+            "two exps added inline",
+            "  V = TVV * exp(ETA_V)\n  CL = exp(RE) + exp(RE)",
+            LogNormal,
+        ),
+        // Dies under: `follow` keeping every terminal of a parameter's other
+        // readers — `V`'s `exp` is not on a definition of `CL`.
+        (
+            "a parameter read inside another parameter's exp",
+            "  CL = TVCL + RE\n  V = TVV * exp(ETA_V + CL)",
+            Additive,
+        ),
+        // Dies under: `reach_add` counting a `Custom` arrival as a scale.
+        (
+            "read twice, already custom",
+            "  V = TVV * exp(ETA_V)\n  CL = TVCL * RE * RE",
+            Custom,
+        ),
+    ];
+    check_re_rows(&rows);
+}
+
+/// #1724 item 2: a sign does not change |CV|, so a negation anywhere above
+/// the `exp` keeps the label. Unary minus parses as `0 - x`, transparent in
+/// the walk like any `-`. Each is asserted for an ETA and a kappa.
+/// Dies under: `leaf_scales` treating `-` as a scale-deciding operation.
+#[test]
+fn a_negation_inside_a_product_keeps_the_label() {
+    use crate::types::EtaParamType::LogNormal;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows = [
+        ("leading minus", format!("{v}  CL = -TVCL * exp(RE)")),
+        (
+            "minus on the exp factor",
+            format!("{v}  CL = TVCL * -exp(RE)"),
+        ),
+        (
+            "subtracted from zero",
+            format!("{v}  CL = 0 - TVCL * exp(RE)"),
+        ),
+        ("negated exp argument", format!("{v}  CL = TVCL * exp(-RE)")),
+    ];
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(l, i)| (*l, i.as_str(), LogNormal))
+        .collect();
+    check_re_rows(&rows);
+}
+
+/// #1724: when the MU-reference pattern matches one occurrence of an ETA that
+/// reaches its product twice (Pattern 1, `TVCL * exp(ETA) * exp(ETA)`: one θ
+/// anchor and an `exp(ETA)` in the chain), the walk overrides the pattern's
+/// `LogNormal`, and the θ link goes with it. The pattern match itself is
+/// asserted, so the row cannot quietly stop reaching the override.
+/// Dies under: the override branch in `emit_eta_infos` deleted.
+#[test]
+fn the_walk_overrides_a_pattern_on_a_doubled_eta() {
+    use crate::types::EtaParamType::*;
+    let exp_eta = || {
+        Box::new(Expression::UnaryFn(
+            "exp".into(),
+            Box::new(Expression::Eta(0)),
+        ))
+    };
+    let twice = Expression::BinOp(
+        Box::new(Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            exp_eta(),
+        )),
+        BinOp::Mul,
+        exp_eta(),
+    );
+    let class = classify_expr(&twice, 4).expect("the pattern must match");
+    assert_eq!((class.param_type, class.theta_idx), (LogNormal, Some(0)));
+    let cl = |indiv: &str| {
+        let m = eta_scale_model(&format!("{indiv}\n  V = TVV * exp(ETA_V)"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        (i.param_type, i.linked_theta.clone())
+    };
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL)"),
+        (LogNormal, Some("TVCL".into())),
+        "read once"
+    );
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"),
+        (Custom, None),
+        "read twice"
+    );
 }
 
 // ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
