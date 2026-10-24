@@ -9644,6 +9644,84 @@ mod absorption {
         assert!(wrong.is_empty(), "gated:\n{}", wrong.join("\n"));
     }
 
+    /// #1878 review r5. The η/κ combination of
+    /// `a_kappa_is_measured_jointly_with_a_coarser_eta`, with the kappa read
+    /// as `KAPPA_E0 · (W + 2 − OCC)` over the three occasions: shifting
+    /// `ETA_E0` by `c` and every kappa by `−c` moves `y` by `c · (OCC − 2)`,
+    /// so the levels take `[c, 0, −c]` in each subject — a direction that sums
+    /// to zero within the subject's group, which `sum_to_zero_within` leaves
+    /// free. So no contrast identifies the kappa: within and auto are refused
+    /// as the global contrasts are, within naming its within-group direction.
+    /// The `W + 1` row is the control: its levels' direction is a shift
+    /// common to the subject, removed by within, which binds. The direction is
+    /// asserted on the Jacobian, the pair straddling it: `Σ Z_η − Σ Z_κ`
+    /// inside the within-coded block's span for the zero-sum row and outside
+    /// it for the control.
+    ///
+    /// Mutations — the coarser combination recorded as `Span::Levels` again
+    /// (within and auto bind the zero-sum row); the within refusal dropped
+    /// (the same).
+    #[test]
+    fn a_coarser_combination_that_sums_to_zero_within_binds_under_no_contrast() {
+        let pop = arms_pop();
+        let row = |tag, kappa: &str| -> Row {
+            (
+                tag,
+                "STUDY, OCC",
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * ({kappa})"),
+                format!("E0 + {EMAXY}"),
+                true,
+            )
+        };
+        let zero_sum = row("κ·(W + 2 − OCC)", "W + 2 - OCC");
+        let control = row("κ·(W + 1)", "W + 1");
+        let mut wrong = Vec::new();
+        // `Σ Z_η − Σ Z_κ` outside the within-coded block, relative to its norm.
+        let outside_within = |r: &Row| {
+            let j = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
+            let sum = |name: &str| -> DVector<f64> {
+                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
+                z.column_sum()
+            };
+            let v = sum("ETA_E0") - sum("KAPPA_E0");
+            assert!(v.iter().all(|x| x.is_finite()), "{}: non-finite", r.0);
+            let x = &j.xb * coding(&j, LevelContrast::SumToZeroWithin);
+            let n = v.norm();
+            residual_sv(&DMatrix::from_column_slice(v.len(), 1, v.as_slice()), &x)[0] / n
+        };
+        let (dz, dc) = (outside_within(&zero_sum), outside_within(&control));
+        eprintln!("outside the within span: zero-sum {dz:.3e}, control {dc:.3e}");
+        if dz >= 1e-8 || dc <= 1e-2 {
+            wrong.push(format!("direction: zero-sum {dz:.1e}, control {dc:.1e}"));
+        }
+        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at \
+                      every record of each occasion, exactly as some combination of this \
+                      block's levels does";
+        let within = "and under `contrast = sum_to_zero_within` the levels still reproduce that \
+                      combination: it moves them in a direction that sums to zero within each \
+                      STUDY group, so the model is not identified. No contrast keeps it a \
+                      direction of its own: remove the block, or drop the random effect.";
+        for c in ["sum_to_zero", "ref", "none"] {
+            for r in [&zero_sum, &control] {
+                match try_bind(&row_text(r)(c), &pop) {
+                    Err(e) if e.contains(clause) => {}
+                    got => wrong.push(format!("{} {c:?}: {got:?}", r.0)),
+                }
+            }
+        }
+        for c in ["", "sum_to_zero_within"] {
+            match try_bind(&row_text(&zero_sum)(c), &pop) {
+                Err(e) if e.contains(clause) && e.contains(within) => {}
+                got => wrong.push(format!("zero-sum {c:?}: {got:?}")),
+            }
+            match try_bind(&row_text(&control)(c), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("control {c:?}: {got:?}, want within")),
+            }
+        }
+        assert!(wrong.is_empty(), "zero-sum:\n{}", wrong.join("\n"));
+    }
+
     /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
     /// `ETA_A` and `ETA_B`, and `KAPPA_E0` declared when `kappa`.
     fn two_eta_model(e0: String, kappa: bool) -> impl Fn(&str) -> String {

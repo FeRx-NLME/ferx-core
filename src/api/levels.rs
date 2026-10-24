@@ -1463,6 +1463,12 @@ enum Span {
     /// on a nested block: the within-group contrast absorbs it too, so it is
     /// absorbed under every contrast (#1874 review, F1).
     Within,
+    /// A combination with random effects at coarser units, measured over the
+    /// subject (#1878 review r5): an η is one value across the subject's
+    /// occasions, so the per-unit within residual cannot judge it, and
+    /// whether a contrast absorbs it — `sum_to_zero_within` included — is
+    /// [`carried`]'s to measure.
+    Coarser,
 }
 
 impl Absorbed<'_> {
@@ -1498,7 +1504,7 @@ impl Absorbed<'_> {
                 together(with),
                 self.unit,
                 match span {
-                    Span::Levels => "",
+                    Span::Levels | Span::Coarser => "",
                     Span::Within => ", one that sums to zero within each group",
                 },
             ),
@@ -2162,7 +2168,9 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// rescues it (#1874 review, F1): against the differences of the subject's level
 /// columns inside each within-group, the directions that contrast leaves free.
 /// A random effect inside those is [`Span::Within`], absorbed under every
-/// contrast; one only inside the full span is [`Span::Levels`].
+/// contrast; one only inside the full span is [`Span::Levels`]; one that
+/// reaches it only with the random effects of coarser units, over the subject,
+/// is [`Span::Coarser`], judged contrast by contrast by [`carried`].
 fn spanned(
     model: &CompiledModel,
     decl: &LevelBlockDecl,
@@ -2190,6 +2198,9 @@ fn spanned(
     let mut within: Vec<bool> = vec![nested; silent.len()];
     // Per silent random effect: some unit needed the others to reach the span.
     let mut partnered: Vec<bool> = vec![false; silent.len()];
+    // Per silent random effect: some unit reached the span only with the
+    // coarser random effects, over the subject.
+    let mut coarse_joint: Vec<bool> = vec![false; silent.len()];
     for (theta, re) in probe_points(model) {
         if holds.iter().all(|h| !h) {
             break;
@@ -2452,6 +2463,7 @@ fn spanned(
                         measured[s] = true;
                         partnered[s] = true;
                         within[s] = false;
+                        coarse_joint[s] = true;
                     } else {
                         holds[s] = false;
                     }
@@ -2466,7 +2478,9 @@ fn spanned(
         if !holds[s] {
             continue;
         }
-        let span = if within[s] {
+        let span = if coarse_joint[s] {
+            Span::Coarser
+        } else if within[s] {
             Span::Within
         } else {
             Span::Levels
@@ -4184,6 +4198,13 @@ fn resolve_absorbing(
             && free_count(&groups, c) > 0
             && dead_failure(&groups, c, dead, absorbed.as_ref()).is_none()
     };
+    // A combination with coarser random effects may survive the within-group
+    // contrast: its levels' direction can sum to zero within each group, so
+    // only the certificate under that contrast says, and refuses it below
+    // (#1878 review r5).
+    let coarser = absorbed
+        .as_ref()
+        .is_some_and(|a| matches!(a.how, How::Measured(Span::Coarser, _)));
     let resolved = match decl.contrast() {
         LevelContrast::Auto if nested && absorbed.is_some() => LevelContrast::SumToZeroWithin,
         // A one-column block (the arm above took every nested one) whose
@@ -4218,6 +4239,33 @@ fn resolve_absorbing(
     // looked for a fixed intercept would wave it through, which is precisely
     // the silent flat direction this codebase treats as a bug.
     if let Some(found) = absorbed.as_ref() {
+        if nested
+            && coarser
+            && resolved == LevelContrast::SumToZeroWithin
+            && free > 0
+            && !identified(resolved)
+        {
+            let fix = match [LevelContrast::SumToZero, LevelContrast::Ref]
+                .into_iter()
+                .find(|&c| rescues(c))
+            {
+                Some(c) => format!(
+                    "Use `contrast = {}`, which keeps it a direction of its own, or drop the \
+                     random effect.",
+                    contrast_token(c)
+                ),
+                None => "No contrast keeps it a direction of its own: remove the block, or \
+                         drop the random effect."
+                    .to_string(),
+            };
+            return Err(format!(
+                "{block}: {}, and under `contrast = sum_to_zero_within` the levels still \
+                 reproduce that combination: it moves them in a direction that sums to zero \
+                 within each {} group, so the model is not identified. {fix}",
+                found.clause(),
+                subject_key_columns(decl).join(", "),
+            ));
+        }
         // A one-column block with no free θ is the plain single-level case
         // below: there is no level left for the random effect to be confused with.
         if !nested && free > 0 && !identified(resolved) {
